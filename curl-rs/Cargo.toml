@@ -1,0 +1,670 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# =============================================================================
+# curl-rs -- member manifest for the curl command-line client
+# =============================================================================
+#
+# This crate is the command-line tool. It absorbs the 22,399 lines of C under
+# src/ (measured: `cat src/*.c src/*.h src/toolx/*` = 22399) and, per AAP
+# section 0.1.1 goal G1, it is "a thin CLI over" the engine: it contains no
+# protocol logic whatsoever. Everything it needs comes from curl-rs-lib's
+# public surface.
+#
+# AAP section 0.5.3 makes this file authoritative for the crate:
+# "Cargo.toml at the workspace root and in each member -- the new authority for
+# dependencies, features, and MSRV." AAP section 0.4.2 constrains how: the
+# workspace manifest "is the single place versions are declared; member
+# manifests inherit through `workspace = true`, so a version can never disagree
+# between crates." Consequently no version literal appears anywhere below.
+#
+# NO USER-SPECIFIED RULES EXIST FOR THIS PROJECT. `review_rules` returns the
+# single line "No user rules provided."; this was checked with the default
+# window and again with an explicit full-document range, both returning that
+# identical line, which corroborates AAP section 0.7. Nothing in this file is
+# therefore attributed to a rule. The constraints cited here are AAP
+# requirements taken from the user's request (AAP section 0.8) -- they are
+# binding, but they are requirements, not rules. Where no requirement speaks,
+# enterprise-standard best practice governs; the absence of rules is not
+# permission to lower the bar.
+#
+# Every non-obvious decision below cites its authority: an AAP section, or a
+# repository path and line measured in this tree at commit 54cf587b9c, the
+# commit AAP section 0.8.5 conflict C6 binds every parity claim to.
+# =============================================================================
+
+[package]
+name = "curl-rs"
+
+# Inherited from [workspace.package] in the root manifest, never restated.
+# Hard-coding the version, edition or rust-version here would reintroduce
+# exactly the drift the root manifest exists to prevent (AAP section 0.4.2).
+#
+# rust-version is mandatory in every member: AAP section 0.7 requires that
+# "`rust-version` appears in every member manifest" and is reinforced by
+# rust-toolchain.toml. It resolves to the value the root declares and agrees
+# with clippy.toml's `msrv`, so the MSRV-sensitive clippy lints do not suggest
+# constructs newer than the declared floor.
+#
+# Measured caveat, recorded so the declared floor is not mistaken for a
+# verified one: the mandated dependency set cannot actually be built on that
+# floor. `cargo +1.75.0 build -p curl-rs` fails outright, and it fails on THIS
+# crate's own dependency path, not only on the engine's. Two independent causes
+# were reproduced:
+#   * clap_builder, pinned transitively by the mandated clap release, requires
+#     clap_lex ^1.0.0, and clap_lex 1.1.0 is an edition2024 crate. Cargo 1.75
+#     refuses even to download it: "The package requires the Cargo feature
+#     called `edition2024`, but that feature is not stabilized in this version
+#     of Cargo (1.75.0)". Worth noting because AAP section 0.5.1 chose this clap
+#     release over the newest one specifically to respect the floor -- and the
+#     floor is breached anyway, one level deeper.
+#   * home 0.5.12, reached through the engine's SSH transport, is edition2024
+#     for the same reason, and 46 of the 327 locked crates declare a
+#     rust-version above 1.75. The lowest reachable value is 1.88.
+# This is AAP section 0.8.6 ambiguity A4 and it needs a user decision. Raising
+# the floor is NOT this file's call and neither is repinning clap, so the
+# inherited value stands unchanged and the finding is reported instead.
+#
+# One consequence of the declared floor DOES bind a sibling file, so it is
+# recorded here where the declaration lives: Cargo rejects the double-colon
+# `cargo::` build-script output syntax when rust-version is below 1.77.
+# Measured: "error: the `cargo::` syntax for build script output instructions
+# was added in Rust 1.77.0, but the minimum supported Rust version of
+# `curl-rs` is 1.75. Switch to the old `cargo:rerun-if-changed=build.rs`
+# syntax (note the single colon)." curl-rs/build.rs must therefore use the
+# single-colon form for every instruction it emits.
+#
+# This inheritance is a hard cross-file precondition: if the root's
+# [workspace.package] omitted any field inherited here, cargo would refuse to
+# load the ENTIRE workspace with "error inheriting `<field>` from workspace
+# root manifest's `workspace.package.<field>` ... was not defined" (measured).
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+# Declared locally rather than inherited, deliberately: the root's description
+# covers the workspace as a whole, while this crate is a distinct artifact --
+# the executable, not the library. A local one-liner is the more informative of
+# the two permitted choices and removes one inheritance edge from the
+# precondition noted above.
+description = "curl command-line client: transfer data with URLs"
+
+# This crate is never published to a registry: it is distributed as an
+# executable, and its only path dependency carries no registry version, which
+# would make publishing impossible in any case. Saying so explicitly is not
+# decoration -- it is required to pass the supply-chain gate that AAP section
+# 0.7 makes continuous. deny.toml sets `wildcards = "deny"` together with
+# `allow-wildcard-paths = true`, and cargo-deny grants that path exemption only
+# to PRIVATE crates. Measured: without this line,
+# `cargo deny check bans` fails with "error[wildcard]: found 1 wildcard
+# dependency for crate 'curl-rs'. allow-wildcard-paths is enabled, but does not
+# apply to public crates as crates.io disallows path dependencies", pointing at
+# the curl-rs-lib line below; with it, the check reports "bans ok". The
+# alternative -- giving the path dependency a registry version -- would restate
+# a version literal, which AAP section 0.4.2 rules out.
+publish = false
+
+# Declared explicitly instead of relying on Cargo's auto-detection, so the
+# relationship is self-documenting.
+#
+# AAP section 0.4.1 assigns this script three C generators:
+#   curl-rs/build.rs | CREATE | src/mkhelp.pl, src/mk-file-embed.pl,
+#   scripts/completion.pl | Three Perl generators become one build script
+#   writing to OUT_DIR
+# In the C build those are src/Makefile.am:123 (MKHELP=.../src/mkhelp.pl,
+# producing tool_hugehelp.c named at :124), src/Makefile.am:193-195
+# (mk-file-embed.pl --var curl_ca_embed, producing tool_ca_embed.c named at
+# :188), and scripts/completion.pl. All three, together with scripts/managen
+# which build.rs drives to render the manual source, were confirmed present in
+# this tree. Their outputs are build artifacts rather than committed source, so
+# hand-writing them in Rust would guarantee drift -- AAP section 0.2.1 lists
+# reproducing them in build.rs as mandatory.
+build = "build.rs"
+
+# The version string this binary reports is load-bearing, not cosmetic, so it
+# is worth recording where it comes from and why it must not be touched.
+# include/curl/curlver.h (read in full) declares at :31
+# LIBCURL_COPYRIGHT "Daniel Stenberg, <daniel@haxx.se>.", at :35
+# LIBCURL_VERSION "8.19.0-DEV", at :39-41 MAJOR 8 / MINOR 19 / PATCH 0, at :61
+# LIBCURL_VERSION_NUM 0x081300 and at :72 LIBCURL_TIMESTAMP "[unreleased]".
+# AAP section 0.6.7 explains the consequence: the %VERSION and %HOSTIP
+# placeholders in the fixtures are substituted by the harness from
+# tests/globalconfig.pm and tests/servers.pm, "which means the `User-Agent`
+# string must match the version the binary reports." 1,476 of the 1,914
+# fixtures (measured: `ls tests/data/test* | wc -l` = 1914) compare full
+# request bytes, so a wrong version string fails all of them at once. No
+# version is bumped here; AAP section 0.8.1 freezes the contract.
+
+# =============================================================================
+# Binaries -- exactly two, both named explicitly so nothing depends on
+# auto-discovery.
+# =============================================================================
+#
+# The C build produces the same two executables:
+#   src/Makefile.am:49    bin_PROGRAMS = curl              (installed)
+#   src/Makefile.am:51-52 curlinfo_SOURCES = curlinfo.c
+#                         noinst_PROGRAMS = curlinfo       (NOT installed)
+# src/CMakeLists.txt:111-113 agrees for the second one:
+#   add_executable(curlinfo EXCLUDE_FROM_ALL "curlinfo.c")
+#   target_link_libraries(curlinfo PRIVATE ${CURL_LIBS})
+#   set_target_properties(curlinfo PROPERTIES UNITY_BUILD OFF)
+
+# The primary binary is named curl-rs, NOT curl. The C tool installs as `curl`
+# (src/Makefile.am:49); the Cargo target name deliberately differs so the two
+# artifacts can coexist during the transformation. This is settled: the
+# README.md update lists "curl-rs -- the command-line executable" under
+# Artifacts, and .cargo/config.toml's validation checklist inspects
+# target/release/curl-rs by that name.
+#
+# The divergence is harmless for the test suite because the harness takes the
+# binary under test as an argument: tests/runtests.pl:2344-2348 reads
+# `elsif($ARGV[0] eq "-c") { ... $DBGCURL=$CURL=$ARGV[1]; shift @ARGV; }`
+# (AAP section 0.6.5). No Perl is modified to accommodate the name.
+[[bin]]
+name = "curl-rs"
+path = "src/main.rs"
+
+# The diagnostic binary. src/curlinfo.c:25-27 states its purpose: "to figure
+# out which, if any, features that are disabled which should otherwise exist
+# and work. These are not visible in regular curl -V output." It prints a
+# compile-time ON/OFF line per capability (its main() at :260-271 simply
+# puts()es the `disabled[]` table). Not installed, exactly as upstream.
+# AAP section 0.4.1: curl-rs/src/bin/curlinfo.rs | CREATE | src/curlinfo.c |
+# Separate diagnostic binary.
+[[bin]]
+name = "curlinfo"
+path = "src/bin/curlinfo.rs"
+
+# No library target is declared: AAP section 0.3.1 lists no curl-rs/src/lib.rs,
+# so this crate is binaries only.
+#
+# The C build's static convenience library has no counterpart here on purpose.
+# src/Makefile.am:104-119 builds it under `if BUILD_UNITTESTS` as
+# noinst_LTLIBRARIES = libcurltool.la with
+# libcurltool_la_CPPFLAGS = $(AM_CPPFLAGS) -DCURL_STATICLIB -DUNITTESTS, and
+# src/CMakeLists.txt:115-119 mirrors it as `add_library(curltool STATIC
+# EXCLUDE_FROM_ALL ...)` with target_compile_definitions PUBLIC "CURL_STATICLIB"
+# "UNITTESTS". Its only consumers are the C unit tests, and AAP section 0.8.7
+# documents that tests/libtest/*.c (235 files) and tests/unit/*.c (59 files)
+# "cannot link unmodified" against a Rust static library -- pub(crate) items are
+# genuinely absent from the symbol table, not merely hidden. Their coverage is
+# relocated into #[cfg(test)] modules instead, so exporting a library here
+# would buy nothing and would weaken the encapsulation the zero-unsafe
+# guarantee rests on.
+#
+# No benchmark or example targets either. AAP section 0.1.1 is explicit:
+# "Explicitly NOT performance. No performance objective, latency target, or
+# throughput requirement appears anywhere in the request ... any change
+# justified solely by speed is out of scope."
+
+# =============================================================================
+# Dependencies -- `{ workspace = true }` only, plus a crate-local feature
+# overlay where one is genuinely required.
+# =============================================================================
+#
+# The root [workspace.dependencies] table pins every version exactly. Nothing
+# is re-derived or "upgraded" here, for a documented reason: AAP section 0.5.1
+# records that "the crates.io API returns a crate's versions in
+# reverse-chronological publication order, not descending semantic-version
+# order", a trap that "corrected two of 57 values" once sorting was fixed, and
+# that six candidate crates -- including three the request names by hand --
+# declare a minimum Rust version of 1.85 and therefore violate the declared
+# floor. The adopted compliant set "was swept in full and produced zero
+# violations". Reproducing a version literal here could only ever disagree with
+# that sweep, so this file states none.
+#
+# Only crates already present in the root [workspace.dependencies] are
+# referenced, and only crates a module under curl-rs/src/ actually uses, per
+# the AAP section 0.7 supply-chain obligation ("cargo audit and cargo deny run
+# in continuous integration").
+
+[dependencies]
+
+# The engine. This is the crate's only path dependency and the only place it
+# gets protocol behaviour from.
+#
+# The dependency direction is acyclic and one-way, per AAP section 0.1.1 goal
+# G1 and the section 0.4.2 graph: the C ABI shim and this binary both depend on
+# the engine, and the engine depends on neither, "with no cycles and no
+# protocol logic in either leaf crate". The third workspace member -- the C ABI
+# shim that exports the 100 public libcurl symbols -- is deliberately NOT a
+# dependency of this crate and must never become one: the command-line tool
+# links the engine directly in Rust, never through the C ABI. Depending on it
+# would put a cdylib boundary in the middle of the tool for no reason and would
+# create a second, divergent path to the same engine.
+#
+# default-features = false is deliberate. It suppresses the engine's own
+# default feature set so that the [features] table below is AUTHORITATIVE
+# rather than additive: with the engine's defaults off, the only way an engine
+# capability turns on is through a forward declared here. That is what makes
+# `--no-default-features` on this crate mean what it says, and it is the
+# mechanism that keeps the reported feature banner honest (see [features]).
+#
+# What this single line replaces: src/Makefile.inc:33-34 explains that "libcurl
+# has sources that provide functions named curlx_* that are not part of the
+# official API, but we reuse the code here to avoid duplication", and then
+# lists 16 ../lib/curlx/*.c files at :35-51 plus 17 matching headers at :53-70
+# (including ../lib/curl_setup.h) that the C build compiles a SECOND time into
+# the tool, gated on src/Makefile.am:69-76's USE_CPPFLAG_CURL_STATICLIB. AAP
+# section 0.4.2: that duplicate compilation "disappears entirely; the CLI
+# depends on the library crate instead."
+curl-rs-lib = { path = "../curl-rs-lib", default-features = false }
+
+# The argument surface. AAP section 0.8.3 preserves the user's directive in
+# their own terms: "clap 4.x, derived 1:1 from the curl 8.x long-option
+# inventory." The inventory is measured, not estimated: src/tool_getparam.c:80
+# opens `static const struct LongShort aliases[]= {`, which closes at :374 and
+# contains 282 rows; rows carrying the ARG_NO mask additionally generate
+# --no-<flag> negations, so the derived surface is larger than the row count.
+#
+# `derive` is the one feature this crate needs, because AAP section 0.4.1 maps
+# src/tool_getparam.c to curl-rs/src/cli/args.rs with "The 282-row `aliases[]`
+# table becomes a clap derive."
+#
+# Two features were considered and rejected, so the rejection is on the record
+# rather than looking like an oversight:
+#   * `string` -- the option inventory is a fixed compile-time table, so no
+#     clap API here needs an owned String. Declaring it would widen the surface
+#     without a consumer.
+#   * `wrap_help` -- help output must reproduce src/tool_listhelp.c's table
+#     verbatim. That file's header at :30-34 records that it is generated ("make
+#     listhelp"), :35 opens `const struct helptxt helptext[] = {`, and it holds
+#     274 entries (measured), matching the 274 option pages among the 293
+#     docs/cmdline-opts/*.md files. AAP section 0.8.1 freezes that output, so
+#     clap must not reflow it to the terminal width, and the feature would pull
+#     in a terminal-size dependency for a job this crate does itself.
+# Cargo unions features across the graph, so this overlay guarantees a minimum;
+# it cannot and does not try to subtract anything the root's pin enables.
+clap = { workspace = true, features = ["derive"] }
+
+# Shell completions at run time, backing curl-rs/src/cli/completions.rs, which
+# AAP section 0.4.1 maps from scripts/completion.pl. AAP section 0.5.1 verified
+# the pairing explicitly: the completion crate's pinned release requires
+# clap ^4.5.20, which the pinned clap satisfies. No feature overlay is needed.
+clap_complete = { workspace = true }
+
+# The async runtime. AAP section 0.8.3 preserves an unusual and specific
+# pairing in the user's own terms: "Runtime shape -- Tokio with a
+# current-thread runtime for the CLI and a multi-thread runtime for the multi
+# handle. This is a specific and unusual pairing, and it is honoured:
+# curl-rs/src/main.rs builds the current-thread runtime;
+# curl-rs/src/operate/parallel.rs and the multi handle use the multi-thread
+# runtime." Both flavours therefore have to be available from this one crate,
+# which is why `rt` and `rt-multi-thread` are both enabled here.
+#
+# The features are enumerated rather than pulled in with `full`, so that every
+# one of them has a named consumer (AAP section 0.7 supply-chain obligation):
+#   rt              -- the current-thread runtime built in src/main.rs
+#   rt-multi-thread -- the multi-thread runtime in src/operate/parallel.rs,
+#                      which drives --parallel (from src/tool_operate.c's
+#                      parallel path, AAP section 0.4.1)
+#   macros          -- select! in that parallel driver, racing transfer
+#                      completion against the progress-meter tick that
+#                      src/tool_progress.c updates on a timer; also
+#                      #[tokio::test] in the crate's #[cfg(test)] modules
+#   signal          -- the tool ignores SIGPIPE. src/tool_main.c:174-178 reads
+#                      `#if defined(HAVE_SIGNAL) && defined(SIGPIPE)` ...
+#                      `(void)signal(SIGPIPE, SIG_IGN);`, with a
+#                      CURL_SIGPIPE_DEBUG escape hatch at :176. tokio's unix
+#                      signal support expresses that WITHOUT unsafe, which
+#                      matters because this crate forbids unsafe outright (see
+#                      the note at the end of this file)
+#   io-util         -- the transfer callbacks in src/callbacks/{write,read}.rs
+#                      (from src/tool_cb_wrt.c and src/tool_cb_rea.c)
+#   fs              -- file I/O the tool owns: -o output, -T upload, -K config
+#                      files, --create-dirs (src/tool_dirhie.c)
+#   time            -- --limit-rate pacing, --retry-delay, --speed-time and the
+#                      progress-meter interval
+tokio = { workspace = true, features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "io-util",
+  "fs",
+  "time",
+] }
+
+# -----------------------------------------------------------------------------
+# Deliberately NOT dependencies of this crate. Each omission is a decision with
+# an authority, recorded so that nobody re-adds it as an "obvious" oversight.
+# -----------------------------------------------------------------------------
+#
+# * No content-type-inference crate. This was settled by measurement, not
+#   assumption: curl performs no extension-based content-type inference at all.
+#   src/tool_formparse.c:310 calls `curl_mime_type(part, m->type)` with the
+#   USER-supplied type; that type reaches it only from the explicit parse at
+#   :508, `if(!endct && checkprefix("type=", p))`; and the function's own
+#   documentation at :669-685 presents ';type=<content-type>' as the only
+#   mechanism. The one other apparent hit, src/tool_xattr.c:39
+#   `{ "user.mime_type", CURLINFO_CONTENT_TYPE }`, writes the SERVER's
+#   Content-Type into an extended attribute -- it infers nothing. Every
+#   remaining "guess" in src/*.c is CURLU_GUESS_SCHEME. AAP section 0.5.1 does
+#   list such a crate for "content-type inference for -F uploads", but adding
+#   inference would be a behaviour change, which AAP section 0.8.1 ("CLI flag
+#   semantics ... and default value are frozen") and section 0.8.2 ("No
+#   behaviour change justified by improvement") both prohibit. Changing this
+#   needs a user decision, not a manifest edit.
+#
+# * No libc. Nothing in this crate needs a libc type or constant that std does
+#   not expose, and it could not be used for a syscall here in any case,
+#   because this crate forbids unsafe code with zero exemptions. The three
+#   places in src/ that genuinely need a raw syscall are src/tool_xattr.c:89-99
+#   (fsetxattr / extattr_set_fd), src/terminal.c:59-63
+#   (ioctl(STDIN_FILENO, TIOCGWINSZ) / TIOCGSIZE) and src/tool_getpass.c:136-157
+#   (tcgetattr and ioctl(TCSETA) to suppress echo). Per AAP section 0.8.5
+#   conflict C3 those belong in curl-rs-lib/src/ffi/sys.rs -- "relocate the
+#   genuine residue into curl-rs-lib/src/ffi/sys.rs" -- and this crate consumes
+#   the safe wrapper. What std already covers needs nothing: isatty is
+#   std::io::IsTerminal, and src/tool_filetime.c's utimes() at :132 (reached
+#   from setfiletime at :86, the -R path) is std::fs::File::set_times, which
+#   became stable in exactly the declared MSRV.
+#
+# * No logging or tracing facade. AAP section 0.4.1 places trace formatting in
+#   curl-rs-lib/src/trace.rs with "--trace formats frozen", and the tool-side
+#   debug callback (src/tool_cb_dbg.c -> curl-rs/src/callbacks/debug.rs) writes
+#   a byte-frozen hex dump with std::io rather than emitting structured log
+#   records. No subscriber crate appears anywhere in AAP section 0.5.1's
+#   inventory either, which independently confirms the CLI is not the logging
+#   owner. If diagnostics ever need a sink, the engine owns that decision.
+#
+# * No header generator. It is a build dependency of the C ABI shim alone: AAP
+#   section 0.4.1 assigns the header-generation invocation, and the soname
+#   configuration that goes with it, to that crate's build.rs.
+#
+# * No CI tooling. The coverage, advisory-scanning, licence-policy and
+#   cross-compilation helpers named in AAP section 0.5.1 are binaries the
+#   workflows install; they are not manifest dependencies of anything.
+#
+# * No protocol, TLS, QUIC, SSH, compression or cryptographic crate. Every one
+#   of those in AAP section 0.5.1's inventory belongs to the engine crate
+#   ALONE. Declaring any of them here would put protocol knowledge in the CLI
+#   and contradict AAP section 0.1.1 goal G1 -- "a thin CLI over it", with "no
+#   protocol logic in either leaf crate".
+#
+# * No C-binding crate of any kind, at any configuration. AAP section 0.8.2:
+#   "No C TLS library at any configuration -- not as a default, not behind a
+#   feature flag, not as a fallback." deny.toml enforces this workspace-wide
+#   with an explicit ban list and is the authoritative record of it; this file
+#   simply never reaches for one.
+
+# =============================================================================
+# Build dependencies -- the section is deliberately ABSENT.
+# =============================================================================
+#
+# curl-rs/build.rs uses only the standard library, including
+# std::process::Command to drive scripts/managen through Perl. Two reasons, in
+# the order they were decided:
+#
+#   1. The embedded manual is emitted in PLAIN form, reproducing src/mkhelp.pl
+#      WITHOUT its -c flag, so no compression crate is needed. That is a
+#      supported upstream configuration, not a shortcut: src/Makefile.am:141-154
+#      generates both forms when zlib is available (the plain one under
+#      `#ifndef HAVE_LIBZ`), and :155-161 is the `else` branch whose own comment
+#      reads "This generates the tool_hugehelp.c file uncompressed only".
+#      Binary size is not an objective -- AAP section 0.1.1 makes performance an
+#      explicit non-goal.
+#   2. Shell completions are produced by parsing the curldown front matter of
+#      the 274 option pages under docs/cmdline-opts/ directly, which is the
+#      faithful 1:1 replacement for scripts/completion.pl -- itself written
+#      against core Perl with no library. Generating them from the clap surface
+#      instead would mean include!-ing derive code into a build script, which
+#      would force curl-rs/src/cli/args.rs to be build-script-includable and
+#      impose an invasive constraint on a file this manifest has no business
+#      constraining.
+#
+# If build.rs is ever found to genuinely need a crate, the correct action is to
+# add it to the root [workspace.dependencies] FIRST and reference it here as
+# `{ workspace = true }` -- never to pin a version locally, because AAP
+# section 0.7 requires that "every version in section 0.5.1 is exact". A pure
+# Rust backend must be selected for anything that has a C fallback, since
+# deny.toml bans the C compression and TLS bindings outright.
+
+# =============================================================================
+# Features -- the canonical 15-name vocabulary, every one forwarded to the
+# engine.
+# =============================================================================
+#
+# Cargo has no [workspace.features] table, so the root manifest can only fix
+# the vocabulary and the default-on/off state in prose; the functioning table
+# lives here. AAP section 0.5.2 gives that vocabulary as exactly fifteen names,
+# "declared once at the workspace level so that a capability cannot be enabled
+# in one crate and disabled in another". They are used verbatim and none is
+# added.
+#
+# WHY THE FORWARDING IS LOAD-BEARING RATHER THAN COSMETIC -- the single most
+# important thing to understand about this table.
+#
+# curl-rs/src/cli/libinfo.rs (from src/tool_libinfo.c) asks the library what it
+# can do and the tool prints the answer through `--version`. AAP section 0.6.5
+# establishes that the test harness BELIEVES that banner. tests/runtests.pl
+# parses the two lines: at :651-654 `elsif($_ =~ /^Protocols: (.*)/i)` hands the
+# list to `parseprotocols()` (defined at :462-463), which additionally derives
+# <proto>-ipv6 and <proto>-unix variants and appends http-proxy and https-mtls;
+# at :655-661 `elsif($_ =~ /^Features: (.*)/i)` populates a feature map over a
+# 52-name vocabulary. 874 of the 1,914 fixtures gate on <features>, and the
+# asymmetry is decisive: "under-reporting a capability makes a fixture skip;
+# over-reporting makes it run and fail."
+#
+# So if this crate's feature set could drift from the engine's, the banner would
+# lie, and a clean skip would turn into a hard failure. The forwarding table
+# below, together with default-features = false on the path dependency above, is
+# the mechanism that makes that drift impossible: this crate cannot enable a
+# capability the engine does not get, and cannot fail to enable one the engine
+# does.
+#
+# CRITICAL MECHANISM -- Cargo UNIONS features across the entire dependency
+# graph. There is no local scope for feature selection. Adding a feature here,
+# or enabling one on a transitive dependency, that reaches a second
+# cryptographic provider, a post-quantum hybrid key exchange, or an
+# operating-system trust-store verifier silently changes the whole build even
+# though the root manifest asked for none of them with default-features = false.
+# AAP section 0.5.1 records the four resulting defects: duplicated cryptographic
+# code; a build-time CMake-and-NASM requirement from vendored C and assembly
+# that "is likely to break the `cross`-based aarch64 Linux leg"; a large
+# vendored-C surface at odds with the no-C-TLS requirement; and a hybrid key
+# exchange that "changes the bytes of the TLS ClientHello" relative to curl
+# 8.x -- which, under the byte-exact comparison AAP section 0.6.7 documents,
+# places EVERY HTTPS fixture at risk. The exact feature and crate names are
+# pinned in the root manifest and banned in deny.toml; nothing in this table may
+# undo either.
+#
+# There is deliberately NO switch here for the TLS layer. AAP section 0.4.2
+# uses a `feature = "..."` cfg on the TLS layer only as an ILLUSTRATIVE example
+# of how `#ifdef USE_SSL` translates; it is not one of section 0.5.2's fifteen
+# names, and an off-switchable one would permit a build with no TLS at all,
+# contradicting AAP section 0.1.1 goal G4 -- exactly one TLS implementation,
+# with certificate validation on by default -- and section 0.8.2. TLS is
+# unconditional. This paragraph exists so that the omission reads as a decision
+# and nobody adds the switch later.
+#
+# What this fifteen-name map replaces: the C configuration surface, which is
+# 101 knobs in configure.ac (measured: 57 AC_ARG_ENABLE + 44 AC_ARG_WITH) and
+# 98 option() calls in CMakeLists.txt. Per AAP section 0.4.2 the three jobs of
+# `#include "curl_setup.h"` now separate cleanly: feature selection becomes
+# Cargo [features], platform detection becomes cfg(target_os) and
+# cfg(target_arch), and shared type declarations become ordinary `use`
+# statements. src/tool_setup.h -- the tool-wide portability umbrella -- and the
+# -D definitions the C build passes on the command line (src/Makefile.am:54-59
+# -DCURL_STATICLIB and -DDEBUGBUILD, :135 -DUSE_MANUAL, :192 -DCURL_CA_EMBED)
+# have no successor as macros; they become features and cfg predicates.
+
+[features]
+
+# The twelve default-on capabilities, in AAP section 0.5.2's order.
+default = [
+  "http2",
+  "http3",
+  "ftp",
+  "ssh",
+  "websockets",
+  "cookies",
+  "hsts",
+  "altsvc",
+  "doh",
+  "brotli",
+  "zstd",
+  "gzip",
+]
+
+# Each name forwards to the identically named engine feature and adds nothing of
+# its own, so the tool and the engine can never disagree about what is built.
+http2      = ["curl-rs-lib/http2"]
+http3      = ["curl-rs-lib/http3"]
+ftp        = ["curl-rs-lib/ftp"]
+ssh        = ["curl-rs-lib/ssh"]
+websockets = ["curl-rs-lib/websockets"]
+cookies    = ["curl-rs-lib/cookies"]
+hsts       = ["curl-rs-lib/hsts"]
+altsvc     = ["curl-rs-lib/altsvc"]
+doh        = ["curl-rs-lib/doh"]
+brotli     = ["curl-rs-lib/brotli"]
+zstd       = ["curl-rs-lib/zstd"]
+gzip       = ["curl-rs-lib/gzip"]
+
+# Negotiate authentication, default OFF. AAP section 0.8.5 conflict C2 resolves
+# the apparent clash with the no-C-library requirement: "GSS-API is neither
+# libcurl, nor libssl, nor a TLS library -- it is an authentication mechanism.
+# Negotiate sits behind a non-default `negotiate` feature with the binding
+# confined to curl-rs-lib/src/ffi/gss.rs, so the default build links no C
+# security library at all." While this is off, the reported Features: line must
+# NOT advertise GSS-API, SPNEGO or Kerberos -- three of the 52 names the harness
+# recognises -- because over-reporting turns a clean skip into a failure.
+negotiate = ["curl-rs-lib/negotiate"]
+
+# Alternative asynchronous resolver, default OFF. AAP section 0.8.3, in the
+# user's own terms: "System resolver by default, with hickory-dns as an optional
+# feature that is disabled by default."
+hickory-dns = ["curl-rs-lib/hickory-dns"]
+
+# Allocation accounting, default OFF, and the most consequential of the three
+# off switches because withholding it changes which fixtures run.
+#
+# This feature also gates the tool-side initialisation, which is why the CLI has
+# a stake in it and not just the engine: src/tool_main.c:101-127 is
+# `#ifdef CURL_MEMDEBUG static void memory_tracking_init(void)`, reading the
+# CURL_MEMDEBUG environment variable at :106 for the log filename and
+# CURL_MEMLIMIT at :118 to enable fail-on-allocation-N; it is called from main
+# at :182. The log format the harness consumes is fully specified:
+# lib/memdebug.c (L191-368) emits `MEM <src>:<line> malloc(<n>) = <ptr>` with
+# parallel forms for calloc(n,size), strdup(p)(n), wcsdup(p)(n), realloc(p,n)
+# and free(p), plus LIMIT, FD, FILE and ADDR records;
+# tests/memanalyzer.pm (L119-349) parses them with /^MEM ([^ ]*):(\d*) (.*)/ and
+# siblings; and the destination comes from CURL_MEMDEBUG (tests/runner.pm:165).
+#
+# THE DECISION AND ITS COST, from AAP section 0.6.6, stated rather than buried.
+# The default posture is NOT to advertise Debug in the version banner, because
+# tests/runtests.pl:660 sets `$feature{"TrackMemory"} = $feat =~ /Debug/i;` and
+# the entire memory-checking block at :1759 is wrapped in
+# `if($feature{"TrackMemory"})`. Withholding Debug therefore makes the 28
+# fixtures carrying a <limits> block inert -- their allocation ceilings are
+# never compared, which matters because a Rust allocation pattern will not match
+# a C one. The price: 98 fixtures require Debug and will SKIP, and
+# `make torture-test` hard-requires the feature (tests/runtests.pl:847-849 dies
+# with "cannot run torture tests since curl was built without TrackMemory
+# feature") and is therefore not applicable. Enabling this feature is the
+# remedy if that trade is ever rejected.
+memdebug = ["curl-rs-lib/memdebug"]
+
+# =============================================================================
+# Development dependencies -- kept minimal.
+# =============================================================================
+
+[dev-dependencies]
+
+# AAP section 0.5.1 lists this crate as a "development dependency for
+# integration tests"; the tests below need scratch files and directories for
+# -o output, -K config files and cookie jars.
+tempfile = { workspace = true }
+
+# Test-only runtime surface. `test-util` gives the paused-clock control the
+# timing-sensitive assertions need (--retry-delay, --speed-time) without
+# sleeping in real time; `macros` and `rt` drive #[tokio::test].
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+
+# =============================================================================
+# Test targets -- the two tests-rs entries AAP section 0.3.1 assigns to the CLI.
+# =============================================================================
+#
+# tests-rs/ is deliberately not a fourth workspace member; its tests are wired
+# in through the member crates' [[test]] targets, so each file is claimed by
+# exactly one crate. Of AAP section 0.3.1's test layout, these two are the CLI's
+# and the rest belong elsewhere: the ABI trio (symbol parity against
+# lib/libcurl.def, the enumeration-integer assertions, and compiling all 129
+# docs/examples/*.c) belongs to the C ABI shim, and the protocol integration
+# tests plus the self-signed-certificate rejection test are the engine's. A
+# second crate declaring one of the two paths below would silently compile it
+# twice -- Cargo does not warn about that (measured) -- so the split is
+# maintained by discipline, and this comment is where it is written down.
+#
+# Measured behaviour while either file is still absent, so the symptom is not
+# mistaken for a defect in this manifest: `cargo metadata` and `cargo build`
+# both succeed with zero warnings, because a test target is not built by
+# default, while `cargo test` fails with "can't find integration-test <name> at
+# path ...". The declaration is still correct -- it is what wires gate 10 and
+# the fixture harness to a runner at all -- and it resolves as soon as the two
+# files land.
+
+# AAP section 0.4.1 maps this from src/tool_msgs.c: "--insecure must warn on
+# stderr before proceeding". AAP section 0.8.4 makes it validation gate 10, and
+# AAP section 0.8.1 lists the warning among the frozen default behaviours.
+[[test]]
+name = "insecure_warns"
+path = "../tests-rs/integration/insecure_warns.rs"
+
+# AAP section 0.4.1 maps this from tests/runtests.pl: "Invokes the harness with
+# -c pointed at the Rust binary" -- the documented injection point at
+# tests/runtests.pl:2344-2348. The 1,914 fixtures stay byte-for-byte unmodified;
+# only the binary under test changes.
+[[test]]
+name = "curl_suite"
+path = "../tests-rs/harness/curl_suite.rs"
+
+# =============================================================================
+# What this file deliberately does NOT contain.
+# =============================================================================
+#
+# * No [profile.*] table. Cargo honours profiles only in the workspace root
+#   manifest and WARNS that a profile in a member is ignored, which would break
+#   AAP section 0.8.4 gate 1 ("zero warnings") on its own. The root manifest
+#   owns [profile.release] and keeps it conservative -- in particular, unwinding
+#   must stay recoverable across the C ABI boundary, where the shim crate
+#   contains it deliberately instead of letting it end the host process, so no
+#   member may switch the release strategy to abort.
+#
+# * No [lints] table inheriting from the workspace. The root manifest defines no
+#   [workspace.lints], so `workspace = true` there would simply fail to resolve.
+#
+# * No `-D warnings`. That is applied on the command line by
+#   .github/workflows/rust-clippy.yml, per AAP section 0.8.4 gate 2, "so that a
+#   lint failure names itself rather than hiding inside a build log".
+#
+# * No native-library link declaration. This crate links no native library --
+#   AAP section 0.4.2 records that the C build's duplicate compilation of
+#   ../lib/curlx/*.c "disappears entirely".
+#
+# * No [patch], [replace], [source] or [registries] table, and no git
+#   dependency. AAP section 0.5.1: the workspace has "exactly three path
+#   dependencies among its own members and no private registry, vendored crate,
+#   or internal package feed."
+#
+# * No required-features on either binary. The tool must build with
+#   --no-default-features, because the command-line surface is frozen and a
+#   flag's PRESENCE must never depend on a Cargo feature. Where a capability is
+#   compiled out, the correct behaviour is curl's own disabled-feature
+#   behaviour -- an error when the flag is used -- not a missing flag. For the
+#   same reason nothing declared here introduces a new command-line flag, which
+#   AAP section 0.8.2 prohibits outright.
+#
+# * No safety attribute. The invariant is enforced in source, not in metadata:
+#   AAP section 0.1.1 goal G6 requires `#![forbid(unsafe_code)]` at the root of
+#   the engine and of this crate, "with a single #[allow(unsafe_code)] attribute
+#   on `mod ffi`". This crate has NO ffi module, so both of its crate roots --
+#   src/main.rs and src/bin/curlinfo.rs -- forbid unsafe code with ZERO
+#   exemptions, and the operating-system integration that genuinely needs it
+#   lives in curl-rs-lib/src/ffi/sys.rs per AAP section 0.8.5 conflict C3.

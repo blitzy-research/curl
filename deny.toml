@@ -87,8 +87,8 @@ deny = [
 # Duplicate versions that are structurally unavoidable with the pinned set.
 # Each entry is the OLDER/NEWER pair pulled in by a transitive dependency that
 # cannot be unified without abandoning a mandated crate version:
-#   rand/rand_core/chacha20/getrandom - quinn-proto uses rand 0.10 while russh
-#                                       and the auth code use rand 0.8
+#   rand/rand_chacha/rand_core/       - quinn-proto uses rand 0.10 while russh
+#   chacha20/getrandom                  and the auth code use rand 0.8
 #   thiserror/thiserror-impl          - transitive deps still on 1.x
 #   syn/winnow/cpufeatures            - proc-macro and parser generations
 skip = [
@@ -96,6 +96,7 @@ skip = [
   { name = "cpufeatures" },
   { name = "getrandom" },
   { name = "rand" },
+  { name = "rand_chacha" },
   { name = "rand_core" },
   { name = "syn" },
   { name = "thiserror" },

@@ -1,0 +1,703 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# curl / libcurl - Cargo workspace manifest.
+#
+# This is the single authority for workspace membership, shared package
+# metadata, the minimum supported Rust version, the complete external
+# dependency inventory with exact versions, and the capability vocabulary
+# that replaces curl's preprocessor configuration.
+#
+# It supersedes the dependency-resolution, feature-selection, code-generation
+# and packaging duties of the C build system: configure.ac (57 AC_ARG_ENABLE
+# plus 44 AC_ARG_WITH knobs, CURLVERSION extracted from curlver.h at
+# configure.ac:129), CMakeLists.txt (project version derived at
+# CMakeLists.txt:54-66), acinclude.m4, m4/*.m4, and the Makefile.am /
+# Makefile.inc set that shared source lists through lib/Makefile.inc and
+# src/Makefile.inc. None of that machinery has a mechanical Cargo
+# equivalent, so every capability it provided is re-established here
+# explicitly instead of being left to a Cargo default.
+#
+# Nothing decided here may change observable behaviour. The three frozen
+# contracts are the bytes on the wire, the command-line surface, and the C
+# ABI; this manifest only selects the code that implements them. Where a
+# choice existed between a faster design and a more behaviourally faithful
+# one, faithfulness won - performance is an explicit non-goal for this work.
+#
+# Companion configuration, deliberately kept in separate files:
+#   rust-toolchain.toml   toolchain pin (channel 1.97.1) and target matrix
+#   clippy.toml           msrv, kept equal to rust-version below
+#   rustfmt.toml          formatting
+#   deny.toml             licence allow-list, provider bans, advisory policy
+#   .cargo/config.toml    per-target linkers; the libcurl.so.4 soname is NOT
+#                         set there or here - it is a cdylib-only link arg
+#                         emitted by curl-rs-ffi/build.rs
+#   Cargo.lock            committed; reproducible resolution of this graph
+
+[workspace]
+# Resolver v2 is required for edition 2021 feature resolution: it stops
+# build-dependency and target-specific features from leaking into the normal
+# dependency graph, which is what keeps the cryptographic-provider selection
+# below from being silently widened by a build script.
+resolver = "2"
+
+# Three members, and the dependency direction between them is acyclic:
+#
+#     curl-rs-ffi  ->  curl-rs-lib  <-  curl-rs
+#
+# curl-rs-lib is the protocol engine and the only crate with protocol
+# knowledge. curl-rs is a thin command-line front end over it; curl-rs-ffi is
+# a thin C ABI over it. Neither leaf crate contains protocol logic, and
+# neither leaf depends on the other.
+members = [
+  "curl-rs-lib",
+  "curl-rs",
+  "curl-rs-ffi",
+]
+
+# tests-rs/ is deliberately NOT a workspace member. The Rust-side tests live
+# outside the C tests/ tree so that tests/runtests.pl and the 1,914 fixtures
+# under tests/data/ stay untouched; they are wired in through the member
+# crates' [[test]] targets rather than as a fourth member. Adding tests-rs
+# here would make Cargo demand a package manifest for it and would give the
+# test tree a publishable identity it must not have.
+#
+# lib/, src/, tests/, docs/ and projects/ need no `exclude` entries: they
+# contain no Cargo.toml, and Cargo only looks at the paths listed in
+# `members`, so it never scans them.
+
+[workspace.package]
+# curl 8.19.0-DEV, the tree this implementation is measured against.
+#
+# include/curl/curlver.h is the authority: LIBCURL_VERSION "8.19.0-DEV" at
+# line 35, MAJOR 8 / MINOR 19 / PATCH 0 at lines 39-41, and
+# LIBCURL_VERSION_NUM 0x081300 at line 61.
+#
+# Cargo requires a SemVer version, and "8.19.0-DEV" is not one: `-DEV` would
+# be read as a pre-release identifier that orders *below* 8.19.0. The C build
+# system already solves this exactly the same way - CMakeLists.txt:63-66
+# strips the suffix with a regex before calling project(CURL VERSION ...) -
+# so "8.19.0" is the established SemVer form of this release, not a new
+# decision.
+#
+# The version string consumers actually observe is unchanged and remains
+# "8.19.0-DEV": `curl --version`, `curl-config --version`
+# (curl-config.in:98) and the Version: field of libcurl.pc
+# (libcurl.pc.in, @CURLVERSION@ substituted from configure.ac:129) are all
+# rendered from LIBCURL_VERSION by curl-rs-lib/src/version.rs. No version is
+# bumped anywhere: the ABI contract is frozen.
+version = "8.19.0"
+
+# Rust edition 2021 and MSRV 1.75, both mandated verbatim by the
+# specification. rust-version is repeated into every member through
+# `rust-version.workspace = true` and is mirrored by clippy.toml's `msrv`;
+# the two must always agree, or MSRV-sensitive clippy lints fire under
+# `-D warnings`.
+#
+# Measured caveat, recorded here rather than hidden: 1.75 is not reachable
+# with the mandated dependency set. `cargo metadata` over the resolved graph
+# shows 46 of 327 packages declaring a rust-version above 1.75 - the icu_*
+# and idna_adapter family at 1.86 (reached through idna), rand 0.10 at 1.85
+# (reached through quinn-proto), and home 0.5.12 at 1.88 (reached through
+# russh), which is the binding maximum. The lowest reachable floor is
+# therefore 1.88, or 1.86 if russh's dependency on home is removed.
+# `cargo +1.75.0 build --workspace` fails on that basis alone, before any
+# code in this workspace is compiled.
+#
+# The declared value stays 1.75 because the specification froze it and
+# because two of its own requirements - the MSRV floor and the crate set -
+# cannot both be satisfied by any implementation; that conflict is escalated
+# for a decision rather than resolved unilaterally by editing the mandate.
+# Raise this line, clippy.toml's msrv and rust-toolchain.toml together once
+# the decision is made. Declaring 1.75 while building on 1.97.1 is safe:
+# Cargo only rejects a toolchain older than rust-version.
+edition = "2021"
+rust-version = "1.75"
+
+# Project metadata, taken from the existing consumer-facing files so that
+# nothing a downstream packager reads changes: libcurl.pc.in supplies
+# `URL: https://curl.se/` and
+# `Description: Library to transfer files with HTTP, FTP, etc.`, and
+# include/curl/curlver.h:31 supplies LIBCURL_COPYRIGHT.
+license = "curl"
+authors = [
+  "Daniel Stenberg <daniel@haxx.se>",
+  "the curl project contributors",
+]
+description = "Library to transfer files with HTTP, FTP, etc."
+homepage = "https://curl.se/"
+repository = "https://github.com/curl/curl"
+documentation = "https://curl.se/libcurl/"
+readme = "README.md"
+keywords = ["curl", "libcurl", "http", "ftp", "tls"]
+categories = [
+  "network-programming",
+  "command-line-utilities",
+  "web-programming::http-client",
+]
+
+# These artifacts ship as libcurl.so.4 and the curl executable through the
+# usual packaging path described by libcurl.pc and curl-config, not as
+# crates.io packages, and the three crate names are not registered to this
+# project. Publishing is therefore refused outright.
+publish = false
+
+# ---------------------------------------------------------------------------
+# External dependencies - declared once, here, and inherited by the members
+# through `<crate> = { workspace = true }`.
+# ---------------------------------------------------------------------------
+#
+# Every version is EXACT. Each requirement is written `=x.y.z` rather than
+# the bare `x.y.z` form, because a bare requirement is a caret range: Cargo
+# reads "0.23.42" as "^0.23.42" and is free to resolve 0.23.43. That was not
+# hypothetical - resolving this same set with bare requirements floated clap
+# to 4.6.4 and rustls to 0.23.43, and clap 4.6.4 raises its own MSRV to 1.85.
+# Exact pins make the graph a fact of this file instead of a fact of the day
+# it was resolved, and they compose with every documented range requirement
+# in the graph (verified below). Cargo.lock is committed as the second half
+# of the same guarantee.
+#
+# Version selection is not re-derived here and must not be re-derived
+# downstream. The crates.io API returns a crate's versions in
+# reverse-chronological publication order, not descending semantic-version
+# order, so reading the first element yields the most recently published
+# version rather than the highest one.
+#
+# The set is the newest version of each crate that satisfies the mandated
+# MSRV, which is also why it is internally coherent in two ways that the
+# newest-of-everything set is not:
+#   * the RustCrypto family stays on a single `digest` 0.10 generation, so
+#     Hmac<Sha1> and friends actually compile - digest 0.10 and 0.11 in one
+#     graph do not unify, and deny.toml bans digest >= 0.11 to keep it that
+#     way;
+#   * no release-candidate cryptography enters the graph. russh 0.58.0
+#     through 0.62.4 depend on rsa 0.10.0-rc, ssh-key 0.7.0-rc and
+#     pkcs1 0.8.0-rc; shipping those would put the `cargo audit` gate in
+#     permanent jeopardy.
+#
+# Verified pairings (each requirement is satisfied by the pin above it):
+#   tokio-rustls 0.26.4 needs rustls ^0.23.27
+#   quinn 0.11.9        needs rustls ^0.23.5, tokio ^1.28.1
+#   h3-quinn 0.0.10     needs h3 ^0.0.8, quinn ^0.11.7, tokio-util ^0.7.9
+#   hyper 1.11.0        needs http ^1, http-body ^1, bytes ^1.2
+#   clap_complete       needs clap ^4.5.20
+#   russh               needs aes ^0.8, digest ^0.10, hmac ^0.12, rand ^0.8,
+#                       sha1 ^0.10.5, sha2 ^0.10.6, des ^0.8.1, rsa ^0.9,
+#                       tokio ^1.17.0
+[workspace.dependencies]
+
+# --- Async runtime and plumbing -------------------------------------------
+#
+# tokio replaces select()/poll() (lib/select.c, lib/curlx/wait.c), the
+# thread abstraction of lib/curl_threads.c, and - most valuably - the
+# alarm() plus sigsetjmp/siglongjmp DNS timeout in lib/hostip.c, which is
+# the most hazardous construct in the C tree.
+#
+# The "full" feature is declared once here because the two crates need
+# different, overlapping subsets and both runtime flavours are mandated: the
+# command-line tool drives a current-thread runtime, while the multi handle
+# drives a multi-thread runtime. Enumerating a narrower list per crate would
+# only move the risk of a missing feature into the member manifests.
+tokio = { version = "=1.53.1", features = ["full"] }
+tokio-util = { version = "=0.7.19", features = ["codec", "compat", "io"] }
+futures = "=0.3.33"
+# Safe pin projection for the connection-filter chain, which is where the C
+# tree used a `void *ctx` behind a 14-member vtable (lib/cfilters.h:210-226).
+pin-project-lite = "=0.2.17"
+# Replaces the hand-tracked pointer/length/capacity triples of
+# lib/curlx/dynbuf.c, lib/sendf.c and lib/bufq.c.
+bytes = "=1.12.1"
+
+# --- HTTP/1.1 and HTTP/2 ---------------------------------------------------
+#
+# hyper and h2 are BOTH declared, on purpose. hyper already embeds h2, but
+# hyper is used only for connection management, keep-alive and framing;
+# raw SETTINGS and flow-control manipulation is observable in the fixture
+# expectations under tests/data/ and is not reachable through hyper's
+# surface, so h2 is used directly where that matters.
+#
+# hyper's `ffi` and `capi` features are deliberately NOT enabled: they add
+# #[no_mangle] C entry points, which would appear in libcurl.so.4 and break
+# the 100-symbol export parity gate against lib/libcurl.def.
+#
+# Note that hyper decides neither which headers are emitted nor in what
+# order. tests/getpart.pm compares the whole request as one string, so
+# header order, casing and spacing are all significant; request-line and
+# header serialisation stays in curl-rs-lib/src/protocols/http1.rs.
+hyper = { version = "=1.11.0", features = ["http1", "http2", "client"] }
+hyper-util = { version = "=0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+h2 = "=0.4.15"
+http = "=1.4.2"
+http-body = "=1.1.0"
+http-body-util = "=0.1.4"
+# HTTP date formatting for conditional requests (-z / --time-cond).
+httpdate = "=1.0.3"
+
+# ---------------------------------------------------------------------------
+# Cryptographic provider selection - the single most consequential decision
+# in this manifest, and the reason the next two groups look verbose.
+# ---------------------------------------------------------------------------
+#
+# rustls, tokio-rustls, quinn and russh all pick a cryptographic provider
+# through their DEFAULT features, and their defaults disagree:
+#
+#   rustls 0.23.42      ["aws_lc_rs", "logging", "prefer-post-quantum",
+#                        "std", "tls12"]
+#   tokio-rustls 0.26.4 ["logging", "tls12", "aws_lc_rs"]
+#   quinn 0.11.9        ["log", "platform-verifier", "runtime-tokio",
+#                        "rustls-ring", "bloom"]
+#   quinn-proto 0.11.12 ["rustls-ring", "log", "bloom"]
+#   russh               ["flate2", "aws-lc-rs", "rsa"]
+#
+# Because Cargo unifies features across a graph, accepting all defaults
+# links BOTH providers into one binary. That produces four distinct defects
+# at once:
+#
+#   1. duplicated cryptographic code - two implementations of the same
+#      primitives in one artifact;
+#   2. a build-time requirement for CMake and NASM, introduced by
+#      aws-lc-rs's vendored C and assembly, which is likely to break the
+#      cross-based aarch64-unknown-linux-gnu leg of the target matrix;
+#   3. a large vendored-C surface, which sits awkwardly against the
+#      requirement that no C TLS code be linked at any configuration;
+#   4. prefer-post-quantum offers a hybrid X25519MLKEM768 key exchange,
+#      which CHANGES THE BYTES OF THE TLS ClientHello relative to curl 8.x.
+#      The fixture comparison is byte-exact and order-significant, so this
+#      alone places every HTTPS fixture at risk.
+#
+# So `default-features = false` plus an explicit provider is mandatory on
+# all four crates, not a preference. quinn's own `rustls` feature already
+# implies `rustls-ring`, so the provider stays consistent right through
+# quinn-proto and no second provider can slip in transitively.
+#
+# platform-verifier is deliberately omitted from quinn. It would delegate
+# trust decisions to the operating-system store, which conflicts with
+# curl's --cacert, --capath and --insecure semantics remaining
+# authoritative; certificate verification must stay under this
+# implementation's control, on by default, with --insecure the only way to
+# relax it and a stderr warning when it is used.
+#
+# Honest caveat, recorded rather than glossed: neither `ring` nor
+# `aws-lc-rs` is pure Rust - both contain C and assembly. The constraint is
+# satisfied in the sense that matters, which is that no C TLS *library* is
+# linked: rustls implements the TLS state machine, the record layer and
+# certificate verification in Rust, and the provider supplies only
+# primitives. `ring` is chosen as the more portable and more readily
+# cross-compiled of the two, and deny.toml bans aws-lc-rs and aws-lc-sys
+# outright so a transitive dependency cannot reintroduce them.
+
+# --- QUIC and HTTP/3 -------------------------------------------------------
+#
+# Replaces lib/vquic/ (ngtcp2 and nghttp3; quiche is dropped). HTTP/3 is
+# already a connection filter in the C design - Curl_cft_http3 in
+# lib/vquic/vquic.h:48 - so it composes into the same filter chain as TLS
+# and raw sockets rather than needing a parallel abstraction.
+quinn = { version = "=0.11.9", default-features = false, features = ["ring", "runtime-tokio", "rustls", "log"] }
+h3 = "=0.0.8"
+h3-quinn = "=0.0.10"
+
+# --- TLS - rustls exclusively ---------------------------------------------
+#
+# Replaces the whole of lib/vtls/ except its rustls backend, which is kept
+# as a reference: lib/vtls/rustls.c already maps curl's TLS semantics onto
+# rustls concepts, and that mapping is followed rather than reinvented.
+# openssl.c, gtls.c, mbedtls.c, wolfssl.c, schannel.c and apple.c have no
+# successor at any configuration; deny.toml bans openssl, openssl-sys,
+# native-tls and schannel so none can return by the back door.
+#
+# webpki-roots and rustls-native-certs are both declared and are not
+# alternatives: the bundled anchors back the embedded CA bundle path, while
+# the platform store backs --ca-native. Selecting between them is a runtime
+# decision driven by curl's own options, never a build-time one.
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "=1.15.1"
+# PEM parsing for --cacert, --cert and --key.
+#
+# Advisory disclosure: RUSTSEC-2025-0134 marks rustls-pemfile 2.2.0
+# UNMAINTAINED - the repository was archived in August 2025. It is an
+# unmaintained notice, not a vulnerability, and no upgrade exists to move
+# to. The upstream recommendation is to use the PEM code that moved into
+# rustls-pki-types (>= 1.9, so the 1.15.1 pinned directly above already has
+# it) through its PemObject trait, of which rustls-pemfile 2.2.0 is now only
+# a thin wrapper. The crate stays declared because the inventory is a
+# specification mandate; the TLS module should prefer
+# rustls_pki_types::pem::PemObject, at which point this line can simply be
+# deleted with no functional change.
+rustls-pemfile = "=2.2.0"
+webpki-roots = "=1.0.9"
+rustls-native-certs = "=0.8.4"
+
+# --- SSH: SFTP and SCP ----------------------------------------------------
+#
+# Replaces lib/vssh/libssh2.c and lib/vssh/vssh.c; lib/vssh/libssh.c is
+# dropped.
+#
+# DEVIATION, recorded deliberately: the specification names russh 0.54.6.
+# That version cannot be used, and the reason is external to this
+# repository. russh 0.54.6 added a NON-OPTIONAL dependency on
+# libcrux-ml-kem ^0.0.3, and libcrux-ml-kem 0.0.3 is YANKED on crates.io.
+# A `^0.0.3` requirement on a 0.0.x version admits nothing but 0.0.3
+# exactly, so there is no unyanked candidate: resolution fails, and even if
+# it were forced through, deny.toml sets `yanked = "deny"`, so the
+# supply-chain gate would reject the lockfile.
+#
+# 0.54.5 is the immediately preceding release and the minimal correction.
+# It has no libcrux-ml-kem dependency at all, is not yanked, declares
+# rust-version 1.75, and satisfies every requirement pairing the
+# specification documents for 0.54.6 identically (aes ^0.8, digest ^0.10,
+# hmac ^0.12, rand ^0.8, sha1 ^0.10.5, sha2 ^0.10.6, des ^0.8.1, rsa ^0.9,
+# tokio ^1.17.0). Every stated reason for choosing the 0.54 line over
+# 0.58+ - a fully stable dependency graph with no pre-release requirements,
+# and coherence on digest 0.10 - holds unchanged. Moving forward instead is
+# not available: russh 0.55.0 needs libcrux-ml-kem ^0.0.4 and raises its
+# MSRV to 1.85.
+#
+# default-features = false is mandatory here for the same reason as for
+# rustls: russh's defaults are ["flate2", "aws-lc-rs", "rsa"], so accepting
+# them would pull aws-lc-rs into the graph and defeat the single-provider
+# decision above. The three features restored are the two that were default
+# and wanted (rsa for RSA host and user keys, flate2 for the SSH
+# compression the transport negotiates) plus ring in place of aws-lc-rs.
+# Additional cipher features (des for 3des-cbc, dsa) are additive and can be
+# added here if fixture parity for a legacy algorithm ever demands them.
+#
+# OPEN SECURITY ADVISORIES ON THIS PIN - disclosed rather than muted,
+# because silently accepting a defect that CI would otherwise report is the
+# worst of the available options:
+#
+#   RUSTSEC-2026-0154  russh 0.54.5, "Unbounded 32-bit allocation",
+#                      CVSS 7.5 (high). Fixed in >= 0.60.3.
+#   RUSTSEC-2026-0153  russh-cryptovec 0.52.0, "Unchecked CryptoVec
+#                      allocation and growth handling", CVSS 7.5 (high).
+#                      Fixed in >= 0.60.3.
+#
+# The prescribed fix cannot be taken without breaking constraints that rank
+# above it, and the whole 0.55..=0.62 range was checked one release at a
+# time rather than assumed:
+#   * 0.61.0 and later require digest ^0.11.0-rc.5, which breaks the single
+#     digest 0.10 generation this graph depends on and is banned outright by
+#     deny.toml;
+#   * 0.60.0 through 0.60.3 - the first releases that carry the fix - pull
+#     sixteen release-candidate cryptography crates (rsa 0.10.0-rc,
+#     pkcs1/pkcs5/pkcs8/spki, ecdsa, elliptic-curve, crypto-bigint,
+#     ml-kem 0.3.0-rc.1, curve25519-dalek and ed25519-dalek pre-releases,
+#     p256/p384/p521, aead, aes-gcm), which is precisely the supply chain
+#     this version line was chosen to avoid;
+#   * every release from 0.55.0 up declares MSRV 1.85, and 0.55.0 - the one
+#     release in that range with a stable graph - does not contain the fix
+#     anyway;
+#   * the version inventory itself is a specification mandate, not a
+#     preference this file may re-open.
+#
+# Both findings are HIGH, not CRITICAL, so the stated gate - `cargo audit`
+# with zero critical advisories - still holds; a strict `cargo audit
+# --deny warnings` does not, and `cargo deny check advisories` reports them.
+# That is the intended outcome: this is the same MSRV-versus-crate-set
+# conflict that is already escalated for a decision, surfacing from a third
+# direction, and it needs the version mandate revisited rather than an
+# `ignore` entry added to deny.toml by this file.
+#
+# Impact is bounded and worth stating precisely: both advisories are
+# remote-allocation denial-of-service vectors reachable only by a malicious
+# or compromised SSH server, so they affect sftp:// and scp:// transfers
+# only. Every other scheme, and any build without the `ssh` feature, is
+# unaffected.
+#
+# One more consequence of this pin, so the zero-warnings gate is not
+# misread: russh 0.54.5 trips a future-incompatibility lint of its own
+# (macro-expanded macro_export referred to by an absolute path, rust issue
+# 52234, in its server module, which this client-only use never touches).
+# Registry crates are compiled with --cap-lints allow, so no rustc warning
+# reaches the build; cargo still prints one informational line naming the
+# package. Workspace crates themselves build with zero warnings.
+russh = { version = "=0.54.5", default-features = false, features = ["ring", "rsa", "flate2"] }
+
+# --- Command line ---------------------------------------------------------
+#
+# clap replaces the 282-row aliases[] table of src/tool_getparam.c:80 and
+# must reproduce it 1:1 - names, aliases, argument arity, argument type and
+# default value, including the --no-<flag> negations generated for rows
+# flagged ARG_NO. clap_complete replaces scripts/completion.pl.
+clap = { version = "=4.5.61", features = ["derive", "env", "string", "wrap_help"] }
+clap_complete = "=4.5.67"
+
+# --- Public header generation (build dependency) --------------------------
+#
+# cbindgen generates include/curl/curl.h from curl-rs-ffi, inverting the
+# direction of the C build, where lib/optiontable.pl derived the internal
+# option table FROM the header (lib/Makefile.am:179-180). It is a
+# build-dependency of curl-rs-ffi only and is never linked into
+# libcurl.so.4, which is why deny.toml grants MPL-2.0 to this crate alone.
+#
+# include/curl/typecheck-gcc.h is NOT generated by it: 958 lines of 258
+# curlcheck_ macros are beyond what cbindgen can express, so that header
+# stays hand-maintained and ships verbatim beside the generated one.
+cbindgen = "=0.29.4"
+
+# --- Sockets --------------------------------------------------------------
+#
+# socket2's "all" feature exposes the platform socket options curl sets
+# directly - keepalive parameters, TCP_NODELAY, bind-to-device and the
+# rest - so that lib/cf-socket.c, lib/socketpair.c and
+# lib/curlx/nonblock.c migrate with no hand-written unsafe. What genuinely
+# cannot be expressed safely is confined to curl-rs-lib/src/ffi/sys.rs.
+socket2 = { version = "=0.6.5", features = ["all"] }
+
+# --- URL and encoding -----------------------------------------------------
+#
+# url supports, but does not replace, lib/urlapi.c: curl's parser has
+# documented quirks that the six exported curl_url_* symbols expose, so
+# parsing stays curl's own and this crate is used only where the semantics
+# genuinely coincide. idna replaces libidn2 (lib/idn.c), and
+# percent-encoding backs the escape tables of lib/escape.c.
+url = "=2.5.8"
+idna = "=1.1.0"
+percent-encoding = "=2.3.2"
+form_urlencoded = "=1.2.2"
+
+# --- Cryptographic primitives (one digest generation: 0.10) ---------------
+#
+# Replaces the hand-rolled primitives of lib/md5.c, lib/md4.c,
+# lib/sha256.c, lib/curl_sha512_256.c and lib/hmac.c. des backs the NTLM
+# response computed in lib/curl_ntlm_core.c. All of these must stay on
+# digest 0.10 for their traits to unify.
+#
+# rand is pinned at 0.8.7 rather than advanced specifically because russh
+# requires rand ^0.8; advancing it would split the crate across two
+# incompatible generations inside one graph for no gain. quinn-proto pulls
+# its own rand 0.10 transitively, which is why deny.toml lists rand,
+# rand_core, chacha20 and getrandom as accepted duplicates - that pair is
+# structural and cannot be unified without abandoning a mandated version.
+sha1 = "=0.10.7"
+sha2 = "=0.10.9"
+md-5 = "=0.10.6"
+md4 = "=0.10.2"
+hmac = "=0.12.1"
+des = "=0.8.1"
+rand = "=0.8.7"
+
+# --- Encoding and compression --------------------------------------------
+#
+# base64 is declared without its default features: the default set is
+# ["std", "simd-unsafe"], and `simd-unsafe` opts a dependency into unsafe
+# SIMD intrinsics for a speed-up this project has no use for. Performance
+# is a non-goal, memory safety is the point of the exercise, and base64
+# encoding sits on no hot path, so the feature is declined explicitly
+# rather than inherited silently.
+#
+# flate2 replaces zlib and is likewise pinned to its pure-Rust backend
+# explicitly. rust_backend (miniz_oxide) is the default today, but the
+# crate also offers zlib, zlib-ng, zlib-rs and cloudflare_zlib backends,
+# any of which would reintroduce a C library through a transitive feature
+# request. Inflate output is fully determined by RFC 1951, so decompressed
+# bytes are identical to zlib's.
+#
+# brotli replaces the C brotli library and is pure Rust; its `ffi-api` and
+# `no-stdlib-ffi-binding` features are not defaults and must stay off,
+# since they would add #[no_mangle] C symbols to libcurl.so.4 and break
+# export parity. zstd keeps its defaults, including `legacy`, which
+# matches the legacy-format decoding a distribution libzstd is normally
+# built with - behavioural faithfulness outranks a smaller vendored
+# surface here.
+base64 = { version = "=0.23.0", default-features = false, features = ["std"] }
+hex = "=0.4.3"
+flate2 = { version = "=1.1.9", default-features = false, features = ["rust_backend"] }
+brotli = "=8.0.4"
+zstd = "=0.13.3"
+
+# --- Supporting libraries -------------------------------------------------
+#
+# publicsuffix replaces libpsl (lib/psl.c) and supplies ONLY the
+# domain-matching rules libpsl supplied. Its features mirror what libpsl's
+# cookie-domain check actually does: `punycode` for IDN domains, `anycase`
+# because DNS labels compare case-insensitively, and `std` for file-backed
+# list loading.
+#
+# Deliberate omission: no cookie-store crate is used. curl's Netscape
+# cookie-jar file must remain byte-compatible, so that a jar written by
+# curl 8.x is readable by this implementation and vice versa, and no
+# general-purpose crate commits to that on-disk format. The jar is
+# implemented natively in curl-rs-lib/src/cookies/mod.rs.
+#
+# thiserror sits behind the pinned CURLcode mapping, never in front of it:
+# the public error integers are declared explicitly in curl-rs-ffi and are
+# never derived from Rust variant ordering.
+#
+# libc supplies types for the confined FFI island only
+# (curl-rs-lib/src/ffi/, curl-rs-ffi/src/ffi/) and is not a general-purpose
+# escape hatch. log is the facade the TLS and QUIC crates already log
+# through; tracing backs curl's own --trace output.
+publicsuffix = { version = "=2.3.0", features = ["anycase", "punycode", "std"] }
+thiserror = "=2.0.19"
+libc = "=0.2.189"
+log = "=0.4.33"
+tracing = "=0.1.44"
+# Byte scanning for header and chunked-framing parsing (lib/curl_memrchr.c).
+memchr = "=2.8.3"
+# Content-type inference for -F uploads (src/tool_formparse.c).
+mime_guess = "=2.0.5"
+# Development dependency only; used by the integration tests.
+tempfile = "=3.27.0"
+
+# ---------------------------------------------------------------------------
+# Capability vocabulary - the replacement for curl's preprocessor
+# configuration, fixed here so a capability cannot mean one thing in one
+# crate and something else in another.
+# ---------------------------------------------------------------------------
+#
+# Cargo has no [workspace.features] table, so the member manifests declare
+# the matching [features] tables themselves. What is authoritative here is
+# the VOCABULARY and the default-on / default-off state; a member may not
+# invent a name outside this list, rename one, or flip a default.
+#
+# Default ON (twelve):
+#   http2        HTTP/2 over ALPN            (lib/http2.c)
+#   http3        HTTP/3 over QUIC            (lib/vquic/)
+#   ftp          FTP and FTPS                (lib/ftp.c)
+#   ssh          SFTP and SCP                (lib/vssh/)
+#   websockets   the four curl_ws_* symbols  (lib/ws.c)
+#   cookies      cookie engine and jar       (lib/cookie.c)
+#   hsts         HSTS cache                  (lib/hsts.c)
+#   altsvc       Alt-Svc cache               (lib/altsvc.c)
+#   doh          DNS-over-HTTPS              (lib/doh.c)
+#   brotli       Content-Encoding: br        (lib/content_encoding.c)
+#   zstd         Content-Encoding: zstd      (lib/content_encoding.c)
+#   gzip         Content-Encoding: gzip      (lib/content_encoding.c)
+#
+# Default OFF (three), each for a stated reason:
+#
+#   negotiate     GSS-API Negotiate/SPNEGO (lib/vauth/krb5_gssapi.c,
+#                 spnego_gssapi.c, lib/http_negotiate.c). GSS-API is an
+#                 authentication mechanism, not a TLS library, so it does
+#                 not contradict "rustls exclusively" - but keeping it
+#                 non-default is what makes the statement "the default
+#                 build links no C security library at all" true. The
+#                 binding is confined to curl-rs-lib/src/ffi/gss.rs.
+#
+#   hickory-dns   The system resolver is the default, with hickory-dns as
+#                 an optional feature that is disabled by default. It is
+#                 deliberately absent from [workspace.dependencies] above:
+#                 whichever member gates on it declares it there as
+#                 `optional = true`, so that a default build neither
+#                 downloads nor compiles it, and it must not be pinned to a
+#                 version that raises the workspace MSRV.
+#
+#   memdebug      A counting GlobalAlloc reproducing the log format of
+#                 lib/memdebug.c (MEM <src>:<line> malloc(<n>) = <ptr> and
+#                 its calloc/strdup/realloc/free siblings, plus the LIMIT,
+#                 FD, FILE and ADDR records that tests/memanalyzer.pm
+#                 parses). It is needed only if the decision to withhold
+#                 the "Debug" feature from the version banner is reversed,
+#                 because the harness gates every allocation-cap and
+#                 leak check on that banner token. Off by default keeps
+#                 those 28 <limits> fixtures inert rather than failing.
+#
+# This vocabulary replaces 101 measured configure.ac knobs (57
+# AC_ARG_ENABLE plus 44 AC_ARG_WITH) - among them alt-svc, brotli, cookies,
+# doh, ftp, http, hsts, nghttp2, ngtcp2, nghttp3, libssh2, ntlm,
+# negotiate-auth, websockets, zlib and zstd - of which roughly ninety
+# select a capability and the remainder configure build plumbing that Cargo
+# handles natively.
+#
+# More precisely, the three separate jobs that `#include "curl_setup.h"`
+# performed in nearly every C translation unit now separate cleanly:
+#   feature selection    -> Cargo [features], resolved when the build graph
+#                           is constructed rather than by the preprocessor
+#   platform detection   -> #[cfg(target_os = ...)] / #[cfg(target_arch = ...)]
+#   shared declarations  -> ordinary `use` statements against the module
+#                           that owns each type
+#
+# Advertising a capability that is not implemented is worse than omitting
+# one: the test harness parses the Features: and Protocols: lines of
+# `curl --version` to decide which fixtures to run, so under-reporting
+# skips cleanly while over-reporting converts a skip into a hard failure.
+# curl-rs-lib/src/version.rs must report exactly the features enabled here.
+[workspace.metadata.curl-rs]
+# Parity anchors, each measured from the C tree rather than assumed, so the
+# ABI workflow and the version banner have one place to read them from.
+libcurl-version = "8.19.0-DEV"          # include/curl/curlver.h:35
+libcurl-version-num = "0x081300"        # include/curl/curlver.h:61
+libtool-version-info = "12:0:8"         # lib/Makefile.soname
+soname = "libcurl.so.4"                 # derived from the line above
+exported-symbols = 100                  # lib/libcurl.def, counted
+curlcode-discriminants = 103            # include/curl/curl.h, CURL_LAST = 102
+
+[workspace.metadata.curl-rs.features]
+default = [
+  "http2",
+  "http3",
+  "ftp",
+  "ssh",
+  "websockets",
+  "cookies",
+  "hsts",
+  "altsvc",
+  "doh",
+  "brotli",
+  "zstd",
+  "gzip",
+]
+optional = [
+  "negotiate",
+  "hickory-dns",
+  "memdebug",
+]
+
+# Continuous-integration tooling. These are installed by the workflows with
+# `cargo install --locked --version <v>`; they are NOT dependencies of any
+# crate and must never appear in [workspace.dependencies]. Pinned here so
+# that rust-coverage.yml, rust-audit.yml and rust-build.yml install exactly
+# these versions rather than whatever is newest on the day they run.
+[workspace.metadata.curl-rs.ci-tools]
+cargo-llvm-cov = "0.8.7"                # >= 80% on protocols/ and transfer/
+cargo-audit = "0.22.2"                  # zero critical advisories
+cargo-deny = "0.20.2"                   # licence and duplicate-version policy
+cross = "0.2.5"                         # aarch64-unknown-linux-gnu leg
+
+# ---------------------------------------------------------------------------
+# Build profiles - deliberately conservative.
+# ---------------------------------------------------------------------------
+#
+# Performance is an explicit non-goal of this work: no latency target and no
+# throughput requirement exists anywhere in the requirements, and a change
+# justified solely by speed is out of scope. So there is no `lto = "fat"`,
+# no `codegen-units = 1` and no opt-level tuning here. `lto = false` is
+# written out only to say that the omission is a decision rather than an
+# oversight.
+[profile.release]
+lto = false
+
+# panic = "abort" is PROHIBITED, and this is a correctness requirement
+# rather than a style preference. curl-rs-ffi is reached from C, and
+# unwinding across the C ABI boundary is undefined behaviour, so every
+# extern "C" entry point contains the unwind with catch_unwind and converts
+# it into the CURLcode a C caller expects. Aborting instead would kill the
+# host process - an application that embeds libcurl would die because one
+# transfer hit a bug, which is behaviour curl 8.x never exhibits. The
+# setting is stated explicitly so it cannot be flipped by inheritance.
+panic = "unwind"
+
+# Line tables in release builds. This costs nothing observable and is what
+# makes the AddressSanitizer gate produce symbolised stacks instead of raw
+# addresses; strip is pinned to "none" for the same reason, because Cargo
+# strips release debuginfo by default.
+debug = 1
+strip = "none"
+
+# Integer overflow panics in release exactly as it already does in dev.
+# This is a safety choice, not a performance one: it keeps the release
+# binary - the one the fixture suite actually drives - behaving like the
+# binary the unit tests exercise, so an arithmetic defect in a length or
+# offset calculation cannot silently wrap on the wire only in release.
+# Code that intends wrapping arithmetic says so with the wrapping_* methods
+# and is unaffected.
+overflow-checks = true
+
+# [profile.dev], [profile.test] and [profile.bench] keep their Cargo
+# defaults on purpose: dev already enables debug-assertions and
+# overflow-checks, and test and bench inherit from dev and release
+# respectively. Miri and the sanitizer legs pass their own flags on the
+# command line rather than through a bespoke profile, so that what CI
+# measures is the same profile a developer builds.
