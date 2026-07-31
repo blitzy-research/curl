@@ -19,3 +19,8 @@ Example:
 Set the TFTP **BLKSIZE** option (must be 512 or larger). This is the block
 size that curl tries to use when transferring data to or from a TFTP
 server. By default 512 bytes are used.
+
+This build performs no TFTP transfers, so a transfer request for a TFTP URL
+fails with `CURLE_UNSUPPORTED_PROTOCOL` even though curl accepts and parses
+this option. The `Protocols:` line in the --version output does not name the
+scheme.

@@ -18,6 +18,11 @@ Example:
 
 Specify the login options to use during server authentication.
 
+This build implements no IMAP, IMAPS, POP3, POP3S, SMTP, SMTPS, LDAP or LDAPS
+transfers. curl accepts this option and parses its argument, yet the transfer
+itself fails with `CURLE_UNSUPPORTED_PROTOCOL`, and the `Protocols:` line in
+the --version output omits those schemes.
+
 You can use login options to specify protocol specific options that may be
 used during authentication. At present only IMAP, POP3 and SMTP support login
 options. For more information about login options please see RFC 2384,

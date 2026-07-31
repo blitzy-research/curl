@@ -45,6 +45,83 @@ run:
 After a test fails, examine the tests/log directory for stdout, stderr, and
 output from the servers used in the test.
 
+## Testing the specified Rust binary
+
+The harness selects the binary under test through the `runtests.pl` `-c`
+option. Its own help output describes that option as
+`-c path  use this curl executable`. The specified `curl-rs` command-line
+binary substitutes for the C binary through this documented option, so no
+change to the harness is required in order to exercise it.
+
+Two companion options matter while bootstrapping a run. `-vc <path>` selects
+the curl used only to verify that the test servers are up, and `-ac <path>`
+selects the curl used only to talk to continuous-integration test APIs.
+Pointing either of those at a system curl avoids a circular dependency while
+the binary under test is the one being exercised. No Perl module, no mock
+server and no test case is modified in order to run the suite against a
+different binary.
+
+During start-up the harness runs `curl --version` and parses two lines of
+the output. The `Protocols:` line is handed to `parseprotocols`, which
+derives a `-ipv6` and a `-unix` variant of every name it finds and then
+appends `http-proxy` and `https-mtls`. The `Features:` line populates a
+feature map over a fixed vocabulary of names, spelled exactly as the harness
+spells them.
+
+The binary therefore describes itself to the harness, and the harness
+believes it. 874 of the test cases gate on a `<features>` requirement, which
+makes one asymmetry decisive. **Under-reporting a capability makes a fixture
+skip; over-reporting makes it run and fail.** Truthful advertisement is
+therefore the optimal strategy as well as the honest one.
+
+The specified target advertises only the protocols it implements. Those nine
+schemes are `file`, `ftp`, `ftps`, `http`, `https`, `scp`, `sftp`, `ws` and
+`wss`. Every other registered scheme keeps its public protocol constant for
+ABI completeness and returns an unsupported-protocol error, and each is
+withheld from the `Protocols:` line so that the cases requiring it skip
+rather than fail.
+
+The harness sets its own `rustls` feature from a `rustls-ffi` token in the
+libcurl version banner, at `tests/runtests.pl` lines 585-586, rather than
+from the word rustls alone. That branch is also the one branch of the TLS
+detection which leaves the `SSLpinning` feature unset. The specified target
+uses rustls as a native library rather than through its C FFI layer, so a
+truthful banner does not match that token and the cases gated on the harness
+`rustls` feature skip. The resolution is deliberate: truthful product
+identification is preferred over emitting a token that would describe the
+implementation incorrectly, and the resulting skips are accepted. That
+follows the same asymmetry, under which under-reporting is the safe
+direction.
+
+## What "the suite passes" means
+
+The corpus under `tests/data` comprises 1,914 cases, and the honest way to
+describe a run is to account for which of them are eligible.
+
+- 1,476 cases contain a byte-exact `<protocol>` expectation. The comparison
+  is a full-string comparison, so header order, casing and spacing all
+  matter: `sub compareparts` in `tests/getpart.pm` joins each side into a
+  single string before comparing. The `%alternatives[a,b]` construct and the
+  `<strip>` and `<strippart>` rules are the only escapes. The tag itself is
+  documented in [`FILEFORMAT`](FILEFORMAT.md).
+- 874 cases gate on a `<features>` requirement and 28 carry a `<limits>`
+  allocation cap.
+- Approximately 1,413 cases, or 73.8% of the corpus, target the nine
+  implemented schemes: HTTP 1029, FTP 257, SFTP 40, HTTPS 38, FILE 27,
+  SCP 13 and FTPS 9.
+- Approximately 283 cases, or 14.8% of the corpus, target protocols outside
+  the implementation scope and skip legitimately, because those protocols
+  are not advertised: SMTP 91, IMAP 73, POP3 54, MQTT 22, TFTP 18, RTSP 10,
+  GOPHER 6, TELNET 4, SMB 2, DICT 2 and LDAP 1.
+- Withholding the `Debug` token makes a further 98 cases skip, and disables
+  torture mode.
+
+The success criterion is therefore precise: every fixture eligible under the
+honestly advertised feature and protocol set passes unmodified. That result
+must never be summarized as a claim that the whole suite passes, nor as a
+percentage of the suite passing; both statements are inaccurate and are
+prohibited throughout this documentation.
+
 ## Requires to run
 
 - `perl` (and a Unix-style shell)
@@ -74,10 +151,11 @@ be a missing requirement for impacket.
 
 ## Event-based
 
-If curl is built with `Debug` enabled (see below), then the `runtests.pl`
-script offers a `-e` option (or `--test-event`) that makes it perform
-*event-based*. Such tests invokes the curl tool with `--test-event`, a
-debug-only option made for this purpose.
+When the binary under test advertises a `Debug` token in its `Features:`
+line (see below), the `runtests.pl` script offers a `-e` option (or
+`--test-event`) that makes it perform *event-based*. The harness gates this
+on what the binary advertises, not on how it was built. Such tests invokes
+the curl tool with `--test-event`, a debug-only option made for this purpose.
 
 Performing event-based means that the curl tool uses the
 `curl_multi_socket_action()` API call to drive the transfer(s), instead of
@@ -88,14 +166,24 @@ as with the non-event based API.
 To be able to use `--test-event` together with `--parallel`, curl requires
 *libuv* to be present and enabled in the build: `configure --enable-libuv`
 
+The specified default `Rust` target advertises no `Debug` token, so the
+harness does not exercise this mode against it by default. Both
+`configure --enable-libuv` and the debug-only `--test-event` option are
+mechanisms of the retained C build.
+
 ## Duplicated handles
 
-If curl is built with `Debug` enabled (see below), then the `runtests.pl`
-script offers a `--test-duphandle` option. When enabled, curl always
-duplicates the easy handle and does its transfers using the new one instead
-of the original. This is done entirely for testing purpose to verify that
-everything works exactly the same when this is done; confirming that the
-`curl_easy_duphandle()` function duplicates everything that it should.
+When the binary under test advertises a `Debug` token in its `Features:`
+line (see below), the `runtests.pl` script offers a `--test-duphandle`
+option. Here too the gate is what the binary advertises rather than how it
+was built. When enabled, curl always duplicates the easy handle and does its
+transfers using the new one instead of the original. This is done entirely
+for testing purpose to verify that everything works exactly the same when
+this is done; confirming that the `curl_easy_duphandle()` function duplicates
+everything that it should.
+
+The specified default `Rust` target advertises no `Debug` token, so the
+harness does not exercise this mode against it by default either.
 
 ### Port numbers used by test servers
 
@@ -130,9 +218,12 @@ There is a test DNS server to allow tests to resolve hostnames to verify
 those code paths. This server is started like all the other servers within
 the `<servers>` section.
 
-To make a curl build actually use the test DNS server requires a debug
-build. When such a test runs, the environment variable `CURL_DNS_SERVER` is
-set to identify the IP address and port number of the DNS server to use.
+When such a test runs, the harness sets the environment variable
+`CURL_DNS_SERVER` to identify the IP address and port number of the DNS
+server to use. Honoring that variable is a property of the binary under test
+rather than of a build flag.
+
+In the retained C build, two paths lead there:
 
 - curl built to use c-ares for resolving automatically asks that server for
   host information
@@ -147,8 +238,20 @@ set to identify the IP address and port number of the DNS server to use.
 curl that is built to support a custom DNS server in a test gets the
 `override-dns` feature set.
 
-When curl ask for HTTPS-RR, c-ares is always used and in debug builds such
-asks respects the dns server environment variable as well.
+In the retained C build, HTTPS resource-record lookups go through the c-ares
+path, and in a debug build such lookups respect the DNS server environment
+variable as well.
+
+The specified target does not use c-ares at all: c-ares is dropped, and
+`lib/asyn-ares.c` is not migrated. The specified target uses the system
+resolver by default, with the `hickory-dns` `crate` specified as an optional
+resolver behind a `Cargo` feature that is off by default. HTTPS
+resource-record handling and DNS-over-HTTPS are specified as the target
+modules `curl-rs-lib/src/dns/httpsrr.rs` and `curl-rs-lib/src/dns/doh.rs`,
+neither of which is a current file. The retained C build implements resolver
+timeouts with `alarm()` together with `sigsetjmp` and `siglongjmp`; the
+specified target replaces that construct with `tokio::time::timeout`, and the
+threaded-resolver abstraction is subsumed by the `async` runtime.
 
 The test DNS server only has a few limited responses. When asked for
 
@@ -174,21 +277,52 @@ script.
 
 ### Memory test
 
-The test script checks that all allocated memory is freed properly IF curl
-has been built with the `DEBUGBUILD` define set. The script automatically
-detects if that is the case, and it uses the `memanalyze.pl` script to
-analyze the memory debugging output.
+The test script checks that all allocated memory is freed properly, but it
+only does so when the binary under test advertises a `Debug` token in its
+`Features:` line. From that line `tests/runtests.pl` sets
+`$feature{"TrackMemory"} = $feat =~ /Debug/i;` and
+`$feature{"Debug"} = $feat =~ /Debug/i;`, and the entire memory-checking
+block is wrapped in `if($feature{"TrackMemory"})`. When the token is absent,
+both the leak check and the allocation-cap check are skipped, and a missing
+memory-dump file records only a marker rather than a failure.
+
+The allocation figures in a `<limits>` block are caps rather than equality
+checks. The harness defaults to 1000 allocations and one million bytes when
+a case omits the block, and then compares with a greater-than test, so an
+allocation count that differs without being larger passes. `tests/data/test1`
+is the canonical example, specifying an allocation count and a maximum
+allocated size.
+
+Torture mode, reached through the `runtests.pl` `-t` option and through
+`make torture-test`, hard-requires the advertised memory-tracking feature:
+without it the harness stops with an error rather than degrading. Torture
+mode runs each test many times and makes each different memory allocation
+fail on each successive run. This tests the out of memory error handling code
+to ensure that memory leaks do not occur even in those situations.
+
+The specified default `Rust` target advertises no `Debug` token. The 28 cases
+that carry a `<limits>` allocation cap are therefore inert, the 98 cases that
+require `Debug` skip, and `make torture-test` is not applicable to the
+specified target. A default-off `memdebug` `Cargo` feature is specified,
+rather than present, as the mechanism that could restore this accounting by
+reproducing the log format the harness already parses. That format is fully
+specified by the retained C tree: records of the form
+`MEM <source>:<line> malloc(<size>) = <pointer>`, with parallel forms for
+`calloc`, `strdup`, `wcsdup`, `realloc` and `free`, plus `LIMIT`, `FD`,
+`FILE` and `ADDR` records. `tests/memanalyzer.pm` parses them, and
+`tests/runner.pm` sets the destination through the `CURL_MEMDEBUG`
+environment variable. An individual case can opt out with
+`<command option="no-memdebug">`.
+
+The `DEBUGBUILD` define, the `memanalyze.pl` script that analyzes the memory
+debugging output, and `CPPFLAGS=-DMEMDEBUG_LOG_SYNC`, which helps ensure that
+the memory log file is written even if curl crashes, are all mechanisms of
+the retained C build.
 
 Also, if you run tests on a machine where valgrind is found, the script uses
 valgrind to run the test with (unless you use `-n`) to further verify
-correctness.
-
-The `runtests.pl` `-t` option enables torture testing mode. It runs each
-test many times and makes each different memory allocation fail on each
-successive run. This tests the out of memory error handling code to ensure
-that memory leaks do not occur even in those situations. It can help to
-compile curl with `CPPFLAGS=-DMEMDEBUG_LOG_SYNC` when using this option, to
-ensure that the memory log file is properly written even if curl crashes.
+correctness. Valgrind runs against whichever binary the harness is pointed
+at.
 
 ### Debug
 
@@ -204,9 +338,9 @@ runtests.pl script). They remain in there after a test run.
 
 ### Log Verbosity
 
-A curl build with `--enable-debug` offers more verbose output in the logs.
-This applies not only for test cases, but also when running it standalone
-with `curl -v`. While a curl debug built is
+In the retained C build, `--enable-debug` offers more verbose output in the
+logs. This applies not only for test cases, but also when running it
+standalone with `curl -v`. While a curl debug built is
 ***not suitable for production***, it is often helpful in tracking down
 problems.
 
@@ -227,9 +361,13 @@ case insensitive. Note that these names are implementation internals and
 subject to change.
 
 Some, likely stable names are `tcp`, `ssl`, `http/2`. For a current list,
-one may search the sources for `struct Curl_cftype` definitions and find
-the names there. Also, some filters are only available with certain build
-options, of course.
+one may search the retained C tree for `struct Curl_cftype` definitions and
+find the names there. Also, some filters are only available with certain
+build options, of course.
+
+The specified target expresses the same connection filter chain as a `Rust`
+trait carrying a typed context, in the specified module
+`curl-rs-lib/src/conn/filters.rs`.
 
 ### Test input files
 
@@ -240,6 +378,8 @@ See [`FILEFORMAT`](FILEFORMAT.md) for a description of the test case file
 format.
 
 ### Code coverage
+
+The instrumentation described next belongs to the retained C build.
 
 gcc provides a tool that can determine the code coverage figures for the
 test suite. To use it, configure curl with `CFLAGS='-fprofile-arcs
@@ -256,6 +396,13 @@ coverage reports on \*nix hosts:
 
 The text mode tool `gcov` may also be used, but it does not handle object
 files in more than one directory correctly.
+
+Coverage for the specified `Rust` `workspace` is measured with
+`cargo llvm-cov`. The acceptance gate is a minimum of 80% line coverage on
+the two specified module trees `curl-rs-lib/src/protocols/` and
+`curl-rs-lib/src/transfer/`. That figure is a threshold the specified target
+has to meet, not a measured result. The memory test section above explains
+why `make torture-test` is not applicable to the specified default target.
 
 ### Remote testing
 
@@ -301,15 +448,34 @@ etc.
 The libcurl tests are identical to the curl ones, except that they use a
 specific and dedicated custom-built program to run instead of "curl". This
 tool is built from source code placed in `tests/libtest` and if you want to
-make a new libcurl test that is where you add your code.
+make a new libcurl test that is where you add your code. `tests/libtest`
+holds 235 such test programs, built from its `lib*.c` sources.
 
 ### unit tests
 
 Unit tests are placed in `tests/unit`. There is a tests/unit/README
 describing the specific set of checks and macros that may be used when
 writing tests that verify behaviors of specific individual functions.
+`tests/unit` holds 59 test programs.
 
-The unit tests depend on curl being built with debug enabled.
+In the retained C build, the unit tests depend on curl being built with debug
+enabled.
+
+Both `tests/libtest` and `tests/unit` hold C programs that link against a
+static libcurl and call internal `Curl_*` symbols. In the specified `Rust`
+implementation those internal items are crate-private, and they are genuinely
+absent from the static library's symbol table rather than merely hidden, so
+these programs cannot link unmodified, and no quality of implementation
+changes that. Their assertions are relocated into the specified `Rust`
+`crates` as `#[cfg(test)]` modules, or behind a specified `testing` `Cargo`
+feature, which preserves the coverage without preserving the linkage.
+Exporting internal symbols solely to satisfy these programs is explicitly
+rejected, because it would defeat the encapsulation that the safety
+guarantees depend on.
+
+This deviation is strictly separate from `tests/data`. That case corpus
+drives only the command-line binary through documented flags, so those cases
+do pass unmodified.
 
 ### test bundles
 
@@ -320,3 +486,47 @@ In these executables, the build process automatically renames the entry point
 to a unique symbol. `test` becomes `test_<tool>`, e.g. `test_lib1598` or
 `test_unit1305`. For servers `main` becomes `main_sws` for the `sws` server,
 and so on. Other common symbols may also be suffixed the same way.
+
+## Acceptance gates for the specified Rust target
+
+The test infrastructure itself is retained. The C mock protocol servers under
+`tests/server/` remain C and remain in use, `tests/certs/` remains the
+certificate and key corpus, and the Perl harness modules are retained
+unmodified.
+
+The specified target uses rustls as its sole TLS implementation, at every
+configuration. Certificate validation is on by default, a self-signed
+certificate has to be rejected by default, and `--insecure` has to emit a
+warning on stderr before proceeding. Both of those behaviors are covered by
+dedicated integration tests specified under `tests-rs/integration/`, a
+specified location that is not part of this checkout.
+
+The items below are acceptance criteria that the specified target has to
+satisfy. They are criteria, never results, and `docs/CODE_REVIEW.md` owns
+their full treatment.
+
+- A zero-warning release build of the whole `workspace` on four targets:
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `x86_64-apple-darwin` and `aarch64-apple-darwin`.
+- `cargo clippy` across the `workspace` with warnings promoted to errors.
+- The full `cargo test` run across the `workspace`.
+- Every eligible case of the retained corpus passing unmodified, per the
+  accounting given earlier on this page.
+- `Miri` over `curl-rs-lib` with no undefined behavior.
+- `ASan` with no errors across the FFI surface.
+- Exported-symbol parity against the retained authority `lib/libcurl.def`,
+  which lists exactly 100 names.
+- A minimum of 80% line coverage on `curl-rs-lib/src/protocols/` and
+  `curl-rs-lib/src/transfer/`.
+- A dependency-advisory scan with no critical findings.
+- All 129 standalone programs under `docs/examples/` compiling unchanged
+  against the generated public header, as an additional ABI gate. Those
+  programs are compiled and never edited.
+
+Three documentation gates have scopes that are easy to confuse.
+`.github/scripts/verify-synopsis.pl` checks the synopses in
+`docs/libcurl/curl*.md` against the public headers.
+`.github/scripts/verify-examples.pl` compiles the examples embedded in
+`docs/libcurl/curl*.md` and in `docs/libcurl/opts/*.md`. The 129 standalone
+`docs/examples/*.c` files are compiled separately by the build system and
+remain untouched.

@@ -2,116 +2,946 @@
 #
 # SPDX-License-Identifier: curl
 
-# cargo-deny configuration backing the supply-chain gate:
-#   cargo deny --all-features check
-#   cargo audit --deny warnings
+# cargo-deny policy for the curl Rust workspace: curl-rs-lib, curl-rs, curl-rs-ffi.
 #
-# The allow-list below was derived from the licences actually present in the
-# pinned dependency graph; nothing is allowed speculatively.
+# This file is the supply-chain gate. It answers four questions about the
+# dependency graph that Cargo.lock resolves, and it answers them the same way on
+# a contributor's machine and in continuous integration:
+#
+#   advisories  is any crate we ship subject to a published security advisory,
+#               yanked, or unmaintained?
+#   licenses    is every crate's licence one we may redistribute inside an
+#               MIT-like artifact?
+#   bans        has a superseded C library, a second cryptographic provider or a
+#               duplicate crate version re-entered the graph?
+#   sources     did every crate come from crates.io, and nothing from a git
+#               remote or a private registry?
+#
+# Run it exactly as .github/workflows/rust-audit.yml does:
+#
+#   cargo deny check                 # all four checks
+#   cargo deny check advisories      # one check at a time when triaging
+#
+# The pinned tool version is cargo-deny 0.20.2, recorded in Cargo.toml under
+# [workspace.metadata.curl-rs.ci-tools]. Every key below was verified against
+# that exact version by running it, not by reading documentation: the schema
+# moves between releases, and two of the keys that older guides recommend are
+# now hard errors. Where a 0.20.2-specific detail is load-bearing it is called
+# out in a comment at the point of use.
+#
+# Two conventions hold throughout, because a policy file that cannot be audited
+# is not a policy:
+#
+#   1. Nothing is allowed, skipped or ignored speculatively. Every entry below
+#      corresponds to something measured in this workspace's own graph, and the
+#      comment records the crate, the version and the evidence.
+#   2. Every relaxation names the requirement that forces it and the condition
+#      that would let it be removed. There are five relaxations in this file -
+#      four advisory ignores and seven duplicate skips - and each is annotated.
+
+# ---------------------------------------------------------------------------
+# [graph] - which crates the checks are performed against
+# ---------------------------------------------------------------------------
 
 [graph]
+
+# The four mandated compilation targets, in the same order as
+# rust-toolchain.toml's `targets`, so the supply-chain gate audits precisely the
+# set that is built and no more.
+#
+# All four are 64-bit, and that is load-bearing rather than incidental. The FFI
+# shim carries a curl_off_t through a single register-width slot in the varargs
+# setters, which is only sound where off_t fits a register. 32-bit support is
+# therefore a deliberate forfeit and must not be claimed; no 32-bit triple
+# belongs in this list.
+#
+# Naming the targets - rather than leaving the list empty and auditing the host
+# only - has two measured consequences that matter:
+#
+#   * It prunes crates that are unreachable on all four. The full,
+#     all-platform graph contains 22 crate names at more than one version; 15
+#     of those are the windows-* family, and every one of them disappears under
+#     this filter. Without it, the duplicate check would report fifteen
+#     duplicates that no build of this workspace can ever contain.
+#   * It is what keeps the `schannel` ban below inert. schannel 0.1.29 is
+#     reachable in the all-platform graph through rustls-native-certs under
+#     cfg(windows). It is reachable on none of these four triples, so the ban
+#     documents the policy without ever firing.
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
   "x86_64-apple-darwin",
   "aarch64-apple-darwin",
 ]
-all-features = false
+
+# Audit the union of every feature, not just the default set.
+#
+# A vulnerability behind a feature gate is still a vulnerability: it ships to
+# whoever turns the feature on, and it is discovered at that moment rather than
+# in continuous integration. Three features are declared but off by default -
+# `negotiate`, `hickory-dns` and `memdebug` - and all three are dependency-free
+# today, so this setting changes nothing about the graph as it currently
+# resolves. That is precisely why it is set now: it is what audits them
+# automatically the moment `negotiate` gains its GSS-API binding or
+# `hickory-dns` gains a resolver crate, instead of leaving a gap that has to be
+# noticed by a human.
+#
+# Chosen over the alternative of an explicit `features = [...]` list, which
+# would have to be edited by hand every time a feature is added and would
+# silently under-audit until somebody remembered.
+#
+# Two caveats worth knowing, both verified here. This flag cannot be toggled
+# off once set to true - `--all-features` on the command line is the way to
+# enable it conditionally, not the way to disable it - and it applies only to
+# the workspace members' own features. Transitive dependency features are
+# unaffected: rustls still resolves to exactly [log, logging, ring, std, tls12]
+# under this setting, which is what the [[bans.features]] section relies on.
+all-features = true
+
+# Default features stay enabled on top of the above. Setting this to true would
+# audit a configuration nobody builds or ships.
 no-default-features = false
 
+# ---------------------------------------------------------------------------
+# [output] - diagnostic rendering only; no policy lives here
+# ---------------------------------------------------------------------------
+
 [output]
+
+# The cargo-deny default, written out so that a future reader knows the value
+# was considered rather than inherited. It controls how deep feature edges are
+# followed when a diagnostic prints an inclusion graph. Raising it makes the
+# duplicate-version graphs for the rand family below considerably more verbose
+# without adding information that the annotations here do not already give.
 feature-depth = 1
 
+# ---------------------------------------------------------------------------
+# [advisories] - the RustSec gate
+# ---------------------------------------------------------------------------
+#
+# This section implements the security gate the project is held to: zero
+# critical advisories in the shipped dependency graph. `cargo audit` enforces
+# the same corpus from the other direction; both run in continuous integration
+# so that a new advisory published against a crate we already ship fails the
+# build rather than waiting to be noticed.
+
 [advisories]
+
+# Schema version 2. Under v2 every vulnerability advisory is an error and the
+# `vulnerability` lint level no longer exists, which is the strictest posture
+# available and the one this file keeps.
+#
+# There is deliberately no `severity-threshold` here, and it is worth recording
+# why rather than leaving its absence ambiguous: the key was REMOVED in this
+# line of cargo-deny and is now a hard configuration error
+# (see EmbarkStudios/cargo-deny#611). Setting it to "critical" would have
+# expressed the gate literally, but it would also have silenced every future
+# high-severity advisory invisibly, which is a worse policy than the one below.
+# Documented `ignore` entries are therefore the only honest mechanism for an
+# advisory that a mandated version pin forces us to carry.
 version = 2
+
+# A yanked crate in a COMMITTED lockfile is a reproducibility hazard, not a
+# matter of taste. Cargo.lock is committed precisely so that every contributor
+# and every continuous-integration leg resolve the same graph, and a yanked
+# version can stop being fetchable at any time. Denying it means the lockfile is
+# repaired when the yank happens rather than when a fresh checkout fails.
 yanked = "deny"
-ignore = []
+
+# Report unmaintained crates anywhere in the graph, not just among direct
+# dependencies.
+#
+# The documented middle option is "workspace", which limits the check to crates
+# the workspace depends on directly. That was measured against this graph and
+# rejected: "all" - the strictest scope, covering all 328 resolved packages -
+# already passes with zero findings, so the weaker scope would buy nothing today
+# and would hide an unmaintained transitive crate tomorrow. A transitive
+# dependency that stops being maintained is exactly as unfixable as a direct one
+# and usually harder to notice.
+unmaintained = "all"
+
+# Accepted risks. Read this list as a liability register, not as configuration.
+#
+# RULES, and they are not negotiable:
+#
+#   * Every entry carries the advisory ID, the date it was accepted, the
+#     measured CVSS vector and severity, the requirement that forces the
+#     vulnerable version to stay, and the condition that would let the entry be
+#     deleted. An entry without all five is not a justified risk, it is a
+#     silenced alarm.
+#   * A CRITICAL advisory may NEVER appear here. The gate is zero critical
+#     advisories; an ignore entry cannot be used to satisfy it, because doing so
+#     would make the gate measure the configuration instead of the graph. A
+#     critical advisory is fixed, or the dependency is dropped.
+#   * The list is reviewed whenever Cargo.lock changes. cargo-deny still emits a
+#     note for every ignored advisory, so nothing here is invisible.
+#
+# The ideal state for this list is empty, and it started empty. The four entries
+# below were each measured against this workspace's own graph on 2026-07-31, and
+# each is the direct consequence of a version pin the project mandates:
+#
+#   3 x HIGH (CVSS 7.5) + 1 x MEDIUM (CVSS 5.9), and ZERO CRITICAL.
+#
+# All four are denial-of-service or side-channel findings. None is a critical
+# advisory, so the gate is satisfied by the graph itself and not by this list.
+#
+# The supply-chain decision these entries descend from is worth stating plainly,
+# because it explains why three of them cannot simply be upgraded away. The
+# dependency selection deliberately chose russh 0.54.x over the newer 0.58.0 to
+# 0.62.4 releases, because every one of those depends on release-candidate
+# cryptography - rsa 0.10.0-rc.18, ssh-key 0.7.0-rc.11 and pkcs1 0.8.0-rc.4 -
+# and shipping release-candidate cryptography would have put this very gate in
+# permanent jeopardy: a pre-release crate can be re-tagged, yanked or
+# API-broken without notice, and RustSec does not audit release candidates the
+# way it audits stable releases. That trade bought a fully stable graph with no
+# pre-release requirement anywhere, at the cost of the two russh advisories
+# below. It remains the right trade, and it is recorded here so that whoever
+# revisits it can see both sides.
+ignore = [
+  # RUSTSEC-2026-0185 - quinn-proto 0.11.14
+  #   Accepted   2026-07-31
+  #   Severity   CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H = 7.5 HIGH
+  #   Category   denial-of-service (remote memory exhaustion from unbounded
+  #              out-of-order QUIC stream reassembly)
+  #   Aliases    CVE-2026-25800, GHSA-4w2j-m93h-cj5j
+  #   Reached by quinn 0.11.9 -> quinn-proto 0.11.14, behind the `http3` feature
+  #   Fixed in   quinn-proto >= 0.11.15
+  #
+  # This one is solvable in principle and blocked in practice, and the blocker
+  # was measured rather than assumed. quinn 0.11.9 requires quinn-proto
+  # ^0.11.12, so 0.11.15 and 0.11.16 are both admissible resolutions - but
+  # quinn-proto 0.11.14 declares rust-version 1.74.1 while 0.11.15 and 0.11.16
+  # both declare rust-version 1.85. Taking the fix would raise the workspace's
+  # minimum supported Rust version from the mandated 1.75 to 1.85. That is a
+  # decision for whoever set the MSRV, not a change to be made inside a policy
+  # file, and it is the same MSRV-versus-crate-set conflict already escalated
+  # for the workspace as a whole.
+  #
+  # Remove this entry the moment the MSRV floor is raised to 1.85 or above:
+  # `cargo update -p quinn-proto --precise 0.11.16` then delete the line.
+  { id = "RUSTSEC-2026-0185", reason = "quinn-proto 0.11.14, CVSS 7.5 HIGH remote-OOM DoS behind the http3 feature. The fix (quinn-proto >= 0.11.15) declares rust-version 1.85 and would break the mandated MSRV of 1.75; quinn-proto 0.11.14 declares 1.74.1. Raising the MSRV is an escalated decision, not a policy-file change. Remove this entry as soon as the MSRV floor reaches 1.85." },
+
+  # RUSTSEC-2023-0071 - rsa 0.9.10
+  #   Accepted   2026-07-31
+  #   Severity   CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N = 5.9 MEDIUM
+  #   Category   crypto-failure (Marvin Attack: potential key recovery through
+  #              timing side channels)
+  #   Aliases    CVE-2023-49092, GHSA-c38w-74pg-36hr, GHSA-4grx-2x9w-596c
+  #   Reached by russh 0.54.5 -> rsa 0.9.10, behind the `ssh` feature
+  #   Fixed in   nothing. RustSec records "no safe upgrade is available" for the
+  #              entire rsa 0.9 line.
+  #
+  # The only released fix is in the rsa 0.10.0-rc series, which is exactly the
+  # release-candidate cryptography the dependency selection rejected. Accepting
+  # it would trade a documented medium-severity timing side channel for an
+  # unaudited pre-release cryptographic implementation in the SSH path - a
+  # strictly worse position.
+  #
+  # Exposure is narrow and worth stating: the attack requires the ability to
+  # measure decryption timing against a victim's private key. curl's SSH client
+  # role uses RSA to verify a server's host key and to sign with a user key it
+  # already owns; it does not act as an RSA decryption oracle for a remote
+  # party. The advisory is carried because it is real, not because it is
+  # reachable in this configuration.
+  #
+  # Remove this entry when rsa 0.10 ships as a stable release and russh depends
+  # on it from a stable release of its own.
+  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10, CVSS 5.9 MEDIUM Marvin-Attack timing side channel behind the ssh feature. RustSec records no safe upgrade for the whole 0.9 line; the fix exists only in rsa 0.10.0-rc.x, the release-candidate cryptography the dependency selection deliberately rejected. curl's SSH client role is not an RSA decryption oracle. Remove when rsa 0.10 is stable and russh depends on it from a stable release." },
+
+  # RUSTSEC-2026-0154 - russh 0.54.5
+  #   Accepted   2026-07-31
+  #   Severity   CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H = 7.5 HIGH
+  #   Category   denial-of-service (unbounded 32-bit allocation)
+  #   Aliases    CVE-2026-46673, GHSA-g9f8-wqj9-fjw5
+  #   Reached by curl-rs-lib -> russh 0.54.5, behind the `ssh` feature
+  #   Fixed in   russh >= 0.60.3
+  #
+  # Same GHSA as RUSTSEC-2026-0153 below; RustSec files it against both crates
+  # because the vulnerable code moved between them. The fix lands at 0.60.3,
+  # which is inside the 0.58.0-0.62.4 band rejected above for depending on
+  # release-candidate cryptography, so taking it would reintroduce
+  # rsa 0.10.0-rc.18, ssh-key 0.7.0-rc.11 and pkcs1 0.8.0-rc.4.
+  #
+  # The advisory itself records that "no practical remote code execution,
+  # integrity or confidentiality impact has been demonstrated"; the impact is
+  # availability only, and the remote paths were the compression and transport
+  # buffers.
+  #
+  # Remove this entry when a russh release exists that carries the fix AND has a
+  # fully stable dependency graph.
+  { id = "RUSTSEC-2026-0154", reason = "russh 0.54.5, CVSS 7.5 HIGH availability-only DoS behind the ssh feature (same GHSA-g9f8-wqj9-fjw5 as RUSTSEC-2026-0153). The fix requires russh >= 0.60.3, which sits inside the 0.58.0-0.62.4 band rejected for depending on rsa 0.10.0-rc.18, ssh-key 0.7.0-rc.11 and pkcs1 0.8.0-rc.4. Remove when a russh release carries the fix with a fully stable dependency graph." },
+
+  # RUSTSEC-2026-0153 - russh-cryptovec 0.52.0
+  #   Accepted   2026-07-31
+  #   Severity   CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H = 7.5 HIGH
+  #   Category   denial-of-service (unchecked CryptoVec allocation and growth)
+  #   Aliases    CVE-2026-46673, GHSA-g9f8-wqj9-fjw5
+  #   Reached by russh 0.54.5 -> russh-cryptovec 0.52.0, behind the `ssh` feature
+  #   Fixed in   russh-cryptovec as shipped with russh >= 0.60.3
+  #
+  # The other half of GHSA-g9f8-wqj9-fjw5, and it cannot be resolved
+  # independently: russh-cryptovec 0.52.0 is the version russh 0.54.5 requires,
+  # so the two entries stand or fall together for exactly the reason given
+  # above.
+  #
+  # Remove this entry together with RUSTSEC-2026-0154.
+  { id = "RUSTSEC-2026-0153", reason = "russh-cryptovec 0.52.0, CVSS 7.5 HIGH availability-only DoS behind the ssh feature; the other half of GHSA-g9f8-wqj9-fjw5. russh 0.54.5 requires this exact version, so it cannot be resolved independently of RUSTSEC-2026-0154. Remove both entries together." },
+]
+
+# ---------------------------------------------------------------------------
+# [licenses] - what we may redistribute
+# ---------------------------------------------------------------------------
+#
+# curl itself is distributed under the curl licence, an MIT-like permissive
+# licence: see COPYING, LICENSES/curl.txt, and REUSE.toml, which declares
+# SPDX-License-Identifier = "curl" for the package. libcurl.so.4 is linked into
+# closed-source applications every day, and that is the property this section
+# exists to protect. A dependency whose licence is incompatible with that model
+# is a distribution defect, not a paperwork problem.
 
 [licenses]
+
+# Schema version 2. Under v2 the licence expression comes from the crate's
+# `license` field and, failing that, from its licence files; there is no
+# `unlicensed`/`copyleft`/`allow-osi-fsf-free` triage, only the explicit
+# allow-list below. That is the desired behaviour: an allow-list fails closed.
 version = 2
-confidence-threshold = 0.8
+
+# The allow-list, and it is deliberately an allow-list rather than a deny-list.
+#
+# A deny-list admits every licence nobody thought to name; an allow-list admits
+# only what has been examined. The consequence is that a new dependency carrying
+# an unexamined licence fails the gate, which is the point.
+#
+# This list is EMPIRICALLY MINIMAL. It was not guessed and it is not padded: it
+# is the smallest set that satisfies all 328 resolved packages, derived by
+# running `cargo deny list` and `cargo deny check licenses` against the committed
+# Cargo.lock. cargo-deny reports `warning[license-not-encountered]` for any
+# allowance that never matched, so a padded list is detectable - and this one
+# produces no such warning. Every entry below is load-bearing.
+#
+# Each entry names the crates that FORCE it, which means either that they carry
+# that licence alone with no alternative, or that they carry an AND expression in
+# which it is one of the required halves. That distinction matters: an OR
+# alternative can be satisfied some other way, an AND half cannot.
 allow = [
-  "0BSD",
+  # Required with no alternative by pageant 0.1.0, russh 0.54.5,
+  # russh-cryptovec 0.52.0 and russh-util 0.52.0 - the SSH stack is
+  # Apache-2.0-only, not dual-licensed. Also the first half of ring's
+  # "Apache-2.0 AND ISC".
   "Apache-2.0",
-  "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
+
+  # Required with no alternative by subtle 2.6.1, curve25519-dalek 4.1.3,
+  # ed25519-dalek 2.1.1, alloc-no-stdlib 2.0.4 and alloc-stdlib 0.2.4, and it is
+  # the mandatory half of brotli 8.0.4's "BSD-3-Clause AND MIT". Dropping it
+  # would take out both the SSH key exchange and the Brotli decoder.
   "BSD-3-Clause",
+
+  # Required with no alternative by webpki-roots 1.0.9, the bundled trust-anchor
+  # set. CDLA-Permissive-2.0 is a data licence, which is appropriate: the crate
+  # ships root certificates rather than code, and the licence grants
+  # redistribution without imposing conditions on the software that uses it.
   "CDLA-Permissive-2.0",
+
+  # Required with no alternative by rustls-webpki 0.103.13 and untrusted 0.9.0,
+  # and it is the mandatory second half of ring 0.17.14's "Apache-2.0 AND ISC".
+  # This is the TLS certificate-verification path; without ISC there is no
+  # rustls.
   "ISC",
+
+  # The most common licence in the graph, required with no alternative by 34
+  # crates and available as an alternative in most of the rest.
   "MIT",
+
+  # Required with no alternative by 19 crates of the ICU family reached through
+  # idna - icu_collections, icu_locid, icu_locid_transform(_data),
+  # icu_normalizer(_data), icu_properties(_data), icu_provider(_macros),
+  # litemap, tinystr, writeable, yoke(-derive), zerofrom(-derive),
+  # zerovec(-derive) - and it is the mandatory AND half of unicode-ident
+  # 1.0.24's "(MIT OR Apache-2.0) AND Unicode-3.0". This is the
+  # internationalised-domain-name path that replaces libidn2.
   "Unicode-3.0",
-  "Unlicense",
-  "Zlib",
+
+  # The workspace's own three crates: curl-rs-lib, curl-rs and curl-rs-ffi all
+  # declare license = "curl". `curl` is a registered SPDX identifier, so no
+  # clarification or exception is needed for them. They are checked rather than
+  # exempted - see [licenses.private] below.
   "curl",
 ]
 
-# MPL-2.0 is acceptable only for cbindgen, which is a build-time header
-# generator: it is never linked into libcurl.so.4 or the curl-rs binary.
+# Six licences appear in the graph but are deliberately NOT allowed, and the
+# omission is a decision rather than an oversight. Each occurs only as one
+# alternative inside an OR expression that MIT or Apache-2.0 already satisfies,
+# so cargo-deny never needs to select it:
+#
+#   0BSD                            adler2 2.0.1
+#   Unlicense                       byteorder 1.5.0, memchr 2.8.3
+#   Zlib                            lru-slab 0.1.2, miniz_oxide 0.8.9,
+#                                   tinyvec 1.12.0, tinyvec_macros 0.1.1
+#   BSD-2-Clause                    zerocopy 0.8.55, zerocopy-derive 0.8.55
+#   Apache-2.0 WITH LLVM-exception  rustix 1.1.4, linux-raw-sys 0.12.1
+#   BSD-1-Clause                    fiat-crypto 0.2.9
+#
+# Adding them would pass just as cleanly, because cargo-deny picks the first
+# allowed alternative in an OR - which is exactly why a padded list is easy to
+# write and hard to notice. Leaving them out is the stronger policy: a future
+# dependency licensed ONLY under, say, Zlib is then a finding that a human
+# reviews, instead of an acceptance nobody chose.
+#
+# Strong copyleft is NOT allowed and there is deliberately no blanket copyleft
+# allowance anywhere in this section. GPL, AGPL or LGPL in this graph is a
+# finding to be investigated and resolved, because libcurl is distributed under
+# an MIT-like licence and is linked into proprietary software; a strong-copyleft
+# dependency would be incompatible with shipping libcurl.so.4 as this project
+# ships it. One sighting exists and is benign: r-efi 5.3.0 declares
+# "MIT OR Apache-2.0 OR LGPL-2.1-or-later", and because LGPL-2.1-or-later is
+# absent from the list above it can never be the branch cargo-deny selects. If a
+# crate ever appears with LGPL as its ONLY option, this check fails, which is
+# the correct outcome.
+
+# The cargo-deny default, stated explicitly. It governs how closely a crate's
+# licence FILE must match canonical SPDX text when there is no usable `license`
+# field to read.
+#
+# It is neither raised nor lowered because it does not currently matter: all 328
+# resolved packages declare a machine-readable licence expression, none is
+# unlicensed, and no crate in this graph falls back to text detection. Raising it
+# would risk failing on a correctly-licensed crate whose LICENSE file carries an
+# extra copyright line; lowering it would accept a looser match than the default
+# thinks defensible.
+confidence-threshold = 0.8
+
+# Per-crate allowances. One entry, and it is scoped as narrowly as the schema
+# permits.
+#
+# cbindgen 0.29.4 is the only MPL-2.0 crate in the graph. MPL-2.0 is weak,
+# file-level copyleft: its reciprocity attaches to modified MPL-licensed files,
+# not to a work that merely uses the tool. cbindgen is a BUILD dependency of
+# curl-rs-ffi - it generates include/curl/curl.h at build time - so it is never
+# compiled into libcurl.so.4, never compiled into the curl-rs binary, and never
+# distributed as part of either artifact. Its output is a header derived from
+# this project's own Rust declarations, not from cbindgen's source.
+#
+# Written as an `exceptions` entry rather than by adding "MPL-2.0" to `allow`
+# above, and the difference is the whole point: a blanket allowance would admit
+# MPL-2.0 for any future crate, including one that IS linked into the shipped
+# library. This form admits it for cbindgen and nothing else, so a second
+# MPL-2.0 crate fails the gate and gets reviewed on its own merits.
 exceptions = [
-  { name = "cbindgen", allow = ["MPL-2.0"] },
+  { crate = "cbindgen", allow = ["MPL-2.0"] },
 ]
+
+# No [[licenses.clarify]] entries, and their absence is deliberate.
+#
+# A clarify entry overrides cargo-deny's own determination for a crate, keyed to
+# a hash of that crate's licence file. Every crate in this graph resolves
+# cleanly, so any entry here would be speculative - and worse than useless: it
+# would sit in place asserting an answer, and if a future version of that crate
+# changed its licence, the stale hash would make the clarification silently
+# inapplicable and the change would be easy to miss during review.
+#
+# One crate is worth a note precisely because it is the kind that usually needs
+# clarifying, and does not. ring 0.17.14 declares "Apache-2.0 AND ISC" - an
+# unusual combination, and an AND rather than an OR, so both licences are
+# genuinely required and both appear in `allow` above. Older ring releases
+# declared "ISC AND MIT AND OpenSSL", which is the historical reason cargo-deny's
+# own template uses ring as its clarification example; the version pinned here
+# needs no such help.
+#
+# ring's presence deserves one further disclosure, because it bears on the
+# no-C-TLS constraint rather than on licensing. Neither ring nor the alternative
+# aws-lc-rs is pure Rust; both contain C and assembly. The constraint this
+# project actually satisfies is that no C TLS LIBRARY is linked: rustls
+# implements the TLS state machine, the record layer and certificate
+# verification in Rust, and the provider supplies only cryptographic primitives.
+# ring is chosen over aws-lc-rs as the more portable and more readily
+# cross-compiled of the two - see the [[bans.deny]] entry for aws-lc-rs below.
+# This is a disclosed trade, not an oversight, and if "no C or assembly
+# whatsoever" were the requirement then no rustls configuration would satisfy it.
 
 [licenses.private]
+
+# The workspace's own crates are licence-checked like any other. They are not
+# published to any registry, so cargo-deny would happily skip them if this were
+# true - but "curl" is in the allow-list above and the three members declare it
+# correctly, so there is nothing to skip and skipping would only hide a future
+# member that forgot its `license` field.
 ignore = false
 
+# No private registries. The workspace publishes to none and depends on none;
+# see [sources] below, which enforces the same thing from the other direction.
+registries = []
+
+# ---------------------------------------------------------------------------
+# [bans] - where the manifest's design decisions become enforceable
+# ---------------------------------------------------------------------------
+#
+# Cargo.toml states this project's architectural decisions; this section is what
+# stops them from being silently undone. Three invariants matter enough to be
+# machine-checked rather than reviewed:
+#
+#   1. Exactly one cryptographic provider, and it is ring. Accepting the default
+#      features of rustls, tokio-rustls and quinn would link BOTH ring and
+#      aws-lc-rs into one binary.
+#   2. No C library that this rewrite exists to replace may re-enter the graph
+#      through a -sys binding. Rust's dependency resolution makes that easy to do
+#      by accident and almost impossible to notice by reading.
+#   3. One version of every crate. The version selection in Cargo.toml is an
+#      argument about unifying the graph, and an un-enforced argument decays.
+#
+# A note on the version-specification syntax, because getting it wrong produces a
+# ban that silently does nothing. In cargo-deny 0.20.2 a PackageSpec written
+# `crate = "name:<req>"` treats the tail as a version REQUIREMENT, while
+# `crate = "name@<version>"` treats it as an EXACT version. This was verified by
+# experiment rather than assumed: `digest:>=0.10.0` fires against digest 0.10.7,
+# whereas `digest@>=0.10.0` does not fire at all. Every range ban below therefore
+# uses the colon form. (The older `{ name = ..., version = ... }` pair still
+# parses, but mixing `crate` with a separate `version` key is a hard error.)
+
 [bans]
+
+# One version of each crate. AAP names duplicate-version bans explicitly, and the
+# whole version-selection argument in Cargo.toml turns on unifying the graph.
+#
+# Set to "deny" rather than "warn" deliberately. Seven duplicates exist today,
+# every one of them measured and annotated in `skip` below; enumerating them as
+# named exceptions rather than lowering the lint level is what makes an EIGHTH
+# duplicate - the next one, the accidental one - fail the build instead of
+# scrolling past in a log.
 multiple-versions = "deny"
+
+# A `*` version requirement is a policy failure. Every dependency in
+# Cargo.toml is pinned to an exact "=x.y.z", no entry reads "latest" and none is
+# a placeholder; this is what keeps that true.
 wildcards = "deny"
-# The three workspace members depend on each other by path; those are not the
-# unpinned registry wildcards this check exists to catch.
+
+# The three workspace members depend on one another by path. A path dependency
+# has no meaningful version requirement to pin, so Cargo records it as a
+# wildcard - which is not the unpinned registry dependency the check above exists
+# to catch. Without this, the gate would fail on curl-rs-ffi -> curl-rs-lib.
 allow-wildcard-paths = true
+
+# Show both the lowest-version path and the simplest path when a duplicate is
+# reported. Duplicate-version diagnostics are only actionable if they name the
+# crate that forced the split, and "all" is what prints it.
 highlight = "all"
+
+# Default features are a design decision, not a lint target, and they are made
+# explicitly in Cargo.toml: default-features = false plus an exact feature list
+# on rustls, tokio-rustls, quinn and russh, and full defaults elsewhere. Linting
+# them wholesale here would fire on every crate that legitimately uses its
+# defaults. What actually needs enforcing is narrower and is handled precisely by
+# the [[bans.features]] blocks further down.
 workspace-default-features = "allow"
 external-default-features = "allow"
+
+# No allow-list. This is a deny-list policy: crates are permitted unless named
+# below, which is the correct posture for a graph of 328 packages where the
+# licence and advisory checks already gate what may enter.
 allow = []
+
+# Irrelevant while `allow` is empty and there is no deny-by-default posture, but
+# stated so that nobody has to guess whether the omission was intentional.
+allow-workspace = false
+
+# ---------------------------------------------------------------------------
+# Prohibited crates
+# ---------------------------------------------------------------------------
+#
+# EVERY entry below was verified ABSENT from the graph on all four target triples
+# before being written. That check is not ceremony: a ban that fires on a crate
+# the workspace legitimately needs breaks the build for everyone, and is strictly
+# worse than no ban at all. `cargo deny check bans` passes with zero warnings.
+#
+# Five crates are deliberately NOT banned even though a careless reading of the
+# requirements would ban them. They are recorded here because the omissions are
+# decisions, and an unexplained omission invites someone to "fix" it:
+#
+#   zstd-sys              PRESENT on all four targets, and required. zstd 0.13.3
+#                         -> zstd-safe 7.2.4 -> zstd-sys 2.0.16+zstd.1.5.7. The
+#                         `zstd` crate is a binding to the C libzstd with
+#                         vendored sources, not a pure-Rust decoder, and it has
+#                         no pure-Rust path to select: its resolved features are
+#                         [arrays, default, legacy, zdict_builder]. Banning it
+#                         would mean dropping Zstandard support altogether. It
+#                         does not breach the no-C-TLS constraint, which is about
+#                         TLS libraries. Recorded as a finding: unlike zlib and
+#                         Brotli - replaced by flate2 with the `rust_backend`
+#                         feature and by the pure-Rust `brotli` crate, both
+#                         verified - Zstandard is NOT a C-to-Rust replacement in
+#                         this graph, it is a C library reached through a Rust
+#                         binding.
+#   security-framework    PRESENT on x86_64-apple-darwin and
+#   security-framework-sys aarch64-apple-darwin only, via rustls-native-certs.
+#                         This is the Apple trust-store binding: it reads the
+#                         platform's root certificates. It is not a TLS
+#                         implementation, performs no handshake and terminates no
+#                         connection, so it does not compete with "rustls
+#                         exclusively". Banning it would break certificate
+#                         verification on both Apple targets.
+#   openssl-probe         PRESENT on both Linux targets, via rustls-native-certs.
+#                         Despite the name it contains no OpenSSL and links
+#                         nothing: it is pure Rust that guesses where the system
+#                         CA bundle lives. The `openssl` and `openssl-sys` bans
+#                         below do not touch it, because cargo-deny matches whole
+#                         package names.
+#   hickory-resolver      ABSENT today and must stay un-banned: hickory-dns is a
+#   hickory-proto         sanctioned optional feature, off by default. Banning it
+#                         would prohibit a capability the design allows.
 deny = [
-  # Exactly one cryptographic provider may be linked. rustls, tokio-rustls,
-  # quinn and russh are all configured with default-features = false plus the
-  # "ring" feature; aws-lc-rs would add a second provider, a vendored C/asm
-  # build (CMake + NASM) and would break the aarch64 cross leg.
-  { name = "aws-lc-rs" },
-  { name = "aws-lc-sys" },
-  # No second TLS implementation, and no C TLS library, at any configuration.
-  { name = "openssl" },
-  { name = "openssl-sys" },
-  { name = "native-tls" },
-  { name = "schannel" },
-  # NOTE: security-framework is deliberately NOT banned. It is the Apple
-  # trust-store binding that rustls-native-certs uses on the two darwin
-  # targets; it is not a TLS implementation and does not perform the
-  # handshake, so it does not conflict with "rustls exclusively".
-  # The RustCrypto family must stay on one digest generation (0.10).
-  { name = "digest", version = ">=0.11.0" },
+  # -- Cryptographic provider: exactly one, and it is ring ------------------
+  #
+  # This is the single most consequential manifest decision in the workspace, and
+  # these two entries are what make it hold. rustls, tokio-rustls, quinn and
+  # russh are all declared with default-features = false plus an explicit "ring"
+  # feature. Accepting their defaults instead would link BOTH providers into one
+  # binary, because Cargo unifies features across a graph.
+  #
+  # The cost of getting this wrong is concrete, not theoretical: aws-lc-rs
+  # vendors C and assembly and pulls a build-time dependency on CMake and NASM,
+  # which is precisely what breaks the cross-compiled aarch64-unknown-linux-gnu
+  # leg. It also duplicates cryptographic code that ring already provides.
+  #
+  # Measured detail that makes this ban worth its line: quinn-proto declares
+  # `aws-lc-rs ^1.9` as an OPTIONAL dependency. The crate is absent from the
+  # graph only because default-features = false is honoured, so this entry is a
+  # standing proof of that - if the flag is ever dropped, the build fails here
+  # with a diagnostic naming the cause, instead of quietly growing a second
+  # provider and a C toolchain requirement.
+  { crate = "aws-lc-rs", reason = "Second cryptographic provider. ring is the sole provider, pinned explicitly on rustls, tokio-rustls, quinn and russh via default-features = false. aws-lc-rs vendors C and assembly and requires CMake plus NASM at build time, which breaks the cross-compiled aarch64-unknown-linux-gnu leg. quinn-proto declares it as an optional dependency, so this ban is a standing proof that default-features = false is still honoured." },
+  { crate = "aws-lc-sys", reason = "The vendored C and assembly sys crate behind aws-lc-rs. Banned separately because a future aws-lc-rs could be reached through a differently-named wrapper while this crate is what actually introduces the C build-time toolchain requirement." },
+
+  # -- C TLS libraries: none, at any configuration --------------------------
+  #
+  # rustls is the only TLS implementation. Not as a default, not behind a feature
+  # flag, not as a fallback. These bans cover every binding that curl 8.x's
+  # vtls layer supported plus the Rust ecosystem's usual routes back to a C TLS
+  # stack, and none of them is present on any of the four targets.
+  { crate = "openssl", reason = "C TLS library binding. rustls is the only TLS implementation; lib/vtls/openssl.c is superseded, not wrapped." },
+  { crate = "openssl-sys", reason = "Raw C OpenSSL/libssl bindings. Distinct from openssl-probe, which is pure Rust, contains no OpenSSL and is legitimately present via rustls-native-certs." },
+  { crate = "native-tls", reason = "Delegates TLS to whatever the platform provides - OpenSSL, Secure Transport or Schannel - which is exactly the multi-backend dispatch this rewrite collapses to a single rustls implementation." },
+  { crate = "schannel", reason = "Windows C TLS binding, superseding lib/vtls/schannel.c. Present in the all-platform graph via rustls-native-certs under cfg(windows) but reachable on none of the four mandated targets, so this ban is documentation that stays inert." },
+  { crate = "mbedtls", reason = "C TLS library binding, superseding lib/vtls/mbedtls.c." },
+  { crate = "mbedtls-sys-auto", reason = "Raw C mbedTLS bindings; the -sys route to the same prohibited library." },
+  { crate = "wolfssl-sys", reason = "C TLS library binding, superseding lib/vtls/wolfssl.c." },
+  { crate = "gnutls", reason = "C TLS library binding, superseding lib/vtls/gtls.c." },
+  { crate = "boring", reason = "BoringSSL binding: a C TLS library, and a second cryptographic provider on top of that." },
+  { crate = "boring-sys", reason = "Raw BoringSSL C bindings, with a vendored C build." },
+  { crate = "rustls-ffi", reason = "The C ABI wrapper around rustls that curl 8.x's lib/vtls/rustls.c consumes. This implementation uses rustls NATIVELY as a Rust dependency; routing through its C FFI would reintroduce a C boundary in the TLS path for no benefit." },
+
+  # -- Superseded C protocol and utility libraries --------------------------
+  #
+  # Each of these was replaced by a Rust crate. A -sys binding reappearing would
+  # silently reintroduce a C dependency, a C build-time toolchain requirement and
+  # a second implementation of behaviour that must stay byte-identical on the
+  # wire - so the replacement is enforced here rather than merely intended.
+  { crate = "libnghttp2-sys", reason = "C HTTP/2 library; replaced by the h2 crate." },
+  { crate = "nghttp2-sys", reason = "Alternate crate name for the same C HTTP/2 library; replaced by the h2 crate." },
+  { crate = "libz-sys", reason = "C zlib; replaced by flate2 with the rust_backend feature. Verified: flate2 1.1.9 resolves to [any_impl, default, miniz_oxide, rust_backend], so gzip and deflate are pure Rust through miniz_oxide." },
+  { crate = "zlib-sys", reason = "Alternate crate name for C zlib; same replacement as libz-sys." },
+  { crate = "brotli-sys", reason = "C Brotli; replaced by the pure-Rust brotli crate. Verified: brotli 8.0.4 resolves to [alloc-stdlib, default, std] with no -sys dependency." },
+  { crate = "libssh2-sys", reason = "C libssh2; replaced by russh. lib/vssh/libssh2.c is superseded." },
+  { crate = "libssh2", reason = "Rust wrapper over the C libssh2; the same prohibited C library one level up." },
+  { crate = "ssh2", reason = "The common Rust binding to C libssh2; russh is the sole SSH transport for SFTP and SCP." },
+  { crate = "libssh-sys", reason = "C libssh, the other SSH backend curl 8.x supported via lib/vssh/libssh.c. Dropped outright; russh replaces both." },
+  { crate = "c-ares", reason = "C asynchronous DNS resolver; replaced by the system resolver with tokio::time::timeout, and lib/asyn-ares.c is excluded. hickory-dns is the sanctioned optional alternative and is deliberately NOT banned." },
+  { crate = "c-ares-sys", reason = "Raw C c-ares bindings; the -sys route to the same replaced library." },
+  { crate = "libidn2-sys", reason = "C libidn2; replaced by the idna crate for internationalised domain names." },
+  { crate = "libpsl-sys", reason = "C libpsl; replaced by the publicsuffix crate for cookie-domain matching." },
+
+  # -- Dropped QUIC backend -------------------------------------------------
+  #
+  # quinn + h3 + h3-quinn are the sole QUIC and HTTP/3 path. quiche is dropped
+  # along with lib/vquic/curl_quiche.c, and it would also bring its own
+  # cryptographic provider, breaking invariant 1 above as well.
+  { crate = "quiche", reason = "Alternate QUIC implementation, dropped with lib/vquic/curl_quiche.c. quinn plus h3 plus h3-quinn are the sole QUIC and HTTP/3 path, and quiche would additionally introduce a competing cryptographic provider." },
+
+  # -- The C library this workspace replaces --------------------------------
+  #
+  # A Rust rewrite of curl must never link the C libcurl. It would be a circular
+  # and self-defeating dependency, and it is a genuine hazard: `curl` and
+  # `curl-sys` are popular crates that any transitive dependency wanting an HTTP
+  # client might pull in.
+  #
+  # Safe because cargo-deny matches PACKAGE names: the workspace members are
+  # curl-rs, curl-rs-lib and curl-rs-ffi. curl-rs-ffi does set [lib] name =
+  # "curl" so that it produces libcurl.so.4, but that is a library name, not a
+  # package name, and this ban does not touch it. Verified: bans pass.
+  { crate = "curl", reason = "The Rust binding to the C libcurl. This workspace REPLACES libcurl; linking the C implementation back in would be circular. Matches on package name only, so curl-rs-ffi's [lib] name = \"curl\" is unaffected." },
+  { crate = "curl-sys", reason = "Raw C libcurl bindings, and the crate that actually links or vendors the C library. Same reasoning as the curl entry above." },
+
+  # -- Digest generation coherence -----------------------------------------
+  #
+  # The RustCrypto family must share one `digest` generation or its traits do not
+  # unify: with digest 0.10 and 0.11 in the same graph, `Hmac<Sha1>` fails to
+  # compile because the Mac and Digest traits come from different crates. The
+  # adopted set is coherent on digest 0.10 throughout, and this keeps it that way.
+  #
+  # `multiple-versions = "deny"` above already catches a 0.10/0.11 SPLIT. This
+  # entry catches the case that one cannot see: the whole graph migrating to 0.11
+  # with no duplicate at all, which would break trait unification without
+  # tripping the duplicate check. The colon separator is required - see the note
+  # above the section - and this was verified to be a working range rather than a
+  # no-op by confirming that `digest:>=0.10.0` does fire against digest 0.10.7.
+  { crate = "digest:>=0.11.0", reason = "The RustCrypto stack must stay on one digest generation. The adopted set is coherent on digest 0.10 (0.10.7 resolved); mixing 0.10 and 0.11 breaks trait unification so that Hmac<Sha1> will not compile. Raise this bound only when every RustCrypto dependency has been moved to the newer generation together." },
 ]
 
-# Duplicate versions that are structurally unavoidable with the pinned set.
-# Each entry is the OLDER/NEWER pair pulled in by a transitive dependency that
-# cannot be unified without abandoning a mandated crate version:
-#   rand/rand_chacha/rand_core/       - quinn-proto uses rand 0.10 while russh
-#   chacha20/getrandom                  and the auth code use rand 0.8
-#   thiserror/thiserror-impl          - transitive deps still on 1.x
-#   syn/winnow/cpufeatures            - proc-macro and parser generations
+# ---------------------------------------------------------------------------
+# Accepted duplicate versions
+# ---------------------------------------------------------------------------
+#
+# Seven entries, no more, and every one of them was root-caused before it was
+# written. cargo-deny reports `warning[unnecessary-skip]` for a skip applied to a
+# crate that has only one version, so a padded skip list is detectable the same
+# way a padded allow-list is; this one produces no such warning.
+#
+# A pre-release version anywhere in the graph is a policy failure, and it is
+# worth stating alongside the duplicates because the two are connected. The
+# dependency selection rejected russh 0.58.0 through 0.62.4 precisely because
+# every one of them requires release-candidate cryptography - rsa 0.10.0-rc.18,
+# ssh-key 0.7.0-rc.11, pkcs1 0.8.0-rc.4 - and the committed Cargo.lock contains
+# ZERO pre-release versions as a result. Do not confuse a pre-release with build
+# metadata when checking: three locked versions carry a `+` suffix
+# (0.11.1+wasi-snapshot-preview1, 0.6.11+upstream-0.6.7, 1.0.4+wasi-0.2.12), and
+# `+` is SemVer build metadata, not a pre-release identifier. The pre-release
+# marker is `-`, as in `-rc.18`.
+#
+# Three crates are deliberately NOT skipped, and their absence from this list is
+# load-bearing rather than accidental:
+#
+#   digest    resolved at 0.10.7 only. The adopted set is coherent on digest 0.10
+#             throughout, and a duplicate here would break trait unification
+#             rather than merely bloat the binary - see the range ban above.
+#   rustls    resolved at 0.23.42 only. Two rustls versions would mean two TLS
+#             implementations and, in practice, two cryptographic providers.
+#   base64    resolved at 0.23.0 only, and used across authentication and MIME
+#             where the encoded output is compared byte-for-byte.
+#
+# A duplicate appearing in any of those three is a MANIFEST DEFECT to be fixed in
+# Cargo.toml, never a skip to be added here. The same applies to chacha20,
+# cpufeatures and winnow, each of which resolves to a single version today.
 skip = [
-  { name = "chacha20" },
-  { name = "cpufeatures" },
-  { name = "getrandom" },
-  { name = "rand" },
-  { name = "rand_chacha" },
-  { name = "rand_core" },
-  { name = "syn" },
-  { name = "thiserror" },
-  { name = "thiserror-impl" },
-  { name = "winnow" },
+  # rand 0.8.7 vs 0.9.5 - and this one is a genuine, measured conflict between
+  # two crates the design mandates, not an oversight.
+  #
+  # 0.8.7 is the workspace's own pin, chosen to match russh 0.54.5's `rand ^0.8`,
+  # and it is additionally required by num-bigint 0.4.8, num-bigint-dig 0.8.6 and
+  # rsa 0.9.10. 0.9.5 arrives through quinn 0.11.9 -> quinn-proto 0.11.14.
+  #
+  # The intent recorded in Cargo.toml is that pinning rand at 0.8.7 unifies the
+  # graph. Measured against this lockfile, it does not, and the reason is not
+  # fixable by choosing a different quinn-proto: the registry metadata for
+  # quinn-proto 0.11.12, 0.11.13 AND 0.11.14 all declare `rand ^0.9`, and quinn
+  # 0.11.9 requires `quinn-proto ^0.11.12`, so no admissible quinn-proto version
+  # uses rand 0.8. The split is therefore structural for as long as quinn 0.11.9
+  # and russh 0.54.5 are both mandated.
+  #
+  # Recorded as a finding rather than absorbed silently: resolving it needs a
+  # manifest decision - move russh forward to a release that uses rand 0.9, or
+  # move quinn back to a line that uses rand 0.8 - and neither is a change a
+  # policy file may make. Delete this entry and the three below the moment one
+  # side moves.
+  { crate = "rand", reason = "rand 0.8.7 (workspace pin, matching russh 0.54.5 plus num-bigint, num-bigint-dig and rsa) versus rand 0.9.5 (required by quinn-proto 0.11.14 via quinn 0.11.9). Structural: quinn-proto 0.11.12, 0.11.13 and 0.11.14 all declare rand ^0.9 and quinn 0.11.9 requires quinn-proto ^0.11.12, so no admissible version unifies. Resolving it is a manifest decision about quinn or russh, not a policy change." },
+
+  # rand_chacha 0.3.1 vs 0.9.0 - not an independent duplicate. rand 0.8 depends
+  # on rand_chacha 0.3 and rand 0.9 on rand_chacha 0.9, so this entry disappears
+  # by itself the moment the rand split above is resolved. It is listed
+  # separately only because cargo-deny reports duplicates per crate.
+  { crate = "rand_chacha", reason = "0.3.1 versus 0.9.0, a direct consequence of the rand 0.8/0.9 split: rand 0.8 requires rand_chacha 0.3 and rand 0.9 requires rand_chacha 0.9. Not independently resolvable; it disappears with the rand entry." },
+
+  # rand_core 0.6.4 vs 0.9.5 - likewise a consequence of the rand split. Note
+  # that rand_core 0.6.4 has a far wider reach than rand itself: crypto-bigint,
+  # ed25519-dalek, elliptic-curve, ff, group, p521, password-hash, pkcs8, rsa and
+  # russh's forked ssh-key all depend on it, so the older generation is load
+  # bearing across the whole SSH and elliptic-curve stack.
+  { crate = "rand_core", reason = "0.6.4 versus 0.9.5, a direct consequence of the rand 0.8/0.9 split. 0.6.4 is required across the SSH and elliptic-curve stack (crypto-bigint, ed25519-dalek, elliptic-curve, ff, group, p521, password-hash, pkcs8, rsa, ssh-key), while 0.9.5 arrives with rand 0.9 through quinn-proto. Not independently resolvable." },
+
+  # getrandom 0.2.17 vs 0.3.4 - the same root cause one level deeper
+  # (rand_core 0.6 -> getrandom 0.2, rand_core 0.9 -> getrandom 0.3), with a
+  # second, independent path to 0.3.4: tempfile 3.27.0 <- cbindgen 0.29.4, which
+  # is a BUILD dependency of curl-rs-ffi. So even resolving the rand split would
+  # leave getrandom 0.3.4 in the build graph - it simply would not be a duplicate
+  # any more.
+  { crate = "getrandom", reason = "0.2.17 versus 0.3.4. Mostly the rand split one level deeper (rand_core 0.6 requires getrandom 0.2, rand_core 0.9 requires getrandom 0.3), plus an independent path to 0.3.4 through tempfile 3.27.0 from the cbindgen build dependency. Resolving the rand split removes the duplication, not the crate." },
+
+  # syn 2.0.119 vs 3.0.3 - proc-macro generations, and unavoidable while any
+  # dependency still generates code with the older parser. 3.0.3 is reached
+  # through displaydoc, serde_derive, thiserror-impl 2.x and tokio-macros.
+  # Compile-time only: neither version contributes code to the shipped artifacts,
+  # which is why this is the least consequential entry in the list.
+  { crate = "syn", reason = "2.0.119 versus 3.0.3, two proc-macro parser generations. 3.0.3 is reached through displaydoc, serde_derive, thiserror-impl 2.x and tokio-macros; 2.0.119 through dependencies that have not migrated. Build-time only - neither version contributes code to libcurl.so.4 or the curl-rs binary." },
+
+  # thiserror 1.0.69 vs 2.0.19 - 2.0.19 is the workspace's own pin; 1.0.69 is
+  # required by russh 0.54.5. Resolving it needs russh to move to thiserror 2,
+  # which means moving russh into the 0.58.0-0.62.4 band rejected for
+  # release-candidate cryptography. Same trade as the two russh advisories in the
+  # [advisories] section, and the same resolution: carry the duplicate, keep the
+  # stable dependency graph.
+  { crate = "thiserror", reason = "1.0.69 versus 2.0.19. 2.0.19 is the workspace pin; 1.0.69 is required by russh 0.54.5. Unifying needs a russh release that uses thiserror 2, which lies inside the 0.58.0-0.62.4 band rejected for depending on release-candidate cryptography. Derive-macro plumbing only; it affects no wire behaviour." },
+
+  # thiserror-impl 1.0.69 vs 2.0.19 - the proc-macro half of the entry above,
+  # version-locked to it. It disappears with the thiserror entry.
+  { crate = "thiserror-impl", reason = "1.0.69 versus 2.0.19, the proc-macro half of the thiserror duplicate and version-locked to it. Not independently resolvable; it disappears with the thiserror entry." },
 ]
+
+# No skip-tree entries. skip-tree suppresses duplicate reporting for a crate AND
+# its entire transitive subtree, which is a far blunter instrument than the seven
+# targeted skips above: it would hide duplicates nobody has examined, including
+# ones introduced later underneath the named crate. Every duplicate in this graph
+# is individually accounted for, so nothing needs it.
 skip-tree = []
 
+# ---------------------------------------------------------------------------
+# Prohibited features
+# ---------------------------------------------------------------------------
+#
+# These blocks guard something no crate-level ban can reach, and that is the
+# whole reason they exist.
+#
+# `prefer-post-quantum` is the clearest case. It is a DEFAULT feature of rustls
+# 0.23.42, it is implemented in pure Rust, and it adds no crate to the graph -
+# so aws-lc-rs being banned above says nothing about it and `cargo tree` shows
+# nothing unusual. What it does is offer a hybrid X25519MLKEM768 key exchange,
+# which CHANGES THE BYTES OF THE TLS ClientHello relative to curl 8.x. Under a
+# test corpus that compares emitted bytes as a single string, that is a
+# wire-parity risk on every HTTPS fixture. It is disabled by
+# `default-features = false` in Cargo.toml, and this is what keeps it disabled
+# if anyone ever removes that line.
+#
+# The provider features are guarded for the same reason from the other side: a
+# feature is how the second provider would be enabled, and enabling it is a
+# smaller, more plausible edit than adding a dependency.
+#
+# `platform-verifier` is prohibited on quinn and quinn-proto because it delegates
+# certificate-trust decisions to the operating-system store, which would override
+# curl's own --cacert, --capath and --insecure semantics. Those must stay
+# authoritative: certificate validation is on by default and --insecure is the
+# only way to relax it.
+#
+# One practical note. cargo-deny emits `warning[unknown-feature]` for a feature
+# name a crate does not declare, so every name below was read from the crates'
+# own metadata rather than guessed. rustls and tokio-rustls declare BOTH
+# `aws-lc-rs` and the underscore alias `aws_lc_rs`, so both are listed; russh
+# declares only the hyphenated form, so only that one appears in its block.
+# Verified: bans pass with zero warnings.
+
+[[bans.features]]
+crate = "rustls"
+deny = [
+  # Second cryptographic provider, in both spellings rustls declares.
+  "aws-lc-rs",
+  "aws_lc_rs",
+  # FIPS mode implies the aws-lc-rs provider and its vendored C build.
+  "fips",
+  # Hybrid post-quantum key exchange. Changes the ClientHello bytes relative to
+  # curl 8.x and so risks every byte-compared HTTPS fixture. This is the guard
+  # that no crate-level ban can provide: the feature is pure Rust and adds no
+  # dependency.
+  "prefer-post-quantum",
+]
+
+[[bans.features]]
+crate = "tokio-rustls"
+deny = [
+  # Must agree with rustls above, or the graph ends up with two providers by way
+  # of Cargo's feature unification.
+  "aws-lc-rs",
+  "aws_lc_rs",
+  "fips",
+]
+
+[[bans.features]]
+crate = "quinn"
+deny = [
+  # Every route to the aws-lc-rs provider that quinn declares. quinn's own
+  # `rustls` feature already implies `rustls-ring`, which is why the ring
+  # provider stays consistent across the QUIC path.
+  "aws-lc-rs",
+  "aws-lc-rs-fips",
+  "rustls-aws-lc-rs",
+  "rustls-aws-lc-rs-fips",
+  # Would hand trust decisions to the OS certificate store, overriding curl's
+  # --cacert, --capath and --insecure semantics.
+  "platform-verifier",
+]
+
+[[bans.features]]
+crate = "quinn-proto"
+deny = [
+  # quinn-proto declares `aws-lc-rs ^1.9` as an optional dependency, so these are
+  # the features that would actually pull the banned crate into the graph.
+  "aws-lc-rs",
+  "aws-lc-rs-fips",
+  "rustls-aws-lc-rs",
+  "rustls-aws-lc-rs-fips",
+  "platform-verifier",
+]
+
+[[bans.features]]
+crate = "russh"
+deny = [
+  # russh declares only the hyphenated spelling; adding the underscore alias here
+  # produces an unknown-feature warning, which was observed and removed.
+  "aws-lc-rs",
+]
+
+# ---------------------------------------------------------------------------
+# [sources] - where crates are allowed to come from
+# ---------------------------------------------------------------------------
+#
+# Reproducible builds are non-negotiable, which is why Cargo.lock is committed.
+# A lockfile only delivers reproducibility if the things it names are immutable,
+# and that is a property of the SOURCE rather than of the version string: a
+# registry release is immutable once published, while a git reference can be
+# force-pushed, retagged or deleted, and a vendored copy can be edited in place
+# with nothing to detect it.
+#
+# Measured against the committed lockfile: every `source =` line in Cargo.lock is
+# exactly "registry+https://github.com/rust-lang/crates.io-index" - one distinct
+# value across all 325 external packages. The three workspace members are path
+# dependencies and carry no source at all. This section is what keeps that true.
+
 [sources]
+
+# Raised from the cargo-deny default of "warn". A crate arriving from an
+# unexpected registry is not a style issue: it means the audit performed here -
+# advisories, licences, bans - was performed against a different artifact than
+# the one that gets built, because RustSec advisories are keyed to crates.io
+# releases.
 unknown-registry = "deny"
+
+# Raised from the default of "warn" for the reason given above: a git dependency
+# is a mutable reference. Even pinned to a commit hash it can vanish when the
+# repository moves or is deleted, and `cargo audit` cannot match it against the
+# advisory database. Denying it means such a dependency is a deliberate,
+# reviewed decision recorded in `allow-git` rather than something that arrives in
+# a pull request.
 unknown-git = "deny"
+
+# The one permitted registry. Every dependency in this workspace comes from
+# crates.io - there is no private registry, no vendored crate and no internal
+# package feed anywhere in the design.
+#
+# Note that this list is not merely the default restated: leaving it out would
+# also default to crates.io, but writing it makes the intent explicit and, with
+# `unknown-registry = "deny"` above, makes any addition to it a visible diff.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# No git dependencies, and the empty list is the policy rather than an omission.
+# The workspace has exactly three path dependencies - its own members, which
+# carry no source and are unaffected by this check - and nothing else. If a git
+# dependency ever becomes genuinely necessary, it belongs here with a comment
+# naming the repository, the pinned revision and the reason no published release
+# suffices.
 allow-git = []
 
 [sources.allow-org]
+
+# No organisation-wide allowances, in any of the three forges cargo-deny
+# understands. An entry here is a standing permission for EVERY current and
+# future repository under that organisation, which is a much broader grant than
+# naming a single repository in `allow-git` above - and a broader grant than
+# anything this workspace needs, since it needs none.
 github = []
 gitlab = []
 bitbucket = []

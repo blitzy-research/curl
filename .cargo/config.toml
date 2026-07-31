@@ -2,32 +2,453 @@
 #
 # SPDX-License-Identifier: curl
 
-# Cargo configuration for the Rust workspace (curl-rs-lib, curl-rs, curl-rs-ffi).
+# ===========================================================================
+# Cargo build configuration for the curl Rust workspace
+# ===========================================================================
 #
-# Cross-compilation linkers for the mandated target matrix. The two Linux
-# targets build and link locally; the two Apple targets need an Apple SDK plus
-# a Mach-O capable linker, which is not part of this container image, so no
-# linker is configured for them here (cargo check/clippy still work, and
-# cargo-zigbuild or a macOS runner performs the link).
+# Members, per Cargo.toml: curl-rs-lib (the protocol engine), curl-rs (the
+# command-line binary) and curl-rs-ffi (the C ABI shim, and the only crate in
+# the workspace that emits a cdylib and a staticlib). Every crate and every
+# continuous-integration leg builds under this file, which is why it is
+# deliberately small: it carries per-target link configuration and nothing
+# else.
+#
+# ---------------------------------------------------------------------------
+# What this file replaces
+# ---------------------------------------------------------------------------
+#
+# The two C build systems *computed* their per-platform link line at configure
+# time. Neither computation has a mechanical Cargo equivalent, so the outcome
+# has to be re-established here deliberately rather than translated:
+#
+#   Autotools   configure.ac probes the host and the compiler, then
+#               lib/Makefile.am assembles libcurl_la_LDFLAGS_EXTRA out of four
+#               independent Autotools conditionals.
+#   CMake       CMakeLists.txt with lib/CMakeLists.txt reaches the same place
+#               by another route, through cache options and target properties.
+#
+# lib/Makefile.am, read in the source tree at this commit:
+#
+#   L93        libcurl_la_LDFLAGS_EXTRA =              (starts out empty)
+#   L96-L100   if CURL_LT_SHLIB_USE_VERSION_INFO
+#                include Makefile.soname               (VERSIONCHANGE/ADD/DEL)
+#                libcurl_la_LDFLAGS_EXTRA += $(VERSIONINFO)
+#              endif
+#   L102-L104  if CURL_LT_SHLIB_USE_NO_UNDEFINED       -> a libtool flag
+#              endif
+#   L106-L108  if CURL_LT_SHLIB_USE_MIMPURE_TEXT       -> a text-relocation
+#              endif                                      flag for old SunOS
+#   L110-L117  if CURL_LT_SHLIB_USE_VERSIONED_SYMBOLS  -> a linker version
+#              else                                       script
+#                if DOING_CURL_SYMBOL_HIDING           -> an export regex
+#                endif
+#              endif
+#
+# The essential point is that EVERY ONE of those four flags is conditional on
+# an Autotools feature test; not one of them is applied unconditionally. Of the
+# four, exactly ONE has a Rust counterpart - the soname that L96-L100 derives
+# from VERSIONINFO. The other three have none, and their absence here is a
+# reasoned outcome rather than an oversight; see "Restraint" below, where each
+# is named with its authority.
+#
+# ---------------------------------------------------------------------------
+# Why there is no global build section
+# ---------------------------------------------------------------------------
+#
+# A workspace-wide rustflags key - the one Cargo reads from its global build
+# section rather than from a target table - applies to every target at once, and
+# the link arguments this workspace needs are not portable across all four
+# targets. The soname argument is the clearest case: it is GNU-ld-specific,
+# Apple's ld64 does not accept it, and GNU ld symmetrically rejects Apple's
+# equivalent outright rather than warning. Measured here with GNU ld 2.45:
+#
+#   $ gcc -Wl,-install_name,libcurl.4.dylib -o probe probe.c
+#   /usr/bin/ld: unrecognised option: -install_name
+#   collect2: error: ld returned 1 exit status          (exit status 1)
+#
+# One global flag list therefore cannot be correct for all four mandated
+# targets. Everything below is consequently scoped to a [target.<triple>]
+# table, and nobody should "simplify" this file by hoisting a setting up into a
+# global build section.
+#
+# There is no default-target key either, for the same section's other famous
+# setting. Pinning one default triple would silently narrow the four-target
+# matrix and would change what a bare `cargo build` produces; the committed
+# Cargo.lock is resolved once to serve all four triples.
+#
+# ---------------------------------------------------------------------------
+# The target matrix
+# ---------------------------------------------------------------------------
+#
+# Four triples, and only four. The tables below appear in the same order as
+# rust-toolchain.toml's `targets` array and deny.toml's [graph] targets array,
+# so the toolchain that is provisioned, the dependency graph that is audited
+# and the link configuration that is applied all describe one identical set:
+#
+#   x86_64-unknown-linux-gnu    host, and the primary CI target
+#   aarch64-unknown-linux-gnu   cross-compiled; the linker is configured here
+#   x86_64-apple-darwin         no linker configured here; see its table
+#   aarch64-apple-darwin        likewise, plus one escalated open item
+#
+# All four are 64-bit, and that is load-bearing rather than incidental. The C
+# ABI shim reaches curl's four variadic entry points - curl_easy_setopt,
+# curl_easy_getinfo, curl_multi_setopt and curl_share_setopt - with a
+# non-variadic extern "C" function taking one trailing pointer, because true
+# C-variadic functions are unstable at the workspace MSRV. That design carries
+# a curl_off_t through a single register-width slot, which is sound only where
+# off_t fits a register. 32-bit portability is consequently a DELIBERATE
+# FORFEIT rather than an oversight, and it must not be claimed: no 32-bit
+# triple belongs in this file.
+#
+# ---------------------------------------------------------------------------
+# The shared library's identity: libcurl.so.4
+# ---------------------------------------------------------------------------
+#
+# A drop-in replacement has to satisfy the same dynamic-linker lookups as the
+# library it replaces, so the cdylib must carry DT_SONAME = libcurl.so.4.
+# Cargo sets no soname by default; it has to be configured explicitly.
+#
+# The 4 is derived, never chosen, and the repository derives it twice by
+# independent routes that agree exactly:
+#
+#   1. Autotools.  lib/Makefile.soname:27-29 sets VERSIONCHANGE=12,
+#      VERSIONADD=0 and VERSIONDEL=8; lib/Makefile.soname:32 turns those into
+#      libtool's -version-info 12:0:8; lib/Makefile.am:96-100 includes that
+#      file and appends the result to the shared library's link flags. libtool
+#      names a library lib.so.(current-age).(age).(revision) and sets
+#      SONAME = lib.so.(current-age), so current - age = 12 - 8 = 4, giving
+#      SONAME libcurl.so.4 and the full file name libcurl.so.4.8.0.
+#
+#   2. CMake, reading that very same file.  lib/CMakeLists.txt:282-283
+#      converts Makefile.soname into CMake syntax and includes it; :285
+#      computes math(EXPR _cmakesoname "${VERSIONCHANGE} - ${VERSIONDEL}") = 4;
+#      :286 composes _cmakeversion = "4.8.0"; :289-291 applies
+#      SOVERSION "4" and VERSION "4.8.0" to the shared target.
+#
+# Corroborated a third time at configure.ac:2824, which substitutes
+# CURL_LIBCURL_VERSIONED_SYMBOLS_SONAME as "4" with the comment "Keep in sync
+# with VERSIONCHANGE - VERSIONDEL in lib/Makefile.soname". The number is
+# recorded once for the whole workspace as Cargo.toml's
+# [workspace.metadata.curl-rs] soname key, so nothing here invents it.
+#
+# ---------------------------------------------------------------------------
+# Why the soname link argument is NOT set here - a measured decision
+# ---------------------------------------------------------------------------
+#
+# The workspace-layout note in the transformation plan describes this file as
+# carrying the cdylib soname link argument. It was implemented that way first
+# and then measured, and the measurement disqualified it. The record follows,
+# because the outcome differs from that note and must not be mistaken for an
+# omission.
+#
+# The reason is that [target.<triple>].rustflags are NOT artifact-scoped. They
+# reach EVERY artifact built for that triple - the curl-rs command-line binary,
+# the curlinfo diagnostic binary, and (when host equals target, i.e. a bare
+# `cargo build` with no --target) build script executables too - and not only
+# curl-rs-ffi's cdylib.
+#
+# Measured in this container with GNU ld 2.45 and cargo/rustc 1.97.1, using a
+# probe package shaped like this workspace - a cdylib named curl plus binaries
+# named curl-rs and curlinfo - carrying
+# rustflags = ["-C", "link-arg=-Wl,--soname=libcurl.so.4"]:
+#
+#   * `cargo build --release -v` showed the flag - which rustc spells
+#     -C link-arg=-Wl,--soname=libcurl.so.4 on its command line - on THREE
+#     rustc invocations: --crate-name curl_rs (bin), --crate-name curlinfo
+#     (bin) and --crate-name curl (cdylib + staticlib). Two of the three are
+#     executables, and Cargo offers no way to exclude them from a rustflags
+#     key.
+#   * readelf -d target/release/libcurl.so -> SONAME libcurl.so.4   (intended)
+#   * readelf -d target/release/curl-rs    -> SONAME libcurl.so.4   (WRONG)
+#   * readelf -d target/release/curlinfo   -> SONAME libcurl.so.4   (WRONG)
+#
+# Neither executable link failed and neither emitted a warning; both binaries
+# ran normally. The defect is silent, and it is real: RPM and dpkg dependency
+# generators and ldconfig all read DT_SONAME, so both command-line binaries
+# would advertise that they *provide* libcurl.so.4. Repeating the build with
+# the flag suppressed cleared the soname from all three artifacts, which
+# establishes this file as the cause rather than something incidental.
+#
+# The correctly-scoped mechanism was measured next, and it behaves exactly as
+# wanted. Emitted from curl-rs-ffi/build.rs, with no rustflags in play:
+#
+#   println!("cargo:rustc-cdylib-link-arg=-Wl,--soname=libcurl.so.4");
+#
+#   libcurl.so -> SONAME libcurl.so.4    curl-rs -> none    curlinfo -> none
+#
+# The argument therefore lives there rather than here. That is the same place
+# the transformation plan already assigns "the soname configuration" to,
+# alongside the header generation and sourced from lib/Makefile.soname, and it
+# is what the committed manifests already state: Cargo.toml records that the
+# soname is "NOT set there or here - it is a cdylib-only link arg emitted by
+# curl-rs-ffi/build.rs"; curl-rs-lib/Cargo.toml that it "lives in
+# curl-rs-ffi/build.rs, not here and not in .cargo/config.toml"; and
+# curl-rs-ffi/Cargo.toml quotes the exact line above.
+#
+# ONE MEASURED CONSTRAINT ON THAT LINE, because it is easy to get wrong. Cargo
+# grew a second, double-colon spelling of build script directives, and it is
+# NOT usable at this workspace's floor. Both spellings were run on both
+# toolchains:
+#
+#   cargo 1.75.0, the MSRV     single colon  builds; soname on the cdylib only,
+#                                            both binaries clean
+#                              double colon  HARD FAILURE, "error: unsupported
+#                                            output in build script"
+#   cargo 1.97.1, the pin      both spellings behave identically and correctly
+#
+# The double-colon syntax postdates the declared MSRV floor, so the single-colon
+# form quoted above is the only spelling that satisfies the MSRV and the pinned
+# channel at once. Use it.
+#
+# The consequence for this file is worth stating plainly: it sets NO rustflags
+# at all, for any target. Every remaining setting is a linker or a
+# cross-toolchain variable. That is a stronger guarantee than carefully scoping
+# a flag would have been, because a rustflags key that does not exist can never
+# again reach an artifact it was not meant for.
+#
+# ---------------------------------------------------------------------------
+# Restraint - what is deliberately absent, and on whose authority
+# ---------------------------------------------------------------------------
+#
+# Each of the eight items below was considered and rejected. None of the eight
+# is spelled out as a literal flag token anywhere in this file, not even inside
+# a comment: a rejected linker or codegen flag written out verbatim in a
+# build-configuration file invites a later editor to enable it and invites
+# policy scanners to false-positive. Each is therefore identified by the name of
+# its mechanism plus the guarding Autotools conditional or CMake option and a
+# file:line citation, which a reader can follow to the exact text. (The two
+# flags this file does discuss verbatim - the GNU-ld soname argument and its
+# Apple counterpart - are not in this list: one is genuinely used, per-artifact,
+# from curl-rs-ffi/build.rs, and the other appears only as quoted linker output
+# proving why the two platforms cannot share one flag list.)
+#
+#   1. A linker version script, and any global/local symbol filtering.
+#      A user-supplied version script handed to rustc through a link argument
+#      was measured NOT to control Rust exports: the test symbols stayed
+#      exported and objdump -T tagged them Base, while readelf -V confirmed the
+#      script had genuinely been read (.gnu.version_d gained the expected
+#      node). rustc's internal export list takes precedence. Versioned symbol
+#      names of the form name@@CURL_... are therefore unreachable through a
+#      link argument alone, and that is a documented deviation rather than a
+#      defect: curl versions its symbols only conditionally. lib/Makefile.am:110
+#      guards the mechanism behind if CURL_LT_SHLIB_USE_VERSIONED_SYMBOLS; the
+#      node name in lib/libcurl.vers.in is a pure configure/configure_file
+#      substitution; and lib/CMakeLists.txt:278 declares
+#      option(CURL_LIBCURL_VERSIONED_SYMBOLS ... OFF) - off by DEFAULT. An
+#      unversioned export set is exactly curl's supported
+#      --disable-versioned-symbols mode, and under CMake it is what you get
+#      unless you ask otherwise.
+#
+#   2. Any export-hiding mechanism at all - no visibility flag, no
+#      library-exclusion flag, no export regex. A cdylib exercising Vec,
+#      String, format!, Box::into_raw and C-string literals was built and
+#      inspected here: total dynamic text symbols = 2, curl_* = 2, leaked = 0,
+#      and zero version nodes. Modern rustc emits only what is declared
+#      #[no_mangle] pub extern "C", so export parity comes from declaration
+#      discipline, not from link-time filtering. The C tree needed the
+#      machinery only because C has no such discipline - see
+#      CMake/CurlSymbolHiding.cmake:24 and :41-51, and lib/Makefile.am:115.
+#      Rust needs no analogue, and adding one would obscure the real contract.
+#      The set that discipline has to reproduce is lib/libcurl.def: EXPORTS on
+#      line 1 followed by exactly 100 curl_* names and nothing else. Asserting
+#      that count is the ABI gate's job, not this file's.
+#
+#   3. The two libtool/platform flags at lib/Makefile.am:103 and :107, guarded
+#      by CURL_LT_SHLIB_USE_NO_UNDEFINED and CURL_LT_SHLIB_USE_MIMPURE_TEXT.
+#      Both are artifacts of libtool and of platforms outside the four-target
+#      matrix, and neither has a Cargo analogue. Transliterating the C link
+#      line mechanically would drag them in; they are omitted knowingly.
+#
+#   4. Any performance or code-generation tuning: no host-CPU tuning flag, no
+#      optimisation-level override, no link-time-optimisation setting, no
+#      codegen-unit tuning. Two independent grounds. First, performance is an
+#      explicit non-goal of this work - no latency or throughput requirement
+#      exists anywhere in the requirements, and behaviour changed in the name
+#      of improvement is out of scope. Second, reproducibility: a flag that
+#      tunes for the build machine's microarchitecture produces different
+#      output on different machines, which destroys it outright. Profile
+#      settings belong to Cargo.toml, whose release profile is deliberately
+#      conservative - link-time optimisation off, unwinding preserved rather
+#      than aborting, overflow checks on - so that a panic stays contained at
+#      the FFI boundary instead of taking down a host process. Nothing here may
+#      contradict that.
+#
+#   5. A deny-warnings lint flag. The lint gate applies it on the command line
+#      in .github/workflows/rust-clippy.yml so that a lint failure names itself
+#      instead of hiding inside a build log. Putting it here would destroy that
+#      per-gate attribution AND force a full rebuild between the build leg and
+#      the clippy leg, because rustflags participate in Cargo's fingerprint.
+#
+#   6. Any unstable nightly compiler flag, the sanitiser and standard-library
+#      rebuild flags included. Those two belong to
+#      .github/workflows/rust-asan.yml, and Miri's to rust-miri.yml; both legs
+#      name `cargo +nightly` per invocation, which overrides the toolchain pin.
+#      This is not merely a matter of placement: rust-toolchain.toml pins
+#      channel = "1.97.1", a STABLE channel, and deliberately leaves nightly
+#      unpinned. An unstable flag in these rustflags would be rejected by the
+#      pinned toolchain and would break EVERY build, not just that one leg.
+#
+#   7. No registry, source-replacement, mirror, vendoring or network table, and
+#      no command-alias table. The workspace has no private registry, no
+#      vendored crate and no internal package feed; deny.toml already allows
+#      exactly one source, the public crates.io index. Configuration that
+#      silently redirects where code comes from has no place in a supply chain
+#      audited by cargo-deny.
+#
+#   8. No build-profile table of any kind. Profiles belong to Cargo.toml, which
+#      owns them for the whole workspace; a second definition here would be a
+#      second source of truth for the same setting, and the two would drift.
 
+# ---------------------------------------------------------------------------
+# x86_64-unknown-linux-gnu - host and primary CI target
+# ---------------------------------------------------------------------------
+[target.x86_64-unknown-linux-gnu]
+
+# Nothing to set, and that is a finding rather than a gap.
+#
+# No linker key: this is the host triple, so rustc's default `cc` driver is
+# already correct. No rustflags: the one flag among lib/Makefile.am's four that
+# has a Rust counterpart is the soname, and it belongs to the cdylib alone, so
+# it is emitted from curl-rs-ffi/build.rs for the reason measured above.
+#
+# The table is kept, deliberately empty, so that all four mandated triples are
+# visible in one place and a future per-target setting has an obvious and
+# already-correct home. `cargo config get` confirms it contributes no keys.
+
+# ---------------------------------------------------------------------------
+# aarch64-unknown-linux-gnu - cross-compiled
+# ---------------------------------------------------------------------------
 [target.aarch64-unknown-linux-gnu]
+
+# This is genuinely new configuration, with nothing to transliterate. A search
+# of configure.ac and all 20 m4/*.m4 macro files finds no hard-coded aarch64 or
+# arm64 triple and no cross-linker name at all: Autotools handles
+# cross-building only by disabling run-time probes - configure.ac:5109's
+# AM_CONDITIONAL(CROSSCOMPILING, ...) plus roughly twenty
+# `if test "$cross_compiling" != "yes"` guards, and the parallel guards in
+# m4/curl-compilers.m4 at :479, :979, :996, :1006 and :1179. Cargo needs the
+# linker named outright, so it is named.
+#
+# Verified present in this environment at 15.2.0, and verified to link an
+# aarch64 ELF shared object carrying the correct soname.
 linker = "aarch64-linux-gnu-gcc"
 
-# Used by cc-rs when the `ring` provider compiles its C/asm primitives for the
-# aarch64 Linux target.
+# That is the only key in this file that changes how rustc links anything, and
+# it is the reason the file exists at all. No rustflags here either: the soname
+# is emitted per-artifact from curl-rs-ffi/build.rs, so the shared library's
+# identity is independent of which machine built it and of whether the build was
+# native or cross - measured, with the cross cdylib carrying SONAME
+# libcurl.so.4 while the cross curl-rs and curlinfo binaries carry none.
+#
+# Why this leg is otherwise fragile, and what keeps it working. Accepting the
+# default features of the TLS and QUIC crates pulls in aws-lc-rs, whose
+# vendored C and assembly require CMake and NASM and are hostile to
+# cross-based builds; it would also link two different cryptographic providers
+# into one binary and, through a post-quantum key exchange enabled by default,
+# change the bytes of the TLS ClientHello relative to the C implementation.
+# Pinning ring across rustls, tokio-rustls and quinn removes the vendored
+# toolchain requirement and keeps exactly one provider in the graph.
+#
+# That pinning lives in Cargo.toml - default-features = false plus an explicit
+# "ring" feature on rustls, tokio-rustls and quinn (and on russh) - and THIS
+# FILE MUST NOT UNDO IT. Nothing added here may reintroduce aws-lc-rs or
+# otherwise alter TLS behaviour: security-relevant configuration is explicit,
+# never defaulted. The audit is `cargo tree -i aws-lc-rs` reporting the crate
+# absent while `cargo tree -i ring` reports ring present; the committed
+# Cargo.lock agrees today, with 328 packages, no aws-lc-rs and no aws-lc-sys
+# entry at all, ring 0.17.14 as the sole provider, and zero pre-release
+# versions.
+
+# ---------------------------------------------------------------------------
+# x86_64-apple-darwin
+# ---------------------------------------------------------------------------
+[target.x86_64-apple-darwin]
+
+# No rustflags, and that is a decision, not an omission.
+#
+# The GNU-ld soname argument - the one curl-rs-ffi/build.rs emits for the two
+# Linux targets - must NOT appear here, and no rustflags key must be added here
+# that would carry it. Apple's ld64 does not accept it, and the mismatch is a
+# hard link failure rather than a quiet degradation: the symmetric case was
+# measured in this container, where GNU ld rejects Apple's equivalent with
+# "unrecognised option: -install_name" and exit status 1. rustc was also observed
+# to append a configured link argument verbatim to the `cc` invocation it builds
+# for this triple, so a wrongly-scoped flag really would reach the Apple linker.
+#
+# Apple's equivalent of a soname is -install_name. It is deliberately not set,
+# for two reasons. First, it is a different thing: it records an absolute
+# install path for the dylib, not a bare version-suffixed base name, so there
+# is no value that is simultaneously correct for a build tree, a Homebrew
+# prefix and /usr/lib. Second, this is how the C build already behaves.
+# lib/CMakeLists.txt:259-275 does set _soversion_default TRUE for APPLE as well
+# as Linux, but CMake realises Apple versioning through the VERSION and
+# SOVERSION target properties at :289-291, which the generator turns into
+# -install_name and -compatibility_version - never into the GNU-ld argument.
+# Reproducing that faithfully means letting the toolchain derive it, exactly as
+# CMake does, rather than hard-coding a path here.
+#
+# No linker key either. A cross-link to this triple needs an Apple SDK and a
+# Mach-O capable linker; cargo-zigbuild or a macOS runner supplies both, and
+# each selects its own linker. Naming one here would break the other.
+
+# ---------------------------------------------------------------------------
+# aarch64-apple-darwin
+# ---------------------------------------------------------------------------
+[target.aarch64-apple-darwin]
+
+# Everything said for x86_64-apple-darwin applies unchanged: no soname-style
+# argument, no linker key, and Apple versioning left to the toolchain.
+#
+# This triple additionally carries the highest-severity open item in the plan,
+# escalated as ambiguity A4 and NOT resolved here.
+#
+# The C ABI shim reaches curl's four variadic entry points with a non-variadic
+# extern "C" function taking one trailing pointer, because true C-variadic
+# functions are unstable at the workspace MSRV of 1.75. That is sound on the
+# System V and standard AAPCS64 register conventions, where variadic arguments
+# travel in registers and caller and callee agree - inspection of the generated
+# aarch64 code shows the callee reading the third argument from register x2.
+# Apple's arm64 ABI, however, passes variadic arguments ON THE STACK. A
+# non-variadic Rust callee reached through a variadic C prototype would
+# therefore read a register the caller never populated, and THE FAILURE IS
+# SILENT: no Linux-only test run can observe it, and this container has no
+# Apple SDK, so it cannot be observed here either.
+#
+# NO SETTING IN THIS FILE FIXES THIS. There is no linker flag, no rustflag and
+# no linker choice that changes an argument-passing convention. It is a user
+# decision with exactly three options:
+#
+#   a. Raise the MSRV. The remedy is the c_variadic feature, which was
+#      confirmed marked stable on nightly 1.99 - newer than the mandated 1.75.
+#      Raising it means changing Cargo.toml's rust-version, clippy.toml's msrv
+#      and rust-toolchain.toml's channel together.
+#   b. Drop aarch64-apple-darwin from the target matrix.
+#   c. Accept that this one target's variadic entry points are unsupported, and
+#      say so.
+#
+# No workaround is attempted here, and no flag is added that would pretend to
+# address it. The triple is listed because the target matrix mandates it, not
+# because the variadic entry points are known good on it.
+
+# ---------------------------------------------------------------------------
+# Cross toolchain for the aarch64 Linux leg
+# ---------------------------------------------------------------------------
+#
+# Named because rust-toolchain.toml:124-129 records that this file carries "the
+# aarch64-linux-gnu-gcc linker and matching CC/CXX/AR", and because the ring
+# provider compiles C and assembly primitives through cc-rs: pinning ring is
+# what keeps this leg free of aws-lc-rs's vendored toolchain, but ring still
+# needs a working cross C compiler and archiver. Declaring them makes the cross
+# toolchain an input to the build rather than something cc-rs infers from a
+# target-prefix guess - the same principle that makes rust-toolchain.toml pin
+# an exact channel instead of trusting whatever compiler the machine has.
+#
+# These are per-target variable names, so they are inert for every other
+# triple, and they are not marked forced: an environment that already defines
+# one - a cross container, or `cross` itself - keeps its own value.
+#
+# All three were verified present in this environment at 15.2.0.
 [env]
 CC_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-gcc"
 CXX_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-g++"
 AR_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-ar"
-
-# NOTE: the libcurl.so.4 soname (derived from lib/Makefile.soname,
-# -version-info 12:0:8) is intentionally NOT set here. A rustflag in this file
-# would apply to every crate in the workspace, including the curl-rs binary.
-# It belongs to the cdylib only and is emitted by curl-rs-ffi/build.rs:
-#   println!("cargo:rustc-cdylib-link-arg=-Wl,--soname=libcurl.so.4");
-
-[net]
-retry = 3
-
-[term]
-progress.when = "never"

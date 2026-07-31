@@ -76,4 +76,26 @@ tests/ech-log/
 # Rust / Cargo build output. Cargo.lock is deliberately NOT ignored: it is
 # committed so the workspace builds reproducibly.
 /target
+# The same directory again, per crate, for the case of a member being built
+# on its own instead of through the workspace root.
+curl-rs-lib/target/
+curl-rs/target/
+curl-rs-ffi/target/
 **/*.rs.bk
+
+# Coverage output from cargo llvm-cov, which backs the line coverage gate on
+# the protocol and transfer modules.
+*.profraw
+*.profdata
+/lcov.info
+
+# cbindgen staging output on its way into include/curl/. The committed public
+# headers themselves are deliberately NOT ignored: they are the reviewed C ABI
+# contract that the docs/examples/ programs compile against, so they have to
+# stay tracked and reviewable.
+include/curl/*.new
+include/curl/*.tmp
+
+# Scratch file that .github/scripts/verify-examples.pl writes into the tree.
+# Anchored on purpose, so the tracked tests/cmake/test.c stays visible.
+/test.c

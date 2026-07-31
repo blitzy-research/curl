@@ -19,6 +19,11 @@ Example:
 Specify a single email address, username or mailing list name. Repeat this
 option several times to send to multiple recipients.
 
+This build performs no `SMTP` or `SMTPS` transfers. curl still parses and
+accepts this option, yet a transfer using either scheme fails with
+`CURLE_UNSUPPORTED_PROTOCOL`, and neither scheme appears in the `Protocols:`
+line of the --version output.
+
 When performing an address verification (**VRFY** command), the recipient
 should be specified as the username or username and domain (as per Section 3.5
 of RFC 5321). (Added in 7.34.0)

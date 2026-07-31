@@ -15,8 +15,8 @@ Example:
 
 # `--random-file`
 
-Deprecated option. This option is ignored (added in 7.84.0). Prior to that it
-only had an effect on curl if built to use old versions of OpenSSL.
+Deprecated option. This option is ignored (added in 7.84.0). The TLS
+implementation provides its own random data and consults no seed file.
 
-Specify the path name to file containing random data. The data may be used to
-seed the random engine for SSL connections.
+The argument is the path name to a file containing random data. The data was
+used to seed the random engine for SSL connections.

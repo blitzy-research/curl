@@ -10,6 +10,13 @@ This is an additional test suite using a combination of Apache httpd and
 nghttpx servers to perform various tests beyond the capabilities of the
 standard curl test suite.
 
+This suite drives the curl command-line binary externally rather than linking
+against the library, so it exercises whatever binary it is pointed at. The
+specified `Rust` command-line binary, `curl-rs`, therefore substitutes for the
+C binary without any change to this suite, to `conftest.py`, to the `testenv`
+package, to the server configuration or to any test case. The suite and its
+servers are retained unchanged.
+
 # Usage
 
 The test cases and necessary files are in `tests/http`. You can invoke
@@ -197,3 +204,57 @@ test uses that to reload `httpd` in the middle of the first request. A graceful
 reload in httpd lets ongoing requests finish, but closes the connection
 afterwards and tears down the serving process. The following request then needs
 to open a new connection. This is verified by the test case.
+
+## Notes on the specified Rust target
+
+### Byte-exact request comparison
+
+The standard curl test suite compares the request bytes a client sends against
+a literal expectation. In `tests/getpart.pm`, `sub compareparts` at lines
+351-357 joins each side into a single string and compares the two strings, so
+header order, header casing and header spacing are all significant. The only
+escape is the `%alternatives[a,b]` construct together with the `<strip>` and
+`<strippart>` rules, which are applied before the comparison. The `<protocol>`
+tag that carries these expectations is documented in
+[`FILEFORMAT`](FILEFORMAT.md).
+
+The specified HTTP/1.1 request writer in `curl-rs-lib` therefore owns
+request-line composition and header serialization itself, emitting headers in
+curl's exact order. The `hyper` `crate` is specified for connection
+management, keep-alive and framing. Header emission policy and ordering remain
+curl's own, and are specified to be reproduced by the `Rust` implementation
+rather than delegated.
+
+### HTTP/2 and HTTP/3 boundaries
+
+HTTP/2 is specified over the `h2` `crate`, with ALPN negotiated by rustls. The
+`h2` `crate` is declared alongside `hyper` because direct control of `SETTINGS`
+frames and flow-control windows is observable in the standard suite's
+expectations and is not reachable through the higher-level surface.
+
+HTTP/3 is specified over the `quinn` and `h3` `crates`, using the
+`AsyncUdpSocket` abstraction, and joins the same connection-filter chain that
+carries TLS and raw sockets. In the retained C tree HTTP/3 is already a
+connection filter: `lib/vquic/vquic.h` line 48 declares
+`extern struct Curl_cftype Curl_cft_http3;`. The specification preserves that
+arrangement rather than replacing it.
+
+The nghttpx server in this suite continues to provide the HTTP/3 endpoint. The
+`nghttpx` and `h3` availability tokens the harness recognizes describe the test
+servers, not the capabilities of the binary under test.
+
+### Certificate verification in this suite
+
+The `CurlClient` helper already adds the local CA to the command line so the
+connections to the test servers are verified, as documented above, and that
+arrangement is unaffected. For the specified target, rustls is the sole TLS
+implementation at every configuration, certificate validation is on by
+default, and `--insecure` emits a warning on stderr before proceeding.
+
+### What does not change
+
+The httpd and nghttpx server configuration, the `conftest.py` fixtures, the
+`testenv` package, the `--with-test-*` switches, the `mod_curltest` handlers,
+plus every test case in `tests/http`, are retained unchanged. A case that
+fails is evidence of a defect in the implementation under test, never a reason
+to edit the case or the server configuration.

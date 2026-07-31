@@ -21,6 +21,7 @@ Example:
 Set type of the provided client certificate. PEM, DER, ENG, PROV and P12 are
 recognized types.
 
-The default type depends on the TLS backend and is usually PEM. For Schannel
-it is P12. If --cert is a pkcs11: URI then ENG or PROV is the default type
-(depending on OpenSSL version).
+This build uses `PEM`, which is also the default. The certificate is read as
+`PEM`, so a `DER` certificate is not loaded. `ENG` and `PROV` depend on the
+OpenSSL engine or provider interface, which this build does not have. `P12` is
+specific to the native Windows TLS library, which this build does not use.

@@ -27,6 +27,12 @@ multipart/form-data according to RFC 2388.
 For SMTP and IMAP protocols, this composes a multipart mail message to
 transmit.
 
+This build performs no SMTP, SMTPS, IMAP or IMAPS transfers, and those schemes
+are absent from the `Protocols:` line in the --version output. curl parses the
+mail syntax described below and composes the multipart document from it, yet
+the transfer request then fails with `CURLE_UNSUPPORTED_PROTOCOL`. The HTTP
+and HTTPS multipart form behavior described on this page is fully supported.
+
 This enables uploading of binary files etc. To force the 'content' part to be
 a file, prefix the filename with an @ sign. To just get the content part from
 a file, prefix the filename with the symbol \<. The difference between @ and
