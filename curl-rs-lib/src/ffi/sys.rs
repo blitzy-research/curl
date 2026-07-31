@@ -1237,13 +1237,25 @@ pub(crate) mod memdebug {
         take_allocation(&LIMIT) && deny(func)
     }
 
-    /// Caps the number of allocations that will succeed.
+    /// The arming half of `curl_dbg_memlimit()` (`lib/memdebug.c:175-181`).
     ///
-    /// Reproduces `curl_dbg_memlimit()` (`lib/memdebug.c:175-181`), including its
-    /// one-shot behaviour: the C guards the whole body with `if(!memlimit)`, so a
-    /// second call is ignored. Returns whether this call took effect.
-    pub(crate) fn set_memlimit(allocations: u32) -> bool {
-        LIMIT
+    /// Returns whether this call took effect. The C guards the whole body with
+    /// `if(!memlimit)`, so only the first call arms the cap and every later one
+    /// is ignored -- including one asking for a zero cap. The compare-exchange
+    /// against [`NO_LIMIT`] says exactly that, and arming is one-shot by
+    /// construction, so nothing can disarm it again.
+    ///
+    /// Taken as a function over its counter rather than over the global, for the
+    /// same reason [`take_allocation`] is: it makes the one-shot semantics
+    /// testable without arming the process-wide cap. That matters more than it
+    /// looks. `curl-rs-lib/src/lib.rs` installs [`TrackingAllocator`] as the
+    /// `#[global_allocator]`, so arming [`LIMIT`] in a test would impose the cap
+    /// on the whole test binary: unrelated tests allocating in parallel spend
+    /// the counter, and every allocation after that is denied, which
+    /// `handle_alloc_error` turns into a process abort. Only production code may
+    /// arm the global, and `the_process_cap_starts_disarmed` guards that.
+    fn arm_cap(counter: &AtomicI64, allocations: u32) -> bool {
+        counter
             .compare_exchange(
                 NO_LIMIT,
                 i64::from(allocations),
@@ -1251,6 +1263,19 @@ pub(crate) mod memdebug {
                 Ordering::Relaxed,
             )
             .is_ok()
+    }
+
+    /// Caps the number of allocations that will succeed, process-wide.
+    ///
+    /// Reproduces `curl_dbg_memlimit()` (`lib/memdebug.c:175-181`). This is the
+    /// torture-mode entry point; it is one-shot, and there is deliberately no
+    /// way to disarm it, because the C offers none either.
+    ///
+    /// The behaviour itself is covered by [`arm_cap`]'s tests: arming the
+    /// process-wide counter from inside a test binary would deny that binary's
+    /// own allocations.
+    pub(crate) fn set_memlimit(allocations: u32) -> bool {
+        arm_cap(&LIMIT, allocations)
     }
 
     /// A `GlobalAlloc` that logs every operation in `memanalyzer.pm`'s format.
@@ -1528,15 +1553,65 @@ pub(crate) mod memdebug {
         }
 
         /// `curl_dbg_memlimit()` is one-shot (`lib/memdebug.c:177`).
+        ///
+        /// Exercised through [`arm_cap`] against a local counter rather than
+        /// through [`set_memlimit`] against [`LIMIT`]. That is deliberate and
+        /// it is not a weaker test: the two differ only in which counter they
+        /// address, and arming the real one here would be fatal. Arming is
+        /// one-shot, so nothing could disarm it again, and from that moment the
+        /// `#[global_allocator]` would deny the test binary's own allocations
+        /// once the cap ran out -- which `handle_alloc_error` reports by
+        /// aborting the process, taking every other test with it.
         #[test]
         fn the_process_cap_is_one_shot() {
-            assert!(set_memlimit(4));
-            assert!(!set_memlimit(9));
-            assert_eq!(LIMIT.load(Ordering::Relaxed), 4);
+            // Exercised over a LOCAL counter, never over the process-wide
+            // `LIMIT`. `set_memlimit` is the thin wrapper that applies this to
+            // the global, and arming the global here would abort the test
+            // binary -- see the reasoning on `arm_cap` and the guard below.
+            let counter = AtomicI64::new(NO_LIMIT);
 
-            // Leave the cap where the first call put it, exactly as the C would;
-            // no other test in this module reads it.
-            assert!(!set_memlimit(0));
+            assert!(arm_cap(&counter, 4), "the first call must arm the cap");
+            assert!(!arm_cap(&counter, 9), "a second call must be ignored");
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                4,
+                "the ignored call must not move the counter"
+            );
+
+            // A zero cap is refused like any other second call, so an armed
+            // counter can never be reset to "deny everything".
+            assert!(!arm_cap(&counter, 0), "still armed, so still ignored");
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                4,
+                "the refused zero cap must not move the counter"
+            );
+        }
+
+        /// No test may arm the process-wide cap, and a disarmed cap denies
+        /// nothing.
+        ///
+        /// A regression guard, not a property of the C. Because
+        /// `curl-rs-lib/src/lib.rs` installs [`TrackingAllocator`] as the
+        /// `#[global_allocator]` under this feature, an armed [`LIMIT`] applies
+        /// to the entire test binary: unrelated tests allocating in parallel
+        /// spend the counter, and the next allocation is denied and aborts the
+        /// process through `handle_alloc_error`. That failure is hard to
+        /// trace back to its cause, so this test names the cause once.
+        ///
+        /// The second assertion records the plain-`memdebug` guarantee: a
+        /// disarmed cap denies nothing until a torture run asks it to. Do not
+        /// delete either one as trivial.
+        #[test]
+        fn the_process_cap_starts_disarmed() {
+            assert_eq!(
+                LIMIT.load(Ordering::Relaxed),
+                NO_LIMIT,
+                "a test armed the process-wide allocation cap; only production \
+                 code may call set_memlimit(), because this allocator is the \
+                 global allocator and the cap would abort the test binary"
+            );
+            assert!(!take_allocation(&LIMIT), "a disarmed cap denies nothing");
         }
 
         /// The allocator round-trips every `GlobalAlloc` entry point under the

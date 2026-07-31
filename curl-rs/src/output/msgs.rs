@@ -211,7 +211,8 @@ const NEWLINE: &[u8] = b"\n";
 ///
 /// The two `curl` spellings inside the quotes are the program's own name and
 /// stay `curl` for the reason given in the module documentation.
-const HELP_TRY_TAIL: &str = "try 'curl --help' or 'curl --manual' for more information\n";
+const HELP_TRY_TAIL: &str =
+    "try 'curl --help' or 'curl --manual' for more information\n";
 
 /// The three gate inputs `src/tool_msgs.c` reads from the C `global` handle.
 ///
@@ -260,7 +261,11 @@ impl MsgConfig {
     /// Offered alongside the public fields because a positional call at the
     /// one place `main.rs` builds this is easier to keep correct than three
     /// separate assignments, and because it documents the intended order.
-    pub(crate) const fn new(silent: bool, show_error: bool, trace_enabled: bool) -> Self {
+    pub(crate) const fn new(
+        silent: bool,
+        show_error: bool,
+        trace_enabled: bool,
+    ) -> Self {
         Self {
             silent,
             show_error,
@@ -455,12 +460,16 @@ fn voutf_bytes_at_width(
     message: &[u8],
     termw: usize,
 ) -> io::Result<()> {
-    debug_assert!(
-        !message.contains(&b'\n'),
-        "voutf messages must not contain a newline: voutf inserts the line \
-         breaks itself (src/tool_msgs.c:45)"
-    );
-
+    // No newline assertion here. C's `DEBUGASSERT(!strchr(fmt, '\n'))` at
+    // `src/tool_msgs.c:45` runs BEFORE `curl_mvsnprintf` expands the format, so
+    // it constrains the format string only -- never the rendered message. A
+    // `%s` argument taken from `argv` may legitimately contain a newline, and
+    // C's `fwrite`/`fputs` write it through. `-F` reaches exactly that: the
+    // "garbage at end of field specification: %s" warning at
+    // `src/tool_formparse.c:877` reports the remainder of the user's argument
+    // verbatim. Asserting on the rendered bytes would abort a debug build on
+    // input the oracle accepts, so the check lives at the format level in
+    // [`voutf`] instead, which is where C has it.
     let prefix_bytes = prefix.as_bytes();
     let width = match termw.checked_sub(prefix_bytes.len()) {
         // `termw > prefw` in C, so an exact tie also takes the SIZE_MAX arm.
@@ -517,7 +526,11 @@ fn voutf_bytes_at_width(
 
 /// [`voutf_bytes_at_width`] with the width taken from the terminal, as
 /// `src/tool_msgs.c:42` does.
-fn voutf_bytes(sink: &mut dyn Write, prefix: &str, message: &[u8]) -> io::Result<()> {
+fn voutf_bytes(
+    sink: &mut dyn Write,
+    prefix: &str,
+    message: &[u8],
+) -> io::Result<()> {
     // `get_terminal_columns` returns C's `unsigned int`; the four mandated
     // targets are all 64-bit, so widening never loses a value.
     let termw = get_terminal_columns() as usize;
@@ -531,7 +544,23 @@ fn voutf_bytes(sink: &mut dyn Write, prefix: &str, message: &[u8]) -> io::Result
 /// that reports failure is not representable in C -- `%s` there reads a plain
 /// C string -- so a failure is ignored and whatever was rendered is emitted,
 /// which is also the more useful behaviour for a diagnostic channel.
-fn voutf(sink: &mut dyn Write, prefix: &str, args: fmt::Arguments<'_>) -> io::Result<()> {
+fn voutf(
+    sink: &mut dyn Write,
+    prefix: &str,
+    args: fmt::Arguments<'_>,
+) -> io::Result<()> {
+    // `:45` -- `DEBUGASSERT(!strchr(fmt, '\n'))`, on the FORMAT, before it is
+    // expanded: voutf inserts the line breaks itself. `Arguments::as_str`
+    // yields the literal exactly when there is nothing to interpolate, which is
+    // as much of the format string as Rust exposes at run time; when there are
+    // arguments the check is vacuous, and that is correct, because the
+    // interpolated values are not what C constrains.
+    debug_assert!(
+        !args.as_str().is_some_and(|format| format.contains('\n')),
+        "voutf formats must not contain a newline: voutf inserts the line \
+         breaks itself (src/tool_msgs.c:45)"
+    );
+
     let mut buffer = MessageBuffer::new();
     let _ = buffer.write_fmt(args);
     voutf_bytes(sink, prefix, buffer.as_bytes())
@@ -564,7 +593,11 @@ fn voutf(sink: &mut dyn Write, prefix: &str, args: fmt::Arguments<'_>) -> io::Re
 ///
 /// The message is wrapped by [`voutf`] and truncated to
 /// [`MSG_TEXT_CAPACITY`].
-pub(crate) fn notef(sink: &mut dyn Write, config: &MsgConfig, args: fmt::Arguments<'_>) {
+pub(crate) fn notef(
+    sink: &mut dyn Write,
+    config: &MsgConfig,
+    args: fmt::Arguments<'_>,
+) {
     if config.trace_enabled {
         let _ = voutf(sink, NOTE_PREFIX, args);
     }
@@ -584,7 +617,11 @@ pub(crate) fn notef(sink: &mut dyn Write, config: &MsgConfig, args: fmt::Argumen
 ///
 /// The message is wrapped by [`voutf`] and truncated to
 /// [`MSG_TEXT_CAPACITY`].
-pub(crate) fn warnf(sink: &mut dyn Write, config: &MsgConfig, args: fmt::Arguments<'_>) {
+pub(crate) fn warnf(
+    sink: &mut dyn Write,
+    config: &MsgConfig,
+    args: fmt::Arguments<'_>,
+) {
     if !config.silent {
         let _ = voutf(sink, WARN_PREFIX, args);
     }
@@ -603,7 +640,11 @@ pub(crate) fn warnf(sink: &mut dyn Write, config: &MsgConfig, args: fmt::Argumen
 ///
 /// Identical to [`warnf`] in every other respect -- same prefix, same
 /// `!silent` gate, same wrapping, same [`MSG_TEXT_CAPACITY`] truncation.
-pub(crate) fn warnf_bytes(sink: &mut dyn Write, config: &MsgConfig, message: &[u8]) {
+pub(crate) fn warnf_bytes(
+    sink: &mut dyn Write,
+    config: &MsgConfig,
+    message: &[u8],
+) {
     if !config.silent {
         let _ = voutf_bytes(sink, WARN_PREFIX, message);
     }
@@ -639,7 +680,10 @@ pub(crate) fn helpf(sink: &mut dyn Write, args: Option<fmt::Arguments<'_>>) {
 
 /// The fallible core of [`helpf`], separated so the tests can assert that both
 /// halves are written and that a failure propagates instead of being retried.
-fn helpf_into(sink: &mut dyn Write, args: Option<fmt::Arguments<'_>>) -> io::Result<()> {
+fn helpf_into(
+    sink: &mut dyn Write,
+    args: Option<fmt::Arguments<'_>>,
+) -> io::Result<()> {
     // `:109` -- the message is emitted only when there is one.
     if let Some(args) = args {
         // Rendered rather than streamed so that `:112`'s own `DEBUGASSERT` has
@@ -683,9 +727,41 @@ fn helpf_into(sink: &mut dyn Write, args: Option<fmt::Arguments<'_>>) -> io::Res
 ///
 /// The message is wrapped by [`voutf`] and truncated to
 /// [`MSG_TEXT_CAPACITY`].
-pub(crate) fn errorf(sink: &mut dyn Write, config: &MsgConfig, args: fmt::Arguments<'_>) {
+pub(crate) fn errorf(
+    sink: &mut dyn Write,
+    config: &MsgConfig,
+    args: fmt::Arguments<'_>,
+) {
     if !config.silent || config.show_error {
         let _ = voutf(sink, ERROR_PREFIX, args);
+    }
+}
+
+/// [`errorf`] for a message that is already a byte string.
+///
+/// The `errorf` counterpart of [`warnf_bytes`], added for the same reason and
+/// with the same restriction on its use: C renders `%s` from a `char *`, so a
+/// path that is not valid UTF-8 reaches the terminal as the bytes the operating
+/// system gave us, while Rust's `Display` route through `Path::display` would
+/// substitute U+FFFD instead. That is a change to the emitted bytes and
+/// therefore not available under AAP section 0.8.1. Callers holding an `OsStr`
+/// or a `Vec<u8>` use this and stay faithful.
+///
+/// [`crate::output::dirhie`] is the in-crate caller. All six frozen messages of
+/// `show_dir_errno` (`src/tool_dirhie.c:36-71`) substitute a filesystem path --
+/// an arbitrary byte string on Unix -- and every one of them goes through
+/// `errorf` in C.
+///
+/// Identical to [`errorf`] in every other respect: same [`ERROR_PREFIX`], same
+/// `!silent || show_error` gate of `src/tool_msgs.c:131`, same wrapping, same
+/// [`MSG_TEXT_CAPACITY`] truncation.
+pub(crate) fn errorf_bytes(
+    sink: &mut dyn Write,
+    config: &MsgConfig,
+    message: &[u8],
+) {
+    if !config.silent || config.show_error {
+        let _ = voutf_bytes(sink, ERROR_PREFIX, message);
     }
 }
 
@@ -738,7 +814,11 @@ pub(crate) fn errorf(sink: &mut dyn Write, config: &MsgConfig, args: fmt::Argume
 /// * This function only warns. It never changes a default: AAP section 0.8.1
 ///   freezes "default option values, including the default-on state of
 ///   certificate verification".
-pub(crate) fn warn_insecure(sink: &mut dyn Write, config: &MsgConfig, option: &str) {
+pub(crate) fn warn_insecure(
+    sink: &mut dyn Write,
+    config: &MsgConfig,
+    option: &str,
+) {
     warnf(
         sink,
         config,
@@ -864,7 +944,9 @@ mod tests {
         output
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
-            .map(|line| line.strip_prefix(prefix.as_bytes()).unwrap_or(line).len())
+            .map(|line| {
+                line.strip_prefix(prefix.as_bytes()).unwrap_or(line).len()
+            })
             .collect()
     }
 
@@ -874,7 +956,8 @@ mod tests {
     /// the ambient `COLUMNS`, which `get_terminal_columns` reads.
     fn wrap(prefix: &str, message: &str, termw: usize) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
-        let result = voutf_bytes_at_width(&mut out, prefix, message.as_bytes(), termw);
+        let result =
+            voutf_bytes_at_width(&mut out, prefix, message.as_bytes(), termw);
         assert!(result.is_ok(), "the wrapper must not fail on a Vec sink");
         out
     }
@@ -1134,19 +1217,32 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "must not contain a newline")]
-    fn a_newline_in_the_message_trips_the_debug_assertion() {
-        // src/tool_msgs.c:45 `DEBUGASSERT(!strchr(fmt, '\n'))`.
+    fn a_newline_in_the_format_trips_the_debug_assertion() {
+        // src/tool_msgs.c:45 `DEBUGASSERT(!strchr(fmt, '\n'))` -- on `fmt`,
+        // before expansion. `format_args!` with no interpolation is the one
+        // shape where Rust can still see the literal.
         let mut out: Vec<u8> = Vec::new();
-        let _ = voutf_bytes_at_width(&mut out, WARN_PREFIX, b"a\nb", 79);
+        let _ = voutf(&mut out, WARN_PREFIX, format_args!("a\nb"));
     }
 
     #[test]
-    #[cfg(not(debug_assertions))]
-    fn a_newline_in_the_message_is_written_verbatim_in_release() {
-        // Release builds compile the assertion out, and C's fwrite/fputs
-        // write the byte through, so the emission stays well defined.
-        let out = wrap(WARN_PREFIX, "a\nb", 79);
+    fn a_newline_in_an_interpolated_value_is_written_verbatim() {
+        // C asserts on the format, not on the expansion, and its fwrite/fputs
+        // write the byte through. `-F 'f=v;type=a/b<newline>tail'` reaches this
+        // through `src/tool_formparse.c:877`, so a message-level assertion
+        // would abort a debug build on input the oracle accepts.
+        let value = "a\nb";
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = voutf(&mut out, WARN_PREFIX, format_args!("{value}"));
+        assert!(outcome.is_ok());
         assert_eq!(String::from_utf8_lossy(&out), "Warning: a\nb\n");
+
+        // And the byte-oriented entry point, which has no format at all.
+        let mut bytes: Vec<u8> = Vec::new();
+        let outcome =
+            voutf_bytes_at_width(&mut bytes, WARN_PREFIX, b"a\nb", 79);
+        assert!(outcome.is_ok());
+        assert_eq!(String::from_utf8_lossy(&bytes), "Warning: a\nb\n");
     }
 
     // -- voutf: error propagation -----------------------------------------
@@ -1168,7 +1264,12 @@ mod tests {
     #[test]
     fn a_write_failure_propagates_out_of_the_wrapper() {
         let long = "q".repeat(500);
-        let result = voutf_bytes_at_width(&mut FailingSink, WARN_PREFIX, long.as_bytes(), 40);
+        let result = voutf_bytes_at_width(
+            &mut FailingSink,
+            WARN_PREFIX,
+            long.as_bytes(),
+            40,
+        );
         assert!(result.is_err());
     }
 
@@ -1391,7 +1492,9 @@ mod tests {
             warn_insecure(&mut out, &MsgConfig::default(), flag);
             assert_eq!(
                 String::from_utf8_lossy(&out),
-                format!("Warning: using --{flag} makes the transfer insecure\n")
+                format!(
+                    "Warning: using --{flag} makes the transfer insecure\n"
+                )
             );
         }
     }
@@ -1401,7 +1504,11 @@ mod tests {
         // Documented consequence of routing through warnf, recorded so the
         // integration test knows not to pass --silent.
         let mut muted: Vec<u8> = Vec::new();
-        warn_insecure(&mut muted, &MsgConfig::new(true, true, true), "insecure");
+        warn_insecure(
+            &mut muted,
+            &MsgConfig::new(true, true, true),
+            "insecure",
+        );
         assert!(muted.is_empty());
     }
 
@@ -1426,7 +1533,11 @@ mod tests {
         // src/tool_stderr.c:44-47. Oracle: `--stderr -` puts diagnostics on
         // stdout and leaves the process stderr empty.
         let mut sink = MessageSink::init();
-        set_stderr_file(&mut sink, &MsgConfig::default(), Some(OsStr::new("-")));
+        set_stderr_file(
+            &mut sink,
+            &MsgConfig::default(),
+            Some(OsStr::new("-")),
+        );
         assert!(matches!(sink, MessageSink::Stdout(_)));
     }
 
@@ -1436,7 +1547,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("--");
         let mut sink = MessageSink::init();
-        set_stderr_file(&mut sink, &MsgConfig::default(), Some(path.as_os_str()));
+        set_stderr_file(
+            &mut sink,
+            &MsgConfig::default(),
+            Some(path.as_os_str()),
+        );
         assert!(matches!(sink, MessageSink::File(_)));
     }
 
@@ -1448,7 +1563,11 @@ mod tests {
         let path = dir.path().join("diagnostics.txt");
 
         let mut sink = MessageSink::init();
-        set_stderr_file(&mut sink, &MsgConfig::default(), Some(path.as_os_str()));
+        set_stderr_file(
+            &mut sink,
+            &MsgConfig::default(),
+            Some(path.as_os_str()),
+        );
         assert!(matches!(sink, MessageSink::File(_)));
 
         errorf(&mut sink, &MsgConfig::default(), format_args!("(37) oops"));
@@ -1464,10 +1583,15 @@ mod tests {
     fn an_existing_target_is_truncated_like_fopen_w_does() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("diagnostics.txt");
-        std::fs::write(&path, b"stale contents that must not survive").expect("seed the file");
+        std::fs::write(&path, b"stale contents that must not survive")
+            .expect("seed the file");
 
         let mut sink = MessageSink::init();
-        set_stderr_file(&mut sink, &MsgConfig::default(), Some(path.as_os_str()));
+        set_stderr_file(
+            &mut sink,
+            &MsgConfig::default(),
+            Some(path.as_os_str()),
+        );
         drop(sink);
 
         let written = std::fs::read(&path).expect("the redirected file");
@@ -1485,7 +1609,11 @@ mod tests {
         // are assertable; the redirect decision is what is under test.
         let mut captured: Vec<u8> = Vec::new();
         let mut sink = MessageSink::init();
-        set_stderr_file(&mut sink, &MsgConfig::default(), Some(path.as_os_str()));
+        set_stderr_file(
+            &mut sink,
+            &MsgConfig::default(),
+            Some(path.as_os_str()),
+        );
         // The channel must be unchanged after a failure.
         assert!(matches!(sink, MessageSink::Stderr(_)));
 

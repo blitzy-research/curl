@@ -17,3 +17,9 @@ Example:
 
 Pass on names of multipart form fields and files using backslash-escaping
 instead of percent-encoding.
+
+This build performs no SMTP, SMTPS, IMAP or IMAPS transfers, and those schemes
+are absent from the `Protocols:` line in the --version output. curl accepts
+this option and applies the backslash-escaping to the composed MIME part, yet
+an SMTP or IMAP transfer then fails with `CURLE_UNSUPPORTED_PROTOCOL`; HTTP
+and HTTPS multipart form use is fully supported.

@@ -15,6 +15,11 @@ Example:
 
 # `--mail-rcpt-allowfails`
 
+This build performs no `SMTP` or `SMTPS` transfers. curl still parses and
+accepts this option, yet a transfer using either scheme fails with
+`CURLE_UNSUPPORTED_PROTOCOL`, and neither scheme appears in the `Protocols:`
+line of the --version output.
+
 When sending data to multiple recipients, by default curl aborts SMTP
 conversation if at least one of the recipients causes RCPT TO command to
 return an error.

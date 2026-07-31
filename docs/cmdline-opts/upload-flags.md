@@ -23,3 +23,8 @@ by prepending them with a '-' character. Currently the following
 flag values are accepted: answered, deleted, draft, flagged, and
 seen. The currently accepted flag values are used to set flags on
 IMAP uploads.
+
+This build performs no IMAP or IMAPS transfers. curl accepts this
+option and parses its flag list, yet a transfer using either
+scheme fails with `CURLE_UNSUPPORTED_PROTOCOL`, and the
+`Protocols:` line in the --version output names neither scheme.

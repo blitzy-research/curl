@@ -10,6 +10,36 @@ Client writers is a design in the internals of libcurl, not visible in its
 public API. They were started in curl v8.5.0. This document describes the
 concepts, its high level implementation and the motivations.
 
+The C implementation is the reference oracle for this design. `lib/sendf.c`
+holds the writer chain, `lib/cw-out.c` the client writer at the end of it and
+the buffering that writer performs, `lib/cw-pause.c` the pause handling and
+`lib/content_encoding.c` the decoders. Those four files define the behavior
+that the migration preserves. The contract below is restated explicitly
+because it is precisely what the successor described at the end of this page
+maps one for one, rather than reinterprets.
+
+- **Header and body ordering is observable.** The application sees headers
+  before the body they belong to, and it sees them in the order they arrived.
+  Interleaving or reordering them changes behavior.
+- **The type bits are part of the contract.** Whether a write is a body, a
+  header, an informational header, a status line, a CONNECT response, a 1xx
+  response or a trailer decides which application callback receives it, and
+  whether it is written at all.
+- **`CLIENTWRITE_BODY` and `CLIENTWRITE_HEADER` are mutually exclusive**, and
+  the remaining bits only qualify `CLIENTWRITE_HEADER`.
+- **Phase ordering is behavioral.** The protocol length check happens before
+  content decoding, which makes the compared length the length received and
+  not the length after decoding. Moving that check produces different errors
+  on the same input.
+- **Write chopping is observable.** A write larger than the maximum documented
+  for `CURLOPT_WRITEFUNCTION` is split, and the application therefore sees a
+  particular sequence of callback invocations.
+- **Pausing is observable and must not lose bytes.** When an application
+  callback returns `CURL_WRITEFUNC_PAUSE`, the bytes already produced are held
+  and then delivered in the same order once the transfer is unpaused. That
+  buffering is why `lib/cw-out.c` and `lib/cw-pause.c` exist as separate
+  concerns.
+
 ## Naming
 
 `libcurl` operates between clients and servers. A *client* is the application
@@ -166,3 +196,116 @@ implementations.
 Having a writer chain as implementation allows protocol handlers with extra
 needs, like HTTP, to add to this for special behavior. The common way of
 writing the actual response data stays the same.
+
+## The specified `Rust` successor
+
+The migration to the three-`crate` `Rust` `workspace` specifies successors to
+the four C files named at the top of this page. No `Rust` source file exists
+in the tree, so every path below is specified target state, while those C
+files remain the reference oracle at runtime.
+
+- `curl-rs-lib/src/transfer/writeout.rs` succeeds `lib/cw-out.c` and
+  `lib/cw-pause.c`: the client writer at the end of the chain, together with
+  the pause handling.
+- `curl-rs-lib/src/transfer/sendf.rs` succeeds `lib/sendf.c`: the shared send
+  and write plumbing that builds the chain and drives it.
+- `curl-rs-lib/src/transfer/content_encoding.rs` succeeds
+  `lib/content_encoding.c`: the content coding decoders.
+- On the tool side, `curl-rs/src/callbacks/write.rs` succeeds
+  `src/tool_cb_wrt.c`, `curl-rs/src/callbacks/header.rs` succeeds
+  `src/tool_cb_hdr.c` and `curl-rs/src/callbacks/debug.rs` succeeds
+  `src/tool_cb_dbg.c`. Those three hold the callbacks that the curl tool
+  installs, which puts them at the client end of everything described above.
+
+One name invites confusion and is worth separating out here.
+`curl-rs/src/output/writeout.rs` is the specified successor to
+`src/tool_writeout.c` and `src/tool_writeout_json.c`, which format the
+`--write-out` report once a transfer has finished. Despite the similar
+filename it is a **different** concern from the client writer chain:
+`curl-rs-lib/src/transfer/writeout.rs` is the chain, and
+`curl-rs/src/output/writeout.rs` is the report.
+
+Each part of the contract stated near the top of this page maps across as
+follows.
+
+- **The writer type becomes a trait.** `struct Curl_cwtype` is a name plus a
+  table of function pointers, which is the strategy pattern written without
+  language support for it. The specified design expresses it as a trait that
+  each stage implements, so `do_init`, `do_write` and `do_close` become
+  methods on that trait. The `next` pointer of `struct Curl_cwriter` becomes
+  an owned chain of boxed trait objects: a stage owns its successor, and the
+  chain is released with the transfer that holds it.
+- **The phase enumeration is preserved as an explicit ordered enumeration**,
+  with the insertion rule described above intact. The protocol length check
+  stays at `CURL_CW_PROTOCOL`, ahead of `CURL_CW_CONTENT_DECODE`, and that
+  ordering is a deliberate constraint rather than an accident of the C code: a
+  check placed behind the decoders compares the decoded length instead of the
+  received one, which changes the error that a truncated compressed response
+  produces.
+- **The type bits are preserved as an explicit set of flags.** Their numeric
+  shape matters wherever it crosses the public C ABI, so those values stay
+  pinned in `curl-rs-ffi`. Inside `curl-rs-lib` the same distinctions travel
+  in a typed value, which turns the mutual exclusivity of body and header
+  into a property of the type rather than a convention that every caller has
+  to keep.
+- **Header and body ordering is preserved.** The fixture corpus compares
+  emitted bytes against a literal expectation, header order included, which is
+  why the specified module for HTTP/1.1 at
+  `curl-rs-lib/src/protocols/http1.rs` owns request line composition and
+  header emission itself instead of delegating them to the `hyper` `crate`.
+  The writer side is the mirror of that: what the application observes arrives
+  in exactly the order it was received, with headers ahead of the body they
+  belong to.
+- **Pausing keeps its buffering.** The held bytes become an owned buffer,
+  `bytes::BytesMut` or `Vec<u8>`, so the length and capacity bookkeeping that
+  `lib/cw-out.c` performs by hand is carried by the type instead. The two
+  buffer modules that those C files build on are described in
+  [dynbuf](DYNBUF.md) and [bufq](BUFQ.md). Ordering across a pause does not
+  change: what was held is played back to the callbacks in the order it
+  arrived, with body and header buffers interleaved exactly as they were
+  produced. The pause state is owned by the transfer rather than reached for
+  through a shared mutable structure declared in `lib/urldata.h`.
+- **Write chopping is preserved.** A write larger than the maximum documented
+  for `CURLOPT_WRITEFUNCTION` is still split at that boundary, because the
+  resulting sequence of callback invocations is observable.
+- **The decoders change implementation, not behavior.** `gzip` and `deflate`
+  map to the `flate2` `crate`, `br` to the `brotli` `crate` and `zstd` to the
+  `zstd` `crate`, in place of the C libraries that `lib/content_encoding.c`
+  calls. What stays fixed is the observable part: the coding names accepted,
+  the `x-gzip` alias and the `identity` and `none` spellings among them; the
+  order the decoders are applied in, which follows the order of the header
+  value; the ceiling on how many of them may be stacked; and the errors
+  produced on malformed input, `CURLE_BAD_CONTENT_ENCODING` among them. The
+  matching `Cargo` features are `gzip`, `brotli` and `zstd`.
+- **Progress accounting moves with the download writer.** The counters that
+  the `"download"` writer updates are specified to live in
+  `curl-rs-lib/src/transfer/progress.rs`, with the rate limiting that reads
+  those same counters at `curl-rs-lib/src/transfer/ratelimit.rs`. See
+  [Rate Limiting Transfers](RATELIMITS.md).
+
+`#![forbid(unsafe_code)]` is specified at the root of `curl-rs-lib` and at the
+root of `curl-rs`, with a single narrowly allowed island under
+`curl-rs-lib/src/ffi/` for the operating system calls that have no safe
+expression, and a mandatory `// SAFETY:` comment on every `unsafe` block
+there. The writer chain has no business in that island: holding bytes and
+handing them to a callback asks for nothing that the safe subset does not
+already offer.
+
+The application callbacks are reached across the public C ABI in
+`curl-rs-ffi`, and that is where the pointer and length contract with the
+caller is kept, exactly as `CURLOPT_WRITEFUNCTION` and
+`CURLOPT_HEADERFUNCTION` document it. The value a callback returns is part of
+that same contract, `CURL_WRITEFUNC_PAUSE` included, which is the reason
+pausing is treated here as behavior visible across the ABI rather than as an
+internal convenience.
+
+One point in the retained text above deserves a note so that it is not
+misread. The bits that refine `CLIENTWRITE_HEADER` are described there as
+used by HTTP and related protocols, RTSP and WebSocket among them. WebSocket
+is in scope, and its specified successor to `lib/ws.c` is
+`curl-rs-lib/src/protocols/ws.rs`. RTSP is not in scope: it is one of the 24
+schemes that route to `curl-rs-lib/src/protocols/stub.rs`, which returns
+`CURLE_UNSUPPORTED_PROTOCOL`, and it is withheld from the protocol banner
+that `curl --version` prints, so its fixtures skip rather than fail. The nine
+schemes that carry transfers are FILE, FTP, FTPS, HTTP, HTTPS, SCP, SFTP, WS
+and WSS.

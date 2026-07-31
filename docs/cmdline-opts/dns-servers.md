@@ -19,6 +19,10 @@ Example:
 
 # `--dns-servers`
 
-Set the list of DNS servers to be used instead of the system default. The list
-of IP addresses should be separated with commas. Port numbers may also
-optionally be given, appended to the IP address separated with a colon.
+Specify the list of DNS servers to use instead of the system default. The
+argument is a list of IP addresses separated with commas. Port numbers may
+also optionally be given, appended to the IP address separated with a colon.
+
+This build resolves names with the system resolver and does not use c-ares, so
+this option is accepted and has no effect. To send name resolution over
+DNS-over-HTTPS to a server of your choosing, consider the --doh-url option.

@@ -1,0 +1,370 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Validation gate 2 of the ten that guard the Rust workspace: LINT.
+#
+# This workflow runs `cargo clippy` with warnings denied, and it runs
+# `cargo fmt --check`. It does nothing else. The build lives in
+# rust-build.yml, the tests in rust-test.yml, coverage in rust-coverage.yml,
+# undefined behaviour in rust-miri.yml, the sanitizer in rust-asan.yml, symbol
+# and header parity in rust-abi.yml, supply chain in rust-audit.yml, and the
+# curl fixture corpus in curl-testsuite.yml. One workflow per validation gate,
+# so that a failure names its own cause.
+#
+# That last sentence is the entire reason this file is separate rather than a
+# job inside rust-build.yml: lint cleanliness is a merge gate, and it runs as
+# its own workflow so that a lint failure names itself rather than hiding
+# inside a build log. Folding it into the build would put a clippy diagnostic
+# and a genuine compilation error behind the same red cross.
+#
+# LINEAGE. This file is the successor to exactly ONE job: the `checksrc` job
+# of the deleted .github/workflows/checksrc.yml, whose sole substantive step
+# ran scripts/checksrc-all.pl. That was the C style and correctness linter;
+# clippy and rustfmt are its Rust replacement. Two details of the inheritance
+# are worth writing down:
+#
+#   scripts/checksrc.pl enforced a 79-column limit (`my $max_column = 79`)
+#   among many other C-specific rules. Its Rust successor is not a rule in
+#   this file but the `max_width` setting in rustfmt.toml, which the rustfmt
+#   step below enforces.
+#
+#   scripts/checksrc.pl itself MUST REMAIN ON DISK even though
+#   scripts/checksrc-all.pl is superseded, because
+#   .github/scripts/verify-examples.pl hardcodes `./scripts/checksrc.pl` and
+#   checkdocs.yml still invokes verify-examples.pl. This workflow neither runs
+#   that script nor removes it.
+#
+# checksrc.yml's other four jobs - `linters`, `complexity`, `xmllint` and
+# `miscchecks`, fifteen distinct checks including `reuse lint`, codespell,
+# typos, actionlint, zizmor, shellcheck, yamlcheck, spacecheck and badwords -
+# were relocated to .github/workflows/hygiene.yml, NOT here. Duplicating any
+# of them in this file would create two owners for one check and break the
+# one-gate-per-workflow property that the paragraph above depends on.
+#
+# WHAT THIS GATE CONTRIBUTES TO THE SAFETY INVARIANT. `#![forbid(unsafe_code)]`
+# at the root of curl-rs-lib and curl-rs is enforced by rustc itself, so a
+# violation of it is a compilation error and rust-build.yml is where it is
+# owned. Measured, so that the division of labour is stated accurately rather
+# than assumed: clippy stops on it too, because clippy-driver wraps rustc and
+# inherits its lints - a stray `unsafe` block in curl-rs-lib reports here as
+# `error: usage of an unsafe block`. That overlap is harmless and this gate
+# does not rely on it. Clippy's own contribution is the hygiene around the one
+# sanctioned unsafe island: `clippy::undocumented_unsafe_blocks` mechanises the
+# requirement that every `unsafe` block in curl-rs-lib/src/ffi/{mod,sys,gss}.rs
+# and in curl-rs-ffi carries a `// SAFETY:` comment. Whether that lint is
+# enabled is clippy.toml and crate-attribute territory and is owned elsewhere;
+# what this file must do is never weaken `-D warnings` in a way that would
+# demote it. Hence no `--cap-lints`, no `continue-on-error` and no `if:`
+# condition on any step below.
+
+name: 'Rust lint'
+
+'on':
+  push:
+    branches:
+      - master
+      - '*/ci'
+    # A deny-list, deliberately, and never a `paths:` allow-list. checkdocs.yml
+    # uses an allow-list restricted to documentation paths, which is exactly
+    # why the hygiene jobs could not be folded into it: an allow-list here
+    # would have to name Cargo.toml, clippy.toml, rustfmt.toml,
+    # rust-toolchain.toml and every source path in three crates, and the day
+    # somebody forgot one is the day unlinted code merged without this gate
+    # ever firing. The four entries below are the ones the C build workflows
+    # ignore; `projects/**` holds the OS400, Windows and VMS project files,
+    # which are out of scope for this migration entirely and cannot affect a
+    # Rust lint.
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # Colour off, and not for tidiness. The rustfmt step parses tool output with
+  # grep to decide whether rustfmt rejected a configuration option; an ANSI
+  # escape sequence embedded in a diagnostic would make an anchored pattern
+  # silently stop matching, and an assertion that silently stops matching is
+  # worse than no assertion at all.
+  CARGO_TERM_COLOR: never
+
+  # This job resolves and downloads the locked dependency graph. A transient
+  # registry hiccup should retry, not fail the lint gate and send somebody
+  # looking for a clippy finding that is not there.
+  CARGO_NET_RETRY: '3'
+
+  # Incremental state is never restored between runs here - no cache is
+  # loaded - so it is output that nothing ever reads. This is not a speed
+  # tuning; performance is an explicit non-goal of this work and no step
+  # below is ordered or configured for it.
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  clippy:
+    name: 'clippy + rustfmt'
+
+    # ubuntu-latest rather than the leaner ubuntu-slim used by the C source
+    # checks. clippy is a full type-check of the workspace and of all 300-odd
+    # crates beneath it, which needs a general-purpose runner; ubuntu-slim
+    # suited scripts/checksrc-all.pl because that was a Perl pass over text.
+    runs-on: ubuntu-latest
+
+    # A single job, and no matrix. Clippy findings here are target-independent:
+    # the workspace has no `#[cfg(target_arch)]`-gated lint surface that a
+    # second triple would reach, and gate 2 names no matrix. The four-target
+    # compilation matrix belongs to rust-build.yml, which is where a
+    # target-specific defect must surface. One job, one gate, one cause. Were a
+    # matrix ever added here, `fail-fast: false` would be mandatory - every
+    # matrix in this repository carries it - because a lint gate that cancels
+    # its siblings on the first failure hides the rest of the findings.
+    #
+    # 20 minutes. The tree's common values are 5, 10 and 15, and this job is
+    # heavier than any of them: it type-checks the whole workspace twice, once
+    # for the default target set and once for `--all-targets`, after fetching
+    # the locked graph. 20 leaves headroom on a cold cache. A timeout must not
+    # be the thing that fails a lint gate.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'toolchain versions'
+        run: |
+          # Evidence before use. Every claim this workflow makes downstream is
+          # a statement about which toolchain produced it, so the versions are
+          # printed before anything is judged by them.
+          echo '::group::rust toolchain'
+          command -v rustc
+          command -v cargo
+          rustc --version
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
+          echo '::endgroup::'
+
+          # Nothing installs a toolchain or a component here, and that is
+          # deliberate. rust-toolchain.toml pins an exact stable channel and
+          # names rustfmt, clippy and llvm-tools-preview among its components;
+          # rustup honours all of it on the first `cargo` invocation. A
+          # `rustup component add clippy` in this file would only create a way
+          # for the two to disagree. The four `cargo` and `rustc` calls above
+          # having succeeded is itself the proof that the components resolved.
+          echo '::group::rust-toolchain.toml (the pin this leg honours)'
+          grep -v -E '^(#|$)' rust-toolchain.toml
+          echo '::endgroup::'
+
+          # The two configuration files this gate exists to enforce, printed
+          # so that a reader of the log can see what the verdict was passed on.
+          echo '::group::clippy.toml (validated by the clippy steps below)'
+          grep -v -E '^(#|$)' clippy.toml
+          echo '::endgroup::'
+          echo '::group::rustfmt.toml (validated by the rustfmt step below)'
+          grep -v -E '^(#|$)' rustfmt.toml
+          echo '::endgroup::'
+
+      - name: 'assert: the pinned stable toolchain is the active one'
+        run: |
+          # Nightly is deliberately absent from rust-toolchain.toml: the Miri
+          # and AddressSanitizer gates need it and install it for themselves in
+          # rust-miri.yml and rust-asan.yml. This gate must run on the pinned
+          # stable channel, and the assertion below is what says so out loud
+          # rather than trusting that no `+nightly` crept into a step.
+          #
+          # It matters for correctness, not only for tidiness. rustfmt silently
+          # ACCEPTS a nightly-only configuration key on nightly and only warns
+          # about it on stable, so the channel determines what the rustfmt step
+          # below is actually able to detect.
+          pinned="$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          if [ -z "${pinned}" ]; then
+            echo 'FAIL: rust-toolchain.toml declares no [toolchain] channel'
+            exit 1
+          fi
+          case "${pinned}" in
+            nightly*|beta*)
+              echo "FAIL: rust-toolchain.toml pins ${pinned}."
+              echo 'This gate runs on the pinned stable channel; nightly belongs to rust-miri.yml and rust-asan.yml.'
+              exit 1
+              ;;
+          esac
+          if rustc --version | grep -q -E 'nightly|beta'; then
+            echo 'FAIL: the active rustc is a nightly or beta build, but this gate requires the pinned stable channel'
+            rustc --version
+            exit 1
+          fi
+          active="$(rustc --version | awk '{ print $2 }')"
+          case "${pinned}" in
+            [0-9]*)
+              if [ "${active}" != "${pinned}" ]; then
+                echo "FAIL: rustc reports ${active}, but rust-toolchain.toml pins the exact version ${pinned}."
+                echo 'An exact pin is honoured by rustup on the first cargo invocation, so a mismatch means'
+                echo 'something in this job overrode the toolchain. Find and remove the override.'
+                exit 1
+              fi
+              echo "rustc ${active} matches the exact pin in rust-toolchain.toml"
+              ;;
+            *)
+              echo "rust-toolchain.toml pins the ${pinned} channel; the active rustc is ${active}"
+              ;;
+          esac
+
+      - name: 'fetch the locked dependency graph'
+        run: |
+          # Its own step, so that a registry or network failure is reported as
+          # a fetch failure instead of arriving disguised as a clippy failure.
+          # That is the same attribution argument that put this gate in its own
+          # workflow, applied one level down.
+          #
+          # --locked because Cargo.lock is committed and reproducible builds
+          # are non-negotiable. It makes a lockfile that disagrees with the
+          # manifests fail loudly here rather than be silently regenerated
+          # under the gate - and every cargo invocation in this file that reads
+          # the lockfile carries it, for the same reason. `cargo fmt` does not
+          # resolve dependencies, so the flag is not applicable there and is
+          # correctly absent from that step.
+          cargo fetch --locked
+
+      - name: 'clippy: cargo clippy --workspace -- -D warnings'
+        run: |
+          # Gate 2, verbatim, with --locked added.
+          #
+          # -D warnings goes on the COMMAND LINE, after `--`, and nowhere else.
+          # It must never be set in a repo-wide RUSTFLAGS or in
+          # .cargo/config.toml: `rustflags` participate in cargo's fingerprint,
+          # so a global -D warnings would force a full rebuild between the
+          # build leg and this one and would destroy per-gate attribution by
+          # turning every other workflow's warnings into errors too. Neither
+          # the workspace manifest nor any member manifest declares a [lints]
+          # table either, which means this command line is the ONLY mechanism
+          # that denies warnings anywhere in the workspace. Weakening it
+          # weakens the whole invariant.
+          #
+          # This is also the step that validates clippy.toml. An unknown key in
+          # clippy.toml is a HARD ERROR rather than a warning - clippy refuses
+          # to start, reporting `error reading Clippy's configuration file:
+          # unknown field ...` - so merely getting this far proves clippy.toml
+          # is well-formed and schema-valid against the pinned toolchain. That
+          # is why a clippy.toml typo surfaces as a failure of THIS workflow.
+          #
+          # This narrow form is run before the broad one below so that a
+          # finding in library and binary code is reported without test-code
+          # noise. It covers the lib and bin targets of all three members:
+          # curl-rs-lib, curl-rs and curl-rs-ffi.
+          cargo clippy --locked --workspace -- -D warnings
+
+      - name: 'clippy: cargo clippy --workspace --all-targets -- -D warnings'
+        run: |
+          # The broad form, and it is not redundant. Measured on the pinned
+          # toolchain with a deliberate `needless_return` planted in two
+          # places, the narrow form above reported NOTHING while this form
+          # reported both:
+          #
+          #   a `#[cfg(test)] mod tests` module inside a library, and
+          #   a [[test]] target whose `path` lies outside its package
+          #   directory.
+          #
+          # Both matter here. The assertions from the C tree's tests/libtest
+          # and tests/unit programs - 235 and 59 files, which cannot link
+          # against a Rust static library because pub(crate) items are absent
+          # from its symbol table - are relocated into the crates as
+          # `#[cfg(test)]` modules or behind a `testing` feature, so that is a
+          # large body of code that must not escape the linter. And tests-rs/
+          # sits at the repository root and is deliberately not a workspace
+          # member: it is reached only through [[test]] targets declared in the
+          # member manifests with `path = "../tests-rs/..."`. --all-targets is
+          # what puts both inside this gate.
+          #
+          # One thing that was checked rather than assumed: on the pinned
+          # cargo, a [[test]] path outside the package directory produces no
+          # cargo warning at all, and it is still compiled and linted. So there
+          # is nothing here for -D warnings to surface on that account - and
+          # nothing for it to surface in principle either, since a cargo
+          # diagnostic is not a rustc lint. Were such a warning ever to appear,
+          # the remedy would be in the manifest, never a suppression in this
+          # workflow.
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: 'rustfmt: cargo fmt --all -- --check'
+        run: |
+          # --check, never a bare `cargo fmt`. A continuous-integration job
+          # that rewrites source is not a gate: it would hide the very
+          # violation it exists to report, and the minimal-change mandate
+          # forbids this workflow from changing the tree at all. There is no
+          # --fix anywhere in this file, for clippy or for rustfmt.
+          #
+          # The formatting gate lands here because no separate formatting
+          # workflow is specified, and because style enforcement is precisely
+          # what the C linter this file replaces used to do.
+          fmt_out="${RUNNER_TEMP}/cargo-fmt-check.out"
+          fmt_err="${RUNNER_TEMP}/cargo-fmt-check.err"
+          status=0
+          cargo fmt --all -- --check >"${fmt_out}" 2>"${fmt_err}" || status=$?
+
+          echo '::group::cargo fmt --all -- --check : stdout (the diff, if any)'
+          cat "${fmt_out}"
+          echo '::endgroup::'
+          echo '::group::cargo fmt --all -- --check : stderr (configuration diagnostics)'
+          cat "${fmt_err}"
+          echo '::endgroup::'
+
+          # The configuration assertion, and it must come before the exit
+          # status is examined, because the failure it catches is SILENT.
+          # Measured on the pinned stable channel: a nightly-only key yields
+          # `Warning: can't set ... unstable features are only available in
+          # nightly channel.` and an unrecognised key yields `Warning: Unknown
+          # configuration option ...` - and in BOTH cases rustfmt ignores the
+          # key and still exits 0. Without this check, a nightly-only setting
+          # in rustfmt.toml would leave the formatting contract quietly
+          # unenforced while this gate reported success. rustfmt.toml must
+          # therefore use stable options only, and this is what holds it to it.
+          if grep -F 'Warning' "${fmt_err}"; then
+            echo 'FAIL: rustfmt ignored a configuration option, so rustfmt.toml is not fully in force.'
+            echo 'Either the option is unknown, or it is nightly-only and this gate runs on the pinned'
+            echo 'stable channel. Fix rustfmt.toml; do not silence this check.'
+            exit 1
+          fi
+
+          if [ "${status}" -ne 0 ]; then
+            echo 'FAIL: the workspace is not rustfmt-clean. The diff above is what cargo fmt --all would'
+            echo 'change. Run it locally and commit the result; this gate reports, it does not rewrite.'
+            exit "${status}"
+          fi
+
+          echo 'the workspace is rustfmt-clean, and rustfmt.toml uses only options that exist on the pinned stable channel'
+
+      - name: 'assert: this gate rewrote nothing'
+        run: |
+          # The property that makes the two steps above trustworthy. Every
+          # cargo invocation here either only reads the tree or was passed
+          # --locked, so nothing should have been able to modify a tracked file
+          # or write Cargo.lock. This says so out loud rather than assuming it.
+          #
+          # A finding means one of three things, all of them defects worth
+          # failing on: --check was dropped from the rustfmt step, --fix
+          # reached a clippy step, or --locked was dropped somewhere and cargo
+          # regenerated the lockfile. target/ is git-ignored, so a normal run
+          # leaves this empty.
+          changed="${RUNNER_TEMP}/worktree-status.txt"
+          git status --porcelain > "${changed}"
+          if [ -s "${changed}" ]; then
+            echo 'FAIL: the working tree changed while this gate ran:'
+            cat "${changed}"
+            exit 1
+          fi
+          echo 'the working tree is byte-identical to the checkout: this gate reports, it does not rewrite'
