@@ -18,6 +18,9 @@ Example:
 
 # `--dns-interface`
 
-Send outgoing DNS requests through the given interface. This option is a
-counterpart to --interface (which does not affect DNS). The supplied string
-must be an interface name (not an address).
+Specify the interface for outgoing DNS requests. This option is a counterpart
+to --interface (which does not affect DNS). The supplied string must be an
+interface name (not an address).
+
+This build resolves names with the system resolver and does not use c-ares, so
+this option is accepted and has no effect.

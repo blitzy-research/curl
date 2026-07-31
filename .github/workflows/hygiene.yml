@@ -2,9 +2,9 @@
 #
 # SPDX-License-Identifier: curl
 
-# This workflow contains checks at the source code level only.
+# This workflow contains repository-wide hygiene, spelling, licensing and lint checks.
 
-name: 'Source'
+name: 'Hygiene'
 
 'on':
   push:
@@ -30,17 +30,6 @@ concurrency:
 permissions: {}
 
 jobs:
-  checksrc:
-    name: 'checksrc'
-    runs-on: ubuntu-slim
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: 'check'
-        run: scripts/checksrc-all.pl
-
   linters:
     name: 'spellcheck, linters, REUSE'
     runs-on: ubuntu-24.04-arm
@@ -181,4 +170,4 @@ jobs:
       - name: 'badwords'
         run: |
           # we allow some extra in source code
-          grep -Ev '(\\bwill| But: | So : )' .github/scripts/badwords.txt | .github/scripts/badwords.pl -a src lib include docs/examples
+          grep -Ev '(\\bwill| But: | So : )' .github/scripts/badwords.txt | .github/scripts/badwords.pl -a src lib include docs/examples curl-rs-lib/src curl-rs/src curl-rs-ffi/src

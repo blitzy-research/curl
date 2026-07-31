@@ -2,7 +2,14 @@
 <!-- SPDX-License-Identifier: curl -->
 # PROTOCOLS
 curl supports numerous protocols, or put in URL terms: schemes. Your
-particular build may not support them all.
+particular build may not support them all. The sections below cover the 33
+schemes curl registers, while this build performs transfers for exactly nine of
+them: `file`, `ftp`, `ftps`, `http`, `https`, `scp`, `sftp`, `ws` and `wss`.
+curl recognizes each of the other 24 registered schemes when it parses a URL,
+yet a transfer request for one of them fails with `CURLE_UNSUPPORTED_PROTOCOL`.
+The `Protocols:` line in the --version output names only those nine schemes,
+so read a section below as a description of the scheme itself rather than as a
+claim about what this build transfers.
 ## DICT
 Lets you lookup words using online dictionaries.
 ## FILE

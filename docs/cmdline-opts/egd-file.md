@@ -16,8 +16,8 @@ Example:
 
 # `--egd-file`
 
-Deprecated option (added in 7.84.0). Prior to that it only had an effect on
-curl if built to use old versions of OpenSSL.
+Deprecated option (added in 7.84.0). curl accepts the option and ignores
+it, as the TLS implementation provides its own random data.
 
-Specify the path name to the Entropy Gathering Daemon socket. The socket is
-used to seed the random engine for SSL connections.
+The argument is the path name to the Entropy Gathering Daemon socket. The
+socket was used to seed the random engine for SSL connections.

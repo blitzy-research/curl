@@ -2,35 +2,149 @@
 #
 # SPDX-License-Identifier: curl
 
-# Toolchain pin for the Rust workspace (curl-rs-lib, curl-rs, curl-rs-ffi).
+# Rust toolchain pin for the curl workspace: curl-rs-lib, curl-rs, curl-rs-ffi.
 #
-# The crates declare rust-version = "1.75" (MSRV). This file pins the toolchain
-# that builds and validates them; it is deliberately a concrete version rather
-# than "stable" so every contributor and every CI leg agree byte for byte.
+# This file replaces the compiler-detection machinery of the two C build
+# systems it supersedes. configure.ac:503 runs AC_CANONICAL_HOST to discover
+# the build triple and record it as CURL_OS, then configure.ac:575 runs
+# CURL_CHECK_COMPILER - defined at m4/curl-compilers.m4:33, where it probes ten
+# different C compilers in turn (DEC, HP-UX, IBM, Intel, clang, GNU, SGI
+# MIPSPro, SGI MIPS, SunPro, tiny-c) - before configure.ac:603-606 derives a
+# basic, debug, optimize and warning flag set for whichever one answered.
+# CMakeLists.txt arrives at the same place by its own route: the
+# project(CURL ... LANGUAGES C) call at CMakeLists.txt:64-66 triggers CMake's
+# compiler probe, CMakeLists.txt:113-131 then branches on CMAKE_C_COMPILER_ID
+# and CMakeLists.txt:135-137 on CMAKE_C_STANDARD.
 #
-# The nightly-only gates are invoked explicitly and override this pin:
-#   cargo +nightly miri test -p curl-rs-lib
-#   cargo +nightly build -Zbuild-std -Zsanitizer=address
-# The MSRV floor is verified explicitly as well:
-#   cargo +1.75.0 build --workspace --locked
+# Nothing below guesses. rustup reads this file, selects exactly the toolchain
+# named here and provisions exactly the components and targets listed. The
+# compiler becomes a declared input to the build rather than a discovered
+# property of the machine, which is what makes every contributor and every
+# continuous-integration leg agree.
 #
-# That MSRV check was run and it FAILS with the mandated dependency set: home
-# 0.5.12 (pulled in by russh) needs the edition2024 Cargo feature, which 1.75
-# does not have, and 46 of the 327 locked crates declare a rust-version above
-# 1.75 (quinn-proto and quinn-udp at 1.85, idna_adapter and the icu_* family at
-# 1.86, rand 0.10 at 1.85, home at 1.88). The lowest reachable MSRV is 1.88, or
-# 1.86 if the russh dependency on home is removed. The 1.75.0 toolchain is
-# installed so the check stays runnable, but rust-version and clippy.toml's msrv
-# need raising once that decision is made. The pin below is unaffected: 1.97.1
-# builds the whole workspace cleanly on all four targets.
+# Companion configuration, deliberately kept in separate files:
+#   Cargo.toml          rust-version (the MSRV floor), edition, dependencies
+#   clippy.toml         msrv, held equal to Cargo.toml's rust-version
+#   rustfmt.toml        formatting, read by the rustfmt component below
+#   .cargo/config.toml  per-target linkers for the cross-compiled targets
+#   deny.toml           supply-chain policy, over this same target list
 
 [toolchain]
+
+# An exact stable version, deliberately not the floating "stable" string. A
+# floating channel cannot guarantee that every contributor and every CI leg
+# agree, because it resolves to whichever stable release happens to be current
+# that week: a lint or a build that is clean today can fail tomorrow with no
+# commit in between. 1.97.1 is the stable toolchain this design was verified
+# against - the FFI ABI probes, the symbol-export measurements and the
+# dependency resolution recorded in Cargo.lock were all run on it.
+#
+# This pin is NOT the minimum supported Rust version. The workspace floor is
+# rust-version = "1.75" in Cargo.toml, mirrored by msrv = "1.75" in
+# clippy.toml, and those two enforce it independently of this file: Cargo
+# rejects a toolchain older than rust-version, and clippy's MSRV-sensitive
+# lints reject constructs newer than msrv under -D warnings. Building on 1.75
+# must therefore also succeed, which is why the 1.75.0 toolchain is installed
+# alongside this pin and checked with `cargo +1.75.0 build --workspace`.
+#
+# Measured against the committed Cargo.lock rather than assumed: of the 328
+# locked packages - 325 externals plus the three workspace members - exactly
+# two declare a rust-version above 1.75, wasip2 1.0.4 at 1.87.0 and
+# wit-bindgen 0.57.1 at 1.85.0, and wit-bindgen is also the graph's only
+# edition-2024 manifest. Both are reachable solely through getrandom's
+# cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2"))
+# dependency, so neither enters the build graph of any target listed below. A
+# scratch crate over that same getrandom does compile under
+# `cargo +1.75.0 build`; it is only `cargo metadata`, which resolves every
+# platform at once, that trips over the edition-2024 manifest. The end-to-end
+# check cannot be completed at this commit, because the workspace members have
+# no sources yet and `cargo build` therefore stops while loading manifests, so
+# read 1.75 as clean on the necessary condition and not yet demonstrated.
+# Cargo.toml and clippy.toml still describe an earlier, looser resolution - 46
+# packages above 1.75, a floor of 1.88, home 0.5.12 pulled in by russh. The
+# pins were tightened after that measurement (russh 0.54.5, home 0.5.9,
+# quinn-proto 0.11.14, icu_normalizer 1.5.0), and the figures above are what
+# the lockfile at this commit actually contains.
+#
+# The floor stays at 1.75 either way, because it was mandated: raising a
+# minimum supported version is a decision for whoever set it, not a
+# build-configuration change to be made here. If it is raised, raise
+# Cargo.toml's rust-version, clippy.toml's msrv and this channel together.
+#
+# Nightly is deliberately not pinned here. Two validation gates need it, and
+# both name it explicitly per invocation, which overrides this pin:
+#   cargo +nightly miri test -p curl-rs-lib
+#     .github/workflows/rust-miri.yml, undefined-behaviour gate
+#   cargo +nightly build -Zbuild-std -Zsanitizer=address
+#     .github/workflows/rust-asan.yml, AddressSanitizer over the FFI surface
+# Both of those legs also need rust-src, which is precisely why rust-src is
+# absent from `components` below: it belongs to the nightly toolchain they
+# install for themselves, not to the stable toolchain that builds and ships.
+#
+# One open item bears directly on this line. The FFI shim reaches curl's four
+# variadic entry points - curl_easy_setopt, curl_easy_getinfo,
+# curl_multi_setopt and curl_share_setopt - with a non-variadic extern "C"
+# function taking one trailing pointer, because true C-variadic functions are
+# unstable on 1.75. That is sound on the System V and AAPCS64 register
+# conventions, but Apple's arm64 ABI passes variadic arguments on the stack,
+# so on aarch64-apple-darwin the callee would read a register the caller never
+# filled, and it would do so silently. The remedy is the stabilised c_variadic
+# feature, which requires a toolchain newer than 1.75. A decision to raise the
+# MSRV for that reason would change this channel and the floor above together;
+# see the variadic-setter analysis and the escalated ambiguity A4 in the
+# specification.
 channel = "1.97.1"
-profile = "minimal"
-components = ["clippy", "rustfmt", "llvm-tools-preview", "rust-src"]
+
+# Exactly the three components the validation gates require, and no more:
+#
+#   rustfmt             `cargo fmt --all --check`, configured by rustfmt.toml
+#   clippy              `cargo clippy --workspace -- -D warnings`, the lint
+#                       gate, configured by clippy.toml
+#   llvm-tools-preview  `cargo llvm-cov`, the coverage gate at >= 80% line
+#                       coverage over curl-rs-lib/src/protocols/ and
+#                       curl-rs-lib/src/transfer/; it is what supplies
+#                       llvm-profdata and llvm-cov to the coverage run
+#
+# Nothing further is listed. Every component named here is downloaded on every
+# fresh checkout, and rust-src - the only other candidate - is needed solely
+# by the nightly Miri and -Zbuild-std ASan legs described above, which provide
+# it themselves on the toolchain they select.
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+
+# The four mandated compilation targets. deny.toml's [graph] targets lists the
+# same four in the same order, so the supply-chain gate audits precisely the
+# set that is built.
+#
+# All four are 64-bit, and that is load-bearing rather than incidental. The
+# single-trailing-pointer varargs design described above carries a curl_off_t
+# through one register-width slot, which is only sound where off_t fits a
+# register. 32-bit portability is therefore a deliberate forfeit rather than an
+# oversight, and must not be claimed; no 32-bit triple belongs in this list.
+#
+# aarch64-unknown-linux-gnu is cross-compiled, either through cross 0.2.5 or
+# with the aarch64-linux-gnu-gcc linker and matching CC/CXX/AR configured in
+# .cargo/config.toml. Pinning the ring cryptographic provider across rustls,
+# tokio-rustls and quinn - instead of letting aws-lc-rs in through default
+# features - is what keeps this leg buildable at all: aws-lc-rs vendors C and
+# assembly and would add CMake and NASM to the cross build's requirements.
+#
+# aarch64-apple-darwin is the highest-severity open item in the plan. It is the
+# one target where the Apple variadic-ABI mismatch noted above bites, and the
+# failure mode is silence: no Linux-only test run can observe it. This
+# container also has no Apple SDK, so both Apple targets compile here but need
+# cargo-zigbuild or a macOS runner to link. The triple is listed because the
+# target matrix mandates it, not because the varargs entry points are known
+# good on it.
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
   "x86_64-apple-darwin",
   "aarch64-apple-darwin",
 ]
+
+# rustup's own default profile: rustc, cargo, rust-std, rust-docs, plus rustfmt
+# and clippy. The conservative choice, and it is consulted only when rustup has
+# to install the toolchain from scratch - the components and targets above are
+# additive on top of whatever the profile brings, so no gate depends on which
+# profile is named here.
+profile = "default"

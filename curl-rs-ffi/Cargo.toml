@@ -23,7 +23,7 @@
 # Text hygiene. This file is pure ASCII, spaces only, LF endings, no trailing
 # whitespace, no consecutive blank lines and exactly one newline at EOF.
 # scripts/spacecheck.pl enforces every one of those over `git ls-files`; it runs
-# in CI (.github/workflows/checksrc.yml:175-176) and from Makefile.am:175, and
+# in CI (.github/workflows/hygiene.yml:164-165) and from Makefile.am:175, and
 # this path appears in none of its allow-lists, so a tab, a CRLF or any byte in
 # 0x80-0xff would fail the gate. The [*] section of .editorconfig applies too
 # (charset=utf-8, indent_style=space, insert_final_newline,

@@ -19,6 +19,13 @@ Each test case source exists as a file matching the format
 `tests/data/testNUM`, where `NUM` is the unique test number, and must begin
 with a `testcase` tag, which encompasses the remainder of the file.
 
+The case files under `tests/data` are immutable behavioral inputs. Both this
+format and the individual cases are frozen: a case that fails is evidence of a
+defect in the implementation under test, never a reason to edit the case. This
+holds for the specified `Rust` implementation exactly as it holds for the
+retained C implementation, and every case eligible under the feature and
+protocol set that the binary under test advertises must pass unmodified.
+
 # Preprocessing
 
 When a test is to be executed, the source file is first preprocessed and
@@ -752,8 +759,14 @@ a header and what is not in order to apply the CRLF line endings appropriately.
 
 ### `<limit>`
 
-When this test runs and curl was built with debug enabled, runtests make sure
-that the set limits are not exceeded. Supported limits:
+When the binary under test advertises a `Debug` token in its `Features:` line,
+the harness enables memory tracking and runtests make sure that the set limits
+are not exceeded. The figures are upper bounds, so a run that allocates fewer
+times, or less memory, passes. On the specified default `Rust` target, which
+advertises no `Debug` token, these limits are inert and the cases that carry
+them run without a memory check; a default-off `memdebug` `Cargo` feature is
+specified, rather than present, as the mechanism that re-enables the existing
+memory log format. Supported limits:
 
     Allocations: [number of allocation calls]
     Maximum allocated: [maximum concurrent memory allocated]
