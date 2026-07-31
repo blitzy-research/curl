@@ -1,0 +1,824 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Validation gate 1 of the ten that guard the Rust workspace: BUILD.
+#
+# This workflow runs `cargo build --locked --release --workspace` once per
+# mandated target triple, with warnings denied, and it confirms the minimum
+# supported Rust version still builds the workspace. It does nothing else.
+# The lint gate lives in rust-clippy.yml, the tests in rust-test.yml, coverage
+# in rust-coverage.yml, undefined behaviour in rust-miri.yml, the sanitizer in
+# rust-asan.yml, symbol and header parity in rust-abi.yml, the supply chain in
+# rust-audit.yml, and the curl fixture corpus in curl-testsuite.yml. One
+# workflow per validation gate, so that a failure names its own cause.
+#
+# That principle is why there is no clippy step, no `cargo fmt`, no
+# `cargo test`, no coverage instrumentation, no `cargo audit`, no symbol
+# comparison and no invocation of tests/runtests.pl anywhere below. Every one
+# of those has an owner, and a second owner would mean a red cross that does
+# not say what broke.
+#
+# LINEAGE. This file is the successor to the compilation half of two C build
+# workflows, .github/workflows/linux.yml and .github/workflows/macos.yml, both
+# of which remain on disk unmodified because they still build the C tree. What
+# was inherited from them is convention rather than content: the trigger shape,
+# the pinned checkout, the fail-fast policy, the per-job timeout, the apt
+# invocation, the ::group:: log idiom, the `command -v` habit, and above all
+# the practice of hoisting every matrix value into an `env:` block instead of
+# interpolating it into a shell body. What was NOT inherited is their
+# structure: those two workflows configure, build, install and test in one job
+# because the C build system offers no way to separate them. Cargo does, so
+# this file builds and stops.
+#
+# WHAT THIS GATE PROVES, AND WHAT IT DELIBERATELY DOES NOT
+#
+# Proves: the committed lockfile resolves; every workspace member compiles for
+# each of the four mandated triples in release configuration; the compilation
+# is free of rustc warnings; the four expected artifacts appear; and the
+# minimum supported Rust version accepts the same tree and the same lockfile.
+#
+# Does not prove: that the artifacts export the right symbols, that the
+# generated public header is correct, that the code behaves correctly, or that
+# the dependency graph is free of advisories. Those are other gates, by
+# design.
+
+name: 'Rust build'
+
+'on':
+  push:
+    branches:
+      - master
+      - '*/ci'
+    # A deny-list, not an allow-list, and the same four entries the sibling
+    # Rust workflows and the two C build workflows use. An allow-list would
+    # have to enumerate Cargo.toml, Cargo.lock, rust-toolchain.toml,
+    # .cargo/config.toml, three member manifests, two build scripts and every
+    # source path in three crates, and the day one of them was left out is the
+    # day a change merged without ever having been compiled. `projects/**`
+    # holds the OS400, Windows and VMS project files, which are outside this
+    # migration entirely and cannot affect a Rust build.
+    #
+    # ONE ENTRY IS DELIBERATELY ABSENT, and the omission is the considered
+    # choice rather than an oversight. macos.yml additionally ignores
+    # '**/*.md', which for a documentation-only commit is reasonable there.
+    # It would be wrong here, because in this workspace markdown is a BUILD
+    # INPUT: curl-rs/build.rs drives scripts/managen over docs/cmdline-opts to
+    # generate the embedded manual, and it names the directory plus every one
+    # of the 293 `*.md` pages inside it in `cargo:rerun-if-changed=`
+    # directives. It also asserts the page count, so a page added or removed
+    # without its companion table being updated is a BUILD FAILURE. Ignoring
+    # markdown would let exactly that class of change reach master without
+    # this gate ever running. The cost of keeping markdown in scope is some
+    # redundant builds; the cost of ignoring it is a hole in gate 1.
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # Colour off. Nothing below parses cargo's output to reach a verdict - the
+  # verdicts come from exit statuses and from file existence - but an escape
+  # sequence in a diagnostic makes a log harder to read for the person who has
+  # to diagnose a four-target failure, and it would silently break any future
+  # anchored pattern somebody adds here.
+  CARGO_TERM_COLOR: never
+
+  # The dependency graph is fetched in its own step below. A transient registry
+  # hiccup should retry rather than be reported as a compilation failure and
+  # send somebody looking for a compiler error that is not there.
+  CARGO_NET_RETRY: '3'
+
+  # No cache is restored into these jobs, so incremental state is output that
+  # nothing ever reads. This is not a speed setting: performance is an explicit
+  # non-goal of this work, and no step below is ordered or configured for it.
+  CARGO_INCREMENTAL: '0'
+
+  # The minimum supported Rust version, used by the `msrv` job. It is declared
+  # here as a three-component rustup toolchain name because that is what
+  # `rustup toolchain install` wants, while Cargo.toml declares the floor as
+  # the two-component `rust-version = "1.75"`. The `msrv` job asserts that the
+  # two agree, so this value cannot drift away from the manifest unnoticed.
+  MSRV_TOOLCHAIN: '1.75.0'
+
+  # The cross-compilation toolchain for the aarch64-unknown-linux-gnu leg.
+  #
+  # This is the ONLY place the package list is written. The matrix entry below
+  # carries a selector - the name of the cross toolchain it needs - and not the
+  # list itself, because a list written in two places is a list that will
+  # eventually disagree with itself. The house pattern is the same: linux.yml
+  # declares its version pins in the workflow `env:` block and lets the matrix
+  # reference them.
+  #
+  #   gcc-aarch64-linux-gnu   supplies aarch64-linux-gnu-gcc, which is the
+  #                           `linker` .cargo/config.toml already names for
+  #                           this triple, and the CC the same file exports
+  #   g++-aarch64-linux-gnu   supplies the CXX that same file exports; it is
+  #                           listed because the variable is exported
+  #                           unconditionally, so a crate that probes CXX must
+  #                           find something rather than a missing binary
+  #   libc6-dev-arm64-cross   the target headers and CRT that the C-compiling
+  #                           crates in the graph need; it arrives as a
+  #                           dependency of the compiler packages, and is
+  #                           named anyway so the requirement is visible
+  CROSS_LINUX_PACKAGES: 'gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross'
+
+jobs:
+  # =========================================================================
+  # Gate 1 proper: the four-target release build, warnings denied
+  # =========================================================================
+  build:
+    name: ${{ matrix.build.target }}
+
+    # One runner per target, chosen so that every leg links natively where it
+    # can. The two Apple triples share macos-latest, whose Xcode toolchain
+    # links both arm64 and x86_64 Mach-O out of the box; no Linux runner can
+    # link a Mach-O object at all, which is why they are not cross-compiled
+    # from Ubuntu the way the aarch64 Linux leg is.
+    runs-on: ${{ matrix.build.image }}
+
+    # 30 minutes. The tree's common values are 5, 10 and 15, and its ceiling is
+    # 45; the closest comparable job is rust-audit.yml at 30. This leg is
+    # heavier than any of the C build jobs it descends from: a cold release
+    # build of the whole workspace over a locked graph of 328 packages, several
+    # of which compile vendored C or assembly (the ring cryptographic provider
+    # and the zstd bindings among them), with no cache restored. 30 leaves
+    # headroom on a cold start. A timeout must never be the thing that fails a
+    # build gate, because a timeout tells you nothing about the code.
+    timeout-minutes: 30
+
+    # EVERY matrix value is hoisted here and referenced as a plain shell
+    # variable inside the `run:` bodies below. Not one `${{ ... }}` expression
+    # appears in a shell body anywhere in this file. Three independent reasons,
+    # all of them measured on this repository's own tooling:
+    #
+    #   1. zizmor --pedantic runs a template-injection audit over
+    #      .github/workflows/*.yml and treats an expression interpolated into a
+    #      shell body as a finding.
+    #   2. .github/scripts/shellcheck-ci.sh extracts every `run:` string into
+    #      one synthetic bash script and rewrites expressions with
+    #      `sed -E 's|\$\{\{ .+ \}\}|GHA_EXPRESSION|g'`. That pattern is
+    #      GREEDY, so two expressions on one line collapse into a single token
+    #      and the shell the linter then checks is not the shell that would
+    #      run.
+    #   3. It is what linux.yml and macos.yml already do, and consistency is
+    #      what makes the convention enforceable.
+    env:
+      MATRIX_TARGET: '${{ matrix.build.target }}'
+      MATRIX_IMAGE: '${{ matrix.build.image }}'
+      MATRIX_CROSS_TOOLCHAIN: '${{ matrix.build.cross_toolchain }}'
+
+    strategy:
+      # Present on every matrix in this repository, and load-bearing for a
+      # four-target gate in particular. A target-specific defect is exactly
+      # what this matrix exists to find, and cancelling the other three legs
+      # the moment one fails would hide whether the defect is specific to one
+      # triple or common to all four - which is the first question anybody
+      # diagnosing it will ask.
+      fail-fast: false
+      matrix:
+        # THE FOUR MANDATED TARGETS, and only four. This list is identical,
+        # character for character and in the same order, to rust-toolchain.toml
+        # `targets` and to deny.toml `[graph] targets`, so the toolchain that
+        # is provisioned, the graph that is audited and the artifacts that are
+        # built all describe one identical set. An assertion step below proves
+        # the three files still agree rather than trusting that they do.
+        #
+        # ALL FOUR ARE 64-BIT, AND THAT IS LOAD-BEARING RATHER THAN INCIDENTAL.
+        # The C ABI shim reaches curl's four variadic entry points -
+        # curl_easy_setopt, curl_easy_getinfo, curl_multi_setopt and
+        # curl_share_setopt - with a non-variadic extern "C" function taking
+        # one trailing pointer, because true C-variadic functions are unstable
+        # at the workspace's minimum supported Rust version. That design
+        # carries a curl_off_t through a single register-width slot, which is
+        # sound only where off_t fits a register. 32-bit portability is
+        # therefore a DELIBERATE FORFEIT rather than an oversight, and it must
+        # not be claimed: no 32-bit triple belongs in this matrix, and neither
+        # does any Windows triple.
+        #
+        # `cross_toolchain` is a SELECTOR, not a package list: it names which
+        # cross toolchain a leg needs, and the packages themselves live once in
+        # the workflow `env:` block above. It is set on every entry, including
+        # the three that need nothing, because actionlint infers a matrix
+        # entry's shape from the entries it sees and reports a key that is
+        # absent from some of them. macos.yml solves the same problem the same
+        # way, with the note "Set it once to silence actionlint."
+        build:
+          # -----------------------------------------------------------------
+          # The host triple, and the primary leg. Native compile, native link.
+          # -----------------------------------------------------------------
+          - target: 'x86_64-unknown-linux-gnu'
+            image: 'ubuntu-latest'
+            cross_toolchain: ''
+
+          # -----------------------------------------------------------------
+          # Cross-compiled from an Ubuntu runner.
+          #
+          # TWO ROUTES EXIST AND THIS ONE WAS CHOSEN BY MEASUREMENT. The
+          # alternative is `cross`, pinned at 0.2.5 in Cargo.toml's
+          # [workspace.metadata.curl-rs.ci-tools] table for exactly this leg,
+          # which drives the build inside a container. It is deliberately NOT
+          # installed here. The route taken instead is the linker
+          # .cargo/config.toml already configures for this triple, plus the
+          # matching CC, CXX and AR that the same file exports through its
+          # [env] table.
+          #
+          # Why: this leg then runs the IDENTICAL cargo command line as the
+          # other three, on the identical toolchain that rust-toolchain.toml
+          # pins, differing only in the linker the configuration already
+          # names. `cross` would introduce a second build driver, a container
+          # image and a second toolchain provisioning path on one leg out of
+          # four, and a failure there would be ambiguous between the container
+          # and the code - which is precisely the attribution property this
+          # gate exists to preserve. Verified before being chosen: this route
+          # produces an `ELF 64-bit LSB shared object, ARM aarch64` libcurl
+          # carrying the intended soname, together with the static archive.
+          #
+          # ONE THING TO KNOW IF THIS LEG SUDDENLY DEMANDS CMake OR NASM. That
+          # is not a cross-compilation fault, it is a cryptographic-provider
+          # regression. rustls, tokio-rustls and quinn are all pinned to the
+          # `ring` provider with default features off; letting defaults back in
+          # pulls aws-lc-rs, whose vendored C and assembly add CMake and NASM
+          # to the requirements and are hostile to a cross build. The
+          # assertions that hold the provider pinning in place live in
+          # rust-audit.yml and are deliberately not duplicated here.
+          # -----------------------------------------------------------------
+          - target: 'aarch64-unknown-linux-gnu'
+            image: 'ubuntu-latest'
+            cross_toolchain: 'aarch64-linux'
+
+          # -----------------------------------------------------------------
+          # Cross-compiled on an arm64 macOS runner, which links Mach-O for
+          # both architectures through one Xcode toolchain.
+          # -----------------------------------------------------------------
+          - target: 'x86_64-apple-darwin'
+            image: 'macos-latest'
+            cross_toolchain: ''
+
+          # -----------------------------------------------------------------
+          # ###################################################################
+          # aarch64-apple-darwin -- THE HIGHEST-SEVERITY OPEN ITEM IN THE PLAN.
+          # Escalated ambiguity A4. READ THIS BEFORE DEBUGGING A FAILURE HERE.
+          # ###################################################################
+          #
+          # Apple's arm64 ABI passes variadic arguments ON THE STACK. Standard
+          # AAPCS64, which Linux aarch64 follows, passes them in registers. The
+          # C ABI shim's setopt and getinfo entry points are declared
+          # non-variadic and take one trailing pointer, and the generated
+          # aarch64 code for that shape was measured to read the third
+          # argument out of register x2 - literally `mov x0, x2; ret`. Reached
+          # through the variadic prototype the public header declares, that
+          # callee therefore reads a register the caller never populated, on
+          # this target and on no other.
+          #
+          # THE FAILURE IS SILENT, AND IT WOULD NOT SURFACE IN A LINUX-ONLY
+          # ENVIRONMENT. It is not a compilation error, so this leg compiling
+          # green is not evidence that the entry points work. Conversely, if
+          # this leg ever fails, check A4 before suspecting this workflow.
+          #
+          # The remedy is the stabilised c_variadic feature, which was measured
+          # as stable on nightly 1.99 and therefore requires a toolchain NEWER
+          # than the mandated floor of 1.75. Two of the requirements - the MSRV
+          # floor and this four-target matrix - cannot both be met by any
+          # implementation. Resolving that is a decision for whoever set them:
+          # raise the MSRV, drop this target, or accept that this target's
+          # varargs entry points are unsupported.
+          #
+          # UNTIL THAT DECISION IS MADE, NOTHING HERE MAY PAPER OVER IT. There
+          # is no `continue-on-error` on this entry, no `if:` that skips it, no
+          # `if: always()` masking anywhere in this file, and the triple is not
+          # removed. A gate that hides a known unresolved defect is worse than
+          # no gate, because it converts an open question into a false
+          # assurance.
+          #
+          # Related and expected: curl-rs-ffi/build.rs deliberately emits a
+          # `cargo:warning=` advisory about A4 when it sees this target. That
+          # advisory MUST NOT fail this leg, and under the zero-warning
+          # mechanism chosen below it cannot - see the build step for why that
+          # is a property of the mechanism rather than an exception carved out
+          # for it.
+          # -----------------------------------------------------------------
+          - target: 'aarch64-apple-darwin'
+            image: 'macos-latest'
+            cross_toolchain: ''
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'toolchain versions'
+        run: |
+          # Evidence before use. Everything this leg concludes is a statement
+          # about which toolchain produced it and which target it produced it
+          # for, so both are printed before anything is judged by them.
+          echo '::group::rust toolchain'
+          command -v rustc
+          command -v cargo
+          command -v rustup
+          rustc --version
+          cargo --version
+          rustup --version
+          echo '::endgroup::'
+
+          # NOTHING INSTALLS A TOOLCHAIN, A COMPONENT OR A TARGET IN THIS JOB,
+          # and that is deliberate. rust-toolchain.toml pins an exact stable
+          # channel, names rustfmt, clippy and llvm-tools-preview among its
+          # components, and lists all four mandated targets; rustup honours the
+          # whole file on the first `cargo` invocation. A `rustup target add`
+          # or a `rustup component add` here would add nothing except a second
+          # place for the two to disagree. The commands above having succeeded,
+          # and the target list below being complete, is the proof that the pin
+          # resolved.
+          #
+          # `cross` is likewise not installed - see the aarch64 matrix entry.
+          echo '::group::rust-toolchain.toml (the pin this leg honours)'
+          grep -v -E '^(#|$)' rust-toolchain.toml
+          echo '::endgroup::'
+          echo '::group::targets installed by that pin'
+          rustup target list --installed
+          echo '::endgroup::'
+
+          # The target for this leg, printed plainly and then in full, so that
+          # the wrong triple is visible in the log rather than inferred from a
+          # puzzling link error two steps later.
+          echo "this leg builds for: ${MATRIX_TARGET}"
+          echo "on runner image: ${MATRIX_IMAGE}"
+          echo '::group::rustc --print cfg for this target'
+          rustc --print cfg --target "${MATRIX_TARGET}"
+          echo '::endgroup::'
+
+      - name: 'assert: the pinned stable toolchain, and a mandated target'
+        run: |
+          # Nightly is deliberately absent from rust-toolchain.toml, because
+          # only two gates need it and both install it for themselves and name
+          # it per invocation: rust-miri.yml and rust-asan.yml. THIS FILE MUST
+          # NOT INSTALL OR INVOKE NIGHTLY. The assertion below is what says so
+          # out loud rather than trusting that no `+nightly` crept into a step,
+          # and it matters beyond tidiness: an unstable flag or a nightly-only
+          # construct that compiled here would break every consumer building on
+          # the pinned stable channel.
+          pinned="$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          if [ -z "${pinned}" ]; then
+            echo 'FAIL: rust-toolchain.toml declares no [toolchain] channel'
+            exit 1
+          fi
+          case "${pinned}" in
+            nightly*|beta*)
+              echo "FAIL: rust-toolchain.toml pins ${pinned}."
+              echo 'Gate 1 builds on the pinned stable channel; nightly belongs to rust-miri.yml and rust-asan.yml.'
+              exit 1
+              ;;
+          esac
+          if rustc --version | grep -q -E 'nightly|beta'; then
+            echo 'FAIL: the active rustc is a nightly or beta build, but this gate requires the pinned stable channel'
+            rustc --version
+            exit 1
+          fi
+          active="$(rustc --version | awk '{ print $2 }')"
+          case "${pinned}" in
+            [0-9]*)
+              if [ "${active}" != "${pinned}" ]; then
+                echo "FAIL: rustc reports ${active}, but rust-toolchain.toml pins the exact version ${pinned}."
+                echo 'An exact pin is honoured by rustup on the first cargo invocation, so a mismatch means'
+                echo 'something in this job overrode the toolchain. Find and remove the override.'
+                exit 1
+              fi
+              echo "rustc ${active} matches the exact pin in rust-toolchain.toml"
+              ;;
+            *)
+              echo "rust-toolchain.toml pins the ${pinned} channel; the active rustc is ${active}"
+              ;;
+          esac
+
+          # The three-file target agreement, asserted rather than assumed. The
+          # matrix above, rust-toolchain.toml `targets` and deny.toml
+          # [graph] targets must describe one identical set of four triples: if
+          # they drift, this gate builds a triple the toolchain does not
+          # provision or the supply-chain gate never audits, and neither
+          # failure would name its own cause.
+          toolchain_targets="$(sed -n '/^targets = \[/,/^]/p' rust-toolchain.toml | sed -n 's/^ *"\([^"]*\)".*/\1/p')"
+          deny_targets="$(sed -n '/^targets = \[/,/^]/p' deny.toml | sed -n 's/^ *"\([^"]*\)".*/\1/p')"
+          echo '::group::declared target sets'
+          echo "rust-toolchain.toml: ${toolchain_targets}"
+          echo "deny.toml: ${deny_targets}"
+          echo '::endgroup::'
+          toolchain_count="$(printf '%s\n' "${toolchain_targets}" | grep -c .)"
+          if [ "${toolchain_count}" -ne 4 ]; then
+            echo "FAIL: rust-toolchain.toml declares ${toolchain_count} targets; the mandated matrix has exactly 4."
+            echo 'Adding a fifth target, or dropping one, is a requirements change and not a CI change.'
+            exit 1
+          fi
+          if [ "${toolchain_targets}" != "${deny_targets}" ]; then
+            echo 'FAIL: rust-toolchain.toml and deny.toml no longer declare the same targets in the same order.'
+            exit 1
+          fi
+          if ! printf '%s\n' "${toolchain_targets}" | grep -q -x -F "${MATRIX_TARGET}"; then
+            echo "FAIL: this leg builds ${MATRIX_TARGET}, which rust-toolchain.toml does not provision."
+            exit 1
+          fi
+          echo "${MATRIX_TARGET} is one of the four mandated triples, and all three files agree"
+
+      - name: 'install the cross-compilation toolchain'
+        # Runs only on the leg that names a cross toolchain, which today is
+        # the aarch64 Linux leg alone. This is a guard on a step that would be
+        # meaningless elsewhere - apt does not exist on the macOS runners - and
+        # not a mask over a failure: no step in this file is conditional on the
+        # outcome of another, and none carries `continue-on-error` or
+        # `if: always()`.
+        if: ${{ matrix.build.cross_toolchain }}
+        run: |
+          # The house apt pattern, taken verbatim from linux.yml and
+          # checksrc.yml: drop the pre-seeded third-party sources first,
+          # because they are the usual cause of an `apt-get update` failure on
+          # a hosted runner, then update, then install without a pseudo-tty so
+          # the log stays readable.
+          sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
+          sudo apt-get -o Dpkg::Use-Pty=0 update
+          echo "installing the ${MATRIX_CROSS_TOOLCHAIN} cross toolchain"
+          sudo apt-get -o Dpkg::Use-Pty=0 install \
+            ${CROSS_LINUX_PACKAGES}
+
+          # Prove the linker Cargo will actually reach is present, and prove it
+          # by READING THE NAME OUT OF .cargo/config.toml rather than repeating
+          # it here. That is the point of the check: it fails loudly if the
+          # configuration key is ever renamed, retargeted or removed, which
+          # would otherwise surface as an inscrutable link error - or, worse,
+          # as a silent fallback to the host linker producing a host object.
+          linker="$(sed -n '/^\[target\.aarch64-unknown-linux-gnu\]/,/^\[/p' .cargo/config.toml |
+            sed -n 's/^linker = "\([^"]*\)".*/\1/p')"
+          if [ -z "${linker}" ]; then
+            echo 'FAIL: .cargo/config.toml no longer names a linker for aarch64-unknown-linux-gnu.'
+            exit 1
+          fi
+          echo '::group::cross toolchain'
+          command -v "${linker}"
+          "${linker}" --version | head -n 1
+          echo '::endgroup::'
+          echo "the linker .cargo/config.toml names for this triple is present: ${linker}"
+
+      - name: 'fetch the locked dependency graph'
+        run: |
+          # Its own step, so that a registry or network failure is reported as
+          # a fetch failure instead of arriving disguised as a build failure.
+          # That is the same attribution argument that put this gate in its own
+          # workflow, applied one level down.
+          #
+          # --locked because Cargo.lock is committed and reproducible builds
+          # are non-negotiable: it makes a lockfile that disagrees with the
+          # manifests fail loudly here rather than be silently regenerated
+          # underneath the gate. Every cargo invocation in this file that reads
+          # the lockfile carries it.
+          #
+          # --target narrows the fetch to the graph this leg actually needs,
+          # which also means a dependency that is unresolvable for this triple
+          # is reported here, by name, rather than mid-compilation.
+          cargo fetch --locked --target "${MATRIX_TARGET}"
+
+      - name: 'build: cargo build --locked --release --workspace'
+        # ZERO WARNINGS IS THE GATE, NOT A NICETY, AND THIS IS THE WHOLE
+        # MECHANISM. One env var, scoped to this single step.
+        #
+        # WHY HERE AND NOWHERE ELSE. It must never be set in a repo-wide
+        # RUSTFLAGS or in .cargo/config.toml - that file explicitly forbids it
+        # - because `rustflags` participate in Cargo's fingerprint. A global
+        # deny would force a full rebuild between this leg and the clippy leg
+        # AND would destroy per-gate attribution by turning every other
+        # workflow's warnings into errors too. Step scope is what keeps the
+        # deny inside gate 1.
+        #
+        # WHAT IT COVERS, MEASURED RATHER THAN ASSUMED, by inspecting every
+        # rustc invocation of a build shaped like this workspace:
+        #
+        #   workspace member lib/bin   no cap-lints, receives the deny  DENIED
+        #   registry dependency lib    receives the deny, but Cargo also
+        #                              applies --cap-lints allow to it   capped
+        #   build script (any)         host unit; does not receive it    exempt
+        #
+        # So the deny effectively scopes to the workspace's own code. That is
+        # exactly what is wanted: a warning inside one of the 325 external
+        # crates is not ours to fix and must not be able to fail this gate,
+        # while a warning in our own code fails it immediately. Confirmed
+        # end-to-end: a single unused variable planted in a workspace crate
+        # turns this step red with `error: unused variable`, and the identical
+        # tree exits 0 with the deny removed.
+        #
+        # WHY NOT THE LOG-GREP ALTERNATIVE. Capturing the build log and failing
+        # on the text `warning:` was measured and DISQUALIFIED, not merely
+        # ranked lower. On a clean, warning-free build that grep still matches,
+        # because cargo renders build-script advisories as
+        # `warning: <crate>@<version>: <text>`. curl-rs-ffi/build.rs emits
+        # exactly such an advisory, on purpose, for open ambiguity A4 whenever
+        # it sees aarch64-apple-darwin, and curl-rs/build.rs emits others when
+        # an optional input such as Perl is absent. A log grep would therefore
+        # fail the Apple arm64 leg on an INTENTIONAL advisory - a false
+        # negative on the one target whose real defect is silent, which is the
+        # worst possible failure mode here. The deny-flag mechanism is immune
+        # by construction: a build-script advisory is a cargo diagnostic, not a
+        # rustc lint, so it is reported in the log and does not affect the exit
+        # status. Verified: a build carrying that advisory and nothing else
+        # exits 0.
+        #
+        # WHAT IT HONESTLY DOES NOT COVER, stated rather than glossed over.
+        # Because every leg passes --target, build scripts are host units and
+        # RUSTFLAGS does not reach them, so a warning in build-script SOURCE is
+        # not denied here. That warning is target-independent, so replicating a
+        # check for it four times would be the wrong shape anyway; it is caught
+        # by `cargo clippy --workspace -- -D warnings` in rust-clippy.yml,
+        # which was verified to stop on it. Cargo's own manifest diagnostics
+        # are likewise not rustc lints and are outside this flag; the remedy
+        # for one of those is always the manifest, never a suppression here.
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: |
+          # Gate 1, verbatim, with --locked and the per-leg --target added.
+          #
+          # --workspace covers all three members in one invocation:
+          #   curl-rs-lib   the engine, an rlib
+          #   curl-rs       two binaries, curl-rs and curlinfo
+          #   curl-rs-ffi   a cdylib and a staticlib, named `curl` by its
+          #                 [lib] table so the artifacts are libcurl.*
+          #
+          # --release because that is what gate 1 names, and because the
+          # release profile is where the workspace's own settings apply -
+          # link-time optimisation off, unwinding preserved so a panic stays
+          # contained at the FFI boundary, and overflow checks deliberately
+          # left ON. A debug build would not exercise any of them.
+          #
+          # No Perl install step, and none is needed: curl-rs/build.rs drives
+          # scripts/managen through Perl to generate the embedded manual, and
+          # both the ubuntu and the macos runner images ship Perl. If it were
+          # ever absent the script degrades to a stub with an advisory rather
+          # than failing, so its absence would be a quietly smaller manual and
+          # not a red build - which is precisely why no step here asserts
+          # anything about Perl that the build script does not.
+          cargo build --locked --release --workspace --target "${MATRIX_TARGET}"
+
+      - name: 'artifacts'
+        run: |
+          # A build that exits 0 while producing nothing is not a build, and
+          # cargo will happily do it if a [[bin]] or [lib] table is edited
+          # wrongly. This step is what turns "the compiler was happy" into "the
+          # four artifacts gate 1 promises exist".
+          #
+          # The names are not arbitrary. curl-rs/Cargo.toml declares two [[bin]]
+          # targets, curl-rs and curlinfo. curl-rs-ffi/Cargo.toml declares
+          # [lib] name = "curl" with crate-type ["cdylib", "staticlib"], and
+          # that name is the reason the library artifacts are libcurl.* rather
+          # than libcurl_rs_ffi.* - a drop-in replacement has to be findable
+          # under the name its consumers already use.
+          #
+          # The shared-library extension is target-dependent, so it is derived
+          # from the triple rather than hardcoded: a Mach-O dynamic library is
+          # a .dylib and looking for a .so on the Apple legs would fail every
+          # one of them for the wrong reason.
+          case "${MATRIX_TARGET}" in
+            *-apple-darwin)
+              shared='libcurl.dylib'
+              ;;
+            *-unknown-linux-gnu)
+              shared='libcurl.so'
+              ;;
+            *)
+              echo "FAIL: no shared-library naming convention is known for ${MATRIX_TARGET}."
+              echo 'The four mandated triples are two -unknown-linux-gnu and two -apple-darwin.'
+              exit 1
+              ;;
+          esac
+
+          out="target/${MATRIX_TARGET}/release"
+          echo '::group::release directory'
+          ls -l "${out}"
+          echo '::endgroup::'
+
+          missing=''
+          for artifact in curl-rs curlinfo "${shared}" libcurl.a; do
+            if [ ! -f "${out}/${artifact}" ]; then
+              missing="${missing} ${artifact}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "FAIL: the build reported success but these artifacts are absent from ${out}:${missing}"
+            echo 'Check the [[bin]] tables in curl-rs/Cargo.toml and the [lib] table in curl-rs-ffi/Cargo.toml.'
+            exit 1
+          fi
+
+          # Identify each one, so the log records what was actually produced
+          # and a cross-compiled leg that quietly emitted a host object is
+          # visible. `file` is used because it is present on both runner
+          # families; `stat` is not, its flags differ between GNU and BSD.
+          #
+          # Deliberately NOT done here: no nm, no objdump, no symbol counting
+          # and no soname inspection. Exported-symbol parity against the
+          # 100-name export list, and the generated public header, belong to
+          # rust-abi.yml. Gate 1 asks only whether the artifacts were built.
+          echo '::group::artifact identity'
+          for artifact in curl-rs curlinfo "${shared}" libcurl.a; do
+            file -- "${out}/${artifact}"
+          done
+          echo '::endgroup::'
+          echo "all four artifacts were produced for ${MATRIX_TARGET}"
+
+      - name: 'assert: this gate wrote nothing outside target/'
+        run: |
+          # The property that makes everything above trustworthy. Every cargo
+          # invocation in this job either only reads the tree or was passed
+          # --locked, so nothing should have been able to modify a tracked file
+          # or regenerate Cargo.lock. This says so out loud rather than
+          # assuming it.
+          #
+          # A finding means one of three things, all of them worth failing on:
+          # --locked was dropped somewhere and cargo rewrote the lockfile, a
+          # build script wrote into the source tree instead of OUT_DIR, or a
+          # generated artifact that .gitignore does not cover appeared. The
+          # root .gitignore already covers /target, the per-crate target
+          # directories, the coverage intermediates and the cbindgen staging
+          # files, so a normal run leaves this empty.
+          changed="${RUNNER_TEMP}/worktree-status.txt"
+          git status --porcelain > "${changed}"
+          if [ -s "${changed}" ]; then
+            echo 'FAIL: the working tree changed while this gate ran:'
+            cat "${changed}"
+            exit 1
+          fi
+          echo 'the working tree is byte-identical to the checkout: this gate builds, it does not rewrite'
+
+  # =========================================================================
+  # The minimum supported Rust version floor
+  # =========================================================================
+  #
+  # WHY THIS IS A JOB IN THIS FILE, AND WHY IT IS NOT A MATRIX LEG ABOVE.
+  #
+  # It belongs in this file because the MSRV floor is a property of the BUILD:
+  # the question it answers is whether the declared minimum toolchain still
+  # compiles the workspace against the committed lockfile. It is one of the
+  # four items the previous attempt at this migration left unfinished - a
+  # header that broke C consumers, an advisory scan never executed, the aarch64
+  # and macOS targets never built, and THE MSRV PIN NEVER CONFIRMED - and all
+  # four are designed in from the start here rather than deferred again.
+  #
+  # It is a separate job rather than a fifth matrix leg so that a failure names
+  # itself. A matrix leg would report as "the build failed for one entry" and
+  # send somebody looking at a target triple; a distinct job called `MSRV
+  # floor` reports the actual finding, which is that a dependency has raised
+  # its own minimum.
+  msrv:
+    name: 'MSRV floor'
+    runs-on: ubuntu-latest
+
+    # 20 minutes. This job compiles the same workspace as one build leg, minus
+    # the release profile's optimisation work, on a toolchain that has to be
+    # downloaded first.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'install the MSRV toolchain'
+        run: |
+          # THE ONE TOOLCHAIN INSTALLATION IN THIS FILE, and the only one that
+          # is justified: rust-toolchain.toml pins the stable channel the build
+          # legs use and deliberately does not mention the floor, because the
+          # floor is not a channel anybody develops on.
+          #
+          # --profile minimal because this job needs rustc, cargo and the host
+          # standard library and nothing else. rustfmt, clippy and
+          # llvm-tools-preview belong to the pinned channel for the gates that
+          # use them; downloading them for a toolchain that only has to answer
+          # "does this compile" would be waste, and a component that failed to
+          # download would fail this job for a reason unrelated to the MSRV.
+          #
+          # Explicitly NOT nightly. Nightly appears nowhere in this file; it
+          # belongs to rust-miri.yml and rust-asan.yml, which install it
+          # themselves.
+          rustup toolchain install "${MSRV_TOOLCHAIN}" --profile minimal
+
+      - name: 'toolchain versions'
+        run: |
+          # Both toolchains are printed: the pinned stable channel, so it is
+          # clear which one this job is NOT using, and the floor, so it is
+          # clear which one it is.
+          echo '::group::the pinned stable channel (not used by this job)'
+          rustc --version
+          cargo --version
+          echo '::endgroup::'
+          echo '::group::the MSRV toolchain this job uses'
+          rustc "+${MSRV_TOOLCHAIN}" --version
+          cargo "+${MSRV_TOOLCHAIN}" --version
+          echo '::endgroup::'
+          # The manifest section that declares the floor. awk rather than a sed
+          # line range because a range ends ON its terminator, so it would
+          # print the next section's header too and the log would suggest this
+          # step read more than it did.
+          echo '::group::Cargo.toml [workspace.package]'
+          awk '/^\[/ { inside = ($0 == "[workspace.package]") } inside && !/^(#|$)/' Cargo.toml
+          echo '::endgroup::'
+
+      - name: 'assert: the installed floor is the declared floor'
+        run: |
+          # A cross-file assertion, and the reason MSRV_TOOLCHAIN cannot drift
+          # away from the manifest unnoticed. Cargo.toml declares the floor as
+          # a two-component `rust-version`; rustup wants a three-component
+          # toolchain name; this reconciles them instead of letting two
+          # independent literals slowly disagree.
+          declared="$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "${declared}" ]; then
+            echo 'FAIL: Cargo.toml [workspace.package] declares no rust-version.'
+            echo 'The MSRV floor is a mandated requirement and the manifest is where it is declared.'
+            exit 1
+          fi
+          case "${MSRV_TOOLCHAIN}" in
+            nightly*|beta*)
+              echo "FAIL: MSRV_TOOLCHAIN is ${MSRV_TOOLCHAIN}; the floor must be a released stable version."
+              exit 1
+              ;;
+          esac
+          want="$(printf '%s' "${declared}" | cut -d. -f1,2)"
+          have="$(printf '%s' "${MSRV_TOOLCHAIN}" | cut -d. -f1,2)"
+          if [ "${want}" != "${have}" ]; then
+            echo "FAIL: Cargo.toml declares rust-version ${declared}, but this job installs ${MSRV_TOOLCHAIN}."
+            echo 'Raise or lower both together, or neither. They are the same requirement stated twice.'
+            exit 1
+          fi
+          active="$(cargo "+${MSRV_TOOLCHAIN}" --version | awk '{ print $2 }')"
+          if [ "${active}" != "${MSRV_TOOLCHAIN}" ]; then
+            echo "FAIL: cargo +${MSRV_TOOLCHAIN} reports ${active}."
+            echo 'The explicit +toolchain argument overrides rust-toolchain.toml, so a mismatch means'
+            echo 'the requested toolchain is not the one that ran. Find and remove the override.'
+            exit 1
+          fi
+          echo "Cargo.toml rust-version ${declared} is honoured by the installed toolchain ${active}"
+
+      - name: 'msrv: cargo build --locked --workspace on the floor toolchain'
+        run: |
+          # The floor, confirmed.
+          #
+          # HOST ONLY, AND NO --release. The question this job answers is
+          # whether the floor toolchain accepts this source and this lockfile,
+          # and a host debug build answers it completely. Adding --target would
+          # re-ask gate 1's question on a toolchain gate 1 does not use, and
+          # adding --release would re-ask it again in a second configuration;
+          # both would blur what a failure here means. --locked stays, because
+          # the lockfile is half of what is being tested.
+          #
+          # HOW TO READ A FAILURE HERE. It almost certainly means a dependency
+          # version in Cargo.toml declares a minimum newer than the floor, and
+          # THE DEFECT IS THAT VERSION PIN, NOT THE FLOOR. Raising the MSRV is
+          # a decision for whoever set it - it is escalated as ambiguity A4 -
+          # and it is not a change to be made to get a build green. The adopted
+          # version set was swept in full against the floor and produced zero
+          # violations, and it was chosen over the newest releases on purpose:
+          # clap 4.6.4, quinn 0.11.11, russh 0.62.4, rand 0.10.2, sha2 0.11.0
+          # and hmac 0.13.0 all declare a minimum of 1.85. Two independent
+          # reasons make the adopted set preferable anyway, so a "fix" that
+          # advanced those pins would lose both. First, every russh release
+          # from 0.58.0 through 0.62.4 pulls release-candidate cryptography -
+          # a release-candidate RSA, ssh-key and pkcs1 - whereas the pinned
+          # russh has a fully stable graph, and shipping release-candidate
+          # cryptography would put the advisory gate in permanent jeopardy.
+          # Second, the adopted set is coherent on one digest generation
+          # throughout; the newest set would place two incompatible digest
+          # generations in one graph and the HMAC-over-SHA-1 construction
+          # would simply fail to compile.
+          #
+          # ONE OTHER REGRESSION THIS JOB IS THE ONLY GATE TO CATCH. Both build
+          # scripts must emit the legacy single-colon `cargo:` directive form
+          # rather than the double-colon `cargo::` form, which postdates the
+          # floor. Measured on the floor toolchain, a double-colon directive is
+          # a HARD FAILURE - cargo reports `error: unsupported output in build
+          # script` and stops - so if this job fails with that message the
+          # remedy is to restore the single-colon spelling in the build script,
+          # nothing more. That matters because the soname of the shared library
+          # is emitted by exactly such a directive from curl-rs-ffi/build.rs.
+          cargo "+${MSRV_TOOLCHAIN}" build --locked --workspace
+
+      - name: 'assert: this gate wrote nothing outside target/'
+        run: |
+          # Same property as the build legs, same reasoning. --locked means the
+          # lockfile must be unchanged, and a floor toolchain that regenerated
+          # it would have invalidated the very thing this job set out to test.
+          changed="${RUNNER_TEMP}/worktree-status.txt"
+          git status --porcelain > "${changed}"
+          if [ -s "${changed}" ]; then
+            echo 'FAIL: the working tree changed while this gate ran:'
+            cat "${changed}"
+            exit 1
+          fi
+          echo 'the working tree is byte-identical to the checkout: this gate builds, it does not rewrite'

@@ -1,0 +1,647 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Validation gate 5 of the ten that guard the Rust workspace: UNDEFINED
+# BEHAVIOUR.
+#
+# The gate, verbatim: `cargo +nightly miri test -p curl-rs-lib`, with zero
+# undefined behaviour reported. This file adds `--locked` and nothing else.
+#
+# It does nothing further. The build lives in rust-build.yml, lint in
+# rust-clippy.yml, the tests in rust-test.yml, coverage in rust-coverage.yml,
+# the sanitizer in rust-asan.yml, symbol and header parity in rust-abi.yml,
+# supply chain in rust-audit.yml, and the curl fixture corpus in
+# curl-testsuite.yml. One workflow per validation gate, so that a failure
+# names its own cause. Nothing below builds, lints, formats, measures
+# coverage, audits a dependency, inspects a symbol table, compiles an example
+# program or runs tests/runtests.pl.
+#
+# NO C ANCESTOR, unlike every other workflow in this family. rust-clippy.yml
+# succeeds the `checksrc` job of the deleted checksrc.yml; rust-build.yml
+# succeeds the Autotools and CMake legs of linux.yml and macos.yml. This one
+# succeeds nothing at all. Miri interprets Rust against a model of the
+# abstract machine and reports operations the language declares undefined, and
+# the C tree had no equivalent: there was never a checker that could be pointed
+# at the whole of lib/ and asked whether it stayed inside the language. So the
+# scaffolding here - the trigger shape, the pinned checkout, the log grouping,
+# the closing worktree assertion - is borrowed from the neighbouring
+# workflows, and nothing else is inherited.
+
+# ---------------------------------------------------------------------------
+# WHY THE SCOPE IS `-p curl-rs-lib`, AND WHY IT IS THE ONLY SCOPE
+# ---------------------------------------------------------------------------
+#
+# curl-rs-lib is the crate that carries the safety invariant, so it is the
+# crate Miri is aimed at. The invariant is machine-enforced rather than
+# review-enforced: curl-rs-lib/src/lib.rs escalates `unsafe_code` at the crate
+# root and grants exactly one exemption, `#[allow(unsafe_code)]` on
+# `pub(crate) mod ffi`. That converts a prose requirement into a
+# compiler-checked one. Everything in the crate outside src/ffi/ therefore
+# cannot contain an `unsafe` block at all, and Miri's value over that code is
+# in standard-library and lifetime interactions rather than in raw pointers.
+#
+# Measured, so the claim is exact rather than approximate: the crate root uses
+# `deny` and not `forbid`, because `forbid` at crate level cannot be lifted by
+# an inner `#[allow]` and the one sanctioned exemption would not compile.
+# `deny` plus a single targeted `#[allow]` is what makes the invariant
+# checkable. This workflow neither relies on the distinction nor may change
+# it; curl-rs-lib/src/lib.rs owns it.
+#
+# WHAT THIS RUN REACHES. Under the default feature set, and stated as an
+# under-claim on purpose, because over-claiming what a gate covers is worse
+# than admitting a gap:
+#
+#   curl-rs-lib/src/ffi/mod.rs   REACHED. The module root, its re-export
+#                                surface and the injection seam described
+#                                below.
+#   curl-rs-lib/src/ffi/sys.rs   REACHED. The residue of socket and host
+#                                operations that has no safe expression.
+#                                socket2 absorbs most of what the C tree did
+#                                by hand - raw setsockopt, getsockopt and
+#                                fcntl - and what genuinely remains is a
+#                                hostname query, the successor to
+#                                lib/curl_gethostname.c, plus a small number
+#                                of platform calls. They are confined here so
+#                                that one `#[allow]` covers the whole of the
+#                                crate's unsafe surface.
+#   curl-rs-lib/src/ffi/gss.rs   NOT REACHED. It is the optional GSS-API
+#                                binding for Negotiate and sits behind
+#                                `#[cfg(feature = "negotiate")]`, which is
+#                                default-off in curl-rs-lib/Cargo.toml. A
+#                                default-feature run does not compile it, so
+#                                this gate says nothing about it.
+#
+# The gss.rs gap is deliberate rather than an oversight, and adding a second
+# leg with `--features negotiate` would not close it. GSS-API is a foreign C
+# library and Miri cannot execute a foreign function, so such a leg would
+# fail on an unsupported operation rather than on undefined behaviour - a red
+# cross that means nothing about UB. `--all-features` is worse still: it would
+# additionally enable `hickory-dns`, the one feature whose crate carries no
+# pinned version, so a failure there would be a resolution failure wearing
+# this gate's name. One leg, default features, honestly scoped.
+#
+# NOT `-p curl-rs-ffi`, and this is a division of labour rather than a gap.
+# That crate's unsafe surface is the C boundary itself: `Box::into_raw` in
+# curl_easy_init paired with `Box::from_raw` in curl_easy_cleanup, the
+# `#[no_mangle] pub extern "C"` entry points, and the single-trailing-pointer
+# design that stands in for curl's four variadic setters. All of it is only
+# ever entered from C, and Miri cannot interpret a call that originates
+# outside the Rust it is interpreting. AddressSanitizer can, which is why
+# rust-asan.yml is the sanitizer leg retargeted at the FFI surface and why
+# curl-rs-ffi is audited there and not here. It is audited; just not by Miri.
+#
+# NOT `-p curl-rs` either. The binary crate escalates `unsafe_code` at its
+# root with no `ffi` module and therefore no exemption, so there is no unsafe
+# code in it for Miri to examine.
+#
+# NOT `--workspace`. It would pull in both of the above and buy nothing that
+# the two paragraphs before it do not already rule out.
+
+# ---------------------------------------------------------------------------
+# NO RELAXATIONS. Zero undefined behaviour is the whole gate.
+# ---------------------------------------------------------------------------
+#
+# Miri exits non-zero on any undefined behaviour it detects, so the gate is
+# the exit status and every flag that narrows what Miri looks for narrows the
+# gate. This file sets MIRIFLAGS nowhere and passes no `-Zmiri-` flag at all.
+# In particular:
+#
+#   -Zmiri-disable-stacked-borrows  would switch off the aliasing model, which
+#                                   is most of what Miri knows that a compiler
+#                                   does not.
+#   -Zmiri-ignore-leaks             would hide a leak at the exact boundary
+#                                   where ownership crosses into C, which is
+#                                   the boundary this workspace is most likely
+#                                   to get wrong.
+#   -Zmiri-disable-isolation        would grant clock, environment and
+#                                   filesystem access. Not needed: the
+#                                   resolver, the clock and the TLS provider
+#                                   are injected rather than reached for
+#                                   globally, and src/ffi/sys.rs puts every
+#                                   raw call behind a trait whose test double
+#                                   is pure Rust. It also would not help with
+#                                   a foreign call, which isolation does not
+#                                   govern.
+#
+# There is likewise no `continue-on-error`, no `if:` on any step, and no
+# `|| true` anywhere. A failing Miri run must fail this workflow.
+#
+# Nor may any of this move into .cargo/config.toml. That file deliberately
+# sets no `rustflags` key at all and records the reason: an unstable `-Z` flag
+# there would be rejected by the pinned stable toolchain and would break every
+# build rather than one leg. Miri's flags belong to this file, and this file
+# needs none.
+
+name: 'Rust undefined behaviour'
+
+'on':
+  push:
+    branches:
+      - master
+      - '*/ci'
+    # A deny-list, and deliberately the same four entries the sibling Rust
+    # gates use, so that the ten gates can be diffed against one another.
+    # Never a `paths:` allow-list: an allow-list would have to name every
+    # source path in curl-rs-lib plus Cargo.toml, Cargo.lock and
+    # rust-toolchain.toml, and the day one was forgotten is the day a change
+    # to curl-rs-lib/src/ffi/** merged without this gate ever firing - which
+    # is precisely when it must fire.
+    #
+    # `**/*.md` was considered, because macos.yml ignores it and this is a
+    # slow gate, and it was rejected. A Markdown file reachable through a
+    # `#![doc = include_str!(...)]` attribute would make the entry wrong, and
+    # curl-rs-lib already reads repository files with `include_str!` in its
+    # tests. A deny entry that is too broad fails the same way an allow-list
+    # does, by silence, and wall-clock is not a reason to accept that risk.
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # Colour off. Three steps below parse tool output with `sed`, `grep` and
+  # `awk` to decide a verdict, and an ANSI escape sequence embedded in a
+  # diagnostic would make an anchored pattern silently stop matching. An
+  # assertion that silently stops matching is worse than no assertion.
+  CARGO_TERM_COLOR: never
+
+  # The nightly toolchain and the locked dependency graph are both downloaded
+  # here. A transient registry or CDN hiccup should retry rather than fail
+  # this gate and send somebody hunting for undefined behaviour that is not
+  # there.
+  CARGO_NET_RETRY: '3'
+
+  # No cache is restored in this job, so incremental state is output that
+  # nothing ever reads. Not a speed tuning - performance is an explicit
+  # non-goal of this work and no step below is ordered or configured for it.
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  miri:
+    name: 'cargo miri test -p curl-rs-lib'
+
+    # ubuntu-latest, not the leaner ubuntu-slim that the text and shell checks
+    # use. This job installs a full nightly toolchain, builds a Miri sysroot
+    # from rust-src, then compiles and interprets curl-rs-lib and its locked
+    # dependency graph; ubuntu-slim suits a Perl pass over text, not that.
+    runs-on: ubuntu-latest
+
+    # A single job and no matrix. Gate 5 names one command on one crate, and
+    # cross-target coverage belongs to rust-build.yml, which is where a
+    # target-specific defect must surface. Were a matrix ever added here,
+    # `fail-fast: false` would be mandatory - every matrix in this repository
+    # carries it - because a gate that cancels its siblings on the first
+    # finding hides the rest of them.
+    #
+    # 60 minutes, chosen by arithmetic rather than copied, and deliberately
+    # larger than anything else in this repository. The tree's values are 1, 2,
+    # 3, 5, 10, 15, 20, 30 and 45, and this gate is the slowest in the family
+    # by construction: it builds the standard library from source and then
+    # INTERPRETS curl-rs-lib and its locked graph instead of executing them.
+    #
+    # The budget is apportioned so that the interpretation cannot be squeezed
+    # by the work that precedes it. The two preparatory steps carry their own
+    # ceilings of 10 and 15 minutes, so even if both ran to the limit the gate
+    # command still has 35 minutes of the 60 - which is the whole reason those
+    # step ceilings are lower than they could otherwise afford to be. Had the
+    # job been left at 45, a slow toolchain download plus a slow sysroot build
+    # could have reduced the actual gate to minutes without anything looking
+    # wrong.
+    #
+    # A timeout must never be the thing that fails a correctness gate. Note
+    # also that the interpreter being slow is not itself a finding: performance
+    # is an explicit non-goal here, and no step below is ordered or configured
+    # for speed.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # NOTHING IS CACHED HERE, and the decision is deliberate.
+      #
+      # actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb is the only
+      # cache pin in use in this tree and would be the one to reach for, so
+      # the reasons for not reaching for it are worth writing down.
+      #
+      # The Miri sysroot is the only artifact worth caching, and its cache key
+      # would have to carry the exact nightly commit that built it, because a
+      # sysroot from a different rustc is not merely stale, it is wrong. That
+      # commit is unknown until after `rustup toolchain install nightly` has
+      # run, which is after the point a restore step must sit if it is to save
+      # any work at all. Resolving that ordering means an extra step whose only
+      # purpose is wall-clock, and performance is an explicit non-goal here.
+      #
+      # The deeper reason is that this is a correctness gate. Every cache is a
+      # way for a verdict to rest on something other than the state of the
+      # tree in front of it, and a UB gate has to be trustworthy before it is
+      # quick. rust-clippy.yml made the same call for the same reason.
+      #
+      # Were a cache ever added, the key must include the nightly commit hash
+      # that `rustc +nightly --version` reports, not the date and not the
+      # literal string `nightly`, and the path must be Miri's sysroot cache
+      # rather than target/.
+      - name: 'install the nightly toolchain, with miri and rust-src'
+        # Its own step-level budget, following the pattern rust-audit.yml uses
+        # for its tool installs, so that a slow or failing download is
+        # attributed to the download and cannot consume the interpretation
+        # budget of the gate itself. Deliberately a small share of the job's
+        # 60: see the arithmetic beside timeout-minutes above.
+        timeout-minutes: 10
+        run: |
+          # rust-toolchain.toml pins channel = "1.97.1", a STABLE channel, and
+          # deliberately does not pin nightly. It says so itself, and it names
+          # this file: the Miri and AddressSanitizer gates "need it, and both
+          # name it explicitly per invocation". It also omits rust-src from
+          # `components` for exactly the same reason, recording that rust-src
+          # "belongs to the nightly toolchain they install for themselves".
+          # So installing nightly is this workflow's job, and editing
+          # rust-toolchain.toml to add it would be wrong twice over: it would
+          # download a second toolchain on every checkout for every other leg,
+          # and it is not this file's to change.
+          #
+          # miri is the interpreter. rust-src is required because Miri builds
+          # the standard library from source rather than using the shipped
+          # binary one; it is requested explicitly here instead of being left
+          # to a profile default, since --profile minimal does not carry it.
+          #
+          # --profile minimal because nothing in this job needs rustfmt,
+          # clippy, rust-docs or any cross target: the gate interprets on the
+          # host. --no-self-update keeps rustup itself fixed, so the only
+          # moving part is the nightly channel. --override is deliberately NOT
+          # passed: it would write a directory override and mutate the state
+          # of the checkout, and every invocation below names +nightly instead.
+          command -v rustup
+          rustup --version
+
+          status=0
+          rustup toolchain install nightly \
+            --profile minimal \
+            --component miri \
+            --component rust-src \
+            --no-self-update || status=$?
+
+          if [ "${status}" -ne 0 ]; then
+            echo 'FAIL: could not install the nightly toolchain with miri and rust-src.'
+            echo 'This is a TOOLCHAIN AVAILABILITY failure, not a finding about undefined behaviour.'
+            echo 'The usual cause is that the newest nightly was published without the miri'
+            echo 'component. Confirm against the nightly channel manifest before changing anything'
+            echo 'here, and never work around it by relaxing the gate.'
+            exit "${status}"
+          fi
+
+      - name: 'toolchain versions'
+        run: |
+          # Evidence before use. Every verdict this workflow reaches is a
+          # statement about which interpreter produced it, so the versions are
+          # printed before anything is judged by them.
+          echo '::group::nightly toolchain (the one this gate runs on)'
+          command -v rustup
+          rustc +nightly --version
+          cargo +nightly --version
+          cargo +nightly miri --version
+          echo '::endgroup::'
+
+          # Printed for contrast, not for use. Bare `cargo` in this directory
+          # resolves to the pinned stable channel, and seeing the two side by
+          # side in the log is what makes the assertion in the next step
+          # legible when it ever fires.
+          echo '::group::default toolchain in this checkout (NOT used by this gate)'
+          rustc --version
+          cargo --version
+          echo '::endgroup::'
+
+          echo '::group::rust-toolchain.toml (the pin this gate deliberately bypasses)'
+          grep -v -E '^(#|$)' rust-toolchain.toml
+          echo '::endgroup::'
+
+          # The feature set decides which unsafe code the interpretation
+          # actually reaches, so the manifest's default list is printed too.
+          # `negotiate` must NOT appear in it; if it ever does, the comment at
+          # the top of this file about src/ffi/gss.rs being out of reach stops
+          # being true and must be corrected rather than left to rot.
+          echo '::group::curl-rs-lib default features (what decides the unsafe reach)'
+          sed -n '/^default = \[/,/^\]/p' curl-rs-lib/Cargo.toml
+          echo '::endgroup::'
+
+      - name: 'assert: +nightly resolved to a nightly, and miri came from it'
+        run: |
+          # Two things are asserted here, and the first is the one the layout
+          # of this repository makes worth asserting at all.
+          #
+          # A directory-scoped rust-toolchain.toml with an explicit `channel`
+          # is authoritative for a bare `cargo`, so in this checkout `rustc
+          # --version` reports the pinned stable release. An explicit
+          # `+toolchain` argument outranks that file, which is why every
+          # invocation in this job carries +nightly. Measured on the toolchain
+          # this design was verified against, `rustc +nightly --version`
+          # reports a nightly here while bare `rustc --version` reports the
+          # pin, so the override does win - but a gate that assumes it would
+          # be a gate that silently ran on stable, where Miri does not exist,
+          # the day that ever changed. Hence the check.
+          #
+          # If the override ever stops winning, the remedy is a step-scoped
+          # `env: RUSTUP_TOOLCHAIN: nightly` on the steps below, NEVER an edit
+          # to rust-toolchain.toml, which is owned elsewhere and correct as it
+          # stands.
+          nightly_rustc="$(rustc +nightly --version)"
+          nightly_cargo="$(cargo +nightly --version)"
+          miri_version="$(cargo +nightly miri --version)"
+
+          case "${nightly_rustc}" in
+            *nightly*) ;;
+            *)
+              echo "FAIL: rustc +nightly reports '${nightly_rustc}', which is not a nightly."
+              echo 'rust-toolchain.toml has overridden the +nightly selection. Miri exists only on'
+              echo 'nightly, so this gate cannot run. Add a step-scoped RUSTUP_TOOLCHAIN=nightly to'
+              echo 'the steps in this file; do not edit rust-toolchain.toml.'
+              exit 1
+              ;;
+          esac
+
+          case "${nightly_cargo}" in
+            *nightly*) ;;
+            *)
+              echo "FAIL: cargo +nightly reports '${nightly_cargo}', which is not a nightly."
+              echo 'rustc and cargo have resolved to different channels, so cargo-miri would drive'
+              echo 'a stable cargo. Investigate the rustup installation in the step above.'
+              exit 1
+              ;;
+          esac
+
+          # The second assertion, and it catches a failure the first cannot.
+          # cargo-miri hands the interpreter's own driver to cargo as the
+          # compiler, and Miri refuses to interpret a sysroot built by a
+          # different rustc. Both version strings carry a short commit hash of
+          # the tree they were built from - rustc's is nine characters and
+          # miri's ten, both truncations of the same commit - so comparing the
+          # leading seven proves the interpreter and the compiler are the same
+          # nightly rather than two that merely happen to be installed.
+          rustc_hash="$(printf '%s\n' "${nightly_rustc}" | sed -n 's/.*(\([0-9a-f]\{7,\}\) .*/\1/p')"
+          miri_hash="$(printf '%s\n' "${miri_version}" | sed -n 's/.*(\([0-9a-f]\{7,\}\) .*/\1/p')"
+
+          if [ -z "${rustc_hash}" ] || [ -z "${miri_hash}" ]; then
+            echo 'FAIL: could not read a commit hash out of the version strings:'
+            echo "  rustc: ${nightly_rustc}"
+            echo "  miri : ${miri_version}"
+            echo 'The version format changed. Fix the patterns above rather than dropping the check.'
+            exit 1
+          fi
+
+          if [ "$(printf '%s' "${rustc_hash}" | cut -c1-7)" != "$(printf '%s' "${miri_hash}" | cut -c1-7)" ]; then
+            echo "FAIL: miri was built from ${miri_hash} but the active nightly rustc is ${rustc_hash}."
+            echo 'A sysroot built by one and interpreted by the other is rejected by Miri, and any'
+            echo 'result from such a pairing would be meaningless. Reinstall the nightly toolchain'
+            echo 'so that rustc and miri come from one commit.'
+            exit 1
+          fi
+
+          echo "nightly rustc and miri both come from commit ${rustc_hash}, and +nightly outranked rust-toolchain.toml"
+
+      - name: 'cargo +nightly miri setup (build the Miri sysroot)'
+        # Building the standard library from source is not interpretation, so
+        # it gets its own budget for the same attribution reason as the install
+        # above, and the same deliberately modest share of the job's 60.
+        timeout-minutes: 15
+        run: |
+          # Its own step, and this is the whole point of splitting it out.
+          # `cargo miri test` would do this implicitly on first use, and a
+          # sysroot build that failed would then arrive wearing the gate's
+          # name - somebody would go looking through curl-rs-lib/src/ffi/ for
+          # undefined behaviour that was never reported. Splitting the two
+          # makes failure mode (a) of the three named below distinguishable
+          # from the other two by which step went red, before anybody reads a
+          # single line of log.
+          status=0
+          cargo +nightly miri setup || status=$?
+
+          if [ "${status}" -ne 0 ]; then
+            echo 'FAIL: cargo miri setup could not build the standard library for the interpreter.'
+            echo 'This is failure mode (a): a TOOLCHAIN problem owned by this workflow, and NOT a'
+            echo 'finding about curl-rs-lib. Nothing in curl-rs-lib was interpreted, so no statement'
+            echo 'about undefined behaviour has been made either way. The usual causes are a missing'
+            echo 'rust-src component and a nightly whose miri and rustc disagree; the two steps above'
+            echo 'assert against both, so look there first.'
+            exit "${status}"
+          fi
+
+          echo 'the Miri sysroot is built; curl-rs-lib can now be interpreted'
+
+      - name: 'miri: cargo +nightly miri test --locked -p curl-rs-lib'
+        run: |
+          # GATE 5, verbatim, with --locked added and nothing else.
+          #
+          # --locked because Cargo.lock is committed and reproducible builds
+          # are non-negotiable: it makes a lockfile that disagrees with the
+          # manifests fail loudly here rather than be regenerated underneath
+          # the gate. It was verified rather than assumed that the flag and
+          # cargo-miri get along - cargo-miri re-invokes cargo internally with
+          # its own driver, so the flag surviving that hand-off is a real
+          # question and the answer is that it does. It stays.
+          #
+          # -p curl-rs-lib, and nothing else. The reasoning is at the top of
+          # this file: curl-rs-lib carries the one sanctioned unsafe island,
+          # curl-rs-ffi's C boundary belongs to rust-asan.yml because Miri
+          # cannot interpret a call that originates in C, and curl-rs has no
+          # unsafe code at all.
+          #
+          # No MIRIFLAGS and no -Zmiri- flag. Zero undefined behaviour is the
+          # gate and every relaxation narrows it; the list of the ones that
+          # were considered and rejected is at the top of this file.
+          #
+          # Streamed through tee rather than redirected to a file, then the
+          # real status recovered from PIPESTATUS. This job has a 45 minute
+          # budget and Miri is slow by construction, so a run that hits the
+          # ceiling must still have printed how far it got. A plain redirect
+          # would have thrown that away, and `set -o pipefail` cannot be
+          # relied upon because the default shell here is `bash -e`, without
+          # it. tee always succeeds, so the pipeline satisfies -e and the
+          # assignment on the very next line carries cargo's own status.
+          log="${RUNNER_TEMP}/miri-test.log"
+
+          status=0
+          cargo +nightly miri test --locked -p curl-rs-lib 2>&1 | tee "${log}"
+          status="${PIPESTATUS[0]}"
+
+          # The failure path is the CONDITIONAL branch and the success path is
+          # the fall-through, which is not merely a stylistic preference. The
+          # shell-lint gate concatenates every `run:` body in this file into a
+          # single script and checks it as one unit, so a top-level `exit` as
+          # the last statement of a step renders every later step unreachable
+          # and is reported as such. Writing it this way keeps the whole file
+          # analysable. The neighbouring Rust workflows have the same shape for
+          # the same reason.
+          if [ "${status}" -ne 0 ]; then
+            # Which of the three failure modes this is decides who owns the
+            # fix, so it is classified here rather than left to whoever opens
+            # the log. Checked in order of severity; a run can exhibit more
+            # than one, and the most serious is the one reported.
+            echo '::group::failure classification'
+
+            if grep -q -F 'error: Undefined Behavior' "${log}"; then
+              echo 'FAILURE MODE (c): UNDEFINED BEHAVIOUR. This is the finding this gate exists to make.'
+              echo 'Owner: curl-rs-lib, specifically curl-rs-lib/src/ffi/mod.rs or src/ffi/sys.rs, since'
+              echo 'the rest of the crate cannot contain an unsafe block. Miri prints the offending'
+              echo 'operation, where the allocation was created and where it died; the sites are quoted'
+              echo 'above. Fix the unsafe code. Do NOT add a -Zmiri- flag to this workflow to silence'
+              echo 'it, and do NOT weaken the // SAFETY: claim to match the code - the claim is the'
+              echo 'thing Miri just falsified.'
+            elif grep -q -F 'unsupported operation' "${log}"; then
+              echo 'FAILURE MODE (b): AN UNSUPPORTED OPERATION, which is NOT undefined behaviour.'
+              echo 'Miri does not execute foreign functions, so a test that reaches an unshimmed libc'
+              echo 'call, a real socket or a real interface enumeration stops the interpreter with this'
+              echo 'diagnostic. It says nothing about the soundness of the code under it. Note that'
+              echo 'many calls ARE shimmed and pass straight through, so this is about the ones that'
+              echo 'are not rather than about libc in general.'
+              echo 'Owner: curl-rs-lib. The remedy is #[cfg_attr(miri, ignore = "...")] on the affected'
+              echo 'test, with a reason naming the call, applied by whoever owns that file - not here.'
+              echo 'src/ffi/sys.rs already routes every raw call through the SysCalls trait precisely so'
+              echo 'that a pure-Rust double covers the surrounding logic under interpretation, so a new'
+              echo 'occurrence usually means a test reached past that seam.'
+              echo 'This workflow must NOT be relaxed to accommodate it: -Zmiri-disable-isolation does'
+              echo 'not permit foreign calls and would not help even if it were acceptable.'
+            else
+              echo 'FAILURE: neither an undefined-behaviour report nor an unsupported operation, so'
+              echo 'this gate has made no statement about undefined behaviour. Four causes land here,'
+              echo 'and they do not all belong to curl-rs-lib:'
+              echo '  1. A WORKSPACE MANIFEST failure. Worth stating because it is counter-intuitive:'
+              echo '     cargo resolves the whole workspace before honouring -p, so a manifest that'
+              echo '     cannot be loaded in ANY member - curl-rs or curl-rs-ffi included - stops this'
+              echo '     gate even though neither is interpreted. Look for "failed to load manifest for'
+              echo '     workspace member" above; the owner is that member, NOT curl-rs-lib.'
+              echo '  2. A LOCKFILE disagreement. If the log says Cargo.lock is out of date, --locked'
+              echo '     did its job by refusing to regenerate it underneath the gate. Owner: whoever'
+              echo '     changed a manifest without committing the resulting lockfile.'
+              echo '  3. A COMPILATION error in curl-rs-lib or a dependency of it. Owner: curl-rs-lib.'
+              echo '  4. A GENUINE ASSERTION FAILURE in a test. Owner: curl-rs-lib, and it is a real'
+              echo '     defect - Miri runs the same assertions the ordinary test suite does, so a test'
+              echo '     that fails here would fail there too.'
+            fi
+
+            # Closed on every branch, so an unterminated group can never
+            # swallow the rest of the log in the run summary.
+            echo '::endgroup::'
+            exit "${status}"
+          fi
+
+          echo "miri interpreted curl-rs-lib and reported no undefined behaviour (exit ${status})"
+
+      - name: 'assert: the interpretation was not vacuous, and name every skip'
+        run: |
+          # A green Miri run that interpreted nothing is the most dangerous
+          # outcome this gate has, because it looks exactly like success. It
+          # arises easily: a filter that matches no test, a `default` feature
+          # set that compiles no test target, or a rename of the package that
+          # leaves `-p curl-rs-lib` selecting an empty set. This step is what
+          # makes that outcome red.
+          #
+          # It runs only when the step above passed, which is deliberate and
+          # not an oversight. On undefined behaviour the test binary ABORTS and
+          # no `test result:` summary line is printed at all, so a count taken
+          # after a failure would read zero and would misreport a genuine UB
+          # finding as a vacuous run. Ordering the two steps this way is what
+          # keeps each failure naming its own cause. There is no `if:` on this
+          # step for the same reason: it must not run after a failure.
+          log="${RUNNER_TEMP}/miri-test.log"
+
+          if [ ! -s "${log}" ]; then
+            echo "FAIL: ${log} is missing or empty, so the step above produced no output to check."
+            exit 1
+          fi
+
+          # Summed across every `test result:` line rather than read from one,
+          # because a run emits one per test target. Both the unit-test binary
+          # and the doc-test block are counted, and that was verified to be
+          # accurate rather than merely convenient: doc-tests are interpreted
+          # too on a current nightly, and undefined behaviour inside one is
+          # reported like any other. Counting them therefore does not overstate
+          # what Miri covered. The `+ 0` makes awk print a number rather than
+          # an empty line when there is nothing to sum.
+          executed="$(sed -n 's/^test result:.* \([0-9][0-9]*\) passed;.*/\1/p' "${log}" | awk '{ total += $1 } END { print total + 0 }')"
+          skipped="$(sed -n 's/^test result:.* \([0-9][0-9]*\) ignored;.*/\1/p' "${log}" | awk '{ total += $1 } END { print total + 0 }')"
+
+          echo "miri executed ${executed} test(s) and skipped ${skipped}"
+
+          if [ "${executed}" -eq 0 ]; then
+            echo 'FAIL: miri reported success while executing ZERO tests, which is a vacuous pass.'
+            echo 'The command exited clean but interpreted nothing, so this gate has made no'
+            echo 'statement about undefined behaviour in curl-rs-lib. Likely causes: the package name'
+            echo 'in -p no longer matches curl-rs-lib/Cargo.toml, the crate has no test targets under'
+            echo 'the default feature set, or every test is ignored under interpretation. Find the'
+            echo 'cause; a gate that cannot fail is not a gate.'
+            exit 1
+          fi
+
+          # Named, not merely counted. A skip is a hole in the coverage this
+          # gate claims, and a hole nobody can see is one nobody closes. The
+          # pattern catches both `... ignored, <reason>` and a bare
+          # `... ignored`, so an unexplained skip stands out in the log next to
+          # the explained ones.
+          if [ "${skipped}" -gt 0 ]; then
+            echo "::group::tests skipped under interpretation (${skipped}) - each is a gap this gate does not cover"
+            grep -E '^test .* \.\.\. ignored' "${log}"
+            echo '::endgroup::'
+            echo 'Every line above is a test the interpreter did not run. The expected reasons are'
+            echo 'foreign calls that Miri cannot execute - gethostname(2), getifaddrs(3),'
+            echo 'if_nametoindex(3) and, when the non-default negotiate feature is on,'
+            echo 'gss_init_sec_context(3). A skip without a reason is worth giving one, in the'
+            echo 'crate that owns the test.'
+          else
+            echo 'no test was skipped under interpretation'
+          fi
+
+          # Stated in the log as well as in the comments at the top of this
+          # file, so that the scope of the verdict travels with the run rather
+          # than living only in a file somebody has to go and read.
+          echo '::group::what this verdict covers'
+          echo 'REACHED     curl-rs-lib/src/ffi/mod.rs and curl-rs-lib/src/ffi/sys.rs, the only'
+          echo '            unsafe code in the crate under the default feature set.'
+          echo 'NOT REACHED curl-rs-lib/src/ffi/gss.rs, which is behind the default-off negotiate'
+          echo '            feature and was not compiled by this run.'
+          echo 'ELSEWHERE   curl-rs-ffi, whose unsafe surface is the C boundary itself'
+          echo '            (Box::into_raw and Box::from_raw, the #[no_mangle] extern "C" entry'
+          echo '            points, the single-trailing-pointer varargs design). Miri cannot'
+          echo '            interpret a call that starts in C, so rust-asan.yml audits it.'
+          echo 'ELSEWHERE   curl-rs, which has no unsafe code and so nothing for Miri to examine.'
+          echo '::endgroup::'
+
+      - name: 'assert: this gate rewrote nothing'
+        run: |
+          # The property that makes everything above trustworthy. Every cargo
+          # invocation in this job either only reads the tree or was passed
+          # --locked, so nothing should have been able to modify a tracked file
+          # or regenerate Cargo.lock. This says so out loud rather than
+          # assuming it.
+          #
+          # A finding means one of a few things, all worth failing on: --locked
+          # was dropped somewhere and cargo rewrote the lockfile, a step edited
+          # a source file to make the interpreter happy, or an interpretation
+          # artifact escaped the ignored target/ directory. The minimal-change
+          # mandate forbids this workflow from changing the tree at all.
+          changed="${RUNNER_TEMP}/worktree-status.txt"
+          git status --porcelain > "${changed}"
+
+          if [ -s "${changed}" ]; then
+            echo 'FAIL: the working tree changed while this gate ran:'
+            cat "${changed}"
+            exit 1
+          fi
+
+          echo 'the working tree is byte-identical to the checkout: this gate reports, it does not rewrite'
