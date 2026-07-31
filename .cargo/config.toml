@@ -1,0 +1,33 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Cargo configuration for the Rust workspace (curl-rs-lib, curl-rs, curl-rs-ffi).
+#
+# Cross-compilation linkers for the mandated target matrix. The two Linux
+# targets build and link locally; the two Apple targets need an Apple SDK plus
+# a Mach-O capable linker, which is not part of this container image, so no
+# linker is configured for them here (cargo check/clippy still work, and
+# cargo-zigbuild or a macOS runner performs the link).
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# Used by cc-rs when the `ring` provider compiles its C/asm primitives for the
+# aarch64 Linux target.
+[env]
+CC_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-gcc"
+CXX_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-g++"
+AR_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-ar"
+
+# NOTE: the libcurl.so.4 soname (derived from lib/Makefile.soname,
+# -version-info 12:0:8) is intentionally NOT set here. A rustflag in this file
+# would apply to every crate in the workspace, including the curl-rs binary.
+# It belongs to the cdylib only and is emitted by curl-rs-ffi/build.rs:
+#   println!("cargo:rustc-cdylib-link-arg=-Wl,--soname=libcurl.so.4");
+
+[net]
+retry = 3
+
+[term]
+progress.when = "never"

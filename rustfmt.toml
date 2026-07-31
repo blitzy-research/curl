@@ -1,0 +1,10 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Formatting configuration for the Rust workspace. Only stable options are
+# used so that `cargo fmt` works on the pinned stable toolchain.
+edition = "2021"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true

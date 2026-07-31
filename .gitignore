@@ -72,3 +72,8 @@ libstandaloneengine.a
 tests/string
 tests/config
 tests/ech-log/
+
+# Rust / Cargo build output. Cargo.lock is deliberately NOT ignored: it is
+# committed so the workspace builds reproducibly.
+/target
+**/*.rs.bk

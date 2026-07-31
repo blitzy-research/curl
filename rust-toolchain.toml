@@ -1,0 +1,36 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Toolchain pin for the Rust workspace (curl-rs-lib, curl-rs, curl-rs-ffi).
+#
+# The crates declare rust-version = "1.75" (MSRV). This file pins the toolchain
+# that builds and validates them; it is deliberately a concrete version rather
+# than "stable" so every contributor and every CI leg agree byte for byte.
+#
+# The nightly-only gates are invoked explicitly and override this pin:
+#   cargo +nightly miri test -p curl-rs-lib
+#   cargo +nightly build -Zbuild-std -Zsanitizer=address
+# The MSRV floor is verified explicitly as well:
+#   cargo +1.75.0 build --workspace --locked
+#
+# That MSRV check was run and it FAILS with the mandated dependency set: home
+# 0.5.12 (pulled in by russh) needs the edition2024 Cargo feature, which 1.75
+# does not have, and 46 of the 327 locked crates declare a rust-version above
+# 1.75 (quinn-proto and quinn-udp at 1.85, idna_adapter and the icu_* family at
+# 1.86, rand 0.10 at 1.85, home at 1.88). The lowest reachable MSRV is 1.88, or
+# 1.86 if the russh dependency on home is removed. The 1.75.0 toolchain is
+# installed so the check stays runnable, but rust-version and clippy.toml's msrv
+# need raising once that decision is made. The pin below is unaffected: 1.97.1
+# builds the whole workspace cleanly on all four targets.
+
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy", "rustfmt", "llvm-tools-preview", "rust-src"]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]

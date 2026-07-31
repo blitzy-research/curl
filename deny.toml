@@ -1,0 +1,116 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# cargo-deny configuration backing the supply-chain gate:
+#   cargo deny --all-features check
+#   cargo audit --deny warnings
+#
+# The allow-list below was derived from the licences actually present in the
+# pinned dependency graph; nothing is allowed speculatively.
+
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+  "curl",
+]
+
+# MPL-2.0 is acceptable only for cbindgen, which is a build-time header
+# generator: it is never linked into libcurl.so.4 or the curl-rs binary.
+exceptions = [
+  { name = "cbindgen", allow = ["MPL-2.0"] },
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# The three workspace members depend on each other by path; those are not the
+# unpinned registry wildcards this check exists to catch.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = [
+  # Exactly one cryptographic provider may be linked. rustls, tokio-rustls,
+  # quinn and russh are all configured with default-features = false plus the
+  # "ring" feature; aws-lc-rs would add a second provider, a vendored C/asm
+  # build (CMake + NASM) and would break the aarch64 cross leg.
+  { name = "aws-lc-rs" },
+  { name = "aws-lc-sys" },
+  # No second TLS implementation, and no C TLS library, at any configuration.
+  { name = "openssl" },
+  { name = "openssl-sys" },
+  { name = "native-tls" },
+  { name = "schannel" },
+  # NOTE: security-framework is deliberately NOT banned. It is the Apple
+  # trust-store binding that rustls-native-certs uses on the two darwin
+  # targets; it is not a TLS implementation and does not perform the
+  # handshake, so it does not conflict with "rustls exclusively".
+  # The RustCrypto family must stay on one digest generation (0.10).
+  { name = "digest", version = ">=0.11.0" },
+]
+
+# Duplicate versions that are structurally unavoidable with the pinned set.
+# Each entry is the OLDER/NEWER pair pulled in by a transitive dependency that
+# cannot be unified without abandoning a mandated crate version:
+#   rand/rand_core/chacha20/getrandom - quinn-proto uses rand 0.10 while russh
+#                                       and the auth code use rand 0.8
+#   thiserror/thiserror-impl          - transitive deps still on 1.x
+#   syn/winnow/cpufeatures            - proc-macro and parser generations
+skip = [
+  { name = "chacha20" },
+  { name = "cpufeatures" },
+  { name = "getrandom" },
+  { name = "rand" },
+  { name = "rand_core" },
+  { name = "syn" },
+  { name = "thiserror" },
+  { name = "thiserror-impl" },
+  { name = "winnow" },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []
