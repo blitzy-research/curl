@@ -163,9 +163,16 @@
 //!
 //! # Safety
 //!
-//! This module contains no `unsafe` code and no `#[allow(unsafe_code)]`. The
-//! crate root asserts `#![forbid(unsafe_code)]`, whose single exemption is
-//! `mod ffi`.
+//! This module contains no `unsafe` code and does not relax the `unsafe_code`
+//! lint. The crate root denies that lint, and its single exemption is the
+//! `mod ffi` declaration in `curl-rs-lib/src/lib.rs`.
+//!
+//! The root must use `deny`, not `forbid`. `forbid` is `deny` plus a
+//! prohibition on relaxing the level later, so a `forbid` root followed by a
+//! relaxation on `mod ffi` fails to compile with `error[E0453]` ("incompatible
+//! with previous forbid"), and the `unsafe` blocks inside `ffi` are rejected as
+//! well. Verified by compiling both constructions on the pinned toolchain:
+//! `forbid` plus a relaxation errors, `deny` plus a relaxation builds clean.
 
 use std::borrow::Cow;
 
@@ -1053,7 +1060,10 @@ impl Error {
     /// The message is what `Curl_failf` would have written into
     /// `CURLOPT_ERRORBUFFER`.
     #[must_use]
-    pub fn with_context(code: CURLcode, context: impl Into<Cow<'static, str>>) -> Self {
+    pub fn with_context(
+        code: CURLcode,
+        context: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Self {
             code,
             context: Some(context.into()),
@@ -1113,7 +1123,10 @@ impl Error {
 
     /// Attaches a message to an existing error, replacing any it already had.
     #[must_use]
-    pub fn context_with(mut self, context: impl Into<Cow<'static, str>>) -> Self {
+    pub fn context_with(
+        mut self,
+        context: impl Into<Cow<'static, str>>,
+    ) -> Self {
         self.context = Some(context.into());
         self
     }
@@ -1240,7 +1253,8 @@ mod tests {
                 }
 
                 // Every discriminant distinct.
-                let mut seen: Vec<i32> = $name::VARIANTS.iter().map(|c| c.as_i32()).collect();
+                let mut seen: Vec<i32> =
+                    $name::VARIANTS.iter().map(|c| c.as_i32()).collect();
                 seen.sort_unstable();
                 let total = seen.len();
                 seen.dedup();
@@ -1270,7 +1284,10 @@ mod tests {
                 // resolve to the fallback for messaging.
                 for raw in [i32::MIN, -9999, 100_000, i32::MAX] {
                     assert_eq!($name::from_i32(raw), None);
-                    assert_eq!($name::try_from(raw), Err(UnknownCode::new($kind, raw)));
+                    assert_eq!(
+                        $name::try_from(raw),
+                        Err(UnknownCode::new($kind, raw))
+                    );
                     assert_eq!($name::message_for(raw), $unknown);
                 }
 
@@ -1290,7 +1307,8 @@ mod tests {
                 }
 
                 // Usable as an ordinary Rust error.
-                let boxed: Box<dyn std::error::Error> = Box::new($name::VARIANTS[0]);
+                let boxed: Box<dyn std::error::Error> =
+                    Box::new($name::VARIANTS[0]);
                 assert_eq!(boxed.to_string(), $name::VARIANTS[0].message());
             }
         };
@@ -1380,7 +1398,8 @@ mod tests {
         // Each is named after the position it holds, so the header and this
         // file can be grepped against one another.
         for value in placeholders {
-            let code = CURLcode::from_i32(value).expect("placeholder must exist");
+            let code =
+                CURLcode::from_i32(value).expect("placeholder must exist");
             assert_eq!(code.c_name(), format!("CURLE_OBSOLETE{value}"));
             // C reaches `default:` for all of them.
             assert_eq!(code.message(), "Unknown error");
@@ -1409,7 +1428,10 @@ mod tests {
     fn curlm_call_multi_socket_aliases_call_multi_perform() {
         assert_eq!(CURLM_CALL_MULTI_SOCKET, CURLMcode::CallMultiPerform);
         assert_eq!(CURLM_CALL_MULTI_SOCKET.as_i32(), -1);
-        assert_eq!(CURLM_CALL_MULTI_SOCKET.c_name(), "CURLM_CALL_MULTI_PERFORM");
+        assert_eq!(
+            CURLM_CALL_MULTI_SOCKET.c_name(),
+            "CURLM_CALL_MULTI_PERFORM"
+        );
     }
 
     /// `CURLUcode` bounds, from `include/curl/urlapi.h:34-68`.
@@ -1458,7 +1480,10 @@ mod tests {
         assert_eq!(CURLMcode::Last.c_name(), "CURLM_LAST");
         assert_eq!(CURLUcode::VARIANTS.last().copied(), Some(CURLUcode::Last));
         assert_eq!(CURLUcode::Last.c_name(), "CURLUE_LAST");
-        assert_eq!(CURLSHcode::VARIANTS.last().copied(), Some(CURLSHcode::Last));
+        assert_eq!(
+            CURLSHcode::VARIANTS.last().copied(),
+            Some(CURLSHcode::Last)
+        );
         assert_eq!(CURLSHcode::Last.c_name(), "CURLSHE_LAST");
     }
 
@@ -1488,7 +1513,10 @@ mod tests {
             "URL using bad/illegal format or missing URL"
         );
         assert_eq!(CURLcode::OutOfMemory.message(), "Out of memory");
-        assert_eq!(CURLcode::OperationTimedout.message(), "Timeout was reached");
+        assert_eq!(
+            CURLcode::OperationTimedout.message(),
+            "Timeout was reached"
+        );
         assert_eq!(CURLcode::SslConnectError.message(), "SSL connect error");
         assert_eq!(
             CURLcode::TooManyRedirects.message(),
@@ -1596,7 +1624,10 @@ mod tests {
             CURLUcode::Urldecode.message(),
             "URL decode error, most likely because of rubbish in the input"
         );
-        assert_eq!(CURLUcode::OutOfMemory.message(), "A memory function failed");
+        assert_eq!(
+            CURLUcode::OutOfMemory.message(),
+            "A memory function failed"
+        );
         assert_eq!(
             CURLUcode::UserNotAllowed.message(),
             "Credentials was passed in the URL when prohibited"
@@ -1697,7 +1728,8 @@ mod tests {
     /// A rejected integer reports both the family and the offending value.
     #[test]
     fn unknown_code_reports_family_and_value() {
-        let error = CURLcode::try_from(4242).expect_err("4242 is not a CURLcode");
+        let error =
+            CURLcode::try_from(4242).expect_err("4242 is not a CURLcode");
         assert_eq!(error, UnknownCode::new(CodeKind::Easy, 4242));
         assert_eq!(error.kind, CodeKind::Easy);
         assert_eq!(error.value, 4242);
@@ -1720,18 +1752,24 @@ mod tests {
         assert_eq!(bare.message(), "Could not resolve hostname");
         assert_eq!(bare.to_string(), "Could not resolve hostname");
 
-        let detailed =
-            Error::with_context(CURLcode::CouldntResolveHost, "no address for example.com");
+        let detailed = Error::with_context(
+            CURLcode::CouldntResolveHost,
+            "no address for example.com",
+        );
         assert_eq!(detailed.code(), CURLcode::CouldntResolveHost);
         assert_eq!(detailed.context(), Some("no address for example.com"));
         assert_eq!(detailed.to_string(), "no address for example.com");
         // The generic string stays reachable, which is what strerror needs.
         assert_eq!(detailed.code().message(), "Could not resolve hostname");
 
-        let owned = Error::with_context(CURLcode::TooLarge, format!("{} bytes", 1 << 20));
+        let owned = Error::with_context(
+            CURLcode::TooLarge,
+            format!("{} bytes", 1 << 20),
+        );
         assert_eq!(owned.context(), Some("1048576 bytes"));
 
-        let relabelled = Error::new(CURLcode::WriteError).context_with("disk full");
+        let relabelled =
+            Error::new(CURLcode::WriteError).context_with("disk full");
         assert_eq!(relabelled.code(), CURLcode::WriteError);
         assert_eq!(relabelled.context(), Some("disk full"));
     }
@@ -1745,7 +1783,10 @@ mod tests {
             assert_eq!(Error::new(code).into_code(), code);
             assert_eq!(i32::from(Error::new(code)), code.as_i32());
             // Context never changes the code that reaches the boundary.
-            assert_eq!(CURLcode::from(Error::with_context(code, "context")), code);
+            assert_eq!(
+                CURLcode::from(Error::with_context(code, "context")),
+                code
+            );
             // And the lift back is the identity on the code.
             assert_eq!(Error::from(code).code(), code);
         }
@@ -1755,12 +1796,17 @@ mod tests {
     #[test]
     fn error_source_is_reachable() {
         let inner = UnknownCode::new(CodeKind::Easy, 999);
-        let outer = Error::with_source(CURLcode::SslConnectError, "handshake failed", inner);
+        let outer = Error::with_source(
+            CURLcode::SslConnectError,
+            "handshake failed",
+            inner,
+        );
 
         assert_eq!(outer.code(), CURLcode::SslConnectError);
         assert_eq!(outer.to_string(), "handshake failed");
 
-        let source = std::error::Error::source(&outer).expect("source must be reachable");
+        let source = std::error::Error::source(&outer)
+            .expect("source must be reachable");
         assert_eq!(source.to_string(), "999 is not a valid CURLcode value");
 
         assert!(std::error::Error::source(&Error::new(CURLcode::Ok)).is_none());

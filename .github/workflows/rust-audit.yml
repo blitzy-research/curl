@@ -1,0 +1,804 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Validation gate 9 of the ten that guard the Rust workspace: SUPPLY CHAIN.
+#
+# This workflow runs `cargo audit` and `cargo deny`, and it asserts that the
+# cryptographic-provider pinning written into the manifests actually took
+# effect in the resolved dependency graph. It does nothing else. The build
+# lives in rust-build.yml, the lint gate in rust-clippy.yml, the tests in
+# rust-test.yml, coverage in rust-coverage.yml, undefined behaviour in
+# rust-miri.yml, the sanitizer in rust-asan.yml, symbol and header parity in
+# rust-abi.yml, and the curl fixture corpus in curl-testsuite.yml. One
+# workflow per validation gate, so that a failure names its own cause.
+#
+# Why this file exists at all, stated plainly: an earlier attempt at this
+# rewrite left four things unfinished, and one of them was that `cargo audit`
+# was never executed. That gap is designed out from the start here rather
+# than deferred to the end.
+#
+# Two standing obligations are made mechanical by this file:
+#
+#   Supply-chain hygiene is continuous. `cargo audit` and `cargo deny` run in
+#   continuous integration on every push and every pull request, and weekly on
+#   a schedule, because an advisory database changes without the repository
+#   changing.
+#
+#   Security-relevant configuration is explicit, never defaulted. The manifests
+#   declare `default-features = false` with an explicit cryptographic provider
+#   on rustls, tokio-rustls and quinn, and they omit `platform-verifier`. A
+#   comment in a manifest is not a gate; the assertions below are what turn
+#   that intent into one.
+
+name: 'Rust supply chain'
+
+'on':
+  push:
+    branches:
+      - master
+      - '*/ci'
+    # A deny-list, deliberately, and never a `paths:` allow-list. An allow-list
+    # would have to name Cargo.toml, Cargo.lock, deny.toml and every member
+    # manifest, and the day somebody forgot one is the day a dependency change
+    # merged without this gate ever firing - which is precisely when it must
+    # fire. The four entries below are the same ones the C build workflows
+    # ignore: none of them can affect crate resolution.
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  # An addition beyond the specified gate, and the reason is specific to this
+  # gate rather than general good practice: the RustSec advisory database is an
+  # input that changes on its own. A vulnerability disclosed against a crate
+  # already in the committed Cargo.lock makes this workflow's verdict stale
+  # without a single commit landing, and push and pull_request triggers alone
+  # would never notice. One weekly cron, off the hour to avoid the load spike
+  # GitHub warns about, is the whole addition. Push and pull_request remain the
+  # primary gate; this only stops the verdict from silently ageing.
+  schedule:
+    - cron: '17 5 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # The two pinned tool versions. These are the same values recorded in the
+  # workspace manifest under [workspace.metadata.curl-rs.ci-tools], which
+  # states that they are CI tools installed by workflows rather than manifest
+  # dependencies, and names this workflow as one of their consumers.
+  #
+  # The cargo-deny pin is load-bearing rather than cosmetic. deny.toml's schema
+  # is written against cargo-deny 0.20.2 specifically - [advisories] version 2,
+  # the [[bans.features]] blocks, [sources.allow-org] - and schema keys move
+  # between major versions, so a floating install can fail outright with
+  # "unknown field" on a policy file that is perfectly correct. Do not
+  # "modernise" either install to a version range.
+  CARGO_AUDIT_VERSION: '0.22.2'
+  CARGO_DENY_VERSION: '0.20.2'
+
+  # The four mandated compilation targets, in the order they appear in
+  # rust-toolchain.toml's `targets` and in deny.toml's [graph] targets. The
+  # per-triple step below asserts that correspondence character-for-character
+  # rather than trusting this copy.
+  #
+  # All four are 64-bit. That is load-bearing rather than incidental: the FFI
+  # shim carries a curl_off_t through a single register-width slot in the
+  # varargs setters, which is sound only where off_t fits a register. No
+  # 32-bit triple belongs in this list.
+  CARGO_TARGETS: 'x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin'
+
+  # Colour off, and not for tidiness. Several assertions below parse tool
+  # output with grep and sed; ANSI escape sequences embedded in a severity line
+  # or a crate name would make an anchored pattern silently stop matching, and
+  # a supply-chain assertion that silently stops matching is worse than no
+  # assertion at all.
+  CARGO_TERM_COLOR: never
+
+  # This job compiles two tools from source over the network and resolves the
+  # graph four times. A transient registry hiccup should retry, not fail the
+  # gate and send somebody looking for a vulnerability that is not there.
+  CARGO_NET_RETRY: '3'
+
+  # Nothing here is built twice, so incremental state is pure overhead.
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  audit:
+    name: 'cargo audit + cargo deny'
+    runs-on: ubuntu-latest
+
+    # A single job, and no matrix. deny.toml carries all four target triples in
+    # its own [graph] targets, so one invocation already evaluates the graph for
+    # all four; the per-triple step below additionally pins each one down
+    # explicitly with `--target`. A matrix would multiply two `cargo install`
+    # builds by four with nothing gained. Were a matrix ever added here,
+    # `fail-fast: false` would be mandatory - a supply-chain gate that cancels
+    # its siblings on the first failure hides the rest of the findings.
+    #
+    # 30 minutes is longer than the values used elsewhere in this repository,
+    # and the reason is the two `cargo install --locked` builds: cargo-deny and
+    # cargo-audit are each compiled from their own locked sources on every run,
+    # which is a deliberate choice explained on the install step below. The
+    # analysis steps themselves take seconds - `cargo tree`, `cargo deny` and
+    # `cargo audit` resolve the graph and never build the workspace.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'toolchain versions'
+        run: |
+          echo '::group::rust toolchain'
+          command -v rustc
+          command -v cargo
+          rustc --version
+          cargo --version
+          echo '::endgroup::'
+          echo '::group::rust-toolchain.toml (the pin this leg honours)'
+          grep -v -E '^(#|$)' rust-toolchain.toml
+          echo '::endgroup::'
+          # Nothing installs a toolchain here. rust-toolchain.toml pins an
+          # exact stable channel and rustup honours it on the first `cargo`
+          # invocation, along with the components and targets it names, so
+          # restating any of them here would only create a way for them to
+          # disagree. Nightly is deliberately absent: the Miri and
+          # AddressSanitizer gates need it and install it for themselves.
+
+      - name: 'install pinned supply-chain tools'
+        timeout-minutes: 20
+        run: |
+          # Built from source, from the pinned version, on every run - and no
+          # build cache. That is a considered decision, not an oversight.
+          #
+          # A cache of `cargo install` output would reintroduce a mutable
+          # artifact into the one gate whose entire purpose is to assert that
+          # the inputs are immutable and pinned. It would also have to be
+          # restored over ~/.cargo/bin, which on this runner image already
+          # holds the toolchain shims. Speed is not a competing consideration:
+          # performance is an explicit non-goal of this work, and the version
+          # assertion in the next step would have to exist either way.
+          #
+          # --locked makes each tool resolve its own committed lockfile instead
+          # of whatever its dependency ranges float to today, which is the same
+          # reproducibility argument that puts this workspace's Cargo.lock
+          # under version control.
+          #
+          # --force only makes the step idempotent regardless of what the
+          # runner image happens to ship; --version still governs exactly what
+          # lands.
+          cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked --force
+          cargo install cargo-deny --version "${CARGO_DENY_VERSION}" --locked --force
+
+      - name: 'supply-chain tool versions (assert the pins)'
+        run: |
+          echo '::group::supply-chain tool versions'
+          command -v cargo-audit
+          command -v cargo-deny
+          cargo audit --version
+          cargo deny --version
+          echo '::endgroup::'
+          # Evidence first, then the assertion. Printing a version is not the
+          # same as having the pinned version, and every claim this workflow
+          # makes downstream depends on which binary produced it.
+          audit_version="$(cargo audit --version | awk '{ print $NF }')"
+          deny_version="$(cargo deny --version | awk '{ print $NF }')"
+          if [ "${audit_version}" != "${CARGO_AUDIT_VERSION}" ]; then
+            echo "FAIL: cargo-audit reports ${audit_version}, expected the pinned ${CARGO_AUDIT_VERSION}"
+            exit 1
+          fi
+          if [ "${deny_version}" != "${CARGO_DENY_VERSION}" ]; then
+            echo "FAIL: cargo-deny reports ${deny_version}, expected the pinned ${CARGO_DENY_VERSION}"
+            echo 'deny.toml is written against the pinned schema; a different major version can reject it outright.'
+            exit 1
+          fi
+          echo "cargo-audit ${audit_version} and cargo-deny ${deny_version} match the pins"
+
+      - name: 'resolve the dependency graph for all four target triples'
+        run: |
+          graph_dir="${RUNNER_TEMP}/curl-rs-depgraph"
+          mkdir -p "${graph_dir}"
+
+          # One flattened, de-duplicated package list per target triple. Every
+          # crate assertion further down reads these files instead of calling
+          # `cargo tree` again, which matters for a reason that is easy to get
+          # wrong: `cargo tree --invert <crate>` is NOT a reliable presence
+          # test. It exits 101 when the crate is absent from the lockfile, but
+          # it also exits 101 when the crate is present at more than one
+          # version ("specification is ambiguous"), and it exits ZERO with
+          # empty output when the crate is in the lockfile yet unreachable
+          # under the requested target. An assertion written on its exit code
+          # is therefore wrong in both directions. Counting anchored lines in a
+          # flattened graph is immune to all three cases.
+          #
+          # --all-features rather than the default set, matching deny.toml's
+          # `all-features = true`: a vulnerability or a banned crate behind a
+          # feature gate still ships to whoever turns the feature on. The three
+          # optional features - negotiate, hickory-dns, memdebug - are
+          # dependency-free today, so this changes nothing right now, which is
+          # exactly why it is set now rather than after one of them grows a
+          # dependency.
+          #
+          # --locked because Cargo.lock is committed. A stale or missing
+          # lockfile must fail this gate, never be regenerated under it.
+          for target in ${CARGO_TARGETS}; do
+            graph="${graph_dir}/graph-${target}.txt"
+            cargo tree --locked --all-features --target "${target}" \
+              --prefix none --format '{p}' | sed -e 's/ (\*)$//' | sort -u > "${graph}"
+            if [ ! -s "${graph}" ]; then
+              echo "FAIL: cargo tree resolved no packages at all for ${target}"
+              exit 1
+            fi
+            echo "::group::resolved graph: ${target} ($(wc -l < "${graph}") packages)"
+            cat "${graph}"
+            echo '::endgroup::'
+            # Evidence only. `cargo deny check bans` is the authoritative
+            # duplicate gate - multiple-versions is "deny" there, with an
+            # explicitly justified skip list - and this listing exists so that
+            # a reader of the log can see what that verdict was passed on.
+            echo "::group::crates at more than one version: ${target}"
+            sed -e 's/ v[0-9].*$//' "${graph}" | sort | uniq -d
+            echo '::endgroup::'
+          done
+
+          # Enabled-feature sets for the five crates that can reach a
+          # cryptographic provider. The grep must be anchored to the crate
+          # name: an inverted feature tree also lists the features of every
+          # crate between the target and the workspace roots, so an unanchored
+          # search for a provider feature can match a feature belonging to
+          # something else entirely and report a violation that is not there.
+          for crate in rustls tokio-rustls quinn quinn-proto russh; do
+            for target in ${CARGO_TARGETS}; do
+              raw="${graph_dir}/raw-features.txt"
+              if ! cargo tree --locked --all-features --target "${target}" \
+                   --edges features --invert "${crate}" --prefix none > "${raw}"; then
+                echo "FAIL: cargo tree could not invert on ${crate} for ${target}."
+                echo 'The crate is either missing from the lockfile or resolved at more than one version; both are defects.'
+                exit 1
+              fi
+              features="${graph_dir}/features-${crate}-${target}.txt"
+              grep -E "^${crate} feature \"" "${raw}" | sed -e 's/ (\*)$//' | sort -u > "${features}"
+              if [ ! -s "${features}" ]; then
+                echo "FAIL: no enabled features resolved for ${crate} on ${target}."
+                echo 'An empty feature set means the crate is unreachable on this target, so its provider pinning is unverifiable.'
+                exit 1
+              fi
+            done
+            echo "::group::enabled features: ${crate}"
+            for target in ${CARGO_TARGETS}; do
+              echo "-- ${target}"
+              cat "${graph_dir}/features-${crate}-${target}.txt"
+            done
+            echo '::endgroup::'
+          done
+          rm -f "${graph_dir}/raw-features.txt"
+
+      - name: 'cargo audit -- gate 9: zero critical advisories'
+        run: |
+          report="${RUNNER_TEMP}/cargo-audit-report.txt"
+
+          # `cargo audit` exits 1 the moment it finds anything at all, at any
+          # severity. The gate this file has to enforce is narrower and
+          # sharper: zero CRITICAL advisories. Those are not the same
+          # statement, so the exit code alone cannot express the gate. The
+          # status is captured in order to evaluate the real condition, never
+          # in order to soften it.
+          #
+          # Nothing here is a suppression. There is no --ignore flag on the
+          # invocation, no continue-on-error on the step, and no if: always()
+          # anywhere in this file. The step fails on every one of:
+          #
+          #   * a cargo-audit error, as distinct from a finding
+          #   * any advisory of critical severity, or scoring 9.0 or above
+          #   * any advisory NOT already recorded as a reviewed acceptance in
+          #     deny.toml, whatever its severity
+          #   * a report that is empty or that never scanned the lockfile
+          #
+          # The third condition makes this strictly stronger than the gate as
+          # specified. A newly disclosed advisory fails immediately, and there
+          # are exactly two ways to make it pass: change the dependency in the
+          # manifests, or record a reasoned acceptance with a removal condition
+          # in deny.toml. Neither can happen inside this file, which is the
+          # point - the decision belongs in the policy file, in a reviewable
+          # diff, and never in the workflow that checks it.
+          #
+          # cargo-audit has no --locked flag - verified against
+          # `cargo audit --help`, whose options are --color, --db, --deny,
+          # --file, --ignore, --no-yanked, --no-fetch, --stale, --target-arch
+          # and --target-os. It reads the lockfile directly, and if none is
+          # present it will GENERATE one, which is exactly the silent
+          # regeneration that must never happen under a gate whose verdict is a
+          # statement about the committed lockfile. --file names the file
+          # explicitly and the existence check below refuses to proceed without
+          # it; together they are the equivalent guarantee that --locked gives
+          # the invocations that accept it.
+          if [ ! -f Cargo.lock ]; then
+            echo 'FAIL: Cargo.lock is missing. It is committed on purpose, and cargo audit would otherwise'
+            echo 'generate one, auditing a graph that nobody has reviewed or built.'
+            exit 1
+          fi
+          #
+          # No --deny flag either, and that omission is deliberate rather than
+          # an oversight. Yanked and unmaintained crates are cargo-deny's
+          # responsibility here: deny.toml declares yanked = "deny" and
+          # unmaintained = "all", and `cargo deny check advisories` below must
+          # exit 0. Adding --deny would change cargo-audit's exit semantics in
+          # ways this step's report parsing does not model, which is how a hole
+          # gets opened in a gate by making it look stricter.
+          status=0
+          cargo audit --color never --file Cargo.lock > "${report}" 2>&1 || status=$?
+          echo '::group::cargo audit report'
+          cat "${report}"
+          echo '::endgroup::'
+
+          if [ "${status}" -gt 1 ]; then
+            echo "FAIL: cargo audit exited ${status}. That is a tool or advisory-database error, not a finding."
+            exit 1
+          fi
+          if [ ! -s "${report}" ]; then
+            echo 'FAIL: cargo audit produced an empty report, so there is nothing to base a verdict on.'
+            exit 1
+          fi
+          if ! grep -q -F 'Scanning Cargo.lock' "${report}"; then
+            echo 'FAIL: cargo audit never reported scanning Cargo.lock.'
+            echo 'The committed lockfile is the input to this gate; a run that did not read it proves nothing.'
+            exit 1
+          fi
+
+          # The severity band first. cargo-audit computes the CVSS base score
+          # itself and prints it as, for example, "Severity:  7.5 (high)", so
+          # the band name below is the tool's own arithmetic rather than a
+          # reimplementation of CVSS scoring inside a workflow.
+          if grep -q -E '^Severity:.*\(critical\)' "${report}"; then
+            echo 'FAIL: a CRITICAL advisory is present. This gate admits zero critical advisories.'
+            grep -E '^(Crate|Version|ID|Severity|Solution):' "${report}"
+            exit 1
+          fi
+          # And the number, independently, so that an advisory scoring 9.0 or
+          # above still fails if a future cargo-audit spells the band
+          # differently or omits it altogether.
+          if awk '/^Severity:/ { if (($2 + 0) >= 9.0) { hit = 1 } } END { exit hit ? 0 : 1 }' "${report}"; then
+            echo 'FAIL: an advisory scores 9.0 or above on CVSS. This gate admits zero critical advisories.'
+            grep -E '^(Crate|Version|ID|Severity|Solution):' "${report}"
+            exit 1
+          fi
+
+          reported="${RUNNER_TEMP}/audit-reported-ids.txt"
+          accepted="${RUNNER_TEMP}/deny-accepted-ids.txt"
+          sed -n 's/^ID:[[:space:]]*\([A-Za-z0-9-]*\).*/\1/p' "${report}" | sort -u > "${reported}"
+          # deny.toml's reviewed acceptances, and only those. The real entries
+          # are `{ id = "RUSTSEC-...", reason = "..." }`, so the pattern is
+          # anchored on the opening brace; without that anchor it would also
+          # scrape identifiers out of the prose in the surrounding comments and
+          # quietly accept an advisory that nobody had signed off.
+          sed -n 's/^[[:space:]]*{[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' deny.toml | sort -u > "${accepted}"
+          echo '::group::advisory identifiers'
+          echo '-- reported by cargo audit'
+          cat "${reported}"
+          echo '-- accepted with a written reason and a removal condition in deny.toml'
+          cat "${accepted}"
+          echo '::endgroup::'
+          undocumented="$(comm -23 "${reported}" "${accepted}")"
+          if [ -n "${undocumented}" ]; then
+            echo 'FAIL: cargo audit reported advisories that deny.toml has never reviewed:'
+            echo "${undocumented}"
+            echo 'Remedy: change the dependency in the manifests, or record a reasoned acceptance in deny.toml.'
+            echo 'Do not add an --ignore flag here. deny.toml is where an acceptance is reviewable.'
+            exit 1
+          fi
+          echo "cargo audit: $(wc -l < "${reported}") advisory identifier(s), zero critical, every one reviewed in deny.toml"
+
+      - name: 'cargo deny check -- advisories, licenses, bans, sources'
+        run: |
+          echo '::group::deny.toml policy in force (comments stripped)'
+          grep -v -E '^[[:space:]]*(#|$)' deny.toml
+          echo '::endgroup::'
+
+          # All four sub-checks, named one at a time rather than as a single
+          # bare `cargo deny check`, so that the log shows unambiguously that
+          # each was exercised and so that a failure names the sub-check that
+          # produced it.
+          #
+          # What each one enforces, so that a failure here can be read
+          # correctly:
+          #
+          #   advisories  RustSec, with version 2 semantics, yanked = "deny"
+          #               and unmaintained = "all". Every accepted advisory
+          #               carries a written reason and a removal condition, and
+          #               the cargo audit step above independently refuses any
+          #               advisory that is not on that list.
+          #   licenses    an allow-list, so an unexpected licence fails the
+          #               gate instead of being noted in passing.
+          #   bans        multiple-versions = "deny", wildcards = "deny", and
+          #               the explicit crate bans that make the C-library
+          #               removal mechanical rather than aspirational: every
+          #               competing TLS backend, nghttp2, quiche, libssh2,
+          #               zlib, c-ares, libidn2, libpsl - and curl and
+          #               curl-sys, because a Rust rewrite of curl must never
+          #               link the C libcurl back in. The [[bans.features]]
+          #               blocks additionally reach what no crate ban can: a
+          #               pure-Rust feature that adds no dependency at all.
+          #   sources     unknown-registry and unknown-git both "deny", with
+          #               crates.io the only allowed registry and allow-git
+          #               empty. A git reference can be force-pushed, retagged
+          #               or deleted, so a lockfile naming one is not
+          #               reproducible, and cargo audit cannot match it against
+          #               the advisory database either.
+          for which in advisories licenses bans sources; do
+            echo "::group::cargo deny check ${which}"
+            cargo deny --locked check --show-stats "${which}"
+            echo '::endgroup::'
+            echo "OK: cargo deny check ${which}"
+          done
+
+      - name: 'cargo deny check -- per target triple'
+        run: |
+          # deny.toml's [graph] targets already names all four triples, so the
+          # run above evaluated the graph for all four at once. This step does
+          # not trust that: cargo-deny's --target overrides the configured
+          # list, so each triple is pinned down on its own and the verdict is
+          # reported per triple.
+          #
+          # The triples themselves come first. A supply-chain gate that audits
+          # a target set which has drifted from the set being built is worse
+          # than no gate, so the four names are checked character-for-character
+          # against both files that declare them.
+          for target in ${CARGO_TARGETS}; do
+            if ! grep -q -F "\"${target}\"" deny.toml; then
+              echo "FAIL: ${target} is not listed in deny.toml [graph] targets"
+              exit 1
+            fi
+            if ! grep -q -F "\"${target}\"" rust-toolchain.toml; then
+              echo "FAIL: ${target} is not listed in rust-toolchain.toml targets"
+              exit 1
+            fi
+          done
+          echo 'the four target triples match deny.toml and rust-toolchain.toml exactly'
+          for target in ${CARGO_TARGETS}; do
+            echo "::group::cargo deny check -- ${target}"
+            cargo deny --locked --target "${target}" check advisories licenses bans sources
+            echo '::endgroup::'
+            echo "OK ${target}: advisories, licenses, bans, sources"
+          done
+
+      - name: 'assert: no C TLS, compression or SSH library, and ring present'
+        run: |
+          # WHY THIS STEP AND THE NEXT ONE EXIST
+          #
+          # The default feature sets of the crates this design mandates
+          # DISAGREE about the cryptographic provider. rustls 0.23.42 defaults
+          # to ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"]
+          # and tokio-rustls 0.26.4 to ["logging", "tls12", "aws_lc_rs"], while
+          # quinn 0.11.9 defaults to ["log", "platform-verifier",
+          # "runtime-tokio", "rustls-ring", "bloom"] and quinn-proto 0.11.12 to
+          # ["rustls-ring", "log", "bloom"]. Cargo unifies features across a
+          # graph, so accepting all of those defaults links BOTH providers into
+          # one binary. Four consequences follow, and not one of them is
+          # hypothetical:
+          #
+          #   1. duplicated cryptographic code in the shipped artifacts;
+          #   2. a build-time requirement for CMake and NASM, introduced by
+          #      aws-lc-rs's vendored C and assembly, which is likely to break
+          #      the cross-based aarch64-unknown-linux-gnu leg outright;
+          #   3. a large vendored-C surface, which sits badly against the
+          #      requirement that no C TLS library be linked at any
+          #      configuration;
+          #   4. from prefer-post-quantum, a hybrid X25519MLKEM768 key
+          #      exchange that CHANGES THE BYTES OF THE TLS ClientHello
+          #      relative to curl 8.x. The fixture corpus compares emitted
+          #      bytes as one joined string, order and casing included, across
+          #      1,476 expectations, so that one feature alone puts every HTTPS
+          #      fixture at risk.
+          #
+          # The manifests answer all four with default-features = false, an
+          # explicit provider on rustls, tokio-rustls and quinn, and no
+          # platform-verifier. These two steps are what make that a merge gate
+          # instead of a comment.
+          #
+          # HONEST CAVEAT, recorded rather than papered over: neither ring nor
+          # aws-lc-rs is pure Rust - both contain C and assembly. The
+          # constraint is satisfied in the sense that matters, which is that no
+          # C TLS LIBRARY is linked: rustls implements the TLS state machine,
+          # the record layer and certificate verification in Rust, and the
+          # provider supplies only primitives. ring is chosen as the more
+          # portable and more readily cross-compiled of the two. Had the intent
+          # been "no C or assembly whatsoever", no rustls configuration would
+          # satisfy it and the requirement would be unmeetable as written. That
+          # disclosure is NOT a licence to relax the aws-lc-rs ban, and the ban
+          # stays.
+          graph_dir="${RUNNER_TEMP}/curl-rs-depgraph"
+          fail=0
+
+          # Every crate below is also banned in deny.toml, so `cargo deny check
+          # bans` covers the same ground. This is a second, independent reading
+          # of the same graph that does not depend on the policy file having
+          # been found, parsed and applied - which is worth having in the one
+          # gate whose job is to distrust assumptions.
+          #
+          #   aws-lc-rs, aws-lc-sys   the competing provider and its vendored
+          #                           C and assembly, per the four consequences
+          #                           above.
+          #   openssl, openssl-sys, native-tls, schannel, mbedtls,
+          #   wolfssl-sys, boring, boring-sys, rustls-ffi
+          #                           the C TLS backends this migration drops,
+          #                           plus the C FFI wrapper around rustls
+          #                           itself: rustls is used natively here, not
+          #                           through its C interface.
+          #   libnghttp2-sys          nghttp2, replaced by h2.
+          #   quiche                  the alternate QUIC backend, replaced by
+          #                           quinn plus h3 plus h3-quinn, and itself a
+          #                           second route to a competing provider.
+          #   libssh2-sys, ssh2       libssh2, replaced by russh.
+          #   libz-sys                zlib. Its absence is what PROVES that the
+          #                           compression crate resolved to its pure-Rust
+          #                           rust_backend instead of linking the C
+          #                           library. The crate is named on the next
+          #                           line, which carries the house-sanctioned
+          #                           marker: both spell checkers split the token
+          #                           and flag its first half, and editing
+          #                           .github/scripts/typos.toml is out of scope.
+          #                           crate: flate2  spellchecker:disable-line
+          #   c-ares, c-ares-sys      replaced by the system resolver.
+          #   libidn2-sys             replaced by idna.
+          #   libpsl-sys              replaced by publicsuffix.
+          #   curl, curl-sys          the C library this workspace REPLACES;
+          #                           linking it back in would be circular.
+          #                           Matching is on package name, so
+          #                           curl-rs-ffi's [lib] name = "curl" is
+          #                           untouched, and the anchored pattern
+          #                           cannot match curl-rs, curl-rs-lib or
+          #                           curl-rs-ffi either.
+          for target in ${CARGO_TARGETS}; do
+            graph="${graph_dir}/graph-${target}.txt"
+            if [ ! -s "${graph}" ]; then
+              echo "FAIL: no resolved graph for ${target}; the resolve step did not run or produced nothing"
+              exit 1
+            fi
+            for crate in aws-lc-rs aws-lc-sys openssl openssl-sys native-tls schannel mbedtls wolfssl-sys boring boring-sys rustls-ffi libnghttp2-sys quiche libssh2-sys ssh2 c-ares c-ares-sys libidn2-sys libpsl-sys libz-sys curl curl-sys; do
+              if grep -q -E "^${crate} v" "${graph}"; then
+                echo "FAIL[${target}]: ${crate} is in the resolved dependency graph and must not be"
+                fail=1
+              fi
+            done
+            # And the provider that MUST be present. Without this, an empty or
+            # provider-less graph would sail through every absence check above
+            # for entirely the wrong reason.
+            if ! grep -q -E '^ring v' "${graph}"; then
+              echo "FAIL[${target}]: ring is absent. rustls, tokio-rustls, quinn and russh are all pinned to it,"
+              echo 'so a graph without it means the provider pinning has moved somewhere unexamined.'
+              fail=1
+            fi
+          done
+          if [ "${fail}" -ne 0 ]; then
+            exit 1
+          fi
+          echo 'no banned C library crate in any of the four graphs, and ring is present in all four'
+
+      - name: 'assert: provider and verifier features are the pinned ones'
+        run: |
+          graph_dir="${RUNNER_TEMP}/curl-rs-depgraph"
+          fail=0
+
+          # A crate ban cannot reach any of this, which is the whole reason the
+          # step exists separately. prefer-post-quantum is a DEFAULT feature of
+          # rustls, it is implemented in pure Rust and it adds no crate to the
+          # graph, so nothing in the absence step above would notice it.
+          # platform-verifier is the same shape of problem from the other side:
+          # it would hand certificate-trust decisions to the operating-system
+          # store and override curl's own --cacert, --capath and --insecure
+          # semantics, which must stay authoritative because validation is on
+          # by default and --insecure is the only way to relax it.
+          #
+          # Feature names are taken from the crates' own metadata rather than
+          # guessed. rustls and tokio-rustls declare BOTH "aws-lc-rs" and the
+          # underscore alias "aws_lc_rs", so both spellings are checked; russh
+          # declares only the hyphenated form. quinn's own "rustls" feature
+          # already implies "rustls-ring", which is why the ring provider stays
+          # consistent along the QUIC path.
+          for target in ${CARGO_TARGETS}; do
+            for crate in rustls tokio-rustls quinn quinn-proto russh; do
+              features="${graph_dir}/features-${crate}-${target}.txt"
+              if [ ! -s "${features}" ]; then
+                echo "FAIL: no feature snapshot for ${crate} on ${target}"
+                exit 1
+              fi
+              case "${crate}" in
+                rustls)
+                  banned='aws-lc-rs aws_lc_rs fips prefer-post-quantum'
+                  ;;
+                tokio-rustls)
+                  banned='aws-lc-rs aws_lc_rs fips'
+                  ;;
+                quinn|quinn-proto)
+                  banned='aws-lc-rs aws-lc-rs-fips rustls-aws-lc-rs rustls-aws-lc-rs-fips platform-verifier'
+                  ;;
+                russh)
+                  banned='aws-lc-rs'
+                  ;;
+                *)
+                  echo "FAIL: no prohibited-feature list is defined for ${crate}"
+                  exit 1
+                  ;;
+              esac
+              for feature in ${banned}; do
+                if grep -q -F "${crate} feature \"${feature}\"" "${features}"; then
+                  echo "FAIL[${target}]: ${crate} has the ${feature} feature enabled"
+                  fail=1
+                fi
+              done
+              if ! grep -q -F "${crate} feature \"ring\"" "${features}"; then
+                echo "FAIL[${target}]: ${crate} does not have the ring feature enabled"
+                fail=1
+              fi
+            done
+          done
+          if [ "${fail}" -ne 0 ]; then
+            exit 1
+          fi
+          echo 'ring is the only provider enabled on rustls, tokio-rustls, quinn, quinn-proto and russh'
+          echo 'prefer-post-quantum and platform-verifier are off on all four target triples'
+
+      - name: 'assert: version coherence -- digest, rustls, base64, rand'
+        run: |
+          graph_dir="${RUNNER_TEMP}/curl-rs-depgraph"
+          fail=0
+
+          # deny.toml names three crates that it deliberately keeps OFF its
+          # accepted-duplicate list, and says a duplicate in any of them is a
+          # manifest defect rather than a skip to be added:
+          #
+          #   digest  the RustCrypto stack must share one generation or its
+          #           traits do not unify. With digest 0.10 and 0.11 in the
+          #           same graph, Hmac<Sha1> does not compile - a break that
+          #           would surface only after the manifests were written. The
+          #           adopted set is coherent on digest 0.10 throughout.
+          #   rustls  two rustls versions would mean two TLS implementations
+          #           and, in practice, two cryptographic providers.
+          #   base64  used across authentication and MIME, where the encoded
+          #           output is compared byte-for-byte.
+          for target in ${CARGO_TARGETS}; do
+            graph="${graph_dir}/graph-${target}.txt"
+            if [ ! -s "${graph}" ]; then
+              echo "FAIL: no resolved graph for ${target}"
+              exit 1
+            fi
+            for crate in digest rustls base64; do
+              count="$(grep -c -E "^${crate} v" "${graph}" || true)"
+              if [ "${count}" -ne 1 ]; then
+                echo "FAIL[${target}]: ${crate} resolves to ${count} version(s); exactly one is required"
+                grep -E "^${crate} v" "${graph}" || true
+                fail=1
+              fi
+            done
+            # The generation, not merely the count. A whole-graph migration to
+            # digest 0.11 would leave no duplicate at all and still break trait
+            # unification, so the line is asserted directly rather than
+            # inferred from the absence of a duplicate.
+            if ! grep -q -E '^digest v0\.10\.' "${graph}"; then
+              echo "FAIL[${target}]: digest is not on the 0.10 line"
+              grep -E '^digest v' "${graph}" || true
+              fail=1
+            fi
+            # rand is the one measured, documented exception, and it is
+            # recorded here rather than asserted away. 0.8.7 is the workspace's
+            # own pin, matching russh's `rand ^0.8` and additionally required
+            # by num-bigint, num-bigint-dig and rsa; 0.9.x arrives through
+            # quinn -> quinn-proto, and every quinn-proto version admissible
+            # under quinn 0.11.9 declares `rand ^0.9`, so no choice of
+            # quinn-proto unifies them. The split is structural for as long as
+            # both quinn and russh are mandated, and deny.toml carries it as an
+            # accepted duplicate with exactly that reasoning written out. So
+            # what is asserted is that the pin is still there and that the
+            # split has not grown a third version - not that no duplicate
+            # exists, which is a claim the committed lockfile contradicts.
+            # `cargo deny check bans` above remains the authority on whether a
+            # duplicate is accounted for.
+            if ! grep -q -E '^rand v0\.8\.' "${graph}"; then
+              echo "FAIL[${target}]: rand 0.8.x is absent; the pin matching russh's rand ^0.8 has been lost"
+              fail=1
+            fi
+            rand_count="$(grep -c -E '^rand v' "${graph}" || true)"
+            if [ "${rand_count}" -gt 2 ]; then
+              echo "FAIL[${target}]: rand resolves to ${rand_count} versions; only the documented 0.8/0.9 split is accepted"
+              grep -E '^rand v' "${graph}" || true
+              fail=1
+            fi
+          done
+          if [ "${fail}" -ne 0 ]; then
+            exit 1
+          fi
+          echo 'digest, rustls and base64 are single-version; digest is on 0.10; the rand 0.8 pin is intact'
+
+      - name: 'assert: no pre-release version anywhere in Cargo.lock'
+        run: |
+          # This assertion protects a specific decision. Every russh release
+          # from 0.58.0 through 0.62.4 depends on release-candidate
+          # cryptography - rsa 0.10.0-rc.18, ssh-key 0.7.0-rc.11 and
+          # pkcs1 0.8.0-rc.4 - whereas the 0.54 line has a fully stable
+          # dependency graph with no pre-release requirement at all. Shipping
+          # release-candidate cryptography would put this very gate in
+          # permanent jeopardy, so the dependency selection was steered away
+          # from it. This is what keeps it that way.
+          #
+          # The test is SemVer-correct rather than pattern-matched. A version is
+          # major.minor.patch[-prerelease][+build]: the pre-release marker is a
+          # hyphen, and it always precedes any build metadata. Build metadata is
+          # therefore stripped first, and a hyphen in what remains is the
+          # finding. Grepping for '-rc' or '-pre' directly would be wrong in
+          # both directions - it would miss -alpha1 and -beta2, and it would
+          # flag 0.11.1+wasi-snapshot-preview1, 0.6.11+upstream-0.6.7,
+          # 1.0.4+wasi-0.2.12 and 2.0.16+zstd.1.5.7, every one of which is an
+          # ordinary stable release carrying build metadata.
+          versions="${RUNNER_TEMP}/lockfile-versions.txt"
+          sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.lock | sort -u > "${versions}"
+          if [ ! -s "${versions}" ]; then
+            echo 'FAIL: no version fields found in Cargo.lock; the lockfile is missing or unreadable'
+            exit 1
+          fi
+          echo "Cargo.lock declares $(wc -l < "${versions}") distinct version strings"
+          prerelease="$(sed -e 's/+.*$//' "${versions}" | grep -- '-' || true)"
+          if [ -n "${prerelease}" ]; then
+            echo 'FAIL: pre-release version(s) present in Cargo.lock:'
+            echo "${prerelease}"
+            echo 'Release-candidate cryptography in particular is what the dependency selection avoided.'
+            exit 1
+          fi
+          echo 'no pre-release version anywhere in Cargo.lock'
+
+          # And the two pins that the decision produced. russh is asserted by
+          # release LINE rather than exact patch, because the invariant is that
+          # it stays clear of the 0.58.0-0.62.4 band; 0.54.6 is separately
+          # unusable because it requires a yanked libcrux-ml-kem, which
+          # deny.toml's yanked = "deny" rejects. Pinning an exact patch here
+          # would only make this gate fight a legitimate patch bump inside the
+          # same line.
+          russh_version="$(grep -A1 -F -x 'name = "russh"' Cargo.lock | sed -n 's/^version = "\([^"]*\)".*/\1/p')"
+          if [ -z "${russh_version}" ]; then
+            echo 'FAIL: russh is not in Cargo.lock; the SSH transport behind SFTP and SCP has gone missing'
+            exit 1
+          fi
+          case "${russh_version}" in
+            0.54.*)
+              echo "russh ${russh_version} is on the 0.54 line, clear of the release-candidate band"
+              ;;
+            *)
+              echo "FAIL: russh is ${russh_version}. Releases 0.58.0 through 0.62.4 require release-candidate"
+              echo 'cryptography (rsa 0.10.0-rc.x, ssh-key 0.7.0-rc.x, pkcs1 0.8.0-rc.x), and 0.54.6 requires a'
+              echo 'yanked libcrux-ml-kem. Re-verify the graph before moving off the 0.54 line.'
+              exit 1
+              ;;
+          esac
+          rand_pin="$(grep -A1 -F -x 'name = "rand"' Cargo.lock | sed -n 's/^version = "\([^"]*\)".*/\1/p' | grep -E '^0\.8\.' || true)"
+          if [ -z "${rand_pin}" ]; then
+            echo 'FAIL: no rand 0.8.x in Cargo.lock, yet russh requires rand ^0.8'
+            exit 1
+          fi
+          echo "rand ${rand_pin} present, satisfying russh's rand ^0.8 requirement"
+
+      - name: 'assert: the lockfile and the policy files are unchanged'
+        run: |
+          # Every cargo invocation above ran with --locked, so nothing should
+          # have been able to rewrite the lockfile. This is the step that says
+          # so out loud. A stale or missing Cargo.lock has to fail this gate
+          # rather than be silently regenerated under it, because the entire
+          # verdict - which advisories apply, which licences are in play, which
+          # versions resolved - is a statement about the committed lockfile and
+          # about nothing else.
+          git diff --exit-code -- Cargo.lock
+          git diff --exit-code -- deny.toml rust-toolchain.toml
+          git diff --exit-code -- Cargo.toml curl-rs-lib/Cargo.toml curl-rs/Cargo.toml curl-rs-ffi/Cargo.toml
+          echo 'Cargo.lock, deny.toml, rust-toolchain.toml and the four manifests are byte-identical to the committed state'

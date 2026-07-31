@@ -79,7 +79,7 @@
 //!
 //! No `match` on this type anywhere in the crate may carry a `_` arm.
 //! Exhaustiveness checking is what turns an unhandled state from a runtime
-//! fall-through into a compile error, and the C tree shows the very
+//! fall-through into a compile error, and the C tree shows the exact
 //! fall-through it replaces: `Curl_multi_pollset()` already lists all
 //! seventeen states and still needs a `default:` arm that logs "unexpected
 //! multi state" and asserts (`lib/multi.c:1113-1160`, the arm at
@@ -101,8 +101,9 @@
 //! are not interchangeable, and they must never be merged.
 //!
 //! There are no intra-crate imports and no third-party dependencies here,
-//! only `core`, and no `unsafe`, in keeping with the crate root's
-//! `forbid(unsafe_code)`.
+//! only `core`, and no `unsafe`, in keeping with the crate root's denial of the
+//! `unsafe_code` lint. (The root denies rather than forbids: `forbid` cannot be
+//! relaxed later, so it would reject the one exemption `mod ffi` requires.)
 
 /// State of one transfer inside a multi handle.
 ///

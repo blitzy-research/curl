@@ -29,6 +29,12 @@ For an IMAP or SMTP MIME uploaded mail built with --form options, it is
 prepended to the resulting MIME document, effectively including it at the mail
 global level. It does not affect raw uploaded mails (Added in 7.56.0).
 
+This build performs no IMAP, IMAPS, SMTP or SMTPS transfers, and those schemes
+are absent from the `Protocols:` line in the --version output; curl still
+parses this option and prepends the header as described above, yet the IMAP or
+SMTP transfer itself then fails with `CURLE_UNSUPPORTED_PROTOCOL`. The HTTP
+and HTTPS header handling described on this page is fully supported.
+
 You may specify any number of extra headers. Note that if you should add a
 custom header that has the same name as one of the internal ones curl would
 use, your externally set header is used instead of the internal one. This
@@ -51,7 +57,8 @@ stdin. (Added in 7.55.0)
 
 Please note that most anti-spam utilities check the presence and value of
 several MIME mail headers: these are `From:`, `To:`, `Date:` and `Subject:`
-among others and should be added with this option.
+among others and should be added with this option. That advice applies to the
+mail schemes covered by the note above.
 
 You need --proxy-header to send custom headers intended for an HTTP proxy.
 (Added in 7.37.0)

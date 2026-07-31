@@ -35,9 +35,17 @@ When retrieving a specific email from POP3, this switch forces a LIST command
 to be performed instead of RETR. This is particularly useful if the user wants
 to see if a specific message-id exists on the server and what size it is.
 
+Note: This build performs no `POP3` or `POP3S` transfers, so read the
+paragraph above as a description of the command curl sends rather than as a
+transfer it performs. curl still parses and accepts the option, yet a transfer
+using either scheme fails with `CURLE_UNSUPPORTED_PROTOCOL`, and neither
+scheme appears in the `Protocols:` line of the --version output. The FTP, SFTP
+and FILE behavior described on this page is unaffected.
+
 For FILE, this option has no effect yet as directories are always listed in
 this mode.
 
 Note: When combined with --request, this option can be used to send a UIDL
 command instead, so the user may use the email's unique identifier rather than
-its message-id to make the request.
+its message-id to make the request. This UIDL variant is subject to the POP3
+limitation noted above.

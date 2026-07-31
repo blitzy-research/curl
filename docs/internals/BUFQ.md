@@ -9,6 +9,34 @@ SPDX-License-Identifier: curl
 This is an internal module for managing I/O buffers. A `bufq` can be written
 to and read from. It manages read and write positions and has a maximum size.
 
+The C implementation in `lib/bufq.c`, together with its interface in
+`lib/bufq.h`, is the reference oracle for this module: it defines the behavior
+that the migration preserves. The observable contract is restated here because
+it is precisely what the successor described at the end of this page maps one
+for one, rather than reinterprets.
+
+- **Ordering is first in, first out.** A read always takes from the head chunk
+  and a write always appends to the tail chunk, so bytes leave the queue in
+  the order they entered it.
+- **Byte counts are exact.** `Curl_bufq_len` reports the sum of the data held
+  in all of the chunks, and a partial write reports the number of bytes
+  accepted rather than the number requested.
+- **Full and empty are signaled, not reported as failures.** The prototypes
+  below return -1 and set `CURLE_AGAIN` through the `err` out-parameter, which
+  is what a write to a full queue and a read from an empty queue do. Neither
+  is an ordinary error, and neither is a short transfer of zero bytes. The
+  transfer layer depends on that distinction as its pause and back-pressure
+  signal.
+- **Full and non-empty are loosely coupled**, exactly as the worked example in
+  the section on empty, full and overflow shows.
+- `BUFQ_OPT_SOFT_LIMIT` permits a write beyond `max_chunks` while still
+  reporting full. It exists so that a caller that cannot tolerate a partial
+  write does not have to.
+- `BUFQ_OPT_NO_SPARES` frees a chunk that reads empty right away, instead of
+  returning it to the spare list.
+- A pointer obtained from `Curl_bufq_peek` is valid only until the next
+  operation on the queue.
+
 ## read/write
 
 Its basic read/write functions have a similar signature and return code
@@ -172,3 +200,68 @@ multi handle. The advantages of a pool are:
   is used. Empty `bufq`s holds no memory.
 * the latest spare chunk is the first to be handed out again, no matter which
   `bufq` needs it. This keeps the footprint of "recently used" memory smaller.
+
+## The specified `Rust` successor
+
+The migration to the three-`crate` `Rust` `workspace` specifies a successor to
+this module at `curl-rs-lib/src/util/bufq.rs`. That module does not exist in
+the tree, so the path and the design below are the specified target state,
+while `lib/bufq.c` and `lib/bufq.h` remain the reference oracle at runtime.
+
+The shape of the transformation is that the queue holds owned buffer segments
+instead of a hand-linked list of chunks. The specified design uses
+`bytes::BytesMut` for a segment and an owned collection such as `VecDeque` for
+the queue itself, so dropping the head and appending to the tail are
+collection operations rather than pointer surgery. The three pointer chains
+that C maintains, the chunk list, the spare list and the pool, become
+questions of ownership that the type answers: a segment is held by the queue,
+or held by the pool, or dropped.
+
+Each part of the contract stated near the top of this page maps across as
+follows.
+
+- Ordering, byte counts and the head and tail discipline are preserved
+  unchanged. Reads take from the head segment and writes append to the tail
+  segment, a `VecDeque` of segments yields exactly the same observable
+  sequence of bytes, and the reported length remains the sum across the
+  segments held.
+- The full and empty signaling is preserved, and `CURLE_AGAIN` remains
+  observable. It is a public error code, and the transfer and
+  connection-filter layers read it as back-pressure rather than as failure.
+  Its internal expression may be a result type; the code that a caller sees
+  does not change.
+- Pause and resume behavior is preserved. A queue that reports full is how a
+  paused reader or writer stops the flow, which ties this module to
+  [curl client readers](CLIENT-READERS.md) and
+  [curl client writers](CLIENT-WRITERS.md), where pausing is documented.
+- The soft limit remains a distinct and explicit mode rather than something a
+  caller reaches by accident, because a caller that must avoid a partial
+  write depends on it.
+- The `Curl_bufq_peek` validity window stops being a rule that a reader of
+  this page has to remember. A borrow of the head segment is checked by the
+  compiler, so using it after the next mutation of the queue is a compile
+  error instead of a runtime hazard.
+- `Curl_bufq_slurp` and `Curl_bufq_pass` exist so that a reader or a writer
+  can work against the memory that the queue already holds. The specified
+  design keeps that shape by handing the callback a mutable slice of the tail
+  segment or an immutable slice of the head segment. It copies wherever the C
+  code copies and borrows wherever the C code borrows: no copy that
+  `lib/bufq.c` performs is claimed to disappear, and none is added.
+- `struct bufc_pool` maps to a shared segment pool owned at the multi-handle
+  level, which matches the existing constraint that a pool is shared only
+  among queues operating in the same thread. A multi-thread runtime backs the
+  multi handle; the CLI uses a current-thread `tokio` runtime. The
+  single-thread assumption therefore becomes a statement about which value
+  owns the pool, rather than a comment asking each caller to be careful.
+
+`#![forbid(unsafe_code)]` is specified at the root of `curl-rs-lib`, with a
+single narrowly allowed island under `curl-rs-lib/src/ffi/` for the operating
+system calls that have no safe expression, and a mandatory `// SAFETY:`
+comment on every `unsafe` block there. A buffer queue has no business in that
+island. The manual chunk arithmetic of the C version, its read and write
+offsets and its spare list bookkeeping, is the class of code that the
+invariant removes.
+
+For the sibling buffer modules, see [dynbuf](DYNBUF.md), the module that a
+`bufq` follows for initialization and release, and [bufref](BUFREF.md).
+[`curlx`](CURLX.md) covers how the wider `lib/curlx/` set maps.

@@ -18,3 +18,8 @@ Example:
 Do not send TFTP options requests. This improves interop with some legacy
 servers that do not acknowledge or properly implement TFTP options. When this
 option is used --tftp-blksize is ignored.
+
+This build performs no TFTP transfers, so a transfer request for a TFTP URL
+fails with `CURLE_UNSUPPORTED_PROTOCOL` even though curl accepts and parses
+this option. The `Protocols:` line in the --version output does not name the
+scheme.

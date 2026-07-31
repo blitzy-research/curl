@@ -21,3 +21,9 @@ literally. Leading @ and \< characters, and the `;type=` string in the value
 have no special meaning. Use this in preference to --form if there is any
 possibility that the string value may accidentally trigger the @ or \<
 features of --form.
+
+This build performs no SMTP, SMTPS, IMAP or IMAPS transfers, and those schemes
+are absent from the `Protocols:` line in the --version output. curl accepts
+this option and composes the MIME part from the given string, yet an SMTP or
+IMAP transfer then fails with `CURLE_UNSUPPORTED_PROTOCOL`; HTTP and HTTPS
+multipart form use is fully supported.

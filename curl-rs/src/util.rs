@@ -140,7 +140,7 @@ impl WallClockTime {
     /// Builds a reading from a second count and a microsecond remainder.
     ///
     /// A remainder of a whole second or more is carried into the seconds
-    /// field, which is the same normalisation `gettimeofday` guarantees for
+    /// field, which is the same normalization `gettimeofday` guarantees for
     /// `struct timeval`. Keeping the invariant here rather than trusting
     /// callers is what lets `format_trace_timestamp` promise a field of
     /// exactly six microsecond digits: the C tool writes that field into
@@ -360,7 +360,7 @@ pub(crate) fn local_time_hms(epoch_secs: i64) -> Result<Hms, TimeError> {
 ///
 /// C memoises the hour-minute-second text and recomputes it only when the
 /// whole second changes (`src/tool_cb_dbg.c:37-48`). That cache is not
-/// reproduced: it is a performance optimisation, and AAP section 0.1.1 makes
+/// reproduced: it is a performance optimization, and AAP section 0.1.1 makes
 /// performance an explicit non-goal while AAP section 0.8.2 forbids changes
 /// argued on speed grounds. Its absence is unobservable -- the rendered bytes
 /// are identical either way -- whereas reproducing it would need state that
@@ -474,9 +474,10 @@ pub(crate) fn struplocompare4sort<S: AsRef<str>>(p1: &S, p2: &S) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::{
-        after_epoch_reading, ascii_stricmp, before_epoch_reading, format_trace_timestamp,
-        hms_of_epoch_secs, local_time_hms, local_utc_offset_secs, render_trace_field,
-        struplocompare, struplocompare4sort, wall_clock_now, Hms, TimeError, WallClockTime,
+        after_epoch_reading, ascii_stricmp, before_epoch_reading,
+        format_trace_timestamp, hms_of_epoch_secs, local_time_hms,
+        local_utc_offset_secs, render_trace_field, struplocompare,
+        struplocompare4sort, wall_clock_now, Hms, TimeError, WallClockTime,
         MICROS_PER_SEC,
     };
     use core::cmp::Ordering;
@@ -712,7 +713,8 @@ mod tests {
         let field = format_trace_timestamp(WallClockTime::new(0, 250_000));
         assert_eq!(field, "00:00:00.250000 ");
 
-        let other = format_trace_timestamp(WallClockTime::new(1_700_000_000, 7));
+        let other =
+            format_trace_timestamp(WallClockTime::new(1_700_000_000, 7));
         assert_eq!(other, "00:00:00.000007 ");
     }
 
@@ -763,7 +765,7 @@ mod tests {
         }
     }
 
-    // -- Reading construction and normalisation ----------------------------
+    // -- Reading construction and normalization ----------------------------
 
     #[test]
     fn a_whole_second_of_microseconds_carries() {

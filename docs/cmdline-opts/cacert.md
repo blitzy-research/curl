@@ -23,18 +23,17 @@ multiple CA certificates. The certificate(s) must be in PEM format. Normally
 curl is built to use a default file for this, so this option is typically used
 to alter that default file.
 
-curl recognizes the environment variable named 'CURL_CA_BUNDLE' if it is set
-and the TLS backend is not Schannel, and uses the given path as a path to a CA
-cert bundle. This option overrides that variable.
+curl recognizes the environment variable named `CURL_CA_BUNDLE` if it is set,
+and uses the given path as a path to a CA cert bundle. This option overrides
+that variable.
 
-(Windows) curl automatically looks for a CA certs file named
-'curl-ca-bundle.crt', either in the same directory as curl.exe, or in the
-Current Working Directory, or in any folder along your PATH.
+The certificates in the file become the trust anchors used to verify the
+server certificate. Without this option, curl verifies against the trust
+anchors bundled through the `webpki-roots` crate, while --ca-native reads the
+platform trust store through the `rustls-native-certs` crate instead. The file
+named here is parsed with the `rustls-pemfile` crate.
 
-curl 8.11.0 added a build-time option to disable this search behavior, and
-another option to restrict search to the application's directory.
-
-(Schannel) This option is supported for Schannel in Windows 7 or later (added
-in 7.60.0). This option is supported for backward compatibility with other SSL
-engines; instead it is recommended to use Windows' store of root certificates
-(the default for Schannel).
+Verification of the peer is on by default. --insecure is the only way to turn
+it off, and it prints a warning on stderr before the transfer proceeds. A
+revocation list given with --crlfile is applied to the trust anchors that this
+option installs.

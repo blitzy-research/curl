@@ -425,7 +425,13 @@ pub(crate) fn getpass_r(prompt: &str, max_len: usize) -> Vec<u8> {
         Ok(mut tty) => {
             // The `File` is dropped when this arm ends, closing the descriptor.
             // That is `:189-190`, `if(STDIN_FILENO != fd) curlx_close(fd);`.
-            read_password_into(prompt, max_len, &mut tty, &mut err_sink, echo_disabled)
+            read_password_into(
+                prompt,
+                max_len,
+                &mut tty,
+                &mut err_sink,
+                echo_disabled,
+            )
         }
         Err(_) => {
             // The stdin branch of `:189` closes nothing, and `StdinLock` upholds
@@ -443,7 +449,13 @@ pub(crate) fn getpass_r(prompt: &str, max_len: usize) -> Vec<u8> {
             // `io::stdin` for the rest of this process.
             let stdin = io::stdin();
             let mut locked = stdin.lock();
-            read_password_into(prompt, max_len, &mut locked, &mut err_sink, echo_disabled)
+            read_password_into(
+                prompt,
+                max_len,
+                &mut locked,
+                &mut err_sink,
+                echo_disabled,
+            )
         }
     }
 }
@@ -495,7 +507,13 @@ mod tests {
     ) -> (Vec<u8>, Vec<u8>) {
         let mut reader = input;
         let mut sink: Vec<u8> = Vec::new();
-        let password = read_password_into(prompt, max_len, &mut reader, &mut sink, echo_disabled);
+        let password = read_password_into(
+            prompt,
+            max_len,
+            &mut reader,
+            &mut sink,
+            echo_disabled,
+        );
         (password, sink)
     }
 
@@ -638,7 +656,8 @@ mod tests {
 
     #[test]
     fn password_drops_the_trailing_newline() {
-        let (password, _) = run_password("Password:", CALLER_MAX_LEN, b"secret\n", false);
+        let (password, _) =
+            run_password("Password:", CALLER_MAX_LEN, b"secret\n", false);
         assert_eq!(password, b"secret");
     }
 
@@ -654,7 +673,8 @@ mod tests {
 
     #[test]
     fn password_is_empty_on_end_of_input() {
-        let (password, _) = run_password("Password:", CALLER_MAX_LEN, b"", false);
+        let (password, _) =
+            run_password("Password:", CALLER_MAX_LEN, b"", false);
         assert!(password.is_empty());
     }
 
@@ -663,8 +683,13 @@ mod tests {
         // C cannot distinguish -1 from 0: both fail `nread > 0`.
         let mut reader = FailingReader;
         let mut sink: Vec<u8> = Vec::new();
-        let password =
-            read_password_into("Password:", CALLER_MAX_LEN, &mut reader, &mut sink, false);
+        let password = read_password_into(
+            "Password:",
+            CALLER_MAX_LEN,
+            &mut reader,
+            &mut sink,
+            false,
+        );
         assert!(password.is_empty());
         // The prompt was still written before the failing read.
         assert_eq!(sink, b"Password:");
@@ -672,11 +697,13 @@ mod tests {
 
     #[test]
     fn password_survives_non_utf8_bytes() {
-        let (password, _) = run_password("Password:", CALLER_MAX_LEN, b"p\xffw\n", false);
+        let (password, _) =
+            run_password("Password:", CALLER_MAX_LEN, b"p\xffw\n", false);
         assert_eq!(password, b"p\xffw");
 
         // A lone continuation byte and an embedded NUL must also round-trip.
-        let (password, _) = run_password("Password:", CALLER_MAX_LEN, b"a\x80\0b\n", false);
+        let (password, _) =
+            run_password("Password:", CALLER_MAX_LEN, b"a\x80\0b\n", false);
         assert_eq!(password, b"a\x80\0b");
     }
 
@@ -685,7 +712,8 @@ mod tests {
         // Asserting equality, not containment, proves three things at once: the
         // prompt reached the error sink, it gained no trailing newline, and no
         // extra newline was appended.
-        let (_, sink) = run_password("prompt-sample:", CALLER_MAX_LEN, b"pw\n", false);
+        let (_, sink) =
+            run_password("prompt-sample:", CALLER_MAX_LEN, b"pw\n", false);
         assert_eq!(sink, b"prompt-sample:");
     }
 
@@ -713,8 +741,13 @@ mod tests {
         // the read and must not panic.
         let mut reader: &[u8] = b"secret\n";
         let mut sink = FailingWriter;
-        let password =
-            read_password_into("Password:", CALLER_MAX_LEN, &mut reader, &mut sink, true);
+        let password = read_password_into(
+            "Password:",
+            CALLER_MAX_LEN,
+            &mut reader,
+            &mut sink,
+            true,
+        );
         assert_eq!(password, b"secret");
     }
 
@@ -754,7 +787,8 @@ mod tests {
         // verbatim, so the sample still exercises the character classes the real
         // prompts contain: spaces, an apostrophe, a `#` and a trailing colon.
         let prompt = "sample 'quoted' prompt #7:";
-        let (password, sink) = run_password(prompt, CALLER_MAX_LEN, b"pw\n", false);
+        let (password, sink) =
+            run_password(prompt, CALLER_MAX_LEN, b"pw\n", false);
         assert_eq!(sink, prompt.as_bytes());
         assert_eq!(password, b"pw");
     }

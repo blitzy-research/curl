@@ -18,6 +18,8 @@ Example:
 
 # `--dns-ipv6-addr`
 
-Bind to a specific IP address when making IPv6 DNS requests, so that the DNS
-requests originate from this address. The argument should be a single IPv6
-address.
+Specify the source IP address for outgoing IPv6 DNS requests. The argument
+should be a single IPv6 address.
+
+This build resolves names with the system resolver and does not use c-ares, so
+this option is accepted and has no effect.
