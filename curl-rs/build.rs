@@ -235,6 +235,15 @@ const ENV_MAKETGZ_VERSION: &str = "CURL_MAKETGZ_VERSION";
 /// complete rerun set is the point.
 const ENV_SOURCE_DATE_EPOCH: &str = "SOURCE_DATE_EPOCH";
 
+/// An additional, explicit install-staging root for the completion scripts.
+///
+/// Same name and same opt-in semantics as `curl-rs-ffi/build.rs` uses for
+/// `curl-config` and `libcurl.pc`, so a packaging step sets one variable and
+/// collects every installable artifact of the workspace from one tree. Unset by
+/// default, which is what keeps a default build structurally incapable of writing
+/// anywhere but its own `OUT_DIR`.
+const ENV_STAGING_DIR: &str = "CURL_RS_STAGING_DIR";
+
 // Artifact names inside OUT_DIR -- the contract with the consuming modules
 //
 // Written down here because other files include these by name, and a
@@ -246,6 +255,12 @@ const ENV_SOURCE_DATE_EPOCH: &str = "SOURCE_DATE_EPOCH";
 //   $OUT_DIR/ca_embed.bin           raw bundle bytes behind CA_EMBED
 //   $OUT_DIR/completions/_curl      zsh completion, `#compdef curl`
 //   $OUT_DIR/completions/curl.fish  fish completion, `complete -c curl`
+//
+// And the install-staging copies of the two completions, laid out the way
+// `make install` places them, per `scripts/Makefile.am:54-62`:
+//
+//   $OUT_DIR/staging/share/zsh/site-functions/_curl
+//   $OUT_DIR/staging/share/fish/vendor_completions.d/curl.fish
 
 /// To be included by `curl-rs/src/cli/hugehelp.rs`.
 const OUT_HUGEHELP: &str = "hugehelp.rs";
@@ -305,10 +320,29 @@ fn main() {
         // them is a behavioural change smuggled in as a warning. So each of
         // those conditions arrives here instead.
         //
-        // Which inputs are which is not left to the reader: OPTIONAL means
-        // Perl, a configured CA bundle and a pre-rendered ASCII manual, each
-        // of which warns and stubs; REQUIRED means the curldown corpus and
-        // OUT_DIR, for which no substitute exists.
+        // Which inputs are which is not left to the reader, and the list is
+        // shorter than it once was because this script no longer degrades:
+        //
+        //   ABSENT AND LEGITIMATE -- exactly one input, `CURL_CA_EMBED`. Not
+        //   setting it means "do not embed a bundle", which is a real
+        //   configuration rather than a missing one, so it produces the
+        //   empty-by-design artifact with NO diagnostic at all.
+        //
+        //   REQUIRED -- everything else. The curldown corpus, OUT_DIR and
+        //   CARGO_MANIFEST_DIR have no substitute. Neither does the manual:
+        //   Perl and `scripts/managen` are required rather than optional,
+        //   because the only alternative would be embedding a stale or empty
+        //   `--manual`, and `obtain_ascii_manual` records in full why reaching
+        //   for `docs/cmdline-opts/curl.txt` was rejected as that alternative.
+        //   `CURL_ASCIIPAGE` REPLACES the generator rather than standing in for
+        //   it: unset it renders from the corpus, set it is authoritative, and
+        //   set-but-unusable is fatal instead of falling through to something
+        //   nobody asked for.
+        //
+        // The whole file therefore holds a single `warn` call, and it does not
+        // excuse a missing artifact: it names a corpus page whose file name
+        // cannot be a curldown page, and `Corpus::verify_counts` then fails the
+        // build because the surviving page count no longer matches the surface.
         std::process::exit(1);
     }
 }
@@ -536,10 +570,9 @@ fn emit_directive(key: &str, value: &str) -> io::Result<()> {
 //
 // WHY THIS EXISTS. Cargo reads a build script's stdout LINE BY LINE, so a
 // newline embedded in a directive VALUE does not truncate the directive: it
-// ENDS it and begins another one, which Cargo then HONOURS. An earlier
-// revision of the comment on `warn` asserted the opposite -- "Cargo renders a
-// single line per directive and silently truncates at a newline" -- and that
-// assertion is false in exactly the half that matters. Measured in this
+// ENDS it and begins another one, which Cargo then HONOURS. The opposite
+// claim -- "Cargo renders a single line per directive and silently truncates
+// at a newline" -- is false in exactly the half that matters. Measured in this
 // container against both the pinned toolchain and the MSRV floor, using a
 // probe crate whose build script printed
 // `cargo:warning=A\ncargo:rustc-env=P9_INJECTED=yes` and
@@ -669,7 +702,155 @@ fn warn(message: &str) {
 /// `warn` asserted a behaviour Cargo does not have.
 fn run_self_checks() -> io::Result<()> {
     self_check_directive_channel()?;
-    self_check_completion_grammar()
+    self_check_completion_grammar()?;
+    self_check_rendered_completions()
+}
+
+/// One deliberately broken rendering, and the reason it must be refused.
+///
+/// Each row is a complete zsh file, so what is exercised is the check rather
+/// than a fragment of it. The entry count passed alongside is the count the
+/// generator would have reported, which is how a file that lost or gained an
+/// entry between rendering and assembly is caught.
+const BROKEN_ZSH: [(&str, usize, &str); 6] = [
+    (
+        "# curl zsh completion\n_arguments -C -S \\\n  --v \\\n  '*:URL:_urls' && rc=0\nreturn rc\n",
+        1,
+        "the `#compdef curl` tag is missing, so zsh never uses the file",
+    ),
+    (
+        "#compdef curl\n_arguments -C -S \\\n  --v\n  '*:URL:_urls' && rc=0\nreturn rc\n",
+        1,
+        "an entry lost its continuation backslash, ending the command early",
+    ),
+    (
+        "#compdef curl\n_arguments -C -S \\\n  --v \\\nreturn rc\n",
+        1,
+        "the `_arguments` block is never terminated",
+    ),
+    (
+        "#compdef curl\n_arguments -C -S \\\n  --v \\\n  '*:URL:_urls' && rc=0\nreturn rc\n",
+        2,
+        "the block holds fewer entries than were rendered",
+    ),
+    (
+        "#compdef curl\n_arguments -C -S \\\n  --v'[a\tb]' \\\n  '*:URL:_urls' && rc=0\nreturn rc\n",
+        1,
+        "a control character restructures a line-oriented file",
+    ),
+    (
+        "#compdef curl\n_arguments -C -S \\\n  --v'[a]'' \\\n  '*:URL:_urls' && rc=0\nreturn rc\n",
+        1,
+        "a line leaves a single quote open",
+    ),
+];
+
+/// The same, for fish. Counts exclude the `@` path rule the check allows for.
+const BROKEN_FISH: [(&str, usize, &str); 4] = [
+    (
+        "# curl fish completion\ncomplete -c curl -n 'x'\nrm -rf /\n",
+        1,
+        "a content line is not a `complete` command",
+    ),
+    (
+        "# curl fish completion\ncomplete -c curl -n 'x'\ncomplete --command curl --long-option 'v' \\\n",
+        1,
+        "a rule ends in a continuation, fusing it with the next",
+    ),
+    (
+        "# curl fish completion\ncomplete -c curl -n 'x'\ncomplete --command curl --long-option 'v\n",
+        1,
+        "a rule leaves a single quote open",
+    ),
+    (
+        "# curl fish completion\ncomplete -c curl -n 'x'\n",
+        3,
+        "rules are missing relative to what was rendered",
+    ),
+];
+
+/// Proves the rendered-output check refuses what it exists to refuse.
+///
+/// A gate whose own correctness is untested can pass while the defect it exists
+/// to catch is still present, so the check is exercised from both sides here:
+/// every broken file above must be refused, and the real rendering -- including
+/// the apostrophe case that a naive quote count would misread -- must be
+/// accepted. The second half is the one that matters most in practice, because a
+/// check that rejects valid output would be discovered immediately and worked
+/// around, most likely by deleting it.
+fn self_check_rendered_completions() -> io::Result<()> {
+    for (text, entries, reason) in BROKEN_ZSH {
+        if verify_zsh_file(text, entries).is_ok() {
+            return Err(io::Error::other(format!(
+                "a broken zsh completion was accepted -- {reason}: {text:?}"
+            )));
+        }
+    }
+    for (text, entries, reason) in BROKEN_FISH {
+        if verify_fish_file(text, entries).is_ok() {
+            return Err(io::Error::other(format!(
+                "a broken fish completion was accepted -- {reason}: {text:?}"
+            )));
+        }
+    }
+
+    // The no-false-positive half, assembled the way the generator assembles it
+    // so that the templates are covered too. `FROZEN_RENDERINGS` supplies the
+    // entries, which is what puts the `'\''` apostrophe rewrite through the
+    // quote scanner.
+    let mut docs = Vec::with_capacity(FROZEN_RENDERINGS.len());
+    for (front, _, _) in FROZEN_RENDERINGS {
+        docs.push(option_doc_from_front(front).map_err(|why| {
+            io::Error::other(format!(
+                "a frozen-rendering fixture no longer parses: {why}"
+            ))
+        })?);
+    }
+    let zsh_entries = sorted_entries(&docs, render_zsh);
+    let fish_entries = sorted_entries(&docs, render_fish);
+    let zsh = render_zsh_file(&zsh_entries);
+    let fish = render_fish_file(&fish_entries);
+    verify_zsh_file(&zsh, zsh_entries.len()).map_err(|reason| {
+        io::Error::other(format!(
+            "a zsh completion rendered from the frozen fixtures was refused: \
+             {reason}. The check is wrong, not the rendering"
+        ))
+    })?;
+    verify_fish_file(&fish, fish_entries.len()).map_err(|reason| {
+        io::Error::other(format!(
+            "a fish completion rendered from the frozen fixtures was refused: \
+             {reason}. The check is wrong, not the rendering"
+        ))
+    })?;
+
+    // And the scanner directly, on the two shapes the escapers produce. Stated
+    // as literals so that a change to `escape_shell_desc` cannot quietly move
+    // both sides of the comparison at once.
+    let balanced = [
+        r"'[Trigger '\''speed-limit'\'' abort]'",
+        r"'[String to replace USER \[name\]]':'<command>'",
+        r"--probe'[probe]':'<a'\''b>'",
+        "",
+    ];
+    for line in balanced {
+        if !quotes_are_balanced(line) {
+            return Err(io::Error::other(format!(
+                "a correctly escaped line was read as unbalanced, which would \
+                 fail every page whose help text contains an apostrophe: \
+                 {line:?}"
+            )));
+        }
+    }
+    let unbalanced = ["'", r"'[a]''", r"'[a]' ; rm -rf /'"];
+    for line in unbalanced {
+        if quotes_are_balanced(line) {
+            return Err(io::Error::other(format!(
+                "a line with an open quote was read as balanced: {line:?}"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// The adversarial directive values, each paired with the property it probes.
@@ -1386,7 +1567,7 @@ fn generate_manual(
 /// good `curl.txt` and no Perl can still use it, by naming it in
 /// `CURL_ASCIIPAGE`; that turns an invisible guess into a recorded decision.
 ///
-/// Every failure below is therefore terminal, per finding M-05: an unusable
+/// Every failure below is therefore terminal: an unusable
 /// override, an unrunnable Perl, a failing `managen`, and output that is not
 /// usable text all end the build with a diagnostic naming the cause.
 fn obtain_ascii_manual(
@@ -1852,7 +2033,7 @@ fn generate_ca_embed(
 /// `git status --porcelain` dirty after `cargo build`.
 ///
 /// THREE STEPS, each closing a distinct defect that an unconditional
-/// `fs::write` leaves open (finding N-02):
+/// `fs::write` leaves open:
 ///
 ///   1. COMPARE. An unconditional write updates the mtime of every artifact on
 ///      every run of this script, and Cargo compares mtimes to decide what to
@@ -2061,14 +2242,109 @@ fn generate_completions(corpus: &Corpus, out_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(&dir).map_err(|err| {
         io::Error::other(format!("cannot create {}: {err}", dir.display()))
     })?;
-    write_artifact(
-        &dir.join(OUT_ZSH),
-        render_zsh_file(&zsh_entries).as_bytes(),
-    )?;
-    write_artifact(
-        &dir.join(OUT_FISH),
-        render_fish_file(&fish_entries).as_bytes(),
-    )
+
+    let zsh = render_zsh_file(&zsh_entries);
+    let fish = render_fish_file(&fish_entries);
+
+    // Checked BEFORE either file is written, so a build that cannot produce a
+    // valid completion leaves no completion behind at all rather than a broken
+    // one an installer would happily stage. See `verify_zsh_file` for why the
+    // rendered bytes are checked and not just the fields they came from.
+    verify_zsh_file(&zsh, zsh_entries.len()).map_err(|reason| {
+        io::Error::other(format!(
+            "the generated zsh completion is not valid: {reason}. It is \
+             assembled by `render_zsh_file` from entries `render_zsh` \
+             produced, so the fault is in this build script rather than in \
+             docs/cmdline-opts"
+        ))
+    })?;
+    verify_fish_file(&fish, fish_entries.len()).map_err(|reason| {
+        io::Error::other(format!(
+            "the generated fish completion is not valid: {reason}. It is \
+             assembled by `render_fish_file` from entries `render_fish` \
+             produced, so the fault is in this build script rather than in \
+             docs/cmdline-opts"
+        ))
+    })?;
+
+    write_artifact(&dir.join(OUT_ZSH), zsh.as_bytes())?;
+    write_artifact(&dir.join(OUT_FISH), fish.as_bytes())?;
+
+    // The product copies above are what `curl-rs/src/cli/completions.rs`
+    // includes. These are the install copies -- see `stage_completion`.
+    stage_completion(out_dir, INSTALL_ZSH, zsh.as_bytes())?;
+    stage_completion(out_dir, INSTALL_FISH, fish.as_bytes())
+}
+
+/// Where `make install` puts the zsh completion, relative to the prefix.
+///
+/// `scripts/Makefile.am:54-58` installs `_curl` into
+/// `$(DESTDIR)@ZSH_FUNCTIONS_DIR@`, a configure-time substitution with no Cargo
+/// equivalent, so the conventional location is recorded instead. Relative, so a
+/// packaging step can join its own prefix and its own `DESTDIR` onto it.
+const INSTALL_ZSH: &str = "share/zsh/site-functions/_curl";
+
+/// Where `make install` puts the fish completion, relative to the prefix.
+///
+/// `scripts/Makefile.am:59-62`, `@FISH_FUNCTIONS_DIR@`.
+const INSTALL_FISH: &str = "share/fish/vendor_completions.d/curl.fish";
+
+/// Writes one completion into the install-staging tree.
+///
+/// A generated completion has two ways to be useless: not included by any
+/// module, and not installed where a shell will look for it. Including
+/// them makes them reachable from Rust, which is what
+/// `curl-rs/src/cli/completions.rs` does; it does not put them where an installer
+/// can find them under the name and directory the shell requires. This does.
+///
+/// The layout follows the convention `curl-rs-ffi/build.rs` already established
+/// for `curl-config` and `libcurl.pc`, and that `.github/workflows/rust-abi.yml`
+/// already asserts: `$OUT_DIR/staging/<install-relative path>`, laid out the way
+/// `make install` would place it, so packaging is a copy of one directory rather
+/// than a script that has to know each artifact's two names. `CURL_RS_STAGING_DIR`
+/// adds an explicit out-of-tree destination when set, and is opt-in for the same
+/// reason it is there: a build writes outside its own `OUT_DIR` only when told
+/// where, so the default build cannot touch the source tree at all.
+///
+/// Nothing is written into the source tree on any path. AAP section 0.8.4's first
+/// gate asserts a clean tree, and a build script that wrote a tracked file would
+/// defeat it.
+fn stage_completion(
+    out_dir: &Path,
+    install_relative: &str,
+    contents: &[u8],
+) -> io::Result<()> {
+    let mut destinations = vec![out_dir.join("staging").join(install_relative)];
+
+    if let Some(explicit) = env::var_os(ENV_STAGING_DIR) {
+        if explicit.is_empty() {
+            return Err(io::Error::other(format!(
+                "{ENV_STAGING_DIR} is set but empty. An empty value would \
+                 resolve every staged path to a relative one under whatever \
+                 directory Cargo happened to run this script in, which is the \
+                 source tree; unset it instead"
+            )));
+        }
+        destinations.push(PathBuf::from(explicit).join(install_relative));
+    }
+
+    for destination in &destinations {
+        let parent = destination.parent().ok_or_else(|| {
+            io::Error::other(format!(
+                "cannot stage {}: the path has no parent directory",
+                destination.display()
+            ))
+        })?;
+        fs::create_dir_all(parent).map_err(|err| {
+            io::Error::other(format!(
+                "cannot create {}: {err}",
+                parent.display()
+            ))
+        })?;
+        write_artifact(destination, contents)?;
+    }
+
+    Ok(())
 }
 
 /// Renders every option with `render`, then applies Perl's ordering.
@@ -2623,6 +2899,235 @@ fn render_fish_file(entries: &[String]) -> String {
     out
 }
 
+// Verification of the RENDERED completions
+
+/// Checks the assembled zsh file against the grammar it has to satisfy.
+///
+/// Four things are required: validate the option grammar, quote every shell
+/// field, reject controls, and SYNTAX-CHECK THE GENERATED COMPLETIONS. The
+/// first three happen per field as each page is parsed --
+/// `validate_short`, `validate_long`, `validate_quoted_field`,
+/// `escape_shell_arg` and `escape_shell_desc`. This is the fourth, and it is
+/// deliberately a different KIND of check rather than more of the same one.
+///
+/// WHY THE OUTPUT IS CHECKED AND NOT ONLY THE INPUT. Every per-field check
+/// answers "is this value safe to interpolate?". None of them answers "is the
+/// file that came out actually a completion script?". Those differ whenever the
+/// fault is in the assembly rather than in a field: a template edited to drop
+/// the `#compdef` tag, an entry loop that stops emitting its continuation
+/// backslash, a new field spliced in without quotes. Each of those produces a
+/// broken or executable file out of entirely valid fields, so no amount of field
+/// validation sees it. Checking the bytes that will be written closes that gap,
+/// and it also makes the field checks defence in depth rather than the only
+/// defence -- if a future validator is loosened, the shape of the output still
+/// has to hold.
+///
+/// WHY NOT RUN `zsh -n`. It would be the most convincing check available and it
+/// is rejected on purpose: it can only run where zsh is installed, so on every
+/// other machine it would either be skipped or warn -- and a check that
+/// evaporates when a tool is missing is precisely the fail-open shape this
+/// generator must not have. The same argument rules out `fish --no-execute`.
+/// What
+/// is asserted below instead is the subset of each grammar this generator can
+/// actually violate, which needs no interpreter and therefore runs on every
+/// build on every platform.
+fn verify_zsh_file(text: &str, entries: usize) -> Result<(), String> {
+    // zsh finds a completion function by the `#compdef` tag on the first line
+    // -- `completion.pl:51` emits it first for that reason. A file that loses
+    // it is silently never used, which is the invisible failure mode described
+    // at `generate_completions`.
+    let mut lines = text.lines();
+    match lines.next() {
+        Some("#compdef curl") => {}
+        other => {
+            return Err(format!(
+                "the first line must be the `#compdef curl` tag zsh locates \
+                 the completion by, not {other:?}"
+            ));
+        }
+    }
+
+    if !text.ends_with("return rc\n") {
+        return Err(String::from(
+            "the file must end with `return rc` and a newline, so that the \
+             status `_arguments` produced is the status the function returns",
+        ));
+    }
+
+    // The `_arguments` call is ONE command spread over many lines, held
+    // together by a trailing backslash on each. A line inside the block that
+    // lost its continuation ends the command early: every entry after it
+    // becomes a separate command line, and `'*:URL:_urls' && rc=0` would then
+    // run `'*:URL:_urls'` as a program. Counting the continuations also catches
+    // an entry that vanished between rendering and assembly.
+    let mut seen_entries = 0usize;
+    let mut in_block = false;
+    for line in text.lines() {
+        if line == "_arguments -C -S \\" {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if line == "  '*:URL:_urls' && rc=0" {
+            in_block = false;
+            continue;
+        }
+        if !line.ends_with(" \\") {
+            return Err(format!(
+                "an `_arguments` line does not end with a space and a \
+                 continuation backslash, so the command ends there and \
+                 everything after it is read as a separate command: {line:?}"
+            ));
+        }
+        seen_entries += 1;
+    }
+    if in_block {
+        return Err(String::from(
+            "the `_arguments` block is never terminated by its \
+             `'*:URL:_urls' && rc=0` line",
+        ));
+    }
+    if seen_entries != entries {
+        return Err(format!(
+            "the `_arguments` block holds {seen_entries} entries but \
+             {entries} were rendered"
+        ));
+    }
+
+    verify_common(text, "zsh")
+}
+
+/// Checks the assembled fish file against the grammar it has to satisfy.
+///
+/// fish has no continuation and no enclosing command: the file is a sequence of
+/// independent `complete` commands, one per line -- `completion.pl:43-48`. The
+/// invariants are therefore the mirror image of zsh's. Every content line must
+/// BE a `complete` command, and no line may end in a backslash, because there a
+/// continuation would fuse two independent rules into one and silently discard
+/// the second option's completion.
+fn verify_fish_file(text: &str, entries: usize) -> Result<(), String> {
+    let mut seen_entries = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !trimmed.starts_with("complete ") {
+            return Err(format!(
+                "every content line must be a `complete` command, because \
+                 fish reads one rule per line: {line:?}"
+            ));
+        }
+        if trimmed.ends_with('\\') {
+            return Err(format!(
+                "a rule ends with a continuation backslash, which joins it to \
+                 the next rule and drops that option's completion: {line:?}"
+            ));
+        }
+        seen_entries += 1;
+    }
+    // The path rule from `FISH_PATH_RULE` is a `complete` command too, so it is
+    // counted alongside the per-option rules and the expected total allows for
+    // it. Naming it here rather than filtering it out keeps the count a real
+    // check: if the rule were dropped, this arithmetic notices.
+    let expected = entries + 1;
+    if seen_entries != expected {
+        return Err(format!(
+            "the file holds {seen_entries} `complete` rules but {expected} \
+             were expected ({entries} options and the `@` path rule)"
+        ));
+    }
+
+    verify_common(text, "fish")
+}
+
+/// The two properties both files must have, whatever their grammar.
+fn verify_common(text: &str, shell: &str) -> Result<(), String> {
+    // Both files are line-oriented, so a stray control character does not
+    // corrupt a field, it restructures the file. Fields are already screened by
+    // `validate_quoted_field`; this covers the templates and the assembly as
+    // well, making the property total for the bytes actually written.
+    //
+    // THE NEWLINE IS THE ONE EXCEPTION, because here it is the structure rather
+    // than a threat to it -- these are multi-line files, unlike the single-line
+    // Cargo directives `is_directive_hostile` was written for. Every other
+    // control character stays rejected, and the scan deliberately covers the
+    // whole text rather than running per line: `str::lines` strips a trailing
+    // carriage return as part of splitting, so a per-line scan would be blind
+    // to CRLF endings, which no `printf` in `scripts/completion.pl` emits and
+    // which zsh reads as part of the completer's name.
+    if let Some((index, character)) = text
+        .char_indices()
+        .find(|(_, c)| *c != '\n' && is_directive_hostile(*c))
+    {
+        return Err(format!(
+            "the {shell} completion contains U+{:04X} at byte offset {index}, \
+             which restructures a line-oriented file",
+            character as u32
+        ));
+    }
+
+    // THE INJECTION SIGNATURE. The hazard is that a compromised documentation
+    // field emits commands when a completion file is sourced, and the
+    // mechanism is always the same: a field closes its quote early, so the
+    // remainder of the line stops being data and becomes code.
+    //
+    // What actually PREVENTS that is the escaping -- `escape_shell_arg` and
+    // `escape_shell_desc` rewrite an apostrophe as `'\''`, so a hostile value
+    // cannot close its own quote. This check is not a substitute for it and is
+    // not a complete injection oracle: a line can be balanced and still be
+    // wrong, because a field carrying an even number of unescaped quotes
+    // balances. What an OPEN quote is, is the observable signature of the
+    // escaping or the assembly having failed -- the one symptom every such
+    // failure shares, checked on the bytes about to be written rather than on
+    // the fields they came from, so it holds whichever stage let the quote
+    // through.
+    for line in text.lines() {
+        if !quotes_are_balanced(line) {
+            return Err(format!(
+                "a {shell} line leaves a single quote open, so the text after \
+                 it is read as code rather than as data: {line:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Reports whether single quotes on one line open and close evenly.
+///
+/// The scan models the shell rule the escapers rely on, which is why a naive
+/// count of `'` characters will not do. `escape_shell_desc` renders an
+/// apostrophe as `'\''` -- close the quote, emit an escaped quote OUTSIDE it,
+/// reopen -- so that sequence holds three quote characters and is nonetheless
+/// perfectly balanced. Counting would report it odd and fail every page whose
+/// help text contains an apostrophe, of which the corpus has several;
+/// `FROZEN_RENDERINGS`' first row is one, and it is there partly to keep this
+/// function honest.
+///
+/// So: a backslash OUTSIDE a quoted run escapes the next character, and a
+/// backslash INSIDE one is literal, which is what makes `'\''` balance and what
+/// keeps the `\[`, `\]` and `\:` rewrites -- which appear inside quotes --
+/// from being read as escapes of the quote that follows them.
+fn quotes_are_balanced(line: &str) -> bool {
+    let mut characters = line.chars();
+    let mut inside = false;
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if !inside => {
+                // Escapes whatever follows, including a quote. Consuming it
+                // here is what prevents `\'` from toggling the state.
+                characters.next();
+            }
+            '\'' => inside = !inside,
+            _ => {}
+        }
+    }
+    !inside
+}
+
 // What this script deliberately does NOT do
 //
 // Each omission below is a decision with a reason. Recorded here so that none
@@ -2650,15 +3155,17 @@ fn render_fish_file(entries: &[String]) -> String {
 // There is a related hazard nearby that must not be compounded, and the
 // measured record differs from the description this file was written against,
 // so the measurement wins. `.cargo/config.toml` sets NO `rustflags` key at
-// all. Its :135-171 documents why: a soname link argument WAS placed there
+// all. Its "Why the soname link argument is NOT set here" section, :72-111,
+// documents why: a soname link argument WAS placed there
 // first, and `[target.<triple>].rustflags` turned out not to be
-// artifact-scoped -- it reached the `curl-rs` binary, the `curlinfo` binary
+// artifact-scoped -- it reached the `curl` binary, the `curlinfo` binary
 // and this build script's own executable as well as the shared library, and
 // `readelf -d` showed `SONAME libcurl.so.4` stamped on both executables with
 // no error and no warning. The correctly-scoped mechanism,
-// `cargo:rustc-cdylib-link-arg=-Wl,--soname=libcurl.so.4`, lives in
+// `cargo:rustc-link-arg-cdylib=-Wl,--soname=libcurl.so.4` -- that suffix
+// placement, not the older `rustc-cdylib-link-arg` alias -- lives in
 // `curl-rs-ffi/build.rs`, which owns the soname configuration anyway. So if
-// `readelf -d target/release/curl-rs` ever reports a SONAME, the defect
+// `readelf -d target/release/curl` ever reports a SONAME, the defect
 // belongs to whatever reintroduced a rustflags key -- it must be REPORTED
 // there, never compensated for here.
 //

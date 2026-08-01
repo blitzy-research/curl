@@ -137,7 +137,6 @@
 //! 0.8.1 freezes the credential in particular: Basic authentication encodes
 //! precisely those bytes.
 //!
-//!
 //! # What this module does not do
 //!
 //! It emits no error text. Every fallible entry point returns a
@@ -149,13 +148,13 @@
 //! password; [`OperationArgs`] deliberately derives no `Debug` for that
 //! reason.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 
 use curl_rs_lib::error::CURLcode;
 
 use super::args::ParameterError;
 use super::libinfo::LibInfo;
-use crate::output::msgs::{warnf, warnf_bytes, MsgConfig};
+use crate::output::msgs::{warnf, warnf_bytes, DiagnosticSink, MsgConfig};
 use crate::terminal::getpass_r;
 use crate::util::struplocompare4sort;
 
@@ -1396,7 +1395,7 @@ pub(crate) fn proto2num(
     info: &LibInfo,
     preset: &[&str],
     text: &str,
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     msgcfg: &MsgConfig,
 ) -> Result<String, ParameterError> {
     // `:402-404` -- the assertion and the "in case of surprises" guard.
@@ -1625,7 +1624,7 @@ pub(crate) fn check_protocol(
 #[allow(dead_code)]
 pub(crate) fn ftpfilemethod(
     text: &str,
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     msgcfg: &MsgConfig,
 ) -> i64 {
     // `:614-619` -- the C order is singlecwd, nocwd, multicwd. Order is not
@@ -1659,7 +1658,7 @@ pub(crate) fn ftpfilemethod(
 #[allow(dead_code)]
 pub(crate) fn ftpcccmethod(
     text: &str,
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     msgcfg: &MsgConfig,
 ) -> i64 {
     // `:628-631`
@@ -1689,7 +1688,7 @@ pub(crate) fn ftpcccmethod(
 #[allow(dead_code)]
 pub(crate) fn delegation(
     text: &str,
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     msgcfg: &MsgConfig,
 ) -> i64 {
     // `:640-645`
@@ -3501,7 +3500,7 @@ mod tests {
         assert!(!prompt.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]));
     }
 
-    // -------------------------- F24: C-string semantics at the prompt/passwd --
+    // C-string semantics at the prompt and password boundary.
 
     #[test]
     fn checkpasswd_truncates_the_prompt_at_the_c_buffer_bound() {

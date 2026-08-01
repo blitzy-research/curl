@@ -1,3 +1,7 @@
+// Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+//
+// SPDX-License-Identifier: curl
+
 //! Date parsing -- supersedes `lib/parsedate.c` (585 lines).
 //!
 //! # Why this module is `pub` when its parent is not
@@ -10,7 +14,7 @@
 //! public-re-export idiom, and `util/mod.rs` records `parsedate ->
 //! curl_getdate` as one of the four places it applies.
 //!
-//! Review finding M-13 is the reason the re-export exists: the facade needs a
+//! The re-export exists because the facade needs a
 //! date parser, the parser lives here, and DUPLICATING it in the adapter would
 //! put engine logic in the C ABI shim. So the boundary is drawn here instead:
 //! this module owns every parsing decision including the two quirks of
@@ -915,7 +919,6 @@ fn parsedate(date: &[u8]) -> Outcome {
 /// (`lib/parsedate.c:561-575`), and the ONLY date-parsing entry point
 /// `curl-rs-ffi` needs: the adapter converts a `*const c_char` into a `&str`
 /// and an absent value into `-1`, and makes no parsing decision of its own.
-/// Review finding M-13.
 ///
 /// Every format listed in the module documentation is accepted, including
 /// dates with no weekday, no timezone or no time at all.
@@ -965,38 +968,21 @@ pub(crate) fn getdate_capped(date: &str) -> Option<i64> {
     }
 }
 
-// ===========================================================================
-// TESTS
-//
 // The expectations below are not hand-computed. Every one was produced by
 // CALLING `curl_getdate` in the real `libcurl.so.4` built from this
 // repository's own C tree, so the table is a differential oracle rather than a
 // restatement of what this file happens to do. Regenerating it requires only
 // that library and the corpus.
 //
-// Coverage beyond this table, measured once and recorded because the evidence
-// does not fit in a test: a 6,820-entry generated corpus -- systematic
-// permutations of all twelve format families, sweeps across every numeric
-// threshold the parser tests, all 14x8 `YYYYMMDD` month/day combinations,
-// name-length probes around NAME_LEN and the timezone limit, malformed input,
-// and random printable-ASCII soup -- was compared against the same C function
-// and produced ZERO divergences over 1,477 parsed and 5,343 rejected inputs.
+// Two C constants cannot be pinned by any test at this boundary, so their
+// bounds are recorded here instead of asserted:
 //
-// Seven mutations were then applied to this file to confirm the comparison
-// discriminates. Five were caught: the two-digit-year pivot (5), the Gregorian
-// floor (149), the RFC 822 offset sign (170), the six-part limit (8) and a
-// tightened seconds bound (709). Two are UNOBSERVABLE at this boundary and
-// that was proven rather than assumed:
-//
-//  * `ss <= 60` versus `ss <= 61` cannot be seen, because the later
+//  * `ss <= 60` versus `ss <= 61` is unobservable, because the later
 //    `secnum > 60` range check rejects 61 whichever path the parser took. The
-//    guard itself is load-bearing -- tightening it to `<= 5` diverges 709
-//    times -- and the C oracle confirms `00:00:60` parses while `00:00:61`
-//    does not.
+//    guard is still load-bearing: `00:00:60` parses and `00:00:61` does not.
 //  * `NAME_LEN` is 12 in C, but every value from 10 upwards behaves
-//    identically, because no name in any table is that long. Dropping it to 9
-//    diverges 38 times, since `Wednesday` is nine characters.
-// ===========================================================================
+//    identically, because no name in any table is longer than the nine
+//    characters of `Wednesday`.
 
 #[cfg(test)]
 mod tests {

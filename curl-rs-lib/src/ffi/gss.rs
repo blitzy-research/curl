@@ -1341,11 +1341,20 @@ struct StatusText {
 /// exactly one `gss_release_buffer`.
 ///
 /// The release lives in `Drop` rather than at call sites on purpose. C spreads
-/// 31 `gss_release_buffer()` calls over four files -- 17 in
+/// **30** `gss_release_buffer()` calls over four files -- 17 in
 /// `lib/socks_gssapi.c`, 6 in `lib/vauth/spnego_gssapi.c`, 5 in
-/// `lib/vauth/krb5_gssapi.c` and 3 in `lib/curl_gssapi.c` -- precisely because
+/// `lib/vauth/krb5_gssapi.c` and 2 in `lib/curl_gssapi.c` -- precisely because
 /// every early return needs its own, and each one is a leak waiting to happen.
 /// Here an added `?` cannot skip one.
+///
+/// A plain `grep -c` reports 31, one more than the executable calls. The
+/// extra match is `lib/curl_gssapi.c:34`,
+/// `#define Curl_gss_alloc malloc  /* freed via the GSS API
+/// gss_release_buffer() */` -- the name inside a TRAILING block comment on a
+/// `#define`, not a call. It is worth naming because the usual way of skipping
+/// comments, testing whether the line STARTS with a comment marker, does not
+/// catch this one: the count has to exclude comment interiors, not comment-only
+/// lines.
 #[allow(dead_code)]
 struct LibraryBuffer {
     descriptor: GssBufferDesc,

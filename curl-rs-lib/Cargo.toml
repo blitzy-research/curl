@@ -302,13 +302,12 @@ tokio-rustls = { workspace = true }
 # an advisory WITHOUT removing any capability, and without suppressing anything
 # in deny.toml.
 #
-# LOOP NOW CLOSED. Earlier revisions of this comment reported the root
-# manifest's leftover [workspace.dependencies] entry upward rather than acting
-# on it. That entry has since been REMOVED, so the divergence is consistent in
-# both directions: no member forwards the retired crate and the root no longer
-# declares it. `cargo tree -i rustls-pemfile` reports nothing, and it appears
-# in neither Cargo.lock nor the `cargo audit` graph. rustls-pki-types is the
-# single authoritative PEM parser for the workspace.
+# LOOP NOW CLOSED. The root manifest's leftover [workspace.dependencies] entry
+# has been REMOVED rather than merely reported, so the divergence is consistent
+# in both directions: no member forwards the retired crate and the root no
+# longer declares it. `cargo tree -i rustls-pemfile` reports nothing, and it
+# appears in neither Cargo.lock nor the `cargo audit` graph. rustls-pki-types
+# is the single authoritative PEM parser for the workspace.
 rustls-pki-types = { workspace = true, features = ["std"] }
 
 # Bundled trust anchors, superseding the CA bundle the C build embeds through
@@ -561,13 +560,26 @@ memchr = { workspace = true }
 # behaviour-preserving implementation is a native transliteration of ctts[]
 # itself, which needs no dependency at all.
 #
-# `mime_guess = "=2.0.5"` therefore remains pinned in the root
-# [workspace.dependencies], because AAP 0.5.1's inventory is a specification
-# mandate and the root is where versions are recorded, but it is deliberately
-# NOT referenced here - exactly as rustls-pemfile is pinned at the root and left
-# unresolved. AAP 0.7 requires every dependency to have a named consumer, and
-# an unreferenced entry keeps the resolved graph, and therefore the surface
-# `cargo deny`'s multiple-versions policy must satisfy, honest.
+# `mime_guess` is therefore NOT declared here, and it is no longer pinned in the
+# root [workspace.dependencies] either. Keeping the root pin as a record of
+# AAP 0.5.1's inventory choice while leaving it unreferenced, by analogy to
+# rustls-pemfile "pinned at the root and left unresolved", does not work, for
+# two independent reasons:
+#   * rustls-pemfile is not pinned at the root - it was dropped in favour of
+#     rustls-pki-types, which absorbed its PEM decoding upstream. The analogy
+#     points at something that no longer exists.
+#   * A pin nothing references is not a record of anything Cargo can act on. An
+#     unreferenced [workspace.dependencies] entry is never resolved, so it never
+#     enters Cargo.lock and `cargo tree -i mime_guess` reports no such package.
+#     It documented an intention while guaranteeing nothing, which is exactly
+#     the dead-pin shape a dependency inventory should not carry.
+# The decision is now recorded where decisions belong - in prose beside the
+# omission in the root manifest - and ENFORCED where enforcement belongs:
+# deny.toml bans `mime_guess` and `mime`, so a future consumer fails the
+# supply-chain gate with the wire-freeze reason named, rather than silently
+# emitting a Content-Type header curl 8.x never emits. The ten-row `ctts[]`
+# transliteration described above is the whole implementation, and it needs no
+# dependency at all.
 
 # --- Dependencies this crate deliberately does NOT declare ---------------
 #
@@ -715,18 +727,30 @@ negotiate = []
 # preserves the user's directive: "System resolver by default, with
 # hickory-dns as an optional feature that is disabled by default."
 #
-# RESERVED BUT UNIMPLEMENTABLE, AND ENABLING IT IS A HARD BUILD FAILURE.
+# DECLARED, DEFAULT-OFF, BUILDS, AND ADVERTISES NOTHING.
 #
 # The name is retained because AAP 0.5.2 fixes the feature vocabulary at
 # fifteen names, and deleting one would ripple into the `Features:` banner in
 # src/version.rs, the capability table in curl-rs-ffi/build.rs and curlinfo's
-# 29-entry table. But it is backed by NO dependency, and it must not be: an
-# earlier revision declared it as a bare `[]` cfg switch, which made enabling
-# it a SILENT NO-OP while the documentation promised an alternate resolver.
-# That is the worst of the available outcomes, because AAP 0.6.5 makes
-# over-reporting a capability the named failure mode. `compile_error!` in
-# src/lib.rs now converts that silence into an immediate, self-explaining
-# build failure.
+# 29-entry table. But it is backed by NO dependency, for the measured reasons
+# below.
+#
+# The problem that has to be solved alongside that is truthfulness, not
+# buildability. Two shapes are ruled out. A bare `[]` cfg switch the banner
+# still keys off adds `hickory-resolver/0.25.2` to `curl --version` with
+# nothing behind it - over-reporting, which AAP 0.6.5 makes the named fatal
+# failure mode. Answering that with `compile_error!` stops the over-report but
+# makes a DECLARED feature unbuildable: `--all-features` becomes impossible for
+# a workspace whose own deny.toml sets `all-features = true`, four workflows
+# have to enumerate fourteen feature names in lockstep instead, and
+# rust-audit.yml's check that an enabled feature resolves something cannot
+# pass.
+#
+# What is implemented now is the rule this workspace already applies to every
+# other capability - `compiled_in = configured && engine.is_present()`. The
+# feature compiles; `ENGINE_DNS` in src/version.rs is absent, so
+# `resolver_token_is_earned()` is false at every feature setting and the token is
+# withheld. That is under-reporting, which AAP 0.6.5 calls safe.
 #
 # THE WIRING IS TRIVIAL, AND IT WAS BUILT AND TORN DOWN TO BE SURE OF THAT.
 # Adding `hickory-resolver = { version = "=0.25.2", default-features = false,
@@ -775,8 +799,9 @@ negotiate = []
 # decisions: raise the MSRV so the 0.26 line becomes admissible, accept two
 # advisory ignores in deny.toml for a crate nothing yet consumes, or leave the
 # feature as vocabulary until the 0.25 line is patched. Until one is taken, the
-# third is what this manifest implements - and the `compile_error!` is what
-# keeps it from being mistaken for the second.
+# third is what this manifest implements - and the absent `ENGINE_DNS` row is
+# what keeps it from being mistaken for the second, without making a declared
+# feature unbuildable to say so.
 #
 # Recorded precisely because the honest state is easy to overstate in either
 # direction: AAP 0.8.3 requires the "System resolver by default", which

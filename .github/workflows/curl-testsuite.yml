@@ -30,7 +30,7 @@
 #
 # WHY THIS GATE IS RED TODAY: THE BINARY CANNOT ANSWER --version
 #
-# Measured: `target/release/curl-rs --version` exits 4 and prints "option
+# Measured: `target/release/curl --version` exits 4 and prints "option
 # parsing is not built in; no command-line option can be honoured by this
 # build". AAP 0.4.1 assigns the 282-row option table to curl-rs/src/cli/args.rs
 # and it has not landed.
@@ -239,8 +239,8 @@ jobs:
       - name: 'build the Rust command-line binary'
         run: |
           set -eu
-          cargo build --locked --release --bin curl-rs < /dev/null
-          ls -l target/release/curl-rs
+          cargo build --locked --release --bin curl < /dev/null
+          ls -l target/release/curl
 
       - name: 'assert: the binary can describe itself to the harness'
         run: |
@@ -255,11 +255,11 @@ jobs:
           # with `if !` would consume $? and report 0 for every failure, which
           # would hide the very exit code the message is meant to name.
           set +e
-          ./target/release/curl-rs --version > "${banner}" 2>&1
+          ./target/release/curl --version > "${banner}" 2>&1
           rc=$?
           set -e
           if [ "${rc}" -ne 0 ]; then
-            echo "FAIL: 'curl-rs --version' exited ${rc}. The test harness reads this"
+            echo "FAIL: 'curl --version' exited ${rc}. The test harness reads this"
             echo 'output during start-up (tests/runtests.pl:640-730) and uses it to'
             echo 'decide which of the 1,914 fixtures are eligible, so the suite cannot'
             echo 'be run at all until the binary can describe itself.'
@@ -366,10 +366,39 @@ jobs:
           # verification at the system curl, so the subject is never asked to
           # vouch for its own test environment.
           system_curl="$(command -v curl)"
+
+          # THE SUBJECT AND THE REFERENCE NOW SHARE A NAME, so that separation
+          # has to be asserted rather than assumed. The primary binary is named
+          # `curl` (curl-rs/Cargo.toml [[bin]]) precisely because a drop-in
+          # replacement must answer to that name - which means a PATH that ever
+          # contains target/release would make `command -v curl` resolve to the
+          # subject and hand the whole -vc/-ac separation back. Nothing in this
+          # job puts target/release on PATH, and this check is what keeps that
+          # true: it compares resolved absolute paths, so a symlink or a
+          # relative PATH entry cannot slip past it.
+          subject="${GITHUB_WORKSPACE}/target/release/curl"
+          if [ -z "${system_curl}" ]; then
+            echo 'FAIL: no system curl on PATH. -vc and -ac need an INDEPENDENT curl to verify'
+            echo 'that the mock servers came up; the subject must never vouch for its own'
+            echo 'test environment.'
+            exit 1
+          fi
+          # -f, not realpath/readlink -f: neither is portable across both runner
+          # families with the same flags, and `cd`-based resolution is.
+          resolve() { ( cd "$(dirname -- "$1")" >/dev/null 2>&1 && printf '%s/%s\n' "$(pwd -P)" "$(basename -- "$1")" ); }
+          if [ "$(resolve "${system_curl}")" = "$(resolve "${subject}")" ]; then
+            echo "FAIL: 'command -v curl' resolved to the binary under test (${system_curl})."
+            echo 'target/release must not be on PATH: -vc and -ac would then point the'
+            echo 'harness at the subject to verify its own servers, which is exactly the'
+            echo 'bootstrap circularity this gate is built to avoid.'
+            exit 1
+          fi
+          echo "subject:    ${subject}"
+          echo "reference:  ${system_curl} (independent, used for -vc and -ac)"
           cd tests
           set +e
           perl ./runtests.pl \
-            -c "${GITHUB_WORKSPACE}/target/release/curl-rs" \
+            -c "${GITHUB_WORKSPACE}/target/release/curl" \
             -vc "${system_curl}" \
             -ac "${system_curl}" \
             > "${RUNNER_TEMP}/runtests.log" 2>&1

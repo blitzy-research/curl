@@ -5575,7 +5575,7 @@ mod tests {
         assert_eq!(PRINTABLE_HIGH, 0x7f);
     }
 
-    // escape_controls(): control-byte neutralization for terminal sinks (F25)
+    // escape_controls(): control-byte neutralization for terminal sinks.
 
     #[test]
     fn clean_text_is_borrowed_unchanged_by_both_modes() {
@@ -5693,7 +5693,7 @@ mod tests {
 
     // The sink wiring: escaping happens for a terminal and nowhere else.
 
-    /// The payload F25 describes: an ESC sequence in server-supplied header text.
+    /// An ESC sequence in server-supplied header text.
     const HOSTILE_HEADER: &[u8] =
         b"Server: nginx\x1b[2J\x1b[1;31mCOMPROMISED\r\n";
 
@@ -5798,8 +5798,8 @@ mod tests {
     fn dump_needs_no_escaping_because_c_already_neutralizes_it() {
         // Stated as an assertion rather than a comment: the `--trace` and
         // `--trace-ascii` bodies are control-safe in C itself
-        // (src/tool_cb_dbg.c:106-108), so they are outside F25's scope and must
-        // stay byte-for-byte as C renders them.
+        // (src/tool_cb_dbg.c:106-108), so they are outside the escaping rule
+        // and must stay byte-for-byte as C renders them.
         let rendered = dumped(HOSTILE_HEADER, DumpStyle::Ascii);
         assert!(!rendered.as_bytes().contains(&0x1b));
         assert!(rendered.contains("Server: nginx.[2J.[1;31mCOMPROMISED"));

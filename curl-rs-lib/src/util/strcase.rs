@@ -1,3 +1,7 @@
+// Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+//
+// SPDX-License-Identifier: curl
+
 //! Locale-independent ASCII case comparison -- supersedes the public half of
 //! `lib/strcase.c` (the two 256-entry folding tables) and all of
 //! `lib/strequal.c`.
@@ -317,25 +321,18 @@ mod tests {
         assert!(strnequal(Some(&cs("")), Some(&cs("")), 9));
     }
 
-    // =======================================================================
-    // DIFFERENTIAL AGAINST THE REAL C LIBCURL.
+    // The two bit strings below are a differential oracle, not hand-written
+    // expectations: a C program linked against the frozen `libcurl.so.4.8.0`
+    // built from this repository's own `lib/` tree called `curl_strequal` and
+    // `curl_strnequal` over the 22-entry `CORPUS`, and each character is one
+    // call's return value. The first covers every ordered pair; the second
+    // covers every ordered pair against each of the seven `BUDGETS`. A
+    // divergence therefore means this module disagrees with the shipped C.
     //
-    // The two bit strings below were produced by a C program linked against
-    // the frozen `libcurl.so.4.8.0` built from this repository's own `lib/`
-    // tree, calling `curl_strequal` and `curl_strnequal` over the 22-entry
-    // corpus in `CORPUS` -- every ordered pair for the first, and every
-    // ordered pair against each of the seven byte budgets in `BUDGETS` for the
-    // second. Each character is that call's return value. This is an ORACLE,
-    // not an expectation someone wrote down: nothing here was hand-computed,
-    // so a divergence means this module disagrees with the shipped C rather
-    // than with somebody's reading of it.
-    //
-    // The corpus deliberately includes the four bytes adjacent to the folded
-    // ranges (`@` 0x40, `[` 0x5B, `` ` `` 0x60, `{` 0x7B), a DEL (0x7F), a
-    // byte above ASCII (0x80), and two UTF-8 strings differing only in a
-    // continuation byte -- exactly the places a fold that was too eager would
-    // show up.
-    // =======================================================================
+    // The corpus includes the four bytes adjacent to the folded ranges (`@`
+    // 0x40, `[` 0x5B, `` ` `` 0x60, `{` 0x7B), a DEL (0x7F), a byte above
+    // ASCII (0x80), and two UTF-8 strings differing only in a continuation
+    // byte -- the places an over-eager fold would show up.
 
     const C_STREQUAL_BITS: &str = concat!(
         "1000000000000000000000011000000000000000000001100000000000000000000001110000",

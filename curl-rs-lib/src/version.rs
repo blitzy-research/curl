@@ -246,16 +246,11 @@
 //! floor has been exercised rather than assumed: `cargo +1.75.0 check -p
 //! curl-rs-lib --locked --offline` and `cargo +1.75.0 test -p curl-rs-lib
 //! --locked --offline` both exit 0 on this tree, with and without default
-//! features, and the whole workspace builds on that toolchain as well. An
-//! earlier revision of this note recorded the opposite -- that the crate
-//! stopped at module resolution and the floor was therefore a source-level
-//! claim only -- which was true while the module inventory was incomplete and
-//! is no longer. The newest constructs used are let-else (1.65),
-//! `Option::is_some_and` (1.70), inline format arguments (1.58) and `assert!`
-//! in a `const` item (1.57), so anything reached for here in future must clear
-//! the same bar.
+//! features, and the whole workspace builds on that toolchain as well. The
+//! newest constructs used are let-else (1.65), `Option::is_some_and` (1.70),
+//! inline format arguments (1.58) and `assert!` in a `const` item (1.57), so
+//! anything reached for here in future must clear the same bar.
 
-use core::ffi::{c_int, c_long, c_uint};
 use std::sync::OnceLock;
 
 // Version identity
@@ -307,13 +302,13 @@ pub const CURL_NAME: &str = curl_name_literal!();
 pub const LIBCURL_VERSION: &str = libcurl_version_literal!();
 
 /// `LIBCURL_VERSION_MAJOR` -- `8` (`include/curl/curlver.h:39`).
-pub const LIBCURL_VERSION_MAJOR: c_uint = 8;
+pub const LIBCURL_VERSION_MAJOR: u32 = 8;
 
 /// `LIBCURL_VERSION_MINOR` -- `19` (`include/curl/curlver.h:40`).
-pub const LIBCURL_VERSION_MINOR: c_uint = 19;
+pub const LIBCURL_VERSION_MINOR: u32 = 19;
 
 /// `LIBCURL_VERSION_PATCH` -- `0` (`include/curl/curlver.h:41`).
-pub const LIBCURL_VERSION_PATCH: c_uint = 0;
+pub const LIBCURL_VERSION_PATCH: u32 = 0;
 
 /// `LIBCURL_VERSION_NUM` -- `0x081300` (`include/curl/curlver.h:61`).
 ///
@@ -321,7 +316,7 @@ pub const LIBCURL_VERSION_PATCH: c_uint = 0;
 /// through [`version_bits`], because "curl's own configure script greps for it
 /// and needs it to contain the full number" (`include/curl/curlver.h:57-59`).
 /// `tests::version_num_agrees_with_its_parts` asserts the two agree.
-pub const LIBCURL_VERSION_NUM: c_uint = 0x0008_1300;
+pub const LIBCURL_VERSION_NUM: u32 = 0x0008_1300;
 
 /// `LIBCURL_TIMESTAMP` -- `"[unreleased]"` (`include/curl/curlver.h:72`).
 ///
@@ -351,13 +346,13 @@ pub const DEFAULT_USER_AGENT: &str =
 /// #define CURL_VERSION_BITS(x, y, z) ((x) << 16 | (y) << 8 | (z))
 /// ```
 ///
-/// The shifts are performed on [`c_uint`] so that the result is directly
+/// The shifts are performed on `u32` so that the result is directly
 /// comparable with [`LIBCURL_VERSION_NUM`]. Components wider than eight bits
 /// would overlap, exactly as they do in C; the C macro is equally unchecked,
 /// and reproducing that is deliberate -- this is a parity surface, not a place
 /// to add validation the callers of the C macro never had.
 #[must_use]
-pub const fn version_bits(x: c_uint, y: c_uint, z: c_uint) -> c_uint {
+pub const fn version_bits(x: u32, y: u32, z: u32) -> u32 {
     (x << 16) | (y << 8) | z
 }
 
@@ -365,7 +360,7 @@ pub const fn version_bits(x: c_uint, y: c_uint, z: c_uint) -> c_uint {
 ///
 /// True when the version reported by this build is at least `x.y.z`.
 #[must_use]
-pub const fn at_least_version(x: c_uint, y: c_uint, z: c_uint) -> bool {
+pub const fn at_least_version(x: u32, y: u32, z: u32) -> bool {
     LIBCURL_VERSION_NUM >= version_bits(x, y, z)
 }
 
@@ -461,8 +456,19 @@ pub fn host() -> &'static str {
 //
 // Transcribed value by value. The C declarations are `int` macros and the
 // struct field they populate is `int features`, so every constant here is
-// c_int; the highest bit used is 1<<30, which is why a signed representation
-// is sufficient and why no bit may ever be added at 1<<31.
+// SIGNED and 32 bits wide; the highest bit used is 1<<30, which is why a
+// signed representation is sufficient and why no bit may ever be added at
+// 1<<31.
+//
+// Spelled `i32` rather than `core::ffi::c_int`.
+// The two are the same type on all four targets of specification 0.8.3 -- all
+// LP64 -- so nothing about the reproduced values changes. What changes is that
+// the width stops being a property of whatever platform happens to compile the
+// engine and becomes a property of the contract, which is what the C header
+// actually fixes: `int features` is 32-bit because curl's ABI says so, not
+// because a C compiler chose it. Every `c_*` conversion now happens in
+// curl-rs-ffi, at the boundary that owns the C ABI, so the engine stays free of
+// native-width assumptions.
 //
 // Five are deprecated in the header and are reproduced anyway. They cost
 // nothing, they keep this vocabulary complete for curl-rs-ffi, and
@@ -470,67 +476,67 @@ pub fn host() -> &'static str {
 // documented -- a check that presumes the full set exists.
 
 /// IPv6-enabled.
-pub const CURL_VERSION_IPV6: c_int = 1 << 0;
+pub const CURL_VERSION_IPV6: i32 = 1 << 0;
 /// Kerberos V4 auth is supported (deprecated in the header).
-pub const CURL_VERSION_KERBEROS4: c_int = 1 << 1;
+pub const CURL_VERSION_KERBEROS4: i32 = 1 << 1;
 /// SSL options are present.
-pub const CURL_VERSION_SSL: c_int = 1 << 2;
+pub const CURL_VERSION_SSL: i32 = 1 << 2;
 /// libz features are present.
-pub const CURL_VERSION_LIBZ: c_int = 1 << 3;
+pub const CURL_VERSION_LIBZ: i32 = 1 << 3;
 /// NTLM auth is supported.
-pub const CURL_VERSION_NTLM: c_int = 1 << 4;
+pub const CURL_VERSION_NTLM: i32 = 1 << 4;
 /// Negotiate auth is supported (deprecated in the header).
-pub const CURL_VERSION_GSSNEGOTIATE: c_int = 1 << 5;
+pub const CURL_VERSION_GSSNEGOTIATE: i32 = 1 << 5;
 /// Built with debug capabilities.
-pub const CURL_VERSION_DEBUG: c_int = 1 << 6;
+pub const CURL_VERSION_DEBUG: i32 = 1 << 6;
 /// Asynchronous DNS resolves.
-pub const CURL_VERSION_ASYNCHDNS: c_int = 1 << 7;
+pub const CURL_VERSION_ASYNCHDNS: i32 = 1 << 7;
 /// SPNEGO auth is supported.
-pub const CURL_VERSION_SPNEGO: c_int = 1 << 8;
+pub const CURL_VERSION_SPNEGO: i32 = 1 << 8;
 /// Supports files larger than 2GB.
-pub const CURL_VERSION_LARGEFILE: c_int = 1 << 9;
+pub const CURL_VERSION_LARGEFILE: i32 = 1 << 9;
 /// Internationalized domain names are supported.
-pub const CURL_VERSION_IDN: c_int = 1 << 10;
+pub const CURL_VERSION_IDN: i32 = 1 << 10;
 /// Built against Windows SSPI.
-pub const CURL_VERSION_SSPI: c_int = 1 << 11;
+pub const CURL_VERSION_SSPI: i32 = 1 << 11;
 /// Character conversions supported (deprecated in the header).
-pub const CURL_VERSION_CONV: c_int = 1 << 12;
+pub const CURL_VERSION_CONV: i32 = 1 << 12;
 /// Debug memory tracking supported (deprecated in the header).
-pub const CURL_VERSION_CURLDEBUG: c_int = 1 << 13;
+pub const CURL_VERSION_CURLDEBUG: i32 = 1 << 13;
 /// TLS-SRP auth is supported.
-pub const CURL_VERSION_TLSAUTH_SRP: c_int = 1 << 14;
+pub const CURL_VERSION_TLSAUTH_SRP: i32 = 1 << 14;
 /// NTLM delegation to the winbind helper is supported (deprecated).
-pub const CURL_VERSION_NTLM_WB: c_int = 1 << 15;
+pub const CURL_VERSION_NTLM_WB: i32 = 1 << 15;
 /// HTTP/2 support built in.
-pub const CURL_VERSION_HTTP2: c_int = 1 << 16;
+pub const CURL_VERSION_HTTP2: i32 = 1 << 16;
 /// Built against a GSS-API library.
-pub const CURL_VERSION_GSSAPI: c_int = 1 << 17;
+pub const CURL_VERSION_GSSAPI: i32 = 1 << 17;
 /// Kerberos V5 auth is supported.
-pub const CURL_VERSION_KERBEROS5: c_int = 1 << 18;
+pub const CURL_VERSION_KERBEROS5: i32 = 1 << 18;
 /// Unix domain socket support.
-pub const CURL_VERSION_UNIX_SOCKETS: c_int = 1 << 19;
+pub const CURL_VERSION_UNIX_SOCKETS: i32 = 1 << 19;
 /// Mozilla's Public Suffix List, used for cookie domain verification.
-pub const CURL_VERSION_PSL: c_int = 1 << 20;
+pub const CURL_VERSION_PSL: i32 = 1 << 20;
 /// HTTPS-proxy support built in.
-pub const CURL_VERSION_HTTPS_PROXY: c_int = 1 << 21;
+pub const CURL_VERSION_HTTPS_PROXY: i32 = 1 << 21;
 /// Multiple SSL backends available.
-pub const CURL_VERSION_MULTI_SSL: c_int = 1 << 22;
+pub const CURL_VERSION_MULTI_SSL: i32 = 1 << 22;
 /// Brotli features are present.
-pub const CURL_VERSION_BROTLI: c_int = 1 << 23;
+pub const CURL_VERSION_BROTLI: i32 = 1 << 23;
 /// Alt-Svc handling built in.
-pub const CURL_VERSION_ALTSVC: c_int = 1 << 24;
+pub const CURL_VERSION_ALTSVC: i32 = 1 << 24;
 /// HTTP/3 support built in.
-pub const CURL_VERSION_HTTP3: c_int = 1 << 25;
+pub const CURL_VERSION_HTTP3: i32 = 1 << 25;
 /// zstd features are present.
-pub const CURL_VERSION_ZSTD: c_int = 1 << 26;
+pub const CURL_VERSION_ZSTD: i32 = 1 << 26;
 /// Unicode support on Windows.
-pub const CURL_VERSION_UNICODE: c_int = 1 << 27;
+pub const CURL_VERSION_UNICODE: i32 = 1 << 27;
 /// HSTS is supported.
-pub const CURL_VERSION_HSTS: c_int = 1 << 28;
+pub const CURL_VERSION_HSTS: i32 = 1 << 28;
 /// libgsasl is supported.
-pub const CURL_VERSION_GSASL: c_int = 1 << 29;
+pub const CURL_VERSION_GSASL: i32 = 1 << 29;
 /// The libcurl API is thread-safe.
-pub const CURL_VERSION_THREADSAFE: c_int = 1 << 30;
+pub const CURL_VERSION_THREADSAFE: i32 = 1 << 30;
 
 // CURLversion -- include/curl/curl.h:3088-3109
 
@@ -592,7 +598,7 @@ impl CURLversion {
     pub const NOW: Self = Self::Twelfth;
 
     /// The integer behind `CURLVERSION_LAST`, which is not a usable age.
-    pub const LAST: c_int = 12;
+    pub const LAST: i32 = 12;
 
     /// How many real ages exist.
     pub const COUNT: usize = 12;
@@ -615,8 +621,8 @@ impl CURLversion {
 
     /// The integer a C caller passes and receives.
     #[must_use]
-    pub const fn as_c_int(self) -> c_int {
-        self as c_int
+    pub const fn as_c_int(self) -> i32 {
+        self as i32
     }
 
     /// Recovers an age from the integer, or `None` for one that names no age.
@@ -625,7 +631,7 @@ impl CURLversion {
     /// value, so a caller that passes it is passing something meaningless and
     /// the boundary layer should be able to see that.
     #[must_use]
-    pub const fn from_c_int(raw: c_int) -> Option<Self> {
+    pub const fn from_c_int(raw: i32) -> Option<Self> {
         match raw {
             0 => Some(Self::First),
             1 => Some(Self::Second),
@@ -764,12 +770,14 @@ macro_rules! russh_version_literal {
 /// The version `hickory-resolver` would be pinned at -- the optional in-process
 /// resolver that would replace what `lib/asyn-ares.c` did with c-ares.
 ///
-/// The crate is NOT currently a dependency of this workspace: `lib.rs` turns the
-/// `hickory-dns` feature into a `compile_error!` because no release of it
-/// satisfies the MSRV and the advisory database at the same time, and the
-/// reasoning is recorded in full there. This literal is retained because it is
-/// the version that measurement selected, and because it keeps the banner slot
-/// and its token exact for the build in which the dependency is wired back in.
+/// The crate is NOT currently a dependency of this workspace, because no release
+/// of it satisfies the MSRV and the advisory database at the same time; `lib.rs`
+/// records the measurement in full. The `hickory-dns` feature is therefore a
+/// declared, default-off NAME whose engine is absent, and
+/// [`resolver_token_is_earned`] is what withholds this token. This literal is
+/// retained because it is the version that measurement selected, and because it
+/// keeps the banner slot and its token exact for the build in which the
+/// dependency is wired back in.
 macro_rules! hickory_resolver_version_literal {
     () => {
         "0.25.2"
@@ -819,7 +827,7 @@ pub const TLS_BACKEND_NAME: &str = "rustls";
 /// Measured at `include/curl/curl.h:166`. The enumerant already exists in the
 /// published header, so `curl_global_sslset` can report a rustls backend
 /// without inventing a value.
-pub const TLS_BACKEND_ID: c_int = 14;
+pub const TLS_BACKEND_ID: i32 = 14;
 
 /// The pinned version of the TLS implementation.
 pub const RUSTLS_VERSION: &str = rustls_version_literal!();
@@ -867,17 +875,18 @@ const PSL_TOKEN: &str =
 /// leniency detection, so a false match would change harness behaviour.
 const SSH_TOKEN: &str = concat!("russh", "/", russh_version_literal!());
 
-/// The resolver token: `hickory-resolver/0.25.2`, emitted only under the
-/// default-off `hickory-dns` feature.
+/// The resolver token: `hickory-resolver/0.25.2`, emitted only when the
+/// default-off `hickory-dns` feature is on AND its engine is present.
 ///
 /// This occupies the slot the C banner fills with `c-ares/<ares_version()>`
 /// (`lib/version.c`), and it is the reason that slot is not simply dead. The
 /// default build resolves names with the system resolver and emits nothing
 /// here, exactly as [`version_parts`]'s table records. The `hickory-dns` feature
-/// that would fill the slot is reserved rather than live -- `lib.rs` makes
-/// enabling it a `compile_error!` -- so no build that compiles emits this token.
-/// The token and the slot are kept, and kept exact, because that reduces
-/// restoring the resolver to wiring one dependency.
+/// that would fill the slot is a declared name with no crate behind it, and
+/// [`resolver_token_is_earned`] conjoins it with [`ENGINE_DNS`], so no build
+/// emits this token at any feature setting -- `--all-features` included. The
+/// token and the slot are kept, and kept exact, because that reduces restoring
+/// the resolver to wiring one dependency and flipping one registry row.
 ///
 /// It is deliberately **not** spelled `c-ares/...`. `tests/runtests.pl` sets
 /// `$feature{"c-ares"}` from a `c-ares` substring in this banner and then infers
@@ -890,26 +899,41 @@ const SSH_TOKEN: &str = concat!("russh", "/", russh_version_literal!());
 const RESOLVER_TOKEN: &str =
     concat!("hickory-resolver", "/", hickory_resolver_version_literal!());
 
-// The `hickory-dns` feature must be an actual alternative resolver rather than a
-// name, and there is exactly one place that is enforced: the `compile_error!`
-// in `lib.rs`, which fires the moment the feature is enabled.
-//
-// It must not be enforced a second time here by naming a type from the crate.
-// A `const _` contract of that shape -- the style `crate::crypto` uses for its
-// real dependencies -- requires the crate to be in the dependency graph, and
-// `hickory-resolver` deliberately is not: no release satisfies the workspace
-// MSRV and the advisory database simultaneously, and because cargo-deny and
-// cargo-audit read `Cargo.lock` rather than the active feature set, declaring
-// it even as an optional dependency puts the advisory into DEFAULT builds.
-// Measurement settled it -- with the crate declared, `cargo audit` reported six
-// vulnerabilities and `--all-features` metadata carried three packages above the
-// MSRV floor; without it, four and zero.
-//
-// What survives is the slot and its token: `version_parts` still reserves
-// position 6, where `lib/version.c` emits `c-ares/...`, and `RESOLVER_TOKEN`
-// still spells the exact name and version. That keeps the banner contract
-// complete and makes restoring the resolver a one-line manifest change rather
-// than an archaeology exercise.
+/// Whether the banner has earned the right to name an alternative resolver.
+///
+/// `configured && implementation_ready`, the rule every row of the feature and
+/// protocol tables obeys, applied to the one banner slot that needs it. The
+/// `hickory-dns` feature is a declared, default-off NAME: `lib.rs` records the
+/// measured reason no admissible `hickory-resolver` release exists (every one
+/// satisfying the workspace MSRV requires a `hickory-proto` carrying
+/// RUSTSEC-2026-0119, and every one carrying that fix declares rust-version
+/// 1.88), so the crate is not in the graph and no lookup can be issued.
+///
+/// Consulting [`ENGINE_DNS`] rather than `cfg!` alone is what makes enabling the
+/// feature safe. Without the second factor, a reader who turned it on would make
+/// `curl --version` advertise `hickory-resolver/0.25.2` with nothing behind it,
+/// and `tests/runtests.pl` would select fixtures for a resolver this build does
+/// not contain -- the over-reporting failure mode of AAP 0.6.5, which is fatal
+/// where under-reporting is a skip. With it, the feature compiles to nothing
+/// observable, which is the safe direction.
+///
+/// The crate is deliberately not named as a `const _` type contract either --
+/// the style `crate::crypto` uses for its real dependencies -- because that
+/// requires the crate to be in the dependency graph. Measurement settled that
+/// too: with `hickory-resolver` declared even as an optional dependency,
+/// `cargo audit` reported six vulnerabilities and `--all-features` metadata
+/// carried three packages above the MSRV floor, because cargo-deny and
+/// cargo-audit read `Cargo.lock` rather than the active feature set; without it,
+/// four and zero.
+///
+/// What survives is the slot and its token: `version_parts` still reserves
+/// position 6, where `lib/version.c` emits `c-ares/...`, and [`RESOLVER_TOKEN`]
+/// still spells the exact name and version. That keeps the banner contract
+/// complete and makes restoring the resolver a manifest change plus one
+/// `ENGINE_DNS` row, rather than an archaeology exercise.
+fn resolver_token_is_earned() -> bool {
+    cfg!(feature = "hickory-dns") && ENGINE_DNS.is_present()
+}
 
 /// The HTTP/2 token: `h2/0.4.15`.
 ///
@@ -960,11 +984,7 @@ const HYPER_TOKEN: &str = concat!("hyper", "/", hyper_version_literal!());
 /// the corresponding token reports, so the number and the string can never
 /// disagree.
 #[must_use]
-const fn packed_version_24_12(
-    major: c_uint,
-    minor: c_uint,
-    patch: c_uint,
-) -> c_uint {
+const fn packed_version_24_12(major: u32, minor: u32, patch: u32) -> u32 {
     (major << 24) | (minor << 12) | patch
 }
 
@@ -975,11 +995,7 @@ const fn packed_version_24_12(
 /// reports no nghttp2 version: `curl-rs-ffi` and any future HTTP/2 reporting
 /// must use this encoding and not invent another.
 #[must_use]
-const fn packed_version_16_8(
-    major: c_uint,
-    minor: c_uint,
-    patch: c_uint,
-) -> c_uint {
+const fn packed_version_16_8(major: u32, minor: u32, patch: u32) -> u32 {
     (major << 16) | (minor << 8) | patch
 }
 
@@ -1220,7 +1236,11 @@ pub const ENGINE_PROXY: Engine =
 /// fixtures require `NTLM` and will skip; none requires `!NTLM`.
 pub const ENGINE_AUTH: Engine = Engine::absent("curl-rs-lib/src/auth/ntlm.rs");
 
-/// The GSS-API binding -- `curl-rs-lib/src/ffi/gss.rs`.
+/// Negotiate over GSS-API -- `curl-rs-lib/src/auth/negotiate.rs`.
+///
+/// Named for the owner it actually gates, which is the HTTP driver and not the
+/// binding: `ffi/gss.rs` exists and is complete, so heading this entry with that
+/// path would describe a present file while reporting absent.
 ///
 /// Gates `GSS-API`, `Kerberos` and `SPNEGO` jointly with [`ENGINE_AUTH`]. The
 /// binding itself exists, but `auth/negotiate.rs` -- the module that would
@@ -1229,9 +1249,12 @@ pub const ENGINE_AUTH: Engine = Engine::absent("curl-rs-lib/src/auth/ntlm.rs");
 /// `negotiate` feature. 5 fixtures require `GSS-API`.
 ///
 /// The same module is what C's `CURL_DISABLE_NEGOTIATE_AUTH` guards, so the
-/// `negotiate-auth` row of `curlinfo` is gated here too, conjoined with the
-/// `negotiate` feature exactly as the `SPNEGO` row is. No fixture gates on the
-/// `negotiate-auth` label.
+/// `negotiate-auth` row of `curlinfo` is gated here too. Both surfaces now carry
+/// the SAME three conjuncts -- feature, this engine, and the runtime probe --
+/// the banner via `present: Some(gss_present)` folded in by
+/// [`Feature::is_present`], the diagnostic via [`negotiate_usable`]. They are
+/// spelled differently only because C spells them differently; they cannot
+/// disagree. No fixture gates on the `negotiate-auth` label.
 pub const ENGINE_GSS: Engine =
     Engine::absent("curl-rs-lib/src/auth/negotiate.rs");
 
@@ -1295,15 +1318,37 @@ pub const ENGINE_TRANSFER: Engine =
 ///
 /// Gates `threadsafe`, which in C is `#if defined(GLOBAL_INIT_IS_THREADSAFE)`
 /// (`lib/version.c:538`) -- a claim about `curl_global_init` and
-/// `curl_global_cleanup` specifically, not about the engine generally. Absent:
-/// `curl-rs-ffi/src/ffi/global.rs` does not exist, so there is no
-/// initialization path whose concurrent safety could be claimed. The engine's
-/// structural properties -- no process-global mutable state,
-/// `#![forbid(unsafe_code)]`, idempotent initialization -- remain the design,
-/// but they describe an initialiser that has not been written. 1 fixture
-/// requires the name.
+/// `curl_global_cleanup` specifically, not about the engine generally.
+///
+/// PRESENT. `curl-rs-ffi/src/ffi/global.rs` exists, both entry points are among
+/// the exports that are defined today, and the initialization path is
+/// serialized by a `static STATE: Mutex<GlobalState>` -- one lock rather than
+/// two atomics, for the same reason C takes one: the flags and the reference
+/// count move together, and a second thread must not observe the intermediate
+/// state. The immortal backend list beside it is a `OnceLock`. C defines the
+/// macro unconditionally (`lib/easy_lock.h:28`, with no `#if` around it), so
+/// `ON` is also what every stock C build reports.
+///
+/// The initialization path this row describes exists: `global.rs` is 760
+/// lines, and the ordering guarantee above is a property of code, not a plan.
+///
+/// # Why this one has no `const _` link beside `ENGINES`
+///
+/// It cannot have one. Every other present engine is owned by a module of THIS
+/// crate, so the registry can name an item the module must export. This engine
+/// is owned by `curl-rs-ffi`, which DEPENDS on this crate -- naming an item in
+/// it here would invert the dependency direction AAP 0.1.1 goal G1 fixes. The
+/// correspondence is therefore asserted from the other side, in `curl-rs-ffi`,
+/// which is the only crate that can see both. `every_present_engine_has_a_
+/// compile_time_link` records the exception explicitly rather than quietly
+/// tolerating it.
+///
+/// 1 fixture requires the name (`tests/data/test3026`), and it additionally
+/// requires `threaded-resolver`, which the harness derives from an `AsynchDNS`
+/// token this build withholds -- so advertising this truthfully cannot make
+/// that fixture run before its resolver exists.
 pub const ENGINE_GLOBAL_INIT: Engine =
-    Engine::absent("curl-rs-ffi/src/ffi/global.rs");
+    Engine::present("curl-rs-ffi/src/ffi/global.rs");
 
 // Engines consulted only by the `curlinfo` diagnostic
 //
@@ -1401,13 +1446,23 @@ pub const ENGINE_NETRC: Engine =
 
 /// Date parsing -- `curl-rs-lib/src/util/parsedate.rs`.
 ///
-/// Gates the `parsedate` row (`CURL_DISABLE_PARSEDATE`). `util/mod.rs:334`
-/// declares the module and AAP 0.4.1 maps it from `lib/parsedate.c`, but the
-/// file does not exist -- so `curl_getdate`, one of the 100 exported symbols,
-/// has no parser behind it and `--time-cond` cannot interpret an argument. No
-/// fixture gates on the label.
+/// Gates the `parsedate` row (`CURL_DISABLE_PARSEDATE`).
+///
+/// PRESENT. `util/mod.rs:384` declares the module and AAP 0.4.1 maps it from
+/// `lib/parsedate.c`; the file is a complete parser with its own test corpus,
+/// [`crate::util::parsedate::getdate`] is linked below, and `curl_getdate` is
+/// one of the exports that IS defined today -- so the symbol has a real parser
+/// behind it and `--time-cond` has something to interpret an argument with.
+///
+/// C's condition is a single switch (`src/curlinfo.c:127-132`), so unlike
+/// [`has_sha512_256`] and [`supports_multi_wakeup`] this row needs no second
+/// conjunct: nothing else has to exist for a date string to be parsed.
+///
+/// The module is present and carries 22 tests. No fixture gates on the label,
+/// so a misreport here would cost nothing at the harness -- but it would still
+/// describe a working export as one that could not parse a date.
 pub const ENGINE_PARSEDATE: Engine =
-    Engine::absent("curl-rs-lib/src/util/parsedate.rs");
+    Engine::present("curl-rs-lib/src/util/parsedate.rs");
 
 /// The HTTP header API -- `curl-rs-lib/src/headers/mod.rs`.
 ///
@@ -1423,35 +1478,104 @@ pub const ENGINE_HEADERS: Engine =
 ///
 /// Gates the `wakeup` row, which C derives from `ENABLE_WAKEUP` in the internal
 /// `multihandle.h` and which asks whether `curl_multi_wakeup` can interrupt a
-/// blocking `curl_multi_poll`. `lib.rs:897` declares `pub mod multi;` and
-/// `multi/state.rs` exists, but `multi/mod.rs` does not, so there is no handle
-/// to hold the socketpair the capability depends on. `CURLMcode::WakeupFailure`
-/// (`error.rs:784-785`) is not evidence either way: it is the value returned
-/// when wakeup is unavailable. 2 fixtures gate on the label and skip.
+/// blocking `curl_multi_poll`.
+///
+/// ABSENT -- but not for the reason previously given here. That reason was
+/// "`multi/state.rs` exists, but `multi/mod.rs` does not, so there is no handle
+/// to hold the socketpair"; `multi/mod.rs` is 142 lines, declares
+/// `pub(crate) mod state;`, and owns [`crate::multi::wakeup_available`] itself.
+/// What is absent is the HANDLE, not its module: there is no handle type and no
+/// poll, and `curl_multi_wakeup` is one of the 76 exports of `lib/libcurl.def`
+/// still undefined -- measured, `curl_multi_strerror` is the only one of the 22
+/// `curl_multi_*` symbols defined today.
+///
+/// This row is why [`supports_multi_wakeup`] is a conjunction, and it is the
+/// clearest case in the registry for insisting on one. The two halves disagree:
+/// the socketpair MECHANISM is genuinely available -- `wakeup_available()` is
+/// `cfg!(unix)`, true on all four targets of AAP 0.8.3 -- while the function
+/// that would use it does not exist. A row reading the mechanism alone would
+/// therefore print `ON`, and the 2 fixtures gating on the label would RUN and
+/// FAIL instead of skipping, which is exactly the over-report AAP 0.6.5 forbids.
+/// Under-reporting is safe; this is the shape that keeps it under.
+///
+/// `CURLMcode::WakeupFailure` (`error.rs:784-785`) is not evidence either way:
+/// it is the value returned when wakeup is unavailable.
+///
+/// What would clear this: not writing `multi/mod.rs`, which is written, but
+/// defining `curl_multi_wakeup` and the poll it interrupts.
 pub const ENGINE_MULTI: Engine = Engine::absent("curl-rs-lib/src/multi/mod.rs");
 
 /// SHA-512/256 -- `curl-rs-lib/src/crypto/sha512_256.rs`.
 ///
-/// Gates the `sha512-256` row, which C derives from `CURL_HAVE_SHA512_256` and
-/// which HTTP Digest consults for `SHA-512-256` challenges.
-/// `crypto/mod.rs:369` declares the module and AAP 0.5.1 pins `sha2 0.10.9`
-/// which provides the primitive, but the file does not exist, so nothing wires
-/// the primitive to a digest. 5 fixtures gate on the label and skip.
+/// Gates the primitive half of the `sha512-256` row, which C derives from
+/// `CURL_HAVE_SHA512_256`.
+///
+/// PRESENT, and deliberately so. `crypto/mod.rs:396` declares the module
+/// `pub(crate)`, the file is a complete implementation on the `sha2 0.10.9` pin
+/// of AAP 0.5.1 -- a one-shot `sha512_256` function, the incremental context
+/// beside it, the 128-byte block length that distinguishes SHA-512/256 from
+/// SHA-256, and its own tests -- and its `available` predicate is linked below
+/// like every other present engine. Those two items are named in prose rather
+/// than linked because `crypto` is `pub(crate)`: a public doc cannot link into
+/// it, and rustdoc rejects the attempt under `-D warnings`.
+///
+/// The distinction this row turns on is which of the two is missing: the hash
+/// primitive is here, and it is the SHA-512/256 DIGEST that is not. Recording
+/// the gap against this engine instead would put it somewhere that writing a
+/// file which already exists appears to clear.
+///
+/// This being present does NOT turn the row ON. C defines
+/// `CURL_HAVE_SHA512_256` under a two-part condition
+/// (`lib/curl_sha512_256.h:28`), and [`has_sha512_256`] carries both halves --
+/// so the row still reads `OFF`, now because [`ENGINE_AUTH_DIGEST`] is absent,
+/// which is the true reason. 5 fixtures gate on the label and skip.
 pub const ENGINE_SHA512_256: Engine =
-    Engine::absent("curl-rs-lib/src/crypto/sha512_256.rs");
+    Engine::present("curl-rs-lib/src/crypto/sha512_256.rs");
 
 /// The generated public C header -- `curl-rs-ffi/src/ffi/easy.rs`.
 ///
 /// Gates the `typecheck` row (`CURL_DISABLE_TYPECHECK`), the compile-time type
-/// checking of `curl_easy_setopt`'s variadic argument. The 258 `curlcheck_`
-/// macros live in `include/curl/typecheck-gcc.h`, which AAP 0.6.3 keeps
-/// hand-maintained and which does exist -- but they take effect only when a C
-/// consumer includes `curl/curl.h`, and this workspace must GENERATE that
-/// header with cbindgen from `curl-rs-ffi`. `curl-rs-ffi/src/lib.rs:852`
-/// declares `mod ffi` with no source, so `ffi/easy.rs` -- the module defining
-/// the `curl_easy_setopt` those macros wrap -- does not exist, no header
-/// can be generated, and the facility has nothing to check. No fixture gates on
-/// the label.
+/// checking of `curl_easy_setopt`'s variadic argument.
+///
+/// The macros live in `include/curl/typecheck-gcc.h`, which AAP 0.6.3 keeps
+/// hand-maintained because cbindgen cannot express it. Measured, that file is
+/// 958 lines carrying **61** `#define curlcheck_` directives -- 60 distinct
+/// names, since `curlcheck_cb_data` is defined twice: once at `:683` inside an
+/// `#if 0`, and once at `:687` in the `#else /* be less strict */` branch that
+/// is the one a compiler actually sees -- whose 260 occurrences span 258 lines.
+/// The 258 is a LINE span and not a macro count; quoting it as one is the
+/// mistake that keeping all three numbers together exists to prevent.
+///
+/// This comment is the single authority for those figures. Two other places
+/// state them -- `curl-rs-ffi/cbindgen.toml` and the `NEVER_GENERATED` guard in
+/// `curl-rs-ffi/build.rs` -- because each needs them where it stands, and
+/// `.github/workflows/rust-abi.yml` deliberately quotes no count at all and
+/// refers here instead, so the set of copies stays at the two that earn their
+/// place.
+///
+/// Those five numbers are reproducible only with a name pattern that admits
+/// uppercase, so the recipe is pinned here: match `#define\s+(curlcheck_\w+)`
+/// anchored at line start. The narrower `curlcheck_[a-z_]*` truncates the two
+/// uppercase names `curlcheck_NULL` and `curlcheck_FILE` to the bare prefix,
+/// collides them into one, and reports 59 distinct rather than 60. That is worth
+/// a sentence because the failure is silent and inverted: it makes a correct
+/// count look like an off-by-one and invites "fixing" it downward.
+///
+/// ABSENT, and still absent after the correction -- but not for the reason
+/// previously given. That reason was "`curl-rs-ffi/src/lib.rs:852` declares
+/// `mod ffi` with no source, so `ffi/easy.rs` ... does not exist"; `ffi/easy.rs`
+/// is 814 lines and `ffi/` holds fifteen files. The real reason is downstream of
+/// that: the macros take effect only when a C consumer includes
+/// `curl/curl.h`, this workspace must GENERATE that header from `curl-rs-ffi`,
+/// and generation is REFUSED while 76 of the 100 exports in `lib/libcurl.def`
+/// are undefined -- `curl_easy_setopt`, the function these macros exist to
+/// wrap, among them. So no header is produced, the frozen C headers remain the ABI
+/// contract untouched, and there is no checked call for the facility to protect.
+///
+/// The distinction matters for what would clear this: writing `ffi/easy.rs`
+/// would not, because it is written. Completing the export surface would.
+///
+/// No fixture gates on the label.
 pub const ENGINE_PUBLIC_HEADER: Engine =
     Engine::absent("curl-rs-ffi/src/ffi/easy.rs");
 
@@ -1545,7 +1669,7 @@ pub const ENGINES: &[Engine] = &[
 // The compile-time links described in the block comment above: for every engine
 // marked present, a reference to the item its owning module must export. This
 // is what stops a `present: true` from outliving the implementation it claims.
-// There are exactly three such engines, so there are exactly three lines here,
+// There are exactly five such engines, so there are exactly five lines here,
 // and a later checkpoint that flips an entry to `present` is expected to add
 // its own line beside them.
 //
@@ -1558,6 +1682,8 @@ const _: fn(crate::error::CURLcode) -> &'static str =
     crate::error::CURLcode::message;
 const _: fn(std::os::fd::BorrowedFd<'_>, &[u8], &[u8]) -> std::io::Result<()> =
     crate::ffi::sys::set_file_xattr;
+const _: fn() -> bool = crate::crypto::sha512_256::available;
+const _: fn(&str) -> Option<i64> = crate::util::parsedate::getdate;
 
 // Diagnostic capability predicates -- the authorities behind src/curlinfo.c
 //
@@ -1704,29 +1830,71 @@ pub fn supports_xattr() -> bool {
 ///
 /// # How the answer is computed
 ///
-/// `CURL_HAVE_SHA512_256` is defined at `lib/curl_sha512_256.h:32` under a
-/// two-part condition: `!defined(CURL_DISABLE_DIGEST_AUTH) &&
-/// !defined(CURL_DISABLE_SHA512_256)`. Both are build switches and neither has a
-/// counterpart among the fifteen Cargo features, so no build configuration can
-/// remove the digest.
+/// `CURL_HAVE_SHA512_256` is defined at `lib/curl_sha512_256.h:28-32` under a
+/// two-part condition -- `!defined(CURL_DISABLE_DIGEST_AUTH) &&
+/// !defined(CURL_DISABLE_SHA512_256)` -- and this predicate is named after that
+/// macro, so it carries BOTH halves. Carrying only the second would report
+/// `true` on a build that cannot answer a `SHA-512-256` challenge at all.
 ///
-/// The implementation is present and unconditional. `lib/curl_sha512_256.c`
-/// selects among three arms -- OpenSSL at `:76`, GnuTLS at `:178`, and its own
-/// code at `:245` under the comment "No system or TLS backend SHA-512/256
+/// The hash half is present and unconditional. `lib/curl_sha512_256.c` selects
+/// among three arms -- OpenSSL at `:76`, GnuTLS at `:178`, and its own code at
+/// `:245` under the comment "No system or TLS backend SHA-512/256
 /// implementation available" -- so C always has an implementation, and so does
 /// this crate: `crate::crypto::sha512_256` is a plain, non-optional module built
-/// on the `sha2` pin of specification 0.5.1, and it is
-/// [`crate::crypto::sha512_256::available`] that answers this predicate rather
-/// than a literal written here.
+/// on the `sha2` pin of specification 0.5.1, and it is that module's `available`
+/// predicate that answers rather than a literal written here.
+///
+/// The digest half is [`ENGINE_AUTH_DIGEST`], which stands for
+/// `!CURL_DISABLE_DIGEST_AUTH`. It is what makes the answer `false` today:
+/// `auth/digest.rs` is unwritten, so no `SHA-512-256` challenge can be answered
+/// however good the hash is. Reporting the hash alone would set
+/// `$feature{"sha512-256"}` in the harness and run 5 fixtures against a digest
+/// that does not exist -- the over-reporting specification 0.6.5 calls fatal,
+/// where under-reporting merely skips.
 ///
 /// # Examples
 ///
 /// ```
-/// assert!(curl_rs_lib::version::has_sha512_256());
+/// // The hash is there; the digest that would use it is not, so the
+/// // macro-equivalent answer is `false` -- as it would be in a C build
+/// // configured with `CURL_DISABLE_DIGEST_AUTH`.
+/// assert!(!curl_rs_lib::version::has_sha512_256());
 /// ```
 #[must_use]
 pub fn has_sha512_256() -> bool {
-    crate::crypto::sha512_256::available()
+    crate::crypto::sha512_256::available() && ENGINE_AUTH_DIGEST.is_present()
+}
+
+/// Whether `curl_multi_wakeup` can interrupt a blocked `curl_multi_poll`.
+///
+/// The authority for the `wakeup: ` row of `src/curlinfo.c:162-167`, which
+/// prints `OFF` from `#ifndef ENABLE_WAKEUP`.
+///
+/// Two conjuncts, for the same reason [`has_sha512_256`] has two. C's
+/// `ENABLE_WAKEUP` is defined at `lib/multihandle.h:74-76` under
+/// `#ifndef CURL_DISABLE_SOCKETPAIR` -- a question about the wakeup MECHANISM
+/// only -- and in C that is sufficient, because the multi handle is always
+/// there to be woken. Here it is not: [`crate::multi::wakeup_available`] answers
+/// the mechanism half and reports `true` on every target in the AAP 0.1.1 goal
+/// G8 matrix, while [`ENGINE_MULTI`] answers whether there is a poll to
+/// interrupt at all.
+///
+/// Both are needed because the harness treats this row as an instruction.
+/// `tests/runtests.pl:537-545` sets `$feature{"wakeup"}` from an `ON`, and
+/// fixtures gated on it then RUN; a build that advertised the socketpair while
+/// `curl_multi_wakeup` is one of the exports not yet defined would fail them
+/// rather than skip them.
+///
+/// # Examples
+///
+/// ```
+/// // The mechanism is there on this target; the multi handle is not.
+/// assert!(curl_rs_lib::multi::wakeup_available());
+/// assert!(!curl_rs_lib::version::supports_multi_wakeup());
+/// ```
+#[must_use]
+pub fn supports_multi_wakeup() -> bool {
+    crate::multi::wakeup_available() && ENGINE_MULTI.is_present()
 }
 
 /// Whether this build stores and sends cookies.
@@ -1754,15 +1922,29 @@ pub fn has_sha512_256() -> bool {
 /// answer would not be fatal -- but it would still make a fixture skip that
 /// should have run, and the fix costs one function.
 ///
+/// # Why the answer is a CONJUNCTION and not the feature alone
+///
+/// A capability claim has two independent preconditions: was it SELECTED for
+/// this build, and does the module that HONOURS it exist. C never had to
+/// separate them, because one `#if` decided selection and compilation at once.
+/// Here they come apart, and a predicate that answered only the first would
+/// advertise a jar that cannot store a cookie -- over-reporting, which
+/// specification 0.6.5 makes fatal. So every `supports_*` predicate in this
+/// section is `configured && implementation_ready`, and the readiness half
+/// comes from the one registry that owns it.
+///
 /// # Examples
 ///
 /// ```
-/// // On by default, as it is in a stock curl build.
-/// assert!(curl_rs_lib::version::supports_cookies());
+/// // The `cookies` feature is on by default, but `crate::cookies` is not yet
+/// // written, so the capability is withheld. The predicate reports the
+/// // conjunction, which is what keeps 51 fixtures skipping rather than
+/// // failing.
+/// assert!(!curl_rs_lib::version::supports_cookies());
 /// ```
 #[must_use]
-pub fn supports_cookies() -> bool {
-    cfg!(feature = "cookies")
+pub const fn supports_cookies() -> bool {
+    cfg!(feature = "cookies") && ENGINE_STATE_STORES.is_present()
 }
 
 /// Whether this build resolves names over DNS-over-HTTPS.
@@ -1772,17 +1954,258 @@ pub fn supports_cookies() -> bool {
 /// part of the frozen contract.
 ///
 /// Evaluated here rather than in the caller for exactly the reason given on
-/// [`supports_cookies`]: the `doh` feature governs `crate::dns::doh` in this
-/// crate, and a forwarded feature can be enabled on this crate alone.
+/// [`supports_cookies`], and a conjunction for the same reason: the `doh`
+/// feature governs `crate::dns::doh` in this crate, a forwarded feature can be
+/// enabled on this crate alone, and the module itself is unwritten.
 ///
 /// # Examples
 ///
 /// ```
-/// assert!(curl_rs_lib::version::supports_doh());
+/// assert!(!curl_rs_lib::version::supports_doh());
 /// ```
 #[must_use]
-pub fn supports_doh() -> bool {
-    cfg!(feature = "doh")
+pub const fn supports_doh() -> bool {
+    cfg!(feature = "doh") && ENGINE_DOH.is_present()
+}
+
+/// Whether this build can perform Negotiate (SPNEGO/Kerberos) authentication.
+///
+/// The authority for the `negotiate-auth: ` row of `src/curlinfo.c:84-89` and
+/// for the `GSS-API`, `Kerberos` and `SPNEGO` banner tokens, which is why it
+/// is spelled once here instead of three times at three call sites.
+///
+/// Both halves are needed and neither is sufficient. The `negotiate` feature
+/// is non-default by specification 0.8.5 conflict C2, so that the default
+/// build links no C security library at all; and [`ENGINE_GSS`] withholds the
+/// capability until `crate::auth::negotiate` exists to drive the binding
+/// through an HTTP exchange. Note that this is the COMPILE-TIME half only:
+/// the three banner tokens additionally consult a runtime probe, because the
+/// GSS-API library resolves at load time and a host may simply not have one.
+///
+/// # Examples
+///
+/// ```
+/// // Non-default feature, and no negotiate module: withheld twice over.
+/// assert!(!curl_rs_lib::version::supports_negotiate());
+/// ```
+#[must_use]
+pub const fn supports_negotiate() -> bool {
+    cfg!(feature = "negotiate") && ENGINE_GSS.is_present()
+}
+
+/// Whether Negotiate is usable in THIS PROCESS, right now -- all three factors.
+///
+/// [`supports_negotiate`] answers the two compile-time questions; this adds the
+/// third, which no `cfg!` can see: whether the platform GSS-API library
+/// actually works here. `crate::ffi::gss_available` performs that probe (cached,
+/// total, never panicking), and a host can satisfy both compile-time factors
+/// while failing this one -- the library resolves at load time, and a present
+/// but misconfigured `gss_mech` setup is usable to nobody.
+///
+/// # Why the diagnostic surface needs this and not the weaker predicate
+///
+/// The three banner tokens already fold the probe in, because
+/// [`Feature::is_present`] evaluates `compiled_in && present()` exactly as
+/// `lib/version.c:684-688` does. The `negotiate-auth: ` row of the `curlinfo`
+/// diagnostic had no equivalent, so it answered the compile-time question alone
+/// -- and `tests/runtests.pl:537-546` folds every `ON` row of that diagnostic
+/// into the same `%feature` map the banner feeds. One capability was therefore
+/// described by two surfaces that could disagree, and the diagnostic was the
+/// one that could over-report.
+///
+/// C does not need this distinction: its `src/curlinfo.c` row is a bare
+/// `#ifdef`, because in C the library is found at build time. Under-reporting is
+/// safe and over-reporting makes fixtures run and fail (specification 0.6.5),
+/// so where the two traditions differ this follows the asymmetry rather than the
+/// C source.
+///
+/// Not `const fn`, and cannot be: it performs a runtime probe. Callers needing a
+/// constant -- the build-script metadata reader, and const arrays -- must use
+/// [`supports_negotiate`], which is the honest compile-time half.
+///
+/// # Examples
+///
+/// ```
+/// // Withheld three times over in a default build.
+/// assert!(!curl_rs_lib::version::negotiate_usable());
+/// ```
+#[must_use]
+pub fn negotiate_usable() -> bool {
+    supports_negotiate() && gss_present()
+}
+
+/// Whether this build serves the `ftp` and `ftps` schemes.
+///
+/// One of the three scheme predicates behind the `Protocols:` line. AAP 0.5.2
+/// puts `ftp` in the default feature set and AAP 0.4.1 maps the
+/// implementation to `crate::protocols::ftp`, so both halves are asked:
+/// `ftps` additionally needs [`supports_tls`].
+///
+/// # Examples
+///
+/// ```
+/// assert!(!curl_rs_lib::version::supports_ftp());
+/// ```
+#[must_use]
+pub const fn supports_ftp() -> bool {
+    cfg!(feature = "ftp") && ENGINE_PROTOCOLS.is_present()
+}
+
+/// Whether this build serves the `scp` and `sftp` schemes.
+///
+/// The `ssh` feature pulls the `russh` pin; `crate::protocols::sftp` and
+/// `crate::protocols::scp` are what would use it.
+///
+/// # Examples
+///
+/// ```
+/// assert!(!curl_rs_lib::version::supports_ssh());
+/// ```
+#[must_use]
+pub const fn supports_ssh() -> bool {
+    cfg!(feature = "ssh") && ENGINE_PROTOCOLS.is_present()
+}
+
+/// Whether this build serves the `ws` and `wss` schemes.
+///
+/// `wss` additionally needs [`supports_tls`]. The four exported `curl_ws_*`
+/// symbols are a separate question -- they are ABI surface, and this is
+/// capability -- so nothing here should be read as a statement about them.
+///
+/// # Examples
+///
+/// ```
+/// assert!(!curl_rs_lib::version::supports_websockets());
+/// ```
+#[must_use]
+pub const fn supports_websockets() -> bool {
+    cfg!(feature = "websockets") && ENGINE_PROTOCOLS.is_present()
+}
+
+/// Whether this build can complete a TLS handshake.
+///
+/// No Cargo feature governs TLS: rustls is the sole backend at every
+/// configuration (specification 0.8.2), so there is nothing to select and the
+/// only question is readiness. Consumed by the `s`-suffixed schemes and by
+/// every `SSL`-gated banner token.
+///
+/// # Examples
+///
+/// ```
+/// assert!(!curl_rs_lib::version::supports_tls());
+/// ```
+#[must_use]
+pub const fn supports_tls() -> bool {
+    ENGINE_TLS.is_present()
+}
+
+/// Whether this build accounts for its own allocations.
+///
+/// Selected by the non-default `memdebug` feature, which specification 0.6.6
+/// leaves off so that the 28 `<limits>` fixtures go inert rather than fail.
+/// There is no readiness conjunct: the mechanism is a global allocator in this
+/// crate rather than a protocol module, so the feature IS the whole answer --
+/// but it has to be asked here, because a `cfg!` in `curl-rs` reads that
+/// crate's forwarded copy and the two can differ.
+///
+/// This says nothing about the `Debug` token, which is withheld unconditionally
+/// and separately: the harness derives `TrackMemory` from `Debug`, so
+/// advertising one would enable checking the other cannot satisfy.
+///
+/// # Examples
+///
+/// ```
+/// // Follows the engine's `memdebug` feature, so the value depends on how the
+/// // library was built and the example asserts no particular one. Note that
+/// // `cfg!(feature = "memdebug")` would NOT work here: a doctest compiles as
+/// // its own crate, so it would read that crate's (empty) feature set -- the
+/// // same cross-crate mistake this whole family of predicates exists to avoid.
+/// let _accounted = curl_rs_lib::version::supports_memdebug();
+///
+/// // What does NOT depend on the build: selecting allocation accounting must
+/// // never advertise `Debug`. The harness derives `TrackMemory` from that
+/// // token, and specification 0.6.6 withholds it so the 28 `<limits>`
+/// // fixtures go inert rather than fail.
+/// assert!(!curl_rs_lib::version::has_feature("Debug"));
+/// ```
+#[must_use]
+pub const fn supports_memdebug() -> bool {
+    cfg!(feature = "memdebug")
+}
+
+/// Whether this build can decode a `Content-Encoding: gzip` or `deflate` body.
+///
+/// The `gzip` feature pulls the `flate2` pin; `crate::transfer::
+/// content_encoding` is what would call into it.
+///
+/// # Examples
+///
+/// ```
+/// assert!(!curl_rs_lib::version::supports_gzip());
+/// ```
+#[must_use]
+pub const fn supports_gzip() -> bool {
+    cfg!(feature = "gzip") && ENGINE_CONTENT_ENCODING.is_present()
+}
+
+/// Whether this build can decode a `Content-Encoding: br` body.
+///
+/// # Examples
+///
+/// ```
+/// assert!(!curl_rs_lib::version::supports_brotli());
+/// ```
+#[must_use]
+pub const fn supports_brotli() -> bool {
+    cfg!(feature = "brotli") && ENGINE_CONTENT_ENCODING.is_present()
+}
+
+/// Whether this build can decode a `Content-Encoding: zstd` body.
+///
+/// # Examples
+///
+/// ```
+/// assert!(!curl_rs_lib::version::supports_zstd());
+/// ```
+#[must_use]
+pub const fn supports_zstd() -> bool {
+    cfg!(feature = "zstd") && ENGINE_CONTENT_ENCODING.is_present()
+}
+
+/// Whether this build can negotiate and speak HTTP/2.
+///
+/// Three conjuncts, not two. HTTP/2 additionally requires TLS here because
+/// AAP 0.8.3 negotiates the version through ALPN, and ALPN is a TLS extension:
+/// without a handshake there is nothing to negotiate over. (`h2c`, the cleartext
+/// upgrade, is a separate harness token and is not claimed by this predicate.)
+///
+/// # Examples
+///
+/// ```
+/// assert!(!curl_rs_lib::version::supports_http2());
+/// ```
+#[must_use]
+pub const fn supports_http2() -> bool {
+    cfg!(feature = "http2")
+        && ENGINE_PROTOCOLS.is_present()
+        && ENGINE_TLS.is_present()
+}
+
+/// Whether this build can negotiate and speak HTTP/3.
+///
+/// TLS is required for the same reason as [`supports_http2`], and doubly so:
+/// QUIC carries TLS 1.3 inside the transport rather than beneath it.
+///
+/// # Examples
+///
+/// ```
+/// assert!(!curl_rs_lib::version::supports_http3());
+/// ```
+#[must_use]
+pub const fn supports_http3() -> bool {
+    cfg!(feature = "http3")
+        && ENGINE_PROTOCOLS.is_present()
+        && ENGINE_TLS.is_present()
 }
 
 // The features table -- lib/version.c:435-554
@@ -1853,7 +2276,7 @@ pub struct Feature {
 
     /// The `CURL_VERSION_*` bit this name contributes, or `0` for the five
     /// names that have no bit.
-    bitmask: c_int,
+    bitmask: i32,
 
     /// Whether this build compiles the capability in at all -- the C `#if`.
     compiled_in: bool,
@@ -1872,7 +2295,7 @@ impl Feature {
 
     /// The `CURL_VERSION_*` bit, or `0` when the name carries none.
     #[must_use]
-    pub const fn bitmask(&self) -> c_int {
+    pub const fn bitmask(&self) -> i32 {
         self.bitmask
     }
 
@@ -1973,8 +2396,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "brotli",
         bitmask: CURL_VERSION_BROTLI,
-        compiled_in: cfg!(feature = "brotli")
-            && ENGINE_CONTENT_ENCODING.is_present(),
+        compiled_in: supports_brotli(),
         present: None,
     },
     // WITHHELD, DELIBERATELY, AND NEVER GATED ON ANY FEATURE.
@@ -2024,7 +2446,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "GSS-API",
         bitmask: CURL_VERSION_GSSAPI,
-        compiled_in: cfg!(feature = "negotiate") && ENGINE_GSS.is_present(),
+        compiled_in: supports_negotiate(),
         present: Some(gss_present),
     },
     // HTTP Strict Transport Security: crate::cookies::hsts, via
@@ -2040,9 +2462,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "HTTP2",
         bitmask: CURL_VERSION_HTTP2,
-        compiled_in: cfg!(feature = "http2")
-            && ENGINE_PROTOCOLS.is_present()
-            && ENGINE_TLS.is_present(),
+        compiled_in: supports_http2(),
         present: None,
     },
     // HTTP/3 over QUIC: crate::protocols::http3 via quinn and h3. QUIC carries
@@ -2050,14 +2470,16 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "HTTP3",
         bitmask: CURL_VERSION_HTTP3,
-        compiled_in: cfg!(feature = "http3")
-            && ENGINE_PROTOCOLS.is_present()
-            && ENGINE_TLS.is_present(),
+        compiled_in: supports_http3(),
         present: None,
     },
-    // Tunnelling through an HTTPS proxy. Compiled in because TLS is
-    // unconditional here; the capability question is delegated to the backend
-    // exactly as C delegates it (lib/version.c:420-424).
+    // Tunnelling through an HTTPS proxy. TWO engines, because the capability
+    // needs a proxy to tunnel through as well as the TLS to wrap it in: TLS is
+    // unconditional here, so ENGINE_PROXY is what withholds the name today.
+    // The residual capability question -- can the backend do it at all -- is
+    // delegated to the backend exactly as C delegates it
+    // (lib/version.c:420-424). Naming only the conjunct that holds -- the
+    // unconditional TLS -- would imply the row is ON, which it is not.
     Feature {
         name: "HTTPS-proxy",
         bitmask: CURL_VERSION_HTTPS_PROXY,
@@ -2101,7 +2523,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "Kerberos",
         bitmask: CURL_VERSION_KERBEROS5,
-        compiled_in: cfg!(feature = "negotiate") && ENGINE_GSS.is_present(),
+        compiled_in: supports_negotiate(),
         present: Some(gss_present),
     },
     // Transfers larger than 2GB; derived from the width of curl_off_t.
@@ -2117,8 +2539,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "libz",
         bitmask: CURL_VERSION_LIBZ,
-        compiled_in: cfg!(feature = "gzip")
-            && ENGINE_CONTENT_ENCODING.is_present(),
+        compiled_in: supports_gzip(),
         present: None,
     },
     // WITHHELD, UNCONDITIONALLY. There is exactly one TLS backend and no other
@@ -2147,8 +2568,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "PSL",
         bitmask: CURL_VERSION_PSL,
-        compiled_in: cfg!(feature = "cookies")
-            && ENGINE_STATE_STORES.is_present(),
+        compiled_in: supports_cookies(),
         present: None,
     },
     // WITHHELD. Out of alphabetical order here because C is; see the block
@@ -2179,7 +2599,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "SPNEGO",
         bitmask: CURL_VERSION_SPNEGO,
-        compiled_in: cfg!(feature = "negotiate") && ENGINE_GSS.is_present(),
+        compiled_in: supports_negotiate(),
         present: Some(gss_present),
     },
     // TLS. Unconditional: rustls is a plain dependency of this crate, and
@@ -2267,8 +2687,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "zstd",
         bitmask: CURL_VERSION_ZSTD,
-        compiled_in: cfg!(feature = "zstd")
-            && ENGINE_CONTENT_ENCODING.is_present(),
+        compiled_in: supports_zstd(),
         present: None,
     },
 ];
@@ -2310,7 +2729,7 @@ pub fn feature_names() -> &'static [&'static str] {
 /// absent here: no `Debug` capability is advertised, so claiming its companion
 /// bit would contradict the name list.
 #[must_use]
-pub fn features_bitmask() -> c_int {
+pub fn features_bitmask() -> i32 {
     FEATURES
         .iter()
         .filter(|feature| feature.is_present())
@@ -2545,40 +2964,92 @@ pub fn version_parts() -> Vec<&'static str> {
     let mut parts: Vec<&'static str> = Vec::with_capacity(VERSION_PARTS);
 
     parts.push(LIBCURL_TOKEN);
-    parts.push(SSL_VERSION);
 
-    if cfg!(feature = "gzip") {
+    // Slot 2, the TLS token, gated exactly as `lib/version.c:206-209` gates it:
+    //
+    //     src[i++] = LIBCURL_NAME "/" LIBCURL_VERSION;
+    //     #ifdef USE_SSL
+    //       Curl_ssl_version(ssl_version, sizeof(ssl_version));
+    //       src[i++] = ssl_version;
+    //     #endif
+    //
+    // So C emits no TLS token at all when no backend is compiled in -- the same
+    // structure it uses for `HAVE_LIBZ` and `HAVE_BROTLI` below. Pushing this
+    // unconditionally reproduces the brotli/zstd defect one slot higher up: the
+    // banner announces `rustls/0.23.42` while the
+    // `Features:` line withholds `SSL`, because that row asks
+    // [`ENGINE_TLS`]. Measured, the cost at the harness was zero -- `SSL` comes
+    // from the `Features:` line (`tests/runtests.pl:664`) and
+    // `$feature{"rustls"}` needs the literal `rustls-ffi` (`:585-586`), neither
+    // of which reads this slot -- but a token that says this build does TLS when
+    // it cannot is untrue whatever it costs, and specification 0.6.5 makes
+    // under-reporting the only safe error.
+    //
+    // rustls IS linked; that is not the claim. The claim a reader takes from
+    // this slot is "this build does TLS, with rustls", and `tls/mod.rs` is
+    // unwritten, so it cannot.
+    if supports_tls() {
+        parts.push(SSL_VERSION);
+    }
+
+    // Every token below is gated on `configured && implementation_ready`, the
+    // same conjunction the two tables use, and by calling the SAME predicate
+    // they call rather than restating it.
+    //
+    // That is not tidying. Gating these three on `cfg!` alone produces a
+    // measured self-contradiction: the banner reads `brotli/8.0.4
+    // zstd/0.13.3` while the `Features:` line withholds `brotli` and `zstd`,
+    // because those rows already ask [`ENGINE_CONTENT_ENCODING`]. One
+    // capability, two surfaces, two different answers. The harness reads both,
+    // and its feature vocabulary contains the bare words `brotli` and `zstd`
+    // (AAP 0.6.5), so the banner's answer is the one that would count --
+    // turning a clean skip into a fixture that runs against a decoder this
+    // build does not have. Under-reporting is safe; over-reporting is fatal.
+    if supports_gzip() {
         parts.push(LIBZ_TOKEN);
     }
-    if cfg!(feature = "brotli") {
+    if supports_brotli() {
         parts.push(BROTLI_TOKEN);
     }
-    if cfg!(feature = "zstd") {
+    if supports_zstd() {
         parts.push(ZSTD_TOKEN);
     }
 
     // Slot 6 in the C ordering, where `lib/version.c` emits `c-ares/...`. The
-    // default build resolves with the system resolver and emits nothing, and no
-    // build that compiles fills the slot: the `hickory-dns` feature that would
-    // is reserved, and `lib.rs` makes enabling it a build failure. The branch is
-    // kept so that wiring the resolver back in needs no change here, and
-    // [`RESOLVER_TOKEN`] records why the C spelling is not reused.
-    if cfg!(feature = "hickory-dns") {
+    // default build resolves with the system resolver and emits nothing here.
+    //
+    // The condition is `configured && implementation_ready`, exactly the rule
+    // stated for every row of the two tables below, and NOT `cfg!` alone. The
+    // `hickory-dns` feature is a declared, default-off name with no crate
+    // behind it (`lib.rs` records the measured reason), so a reader who enables
+    // it must not thereby make the binary claim a resolver it does not have --
+    // that is the over-reporting AAP 0.6.5 calls fatal. [`ENGINE_DNS`] is the
+    // authority for the second factor, so wiring the resolver in means flipping
+    // that one row and nothing here.
+    if resolver_token_is_earned() {
         parts.push(RESOLVER_TOKEN);
     }
 
-    parts.push(IDN_TOKEN);
+    // `lib/version.c:227-229` puts this behind `#ifdef USE_IDN`, so it is
+    // conditional in C too. The authority is the implementing module's own
+    // predicate -- the same one the `IDN` row consults as its `present` function
+    // -- rather than a second opinion written here. That rule governs the
+    // banner as well as the table. True today, so the token is
+    // emitted; derived, so it cannot outlive the module.
+    if crate::url::idn::available() {
+        parts.push(IDN_TOKEN);
+    }
 
-    if cfg!(feature = "cookies") {
+    if supports_cookies() {
         parts.push(PSL_TOKEN);
     }
-    if cfg!(feature = "ssh") {
+    if supports_ssh() {
         parts.push(SSH_TOKEN);
     }
-    if cfg!(feature = "http2") {
+    if supports_http2() {
         parts.push(HTTP2_TOKEN);
     }
-    if cfg!(feature = "http3") {
+    if supports_http3() {
         parts.push(HTTP3_TOKEN);
     }
 
@@ -2671,7 +3142,7 @@ pub fn version() -> &'static str {
 /// Total by construction: a token it cannot parse yields `None`, and the
 /// caller then reports `0`, which is precisely what the C struct carries when
 /// the library is absent. Nothing here can panic.
-fn version_components(token: &str) -> Option<(c_uint, c_uint, c_uint)> {
+fn version_components(token: &str) -> Option<(u32, u32, u32)> {
     // Take everything after the last '/' so that a token naming a path-like
     // library still parses; for "brotli/8.0.4" this is "8.0.4".
     let version = token.rsplit('/').next()?;
@@ -2696,7 +3167,7 @@ fn version_components(token: &str) -> Option<(c_uint, c_uint, c_uint)> {
 /// and the packed encodings have no room for them, so the numeric prefix is
 /// what gets encoded -- the same lossy-but-monotonic treatment the C macros
 /// give a library version. Returns `None` when there are no leading digits.
-fn leading_number(text: &str) -> Option<c_uint> {
+fn leading_number(text: &str) -> Option<u32> {
     let digits = text
         .as_bytes()
         .iter()
@@ -2741,13 +3212,13 @@ pub struct VersionInfo {
     pub version: &'static str,
 
     /// `version_num` -- [`LIBCURL_VERSION_NUM`].
-    pub version_num: c_uint,
+    pub version_num: u32,
 
     /// `host` -- the `cpu-vendor-os[-env]` triple; see [`host`].
     pub host: &'static str,
 
     /// `features` -- the bitmask; see [`features_bitmask`].
-    pub features: c_int,
+    pub features: i32,
 
     /// `ssl_version` -- human-readable TLS backend and version.
     pub ssl_version: Option<&'static str>,
@@ -2755,7 +3226,7 @@ pub struct VersionInfo {
     /// `ssl_version_num` -- "not used anymore, always 0"
     /// (`include/curl/curl.h:3117`). Reproduced as a zero, not omitted: the
     /// field still occupies its slot in the C layout.
-    pub ssl_version_num: c_long,
+    pub ssl_version_num: i64,
 
     /// `libz_version` -- always `None` here.
     ///
@@ -2775,7 +3246,7 @@ pub struct VersionInfo {
     pub ares: Option<&'static str>,
 
     /// `ares_num` -- always `0`, for the same reason.
-    pub ares_num: c_int,
+    pub ares_num: i32,
 
     // ---- CURLVERSION_THIRD ----
     /// `libidn` -- always `None`: the IDN implementation is `idna`, not libidn2.
@@ -2791,7 +3262,7 @@ pub struct VersionInfo {
 
     // ---- CURLVERSION_FOURTH ----
     /// `iconv_ver_num` -- always `0`: no iconv is used.
-    pub iconv_ver_num: c_int,
+    pub iconv_ver_num: i32,
 
     /// `libssh_version` -- always `None`.
     ///
@@ -2802,7 +3273,7 @@ pub struct VersionInfo {
 
     // ---- CURLVERSION_FIFTH ----
     /// `brotli_ver_num` -- `(MAJOR << 24) | (MINOR << 12) | PATCH`, or `0`.
-    pub brotli_ver_num: c_uint,
+    pub brotli_ver_num: u32,
 
     /// `brotli_version` -- the prefixed token, matching the C shape, where
     /// `brotli_version()` writes `"brotli/%u.%u.%u"` (`lib/version.c:83-90`).
@@ -2810,7 +3281,7 @@ pub struct VersionInfo {
 
     // ---- CURLVERSION_SIXTH ----
     /// `nghttp2_ver_num` -- always `0`: nghttp2 is replaced by `h2`.
-    pub nghttp2_ver_num: c_uint,
+    pub nghttp2_ver_num: u32,
 
     /// `nghttp2_version` -- always `None`, for the same reason. The HTTP/2
     /// implementation is reported by the banner's `h2/...` part.
@@ -2838,7 +3309,7 @@ pub struct VersionInfo {
 
     // ---- CURLVERSION_EIGHTH ----
     /// `zstd_ver_num` -- `(MAJOR << 24) | (MINOR << 12) | PATCH`, or `0`.
-    pub zstd_ver_num: c_uint,
+    pub zstd_ver_num: u32,
 
     /// `zstd_version` -- the prefixed token, matching the C shape, where
     /// `zstd_version()` writes `"zstd/%u.%u.%u"` (`lib/version.c:93-101`).
@@ -2882,7 +3353,15 @@ pub fn version_info() -> &'static VersionInfo {
     static INFO: OnceLock<VersionInfo> = OnceLock::new();
 
     INFO.get_or_init(|| {
-        let (brotli_version, brotli_ver_num) = if cfg!(feature = "brotli") {
+        // These three fields are the SAME capability questions the `Features:`
+        // line and the version banner answer, on a third surface, so they ask
+        // the same predicates. A caller that read `brotli_version` as
+        // `"brotli/8.0.4"` while `features & CURL_VERSION_BROTLI` was clear
+        // would be looking at one library describing itself two ways -- and
+        // `features_bitmask()` below is derived from the table, so the bit is
+        // already the conjunction. Gating the string on anything weaker is what
+        // makes them disagree.
+        let (brotli_version, brotli_ver_num) = if supports_brotli() {
             let (major, minor, patch) =
                 version_components(BROTLI_TOKEN).unwrap_or((0, 0, 0));
             (
@@ -2893,7 +3372,7 @@ pub fn version_info() -> &'static VersionInfo {
             (None, 0)
         };
 
-        let (zstd_version, zstd_ver_num) = if cfg!(feature = "zstd") {
+        let (zstd_version, zstd_ver_num) = if supports_zstd() {
             let (major, minor, patch) =
                 version_components(ZSTD_TOKEN).unwrap_or((0, 0, 0));
             (Some(ZSTD_TOKEN), packed_version_24_12(major, minor, patch))
@@ -2901,7 +3380,7 @@ pub fn version_info() -> &'static VersionInfo {
             (None, 0)
         };
 
-        let quic_version = if cfg!(feature = "http3") {
+        let quic_version = if supports_http3() {
             Some(HTTP3_TOKEN)
         } else {
             None
@@ -2913,7 +3392,16 @@ pub fn version_info() -> &'static VersionInfo {
             version_num: LIBCURL_VERSION_NUM,
             host: host(),
             features: features_bitmask(),
-            ssl_version: Some(SSL_VERSION),
+            // NULL unless a backend can execute, exactly as C leaves it: the
+            // static initialiser at `lib/version.c:564` reads
+            // `NULL, /* ssl_version */` and only the `#ifdef USE_SSL` block at
+            // `:620-623` fills it in. Gated on the same predicate as the banner
+            // slot so the two descriptions of one capability cannot diverge.
+            ssl_version: if supports_tls() {
+                Some(SSL_VERSION)
+            } else {
+                None
+            },
             ssl_version_num: 0,
             libz_version: None,
             protocols: protocols(),
@@ -3158,11 +3646,11 @@ mod tests {
     fn curlversion_is_laid_out_as_a_c_int() {
         assert_eq!(
             core::mem::size_of::<CURLversion>(),
-            core::mem::size_of::<c_int>()
+            core::mem::size_of::<i32>()
         );
         assert_eq!(
             core::mem::align_of::<CURLversion>(),
-            core::mem::align_of::<c_int>()
+            core::mem::align_of::<i32>()
         );
     }
 
@@ -3180,7 +3668,7 @@ mod tests {
     #[test]
     fn curlversion_round_trips_and_rejects_the_sentinel() {
         for (index, age) in CURLversion::VARIANTS.iter().enumerate() {
-            let raw = c_int::try_from(index).expect("twelve ages fit an int");
+            let raw = i32::try_from(index).expect("twelve ages fit an int");
             assert_eq!(age.as_c_int(), raw);
             assert_eq!(CURLversion::from_c_int(raw), Some(*age));
             assert!(age.c_name().starts_with("CURLVERSION_"));
@@ -3191,7 +3679,7 @@ mod tests {
         // CURLVERSION_LAST is "never actually use this" -- a bound, not a value.
         assert_eq!(CURLversion::from_c_int(CURLversion::LAST), None);
         assert_eq!(CURLversion::from_c_int(-1), None);
-        assert_eq!(CURLversion::from_c_int(c_int::MAX), None);
+        assert_eq!(CURLversion::from_c_int(i32::MAX), None);
     }
 
     #[test]
@@ -3318,7 +3806,7 @@ mod tests {
         // item its owning module exports, so the claim cannot outlive the
         // implementation. Asserting the SET rather than the count means a
         // future entry cannot be flipped to present without being named here,
-        // and the three references themselves sit next to `ENGINES`.
+        // and the five references themselves sit next to `ENGINES`.
         let present: Vec<&str> = ENGINES
             .iter()
             .filter(|engine| engine.is_present())
@@ -3328,11 +3816,39 @@ mod tests {
         assert_eq!(
             present,
             vec![
+                // Registry order, not alphabetical: the assertion doubles as a
+                // record of where each present engine sits in `ENGINES`.
                 "curl-rs-lib/src/url/idn.rs",
+                // The one entry with no `const _` line beside `ENGINES`, and
+                // the only one that CANNOT have one: it is owned by
+                // `curl-rs-ffi`, which depends on this crate, so naming an item
+                // in it here would invert the dependency direction. The
+                // correspondence is asserted from that crate instead. The
+                // exception is listed here rather than filtered out, so that a
+                // second cross-crate owner has to be considered deliberately
+                // rather than slipping in behind this one.
+                "curl-rs-ffi/src/ffi/global.rs",
+                "curl-rs-lib/src/util/parsedate.rs",
+                "curl-rs-lib/src/crypto/sha512_256.rs",
                 "curl-rs-lib/src/error.rs",
                 "curl-rs-lib/src/ffi/sys.rs",
             ],
             "each present engine needs its own const _ link"
+        );
+
+        // The exception is exactly one entry wide. Every other present engine
+        // is owned by this crate and therefore linkable here.
+        let cross_crate: Vec<&str> = present
+            .iter()
+            .filter(|owner| !owner.starts_with("curl-rs-lib/"))
+            .copied()
+            .collect();
+
+        assert_eq!(
+            cross_crate,
+            vec!["curl-rs-ffi/src/ffi/global.rs"],
+            "a present engine owned outside this crate cannot be linked here; \
+             assert the correspondence in the owning crate and record it above"
         );
 
         // And the linked items really do answer, which is what makes the
@@ -3367,7 +3883,7 @@ mod tests {
 
     #[test]
     fn every_row_has_the_bit_the_c_table_gives_it() {
-        let expected: [(&str, c_int); 32] = [
+        let expected: [(&str, i32); 32] = [
             ("alt-svc", CURL_VERSION_ALTSVC),
             ("asyn-rr", 0),
             ("AsynchDNS", CURL_VERSION_ASYNCHDNS),
@@ -3727,7 +4243,7 @@ mod tests {
         // bit positions catches a stray bit that no row owns, which is the
         // failure a forward-only check cannot see.
         for position in 0..31 {
-            let bit: c_int = 1 << position;
+            let bit: i32 = 1 << position;
             if mask & bit == 0 {
                 continue;
             }
@@ -3932,20 +4448,44 @@ mod tests {
         }
 
         // What DOES still hold unconditionally for the GSS names: the feature is
-        // necessary even though it is no longer sufficient. Without it the name
-        // can never appear, whatever the host offers.
+        // NECESSARY even though it is not SUFFICIENT. Two things are needed
+        // before the compile-time half can be true, and asserting only the
+        // first is how this test came to fail under `--all-features`: it
+        // demanded `compiled_in() == cfg!(feature = "negotiate")`, which with
+        // the feature enabled demands `true` while the rows correctly report
+        // `false`, because `ENGINE_GSS` is `absent` until
+        // `curl-rs-lib/src/auth/negotiate.rs` exists to drive the binding
+        // through an HTTP exchange.
+        //
+        // The equality asserted here is the one the three rows actually
+        // declare -- `cfg!(feature = "negotiate") && ENGINE_GSS.is_present()`,
+        // spelled identically at :2045, :2122 and :2200. Restating the
+        // conjunction rather than reading `row.compiled_in()` back is the
+        // point: a test that echoed the field would pass whatever the field
+        // said.
+        let gss_compiled =
+            cfg!(feature = "negotiate") && ENGINE_GSS.is_present();
         for name in STRENGTHENED_PREDICATE_ROWS {
             assert_eq!(
                 feature(name)
                     .expect("row must exist in every build")
                     .compiled_in(),
-                cfg!(feature = "negotiate"),
-                "{name} must be compiled in exactly with the negotiate feature"
+                gss_compiled,
+                "{name}'s compile-time half is the negotiate feature AND a \
+                 ready GSS engine, not the feature alone"
             );
             if !cfg!(feature = "negotiate") {
                 assert!(
                     !has_feature(name),
                     "{name} cannot appear without the feature"
+                );
+            }
+            if !ENGINE_GSS.is_present() {
+                assert!(
+                    !has_feature(name),
+                    "{name} cannot appear while the GSS engine is withheld, \
+                     however the feature is set: specification 0.6.5 makes \
+                     over-reporting fatal and under-reporting safe"
                 );
             }
         }
@@ -3983,7 +4523,7 @@ mod tests {
         assert!(!row.compiled_in());
     }
 
-    /// F11's invariant: there is one IDN predicate, it lives in the module that
+    /// The invariant: there is one IDN predicate, it lives in the module that
     /// implements IDN, and the feature table holds a pointer to THAT function
     /// rather than a second copy of its answer.
     #[test]
@@ -4000,35 +4540,48 @@ mod tests {
     /// The three GSS-backed tokens combine a compile-time gate with a RUNTIME
     /// probe, and this asserts the composition rather than either half.
     ///
-    /// Deliberately not `assert_eq!(has_feature("SPNEGO"), cfg!(...))`: an
-    /// earlier revision asserted exactly that, and it is only satisfiable by
-    /// reporting the `cfg!` alone -- which claims a mechanism the host may not
-    /// have. Specification 0.6.5 makes over-reporting fatal and
-    /// under-reporting safe, so what is contractual is:
+    /// Deliberately not `assert_eq!(has_feature("SPNEGO"), cfg!(...))`: that
+    /// form is only satisfiable by reporting the `cfg!` alone -- which claims
+    /// a mechanism the host may not have. Specification 0.6.5 makes
+    /// over-reporting fatal and under-reporting safe, so what is contractual
+    /// is:
     ///
     /// * the row consults a predicate at all (`present` is not `None`);
     /// * being advertised IMPLIES the feature was compiled in;
     /// * all three answer identically, because one library backs all of them;
     /// * the answer equals `compiled_in && gss_present()`.
+    ///
+    /// The compile-time half is itself a conjunction, and getting that wrong is
+    /// what made this test fail under `--all-features`: it read
+    /// `cfg!(feature = "negotiate")` alone, where the rows declare
+    /// `cfg!(feature = "negotiate") && ENGINE_GSS.is_present()`. The engine is
+    /// `absent` until `curl-rs-lib/src/auth/negotiate.rs` exists, so with the
+    /// feature on the two differ, and the row is the one that is right.
     #[test]
     fn the_gss_tokens_combine_compile_time_and_runtime() {
         let mut answers = Vec::new();
+
+        // Spelled out rather than read back from a row, so that this is an
+        // independent statement of the contract and not an echo of it.
+        let compiled = cfg!(feature = "negotiate") && ENGINE_GSS.is_present();
 
         for name in ["GSS-API", "Kerberos", "SPNEGO"] {
             let row = feature(name).expect("the row must exist");
 
             assert!(
                 row.present.is_some(),
-                "{name} must consult a runtime probe; a bare cfg! over-reports                  when the GSS-API library is absent"
+                "{name} must consult a runtime probe; a bare cfg! \
+                 over-reports when the GSS-API library is absent"
             );
             assert_eq!(
                 row.compiled_in(),
-                cfg!(feature = "negotiate"),
-                "{name}'s compile-time half is the negotiate feature"
+                compiled,
+                "{name}'s compile-time half is the negotiate feature AND a \
+                 ready GSS engine"
             );
             assert_eq!(
                 row.is_present(),
-                cfg!(feature = "negotiate") && gss_present(),
+                compiled && gss_present(),
                 "{name} must be the conjunction of both halves"
             );
             assert_eq!(has_feature(name), row.is_present());
@@ -4048,10 +4601,16 @@ mod tests {
              disagree: {answers:?}"
         );
 
-        // With the feature off, the probe result is irrelevant and all three
-        // must be withheld -- the default build advertises no GSS capability.
-        if !cfg!(feature = "negotiate") {
-            assert!(answers.iter().all(|a| !a));
+        // With the compile-time half false, the probe result is irrelevant and
+        // all three must be withheld. That covers both reasons independently:
+        // the default build has no `negotiate` feature, and an all-features
+        // build still has no ready GSS engine.
+        if !compiled {
+            assert!(
+                answers.iter().all(|a| !a),
+                "no GSS token may be advertised without the feature AND the \
+                 engine: {answers:?}"
+            );
         }
     }
 
@@ -4255,8 +4814,21 @@ mod tests {
     fn the_banner_opens_with_libcurl_then_the_tls_token() {
         let parts = version_parts();
         assert_eq!(parts[0], "libcurl/8.19.0-DEV");
-        assert_eq!(parts[1], SSL_VERSION);
+
+        // Slot 2 is the TLS token WHEN there is one. `lib/version.c:206-209`
+        // gates it on `USE_SSL`, so its presence is derived, not fixed, and the
+        // assertion has to be conditional in the same way -- writing
+        // `parts[1] == SSL_VERSION` unconditionally is what would pin an
+        // over-report in place.
         assert_eq!(SSL_VERSION, "rustls/0.23.42");
+        if supports_tls() {
+            assert_eq!(parts[1], SSL_VERSION);
+        } else {
+            assert!(
+                !parts.contains(&SSL_VERSION),
+                "the TLS token must be absent while tls/mod.rs cannot execute"
+            );
+        }
 
         let banner = version();
         assert!(banner.starts_with("libcurl/8.19.0-DEV "));
@@ -4324,47 +4896,116 @@ mod tests {
 
     #[test]
     fn the_banner_parts_match_the_active_features() {
+        // Every optional slot is `configured && implementation_ready`, asserted
+        // through the same predicate the banner consults. Spelling any of
+        // these as `cfg!(feature = ...)` alone is not a cosmetic difference:
+        // it would make this test AGREE with a banner that contradicts the
+        // `Features:` line, which is how `brotli/8.0.4` can come to be printed
+        // beside a withheld `brotli` feature. The predicates are the single
+        // authority for both surfaces, so asserting through them is what makes
+        // the two provably consistent rather than coincidentally similar.
         let parts = version_parts();
-        let expected_len = 3 // libcurl, rustls, idna
-            + usize::from(cfg!(feature = "gzip"))
-            + usize::from(cfg!(feature = "brotli"))
-            + usize::from(cfg!(feature = "zstd"))
-            + usize::from(cfg!(feature = "hickory-dns"))
-            + usize::from(cfg!(feature = "cookies"))
-            + usize::from(cfg!(feature = "ssh"))
-            + usize::from(cfg!(feature = "http2"))
-            + usize::from(cfg!(feature = "http3"));
+        // Only `libcurl/` is unconditional now. The TLS and IDN slots became
+        // derived when they were found to be the last two unconditional pushes,
+        // and C gates both -- `#ifdef USE_SSL` at `lib/version.c:206-209` and
+        // `#ifdef USE_IDN` at `:227-229` -- so counting them as fixed was the
+        // same mistake in arithmetic form.
+        let expected_len = 1 // libcurl
+            + usize::from(supports_tls())
+            + usize::from(crate::url::idn::available())
+            + usize::from(supports_gzip())
+            + usize::from(supports_brotli())
+            + usize::from(supports_zstd())
+            + usize::from(resolver_token_is_earned())
+            + usize::from(supports_cookies())
+            + usize::from(supports_ssh())
+            + usize::from(supports_http2())
+            + usize::from(supports_http3());
         assert_eq!(parts.len(), expected_len);
 
         let banner = version();
-        assert_eq!(banner.contains("flate2/"), cfg!(feature = "gzip"));
-        assert_eq!(banner.contains("brotli/"), cfg!(feature = "brotli"));
-        assert_eq!(banner.contains("zstd/"), cfg!(feature = "zstd"));
-        assert_eq!(banner.contains("publicsuffix/"), cfg!(feature = "cookies"));
-        assert_eq!(banner.contains("russh/"), cfg!(feature = "ssh"));
-        assert_eq!(banner.contains("h2/"), cfg!(feature = "http2"));
-        assert_eq!(banner.contains("quinn/"), cfg!(feature = "http3"));
-        assert_eq!(banner.contains(" h3/"), cfg!(feature = "http3"));
+        assert_eq!(banner.contains("flate2/"), supports_gzip());
+        assert_eq!(banner.contains("brotli/"), supports_brotli());
+        assert_eq!(banner.contains("zstd/"), supports_zstd());
+        assert_eq!(banner.contains("publicsuffix/"), supports_cookies());
+        assert_eq!(banner.contains("russh/"), supports_ssh());
+        assert_eq!(banner.contains("h2/"), supports_http2());
+        assert_eq!(banner.contains("quinn/"), supports_http3());
+        assert_eq!(banner.contains(" h3/"), supports_http3());
         assert_eq!(
             banner.contains("hickory-resolver/"),
-            cfg!(feature = "hickory-dns")
+            resolver_token_is_earned()
         );
-        assert!(banner.contains("idna/1.1.0"));
+        // Derived, not fixed, for the same reason the count above is: `idna/` is
+        // emitted exactly while the implementing module answers. It IS emitted
+        // today -- `url/idn.rs` is one of the present engines -- so this asserts
+        // the positive case rather than merely permitting it.
+        assert_eq!(banner.contains("idna/1.1.0"), crate::url::idn::available());
+        assert_eq!(banner.contains("rustls/0.23.42"), supports_tls());
+    }
+
+    /// The banner and the `Features:` line may never disagree about the same
+    /// capability.
+    ///
+    /// The defect this pins was measured, not hypothesised: with the token gates
+    /// spelled as bare `cfg!`, `version_parts()` returned
+    /// `["...", "brotli/8.0.4", "zstd/0.13.3", ...]` while `has_feature("brotli")`
+    /// and `has_feature("zstd")` were both false. Both surfaces are machine-read
+    /// by `tests/runtests.pl`, and its feature vocabulary contains the bare words
+    /// `brotli` and `zstd`, so the contradiction was not merely untidy -- it was
+    /// an over-report on the surface that would have counted.
+    ///
+    /// Asserted over the token-to-feature pairs rather than by comparing the two
+    /// code paths' expressions, so it stays meaningful if either is rewritten.
+    #[test]
+    fn no_banner_token_contradicts_its_feature_row() {
+        let parts = version_parts();
+
+        for (token, feature) in [
+            // `rustls/` and `idna/` join the list because their slots became
+            // derived rather than unconditional. `rustls/` was the live
+            // contradiction this test would have caught had it covered the pair:
+            // the banner announced the backend while the `SSL` row withheld it.
+            ("rustls/", "SSL"),
+            ("flate2/", "libz"),
+            ("brotli/", "brotli"),
+            ("zstd/", "zstd"),
+            ("idna/", "IDN"),
+            ("publicsuffix/", "PSL"),
+            ("russh/", "libssh2"),
+            ("h2/", "HTTP2"),
+            ("quinn/", "HTTP3"),
+        ] {
+            let in_banner = parts.iter().any(|part| part.starts_with(token));
+
+            assert_eq!(
+                in_banner,
+                has_feature(feature),
+                "the banner token {token} and the Features row {feature} \
+                 describe one capability and must give one answer; the banner \
+                 says {in_banner} and the table says {}",
+                has_feature(feature)
+            );
+        }
     }
 
     #[test]
     fn the_optional_resolver_is_reported_only_when_it_is_compiled_in() {
         // The contract is that the banner names the resolver exactly when the
         // resolver is in the build, and never otherwise. Today only the second
-        // half is reachable: the `hickory-dns` feature is reserved and `lib.rs`
-        // makes enabling it a `compile_error!`, so the `else` arm is the one that
-        // runs and it asserts the token is absent. The `if` arm is retained
-        // deliberately -- it is the assertion that has to hold on the day the
-        // dependency is wired in, including the slot's position in the banner.
+        // half is reachable, and the reason is now the registry rather than a
+        // build failure: `hickory-dns` is a declared, default-off name whose
+        // engine (`ENGINE_DNS`) is absent, so `resolver_token_is_earned` is
+        // false at EVERY feature setting -- including `--all-features`, which
+        // this workspace can now pass. The `else` arm is therefore the one that
+        // runs, and it asserts the token is absent. The `if` arm is retained
+        // deliberately: it is the assertion that has to hold on the day the
+        // dependency is wired in and `ENGINE_DNS` flips to present, including
+        // the slot's position in the banner.
         let banner = version();
         let parts = version_parts();
 
-        if cfg!(feature = "hickory-dns") {
+        if resolver_token_is_earned() {
             assert!(
                 parts.contains(&RESOLVER_TOKEN),
                 "the resolver token belongs in the banner when the feature is on: {parts:?}"
@@ -4469,12 +5110,10 @@ mod tests {
         // freezing one moment of it -- and each one still asserts the exact
         // harness pattern from the cited line.
 
-        // :662-666
         assert_eq!(features.contains("SSL"), ENGINE_TLS.is_present());
         assert!(!lower.contains("multissl"));
         assert!(features.contains("Largefile"));
 
-        // :668-676
         assert_eq!(features.contains("IDN"), ENGINE_IDN.is_present());
         assert_eq!(features.contains("IPv6"), ENGINE_CONN.is_present());
         assert_eq!(
@@ -4486,7 +5125,6 @@ mod tests {
             cfg!(feature = "gzip") && ENGINE_CONTENT_ENCODING.is_present()
         );
 
-        // :678-688
         assert_eq!(
             lower.contains("brotli"),
             cfg!(feature = "brotli") && ENGINE_CONTENT_ENCODING.is_present()
@@ -4536,7 +5174,6 @@ mod tests {
         assert_eq!(features.contains("AsynchDNS"), ENGINE_DNS.is_present());
         assert!(!features.contains("asyn-rr"));
 
-        // :714-726
         let over_tls = ENGINE_PROTOCOLS.is_present() && ENGINE_TLS.is_present();
         assert_eq!(
             features.contains("HTTP2"),
@@ -4597,7 +5234,16 @@ mod tests {
         assert_eq!(info.version_num, LIBCURL_VERSION_NUM);
         assert_eq!(info.host, host());
         assert_eq!(info.features, features_bitmask());
-        assert_eq!(info.ssl_version, Some(SSL_VERSION));
+        // Derived, like the banner slot it mirrors: NULL until a backend can
+        // execute (`lib/version.c:564` and `:620-623`).
+        assert_eq!(
+            info.ssl_version,
+            if supports_tls() {
+                Some(SSL_VERSION)
+            } else {
+                None
+            }
+        );
         assert_eq!(info.protocols, protocols());
         assert_eq!(info.feature_names, feature_names());
     }
@@ -4629,34 +5275,50 @@ mod tests {
         let info = version_info();
         assert_eq!(info.hyper_version, Some("hyper/1.11.0"));
 
-        #[cfg(feature = "brotli")]
-        {
-            assert_eq!(info.brotli_version, Some("brotli/8.0.4"));
-            assert_eq!(info.brotli_ver_num, packed_version_24_12(8, 0, 4));
-            assert_eq!(info.brotli_ver_num, 0x0800_0004);
-        }
-        #[cfg(not(feature = "brotli"))]
-        {
-            assert_eq!(info.brotli_version, None);
-            assert_eq!(info.brotli_ver_num, 0);
-        }
+        // Each field is compared against its capability predicate rather than
+        // against `#[cfg(feature = ...)]` blocks.
+        //
+        // The blocks were not merely more verbose, they encoded the wrong
+        // contract: they asserted `Some("brotli/8.0.4")` whenever the feature
+        // was selected, which is what the payload used to report and what made
+        // it contradict the `Features:` bit beside it -- `features_bitmask()`
+        // has always asked the engine as well. Deriving the expectation from
+        // the same predicate the payload consults keeps the string and the bit
+        // provably in step, and holds under every feature combination rather
+        // than only the two each block covered.
+        assert_eq!(
+            info.brotli_version,
+            supports_brotli().then_some("brotli/8.0.4")
+        );
+        assert_eq!(
+            info.brotli_ver_num,
+            if supports_brotli() {
+                packed_version_24_12(8, 0, 4)
+            } else {
+                0
+            }
+        );
 
-        #[cfg(feature = "zstd")]
-        {
-            assert_eq!(info.zstd_version, Some("zstd/0.13.3"));
-            assert_eq!(info.zstd_ver_num, packed_version_24_12(0, 13, 3));
-            assert_eq!(info.zstd_ver_num, 0x0000_D003);
-        }
-        #[cfg(not(feature = "zstd"))]
-        {
-            assert_eq!(info.zstd_version, None);
-            assert_eq!(info.zstd_ver_num, 0);
-        }
+        assert_eq!(info.zstd_version, supports_zstd().then_some("zstd/0.13.3"));
+        assert_eq!(
+            info.zstd_ver_num,
+            if supports_zstd() {
+                packed_version_24_12(0, 13, 3)
+            } else {
+                0
+            }
+        );
 
-        #[cfg(feature = "http3")]
-        assert_eq!(info.quic_version, Some("quinn/0.11.9 h3/0.0.8"));
-        #[cfg(not(feature = "http3"))]
-        assert_eq!(info.quic_version, None);
+        assert_eq!(
+            info.quic_version,
+            supports_http3().then_some("quinn/0.11.9 h3/0.0.8")
+        );
+
+        // The packed encodings themselves, asserted unconditionally so the
+        // 24-bit/12-bit layout stays pinned even while the capabilities are
+        // withheld and the fields above are all `None`.
+        assert_eq!(packed_version_24_12(8, 0, 4), 0x0800_0004);
+        assert_eq!(packed_version_24_12(0, 13, 3), 0x0000_D003);
     }
 
     #[test]
@@ -4833,7 +5495,7 @@ mod tests {
 
     /// No name this build advertises may be one the sibling artifact withholds.
     ///
-    /// The cross-artifact equality F9 requires, stated generally rather than
+    /// The cross-artifact equality, stated generally rather than
     /// only for the two tokens that prompted it. One build ships two things that
     /// answer the same question -- `curl --version`, assembled from [`FEATURES`]
     /// here, and `curl-config --feature` / `libcurl.pc`, rendered next door
@@ -4864,7 +5526,7 @@ mod tests {
 
     /// `Debug` and `TrackMemory` are withheld by BOTH artifacts, unconditionally.
     ///
-    /// This is the specific half of F9. `version.rs` hard-codes the `Debug` row
+    /// The specific case. `version.rs` hard-codes the `Debug` row
     /// to `compiled_in: false` -- a literal, not a `cfg!` -- and has no
     /// `TrackMemory` row at all, because curl never emits that token: it appears
     /// only in `tests/runtests.pl`, `tests/runner.pm` and `tests/data/test558`,
@@ -4932,11 +5594,11 @@ mod tests {
             ("russh", russh_version_literal!()),
             // `hickory-resolver` is deliberately NOT here. Every other literal
             // in this list names a live `[workspace.dependencies]` pin and is
-            // checked against it; that one names the version the reserved
-            // `hickory-dns` feature would pin, and the crate is absent from the
-            // manifest on purpose (see the block beside `RESOLVER_TOKEN` and the
-            // `compile_error!` in `lib.rs`). Asserting a pin for it would demand
-            // exactly the dependency that was removed.
+            // checked against it; that one names the version the declared-but-
+            // unbacked `hickory-dns` feature would pin, and the crate is absent
+            // from the manifest on purpose (see the block beside
+            // `RESOLVER_TOKEN` and the feature note in `lib.rs`). Asserting a
+            // pin for it would demand exactly the dependency that was removed.
             ("h2", h2_version_literal!()),
             ("quinn", quinn_version_literal!()),
             ("h3", h3_version_literal!()),

@@ -4,10 +4,15 @@
 
 //! Containment for panics that would otherwise unwind into C.
 //!
-//! Every one of the 100 exported entry points routes its body through
-//! exactly one of the four functions here. See the crate-level
-//! documentation for the fallback each return type takes and for why
-//! containment is a safety net rather than an error-handling strategy.
+//! Every exported entry point routes its body through exactly one of the four
+//! functions here. That is the rule for all 100 names in `lib/libcurl.def`;
+//! measured today, 24 of the 100 are defined and every one of those 24 obeys
+//! it, with the remaining 76 unwritten. The rule is stated as a rule rather
+//! than as an accomplished fact because a future export that skipped this
+//! module would be a defect, and a comment claiming completeness would hide
+//! it. See the crate-level documentation for the fallback each return type
+//! takes and for why containment is a safety net rather than an
+//! error-handling strategy.
 //!
 //! # Why every item here carries its own `dead_code` allowance
 //!

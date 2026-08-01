@@ -70,13 +70,22 @@
 # Naming the targets - rather than leaving the list empty and auditing the host
 # only - has two measured consequences that matter:
 #
-#   * It prunes crates that are unreachable on all four. The full,
-#     all-platform graph contains 21 crate names at more than one version; 14
-#     of those are the windows-* family (windows-core, -implement, -link,
-#     -strings, -sys, -targets and the eight windows_<arch>_<abi> leaves), and
-#     every one of them disappears under this filter. Without it, the
-#     duplicate check would report fourteen duplicates that no build of this
-#     workspace can ever contain.
+#   * It prunes crates that are unreachable on all four. Measured against the
+#     committed lock (320 packages), the full all-platform graph contains 22
+#     crate names at more than one version. 14 are the windows-* family
+#     (windows-core, -implement, -link, -strings, -sys, -targets and the eight
+#     windows_<arch>_<abi> leaves) and a fifteenth is `wasi`, at both
+#     0.11.1+wasi-snapshot-preview1 and 0.14.0+wasi-0.2.3; all fifteen are
+#     reachable only under cfg(windows) or a wasm target and every one of them
+#     disappears under this filter. Without it the duplicate check would report
+#     fifteen duplicates that no build of this workspace can ever contain.
+#
+#     What remains under the filter is exactly 7, and they are the ones the
+#     `skip` list below reasons about: getrandom, rand, rand_chacha, rand_core,
+#     syn, thiserror and thiserror-impl. Per-target package counts are 258
+#     (x86_64 linux), 257 (aarch64 linux), 261 (x86_64 darwin) and 260 (aarch64
+#     darwin), for a union of 262 - so the filter also removes 58 packages that
+#     no mandated target builds.
 #   * It is what keeps the `schannel` ban below inert. schannel 0.1.29 is
 #     reachable in the all-platform graph through rustls-native-certs under
 #     cfg(windows). It is reachable on none of these four triples, so the ban
@@ -160,7 +169,7 @@ yanked = "deny"
 #
 # The documented middle option is "workspace", which limits the check to crates
 # the workspace depends on directly. That was measured against this graph and
-# rejected: "all" - the strictest scope, covering all 328 resolved packages -
+# rejected: "all" - the strictest scope, covering all 320 resolved packages -
 # already passes with zero findings, so the weaker scope would buy nothing today
 # and would hide an unmaintained transitive crate tomorrow. A transitive
 # dependency that stops being maintained is exactly as unfixable as a direct one
@@ -204,9 +213,20 @@ unmaintained = "all"
 #   3 x HIGH (CVSS 7.5) + 1 x MEDIUM (CVSS 5.9), ZERO CRITICAL.
 #
 # All four are denial-of-service, resource-exhaustion or side-channel findings.
-# None is a critical advisory, so the gate is satisfied by the graph itself and
-# not by this list. All four are reached unconditionally and are in every
-# artifact, so none of them is excused by a feature gate.
+# None is a critical advisory, so AAP section 0.8.4 gate 9 - "cargo audit with
+# zero CRITICAL advisories" - is satisfied by the graph itself and not by this
+# list.
+#
+# Their reachability needs stating precisely, because "behind a feature" reads
+# as "not shipped" and here it is the opposite. Each of the four sits behind
+# either `http3` or `ssh`, and AAP section 0.5.2 puts BOTH of those in the
+# default feature set. So every default build carries all four, and the only
+# configuration that escapes them is one that explicitly switches off two
+# mandated protocols - which is a diagnostic measurement, not a shippable
+# posture. That measurement is taken and asserted: rust-audit.yml proves the
+# graph without `ssh` and `http3` is advisory-free, which is what localises
+# every entry to an optional protocol surface without pretending the default
+# artifact is clean.
 #
 # A fifth and sixth entry were carried here at one point, for RUSTSEC-2026-0118
 # and RUSTSEC-2026-0119 against hickory-proto 0.25.2, and both have been REMOVED
@@ -218,9 +238,17 @@ unmaintained = "all"
 # The alternative - hickory-proto >= 0.26.1, which carries the fix - arrives only
 # with hickory-resolver 0.26.x at rust-version 1.88 and breaches the mandated
 # 1.75 floor. Growing the accepted set to buy a default-off convenience inverts
-# the priority of continuous supply-chain hygiene, so the feature name is
-# reserved and enabling it is a build failure instead. See the DNS section of the
-# root Cargo.toml for the full option space.
+# the priority of continuous supply-chain hygiene, so NO RESOLVER CRATE IS
+# PINNED AT ALL. The `hickory-dns` feature name stays DECLARED and default-off,
+# it builds, and it advertises nothing: the resolver token is withheld by the
+# capability registry (`hickory-dns` configured AND the engine resolver present,
+# and the engine resolver is absent), not by a build failure. Making the
+# feature a hard `compile_error!` instead is ruled out: it would turn a
+# declared feature into an unbuildable one, make `--all-features` impossible
+# for a workspace whose own [graph] section sets all-features = true, and leave
+# rust-audit.yml asserting a graph shape that could never be produced. See the
+# DNS section of the root Cargo.toml for the
+# full option space.
 #
 # The supply-chain decision these entries descend from is worth stating plainly,
 # because it explains why three of them cannot simply be upgraded away. The
@@ -252,6 +280,72 @@ unmaintained = "all"
 # "upgrade to fix the advisory" would break a compliance property that holds
 # today. Neither blocker is a policy-file decision; both belong to whoever owns
 # the MSRV.
+#
+# ESCALATION -- A THREE-WAY REQUIREMENTS CONFLICT THIS FILE CANNOT SETTLE
+#
+# The paragraphs above record measurements. This one records a conflict, in the
+# same shape and for the same reason as AAP section 0.8.6 ambiguities A4 and A7:
+# three requirements are each individually mandatory, any two of them can be
+# satisfied together, and all three cannot. A policy file must not pick a winner
+# among requirements, so the conflict is written down here rather than resolved
+# by quietly weakening one of them.
+#
+#   R1  AAP 0.8.3, preserved verbatim: "Rust edition 2021, MSRV 1.75." AAP
+#       0.8.1 freezes the contract, so the floor is not a target to drift off.
+#   R2  AAP 0.5.2: `http3` and `ssh` are in the DEFAULT feature set. The
+#       dependency inventory in AAP 0.5.1 names quinn and russh outright, so
+#       neither the crates nor their default-on status is discretionary here.
+#   R3  Zero known vulnerabilities on the default surface. Note carefully that
+#       this is NOT what AAP 0.8.4 gate 9 says. Gate 9 says "cargo audit with
+#       zero CRITICAL advisories", and that gate PASSES today: the set is
+#       3 x HIGH + 1 x MEDIUM, zero critical. R3 is a stricter bar imposed on
+#       top of the gate, and it is a reasonable bar - it is simply not the one
+#       the AAP wrote.
+#
+# WHY THEY CANNOT ALL HOLD, measured on this tree rather than argued:
+#
+#   * Fixing RUSTSEC-2026-0185 requires quinn-proto >= 0.11.15. Read from the
+#     vendored .crate manifests: 0.11.14 declares rust-version 1.74.1, 0.11.15
+#     declares 1.85, 0.11.16 declares 1.85 and additionally moves to rand 0.10
+#     / rand_pcg 0.10, which collides with the rand 0.8.7 pin that russh's
+#     `rand ^0.8` requires. Fix violates R1.
+#   * Fixing RUSTSEC-2026-0153 and -0154 requires russh >= 0.60.3, which
+#     declares rust-version 1.85 and carries 17 pre-release requirements. Fix
+#     violates R1, and independently violates the stable-graph posture the
+#     dependency selection was chosen for.
+#   * RUSTSEC-2023-0071 against rsa 0.9.10 has `patched = []` in the advisory
+#     database. There is NO fixed release at any MSRV, so no choice of floor
+#     retires it; only rsa 0.10 stable plus a russh that depends on it will.
+#   * Dropping `http3` and `ssh` removes all four. That violates R2.
+#   * R1 is not merely declared, it is exercised: `cargo +1.75.0 build
+#     --workspace --offline --locked` exits 0 on this tree. Raising the floor
+#     to 1.85 would discard a property that currently holds and is tested.
+#
+# THE OPTION SPACE, stated so the decision is a choice and not a discovery:
+#
+#   1. Raise the MSRV to 1.85 (relaxing R1). Retires RUSTSEC-2026-0185 and both
+#      russh advisories once a stable russh >= 0.60.3 exists; leaves
+#      RUSTSEC-2023-0071 open regardless, because it has no patched release.
+#   2. Move `http3` and `ssh` out of the default feature set (relaxing R2).
+#      Makes the DEFAULT artifact advisory-free - already measured and asserted
+#      by rust-audit.yml - while any build that enables either protocol carries
+#      the same four findings. This trades a real capability for a clean
+#      default and contradicts AAP 0.5.2 as written.
+#   3. Accept the four advisories as the reviewed, bounded, self-expiring set
+#      recorded below (relaxing R3 to the AAP's own gate-9 wording). This is
+#      the CURRENT STATE, and it is the only one of the three that breaches no
+#      AAP clause - which is why it is what the file does today, per the
+#      precedence rule that an explicit AAP requirement outranks a
+#      recommendation that conflicts with it.
+#
+# THE DECISION BELONGS TO WHOEVER SET THE REQUIREMENTS, NOT TO THIS FILE, and
+# option 3 is a holding position rather than an endorsement. What this file
+# guarantees in the meantime is that the position cannot rot: the set is closed,
+# every entry is self-expiring in both directions, and rust-audit.yml fails the
+# gate the moment any of these becomes fixable within the floor - see the
+# `check_msrv_trigger` mechanism there, which is armed on exactly the 1.85
+# threshold named above. If option 1 or option 2 is chosen, the corresponding
+# entries below are to be DELETED, not re-justified.
 #
 # NOTHING HERE IS SILENTLY ACCEPTED. .github/workflows/rust-audit.yml runs
 # `cargo audit` a second time with these ignores disabled and asserts that the
@@ -392,16 +486,16 @@ ignore = [
   # disqualifying:
   #
   #   1. Release-candidate cryptography. russh 0.60.3 carries SEVENTEEN
-  #      pre-release version requirements, not the three an earlier revision of
-  #      this comment named: aead 0.6.0-rc.10, aes-gcm 0.11.0-rc.3,
+  #      pre-release version requirements: aead 0.6.0-rc.10,
+  #      aes-gcm 0.11.0-rc.3,
   #      crypto-bigint 0.7.0-rc.28, curve25519-dalek 5.0.0-pre.6,
   #      ecdsa 0.17.0-rc.16, ed25519-dalek 3.0.0-pre.6,
   #      elliptic-curve 0.14.0-rc.28, ml-kem 0.3.0-rc.1, p256/p384/p521
   #      0.14.0-rc.7, pkcs1 0.8.0-rc.4, pkcs5 0.8.0-rc.13, pkcs8 0.11.0-rc.11,
   #      rsa 0.10.0-rc.16, signature 3.0.0-rc.10 and spki 0.8.0-rc.4. That is
   #      the entire SSH cryptographic stack on unaudited pre-release code. The
-  #      three names that earlier revision listed - rsa 0.10.0-rc.18,
-  #      ssh-key 0.7.0-rc.11, pkcs1 0.8.0-rc.4 - are 0.62.4's requirements, and
+  #      requirement set is version-specific: rsa 0.10.0-rc.18,
+  #      ssh-key 0.7.0-rc.11 and pkcs1 0.8.0-rc.4 are 0.62.4's, and
   #      0.58.0 has three of its own (pkcs1 0.8.0-rc.4, rand_core 0.10.0-rc-3,
   #      rsa 0.10.0-rc.10), so no member of the 0.58.0-0.62.4 band escapes the
   #      property.
@@ -489,7 +583,7 @@ version = 2
 # an unexamined licence fails the gate, which is the point.
 #
 # This list is EMPIRICALLY MINIMAL. It was not guessed and it is not padded: it
-# is the smallest set that satisfies all 328 resolved packages, derived by
+# is the smallest set that satisfies all 320 resolved packages, derived by
 # running `cargo deny list` and `cargo deny check licenses` against the
 # committed Cargo.lock. cargo-deny reports `warning[license-not-encountered]`
 # for any allowance that never matched, so a padded list is detectable - and
@@ -578,7 +672,7 @@ allow = [
 # licence FILE must match canonical SPDX text when there is no usable `license`
 # field to read.
 #
-# It is neither raised nor lowered because it does not currently matter: all 328
+# It is neither raised nor lowered because it does not currently matter: all 320
 # resolved packages declare a machine-readable licence expression, none is
 # unlicensed, and no crate in this graph falls back to text detection. Raising
 # it would risk failing on a correctly-licensed crate whose LICENSE file carries
@@ -712,7 +806,7 @@ workspace-default-features = "allow"
 external-default-features = "allow"
 
 # No allow-list. This is a deny-list policy: crates are permitted unless named
-# below, which is the correct posture for a graph of 328 packages where the
+# below, which is the correct posture for a graph of 320 packages where the
 # licence and advisory checks already gate what may enter.
 allow = []
 
@@ -861,6 +955,32 @@ deny = [
   # a no-op by confirming that `digest:>=0.10.0` does fire against digest
   # 0.10.7.
   { crate = "digest:>=0.11.0", reason = "The RustCrypto stack must stay on one digest generation. The adopted set is coherent on digest 0.10 (0.10.7 resolved); mixing 0.10 and 0.11 breaks trait unification so that Hmac<Sha1> will not compile. Raise this bound only when every RustCrypto dependency has been moved to the newer generation together." },
+
+  # -- Crates whose only cost is DIFFERENT BYTES ON THE WIRE -----------------
+  #
+  # Everything above is banned for a structural reason: a C library, a second
+  # cryptographic provider, a circular dependency, a broken trait bound. This
+  # entry is banned for a behavioural one, and it is the harder kind to catch,
+  # because the crate is pure Rust, adds no C toolchain requirement, carries no
+  # advisory and would compile perfectly. It is the crate-level counterpart of
+  # the `prefer-post-quantum` feature ban below.
+  #
+  # curl's content-type inference is `ctts[]` at lib/mime.c:1629-1640: exactly
+  # ten extensions - .gif, .jpg, .jpeg, .png, .svg, .txt, .htm, .html, .pdf,
+  # .xml - and application/octet-stream for everything else. Any general-purpose
+  # MIME database is larger, so it answers where curl 8.x answers
+  # application/octet-stream, emitting a Content-Type header curl never emits.
+  # AAP 0.8.1 freezes those bytes; AAP 0.6.7 compares them byte-exactly and
+  # order-significantly across 1,476 fixtures. A ten-row native table is the
+  # only behaviour-preserving implementation, and it needs no dependency.
+  #
+  # AAP 0.5.1's inventory does name mime_guess 2.0.5, so this ban is a deliberate
+  # departure from the inventory in favour of the preservation mandate that
+  # outranks it, and the root Cargo.toml records the full reasoning next to the
+  # omitted pin. Inert today - the crate is in no graph at any feature setting -
+  # exactly like the schannel entry above.
+  { crate = "mime_guess", reason = "General-purpose MIME database. curl's inference table is the ten-entry ctts[] at lib/mime.c:1629-1640 with an application/octet-stream fallback; a larger database answers where curl 8.x answers octet-stream and emits Content-Type bytes curl never emits, breaking the wire freeze of AAP 0.8.1 against the byte-exact fixture comparison of AAP 0.6.7. The behaviour belongs to a native ten-row table in curl-rs-lib/src/mime/mod.rs. AAP 0.5.1 names the crate in its inventory; this ban departs from the inventory in favour of the preservation mandate, and the root Cargo.toml records why beside the omitted pin." },
+  { crate = "mime", reason = "The MIME type vocabulary crate mime_guess is built on, banned alongside it so the same divergence cannot be reintroduced one level down. Nothing in this workspace needs a MIME type model: the only content-type decision curl makes is the ten-row ctts[] lookup described in the mime_guess entry above." },
 ]
 
 # Accepted duplicate versions

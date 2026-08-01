@@ -86,12 +86,12 @@
 #                                the matrix below does compile and interpret
 #                                it.
 #
-# THAT SECOND LEG IS NEW, AND AN EARLIER VERSION OF THIS FILE ARGUED IT WAS
-# IMPOSSIBLE. The argument was that GSS-API is a foreign C library, that Miri
-# cannot execute a foreign function, and that such a leg would therefore fail
-# on an unsupported operation rather than on undefined behaviour - a red cross
-# meaning nothing about UB. The argument was sound about Miri and wrong about
-# this crate, because it assumed the tests reach the real library. They do not.
+# THAT SECOND LEG LOOKS IMPOSSIBLE, AND IS NOT. The argument against it is that
+# GSS-API is a foreign C library, that Miri cannot execute a foreign function,
+# and that such a leg would therefore fail on an unsupported operation rather
+# than on undefined behaviour - a red cross meaning nothing about UB. That
+# argument is sound about Miri and wrong about this crate, because it assumes
+# the tests reach the real library. They do not.
 # src/ffi/gss.rs routes every `gss_*` call through the same injection seam that
 # src/ffi/sys.rs uses, its tests drive a pure-Rust double rather than MIT
 # Kerberos, and its capability probe short-circuits to `false` under
@@ -105,20 +105,15 @@
 # that removed the seam or the `#[cfg(miri)]` probe would reopen it while this
 # leg went red for exactly the reason the old comment predicted.
 #
-# `--all-features` is still wrong, and for a now-definitive reason:
-# `hickory-dns` is a reserved feature name that no
-# crate can back - every resolver release satisfying the workspace MSRV
-# requires a `hickory-proto` affected by RUSTSEC-2026-0119, and every release
-# carrying the fix declares `rust-version 1.88` - so enabling it raises a
-# deliberate `compile_error!` in curl-rs-lib/src/lib.rs. Under
-# `--all-features` this gate would fail before Miri ever ran, reporting a
-# feature-set error wearing an undefined-behaviour gate's name. Where a
-# broader feature set is genuinely wanted, enumerate the fourteen
-# implementable features rather than passing `--all-features`; Cargo has no
-# "all except one" selector. That is exactly what the second matrix leg does,
-# and the list it carries is character-for-character the one in
-# rust-build.yml, rust-clippy.yml and rust-audit.yml so the four can be diffed
-# against one another. Two legs, both honestly scoped.
+# `--all-features` IS admissible for this workspace - `hickory-dns` is a
+# declared name with no crate behind it, but it builds and advertises nothing -
+# and rust-build.yml, rust-clippy.yml and rust-test.yml all pass it. This file
+# still enumerates instead, for a reason of its own rather than a workspace
+# limitation: the second matrix leg's value is that it covers a KNOWN set, so a
+# future narrowing of `default = [...]` in curl-rs-lib/Cargo.toml shows up as a
+# diff here rather than silently shrinking what Miri interprets. The list is
+# therefore the complete fifteen and equal to `--all-features` today, kept
+# explicit on purpose. Two legs, both honestly scoped.
 #
 # NOT `-p curl-rs-ffi`. That crate's unsafe surface is the C boundary itself:
 # `Box::into_raw` in curl_easy_init paired with `Box::from_raw` in
@@ -134,17 +129,19 @@
 # a call that starts in C - rather than on a gap.
 #
 # A CONSEQUENCE OF THAT SCOPE, recorded so it is not mistaken for an omission:
-# this file deliberately does NOT set CURL_RS_A4_VARIADIC_DECISION, which
-# rust-build.yml and rust-clippy.yml both do. That variable is read by
-# curl-rs-ffi/build.rs, and `-p curl-rs-lib` never builds curl-rs-ffi, so
-# setting it here would be a declaration with nothing to read it. Measured, so
-# that the reasoning is checkable rather than assumed: the value is inert on
-# x86_64 and aarch64 Linux and on x86_64 macOS - the script exits 0 and emits
-# no advisory whether it is set, unset or misspelled - and is required only on
-# aarch64-apple-darwin, which this single-host job never targets. If anybody
-# ever widens this gate to `-p curl-rs-ffi`, that variable becomes mandatory
-# and its absence will present as a hard build-script error rather than as a
-# missing environment value; the explanation is in rust-build.yml's env block.
+# this file sets no CURL_RS_A4_VARIADIC_DECISION. No workflow in this repository
+# does - specification 0.8.6 escalates A4 to whoever set the requirements, and
+# rust-build.yml's env block enumerates the three options - but this file has a
+# second, independent reason on top of that one. The variable is read by
+# curl-rs-ffi/build.rs, and `-p curl-rs-lib` never builds curl-rs-ffi, so even
+# were a decision on record it would be a declaration here with nothing to read
+# it. Measured, so that the reasoning is checkable rather than assumed: the value
+# is inert on x86_64 and aarch64 Linux and on x86_64 macOS - the script exits 0
+# and emits no advisory whether it is set, unset or misspelled - and is consulted
+# only on aarch64-apple-darwin, which this single-host job never targets. If
+# anybody ever widens this gate to `-p curl-rs-ffi` AND runs it on Apple arm64,
+# the build script will refuse rather than lint; that refusal is deliberate and
+# its explanation is in rust-build.yml's env block.
 #
 # NOT `-p curl-rs` either. The binary crate escalates `unsafe_code` at its
 # root with no `ffi` module and therefore no exemption, so there is no unsafe
@@ -431,17 +428,20 @@ jobs:
           - label: 'default features'
             features: ''
 
-          # The fourteen implementable features. Twelve of them are already the
-          # default set, so what this leg adds is exactly the two that are
-          # default-off: `negotiate`, which compiles and interprets
-          # src/ffi/gss.rs, src/auth/negotiate.rs and src/proxy/socks_gss.rs,
-          # and `memdebug`, which installs a counting `#[global_allocator]` -
-          # a global allocator being precisely the kind of code an interpreter
-          # is worth pointing at. Written out in full rather than as the two
-          # additions, so that a change to `default = [...]` in
-          # curl-rs-lib/Cargo.toml cannot silently narrow what this leg covers.
-          - label: 'fourteen features'
-            features: 'altsvc,brotli,cookies,doh,ftp,gzip,hsts,http2,http3,ssh,websockets,zstd,negotiate,memdebug'
+          # All fifteen declared features, which is `--all-features` written out.
+          # Twelve are already the default set, so what this leg adds is the
+          # three that are default-off: `negotiate`, which compiles and
+          # interprets src/ffi/gss.rs, src/auth/negotiate.rs and
+          # src/proxy/socks_gss.rs; `memdebug`, which installs a counting
+          # `#[global_allocator]` - a global allocator being precisely the kind
+          # of code an interpreter is worth pointing at; and `hickory-dns`,
+          # which has no crate behind it and compiles to nothing observable, and
+          # is named here only so this list is provably the whole vocabulary.
+          # Written out in full rather than as `--all-features` so that a change
+          # to `default = [...]` in curl-rs-lib/Cargo.toml cannot silently
+          # narrow what this leg covers.
+          - label: 'all declared features'
+            features: 'altsvc,brotli,cookies,doh,ftp,gzip,hsts,http2,http3,ssh,websockets,zstd,negotiate,memdebug,hickory-dns'
 
     #
     # 60 minutes, chosen by arithmetic rather than copied, and deliberately
@@ -653,7 +653,7 @@ jobs:
               ;;
           esac
 
-          # THE PIN ASSERTION, and it is the whole point of M-11's fix. The two
+          # THE PIN ASSERTION, and it is the whole point of the pin. The two
           # checks above would both pass on the moving `nightly` channel, so
           # neither of them can tell whether this run is reproducible. This one
           # can: rustc and cargo-miri each stamp their build DATE into the
@@ -822,9 +822,9 @@ jobs:
           #
           # THE FEATURE SET COMES FROM THE MATRIX, and the two legs differ in
           # nothing else. The default leg passes no --features at all, which is
-          # gate 5 exactly as specified; the second passes the fourteen
-          # implementable names, which is what brings src/ffi/gss.rs and the
-          # `memdebug` global allocator under interpretation. The argument is
+          # gate 5 exactly as specified; the second passes all fifteen declared
+          # names, which is what brings src/ffi/gss.rs and the `memdebug` global
+          # allocator under interpretation. The argument is
           # built as a variable rather than written twice so that the command
           # line cannot drift between legs.
           log="${RUNNER_TEMP}/miri-test.log"
@@ -967,7 +967,7 @@ jobs:
             echo '     this reason is one that deliberately reaches past that seam to the real call.'
             echo '     Note that gss_init_sec_context(3) is NOT in this family: src/ffi/gss.rs uses'
             echo '     the same seam and its capability probe short-circuits under cfg(miri), which is'
-            echo '     why the fourteen-feature leg interprets that module instead of skipping it.'
+            echo '     why the all-declared-features leg interprets that module instead of skipping it.'
             echo '  2. MIRI ISOLATION, which refuses mkdir(2), and therefore refuses tempfile. The'
             echo '     SSLKEYLOGFILE tests in src/tls/keylog.rs need a real scratch directory to'
             echo '     create, reopen, symlink and chmod a secret file, and four of them are'
@@ -994,7 +994,7 @@ jobs:
             echo 'REACHED     the memdebug counting global allocator, likewise default-off.'
           else
             echo 'NOT REACHED curl-rs-lib/src/ffi/gss.rs, which is behind the default-off negotiate'
-            echo '            feature and was not compiled by this run. The fourteen-feature leg of'
+            echo '            feature and was not compiled by this run. The all-declared-features leg of'
             echo '            this matrix covers it; this leg makes no statement about it.'
             echo 'NOT REACHED the memdebug global allocator, likewise default-off and likewise covered'
             echo '            by the other leg.'

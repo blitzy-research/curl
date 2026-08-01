@@ -152,7 +152,7 @@
 use std::ffi::OsStr;
 use std::fmt::{self, Write as FmtWrite};
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::terminal::get_terminal_columns;
 
@@ -352,6 +352,84 @@ impl Write for MessageSink {
     }
 }
 
+/// A diagnostic destination that knows whether its bytes will be interpreted.
+///
+/// This exists for one decision: whether [`write_neutralised`] replaces the
+/// display-affecting control bytes of an attacker-influenced fragment. The
+/// engine's [`curl_rs_lib::escape_control_bytes`] states the rule it must be
+/// used under -- "only for a destination whose bytes are interpreted", because
+/// "a redirected file must stay byte-faithful so its contents can be diffed or
+/// replayed against the C tool" -- and a bare `&mut dyn Write` cannot be asked
+/// the question. This trait is what makes it answerable.
+///
+/// # Why a trait rather than a flag
+///
+/// A flag threaded through [`MsgConfig`] would make the protection opt-in at
+/// every call site, and a protection that must be remembered is one that will
+/// be forgotten. A trait moves the answer to the only code that can know it --
+/// whatever wraps the descriptor -- and leaves the 28 call sites outside this
+/// module unchanged in shape.
+///
+/// This mirrors `curl_rs_lib::trace::TraceSink::is_terminal`, which the engine
+/// already uses for exactly this purpose on the trace path. Following it rather
+/// than inventing a second shape means the two neutralization decisions in the
+/// workspace are made the same way. The name is a code span rather than a link
+/// because `trace` is `pub(crate)` in the engine -- deliberately, since a trace
+/// sink is not something an adapter may construct -- so there is no public path
+/// for rustdoc to resolve.
+///
+/// # Why the default is `false`
+///
+/// An unlabelled sink is treated as a file, so the safe-for-parity answer is
+/// the one a caller gets by saying nothing. Escaping is the deviation from C
+/// (`src/tool_msgs.c:62` writes these bytes through unaltered), so the
+/// deviation has to be asked for. The direction is deliberate and matches the
+/// engine's reasoning verbatim: the cost of wrongly escaping is a corrupted
+/// byte-frozen file, while the cost of wrongly not escaping is a control byte
+/// reaching something that was never going to interpret it.
+pub(crate) trait DiagnosticSink: Write {
+    /// Whether bytes written here reach something that interprets control
+    /// sequences.
+    fn interprets_controls(&self) -> bool {
+        false
+    }
+}
+
+impl DiagnosticSink for MessageSink {
+    /// Answered from the descriptor itself, not from a stored flag.
+    ///
+    /// [`std::io::IsTerminal`] is asked on each of the three variants, so a
+    /// `--stderr <file>` that happens to name a terminal device reports `true`
+    /// and a redirected standard error reports `false`. Recomputing rather than
+    /// caching costs an `isatty` per emitted diagnostic -- diagnostics are rare
+    /// and already syscall-bound -- and removes any way for a cached answer to
+    /// outlive the descriptor it described, which [`set_stderr_file`] would
+    /// otherwise have to keep in step.
+    fn interprets_controls(&self) -> bool {
+        match self {
+            Self::Stderr(sink) => sink.is_terminal(),
+            Self::Stdout(sink) => sink.is_terminal(),
+            Self::File(sink) => sink.is_terminal(),
+        }
+    }
+}
+
+/// The byte-faithful sink every test uses, and the reason the default matters.
+///
+/// A `Vec<u8>` is not a terminal, so it takes [`DiagnosticSink`]'s default and
+/// receives raw bytes. That is what lets a test assert on exactly the bytes C
+/// would have written.
+impl DiagnosticSink for Vec<u8> {}
+
+/// Forwarding so that a `&mut dyn DiagnosticSink` can be reborrowed and passed
+/// on, which is how [`crate::output::formparse`] hands its stored sink to the
+/// entry points here.
+impl<T: DiagnosticSink + ?Sized> DiagnosticSink for &mut T {
+    fn interprets_controls(&self) -> bool {
+        (**self).interprets_controls()
+    }
+}
+
 /// The `char buffer[1024]` of `src/tool_msgs.c:41`, with `addbyter`'s
 /// refuse-when-full behaviour built in.
 ///
@@ -457,7 +535,7 @@ const fn is_blank(byte: u8) -> bool {
 /// that branch is taken only while `rest.len() > width`, so at least one byte
 /// is consumed and the remainder stays non-empty until the final branch runs.
 fn voutf_bytes_at_width(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     prefix: &str,
     message: &[u8],
     termw: usize,
@@ -536,41 +614,60 @@ fn voutf_bytes_at_width(
 /// untouched, so a UTF-8 or Latin-1 path reaches the terminal intact. One byte in
 /// is one byte out, which is what keeps the wrapping accounting exact.
 ///
-/// # Why every destination, and not only a terminal
+/// # Only for a destination whose bytes are interpreted
 ///
-/// The narrower rule would be to escape when the sink is a terminal and stay
-/// byte-faithful to a redirected file. It is not available here, and the reason
-/// is structural rather than a preference: the four public entry points take
-/// `&mut dyn Write`, which cannot be asked whether it is a terminal, and
-/// [`MessageSink`] -- the one type in this module that could answer -- is not
-/// what they receive. Threading a flag through [`MsgConfig`] would make the
-/// protection opt-in at 190-odd call sites, and a protection that must be
-/// remembered is one that will be forgotten. `curl-rs-lib/src/tls/cipher_suite.rs`
-/// took the same decision for the same reason.
+/// The fragment is neutralised when, and only when, the sink says its bytes
+/// reach something that interprets them -- see
+/// [`DiagnosticSink::interprets_controls`]. A redirected standard error, a
+/// `--stderr <file>`, and every sink a test supplies all take the raw bytes, so
+/// a byte-frozen diagnostic stays byte-identical to C's.
 ///
-/// # Why it is safe to diverge from C here
+/// That split is the engine's own instruction rather than a local preference.
+/// [`curl_rs_lib::escape_control_bytes`] carries a "when NOT to call it"
+/// section: "only for a destination whose bytes are interpreted. A redirected
+/// file must stay byte-faithful so its contents can be diffed or replayed
+/// against the C tool, and neutralizing there would be a behaviour change with
+/// no security benefit. Decide on the destination first." Escaping
+/// unconditionally on the grounds that the narrower rule is "not available
+/// here" -- because a `&mut dyn Write` cannot be asked the question -- gets
+/// that destination rule wrong. The answer is to make it askable:
+/// [`DiagnosticSink`] is that change, and it is modelled on the
+/// `curl_rs_lib::trace::TraceSink::is_terminal` the engine already uses for the
+/// same decision on the trace path.
 ///
-/// C writes these bytes through unaltered (`src/tool_msgs.c:62`), so this is a
-/// deliberate divergence, and it was measured before it was taken. All 1,914
+/// # Why it is safe to diverge from C for the terminal case
+///
+/// C writes these bytes through unaltered (`src/tool_msgs.c:62`), so escaping is
+/// a deliberate divergence, and it was measured before it was taken. All 1,914
 /// fixtures under `tests/data/` contain 44 `<stderr>` blocks between them, and
 /// **not one contains a control byte other than the line feeds that separate its
-/// lines**, so escaping is a no-op across the entire corpus. AAP section 0.6.7's
-/// oracle compares the bytes the client *sends*, and diagnostics are not part of
-/// that comparison.
+/// lines**, so escaping would be a no-op across the entire corpus even if a
+/// fixture's sink were a terminal -- which it is not, since the harness
+/// redirects. AAP section 0.6.7's oracle compares the bytes the client *sends*,
+/// and diagnostics are not part of that comparison. Gating on the destination
+/// therefore removes the last way this could have perturbed a comparison, and
+/// keeps the protection where it does something.
 ///
 /// What it stops is real: a diagnostic that interpolates a value from `argv` --
 /// `src/tool_formparse.c:877`'s "garbage at end of field specification: %s"
 /// reports the remainder of the user's argument verbatim -- would otherwise let
 /// an embedded line feed forge a whole additional `curl: ...` line on the
 /// terminal, and an embedded escape byte drive the terminal's control sequences.
-fn write_neutralised(sink: &mut dyn Write, fragment: &[u8]) -> io::Result<()> {
-    sink.write_all(&curl_rs_lib::escape_control_bytes(fragment))
+fn write_neutralised(
+    sink: &mut dyn DiagnosticSink,
+    fragment: &[u8],
+) -> io::Result<()> {
+    if sink.interprets_controls() {
+        sink.write_all(&curl_rs_lib::escape_control_bytes(fragment))
+    } else {
+        sink.write_all(fragment)
+    }
 }
 
 /// [`voutf_bytes_at_width`] with the width taken from the terminal, as
 /// `src/tool_msgs.c:42` does.
 fn voutf_bytes(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     prefix: &str,
     message: &[u8],
 ) -> io::Result<()> {
@@ -588,7 +685,7 @@ fn voutf_bytes(
 /// C string -- so a failure is ignored and whatever was rendered is emitted,
 /// which is also the more useful behaviour for a diagnostic channel.
 fn voutf(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     prefix: &str,
     args: fmt::Arguments<'_>,
 ) -> io::Result<()> {
@@ -644,7 +741,7 @@ fn voutf(
 /// [`MSG_TEXT_CAPACITY`].
 #[allow(dead_code)]
 pub(crate) fn notef(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
     args: fmt::Arguments<'_>,
 ) {
@@ -669,7 +766,7 @@ pub(crate) fn notef(
 /// [`MSG_TEXT_CAPACITY`].
 #[allow(dead_code)]
 pub(crate) fn warnf(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
     args: fmt::Arguments<'_>,
 ) {
@@ -693,7 +790,7 @@ pub(crate) fn warnf(
 /// `!silent` gate, same wrapping, same [`MSG_TEXT_CAPACITY`] truncation.
 #[allow(dead_code)]
 pub(crate) fn warnf_bytes(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
     message: &[u8],
 ) {
@@ -726,14 +823,17 @@ pub(crate) fn warnf_bytes(
 ///
 /// The try-line itself is [`ERROR_PREFIX`] followed by [`HELP_TRY_TAIL`],
 /// which reproduces `:118-122` including the `or 'curl --manual' ` fragment.
-pub(crate) fn helpf(sink: &mut dyn Write, args: Option<fmt::Arguments<'_>>) {
+pub(crate) fn helpf(
+    sink: &mut dyn DiagnosticSink,
+    args: Option<fmt::Arguments<'_>>,
+) {
     let _ = helpf_into(sink, args);
 }
 
 /// The fallible core of [`helpf`], separated so the tests can assert that both
 /// halves are written and that a failure propagates instead of being retried.
 fn helpf_into(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     args: Option<fmt::Arguments<'_>>,
 ) -> io::Result<()> {
     // `:109` -- the message is emitted only when there is one.
@@ -783,7 +883,7 @@ fn helpf_into(
 /// The message is wrapped by [`voutf`] and truncated to
 /// [`MSG_TEXT_CAPACITY`].
 pub(crate) fn errorf(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
     args: fmt::Arguments<'_>,
 ) {
@@ -812,7 +912,7 @@ pub(crate) fn errorf(
 /// [`MSG_TEXT_CAPACITY`] truncation.
 #[allow(dead_code)]
 pub(crate) fn errorf_bytes(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
     message: &[u8],
 ) {
@@ -955,7 +1055,7 @@ pub(crate) fn errorf_bytes(
 /// No fixture is affected: `--insecure` has no warning in curl 8.19.0-DEV at
 /// all, so no expectation encodes its absence, and AAP section 0.6.7's oracle
 /// compares the bytes the client *sends* rather than its diagnostics.
-pub(crate) fn warn_insecure(sink: &mut dyn Write, option: &str) {
+pub(crate) fn warn_insecure(sink: &mut dyn DiagnosticSink, option: &str) {
     // No gate, by design -- see "Why it does not route through `warnf`" above.
     // The prefix, the wrapping and the `MSG_TEXT_CAPACITY` truncation are
     // `voutf`'s, so they stay identical to every other diagnostic.
@@ -1001,7 +1101,7 @@ pub(crate) fn warn_insecure(sink: &mut dyn Write, option: &str) {
 /// bits are clear: the three `if` statements are simply not taken, no
 /// `my_setopt_long` runs, and verification stays on.
 pub(crate) fn warn_insecure_flags(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     insecure: bool,
     doh_insecure: bool,
     proxy_insecure: bool,
@@ -1158,6 +1258,20 @@ mod tests {
         out
     }
 
+    /// [`wrap`] against a sink that reports itself as a terminal.
+    ///
+    /// The only difference is the answer to
+    /// [`DiagnosticSink::interprets_controls`], so a test that pairs this with
+    /// [`wrap`] isolates the neutralization decision from everything else: same
+    /// input, same wrapping arithmetic, one differing byte class.
+    fn wrap_on_terminal(prefix: &str, message: &str, termw: usize) -> Vec<u8> {
+        let mut sink = TerminalSink::default();
+        let result =
+            voutf_bytes_at_width(&mut sink, prefix, message.as_bytes(), termw);
+        assert!(result.is_ok(), "the wrapper must not fail on a Vec sink");
+        sink.bytes
+    }
+
     /// A message short enough that no reachable terminal width can wrap it.
     ///
     /// `get_terminal_columns` yields 79 or a value in `21..=10000`, so the
@@ -1269,7 +1383,7 @@ mod tests {
         // `voutf_bytes_at_width` computes every break position on the RAW bytes
         // and neutralises only what it then writes. This is the test that proves
         // the two halves of that claim at once: the break lands in the same place
-        // as the oracle's, and the tab reaches the terminal as `.` rather than as
+        // as the oracle's, and the tab reaches a TERMINAL as `.` rather than as
         // a cursor movement (see `write_neutralised`).
         let message =
             "Warning: Failed to open /nodir_zzz/aaaaaaaaaa\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1279,11 +1393,30 @@ mod tests {
             "Warning: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
         );
 
-        let out = wrap(WARN_PREFIX, message, ORACLE_TERMW_40);
+        let out = wrap_on_terminal(WARN_PREFIX, message, ORACLE_TERMW_40);
         assert_eq!(String::from_utf8_lossy(&out), expected);
         // Unchanged from the oracle's own line lengths: one byte in, one byte
         // out, so the wrapping is byte-for-byte what C produces.
         assert_eq!(body_lengths(&out, WARN_PREFIX), vec![24, 22, 30]);
+
+        // The other half of the destination rule, and the reason this test now
+        // runs twice: a sink that does NOT interpret its bytes keeps the tab
+        // exactly as C wrote it (`src/tool_msgs.c:62`). The break positions are
+        // computed on raw bytes either way, so the LINE STRUCTURE is identical
+        // and only that one byte differs -- which is what makes a redirected
+        // diagnostic byte-comparable against the C tool.
+        let redirected = wrap(WARN_PREFIX, message, ORACLE_TERMW_40);
+        assert_eq!(
+            String::from_utf8_lossy(&redirected),
+            expected.replace("aaaaaaaaaa.", "aaaaaaaaaa\t"),
+            "a non-terminal sink must receive the tab unaltered"
+        );
+        assert_eq!(
+            body_lengths(&redirected, WARN_PREFIX),
+            body_lengths(&out, WARN_PREFIX),
+            "neutralization is one byte in, one byte out, so it cannot move a \
+             break position"
+        );
     }
 
     #[test]
@@ -1439,17 +1572,30 @@ mod tests {
         // terminal as a line break, so it cannot forge an additional
         // `curl: ...` line. See `write_neutralised`.
         let value = "a\nb";
-        let mut out: Vec<u8> = Vec::new();
+        let mut out = TerminalSink::default();
         let outcome = voutf(&mut out, WARN_PREFIX, format_args!("{value}"));
         assert!(outcome.is_ok());
-        assert_eq!(String::from_utf8_lossy(&out), "Warning: a.b\n");
+        assert_eq!(String::from_utf8_lossy(&out.bytes), "Warning: a.b\n");
 
         // And the byte-oriented entry point, which has no format at all.
-        let mut bytes: Vec<u8> = Vec::new();
+        let mut bytes = TerminalSink::default();
         let outcome =
             voutf_bytes_at_width(&mut bytes, WARN_PREFIX, b"a\nb", 79);
         assert!(outcome.is_ok());
-        assert_eq!(String::from_utf8_lossy(&bytes), "Warning: a.b\n");
+        assert_eq!(String::from_utf8_lossy(&bytes.bytes), "Warning: a.b\n");
+
+        // Third property, and the one the destination rule adds: a sink whose
+        // bytes are not interpreted receives the newline through, exactly as C
+        // does. Nothing can forge a line on a destination that renders none.
+        let mut redirected: Vec<u8> = Vec::new();
+        let outcome =
+            voutf(&mut redirected, WARN_PREFIX, format_args!("{value}"));
+        assert!(outcome.is_ok());
+        assert_eq!(
+            String::from_utf8_lossy(&redirected),
+            "Warning: a\nb\n",
+            "a redirected diagnostic must stay byte-faithful to C"
+        );
     }
 
     #[test]
@@ -1459,7 +1605,7 @@ mod tests {
         // terminal as a second, independent diagnostic. Exactly one newline may
         // leave this function -- the one it appends itself.
         let hostile = "bad\ncurl: (0) everything is fine";
-        let mut out: Vec<u8> = Vec::new();
+        let mut out = TerminalSink::default();
         let outcome = voutf_bytes_at_width(
             &mut out,
             WARN_PREFIX,
@@ -1468,12 +1614,12 @@ mod tests {
         );
         assert!(outcome.is_ok());
         assert_eq!(
-            out.iter().filter(|byte| **byte == b'\n').count(),
+            out.bytes.iter().filter(|byte| **byte == b'\n').count(),
             1,
             "only the terminating newline may appear"
         );
         assert_eq!(
-            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&out.bytes),
             "Warning: bad.curl: (0) everything is fine\n"
         );
     }
@@ -1482,15 +1628,38 @@ mod tests {
     fn an_escape_byte_cannot_reach_the_terminal() {
         // The other half of the same vector: ESC would drive the terminal's
         // control sequences -- colours, cursor movement, or a title change.
-        let mut out: Vec<u8> = Vec::new();
+        let mut out = TerminalSink::default();
         let hostile: &[u8] = b"path\x1b[2Kgone\x07\x7f";
         let outcome =
             voutf_bytes_at_width(&mut out, WARN_PREFIX, hostile, usize::MAX);
         assert!(outcome.is_ok());
-        assert_eq!(String::from_utf8_lossy(&out), "Warning: path.[2Kgone..\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out.bytes),
+            "Warning: path.[2Kgone..\n"
+        );
         assert!(
-            !out.contains(&0x1b),
+            !out.bytes.contains(&0x1b),
             "no escape byte may survive the boundary"
+        );
+
+        // And the destination rule: a redirected sink keeps the ESC, because
+        // nothing there will act on it and AAP section 0.8.1 does not permit
+        // altering bytes C wrote through. The protection is where it protects,
+        // and absent where it would only corrupt.
+        let mut redirected: Vec<u8> = Vec::new();
+        let outcome = voutf_bytes_at_width(
+            &mut redirected,
+            WARN_PREFIX,
+            hostile,
+            usize::MAX,
+        );
+        assert!(outcome.is_ok());
+        let mut expected = WARN_PREFIX.as_bytes().to_vec();
+        expected.extend_from_slice(hostile);
+        expected.push(b'\n');
+        assert_eq!(
+            redirected, expected,
+            "a non-terminal sink must receive every byte unaltered"
         );
     }
 
@@ -1527,6 +1696,38 @@ mod tests {
         }
     }
 
+    /// Takes [`DiagnosticSink`]'s default, so its bytes are not interpreted.
+    /// What these tests assert is failure propagation, which is independent of
+    /// the neutralization decision.
+    impl DiagnosticSink for FailingSink {}
+
+    /// A capturing sink that claims to be a terminal.
+    ///
+    /// The counterpart of a bare `Vec<u8>`: same bytes captured, opposite answer
+    /// to [`DiagnosticSink::interprets_controls`]. Both branches of
+    /// [`write_neutralised`] are therefore reachable from a test without opening
+    /// a real terminal, which no test environment can rely on having.
+    #[derive(Default)]
+    struct TerminalSink {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for TerminalSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.bytes.flush()
+        }
+    }
+
+    impl DiagnosticSink for TerminalSink {
+        fn interprets_controls(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn a_write_failure_propagates_out_of_the_wrapper() {
         let long = "q".repeat(500);
@@ -1558,7 +1759,7 @@ mod tests {
     /// Emits through one entry point with the given gates and returns the
     /// bytes. Uses [`SHORT`], which no reachable width can wrap.
     fn emit(
-        entry: fn(&mut dyn Write, &MsgConfig, fmt::Arguments<'_>),
+        entry: fn(&mut dyn DiagnosticSink, &MsgConfig, fmt::Arguments<'_>),
         config: MsgConfig,
     ) -> String {
         let mut out: Vec<u8> = Vec::new();
@@ -1870,7 +2071,7 @@ mod tests {
         // so there is nothing for a caller to gate on. Coercing it to a
         // gateless function pointer is a compile-time proof of that, in the
         // same shape as helpf_ignores_every_gate above.
-        let ungated: fn(&mut dyn Write, &str) = warn_insecure;
+        let ungated: fn(&mut dyn DiagnosticSink, &str) = warn_insecure;
         let mut out: Vec<u8> = Vec::new();
         ungated(&mut out, "insecure");
         assert!(!out.is_empty());
@@ -2090,6 +2291,45 @@ mod tests {
 
         let written = std::fs::read(&path).expect("the redirected file");
         assert_eq!(String::from_utf8_lossy(&written), "curl: (37) oops\n");
+    }
+
+    #[test]
+    fn a_real_redirected_file_keeps_control_bytes_byte_for_byte() {
+        // Asserted against the PRODUCTION sink rather than
+        // a double. `--stderr <file>` names an ordinary file, so
+        // `MessageSink::interprets_controls` asks `IsTerminal` and gets `false`,
+        // and the diagnostic must land byte-identical to what C writes through
+        // at `src/tool_msgs.c:62`. This is the case an unconditional escape
+        // silently corrupted.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("diagnostics.txt");
+
+        let mut sink = MessageSink::init();
+        set_stderr_file(
+            &mut sink,
+            &MsgConfig::default(),
+            Some(path.as_os_str()),
+        );
+        assert!(matches!(sink, MessageSink::File(_)));
+        assert!(
+            !sink.interprets_controls(),
+            "a plain file is not a terminal, and the answer must come from the \
+             descriptor rather than from a stored flag"
+        );
+
+        let hostile: &[u8] = b"tab\there\x1bESC";
+        errorf_bytes(&mut sink, &MsgConfig::default(), hostile);
+        assert!(sink.flush().is_ok());
+        drop(sink);
+
+        let written = std::fs::read(&path).expect("the redirected file");
+        let mut expected = ERROR_PREFIX.as_bytes().to_vec();
+        expected.extend_from_slice(hostile);
+        expected.push(b'\n');
+        assert_eq!(
+            written, expected,
+            "every byte of a redirected diagnostic must survive unaltered"
+        );
     }
 
     #[test]

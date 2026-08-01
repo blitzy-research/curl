@@ -22,6 +22,11 @@
 
 //! `curlinfo` -- the build-capability diagnostic.
 //!
+//! Comments throughout this crate cite `AAP <section>` -- the frozen
+//! migration specification that this implementation is measured against.
+//! Its section numbers are stable, and a citation marks a decision the
+//! specification fixes rather than one this code is free to change.
+//!
 //! A faithful translation of `src/curlinfo.c` (271 lines), whose own purpose
 //! comment at :24-31 explains why the tool exists: "to figure out which, if
 //! any, features that are disabled which should otherwise exist and work.
@@ -131,12 +136,29 @@
 //!    for this build, and does the module that *honours* it exist -- and C
 //!    never had to separate them because its `#if` decided both at once.
 //!    Twenty-two rows are answered this way.
-//! 2. `cfg!(feature = "...")` over this crate's own compiled feature set,
-//!    always as one conjunct of an engine test rather than alone.
-//!    `curl-rs/Cargo.toml` declares exactly fifteen features and forwards
-//!    each to `curl-rs-lib/<name>` while holding `default-features = false`
-//!    on the path dependency, so the tool's feature set cannot diverge from
-//!    the engine's. There is no `tls` feature and none is invented here.
+//! 2. A `curl_rs_lib::version::supports_*` predicate, for the three rows whose
+//!    answer also depends on a Cargo feature. The predicate is the whole
+//!    conjunction, evaluated INSIDE the engine, and this file evaluates no
+//!    `cfg!(feature = "...")` of its own at all -- a rule the
+//!    `no_local_feature_tests` module at the end of this file enforces against
+//!    this file's own source text. (Named rather than linked: it is a
+//!    `#[cfg(test)]` module, so an intra-doc link to it does not resolve when
+//!    the documentation is built.)
+//!
+//!    It is tempting to argue that because `curl-rs/Cargo.toml` declares
+//!    fifteen features, forwards each to `curl-rs-lib/<name>`, and holds
+//!    `default-features = false` on the path dependency, "the tool's feature
+//!    set cannot diverge from the engine's". That is false, and measurably so.
+//!    Building `-p curl-rs -p curl-rs-ffi --features curl-rs-ffi/negotiate`
+//!    and reading cargo's `--unit-graph` shows `curl_rs_lib` compiled once
+//!    with `negotiate` ENABLED while this binary's own unit is compiled with
+//!    it DISABLED. Forwarding is one-directional: it makes
+//!    `--features curl-rs/negotiate` imply the engine's, but leaves
+//!    `--features curl-rs-lib/negotiate` and `--features
+//!    curl-rs-ffi/negotiate` free to enable the engine's alone. In such a
+//!    build a `cfg!` compiled here reads false while the linked library
+//!    plainly has the capability. There is no `tls` feature -- rustls is
+//!    unconditional per AAP 0.8.2 -- so `supports_tls` asks only readiness.
 //! 3. A genuine build-intrinsic fact: the width of a machine word (rows 21
 //!    and 22), or the absence of a platform or a TLS backend that AAP 0.1.1
 //!    and 0.2.2 exclude outright (rows 24, 25, 29). These are properties of
@@ -182,8 +204,9 @@
 //! wrapper it needed now exists in `curl-rs-lib/src/ffi/sys.rs` and
 //! `curl-rs/src/output/xattr.rs` really writes the attribute, so the row
 //! reports `ON` on the strength of the implementation rather than of a
-//! guess -- see [`use_xattr`], which conjoins the wrapper's engine with the
-//! two operating systems whose arm it compiles.
+//! guess -- see [`use_xattr`], which conjoins the wrapper's engine with
+//! [`version::supports_xattr`], the engine predicate that answers which
+//! operating systems the wrapper's arm compiles for.
 
 use std::io::{self, Write};
 
@@ -348,14 +371,27 @@ const fn verbose_strings() -> bool {
 /// [`version::ENGINE_XATTR`] says the wrapper exists -- a fact this crate root
 /// could not otherwise establish, since `bin/curlinfo.rs` is compiled
 /// separately from `src/main.rs` and so does not fail to build when the
-/// wrapper disappears from under `curl-rs/src/output/xattr.rs`. The `cfg`
-/// says this is one of the two operating systems whose arm the wrapper
-/// compiles; AAP 0.2.2 puts every other platform out of scope, so a build for
-/// one would correctly report `OFF` rather than advertise a syscall it cannot
-/// issue.
-const fn use_xattr() -> bool {
-    version::ENGINE_XATTR.is_present()
-        && cfg!(any(target_os = "linux", target_os = "macos"))
+/// wrapper disappears from under `curl-rs/src/output/xattr.rs`.
+/// [`version::supports_xattr`] says this is one of the two operating systems
+/// whose arm the wrapper compiles; AAP 0.2.2 puts every other platform out of
+/// scope, so a build for one would correctly report `OFF` rather than
+/// advertise a syscall it cannot issue.
+///
+/// The second conjunct is *asked of the engine* rather than spelled here, and
+/// that is the whole point of the line. [`version::supports_xattr`] documents
+/// itself as "the authority for the `xattr:` row" and gives the reason in its
+/// own words -- "delegating rather than repeating the `cfg!` here is the
+/// point: the predicate and the syscall can never disagree, because there is
+/// one expression". Repeating that
+/// `cfg!(any(target_os = "linux", target_os = "macos"))` inline here would
+/// break the claim twice over: it would create a second expression free to
+/// drift from the syscall it describes, and it would leave the declared
+/// authority with no consumer, so nothing would catch the drift. The
+/// predicate is
+/// no longer `const` because the engine's is not, which costs nothing:
+/// [`capabilities`] is an ordinary `fn` and no const context calls this.
+fn use_xattr() -> bool {
+    version::ENGINE_XATTR.is_present() && version::supports_xattr()
 }
 
 /// Row 21, `large-time`. C: `#if (SIZEOF_TIME_T < 5)` yields `OFF`
@@ -391,10 +427,15 @@ const fn large_size() -> bool {
 /// feature is set to, which is why the first conjunct is still evaluated
 /// rather than dropped -- deleting it would hide the fact that flipping
 /// `memdebug` alone cannot change the answer.
+///
+/// The first conjunct is asked of the ENGINE rather than of this crate's own
+/// feature set, for the reason set out at the top of this file: the two can
+/// differ, and only the engine's answer describes the library that is
+/// actually linked.
 fn override_dns() -> bool {
     let alternative_resolver = CURLRES_ARES || USE_FAKE_GETADDRINFO;
 
-    cfg!(feature = "memdebug") && alternative_resolver
+    version::supports_memdebug() && alternative_resolver
 }
 
 /// Row 28, `ssl-sessions`. C (`src/curlinfo.c:244-249`), a POSITIVE test:
@@ -447,11 +488,11 @@ fn capabilities() -> [Capability; CAPABILITY_COUNT] {
         // and forwards to `curl-rs-lib/cookies`, but `cookies/mod.rs` -- the
         // jar itself -- is unwritten, so the feature selects nothing. 51
         // fixtures gate on the label and skip.
-        Capability::new(
-            "cookies: ",
-            cfg!(feature = "cookies")
-                && version::ENGINE_STATE_STORES.is_present(),
-        ),
+        //
+        // Both halves are asked by `supports_cookies` INSIDE the engine, not
+        // restated here: see this file's header note on why a `cfg!` compiled
+        // into this crate is the wrong question.
+        Capability::new("cookies: ", version::supports_cookies()),
         // 3. C `:63-68`: `#ifdef CURL_DISABLE_BASIC_AUTH` -> OFF.
         //
         // AAP 0.4.1: `curl-rs-lib/src/auth/basic.rs` CREATE from
@@ -490,10 +531,18 @@ fn capabilities() -> [Capability; CAPABILITY_COUNT] {
         // the same one the `SPNEGO` banner token uses: `curl-rs-lib/src/
         // ffi/gss.rs` exists, but `auth/negotiate.rs` -- the module that
         // would drive it through an HTTP exchange -- does not.
-        Capability::new(
-            "negotiate-auth: ",
-            cfg!(feature = "negotiate") && version::ENGINE_GSS.is_present(),
-        ),
+        //
+        // THREE conjuncts, via `negotiate_usable()`, not the two of
+        // `supports_negotiate()`. The third is the runtime probe: the GSS-API
+        // library resolves at load time, so a host can satisfy both
+        // compile-time factors and still have nothing usable. C needs no such
+        // test -- its row is a bare `#ifdef`, the library being found at build
+        // time -- but `tests/runtests.pl:537-546` folds every ON row of this
+        // diagnostic into the same `%feature` map the banner feeds, and the
+        // banner already consults the probe through `Feature::is_present`.
+        // Reading only the compile-time half here would let one capability be
+        // described by two surfaces that disagree, with this one over-reporting.
+        Capability::new("negotiate-auth: ", version::negotiate_usable()),
         // 7. C `:91-96`: `#ifdef CURL_DISABLE_AWS` -> OFF.
         //
         // AAP 0.4.1: `curl-rs-lib/src/auth/aws_sigv4.rs` from
@@ -508,10 +557,7 @@ fn capabilities() -> [Capability; CAPABILITY_COUNT] {
         // Doubly unreachable: the module is unwritten and so are the
         // resolver and TLS layers it would issue its query over. 5 fixtures
         // gate on the label and skip.
-        Capability::new(
-            "DoH: ",
-            cfg!(feature = "doh") && version::ENGINE_DOH.is_present(),
-        ),
+        Capability::new("DoH: ", version::supports_doh()),
         // 9. C `:105-110`: `#ifdef CURL_DISABLE_HTTP_AUTH` -> OFF.
         //
         // The HTTP authentication dispatcher, AAP 0.4.1
@@ -570,16 +616,26 @@ fn capabilities() -> [Capability; CAPABILITY_COUNT] {
         // 15. C `:148-153`: `#ifdef CURL_DISABLE_TYPECHECK` -> OFF.
         //
         // Compile-time type checking of `curl_easy_setopt`'s variadic
-        // argument. AAP 0.6.3 records that `include/curl/typecheck-gcc.h` --
-        // 958 lines of 258 `curlcheck_` macros that cbindgen cannot express
-        // -- "is carried as a hand-maintained header shipped verbatim beside
-        // the generated one". That header does exist; what does not is the
-        // generated one beside it. The macros take effect only when a C
-        // consumer includes `curl/curl.h`, which `curl-rs-ffi/build.rs` must
-        // produce with cbindgen from `curl-rs-ffi/src/ffi/` -- and
-        // `curl-rs-ffi/src/lib.rs:852` declares `mod ffi` with no source, so
-        // `ffi/easy.rs`, holding the very `curl_easy_setopt` those macros
-        // wrap, is absent. A facility with nothing to check is not present.
+        // argument. AAP 0.6.3 records that `include/curl/typecheck-gcc.h`
+        // cannot be expressed by cbindgen and so "is carried as a
+        // hand-maintained header shipped verbatim beside the generated one".
+        // Measured, that header is 958 lines carrying 61 `#define curlcheck_`
+        // directives -- 60 distinct names, `curlcheck_cb_data` being defined
+        // twice -- whose 260 occurrences span 258 lines. That 258 is a line
+        // span and not a count. The provenance, and the uppercase-admitting
+        // pattern the five numbers require, are pinned once on
+        // `version::ENGINE_PUBLIC_HEADER`.
+        //
+        // That header does exist; what does not is the generated one beside
+        // it. The macros take effect only when a C consumer includes
+        // `curl/curl.h`, which `curl-rs-ffi/build.rs` must produce with
+        // cbindgen -- and generation is refused while 76 of the 100 exports in
+        // `lib/libcurl.def` are undefined, `curl_easy_setopt` among them. A
+        // facility with nothing to check is not present.
+        //
+        // The cause is NOT a missing `ffi/easy.rs`: that file is 814 lines and
+        // `ffi/` holds fifteen. The distinction decides what would clear the
+        // row -- not writing a source file, but completing the export surface.
         Capability::new(
             "typecheck: ",
             version::ENGINE_PUBLIC_HEADER.is_present(),
@@ -593,14 +649,26 @@ fn capabilities() -> [Capability; CAPABILITY_COUNT] {
         //
         // Whether `curl_multi_wakeup` can interrupt a blocking
         // `curl_multi_poll`. The C learns this from the internal
-        // `multihandle.h`; here it reads the multi handle's own engine.
-        // `lib.rs:897` declares `pub mod multi;` and `multi/state.rs`
-        // exists, but `multi/mod.rs` does not, so there is no handle to own
-        // the socketpair the capability depends on.
-        // `CURLMcode::WakeupFailure` (`error.rs:784-785`) remains no
-        // evidence either way -- it is precisely the value returned when
-        // wakeup is unavailable. 2 fixtures gate on the label and skip.
-        Capability::new("wakeup: ", version::ENGINE_MULTI.is_present()),
+        // `multihandle.h`; here it asks the engine, through the predicate the
+        // multi module owns.
+        //
+        // OFF, from two conjuncts that disagree -- which is why the row must
+        // read `supports_multi_wakeup()` and not either half. The socketpair
+        // MECHANISM is available (`multi::wakeup_available()` is `cfg!(unix)`,
+        // true on all four targets), but `curl_multi_wakeup` is one of the 76
+        // exports still undefined. Reading the mechanism alone would print `ON`
+        // and make the 2 fixtures gating on the label RUN and FAIL rather than
+        // skip -- the over-report AAP 0.6.5 forbids.
+        //
+        // Reading `ENGINE_MULTI.is_present()` directly would give the same
+        // answer today, because that engine is absent for a different and true
+        // reason -- no handle, no poll. `multi/mod.rs` is 142 lines and owns
+        // the predicate, so reading the engine here instead would leave the
+        // mechanism conjunct out of the row entirely.
+        // `CURLMcode::WakeupFailure` (`error.rs:784-785`) remains no evidence
+        // either way -- it is precisely the value returned when wakeup is
+        // unavailable.
+        Capability::new("wakeup: ", version::supports_multi_wakeup()),
         // 18. C `:169-174`: `#ifdef CURL_DISABLE_HEADERS_API` -> OFF.
         //
         // Backed by `curl-rs-lib/src/headers/mod.rs`, from `lib/headers.c`
@@ -632,15 +700,25 @@ fn capabilities() -> [Capability; CAPABILITY_COUNT] {
         // 23. C `:204-209`: `#ifndef CURL_HAVE_SHA512_256` -> OFF. INVERTED.
         //
         // SHA-512/256, which HTTP Digest consults for `SHA-512-256`
-        // challenges. AAP 0.4.1 maps `curl-rs-lib/src/crypto/sha512_256.rs`
-        // from `lib/curl_sha512_256.c` and AAP 0.5.1 pins `sha2 0.10.9`,
-        // which provides the primitive; `crypto/mod.rs:369` declares the
-        // module and the file does not exist, so nothing wires the primitive
-        // to a digest. 5 fixtures gate on the label and skip.
-        Capability::new(
-            "sha512-256: ",
-            version::ENGINE_SHA512_256.is_present(),
-        ),
+        // challenges.
+        //
+        // C prints `ON` from `#ifndef CURL_HAVE_SHA512_256`, and that macro is
+        // defined at `lib/curl_sha512_256.h:28-32` under TWO conditions:
+        // `!defined(CURL_DISABLE_DIGEST_AUTH) && !defined(CURL_DISABLE_SHA512_256)`.
+        // So the row is not a question about the hash alone, and
+        // `version::has_sha512_256()` -- named after the macro -- carries both
+        // halves. The hash half is present: `crypto/mod.rs:396` declares
+        // `crypto/sha512_256.rs`, a complete implementation on the `sha2
+        // 0.10.9` pin of AAP 0.5.1. The digest half is not, so the row reads
+        // OFF and 5 fixtures gate on the label and skip.
+        //
+        // Reading `ENGINE_SHA512_256.is_present()` alone would give the same
+        // answer for the wrong reason: the hash primitive is present, and what
+        // is missing is `auth/digest.rs`. A wrong reason here is worse than
+        // usual, because the fix it implies -- write the hash -- is already
+        // done, so acting on it would flip the row ON while this build still
+        // cannot answer a challenge.
+        Capability::new("sha512-256: ", version::has_sha512_256()),
         // 24. C `:212-219`: `#if !defined(_WIN32) ||
         // (defined(CURL_WINDOWS_UWP) || defined(CURL_DISABLE_CA_SEARCH) ||
         // defined(CURL_CA_SEARCH_SAFE))` -> OFF.
@@ -986,20 +1064,30 @@ mod tests {
     #[test]
     fn the_two_inverted_rows_with_absent_engines_are_off() {
         // `#ifndef ENABLE_WAKEUP` (:163) and `#ifndef CURL_HAVE_SHA512_256`
-        // (:205). A naive `#ifdef` to `OFF` transliteration would render
-        // these ON. They are OFF here for a stated, checkable reason --
-        // `multi/mod.rs` and `crypto/sha512_256.rs` are absent -- so the
-        // assertion tracks those engines rather than a literal, and it will
-        // start demanding ON the moment either module lands.
+        // (:205). A naive `#ifdef` to `OFF` transliteration would render these
+        // ON. They are OFF here for a stated, checkable reason, so each
+        // assertion tracks the authority that decides it rather than a literal,
+        // and each will start demanding ON the moment its reason is removed.
+        //
+        // The two authorities are deliberately of different shapes, because the
+        // two C conditions are. `ENABLE_WAKEUP` is one switch, so the row is one
+        // engine. `CURL_HAVE_SHA512_256` is a conjunction of two
+        // (`lib/curl_sha512_256.h:28`), so the row is
+        // `version::has_sha512_256()` -- which is why this assertion does NOT
+        // read `ENGINE_SHA512_256.is_present()`. It used to, together with a
+        // comment saying `crypto/sha512_256.rs` was absent; the file is in fact
+        // a complete implementation, and reading that engine alone now reports
+        // `true` while the row is correctly `OFF` because the digest that would
+        // consume the hash is what is missing.
         assert_eq!(
             value_of("wakeup: "),
-            Some(version::ENGINE_MULTI.is_present()),
-            "row 17 tracks the multi handle"
+            Some(version::supports_multi_wakeup()),
+            "row 17 tracks the multi handle's wakeup support"
         );
         assert_eq!(
             value_of("sha512-256: "),
-            Some(version::ENGINE_SHA512_256.is_present()),
-            "row 23 tracks the SHA-512/256 module"
+            Some(version::has_sha512_256()),
+            "row 23 tracks C's two-part CURL_HAVE_SHA512_256 condition"
         );
     }
 
@@ -1084,6 +1172,15 @@ mod tests {
     /// Transcribed from the table above so that the two cannot drift: if a row
     /// is rewired to a different engine, or a new bare literal is introduced,
     /// [`no_row_outlives_the_engine_that_would_implement_it`] stops agreeing.
+    ///
+    /// Two rows read a CONJUNCTION of which the engine named here is one
+    /// conjunct: `sha512-256` reads `version::has_sha512_256()` and `wakeup`
+    /// reads `version::supports_multi_wakeup()`, each pairing its engine with a
+    /// second precondition C also requires. That is why the test below asserts
+    /// an implication -- absent engine forces the row OFF -- rather than
+    /// equality. A conjunction can only be MORE restrictive than the engine
+    /// alone, so the direction that matters is preserved, while equality would
+    /// forbid the second conjunct from ever mattering.
     /// The seven rows deliberately absent from this list are the two machine
     /// word widths (21, 22), the two `win32-*` rows and `cert-status` (24, 25,
     /// 29), `override-dns` (27) and `ssl-sessions` (28) -- each covered by its
@@ -1115,19 +1212,29 @@ mod tests {
 
     /// The only rows that this build may legitimately report `ON`.
     ///
-    /// Two are engine-backed by a module that exists (`verbose-strings` from
-    /// `error.rs`, `xattr` from `ffi/sys.rs`) and two are build-intrinsic
-    /// machine word widths. Every other row describes a module AAP 0.4.1
-    /// mandates and this workspace has not written, or a platform or backend
-    /// excluded outright.
+    /// Three are engine-backed by a module that exists (`verbose-strings` from
+    /// `error.rs`, `xattr` from `ffi/sys.rs`, `parsedate` from
+    /// `util/parsedate.rs`) and two are build-intrinsic machine word widths.
+    /// Every other row describes a module AAP 0.4.1 mandates and this workspace
+    /// has not written, or a platform or backend excluded outright.
     ///
     /// This list is the deliberate-edit point: a checkpoint that lands, say,
     /// `mime/mod.rs` flips `ENGINE_MIME` and adds `"Mime: "` here in the same
     /// change, and until it does the claim is refused by
     /// [`no_row_outside_the_substantiated_ones_is_on`].
-    const ROWS_THAT_MAY_BE_ON: [&str; 4] = [
+    ///
+    /// `parsedate` is the first row admitted by that process rather than by the
+    /// original transcription, and it is worth recording why it took a
+    /// correction to notice: the registry had marked its engine absent with the
+    /// reason "the file does not exist", while `util/parsedate.rs` was a
+    /// 1,430-line parser with 22 tests backing the exported `curl_getdate`.
+    /// The gate above enforces the fatal direction -- no unsubstantiated ON --
+    /// and cannot detect an ON that is merely missing, which is what
+    /// [`the_substantiated_rows_are_on_and_each_for_its_own_reason`] is for.
+    const ROWS_THAT_MAY_BE_ON: [&str; 5] = [
         "verbose-strings: ",
         "xattr: ",
+        "parsedate: ",
         "large-time: ",
         "large-size: ",
     ];
@@ -1201,8 +1308,13 @@ mod tests {
     fn the_substantiated_rows_are_on_and_each_for_its_own_reason() {
         // The other direction: under-reporting is safe but it is not
         // truthful, and a row whose capability really is present must say so.
+        // This is the assertion that a silently-withheld capability trips, and
+        // `parsedate` is here because it was silently withheld -- its engine
+        // claimed the parser did not exist while `curl_getdate` was already
+        // exported and backed by it.
         assert_eq!(value_of("verbose-strings: "), Some(true));
         assert_eq!(value_of("xattr: "), Some(true));
+        assert_eq!(value_of("parsedate: "), Some(true));
         assert_eq!(value_of("large-time: "), Some(true));
         assert_eq!(value_of("large-size: "), Some(true));
 
@@ -1308,62 +1420,90 @@ mod tests {
     // -- Feature-driven rows, asserted under both settings ------------------
 
     #[test]
-    fn the_three_feature_gated_rows_need_the_feature_and_the_engine() {
-        // Written as conjunctions rather than as literals, so the test tracks
-        // the registry instead of restating a snapshot of it. Each row is ON
-        // only when BOTH preconditions hold, which is the distinction the C
-        // never had to draw because its `#if` decided selection and
-        // compilation together.
+    fn the_three_feature_gated_rows_come_from_the_engine_predicates() {
+        // Each row is ON only when BOTH preconditions hold -- the feature was
+        // selected AND the module that honours it exists -- which is the
+        // distinction the C never had to draw, because its `#if` decided
+        // selection and compilation together.
+        //
+        // The conjunction is NOT restated here. Spelling it as
+        // `cfg!(feature = "cookies") && ENGINE_STATE_STORES.is_present()`
+        // would reintroduce in the test exactly the defect the production rows
+        // are shaped to avoid: the `cfg!` reads THIS crate's forwarded feature
+        // copy, which a measured `--unit-graph` shows can differ from the
+        // engine's. The row and the test would then disagree for a reason
+        // neither is wrong about.
         assert_eq!(
             value_of("cookies: "),
-            Some(
-                cfg!(feature = "cookies")
-                    && version::ENGINE_STATE_STORES.is_present()
-            ),
-            "row 2 needs the cookies feature and the cookie jar"
+            Some(version::supports_cookies()),
+            "row 2 must be the engine's cookie verdict, not a local cfg!"
         );
+        // Three conjuncts, not two: `negotiate_usable()` adds the runtime GSS
+        // probe that no `cfg!` can see. Asserting `supports_negotiate()` here
+        // would permit the row to over-report on a host whose mechanism glue is
+        // unusable, which is the direction `tests/runtests.pl` punishes.
         assert_eq!(
             value_of("negotiate-auth: "),
-            Some(
-                cfg!(feature = "negotiate") && version::ENGINE_GSS.is_present()
-            ),
-            "row 6 needs the negotiate feature and auth/negotiate.rs"
+            Some(version::negotiate_usable()),
+            "row 6 must be the engine's negotiate verdict, runtime probe included"
         );
         assert_eq!(
             value_of("DoH: "),
-            Some(cfg!(feature = "doh") && version::ENGINE_DOH.is_present()),
-            "row 8 needs the doh feature and dns/doh.rs"
+            Some(version::supports_doh()),
+            "row 8 must be the engine's DoH verdict"
         );
     }
 
-    #[cfg(not(feature = "negotiate"))]
+    /// The direction that specification 0.6.5 makes fatal, pinned separately.
+    ///
+    /// The test above states where each row's value comes from; this one states
+    /// what the value may never be. Over-reporting a capability turns a clean
+    /// skip into a hard failure, so a row whose implementation is withheld must
+    /// be OFF no matter which Cargo features are selected. Checked against the
+    /// registry directly, so it holds even if a predicate is rewritten.
     #[test]
-    fn negotiate_auth_is_off_without_the_negotiate_feature() {
-        // The feature half of the conjunction, asserted absolutely: with the
-        // default-OFF feature absent (AAP 0.8.5 conflict C2), no engine
-        // landing can turn the row ON.
-        assert_eq!(value_of("negotiate-auth: "), Some(false));
+    fn a_withheld_implementation_forces_its_row_off() {
+        for (label, engine) in [
+            ("cookies: ", version::ENGINE_STATE_STORES),
+            ("negotiate-auth: ", version::ENGINE_GSS),
+            ("DoH: ", version::ENGINE_DOH),
+        ] {
+            if !engine.is_present() {
+                assert_eq!(
+                    value_of(label),
+                    Some(false),
+                    "{label}claims a capability whose implementation \
+                     ({}) does not exist; over-reporting makes a fixture \
+                     fail where under-reporting only makes it skip",
+                    engine.owner()
+                );
+            }
+        }
     }
 
-    #[cfg(not(feature = "cookies"))]
-    #[test]
-    fn cookies_is_off_without_the_cookies_feature() {
-        assert_eq!(
-            value_of("cookies: "),
-            Some(false),
-            "--no-default-features must turn the row OFF"
-        );
-    }
-
-    #[cfg(not(feature = "doh"))]
-    #[test]
-    fn doh_is_off_without_the_doh_feature() {
-        assert_eq!(
-            value_of("DoH: "),
-            Some(false),
-            "--no-default-features must turn the row OFF"
-        );
-    }
+    // Three tests stood here, each gated `#[cfg(not(feature = "..."))]` and
+    // each asserting that its row is OFF while THIS crate's copy of the feature
+    // is absent. They were removed rather than repaired, for two independent
+    // reasons.
+    //
+    // They were unsound. The gate condition is the same cross-crate question
+    // the rows themselves were just fixed for: a build may enable the feature on
+    // the engine alone (`--features curl-rs-lib/cookies`), and then the test
+    // compiles -- because this crate's copy is absent -- while the row it
+    // examines is driven by an engine that does have the capability. The
+    // assertion would fail for a reason the implementation was not wrong about.
+    // The attribute form is easy to miss precisely because it does not read like
+    // a capability decision, which is why the gate below now forbids
+    // `feature = "` in code in every form rather than just `cfg!`.
+    //
+    // They were also redundant. The feature half's necessity belongs to the
+    // engine and is asserted there, over all three rows at once
+    // (`curl_rs_lib::version`'s
+    // `feature_gated_names_need_their_cargo_feature_and_their_engine`). What
+    // remains this file's business -- that each row equals its engine predicate,
+    // and that a withheld implementation forces the row OFF -- is asserted by
+    // the two tests immediately above, in every configuration rather than only
+    // in the one the removed gates happened to compile in.
 
     #[test]
     fn override_dns_is_off_whatever_memdebug_is_set_to() {
@@ -1466,5 +1606,237 @@ mod tests {
         // validation, because they cannot be observed from inside the
         // process.
         assert_eq!(rendered(), rendered(), "the table must be deterministic");
+    }
+}
+
+/// A structural gate forbidding `cfg!(feature = ...)` anywhere in this file.
+///
+/// Every capability question this tool answers is a question about the LIBRARY
+/// it links, and `cfg!` compiled into this crate cannot answer it. That is not
+/// a stylistic preference; it was measured. Building
+/// `-p curl-rs -p curl-rs-ffi --features curl-rs-ffi/negotiate` and reading
+/// cargo's own `--unit-graph` shows `curl_rs_lib` compiled ONCE with
+/// `negotiate` enabled while this binary's unit is compiled with it disabled --
+/// one build, two different answers to `cfg!(feature = "negotiate")`, and only
+/// the engine's is about the code that will run. Feature forwarding does not
+/// prevent this: it makes `--features curl-rs/negotiate` imply the engine's,
+/// but leaves `--features curl-rs-lib/negotiate` and
+/// `--features curl-rs-ffi/negotiate` free to enable the engine's alone.
+///
+/// The behavioural tests above cannot catch a regression here, because in a
+/// non-divergent build a local `cfg!` and the engine's predicate agree -- which
+/// is precisely why the defect survived review. So the property is asserted
+/// against the source text, the way `curl-rs/src/main.rs`'s
+/// `mandatory_warning_gate` and `curl-rs-ffi/src/lib.rs`'s unsafe-boundary gate
+/// already do, with comments and string literals stripped so that the prose in
+/// this comment itself -- which spells the forbidden token repeatedly -- cannot
+/// trip it.
+#[cfg(test)]
+mod no_local_feature_tests {
+    /// This file's own text; `include_str!` resolves relative to this file.
+    const SOURCE: &str = include_str!("curlinfo.rs");
+
+    /// The construct that must not appear in code.
+    ///
+    /// Deliberately the feature TEST rather than the `cfg!` macro, so that one
+    /// rule covers every spelling: `cfg!(feature = "x")`,
+    /// `#[cfg(feature = "x")]`, `#[cfg(not(feature = "x"))]` and
+    /// `#[cfg(all(feature = "x", ...))]` are the same cross-crate mistake, and
+    /// the attribute forms are the easier ones to miss because they do not read
+    /// like a capability decision at all. Three `#[cfg(not(feature = ...))]`
+    /// test gates were removed from this crate for exactly that reason.
+    ///
+    /// The trailing quote is deliberately NOT part of the token. [`code_only`]
+    /// replaces each string literal with a space, so by the time a line reaches
+    /// the comparison, `cfg!(feature = "x")` reads `cfg!(feature =  )` and the
+    /// quote is already gone -- a token spelled with it would match nothing and
+    /// the gate would pass vacuously forever. `feature =` is sound here because
+    /// neither guarded file contains any other use of it in code, which
+    /// [`the_gate_is_not_vacuous`] keeps honest from the other direction.
+    const FORBIDDEN: &str = "feature =";
+
+    /// `line` with its trailing `//` comment and every string literal removed.
+    ///
+    /// Literals collapse to a space so that stripping cannot fuse two adjacent
+    /// tokens into one. [`the_gate_sees_no_raw_strings`] rules out the one case
+    /// this cannot handle rather than assuming it away.
+    fn code_only(line: &str) -> String {
+        let without_comment = line.split("//").next().unwrap_or("");
+        let mut out = String::with_capacity(without_comment.len());
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for ch in without_comment.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if ch == '"' {
+                in_string = true;
+                out.push(' ');
+                continue;
+            }
+            out.push(ch);
+        }
+
+        out
+    }
+
+    /// Whether `text` opens a raw string literal in CODE.
+    ///
+    /// Two naive spellings of this were tried and both were wrong, each caught
+    /// by this file's own contents rather than by inspection:
+    ///
+    /// * `text.contains("r\"")` matches a plain literal that merely ENDS in the
+    ///   letter `r`, which this file does at three places (`header"`, `stderr"`,
+    ///   `for"`).
+    /// * Adding a token-boundary rule fixes those but still matches the same
+    ///   letter at the end of a longer literal (`"...ending in r"`) and the
+    ///   token `r"` written inside a doc comment -- both of which this file also
+    ///   contains, in the lines just above.
+    ///
+    /// The distinction cannot be made without knowing whether the position is
+    /// inside a comment or a literal already, so this tracks both. A raw string
+    /// is reported only for an `r` that begins a token, in code, immediately
+    /// followed by `"` or `#"`.
+    fn opens_raw_string(text: &str) -> bool {
+        for line in text.lines() {
+            let bytes = line.as_bytes();
+            let mut index = 0;
+            let mut in_string = false;
+
+            while index < bytes.len() {
+                let byte = bytes[index];
+
+                if in_string {
+                    match byte {
+                        b'\\' => index += 1,
+                        b'"' => in_string = false,
+                        _ => {}
+                    }
+                    index += 1;
+                    continue;
+                }
+                // A `//` outside a literal begins a comment: nothing after it
+                // on this line is code, and `code_only` discards it too.
+                if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                    break;
+                }
+                if byte == b'"' {
+                    in_string = true;
+                    index += 1;
+                    continue;
+                }
+                if byte == b'r' {
+                    let starts_token = index == 0
+                        || !(bytes[index - 1].is_ascii_alphanumeric()
+                            || bytes[index - 1] == b'_');
+                    let hashed = bytes.get(index + 1) == Some(&b'#')
+                        && bytes.get(index + 2) == Some(&b'"');
+
+                    if starts_token
+                        && (bytes.get(index + 1) == Some(&b'"') || hashed)
+                    {
+                        return true;
+                    }
+                }
+                index += 1;
+            }
+        }
+
+        false
+    }
+
+    /// A `//` inside a raw string literal would truncate a line early and let
+    /// the gate miss code after it. This file contains no raw string literal,
+    /// and this test keeps that true rather than trusting it.
+    #[test]
+    fn the_gate_sees_no_raw_strings() {
+        assert!(
+            !opens_raw_string(SOURCE),
+            "a raw string literal would blind `code_only`; if one is added, \
+             teach the stripper about it rather than deleting this test"
+        );
+    }
+
+    /// The raw-string detector must distinguish a prefix from three things that
+    /// merely look like one, or the test above would fire forever -- as two
+    /// earlier versions of it did -- or never fire at all.
+    #[test]
+    fn the_raw_string_detector_reads_token_boundaries() {
+        assert!(opens_raw_string("let s = r\"x\";"), "a real prefix");
+        assert!(opens_raw_string("let s = r#\"x\"#;"), "a hashed prefix");
+        assert!(
+            !opens_raw_string("\"header\".len()"),
+            "a short literal ending in the letter r"
+        );
+        assert!(
+            !opens_raw_string("panic!(\"a literal ending in r\");"),
+            "a long literal ending in the letter r"
+        );
+        assert!(
+            !opens_raw_string("// the token r\" written in prose"),
+            "a comment mentioning the construct"
+        );
+        assert!(!opens_raw_string("let var = 1;"), "no literal at all");
+    }
+
+    /// The gate itself.
+    #[test]
+    fn no_capability_is_decided_by_this_crates_own_features() {
+        let offenders: Vec<usize> = SOURCE
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| code_only(line).contains(FORBIDDEN))
+            .map(|(index, _)| index + 1)
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "curlinfo.rs decides a capability from its OWN feature set at \
+             line(s) {offenders:?}. Ask `curl_rs_lib::version` instead: a \
+             forwarded feature can be enabled on the engine alone, and then \
+             this crate's copy reads false while the linked library plainly \
+             has the capability."
+        );
+    }
+
+    /// The gate must be able to fail. A stripper that returned nothing, or a
+    /// token that never matches anything, would make the test above pass
+    /// vacuously forever.
+    #[test]
+    fn the_gate_is_not_vacuous() {
+        assert!(
+            code_only("        cfg!(feature = \"negotiate\")")
+                .contains(FORBIDDEN),
+            "the macro form must be caught"
+        );
+        assert!(
+            code_only("    #[cfg(feature = \"negotiate\")]")
+                .contains(FORBIDDEN),
+            "the plain attribute form must be caught"
+        );
+        assert!(
+            code_only("    #[cfg(not(feature = \"negotiate\"))]")
+                .contains(FORBIDDEN),
+            "the negated attribute form must be caught -- this is the one \
+             that was actually present and actually missed"
+        );
+        assert!(
+            !code_only("        // cfg!(feature = \"negotiate\") in prose")
+                .contains(FORBIDDEN),
+            "a comment must not trip the gate"
+        );
+        assert!(
+            !code_only("        let s = \"cfg!(feature = x\";")
+                .contains(FORBIDDEN),
+            "a string literal must not trip the gate"
+        );
     }
 }

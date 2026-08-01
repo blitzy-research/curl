@@ -55,8 +55,11 @@ inventory and the status of each gate:
   `curl-rs/src/output/msgs.rs` routes the warning so that no verbosity gate can
   suppress it, and asserts as much across every combination of the silent and
   show-error gates, for `--insecure`, `--proxy-insecure` and `--doh-insecure`
-  alike. The option parsing that would reach it is not yet on disk, so the
-  end-to-end behavior remains target state while the emitter is real.
+  alike. What is missing is the parser that would reach it: `curl-rs/src/cli/args.rs`
+  is on disk and supplies the `ParameterError` vocabulary, while the clap-derived
+  parser itself is not built and `main.rs` does not call into it, so every
+  invocation exits reporting that no command-line option can be honoured. The
+  end-to-end behavior therefore remains target state while the emitter is real.
 - every fixture eligible under the honestly advertised feature and protocol
   set passes unmodified.
 
@@ -177,6 +180,14 @@ admins/group members can be added on request.
 All nine gates below are present in `.github/workflows/` and run on push and
 pull request. One gate lives in one file, so that a failure names its own
 cause.
+
+This page is machine-checked. The `documentation_gate` test module in
+`curl-rs/src/main.rs` parses this file and fails `cargo test` if any workflow
+named here is absent from the checkout, if the numbered gate list is not a
+complete duplicate-free run, if the count word in the sentence above disagrees
+with the length of that list, or if the claims made below about the hygiene
+workflow stop holding. It parses the page rather than restating its contents,
+because a second copy of the list would be free to disagree with this one.
 
 Several of them are RED today, and deliberately so. Each guards a part of the
 target design that has not been built yet, and each fails with a message that

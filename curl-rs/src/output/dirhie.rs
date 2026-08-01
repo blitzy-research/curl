@@ -132,14 +132,14 @@
 
 use std::ffi::OsStr;
 use std::fs::DirBuilder;
-use std::io::{self, Write};
+use std::io::{self};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
 use curl_rs_lib::error::CURLcode;
 
-use crate::output::msgs::{self, MsgConfig};
+use crate::output::msgs::{self, DiagnosticSink, MsgConfig};
 
 /// The single byte `PATH_DELIMITERS` expands to on the mandated targets.
 ///
@@ -433,7 +433,7 @@ fn render_dir_error(text: DirErrorText, name: &[u8]) -> Vec<u8> {
 /// stay in their single owner while the path bytes stay verbatim.
 #[allow(dead_code)]
 fn show_dir_errno(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
     name: &[u8],
     error: &io::Error,
@@ -506,7 +506,7 @@ fn make_directory(path: &Path) -> io::Result<()> {
 #[allow(dead_code)]
 fn create_dir_hierarchy_with<F>(
     outfile: &Path,
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
     mut create: F,
 ) -> CURLcode
@@ -648,7 +648,7 @@ where
 #[allow(dead_code)]
 pub(crate) fn create_dir_hierarchy(
     outfile: &Path,
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
 ) -> CURLcode {
     create_dir_hierarchy_with(outfile, sink, config, make_directory)

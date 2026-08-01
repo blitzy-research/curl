@@ -22,9 +22,20 @@
 //! registries -- `trc_cfts`, keyed on the `Curl_cft_*` connection-filter types,
 //! and `trc_feats`, keyed on the `Curl_trc_feat_*` per-subsystem features -- and
 //! set a `log_level` field on each entry. Those registries are the connection
-//! filter chain and the protocol features. Neither has landed:
-//! `curl-rs-lib/src/trace.rs` exposes only `mstate_name` and `dump`, and
-//! `curl-rs-lib/src/conn/` does not exist at this commit.
+//! filter chain and the protocol features, and neither has landed: measured,
+//! `curl-rs-lib/src/trace.rs` contains no analogue of either `trc_cfts` or
+//! `trc_feats`, and `curl-rs-lib/src/conn/` does not exist at this commit. There
+//! is therefore no entry for a `log_level` to be written to.
+//!
+//! The obstacle is NOT that `trace.rs` is thin, and mistaking it for that
+//! points away from the real reason this function is absent. That file carries
+//! 135 `pub(crate)` items --
+//! `escape_controls` and `ControlEscaping` are consumed today by
+//! `curl-rs-lib/src/lib.rs` and `curl-rs-lib/src/tls/cipher_suite.rs`. None of
+//! them is visible from HERE in any case: `lib.rs:598` declares
+//! `pub(crate) mod trace`, and the file exposes no bare `pub` item at all, so
+//! this `crate` can reach nothing in it. The obstacle is not a thin module; it
+//! is that the two registries the C function walks have no counterpart to walk.
 //!
 //! Parsing the configuration and discarding the result would return the right
 //! `CURLcode` -- the C returns `CURLE_OK` for every input, including NULL,
@@ -242,28 +253,46 @@ pub extern "C" fn curl_global_cleanup() {
     });
 }
 
-// ---------------------------------------------------------------------------
 // curl_global_sslset
-// ---------------------------------------------------------------------------
 
 /// `CURLSSLSET_OK` (`include/curl/curl.h:2832`).
 const CURLSSLSET_OK: c_int = 0;
 /// `CURLSSLSET_UNKNOWN_BACKEND` (`include/curl/curl.h:2833`).
 const CURLSSLSET_UNKNOWN_BACKEND: c_int = 1;
 
-/// `CURLSSLBACKEND_RUSTLS` (`include/curl/curl.h:166`).
+/// `CURLSSLBACKEND_RUSTLS` (`include/curl/curl.h:166`), IMPORTED from the
+/// engine rather than restated here.
 ///
 /// The enumerant already existed in the frozen header, so reporting a rustls
 /// backend needs no new value -- specification 0.1.1 goal G4 relies on exactly
 /// that.
-const BACKEND_ID: c_int = 14;
+///
+/// The value is `curl_rs_lib::version::TLS_BACKEND_ID`, and consuming it is not
+/// a stylistic preference: that constant's own documentation states that
+/// "`crate::tls` and `curl-rs-ffi`'s `curl_global_sslset` must consume it from
+/// here rather than restate it, so that the backend cannot be called one thing
+/// by the banner and another by the API". Writing `14` literally here would
+/// satisfy every test -- because both copies would be right -- while leaving
+/// two independent definitions of one ABI value in a workspace whose entire
+/// premise is that ABI values have exactly one owner. A later divergence would
+/// then surface as a caller being told `rustls` by `curl --version` and
+/// `unknown backend` by `curl_global_sslset`.
+///
+/// The `as c_int` conversion is deliberate and belongs here: the FFI crate is
+/// where engine types become C types, so this line keeps working unchanged if
+/// the engine narrows its own constant to a fixed-width Rust integer.
+const BACKEND_ID: c_int = curl_rs_lib::version::TLS_BACKEND_ID as c_int;
 
-/// The backend's name, spelled as `lib/vtls/rustls.c:1398` spells it.
+/// The backend's name, spelled as `lib/vtls/rustls.c:1398` spells it, and
+/// likewise IMPORTED from the engine.
 ///
 /// Lower case, matching `{ CURLSSLBACKEND_RUSTLS, "rustls" }`. The name is
 /// compared case-insensitively, so the spelling matters only for what a caller
-/// reads back out of `avail`.
-const BACKEND_NAME: &str = "rustls";
+/// reads back out of `avail` -- which is precisely why it must be the same
+/// string the version banner reports. `curl_rs_lib::version::TLS_BACKEND_NAME`
+/// is that string, and `SSL_VERSION` is built from it too, so all three agree
+/// by construction instead of by coincidence.
+const BACKEND_NAME: &str = curl_rs_lib::version::TLS_BACKEND_NAME;
 
 /// The single-entry, NULL-terminated backend array, kept alive forever.
 ///
@@ -438,7 +467,12 @@ mod tests {
     /// every test in this module holds this guard for its whole body. Sharing
     /// one `Mutex` serialises them, which is the only way to assert on a
     /// process-wide counter.
-    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    ///
+    /// `pub(super)` rather than private because
+    /// [`super::engine_registry_correspondence`] also drives the counter and
+    /// must take the SAME lock: a second guard of its own would serialise that
+    /// module against itself while still racing this one.
+    pub(super) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: Mutex<()> = Mutex::new(());
         let guard = SERIAL
             .lock()
@@ -670,6 +704,31 @@ mod tests {
         assert_eq!(enumerate(), [(14, "rustls".to_owned())]);
     }
 
+    /// The advertised backend is the engine's, not a copy that happens to match.
+    ///
+    /// The literals in the test above are the ABI contract read from
+    /// `include/curl/curl.h:166` and `lib/vtls/rustls.c:1398`, so they belong
+    /// there. This test asserts the other half: that what this module publishes
+    /// is derived from `curl_rs_lib::version`, so a change to the engine's
+    /// constants can never leave `curl_global_sslset` reporting a stale value
+    /// while `curl --version` reports the new one. Both assertions are needed --
+    /// the first alone passes when the value is restated locally, which is the
+    /// defect this pair now prevents.
+    #[test]
+    fn the_advertised_backend_is_the_engines_and_not_a_local_copy() {
+        assert_eq!(BACKEND_ID, curl_rs_lib::version::TLS_BACKEND_ID as c_int);
+        assert_eq!(BACKEND_NAME, curl_rs_lib::version::TLS_BACKEND_NAME);
+
+        // And the engine's banner must name the same backend, which is the
+        // user-visible consequence of the two agreeing.
+        assert!(
+            curl_rs_lib::version::SSL_VERSION.starts_with(BACKEND_NAME),
+            "the version banner reports {:?}, which does not name the backend \
+             {BACKEND_NAME:?} that curl_global_sslset advertises",
+            curl_rs_lib::version::SSL_VERSION
+        );
+    }
+
     #[test]
     fn the_matching_id_succeeds_and_others_do_not() {
         // SAFETY: a null name and a null `avail` are both permitted.
@@ -711,5 +770,81 @@ mod tests {
             curl_global_sslset(14, ptr::null(), &mut second);
         }
         assert_eq!(first, second);
+    }
+}
+
+/// The engine-registry correspondence for [`curl_rs_lib::version::ENGINE_GLOBAL_INIT`].
+///
+/// `curl-rs-lib`'s capability registry marks every engine it reports as present
+/// with a compile-time reference to an item the owning module must export, so a
+/// `present: true` cannot outlive the code it claims. `ENGINE_GLOBAL_INIT` is the
+/// single entry that cannot follow that rule where the others do: its owner is
+/// THIS crate, and the registry lives in a crate this one depends on, so a
+/// reference there would invert the dependency direction AAP 0.1.1 goal G1
+/// fixes.
+///
+/// This module is the other half of that arrangement. It is the only place that
+/// can see both the registry's claim and the code the claim is about, so it is
+/// where the correspondence is asserted -- and `curl-rs-lib`'s
+/// `every_present_engine_has_a_compile_time_link` names the exception explicitly
+/// and asserts that it stays exactly one entry wide, so this file cannot be
+/// forgotten by a change on that side.
+#[cfg(test)]
+mod engine_registry_correspondence {
+    use super::{curl_global_cleanup, curl_global_init};
+    use core::ffi::{c_int, c_long};
+
+    /// The two entry points the `threadsafe` claim is ABOUT, referenced with
+    /// their exact ABI signatures. Deleting or re-signing either stops the build
+    /// here, which is what makes the registry's `present` substantive from this
+    /// side.
+    const _: extern "C" fn(c_long) -> c_int = curl_global_init;
+    const _: extern "C" fn() = curl_global_cleanup;
+
+    /// `ENGINE_GLOBAL_INIT` may claim `present` only while this module really
+    /// provides the initialiser -- which the `const _` links above establish at
+    /// compile time -- so what remains to check at run time is the direction the
+    /// links cannot cover: that the claim is not made about a crate whose code
+    /// is absent, and that the initialiser it names actually functions.
+    #[test]
+    fn the_registry_claim_matches_this_module() {
+        assert!(
+            curl_rs_lib::version::ENGINE_GLOBAL_INIT.is_present(),
+            "this module exists and exports a working, mutex-serialised \
+             initialiser, so the registry must not report it absent -- \
+             under-reporting withholds the `threadsafe` feature the \
+             harness reads"
+        );
+        assert_eq!(
+            curl_rs_lib::version::ENGINE_GLOBAL_INIT.owner(),
+            "curl-rs-ffi/src/ffi/global.rs",
+            "the registry must name THIS file, or the exception recorded in \
+             `every_present_engine_has_a_compile_time_link` is about \
+             something else"
+        );
+        assert!(
+            curl_rs_lib::version::has_feature("threadsafe"),
+            "the `threadsafe` row is gated on this engine, so a present \
+             engine must advertise it"
+        );
+    }
+
+    /// The initialiser is idempotent and reference-counted, which is the
+    /// property `GLOBAL_INIT_IS_THREADSAFE` is a claim about. Asserted through
+    /// the public entry points rather than by inspecting `STATE`, so it stays
+    /// true of the behaviour rather than of the representation.
+    #[test]
+    fn repeated_initialization_is_balanced_and_idempotent() {
+        let _serial = super::tests::exclusive();
+
+        assert_eq!(curl_global_init(0), 0, "first init must succeed");
+        assert_eq!(curl_global_init(0), 0, "a nested init must also succeed");
+        curl_global_cleanup();
+        curl_global_cleanup();
+
+        // And the cycle can be repeated: cleanup left no state that prevents a
+        // later init, which is what a leaked count or a poisoned lock would.
+        assert_eq!(curl_global_init(0), 0, "init after full cleanup");
+        curl_global_cleanup();
     }
 }

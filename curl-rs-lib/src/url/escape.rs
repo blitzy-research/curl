@@ -1,3 +1,7 @@
+// Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+//
+// SPDX-License-Identifier: curl
+
 //! Percent-encoding and percent-decoding -- supersedes `lib/escape.c`.
 //!
 //! # Why this module is `pub`

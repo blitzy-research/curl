@@ -153,7 +153,6 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::os::unix::io::RawFd;
 
 use crate::error::{CURLcode, CodeResult};
 
@@ -296,34 +295,6 @@ pub(crate) trait SysCalls {
     /// nothing.
     fn if_nametoindex(&self, name: &CStr) -> Option<u32>;
 
-    /// Sets one extended attribute on an open file descriptor.
-    ///
-    /// `name` is the attribute name as a C string, which is what both platform
-    /// prototypes take. `value` is the raw bytes; its length is passed
-    /// explicitly, so the value is **not** required to be NUL-terminated and
-    /// may contain interior NULs -- unlike `name`.
-    ///
-    /// The two platform forms differ in arity, and the difference is absorbed
-    /// here rather than leaked to callers: `src/tool_xattr.c:89-91` selects
-    /// between `fsetxattr(fd, attr, value, len, 0, 0)` under
-    /// `HAVE_FSETXATTR_6` and `fsetxattr(fd, attr, value, len, 0)` under
-    /// `HAVE_FSETXATTR_5`. Both extra arguments are zero in the C, so a single
-    /// Rust signature loses nothing.
-    ///
-    /// # Errors
-    ///
-    /// The operating system's error, unmodified. C reduces the outcome to
-    /// `err = -1` at `src/tool_xattr.c:90` and then reports `errno` through
-    /// `curlx_strerror` at `src/tool_operate.c:637-638`, so the errno is part
-    /// of the observable behaviour and is preserved rather than collapsed into
-    /// a bare failure.
-    fn fsetxattr(
-        &self,
-        fd: BorrowedFd<'_>,
-        name: &CStr,
-        value: &[u8],
-    ) -> io::Result<()>;
-
     /// The effective user id of the calling process.
     ///
     /// Total: `geteuid(2)` cannot fail. Used to decide whether a file this
@@ -336,7 +307,7 @@ pub(crate) trait SysCalls {
     /// `lseek(fd, 0, SEEK_CUR)`, which is what `ftell(stdin)` reduces to for an
     /// unbuffered descriptor. Reproduces `src/tool_formparse.c:128`'s
     /// `origin = ftell(stdin)`.
-    fn fd_offset(&self, fd: RawFd) -> io::Result<i64>;
+    fn fd_offset(&self, fd: BorrowedFd<'_>) -> io::Result<i64>;
 
     /// The size of `fd` when it refers to a regular file, otherwise [`None`].
     ///
@@ -345,7 +316,7 @@ pub(crate) trait SysCalls {
     /// be read lazily. A descriptor that is a pipe, a socket, a terminal or a
     /// directory yields `Ok(None)` -- not an error, because C treats it as an
     /// ordinary "buffer it instead" answer rather than a failure.
-    fn fd_regular_size(&self, fd: RawFd) -> io::Result<Option<i64>>;
+    fn fd_regular_size(&self, fd: BorrowedFd<'_>) -> io::Result<Option<i64>>;
 
     /// Reads from `fd` into `buf`, as `read(2)` does.
     ///
@@ -355,7 +326,7 @@ pub(crate) trait SysCalls {
     /// [`SysCalls::seek_fd`] for a retry, and a user-space buffer between the
     /// two would still hold bytes from before the seek. C has no such hazard
     /// because `fseek` on a `FILE *` discards its own buffer.
-    fn read_fd(&self, fd: RawFd, buf: &mut [u8]) -> io::Result<usize>;
+    fn read_fd(&self, fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize>;
 
     /// Repositions `fd` to an absolute offset, as `fseek(.., SEEK_SET)` does.
     ///
@@ -363,7 +334,7 @@ pub(crate) trait SysCalls {
     /// (`src/tool_formparse.c:244`), where the offset already includes the
     /// origin. A failure is the non-zero `fseek` return that `:245` turns into
     /// `CURL_SEEKFUNC_CANTSEEK`.
-    fn seek_fd(&self, fd: RawFd, offset: i64) -> io::Result<()>;
+    fn seek_fd(&self, fd: BorrowedFd<'_>, offset: i64) -> io::Result<()>;
 }
 
 /// The real operating system.
@@ -467,88 +438,6 @@ impl SysCalls for RealSys {
         }
     }
 
-    fn fsetxattr(
-        &self,
-        fd: BorrowedFd<'_>,
-        name: &CStr,
-        value: &[u8],
-    ) -> io::Result<()> {
-        // The two arities are `src/tool_xattr.c:89-91`'s two arms, selected on
-        // the target rather than on a configure probe. `HAVE_FSETXATTR_6` is
-        // Darwin's six-argument form and `HAVE_FSETXATTR_5` is the Linux
-        // five-argument one; both trailing arguments are literal zeros in the C
-        // and are literal zeros here.
-        //
-        // A target outside the mandated matrix reaches neither arm and gets
-        // `ENOTSUP`, which is what `src/tool_xattr.h:45-47`'s `#else` arm
-        // amounts to -- except that this reports the failure instead of
-        // silently claiming success, and `xattr_available` tells a caller in
-        // advance so the call is never made.
-        #[cfg(target_os = "macos")]
-        // SAFETY: Darwin's `fsetxattr(int, const char *, const void *, size_t,
-        // u_int32_t, int)` reads `name` as a NUL-terminated C string and reads
-        // exactly `size` bytes from `value`; it writes through neither. `fd` is
-        // a `BorrowedFd`, so it is a live descriptor for the duration of the
-        // call by construction. `CStr::as_ptr` gives a pointer to a live,
-        // NUL-terminated sequence; `value.as_ptr()` with `value.len()` gives a
-        // pointer valid for exactly that many reads, and an empty slice yields
-        // a dangling-but-aligned pointer with a length of zero, which the
-        // kernel never dereferences. `position` is 0 (required for anything but
-        // a resource fork) and `options` is 0 (no `XATTR_NOFOLLOW`,
-        // `XATTR_CREATE` or `XATTR_REPLACE`), matching the C literally.
-        let rc = unsafe {
-            libc::fsetxattr(
-                fd.as_raw_fd(),
-                name.as_ptr(),
-                value.as_ptr().cast::<libc::c_void>(),
-                value.len(),
-                0,
-                0,
-            )
-        };
-
-        #[cfg(target_os = "linux")]
-        // SAFETY: Linux's `fsetxattr(int, const char *, const void *, size_t,
-        // int)` reads `name` as a NUL-terminated C string and reads exactly
-        // `size` bytes from `value`; it writes through neither. `fd` is a
-        // `BorrowedFd`, so it is a live descriptor for the duration of the call
-        // by construction. `CStr::as_ptr` gives a pointer to a live,
-        // NUL-terminated sequence; `value.as_ptr()` with `value.len()` gives a
-        // pointer valid for exactly that many reads, and an empty slice yields
-        // a dangling-but-aligned pointer with a length of zero, which the
-        // kernel never dereferences. `flags` is 0 -- neither `XATTR_CREATE` nor
-        // `XATTR_REPLACE` -- so an existing attribute is overwritten and a
-        // missing one is created, which is the C's behaviour.
-        let rc = unsafe {
-            libc::fsetxattr(
-                fd.as_raw_fd(),
-                name.as_ptr(),
-                value.as_ptr().cast::<libc::c_void>(),
-                value.len(),
-                0,
-            )
-        };
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let rc = {
-            let _ = (fd, name, value);
-            -1
-        };
-
-        if rc == 0 {
-            Ok(())
-        } else {
-            // `src/tool_operate.c:637-638` renders `errno` through
-            // `curlx_strerror`, so the errno is observable and is carried out
-            // rather than replaced with a generic failure.
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            return Err(io::Error::last_os_error());
-
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
-        }
-    }
-
     fn effective_uid(&self) -> u32 {
         // Returned directly, with no conversion: `uid_t` is exactly `u32` on
         // both mandated platforms, so there is nothing to convert and clippy
@@ -561,12 +450,12 @@ impl SysCalls for RealSys {
         unsafe { libc::geteuid() }
     }
 
-    fn fd_offset(&self, fd: RawFd) -> io::Result<i64> {
+    fn fd_offset(&self, fd: BorrowedFd<'_>) -> io::Result<i64> {
         // SAFETY: `lseek` takes three scalars, touches no caller memory and
         // reports every failure through its return value. A closed or
         // unseekable `fd` is therefore a runtime error, not undefined
         // behaviour.
-        let offset = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        let offset = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) };
         if offset < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -576,7 +465,7 @@ impl SysCalls for RealSys {
         Ok(offset)
     }
 
-    fn fd_regular_size(&self, fd: RawFd) -> io::Result<Option<i64>> {
+    fn fd_regular_size(&self, fd: BorrowedFd<'_>) -> io::Result<Option<i64>> {
         // SAFETY: `core::mem::zeroed::<libc::stat>()` is sound for the same
         // reason it is for `libc::termios` -- the type is a plain aggregate of
         // integers and nested integer aggregates on both mandated platforms,
@@ -588,7 +477,7 @@ impl SysCalls for RealSys {
         // and reads nothing else through it. The pointer is derived from a
         // live, initialised, properly aligned local that outlives the call, and
         // the borrow ends when the call returns.
-        let queried = unsafe { libc::fstat(fd, &mut info) };
+        let queried = unsafe { libc::fstat(fd.as_raw_fd(), &mut info) };
         if queried != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -601,7 +490,7 @@ impl SysCalls for RealSys {
         Ok(Some(info.st_size))
     }
 
-    fn read_fd(&self, fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    fn read_fd(&self, fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
         let capacity = buf.len();
         let ptr = buf.as_mut_ptr().cast::<libc::c_void>();
 
@@ -610,7 +499,7 @@ impl SysCalls for RealSys {
         // aligned mutable slice of exactly `capacity` bytes that outlives the
         // call, the borrow ends when the call returns, and every failure is
         // reported through the return value.
-        let read = unsafe { libc::read(fd, ptr, capacity) };
+        let read = unsafe { libc::read(fd.as_raw_fd(), ptr, capacity) };
         if read < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -619,10 +508,11 @@ impl SysCalls for RealSys {
         Ok(read as usize)
     }
 
-    fn seek_fd(&self, fd: RawFd, offset: i64) -> io::Result<()> {
+    fn seek_fd(&self, fd: BorrowedFd<'_>, offset: i64) -> io::Result<()> {
         // SAFETY: as for `fd_offset` -- three scalars, no caller memory, and
         // every failure reported through the return value.
-        let moved = unsafe { libc::lseek(fd, offset, libc::SEEK_SET) };
+        let moved =
+            unsafe { libc::lseek(fd.as_raw_fd(), offset, libc::SEEK_SET) };
         if moved < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1185,88 +1075,25 @@ pub(crate) fn if_nametoindex_with(
 /// The BSD `extattr_set_fd` arm has no counterpart here because no BSD is in
 /// the matrix; adding one would be a claim this workspace cannot test.
 ///
-/// # Examples
+/// # Visibility
 ///
-/// ```
-/// // Every target in the mandated matrix provides the primitive.
-/// assert!(curl_rs_lib::xattr_available());
-/// ```
-pub fn xattr_available() -> bool {
+/// `pub(crate)`, with one consumer: [`crate::version::supports_xattr`], which is
+/// the engine-owned capability query the command-line tool reads. This function
+/// was `pub` and re-exported from the crate root as `curl_rs_lib::xattr_available`
+/// alongside a `set_fd_xattr` that nothing called. Both were withdrawn -- see the
+/// note in `lib.rs` beside the platform facade -- because a second public name
+/// for a capability is a second place the answer can be given, and the two can
+/// then disagree. The measured example of exactly that failure is recorded on
+/// `supports_xattr` itself.
+///
+/// The observable answer is unchanged: `supports_xattr` returns what this returns,
+/// and it is still `true` on all four mandated targets. Its behaviour is asserted
+/// by `the_xattr_primitive_is_available_on_every_supported_target` and
+/// `the_xattr_predicate_tracks_the_operating_system` below, which is where the
+/// doctest that used to sit here has gone. A doctest could not stay: rustdoc does
+/// not run examples on private items, so it would have been silently dead.
+pub(crate) fn xattr_available() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos"))
-}
-
-/// Sets one extended attribute on an open file descriptor.
-///
-/// The safe counterpart of the platform call inside `xattr()` at
-/// `src/tool_xattr.c:77-104`, and the residue that closes the gap recorded on
-/// `curl-rs/src/output/xattr.rs`: `std` exposes no extended-attribute API, no
-/// extended-attribute crate is among the workspace pins (AAP section 0.5.1),
-/// and `curl-rs` forbids `unsafe` outright, so the call has to live in this
-/// module and be reached from there.
-///
-/// `pub` rather than `pub(crate)` for exactly one reason, and it is the reason
-/// the crate root's visibility policy gives: `curl-rs` demonstrably needs it.
-/// The crate root re-exports this single name, not the module, so the rest of
-/// the operating-system residue stays private.
-///
-/// # What it does not do
-///
-/// It does not decide *whether* to write. C's `if(value)` guard at
-/// `src/tool_xattr.c:82` skips the whole body when the value pointer is null,
-/// and that guard belongs to the tool, beside the attribute table it protects;
-/// reproducing it here would put the same condition in two places. An empty
-/// `value` is therefore written as an empty attribute, which is what C does
-/// when handed a non-null pointer to an empty string.
-///
-/// It also does not reproduce the `CURL_FAKE_XATTR` seam of
-/// `src/tool_xattr.c:83-88`. That seam is inside `#ifdef DEBUGBUILD`, prints
-/// through `curl_mprintf` to standard output, and belongs to the tool that owns
-/// the standard-output stream, not to a syscall wrapper.
-///
-/// # Errors
-///
-/// * The operating system's error, unmodified, when the call fails. C reduces
-///   it to `err = -1` and then reports `errno` through `curlx_strerror`
-///   (`src/tool_operate.c:637-638`), so the errno is observable and is carried
-///   out rather than collapsed.
-/// * [`io::ErrorKind::InvalidInput`] when `name` contains an interior NUL and
-///   therefore cannot be a C string. An attribute name reaches this from the
-///   tool's own table, but the error is returned rather than unwrapped for the
-///   same reason [`if_nametoindex`] returns one: nothing in this module may
-///   panic on its input.
-/// * [`io::ErrorKind::Unsupported`] on a target outside the matrix, where
-///   [`xattr_available`] is `false`. C's `#else` arm at
-///   `src/tool_xattr.h:45-47` instead reports success without writing; the
-///   difference is confined to a platform this workspace does not build for,
-///   and reporting the truth is the safer of the two.
-pub fn set_fd_xattr(
-    fd: BorrowedFd<'_>,
-    name: &str,
-    value: &[u8],
-) -> io::Result<()> {
-    set_fd_xattr_with(&RealSys, fd, name, value)
-}
-
-/// [`set_fd_xattr`] over an injected [`SysCalls`].
-///
-/// The injection point exists for the same reason the rest of the trait does:
-/// `cargo +nightly miri test` is a required gate and Miri cannot call a foreign
-/// function, so the name conversion and the error mapping are covered under
-/// Miri through a pure-Rust fake.
-pub(crate) fn set_fd_xattr_with(
-    sys: &dyn SysCalls,
-    fd: BorrowedFd<'_>,
-    name: &str,
-    value: &[u8],
-) -> io::Result<()> {
-    let cname = CString::new(name).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "an extended attribute name cannot contain an interior NUL",
-        )
-    })?;
-
-    sys.fsetxattr(fd, &cname, value)
 }
 
 // Terminal attributes -- supersedes ttyecho() (src/tool_getpass.c:125-160)
@@ -2005,14 +1832,14 @@ pub(crate) fn effective_uid_with(sys: &dyn SysCalls) -> u32 {
 /// because C's compound condition at `:131-135` collapses all of them into the
 /// same "buffer it instead" branch at `:140`. C additionally requires
 /// `origin >= 0`, which a successful `lseek` already guarantees.
-pub(crate) fn regular_file_extent(fd: RawFd) -> Option<(i64, i64)> {
+pub(crate) fn regular_file_extent(fd: BorrowedFd<'_>) -> Option<(i64, i64)> {
     regular_file_extent_with(&RealSys, fd)
 }
 
 /// [`regular_file_extent`] over an injected [`SysCalls`].
 pub(crate) fn regular_file_extent_with(
     sys: &dyn SysCalls,
-    fd: RawFd,
+    fd: BorrowedFd<'_>,
 ) -> Option<(i64, i64)> {
     // Ordered as the C's `&&` chain is, so a descriptor that cannot report its
     // offset is never also stat'ed.
@@ -2025,28 +1852,28 @@ pub(crate) fn regular_file_extent_with(
 ///
 /// `Ok(0)` is end of input, which is what a short `fread` without `ferror`
 /// means at `src/tool_formparse.c:216-219`.
-pub(crate) fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
     read_fd_with(&RealSys, fd, buf)
 }
 
 /// [`read_fd`] over an injected [`SysCalls`].
 pub(crate) fn read_fd_with(
     sys: &dyn SysCalls,
-    fd: RawFd,
+    fd: BorrowedFd<'_>,
     buf: &mut [u8],
 ) -> io::Result<usize> {
     sys.read_fd(fd, buf)
 }
 
 /// Repositions `fd` to `offset`, counted from the start of the file.
-pub(crate) fn seek_fd(fd: RawFd, offset: i64) -> io::Result<()> {
+pub(crate) fn seek_fd(fd: BorrowedFd<'_>, offset: i64) -> io::Result<()> {
     seek_fd_with(&RealSys, fd, offset)
 }
 
 /// [`seek_fd`] over an injected [`SysCalls`].
 pub(crate) fn seek_fd_with(
     sys: &dyn SysCalls,
-    fd: RawFd,
+    fd: BorrowedFd<'_>,
     offset: i64,
 ) -> io::Result<()> {
     sys.seek_fd(fd, offset)
@@ -3347,6 +3174,12 @@ pub(crate) mod memdebug {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    // Only the two independent-observation helpers below take a
+    // descriptor integer: they re-read `ECHO` and an extended
+    // attribute straight from the descriptor to check an assertion
+    // against something other than the code under test. No wrapper
+    // signature uses it -- see the audit block in `ffi/mod.rs`.
+    use std::os::unix::io::RawFd;
     // Needed only here: the production wrappers take a `BorrowedFd` that a
     // caller has already produced, so nothing outside the tests converts one.
     use std::os::fd::AsFd;
@@ -3372,14 +3205,10 @@ mod tests {
         ifaddrs: Result<Vec<IfNode>, i32>,
         /// The index `if_nametoindex` reports, if any.
         index: Option<u32>,
-        /// The `errno` `fsetxattr` reports, or [`None`] for success.
-        xattr_errno: Option<i32>,
         /// The buffer's first byte as the seam received it.
         observed_first_byte: Cell<Option<u8>>,
         /// The bytes, including the terminator, that `if_nametoindex` received.
         observed_name: RefCell<Option<Vec<u8>>>,
-        /// The name (with terminator) and value `fsetxattr` received.
-        observed_xattr: RefCell<Option<(Vec<u8>, Vec<u8>)>>,
         /// The uid `effective_uid` reports.
         uid: u32,
         /// The offset `fd_offset` reports, or the `errno` it reports.
@@ -3401,10 +3230,8 @@ mod tests {
                 hostname: Ok(Vec::new()),
                 ifaddrs: Ok(Vec::new()),
                 index: None,
-                xattr_errno: None,
                 observed_first_byte: Cell::new(None),
                 observed_name: RefCell::new(None),
-                observed_xattr: RefCell::new(None),
                 uid: 0,
                 fd_offset: Ok(0),
                 fd_regular_size: Ok(None),
@@ -3414,12 +3241,6 @@ mod tests {
             }
         }
 
-        fn failing_xattr(errno: i32) -> Self {
-            Self {
-                xattr_errno: Some(errno),
-                ..Self::new()
-            }
-        }
         /// A descriptor that is a regular file of `size`, positioned at
         /// `origin`, whose contents are `bytes`.
         fn with_regular_file(origin: i64, size: i64, bytes: &[u8]) -> Self {
@@ -3500,34 +3321,26 @@ mod tests {
             self.index
         }
 
-        fn fsetxattr(
-            &self,
-            _fd: BorrowedFd<'_>,
-            name: &CStr,
-            value: &[u8],
-        ) -> io::Result<()> {
-            *self.observed_xattr.borrow_mut() =
-                Some((name.to_bytes_with_nul().to_vec(), value.to_vec()));
-
-            match self.xattr_errno {
-                None => Ok(()),
-                Some(errno) => Err(io::Error::from_raw_os_error(errno)),
-            }
-        }
-
         fn effective_uid(&self) -> u32 {
             self.uid
         }
 
-        fn fd_offset(&self, _fd: RawFd) -> io::Result<i64> {
+        fn fd_offset(&self, _fd: BorrowedFd<'_>) -> io::Result<i64> {
             self.fd_offset.map_err(io::Error::from_raw_os_error)
         }
 
-        fn fd_regular_size(&self, _fd: RawFd) -> io::Result<Option<i64>> {
+        fn fd_regular_size(
+            &self,
+            _fd: BorrowedFd<'_>,
+        ) -> io::Result<Option<i64>> {
             self.fd_regular_size.map_err(io::Error::from_raw_os_error)
         }
 
-        fn read_fd(&self, _fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+        fn read_fd(
+            &self,
+            _fd: BorrowedFd<'_>,
+            buf: &mut [u8],
+        ) -> io::Result<usize> {
             let mut held = self.fd_bytes.borrow_mut();
             match &mut *held {
                 Ok(bytes) => {
@@ -3543,7 +3356,7 @@ mod tests {
             }
         }
 
-        fn seek_fd(&self, _fd: RawFd, offset: i64) -> io::Result<()> {
+        fn seek_fd(&self, _fd: BorrowedFd<'_>, offset: i64) -> io::Result<()> {
             self.observed_seeks.borrow_mut().push(offset);
             self.fd_seek.map_err(io::Error::from_raw_os_error)
         }
@@ -4031,101 +3844,28 @@ mod tests {
         );
     }
 
-    /// The name reaches the seam NUL-terminated and the value reaches it
-    /// verbatim, with its own length rather than a terminator.
-    #[test]
-    fn the_name_is_terminated_and_the_value_is_passed_through() {
-        let sys = FakeSys::new();
-        // Any live descriptor; the fake never touches it. Standard input is
-        // guaranteed open for the duration of a test process.
-        let fd = std::io::stdin();
-
-        assert!(set_fd_xattr_with(&sys, fd.as_fd(), "user.creator", b"curl")
-            .is_ok());
-
-        let (name, value) = sys
-            .observed_xattr
-            .borrow_mut()
-            .take()
-            .expect("seam was called");
-        assert_eq!(name, b"user.creator\0");
-        assert_eq!(value, b"curl");
-    }
-
-    /// A value with an interior NUL and no terminator is legitimate: the length
-    /// is passed explicitly, so `value` is bytes, not a C string. Only `name` is
-    /// constrained.
-    #[test]
-    fn a_value_may_contain_an_interior_nul() {
-        let sys = FakeSys::new();
-        let fd = std::io::stdin();
-
-        assert!(set_fd_xattr_with(
-            &sys,
-            fd.as_fd(),
-            "user.xdg.origin.url",
-            b"a\0b"
-        )
-        .is_ok());
-
-        let (_, value) = sys
-            .observed_xattr
-            .borrow_mut()
-            .take()
-            .expect("seam was called");
-        assert_eq!(value, b"a\0b");
-    }
-
-    /// An empty value is written as an empty attribute rather than skipped. C's
-    /// `if(value)` guard at `src/tool_xattr.c:82` tests the *pointer*, not the
-    /// length, and it lives in the tool beside the table it protects.
-    #[test]
-    fn an_empty_value_still_reaches_the_seam() {
-        let sys = FakeSys::new();
-        let fd = std::io::stdin();
-
-        assert!(
-            set_fd_xattr_with(&sys, fd.as_fd(), "user.creator", b"").is_ok()
-        );
-
-        let (_, value) = sys
-            .observed_xattr
-            .borrow_mut()
-            .take()
-            .expect("seam was called");
-        assert!(value.is_empty());
-    }
-
-    /// An interior NUL in the *name* cannot be a C string, and is reported
-    /// rather than panicked on -- and the seam is never reached.
-    #[test]
-    fn an_interior_nul_in_the_name_is_rejected_before_the_call() {
-        let sys = FakeSys::new();
-        let fd = std::io::stdin();
-
-        let error = set_fd_xattr_with(&sys, fd.as_fd(), "user.a\0b", b"v")
-            .expect_err("an interior NUL cannot reach a C string");
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            sys.observed_xattr.borrow().is_none(),
-            "the seam must not be reached once the name is rejected"
-        );
-    }
-
-    /// The operating system's errno is carried out unchanged, because
-    /// `src/tool_operate.c:637-638` renders it through `curlx_strerror`.
-    #[test]
-    fn the_errno_survives_the_wrapper() {
-        let sys = FakeSys::failing_xattr(libc::ENOTSUP);
-        let fd = std::io::stdin();
-
-        let error =
-            set_fd_xattr_with(&sys, fd.as_fd(), "user.creator", b"curl")
-                .expect_err("the fake reports a failure");
-
-        assert_eq!(error.raw_os_error(), Some(libc::ENOTSUP));
-    }
+    // THE FIVE SEAM TESTS AND THE REAL-SYSCALL TEST OF `set_fd_xattr` ARE GONE
+    // WITH THE WRAPPER THEY EXERCISED, and their coverage is not.
+    //
+    // Four of the five asserted properties `set_file_xattr` asserts too, and its
+    // versions are the ones that survive:
+    //
+    //   name arrives NUL-terminated   an_xattr_name_reaches_the_seam_nul_terminated
+    //   an empty value still writes   an_empty_xattr_value_reaches_the_seam_as_a_zero_length_slice
+    //   an interior NUL in the name   an_interior_nul_in_an_xattr_name_is_einval_without_a_call
+    //   the errno survives            the_platform_errno_survives_inside_the_error
+    //   the real syscall round-trips  a_written_attribute_is_readable_back_byte_for_byte
+    //
+    // The fifth, `a_value_may_contain_an_interior_nul`, is not carried over,
+    // because it asserted a DIVERGENCE from the C rather than agreement with it.
+    // Every arm of `src/tool_xattr.c:88-97` passes `strlen(value)` -- the six-
+    // argument Darwin `fsetxattr`, the five-argument Linux one and the BSD
+    // `extattr_set_fd` alike -- so C stops at the first NUL. The withdrawn
+    // wrapper passed `value.len()` and would have written the bytes past it;
+    // that test pinned the wrong behaviour. `set_file_xattr` measures with
+    // `strlen`, and two tests hold it to that:
+    // `an_xattr_value_is_measured_with_strlen` over the seam and
+    // `an_interior_zero_ends_the_value_exactly_as_strlen_does` on a real file.
 
     // Terminal attributes -- the EchoGuard contract
 
@@ -4561,91 +4301,6 @@ mod tests {
         .expect_err("the seam fails");
 
         assert_eq!(error.raw_os_error(), Some(libc::ENOTSUP));
-    }
-
-    /// The real syscall, end to end, on a real file: write an attribute and
-    /// read it back through the same platform pair the wrapper uses.
-    #[test]
-    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
-    fn the_real_syscall_writes_an_attribute_that_reads_back() {
-        use std::io::Write as _;
-
-        // `user.` is the only namespace an unprivileged process may write on
-        // Linux (`xattr(7)`); Darwin has no namespace requirement and accepts
-        // the same name, so one name serves both targets.
-        const NAME: &str = "user.curl_rs_probe";
-        const VALUE: &[u8] = b"curl";
-
-        // A real file in a real directory, removed at the end. `/tmp` on this
-        // host is a normal filesystem, and a filesystem without extended
-        // attribute support reports ENOTSUP, which the assertion below reads as
-        // a skip rather than a failure.
-        let path = std::env::temp_dir()
-            .join(format!("curl_rs_xattr_{}", std::process::id()));
-        let mut file = std::fs::File::create(&path).expect("temporary file");
-        file.write_all(b"body").expect("write");
-
-        let outcome = set_fd_xattr(file.as_fd(), NAME, VALUE);
-
-        match outcome {
-            Ok(()) => {
-                // Read it back with the matching platform getter so the proof
-                // does not depend on an external tool being installed.
-                let cname =
-                    CString::new(NAME).expect("the name has no interior NUL");
-                let mut buf = [0u8; 32];
-
-                // SAFETY: both `fgetxattr` prototypes read `name` as a
-                // NUL-terminated C string and write at most `size` bytes into
-                // `value`; `cname` is live and terminated, and `buf` is a live,
-                // uniquely borrowed array of exactly `buf.len()` bytes, so the
-                // write cannot overrun. `file` is open for the whole call, so
-                // the descriptor is valid. The trailing zeros are Darwin's
-                // `position` and `options`, matching the write above.
-                let read = unsafe {
-                    #[cfg(target_os = "linux")]
-                    let n = libc::fgetxattr(
-                        file.as_raw_fd(),
-                        cname.as_ptr(),
-                        buf.as_mut_ptr().cast::<libc::c_void>(),
-                        buf.len(),
-                    );
-                    #[cfg(target_os = "macos")]
-                    let n = libc::fgetxattr(
-                        file.as_raw_fd(),
-                        cname.as_ptr(),
-                        buf.as_mut_ptr().cast::<libc::c_void>(),
-                        buf.len(),
-                        0,
-                        0,
-                    );
-                    n
-                };
-
-                assert!(
-                    read >= 0,
-                    "the attribute just written must be readable"
-                );
-                let read =
-                    usize::try_from(read).expect("a non-negative length");
-                assert_eq!(&buf[..read], VALUE);
-            }
-            Err(error) => {
-                // A filesystem that does not support extended attributes is a
-                // property of the host, not a defect in the wrapper. Any other
-                // errno is a real failure and is reported as one.
-                let errno = error.raw_os_error();
-                assert!(
-                    errno == Some(libc::ENOTSUP)
-                        || errno == Some(libc::EOPNOTSUPP)
-                        || errno == Some(libc::EPERM),
-                    "unexpected errno from fsetxattr: {error}"
-                );
-            }
-        }
-
-        drop(file);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A different `errno` must not be flattened into the same value.
@@ -5370,7 +5025,6 @@ mod tests {
     #[cfg_attr(miri, ignore = "lseek(2) and fstat(2) are foreign functions")]
     fn a_regular_file_reports_its_offset_and_size() {
         use std::io::{Seek, SeekFrom, Write};
-        use std::os::fd::AsRawFd as _;
 
         let mut file = match tempfile::NamedTempFile::new() {
             Ok(file) => file,
@@ -5380,14 +5034,20 @@ mod tests {
         if file.write_all(contents).is_err() {
             return;
         }
-        let fd = file.as_file().as_raw_fd();
+
+        // The descriptor is borrowed AT each call rather than once up front.
+        // That is not a style choice: `BorrowedFd` holds an immutable borrow of
+        // `file`, and `as_file_mut` below needs a mutable one, so a single
+        // long-lived binding would not compile. The borrow checker is making the
+        // same point the type exists to make -- the descriptor is live exactly
+        // where it is used.
 
         // Positioned at the start, as a freshly opened stdin would be.
         if file.as_file_mut().seek(SeekFrom::Start(0)).is_err() {
             return;
         }
         assert_eq!(
-            regular_file_extent(fd),
+            regular_file_extent(file.as_file().as_fd()),
             Some((0, contents.len() as i64)),
             "origin and size must match what std sees"
         );
@@ -5397,7 +5057,10 @@ mod tests {
         if file.as_file_mut().seek(SeekFrom::Start(4)).is_err() {
             return;
         }
-        assert_eq!(regular_file_extent(fd), Some((4, contents.len() as i64)));
+        assert_eq!(
+            regular_file_extent(file.as_file().as_fd()),
+            Some((4, contents.len() as i64))
+        );
     }
 
     /// A descriptor that is not a regular file is `None`, not an error.
@@ -5411,18 +5074,16 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "fstat(2) is a foreign function")]
     fn a_descriptor_that_is_not_a_regular_file_selects_buffering() {
-        use std::os::fd::AsRawFd as _;
-
         if let Some(socket) = open_non_file() {
             assert_eq!(
-                regular_file_extent(socket.as_raw_fd()),
+                regular_file_extent(socket.as_fd()),
                 None,
                 "a socket must select the buffering branch"
             );
         }
         if let Some(pty) = open_pty_master() {
             assert_eq!(
-                regular_file_extent(pty.as_raw_fd()),
+                regular_file_extent(pty.as_fd()),
                 None,
                 "a terminal must select the buffering branch"
             );
@@ -5435,20 +5096,36 @@ mod tests {
         // `curl-rs/src/output/formparse.rs`'s
         // `a_character_device_standard_input_is_buffered_instead`.
         if let Ok(null) = std::fs::File::open("/dev/null") {
-            let fd = null.as_raw_fd();
             assert!(
-                RealSys.fd_offset(fd).is_ok(),
+                RealSys.fd_offset(null.as_fd()).is_ok(),
                 "/dev/null is seekable, which is what makes this case reach \
                  the file-type test"
             );
             assert_eq!(
-                regular_file_extent(fd),
+                regular_file_extent(null.as_fd()),
                 None,
                 "a character device must select the buffering branch"
             );
         }
-        // A closed descriptor is the same ordinary answer, not a panic.
-        assert_eq!(regular_file_extent(-1), None);
+
+        // A CLOSED descriptor used to be checked here, as `regular_file_extent(-1)`.
+        // It cannot be written any more, and that is the improvement rather than a
+        // loss of coverage: the boundary takes `BorrowedFd`, and `-1` is not a
+        // descriptor a caller can hand it without `unsafe` -- `BorrowedFd::borrow_raw`
+        // forbids that value outright. The case is now unreachable from safe code, so
+        // it is asserted where it remains expressible, at the seam, with the errno a
+        // closed descriptor actually produces.
+        let closed = FakeSys {
+            fd_offset: Err(libc::EBADF),
+            ..FakeSys::new()
+        };
+        let stdin = io::stdin();
+        assert_eq!(
+            regular_file_extent_with(&closed, stdin.as_fd()),
+            None,
+            "EBADF -- what lseek reports for a closed descriptor -- must be the \
+             ordinary buffering answer, not a panic"
+        );
     }
 
     /// Reading and repositioning the descriptor agree with `std`.
@@ -5456,7 +5133,6 @@ mod tests {
     #[cfg_attr(miri, ignore = "read(2) and lseek(2) are foreign functions")]
     fn a_descriptor_can_be_read_and_repositioned() {
         use std::io::Write;
-        use std::os::fd::AsRawFd as _;
 
         let mut file = match tempfile::NamedTempFile::new() {
             Ok(file) => file,
@@ -5465,7 +5141,8 @@ mod tests {
         if file.write_all(b"abcdefgh").is_err() {
             return;
         }
-        let fd = file.as_file().as_raw_fd();
+        // One binding is enough here: nothing below needs `file` mutably again.
+        let fd = file.as_file().as_fd();
         if seek_fd(fd, 0).is_err() {
             return;
         }
@@ -5492,21 +5169,29 @@ mod tests {
         // And an unseekable descriptor reports the failure C turns into
         // CURL_SEEKFUNC_CANTSEEK.
         if let Some(socket) = open_non_file() {
-            assert!(seek_fd(socket.as_raw_fd(), 0).is_err());
+            assert!(seek_fd(socket.as_fd(), 0).is_err());
         }
     }
 
     /// The branch logic, over the fake, so Miri covers it.
     #[test]
     fn the_extent_branches_follow_the_c_condition() {
+        // The seam takes a `BorrowedFd`, which cannot be built from a literal
+        // integer without `unsafe`. Standard input is borrowed instead: every
+        // `FakeSys` method receives the descriptor as `_fd` and never inspects
+        // it, and `Stdin::as_fd` is a value construction rather than a call, so
+        // this stays Miri-clean.
+        let stdin = io::stdin();
+        let fd = stdin.as_fd();
+
         // A regular file with a non-zero origin: both values are carried.
         let sys = FakeSys::with_regular_file(7, 99, b"payload");
-        assert_eq!(regular_file_extent_with(&sys, 0), Some((7, 99)));
+        assert_eq!(regular_file_extent_with(&sys, fd), Some((7, 99)));
 
         // Not a regular file: `Ok(None)` is an answer, so the result is None
         // without any error being invented.
         let sys = FakeSys::new();
-        assert_eq!(regular_file_extent_with(&sys, 0), None);
+        assert_eq!(regular_file_extent_with(&sys, fd), None);
 
         // The offset call failing short-circuits before the size call, as C's
         // `&&` chain does.
@@ -5515,29 +5200,33 @@ mod tests {
             fd_regular_size: Ok(Some(10)),
             ..FakeSys::new()
         };
-        assert_eq!(regular_file_extent_with(&sys, 0), None);
+        assert_eq!(regular_file_extent_with(&sys, fd), None);
 
         // And the size call failing is equally just None.
         let sys = FakeSys {
             fd_regular_size: Err(libc::EBADF),
             ..FakeSys::new()
         };
-        assert_eq!(regular_file_extent_with(&sys, 0), None);
+        assert_eq!(regular_file_extent_with(&sys, fd), None);
     }
 
     /// Reads consume from the front and errors propagate, over the fake.
     #[test]
     fn the_read_and_seek_seams_carry_their_arguments() {
+        // As above: a borrowed descriptor the fake ignores.
+        let stdin = io::stdin();
+        let fd = stdin.as_fd();
+
         let sys = FakeSys::with_regular_file(0, 6, b"abcdef");
         let mut buffer = [0u8; 4];
 
-        assert_eq!(read_fd_with(&sys, 3, &mut buffer).ok(), Some(4));
+        assert_eq!(read_fd_with(&sys, fd, &mut buffer).ok(), Some(4));
         assert_eq!(&buffer, b"abcd");
-        assert_eq!(read_fd_with(&sys, 3, &mut buffer).ok(), Some(2));
+        assert_eq!(read_fd_with(&sys, fd, &mut buffer).ok(), Some(2));
         assert_eq!(&buffer[..2], b"ef");
-        assert_eq!(read_fd_with(&sys, 3, &mut buffer).ok(), Some(0));
+        assert_eq!(read_fd_with(&sys, fd, &mut buffer).ok(), Some(0));
 
-        assert!(seek_fd_with(&sys, 3, 42).is_ok());
+        assert!(seek_fd_with(&sys, fd, 42).is_ok());
         assert_eq!(sys.observed_seeks.borrow().as_slice(), &[42]);
 
         let failing = FakeSys {
@@ -5545,8 +5234,8 @@ mod tests {
             fd_seek: Err(libc::ESPIPE),
             ..FakeSys::new()
         };
-        assert!(read_fd_with(&failing, 3, &mut buffer).is_err());
-        assert!(seek_fd_with(&failing, 3, 0).is_err());
+        assert!(read_fd_with(&failing, fd, &mut buffer).is_err());
+        assert!(seek_fd_with(&failing, fd, 0).is_err());
     }
 
     // Local time

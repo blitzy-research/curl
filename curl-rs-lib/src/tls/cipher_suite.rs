@@ -861,7 +861,7 @@ impl fmt::Display for SuiteDiagnostic<'_> {
     ///
     /// # Why that divergence is the right one, recorded rather than inferred
     ///
-    /// F25's resolution allows escaping for terminal sinks, raw bytes for
+    /// The rule allows escaping for terminal sinks, raw bytes for
     /// non-terminal files, "or an explicit parity/security decision". This is
     /// the third: the substitution happens here, for **every** destination, and
     /// the reasons are specific to this message rather than general.
@@ -2472,7 +2472,7 @@ mod tests {
         assert_eq!(none.capacity(), 0);
     }
 
-    // -- terminal and log safety (F25) -------------------------------------
+    // Terminal and log safety.
 
     /// An escape sequence in a spelling cannot reach a terminal.
     ///

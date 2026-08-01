@@ -1,3 +1,4 @@
+// Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
 // SPDX-License-Identifier: curl
 //
 // Generated from the public headers of curl 8.19.0-DEV at commit
@@ -53,9 +54,7 @@ use core::ffi::{c_char, c_double, c_int, c_long, c_uchar, c_uint, c_void};
 use super::codes::{CURLSTScode, CURLcode};
 use super::handle::{CURL, CURLM};
 
-// --------------------------------------------------------------------------
 // The nineteen shared enumerations.
-// --------------------------------------------------------------------------
 
 /// `CURLMSG`, transcribed from include/curl/multi.h.
 #[allow(non_camel_case_types)]
@@ -358,7 +357,6 @@ pub enum curlsocktype {
     CURLSOCKTYPE_LAST = 2,
 }
 
-// ---------------------------------------------------------------------------
 // Support scalars and structs.
 //
 // Every name in this section is listed under `[export] exclude` in
@@ -374,7 +372,6 @@ pub enum curlsocktype {
 // Struct layouts were measured with gcc against the frozen headers on
 // `x86_64-unknown-linux-gnu` rather than predicted; the `layout` tests at the
 // end of this file assert the measured numbers.
-// ---------------------------------------------------------------------------
 
 /// The 64-bit file-size and offset type, frozen in `system.h` as
 /// `CURL_TYPEOF_CURL_OFF_T`. All four mandated targets are 64-bit
@@ -640,7 +637,6 @@ pub struct curl_version_info_data {
     pub rtmp_version: *const c_char,
 }
 
-// --------------------------------------------------------------------------
 // The thirty-four generated callback prototypes.
 //
 // Each is `Option<unsafe extern "C" fn(..)>` rather than a bare
@@ -649,7 +645,6 @@ pub struct curl_version_info_data {
 // null representation while keeping the pointer's ABI. Measured,
 // cbindgen renders it as the frozen `typedef R (*name)(args);` with
 // every parameter name preserved.
-// --------------------------------------------------------------------------
 
 /// `curl_calloc_callback`, transcribed from include/curl/curl.h.
 #[allow(non_camel_case_types)]
@@ -1017,13 +1012,11 @@ pub type curl_xferinfo_callback = Option<
     ) -> c_int,
 >;
 
-// --------------------------------------------------------------------------
 // Reconciliation constants.
 //
 // These are asserted by the tests below and read by
 // `curl-rs-ffi/build.rs`, so a change here that is not also a change
 // to the authority fails the build rather than drifting silently.
-// --------------------------------------------------------------------------
 
 /// Number of shared enumerations declared in this module.
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers

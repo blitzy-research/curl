@@ -194,12 +194,13 @@
 // contract at the foot of the file spells out every wrapper's return type, and
 // those types are a `CURLcode` result for the wrappers whose failure is a
 // curl-level condition, or an `io::Result` for the descriptor primitives whose
-// caller inspects the underlying error the way C inspects `ferror`. Both
-// descriptor spellings appear: `BorrowedFd` for the guard-returning wrappers,
-// `RawFd` for the single-call ones.
+// caller inspects the underlying error the way C inspects `ferror`. ONE
+// descriptor spelling appears, `BorrowedFd`, for every wrapper that takes a
+// descriptor at all -- the guard-returning ones and the single-call ones alike.
+// `RawFd` is deliberately absent: see the audit block near the foot of this
+// file for why the single-call wrappers no longer take one either.
 use std::io;
 use std::os::fd::BorrowedFd;
-use std::os::unix::io::RawFd;
 
 use crate::error::CodeResult;
 
@@ -242,8 +243,8 @@ pub(crate) mod gss;
 // The membership test is AAP 0.6.9's own: anything `socket2` absorbs -- socket
 // options, non-blocking flags, `getsockname`, `getpeername` -- is deliberately
 // absent, and what remains is what neither `socket2` nor `std` covers. Four of
-// the eight were added to close review findings that each traced back to a
-// missing platform primitive rather than to a defect at the call site:
+// the eight exist because the capability each wraps traced back to a missing
+// platform primitive rather than to a defect at the call site:
 //
 //   suppress_echo  terminal echo control      F15 -- `terminal.rs` hard-coded
 //                  (`tcgetattr`/`tcsetattr`)         `echo_disabled = false`
@@ -335,7 +336,7 @@ pub(crate) use sys::{
 //
 // `init_from_env` is the `CURL_MEMLIMIT` entry point, and it is re-exported
 // rather than kept private because the cap otherwise has no production
-// consumer at all -- which was review finding F9. It reproduces
+// consumer at all. It reproduces
 // `src/tool_main.c:117-125`, the only place outside the C test programs that
 // calls `curl_dbg_memlimit()`. The allocator also arms itself from the same
 // variable on first use, so the cap works today; this hook exists so that the
@@ -436,15 +437,20 @@ pub(crate) use gss::{
 ///
 /// # Why a compile-time check is not enough
 ///
-/// This is the predicate `version.rs` must consult before it puts `GSS-API`,
-/// `SPNEGO` or `Kerberos` into the `Features:` line of `curl --version`. It
-/// does not consult it yet: at present those three rows are gated on
-/// `cfg!(feature = "negotiate")` alone, which is the weaker test, because two
+/// This is the predicate `version.rs` consults before it puts `GSS-API`,
+/// `SPNEGO` or `Kerberos` into the `Features:` line of `curl --version`, and
+/// before the `curlinfo` diagnostic prints its `negotiate-auth: ` row. Two
 /// conditions have to hold and they are independent -- the feature must be
 /// compiled in, *and* the platform library must actually work. A binary can
 /// be built with `negotiate` on a host where the runtime library is present
 /// but unusable -- no mechanism configured, a broken `gss_mech` setup -- and
 /// a `cfg!` check cannot see that.
+///
+/// Both consumers are reached through `version.rs` rather than by calling this
+/// directly, because it is `pub(crate)`: `version::gss_present` wraps it as the
+/// three rows' `present` predicate, which `Feature::is_present` folds in per
+/// `lib/version.c:684-688`, and `version::negotiate_usable` pairs it with the
+/// compile-time half for the diagnostic.
 ///
 /// Getting it wrong is asymmetric, which is what makes the runtime probe worth
 /// its cost: under-reporting a capability makes a fixture skip, whereas
@@ -495,17 +501,27 @@ pub(crate) fn gss_available() -> bool {
 // accounted for:
 //
 //   * `&CStr` in [`sys::SysCalls::if_nametoindex`] and
-//     [`sys::SysCalls::fsetxattr`] -- a safe borrowed standard-library view,
+//     [`sys::XattrCalls::fsetxattr`] -- a safe borrowed standard-library view,
 //     reached through the trait rather than named here.
 //   * `BorrowedFd` -- it appears below because a descriptor is the one thing
-//     the terminal and extended-attribute calls must be handed. It is used
-//     deliberately in preference to a bare `RawFd` wherever a GUARD is
-//     returned: it carries the lifetime of the open file, so the guard from
-//     [`sys::disable_echo`] cannot outlive the descriptor it restores.
-//   * `RawFd` -- `std::os::unix::io::RawFd`, a standard-library alias for
-//     `i32`. Not a `libc` type, and not a pointer. Used by the wrappers that
-//     borrow a descriptor the caller already owns for the duration of ONE
-//     call and never close it, so no ownership question arises.
+//     the terminal, extended-attribute and descriptor calls must be handed. It
+//     is now the ONLY descriptor spelling in this file, for two distinct
+//     reasons that happen to point the same way. Where a GUARD is returned it
+//     carries the lifetime of the open file, so the guard from
+//     [`sys::disable_echo`] cannot outlive the descriptor it restores. Where
+//     a single call borrows a descriptor -- `fd_offset`,
+//     `fd_regular_size`, `read_fd`, `seek_fd`, `fsetxattr` -- it is what makes
+//     "the caller still owns this, open, for the duration of the call" a
+//     checked fact rather than a convention.
+//
+//     A bare `RawFd` used to appear on the four single-call descriptor
+//     wrappers, defended on the grounds that it is a standard-library alias
+//     for `i32` rather than a `libc` type. True, and beside the point: an
+//     integer carries no lifetime, so it cannot distinguish a live descriptor
+//     from a closed one whose number the kernel has since reissued to an
+//     unrelated file. The alias made the type look safe while leaving exactly
+//     the hazard a descriptor type exists to remove, and the caller was
+//     already holding a `BorrowedFd` it had to discard to make the call.
 //   * `SavedTerminal` -- opaque by construction. It wraps an
 //     `Option<libc::termios>` in a private field, so the foreign struct is
 //     unnameable from outside `sys`, and the only way to inspect it is the
@@ -532,9 +548,9 @@ const _: fn() -> CodeResult<Vec<InterfaceAddr>> = interface_addrs;
 const _: fn() -> CodeResult<Vec<Vec<u8>>> = interface_names;
 const _: fn(&[u8]) -> CodeResult<u32> = if_nametoindex;
 const _: fn() -> u32 = effective_uid;
-const _: fn(RawFd) -> Option<(i64, i64)> = regular_file_extent;
-const _: fn(RawFd, &mut [u8]) -> io::Result<usize> = read_fd;
-const _: fn(RawFd, i64) -> io::Result<()> = seek_fd;
+const _: fn(BorrowedFd<'_>) -> Option<(i64, i64)> = regular_file_extent;
+const _: fn(BorrowedFd<'_>, &mut [u8]) -> io::Result<usize> = read_fd;
+const _: fn(BorrowedFd<'_>, i64) -> io::Result<()> = seek_fd;
 
 // Group B: the injection seam. Each `_with` variant takes the operating
 // system as an argument, which is what makes the surrounding logic reachable
@@ -545,11 +561,12 @@ const _: fn(&dyn SysCalls) -> CodeResult<Vec<InterfaceAddr>> =
 const _: fn(&dyn SysCalls) -> CodeResult<Vec<Vec<u8>>> = interface_names_with;
 const _: fn(&dyn SysCalls, &[u8]) -> CodeResult<u32> = if_nametoindex_with;
 const _: fn(&dyn SysCalls) -> u32 = effective_uid_with;
-const _: fn(&dyn SysCalls, RawFd) -> Option<(i64, i64)> =
+const _: fn(&dyn SysCalls, BorrowedFd<'_>) -> Option<(i64, i64)> =
     regular_file_extent_with;
-const _: fn(&dyn SysCalls, RawFd, &mut [u8]) -> io::Result<usize> =
+const _: fn(&dyn SysCalls, BorrowedFd<'_>, &mut [u8]) -> io::Result<usize> =
     read_fd_with;
-const _: fn(&dyn SysCalls, RawFd, i64) -> io::Result<()> = seek_fd_with;
+const _: fn(&dyn SysCalls, BorrowedFd<'_>, i64) -> io::Result<()> =
+    seek_fd_with;
 const _: Option<RealSys> = None;
 const _: Option<IfNode> = None;
 const _: Option<RawIfAddr> = None;

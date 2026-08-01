@@ -142,13 +142,13 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd};
+use std::io::{self, Read};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::output::msgs::{self, MsgConfig};
+use crate::output::msgs::{self, DiagnosticSink, MsgConfig};
 
 // Byte classification -- ASCII-only and locale-independent, as curl's is.
 
@@ -282,7 +282,7 @@ fn sotouz(value: i64) -> usize {
 /// which is what makes the frozen texts assertable.
 #[allow(dead_code)]
 pub(crate) struct FormDiag<'a> {
-    sink: &'a mut dyn Write,
+    sink: &'a mut dyn DiagnosticSink,
     config: MsgConfig,
 }
 
@@ -290,7 +290,10 @@ impl<'a> FormDiag<'a> {
     /// Binds a diagnostic sink and the three gate predicates that decide
     /// whether a message is emitted at all.
     #[allow(dead_code)]
-    pub(crate) fn new(sink: &'a mut dyn Write, config: MsgConfig) -> Self {
+    pub(crate) fn new(
+        sink: &'a mut dyn DiagnosticSink,
+        config: MsgConfig,
+    ) -> Self {
         Self { sink, config }
     }
 
@@ -429,7 +432,7 @@ impl StdinAccess for ProcessStdin {
     /// is the answer for every pipe, socket, terminal and directory, exactly as
     /// C's compound condition at `:131-135` collapses all of them into it.
     fn regular_extent(&mut self) -> Option<(i64, i64)> {
-        curl_rs_lib::regular_file_extent(self.stdin.as_fd().as_raw_fd())
+        curl_rs_lib::regular_file_extent(self.stdin.as_fd())
     }
 
     fn read_all(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
@@ -454,10 +457,7 @@ impl StdinAccess for ProcessStdin {
     /// own buffer; keeping both operations on the raw descriptor is how the same
     /// property is obtained here.
     fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        curl_rs_lib::read_file_descriptor(
-            self.stdin.as_fd().as_raw_fd(),
-            buffer,
-        )
+        curl_rs_lib::read_file_descriptor(self.stdin.as_fd(), buffer)
     }
 
     fn seek_to(&mut self, offset: i64) -> io::Result<()> {
@@ -465,10 +465,7 @@ impl StdinAccess for ProcessStdin {
         // `src/tool_formparse.c:244-245` turns into CURL_SEEKFUNC_CANTSEEK. That
         // is now a real answer from `lseek` rather than an unconditional
         // refusal: the lazy path is reachable, so this is reachable with it.
-        curl_rs_lib::seek_file_descriptor(
-            self.stdin.as_fd().as_raw_fd(),
-            offset,
-        )
+        curl_rs_lib::seek_file_descriptor(self.stdin.as_fd(), offset)
     }
 }
 
@@ -589,7 +586,6 @@ impl StdinSource {
             }
         }
 
-        // :209-225
         if nitems > 0 {
             match self.data.as_deref() {
                 // :210-213 -- return data from memory.
@@ -643,7 +639,6 @@ impl StdinSource {
             SeekWhence::End => offset.saturating_add(self.size),
         };
 
-        // :241-242
         if offset < 0 {
             return StdinSeek::CantSeek;
         }
@@ -1101,16 +1096,14 @@ impl TextLines<'_> {
                     line.pop();
                     return true;
                 }
-                // :306-307
                 if self.eof {
                     return true;
                 }
-            } else if line.is_empty() {
-                // :312-313
-                return false;
             } else {
-                // :309-310
-                return true;
+                // C exits twice here (`src/tool_parsecfg.c:309-313`): a
+                // non-empty buffer is a final line that had no newline, an
+                // empty one is a plain end of input.
+                return !line.is_empty();
             }
         }
     }
@@ -1168,7 +1161,6 @@ fn read_field_headers(
     let mut line = Vec::new();
 
     while lines.my_get_line(&mut line) {
-        // :423-426
         let first = byte_of(&line, 0);
         if first == b'#' {
             continue;
@@ -1185,7 +1177,6 @@ fn read_field_headers(
             len -= 1;
         }
 
-        // :431-432
         if len == 0 {
             continue;
         }
@@ -1521,7 +1512,6 @@ impl Scanner {
                 }
 
                 if self.byte_at(ptr) == b'"' {
-                    // :364-365
                     let mut end_pos = ptr;
 
                     if let Some(escape) = escape {
@@ -1548,11 +1538,9 @@ impl Scanner {
                                 break;
                             }
                         }
-                        // :374
                         end_pos = dst;
                     }
 
-                    // :376
                     ptr += 1;
 
                     // :377-381 -- anything but whitespace here is a mistake.
@@ -1567,13 +1555,11 @@ impl Scanner {
                         ptr += 1;
                     }
                     if trailing_data {
-                        // :382-383
                         diag.warn(format_args!(
                             "Trailing data after quoted form parameter"
                         ));
                     }
 
-                    // :384-385
                     self.pos = ptr;
                     return Word {
                         span: Span {
@@ -1583,21 +1569,18 @@ impl Scanner {
                         quoted: true,
                     };
                 }
-                // :387
                 ptr += 1;
             }
             // :389-390 -- "end quote is missing, treat it as non-quoted."
             ptr = word_begin;
         }
 
-        // :393-394
         while self.byte_at(ptr) != 0
             && self.byte_at(ptr) != b';'
             && self.byte_at(ptr) != endchar
         {
             ptr += 1;
         }
-        // :395-396
         self.pos = ptr;
         Word {
             span: Span {
@@ -1632,15 +1615,12 @@ impl Scanner {
         // absorbed into the first rather than replacing it.
         let mut content_type_open = false;
 
-        // :494-495
         self.skip_blanks();
 
-        // :496-503
         let word = self.get_param_word(endchar, diag);
         let data = self.strip_trailing(word, TrailingClass::Blank);
         let mut sep = self.current();
 
-        // :504
         while sep == b';' {
             // :505-506 -- step over the ';', then over any blanks.
             self.pos += 1;
@@ -1659,7 +1639,6 @@ impl Scanner {
                 content_type_open = true;
                 sep = self.current();
             } else if self.at_prefix(b"filename=") {
-                // :521-536
                 content_type_open = false;
                 self.pos += 9;
                 self.skip_blanks();
@@ -1668,7 +1647,6 @@ impl Scanner {
                     Some(self.strip_trailing(word, TrailingClass::Blank));
                 sep = self.current();
             } else if self.at_prefix(b"headers=") {
-                // :537-593
                 content_type_open = false;
                 self.pos += 8;
                 if self.current() == b'@' || self.current() == b'<' {
@@ -1689,14 +1667,12 @@ impl Scanner {
                     // bytes it is.
                     let path = Path::new(OsStr::from_bytes(&hdrfile));
                     match File::open(path) {
-                        // :559-563
                         Err(error) => diag.warn_two_values(
                             "Cannot read from ",
                             &hdrfile,
                             ": ",
                             curl_rs_lib::os_error_message(&error).as_bytes(),
                         ),
-                        // :564-572
                         Ok(file) => {
                             let mut reader = io::BufReader::new(file);
                             read_field_headers(
@@ -1724,7 +1700,6 @@ impl Scanner {
                     }
                 }
             } else if self.at_prefix(b"encoder=") {
-                // :594-609
                 content_type_open = false;
                 self.pos += 8;
                 self.skip_blanks();
@@ -1769,7 +1744,6 @@ impl Scanner {
         // :628-630 -- "Terminate content type." The span already records where
         // it ends, so there is nothing to write.
 
-        // :632-635
         let content_type = match content_type {
             Some(span) if slots.content_type => Some(self.owned(span)),
             Some(span) => {
@@ -1782,7 +1756,6 @@ impl Scanner {
             None => None,
         };
 
-        // :637-640
         let filename = match filename {
             Some(span) if slots.filename => Some(self.owned(span)),
             Some(span) => {
@@ -1795,7 +1768,6 @@ impl Scanner {
             None => None,
         };
 
-        // :642-645
         let encoder = match encoder {
             Some(span) if slots.encoder => Some(self.owned(span)),
             Some(span) => {
@@ -1818,7 +1790,6 @@ impl Scanner {
             Vec::new()
         };
 
-        // :654-655
         Ok(ParamPart {
             data: self.owned(data),
             content_type,
@@ -1865,7 +1836,6 @@ fn new_filedata(
         let kind = if isremotefile {
             ToolMimeKind::File
         } else {
-            // :114-115
             ToolMimeKind::FileData
         };
         let mut node = ToolMime::new(kind);
@@ -1919,11 +1889,9 @@ fn new_filedata(
         }
     }
 
-    // :161-172
     let kind = if isremotefile {
         ToolMimeKind::Stdin
     } else {
-        // :169-170
         ToolMimeKind::StdinData
     };
     let mut node = ToolMime::new(kind);
@@ -2004,7 +1972,6 @@ pub(crate) fn formparse(
     let equals = match scanner.buffer.iter().position(|&byte| byte == b'=') {
         Some(index) => index,
         None => {
-            // :884-886
             diag.warn(format_args!("Illegally formatted input field"));
             return Err(FormParseError);
         }
@@ -2045,20 +2012,19 @@ pub(crate) fn formparse(
 
         // :759 -- the group joins the current group, then becomes it.
         let mut node = ToolMime::new(ToolMimeKind::Parts);
-        node.headers = part.headers; // :763-764
-        node.content_type = part.content_type; // :765
+        node.headers = part.headers;
+        node.content_type = part.content_type;
         let path = tree.push_current(node);
-        tree.descend(path.clone()); // :762
+        tree.descend(path.clone());
         name_target = Some(path);
     } else if name.is_none() && scanner.remainder() == b")" && !literal_value {
         // :767-774 -- ending a multipart. C's `!strcmp(contp, ")")` demands the
         // whole remainder be exactly that one byte.
         if tree.at_root() {
-            // :769-771
             diag.warn(format_args!("no multipart to terminate"));
             return Err(FormParseError);
         }
-        tree.ascend(); // :773
+        tree.ascend();
     } else if scanner.current() == b'@' && !literal_value {
         // :775-827 -- the '@' introduces one or more files.
         //
@@ -2080,10 +2046,8 @@ pub(crate) fn formparse(
                 Some(ref path) => path.clone(),
                 None => {
                     let path = if sep == b',' {
-                        // :796-800
                         tree.push_current(ToolMime::new(ToolMimeKind::Parts))
                     } else {
-                        // :794-795
                         tree.current_path().to_vec()
                     };
                     group = Some(path.clone());
@@ -2093,7 +2057,7 @@ pub(crate) fn formparse(
 
             // :804 -- `isremotefile` is TRUE, so the filename is sent.
             let (mut node, status) = new_filedata(&part.data, true, stdin);
-            node.headers = part.headers; // :807-808
+            node.headers = part.headers;
             let path = tree.push_child(&target, node);
 
             // :809-819 -- may fail, and when it does the node stays in the
@@ -2122,17 +2086,16 @@ pub(crate) fn formparse(
 
         if scanner.current() == b'<' && !literal_value {
             // :829-853 -- file content only.
-            scanner.pos += 1; // :830
+            scanner.pos += 1;
             let part = scanner.get_param_part(0, Slots::FILE_CONTENT, diag)?;
             sep = part.sep;
 
             // :836 -- `isremotefile` is FALSE, so `tool2curlparts` clears the
             // filename at `:287-288` and none is sent.
             let (mut node, status) = new_filedata(&part.data, false, stdin);
-            node.headers = part.headers; // :839-840
+            node.headers = part.headers;
             path = tree.push_current(node);
 
-            // :841-852
             settle_stdin_read_error(tree.node_mut(&path), status, diag)?;
 
             // :871-873. `;filename=` is not an accepted attribute here, so
@@ -2159,12 +2122,11 @@ pub(crate) fn formparse(
             };
             sep = part.sep;
 
-            // :864
             let mut node = ToolMime::new_data(&part.data);
-            node.headers = part.headers; // :867-868
-            node.filename = part.filename; // :871
-            node.content_type = part.content_type; // :872
-            node.encoder = part.encoder; // :873
+            node.headers = part.headers;
+            node.filename = part.filename;
+            node.content_type = part.content_type;
+            node.encoder = part.encoder;
             path = tree.push_current(node);
         }
 
@@ -2187,7 +2149,6 @@ pub(crate) fn formparse(
         tree.node_mut(&path).name = Some(name);
     }
 
-    // :888
     Ok(())
 }
 
@@ -2354,27 +2315,21 @@ fn tool2curlparts<B: MimeBuilder>(
     mime: &mut B::Mime,
 ) -> Result<(), B::Error> {
     for node in parts {
-        // :264-267
         let mut part = builder.add_part(mime)?;
 
-        // :269
         let mut filename: Option<&[u8]> = node.filename.as_deref();
 
-        // :270-305
         match node.kind {
             ToolMimeKind::Parts => {
-                // :271-278
                 let sub = tool2curlmime(builder, node)?;
                 builder.subparts(&mut part, sub)?;
             }
 
             ToolMimeKind::Data => {
-                // :280-282
                 builder.data(&mut part, payload(node))?;
             }
 
             ToolMimeKind::File | ToolMimeKind::FileData => {
-                // :284-289
                 builder.filedata(&mut part, payload(node))?;
                 if node.kind == ToolMimeKind::FileData && filename.is_none() {
                     // :287-288 -- `<` sends no filename, so the one
@@ -2390,7 +2345,6 @@ fn tool2curlparts<B: MimeBuilder>(
                     filename = Some(STDIN_FILENAME);
                 }
 
-                // :295-300
                 debug_assert!(
                     node.stdin.is_some(),
                     "a standard-input part with no source"
@@ -2419,7 +2373,6 @@ fn tool2curlparts<B: MimeBuilder>(
         // :307-316 -- the FIXED order: filename, type, headers, encoder, name.
         // It decides what the serialiser sees, so it is not to be rearranged.
 
-        // :307-308
         if filename.is_some() {
             builder.filename(&mut part, filename)?;
         }
@@ -2427,13 +2380,10 @@ fn tool2curlparts<B: MimeBuilder>(
         // :309-310 -- unconditional, `None` included.
         builder.content_type(&mut part, node.content_type.as_deref())?;
 
-        // :311-312
         builder.headers(&mut part, &node.headers)?;
 
-        // :313-314
         builder.encoder(&mut part, node.encoder.as_deref())?;
 
-        // :315-316
         builder.name(&mut part, node.name.as_deref())?;
     }
     Ok(())
@@ -2448,14 +2398,11 @@ pub(crate) fn tool2curlmime<B: MimeBuilder>(
     builder: &mut B,
     root: &ToolMime,
 ) -> Result<B::Mime, B::Error> {
-    // :325-327
     let mut mime = builder.init()?;
 
-    // :329
     match tool2curlparts(builder, &root.subparts, &mut mime) {
         Ok(()) => Ok(mime),
         Err(error) => {
-            // :330-333
             builder.free(mime);
             Err(error)
         }

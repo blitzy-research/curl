@@ -314,9 +314,12 @@ arrives from outside into a decision.
 
 - Command-line argument parsing, at `curl-rs/src/cli/args.rs` and
   `curl-rs/src/cli/paramhlp.rs`, reads numbers, sizes, lists and protocol names
-  out of arguments. `paramhlp.rs` is delivered; `args.rs` is not yet on disk,
-  which is why `paramhlp.rs` does not compile on its own today -- it imports
-  `super::args::ParameterError`.
+  out of arguments. Both files are on disk, and both compile: `args.rs` supplies
+  the `ParameterError` vocabulary that `paramhlp.rs` imports as
+  `super::args::ParameterError`. What `args.rs` does not yet carry is the
+  clap-derived parser that would turn an argument vector into a configuration,
+  and `main.rs` does not call into it, so the binary exits reporting that no
+  command-line option can be honoured.
 - The configuration-file reader at `curl-rs/src/config/parseconfig.rs` reads
   the same option spellings out of a file instead of out of an argument vector,
   quoted values included.
@@ -337,11 +340,12 @@ cannot be locally overridden (`error[E0453]: allow(unsafe_code) incompatible
 with previous forbid`) and Agent Action Plan goal G1 permits only three
 crates, so the island cannot move into a fourth; `deny` is no weaker, since a
 stray `unsafe` block outside the island is a hard error rather than a warning.
-In `curl-rs` there is no island at all, so the delivered binary root
-`curl-rs/src/bin/curlinfo.rs` does carry `#![forbid(unsafe_code)]` literally;
-the crate root `curl-rs/src/main.rs` named in Agent Action Plan section 0.3.1
-is not yet on disk. Parsing has no business in that island. Slice indexing is
-bounds-checked, so a parser expressed over slices needs nothing from it.
+In `curl-rs` there is no island at all: measured, that crate contains zero
+`unsafe` blocks and zero `#[allow(unsafe_code)]` attributes, so both of its
+roots carry `#![forbid(unsafe_code)]` literally -- `curl-rs/src/main.rs` and
+the diagnostic binary `curl-rs/src/bin/curlinfo.rs`. Parsing has no business in
+an unsafe island in any case. Slice indexing is bounds-checked, so a parser
+expressed over slices needs nothing from it.
 
 Fidelity is asserted against the fixture corpus under `tests/data`, where a
 fixture can pin the exact bytes the client sends. A parser that accepts a

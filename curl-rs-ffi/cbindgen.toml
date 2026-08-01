@@ -761,11 +761,12 @@ item_types = ["enums", "structs", "unions", "typedefs", "constants", "functions"
 # (CURLFORMcode, CURLINFO, CURLformoption, CURLoption, curl_sslbackend), and
 # these are the remaining 30.
 #
-# CORRECTED. This comment previously read "31 declarations ... these are the
-# remaining 26", which was wrong twice over: the true total is 35, and
-# curlfiletype, curliocmd, curlioerr and curlsocktype appeared in NEITHER
-# list, so the "complete" claim was false and those four enums were silently
-# absent from the generated header. They are included below.
+# The arithmetic is worth stating explicitly, because "31 declarations ... the
+# remaining 26" is the easy mistake to make here and it is wrong twice over: the
+# true total is 35, and curlfiletype, curliocmd, curlioerr and curlsocktype fall
+# in neither the excluded five nor a 26-entry remainder, so any such split
+# silently drops those four enums from the generated header. They are included
+# below.
 #
 # The 34 callback typedefs are listed for the same reason as the enums: with
 # no exported prototypes referencing them yet, none is reachable from an

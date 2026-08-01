@@ -51,8 +51,11 @@ The harness selects the binary under test through the `runtests.pl` `-c`
 option. Its own help output describes that option as
 `-c path  use this curl executable`. That documented option is what lets the
 specified `curl-rs` command-line binary stand in for the C binary with no
-change to the harness. The substitution is not available yet: `curl-rs` has no
-entry point on disk, so no run described on this page has taken place.
+change to the harness. The substitution is not available yet, and the reason is
+narrower than the binary being absent: `curl-rs/src/main.rs` is on disk and
+`cargo build` produces a running executable, but that executable cannot accept
+an option -- every invocation exits reporting that no command-line option can be
+honoured -- so no run described on this page has taken place.
 
 Two companion options matter while bootstrapping a run. `-vc <path>` selects
 the curl used only to verify that the test servers are up, and `-ac <path>`
@@ -539,6 +542,13 @@ checkout at all, because `curl-rs-lib/src/tls/verify.rs` is not a current file
 and the backend it needs awaits its own unit of work. Both behaviors are also
 covered by dedicated integration tests specified under `tests-rs/integration/`,
 a specified location that is not part of this checkout.
+
+That last claim is machine-checked, in both directions: the
+`documentation_gate` test module in `curl-rs/src/main.rs` fails `cargo test`
+if `tests-rs/` is present while this page still says it is absent, and equally
+if the page claims it is present while it is not. Neither state is privileged,
+so delivering the specified tree does not break the gate -- only a page that
+disagrees with the checkout does.
 
 The items below are acceptance criteria that the specified target has to
 satisfy. They are criteria, never results, and `docs/CODE_REVIEW.md` owns

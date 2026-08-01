@@ -12,12 +12,21 @@ standard curl test suite.
 
 This suite drives the curl command-line binary externally rather than linking
 against the library, so it exercises whatever binary it is pointed at. That
-property is what lets the specified `Rust` command-line binary, `curl-rs`,
-substitute for the C binary with no change to this suite, to `conftest.py`, to
-the `testenv` package, to the server configuration or to any test case. The
-suite and its servers are retained unchanged. The substitution itself is not
-available yet: the `curl-rs` binary has no entry point on disk, so nothing here
-has been run against it.
+property is what lets the `Rust` command-line tool -- the `curl-rs` crate,
+whose binary target is named `curl` -- substitute for the C binary with no
+change to this suite, to `conftest.py`, to the `testenv` package, to the server
+configuration or to any test case. The suite and its servers are retained
+unchanged.
+
+The substitution is not available yet, and the reason is narrower than the
+binary being absent. `curl-rs/src/main.rs` is present and `cargo build`
+produces a running executable; what that executable cannot yet do is accept an
+option. Every invocation, `--version` included, exits after reporting that no
+command-line option can be honoured by this build. Since every test case here
+passes options, none of them can pass yet, and nothing in this file has been
+run against the `Rust` binary. The distinction matters when reading a failure:
+the missing piece is the option parser and the transfer engine behind it, not
+an entry point.
 
 # Usage
 

@@ -321,7 +321,7 @@
 // Date parsing -- supersedes `lib/parsedate.c` (585). Backs `curl_getdate`.
 //   LANDED, and declared below rather than only listed here. It is the first
 //   of the 22 to exist because `curl_getdate` is an exported symbol and
-//   `curl-rs-ffi` cannot be written without it -- review finding M-13.
+//   `curl-rs-ffi` cannot be written without it.
 // Byte-range parsing -- supersedes `lib/curl_range.c` (91).
 // The `curl_slist` chain -- supersedes `lib/slist.c` (139). Backs the exported
 // `curl_slist_append` and `curl_slist_free_all`.

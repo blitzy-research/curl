@@ -42,14 +42,39 @@
 //!   of `Curl_cmalloc` and its four siblings (`lib/easy.c:106-110`), backing
 //!   `curl_global_init_mem`.
 //!
-//! The 100 exported entry points themselves are partitioned across the twelve
+//! The 100 exported entry points are TO BE partitioned across the twelve
 //! symbol-family modules the crate documentation tabulates -- `easy`, `multi`,
 //! `share`, `global`, `slist`, `mime`, `form`, `url`, `ws`, `printf`,
 //! `strerror` and `misc` -- together with the three type-and-metadata modules
-//! `opts`, `codes` and `handle`. That partition is disjoint and exhaustive
-//! against `lib/libcurl.def`: each of the 100 names has exactly one
-//! `#[no_mangle] pub extern "C"` definition, because a duplicate is a link
-//! error and nothing builds.
+//! `opts`, `codes` and `handle`. That is the target partition, and the
+//! distinction between it and what exists today is load-bearing rather than
+//! pedantic, so both are stated:
+//!
+//! * MEASURED TODAY: 24 of the 100 are defined, 76 are not, and 0 extra symbols
+//!   are exported (`nm -D --defined-only` over the built cdylib, and
+//!   `build.rs`'s `undefined_abi_exports` computed from the same
+//!   `lib/libcurl.def`, agree exactly). The declarations below are therefore
+//!   SIX symbol-family modules, not twelve: `easy`, `escape`, `global`, `misc`,
+//!   `slist` and `strerror`. `escape` does not appear in the twelve-name list
+//!   above because it is not a family of its own -- it holds `curl_escape`,
+//!   `curl_unescape`, `curl_easy_escape` and `curl_easy_unescape`, which the
+//!   target partition assigns to `misc` and `easy`.
+//! * The 76 that are absent are the remainder of `curl_easy_*` (15), all of
+//!   `curl_multi_*` (21), `curl_share_*` (3), one `curl_global_*`,
+//!   `curl_mime_*` (12), the legacy `curl_form*` trio, `curl_url*` (5),
+//!   `curl_ws_*` (4), the ten `curl_m*printf` functions and the two
+//!   `curl_pushheader_by*` helpers. They are unwritten work, not a defect: the
+//!   modules that back them are assigned to units of work beyond this
+//!   checkpoint, and `include/curl/` is deliberately NOT regenerated while any
+//!   of them is missing, so the reviewed curl 8.19.0-DEV headers remain the ABI
+//!   contract rather than being replaced by a truncated one.
+//!
+//! What holds unconditionally, now and at completion, is the partition's SHAPE:
+//! it is disjoint, and every name defined has exactly one `#[no_mangle] pub
+//! extern "C"` definition, because a duplicate is a link error and nothing
+//! builds. `build.rs`'s `check_export_coverage` asserts that the families are
+//! disjoint and exhaustive against `lib/libcurl.def` as they land, so the claim
+//! becomes true by enforcement rather than by editing this comment.
 //!
 //! Export parity comes from declaration discipline, not from link-time
 //! filtering. A Rust `cdylib` was built and inspected: it exported exactly the
@@ -65,9 +90,12 @@ pub(crate) mod opts;
 pub(crate) mod panic_boundary;
 pub(crate) mod types;
 
-// The symbol-family modules. Each owns a disjoint slice of the 100 names in
+// The symbol-family modules that EXIST at this commit -- six of the twelve the
+// target partition names. Each owns a disjoint slice of the 100 names in
 // `lib/libcurl.def`, and `build.rs`'s `check_export_coverage` asserts that the
-// partition stays disjoint and exhaustive as families land.
+// partition stays disjoint and exhaustive as families land. The six below
+// carry 24 definitions between them; `multi`, `share`, `mime`, `form`, `url`,
+// `ws` and `printf` are not yet declared because they are not yet written.
 pub(crate) mod easy;
 pub(crate) mod escape;
 pub(crate) mod global;

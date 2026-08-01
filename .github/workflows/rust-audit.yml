@@ -306,6 +306,18 @@ jobs:
           # policy file, in a reviewable diff, never in the workflow that checks
           # it.
           #
+          # WHAT THIS GATE DOES NOT CLAIM. Passing here means zero critical
+          # advisories and zero unreviewed ones. It does NOT mean the default
+          # artifact carries no known vulnerability: it carries four, 3 x HIGH
+          # and 1 x MEDIUM, because `http3` and `ssh` are mandated default-on
+          # and the fixes for three of them require a rust-version above the
+          # mandated floor. That is a conflict between requirements rather than
+          # a defect in this graph, it cannot be settled by a workflow or a
+          # policy file, and it is escalated in full - the three requirements,
+          # why they cannot all hold, and the three options - in the ESCALATION
+          # block above the `ignore` list in deny.toml. Read it before treating
+          # a green run here as a clean bill of health.
+          #
           # cargo-audit has no --locked flag; its options are --color, --db,
           # --deny, --file, --ignore, --no-yanked, --no-fetch, --stale,
           # --target-arch and --target-os. It reads the lockfile directly, and
@@ -467,16 +479,29 @@ jobs:
           msrv_minor="$(echo "${msrv}" | cut -d. -f2)"
           echo "workspace rust-version: ${msrv} (minor ${msrv_minor})"
 
-          # Three of the six acceptances are blocked by one thing and one thing
+          # ONE of the four acceptances is blocked by one thing and one thing
           # only: the fix declares a rust-version above this workspace's floor.
-          # Each is paired below with the floor that unblocks it, so raising the
+          # It is paired below with the floor that unblocks it, so raising the
           # MSRV cannot quietly leave a stale acceptance behind - the decision
           # surfaces here, in the gate, on the very commit that raises it.
           #
-          # quinn-proto  >= 0.11.15 declares 1.85
-          # hickory-*    the fix for both hickory entries is hickory-proto
-          #              >= 0.26.1, which ships only with hickory-resolver
-          #              0.26.x, declaring 1.88
+          # quinn-proto  >= 0.11.15 declares 1.85 (measured: 0.11.14 declares
+          #              1.74.1; 0.11.15 and 0.11.16 both declare 1.85)
+          #
+          # The other three are not MSRV-blocked and so have no trigger here.
+          # RUSTSEC-2026-0153 and RUSTSEC-2026-0154 need russh >= 0.60.3, which
+          # is blocked twice over - 17 pre-release version requirements AND
+          # rust-version 1.85 - and deny.toml records both halves, so a floor
+          # move alone does not expire them. RUSTSEC-2023-0071 has
+          # `patched = []`: no fixed version of rsa exists at any MSRV.
+          #
+          # The two hickory advisories (RUSTSEC-2026-0118, `patched = []`, and
+          # RUSTSEC-2026-0119, `patched = [">= 0.26.1"]`) previously had triggers
+          # here. They are gone because the ENTRIES are gone: hickory-resolver is
+          # not a dependency of this workspace at any feature setting, so neither
+          # advisory is reported and neither may be accepted. That is asserted
+          # positively below rather than left to a trigger that could only ever
+          # print "still blocked" about an entry that does not exist.
           expired=''
           check_msrv_trigger() {
             floor="$1"
@@ -495,8 +520,21 @@ jobs:
             fi
           }
           check_msrv_trigger 85 'RUSTSEC-2026-0185' 'cargo update -p quinn-proto --precise 0.11.16, then delete the entry'
-          check_msrv_trigger 88 'RUSTSEC-2026-0119' 'cargo update -p hickory-resolver, then delete both hickory entries'
-          check_msrv_trigger 88 'RUSTSEC-2026-0118' 'cargo update -p hickory-resolver, then delete both hickory entries'
+
+          # The converse, so a removed entry cannot creep back unnoticed: while
+          # hickory-resolver is absent from the graph, an acceptance for either
+          # hickory advisory would be an exemption with nothing behind it.
+          for gone in 'RUSTSEC-2026-0118' 'RUSTSEC-2026-0119'; do
+            if grep -q "id = \"${gone}\"" deny.toml; then
+              echo "FAIL: ${gone} is accepted in deny.toml, but hickory-resolver is not in this graph."
+              echo 'An acceptance for an advisory nothing reports is an unchecked exemption. Either wire'
+              echo 'the dependency - and then justify the entry against a real, reported advisory - or'
+              echo 'delete the entry.'
+              exit 1
+            fi
+            echo "${gone}: correctly absent - hickory-resolver is not a dependency at any feature setting"
+          done
+
           if [ -n "${expired}" ]; then
             echo "FAIL: advisory acceptances have expired and must be deleted from deny.toml:${expired}"
             echo 'An acceptance justified only by the MSRV floor stops being justified the moment the floor moves.'
@@ -506,23 +544,28 @@ jobs:
           count="$(sed -n 's/^[[:space:]]*{[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' deny.toml | sort -u | wc -l)"
           echo "advisory acceptances: ${count}, each with a written justification and a removal condition"
 
-      - name: 'the default build contains none of the optional-feature advisories'
+      - name: 'the optional resolver stack is in NO graph, at any feature setting'
         run: |
-          # Two of the six acceptances - RUSTSEC-2026-0118 and
-          # RUSTSEC-2026-0119 - are reached only through hickory-resolver, an
-          # optional dependency behind the default-off `hickory-dns` feature.
-          # deny.toml says they are therefore absent from every artifact a
-          # default build produces. That claim is worth nothing unless something
-          # checks it, because a stray `default = [...]` edit, or any crate in
-          # the graph growing a non-optional dependency on the resolver, would
-          # silently move two accepted vulnerabilities into every shipped
-          # libcurl.so.4 while leaving the register looking unchanged.
+          # hickory-resolver would carry two advisories - RUSTSEC-2026-0118
+          # (`patched = []`; no fixed version exists) and RUSTSEC-2026-0119
+          # (`patched = [">= 0.26.1"]`, which ships only with hickory-resolver
+          # 0.26.x, declaring rust-version 1.88 against this workspace's 1.75
+          # floor). deny.toml therefore accepts NEITHER, on the stronger ground
+          # that the crate is in no graph at all rather than merely off by
+          # default.
+          #
+          # That is the claim this step checks, and it has to be checked because
+          # cargo-deny and cargo-audit read Cargo.lock rather than the active
+          # feature set: a single `optional = true` entry would put both
+          # advisories into every scan, DEFAULT builds included. Measured, not
+          # predicted - wiring 0.25.2 as an optional dependency moved
+          # `cargo deny check advisories` from ok to FAILED with the feature off.
           #
           # `cargo tree` with the default feature set resolves exactly what a
-          # default build compiles, so an empty result here IS the proof.
-          # --no-dev-dependencies keeps a test-only path from being mistaken for
-          # a shipped one, and both workspace members that produce artifacts are
-          # checked, not just the library.
+          # default build compiles, so an empty result here IS the proof, and the
+          # `--all-features` pass below extends it to every setting a user can
+          # select. Both workspace members that produce artifacts are checked,
+          # not just the library.
           status=0
           for pkg in curl-rs-lib curl-rs curl-rs-ffi; do
             found="$(cargo tree --locked --offline --package "${pkg}" \
@@ -538,26 +581,59 @@ jobs:
           done
           if [ "${status}" -ne 0 ]; then
             echo
-            echo 'RUSTSEC-2026-0118 and RUSTSEC-2026-0119 are accepted in deny.toml on the express'
-            echo 'grounds that no default artifact contains the affected code. Either restore'
-            echo 'hickory-dns to default-off, or re-justify both entries as unconditional.'
+            echo 'deny.toml accepts NEITHER hickory advisory, on the ground that the crate is in no'
+            echo 'graph at all. A resolver in the default graph makes that ground false and puts an'
+            echo 'unaccepted, unfixed advisory (RUSTSEC-2026-0118 has patched = []) into every shipped'
+            echo 'libcurl.so.4. Remove the dependency, or take one of the three decisions'
+            echo 'curl-rs-lib/Cargo.toml escalates beside the hickory-dns feature.'
             exit 1
           fi
 
-          # And the converse, so the feature is not a placebo either: enabling
-          # it must actually bring the resolver in. A feature a user can turn on
-          # and observe nothing from misdescribes the build, which is the defect
-          # this dependency was pinned to fix.
-          enabled="$(cargo tree --locked --offline --package curl-rs-lib \
-                       --features hickory-dns --edges normal --prefix none --no-dedupe 2>/dev/null \
-                     | grep -E '^hickory-resolver ' | sort -u || true)"
-          if [ -z "${enabled}" ]; then
-            echo 'FAIL: enabling hickory-dns does not pull hickory-resolver into the graph.'
-            echo 'The feature would be a no-op, which is exactly what the'
-            echo 'hickory-dns = [dep:hickory-resolver] declaration exists to prevent.'
-            exit 1
-          fi
-          echo "hickory-dns enabled resolves: ${enabled}"
+          # AND AT EVERY FEATURE SETTING, not just the default one. This is the
+          # stronger half, and it is the half a default-only check misses: the
+          # `hickory-dns` feature is DECLARED, so a user can turn it on, and the
+          # gate has to say what happens when they do.
+          #
+          # The answer is that it resolves nothing, deliberately. The feature is
+          # a reserved NAME whose engine is absent - curl-rs-lib/src/version.rs
+          # holds `ENGINE_DNS` as `Engine::absent`, so `curl --version` withholds
+          # the resolver token however the feature is set. That is the
+          # under-reporting AAP 0.6.5 calls safe, as against the over-reporting
+          # it calls fatal, and it is why the feature is neither a silent no-op
+          # nor a `compile_error!`: it builds, and it advertises nothing.
+          #
+          # This step therefore asserts ABSENCE under --all-features. Its earlier
+          # shape asserted the opposite - that enabling the feature must pull
+          # hickory-resolver in - and that assertion could not pass at this
+          # checkpoint, so the gate was red for a reason unconnected to any
+          # advisory. Flip it back only together with the dependency and the
+          # `ENGINE_DNS` row.
+          for pkg in curl-rs-lib curl-rs curl-rs-ffi; do
+            found="$(cargo tree --locked --offline --all-features --package "${pkg}" \
+                       --edges normal,build --prefix none --no-dedupe 2>/dev/null \
+                     | grep -E '^(hickory|ipconfig|resolv-conf|moka)' | sort -u || true)"
+            if [ -n "${found}" ]; then
+              echo "FAIL: ${pkg} resolves the optional resolver stack under --all-features:"
+              echo "${found}"
+              echo 'Both hickory advisories would then be reported and neither is accepted in deny.toml.'
+              exit 1
+            fi
+            echo "${pkg}: --all-features graph is free of the optional resolver stack"
+          done
+
+          # And the feature must remain DECLARED. Deleting it would shrink the
+          # fifteen-name vocabulary AAP 0.5.2 fixes, which the version banner,
+          # curl-rs-ffi/build.rs's capability table and curlinfo's table are all
+          # written against.
+          for member in curl-rs-lib curl-rs curl-rs-ffi; do
+            if ! grep -q '^hickory-dns = ' "${member}/Cargo.toml"; then
+              echo "FAIL: ${member}/Cargo.toml no longer declares the hickory-dns feature."
+              echo 'AAP 0.5.2 fixes the feature vocabulary at fifteen names. Withhold the capability'
+              echo 'through the engine registry, never by deleting the name.'
+              exit 1
+            fi
+          done
+          echo 'hickory-dns is declared by all three members and backed by no dependency, as intended'
 
       - name: 'cargo deny check -- advisories, licenses, bans, sources'
         run: |
@@ -765,9 +841,9 @@ jobs:
           # only through `ssh`. deny.toml says so in each reason; this step
           # checks it.
           #
-          # WHY IT MATTERS, AND WHAT IT DOES AND DOES NOT LICENCE. The review
-          # finding that produced this step asks for the affected features to be
-          # upgraded or disabled. Upgrading is measurably unavailable - every
+          # WHY IT MATTERS, AND WHAT IT DOES AND DOES NOT LICENCE. The
+          # remediation this step exists to report on is to upgrade or disable
+          # the affected features. Upgrading is measurably unavailable - every
           # fixing release of each of the four either declares a minimum newer
           # than the workspace floor or depends on release-candidate
           # cryptography, and deny.toml records the evidence per entry - and

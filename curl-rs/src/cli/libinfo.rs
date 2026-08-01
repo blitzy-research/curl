@@ -1670,23 +1670,31 @@ mod tests {
     /// the three `s`-suffixed ones, because a scheme with no module to
     /// implement it cannot be served whatever its feature says.
     ///
-    /// Restating both halves here rather than reading the engine's table back
-    /// makes this an independent cross-check of that table instead of a
-    /// tautology.
+    /// Building each row from the engine's `supports_*` predicates rather than
+    /// from the engine's `Protocols:` STRING keeps this an independent
+    /// cross-check instead of a tautology: the two are derived from the same
+    /// registry but assembled by different code, so a fault in the assembly is
+    /// still caught.
+    ///
+    /// The feature halves are deliberately NOT restated with `cfg!` here.
+    /// Doing so would make the expectation depend on `curl-rs`'s forwarded
+    /// feature copy, which a measured `--unit-graph` shows can differ from the
+    /// engine's -- so a divergent build would fail this test for a reason the
+    /// implementation was not wrong about.
     fn expected_schemes() -> Vec<&'static str> {
         const ENGINE: bool = version::ENGINE_PROTOCOLS.is_present();
-        const SECURE: bool = ENGINE && version::ENGINE_TLS.is_present();
+        const SECURE: bool = ENGINE && version::supports_tls();
 
         const GATED: &[(&str, bool)] = &[
             ("file", ENGINE),
-            ("ftp", cfg!(feature = "ftp") && ENGINE),
-            ("ftps", cfg!(feature = "ftp") && SECURE),
+            ("ftp", version::supports_ftp()),
+            ("ftps", version::supports_ftp() && SECURE),
             ("http", ENGINE),
             ("https", SECURE),
-            ("scp", cfg!(feature = "ssh") && ENGINE),
-            ("sftp", cfg!(feature = "ssh") && ENGINE),
-            ("ws", cfg!(feature = "websockets") && ENGINE),
-            ("wss", cfg!(feature = "websockets") && SECURE),
+            ("scp", version::supports_ssh()),
+            ("sftp", version::supports_ssh()),
+            ("ws", version::supports_websockets()),
+            ("wss", version::supports_websockets() && SECURE),
         ];
 
         GATED
@@ -1733,11 +1741,14 @@ mod tests {
         // against. While either engine is absent the same contract says the
         // set is empty, and both branches are asserted so neither reading is
         // left untested.
-        let full_features = cfg!(feature = "ftp")
-            && cfg!(feature = "ssh")
-            && cfg!(feature = "websockets");
-        let engines = version::ENGINE_PROTOCOLS.is_present()
-            && version::ENGINE_TLS.is_present();
+        // Asked of the engine, because the engine is what serves a scheme.
+        // A `cfg!` here would read this crate's forwarded feature copy, and a
+        // measured `--unit-graph` shows the two can differ.
+        let full_features = version::supports_ftp()
+            && version::supports_ssh()
+            && version::supports_websockets();
+        let engines =
+            version::ENGINE_PROTOCOLS.is_present() && version::supports_tls();
         if full_features && engines {
             assert_eq!(
                 advertised, IN_SCOPE_SCHEMES,
@@ -1755,25 +1766,25 @@ mod tests {
         // module's opinion of it: bound exactly when the name is advertised,
         // which is the feature and the engine together.
         let engine = version::ENGINE_PROTOCOLS.is_present();
-        let secure = engine && version::ENGINE_TLS.is_present();
+        let secure = engine && version::supports_tls();
         assert_eq!(info.proto_file(), engine.then_some("file"));
         assert_eq!(info.proto_http(), engine.then_some("http"));
         assert_eq!(info.proto_https(), secure.then_some("https"));
         assert_eq!(
             info.proto_ftp(),
-            (cfg!(feature = "ftp") && engine).then_some("ftp")
+            (version::supports_ftp() && engine).then_some("ftp")
         );
         assert_eq!(
             info.proto_ftps(),
-            (cfg!(feature = "ftp") && secure).then_some("ftps")
+            (version::supports_ftp() && secure).then_some("ftps")
         );
         assert_eq!(
             info.proto_scp(),
-            (cfg!(feature = "ssh") && engine).then_some("scp")
+            (version::supports_ssh() && engine).then_some("scp")
         );
         assert_eq!(
             info.proto_sftp(),
-            (cfg!(feature = "ssh") && engine).then_some("sftp")
+            (version::supports_ssh() && engine).then_some("sftp")
         );
 
         // rtsp and tftp keep their table rows (src/tool_libinfo.c:57,64) and
@@ -1785,7 +1796,7 @@ mod tests {
         // ws and wss have no dedicated token -- they are not in the nine-row
         // table -- yet they still tokenize, because proto_token searches the
         // engine's full list (src/tool_libinfo.c:200-210).
-        let ws = cfg!(feature = "websockets");
+        let ws = version::supports_websockets();
         assert_eq!(
             info.proto_token(Some("ws")),
             (ws && engine).then_some("ws")
@@ -1831,11 +1842,10 @@ mod tests {
         // crate merely forwards `negotiate = ["curl-rs-lib/negotiate"]`, and
         // Cargo allows the engine's feature to be enabled on its own
         // (`--features curl-rs-lib/negotiate`), in which case a local `cfg!`
-        // reads false while the engine genuinely has the capability. An earlier
-        // revision asserted against the local `cfg!` and failed in exactly that
-        // configuration -- a cross-crate `cfg!` cannot decide another crate's
-        // capability, which is the same mistake M-02 removes from the
-        // diagnostic and banner surfaces.
+        // reads false while the engine genuinely has the capability. Asserting
+        // against the local `cfg!` fails in exactly that configuration -- a
+        // cross-crate `cfg!` cannot decide another crate's capability, the
+        // same mistake the diagnostic and banner surfaces avoid.
         for name in ["GSS-API", "SPNEGO", "Kerberos"] {
             assert_eq!(
                 names.contains(&name),
@@ -1965,11 +1975,13 @@ mod tests {
 
     #[test]
     fn self_reported_name_is_curl() {
-        // src/tool_version.h:28 -- CURL_NAME is "curl" even though the Cargo
-        // binary is named curl-rs. Nothing in this module derives identity
-        // from package metadata, from the binary name, from the zeroth
-        // argument or from a platform constant; all of them are excluded,
-        // because the default User-Agent is byte-compared by 1,476 fixtures.
+        // src/tool_version.h:28 -- CURL_NAME is "curl". The Cargo PACKAGE is
+        // named curl-rs and its primary [[bin]] target is named `curl`, so the
+        // two happen to agree today; that agreement is deliberately NOT relied
+        // on. Nothing in this module derives identity from package metadata,
+        // from the binary name, from the zeroth argument or from a platform
+        // constant, because the default User-Agent is byte-compared by 1,476
+        // fixtures and must not move if a target name ever does.
         assert_eq!(version::CURL_NAME, "curl");
     }
 
@@ -2072,5 +2084,200 @@ mod tests {
                 row.feature_name
             );
         }
+    }
+}
+
+/// A structural gate forbidding `cfg!(feature = ...)` anywhere in this file.
+///
+/// This module answers what the LIBRARY serves -- the `Protocols:` and
+/// `Features:` lines the test harness parses -- and a `cfg!` compiled into
+/// `curl-rs` cannot answer that. Feature forwarding does not make it safe:
+/// building `-p curl-rs -p curl-rs-ffi --features curl-rs-ffi/negotiate` and
+/// reading cargo's `--unit-graph` shows `curl_rs_lib` compiled once with
+/// `negotiate` ENABLED while this crate's units are compiled with it DISABLED.
+/// Forwarding is one-directional: `--features curl-rs/ftp` implies the
+/// engine's, but `--features curl-rs-lib/ftp` enables the engine's alone.
+///
+/// Because a non-divergent build makes a local `cfg!` and the engine's
+/// predicate agree, no behavioural test can catch a regression here -- which is
+/// how the defect survived review in the first place. So the property is
+/// asserted against the source text.
+///
+/// The helpers are duplicated from the equivalent gate in
+/// `curl-rs/src/bin/curlinfo.rs` rather than shared, because `curl-rs` declares
+/// two `[[bin]]` targets and no `[lib]`: the two files compile into separate
+/// crates and have no module path between them. Sharing would mean adding a
+/// library target purely to host a test helper.
+#[cfg(test)]
+mod no_local_feature_tests {
+    /// This file's own text; `include_str!` resolves relative to this file.
+    const SOURCE: &str = include_str!("libinfo.rs");
+
+    /// The construct that must not appear in code.
+    ///
+    /// Deliberately the feature TEST rather than the `cfg!` macro, so that one
+    /// rule covers every spelling: `cfg!(feature = "x")`,
+    /// `#[cfg(feature = "x")]`, `#[cfg(not(feature = "x"))]` and
+    /// `#[cfg(all(feature = "x", ...))]` are the same cross-crate mistake, and
+    /// the attribute forms are the easier ones to miss because they do not read
+    /// like a capability decision at all. Three `#[cfg(not(feature = ...))]`
+    /// test gates were removed from this crate for exactly that reason.
+    ///
+    /// The trailing quote is deliberately NOT part of the token. [`code_only`]
+    /// replaces each string literal with a space, so by the time a line reaches
+    /// the comparison, `cfg!(feature = "x")` reads `cfg!(feature =  )` and the
+    /// quote is already gone -- a token spelled with it would match nothing and
+    /// the gate would pass vacuously forever. `feature =` is sound here because
+    /// neither guarded file contains any other use of it in code, which
+    /// [`the_gate_is_not_vacuous`] keeps honest from the other direction.
+    const FORBIDDEN: &str = "feature =";
+
+    /// `line` with its trailing `//` comment and every string literal removed.
+    ///
+    /// Literals collapse to a space so stripping cannot fuse two adjacent
+    /// tokens into one.
+    fn code_only(line: &str) -> String {
+        let without_comment = line.split("//").next().unwrap_or("");
+        let mut out = String::with_capacity(without_comment.len());
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for ch in without_comment.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if ch == '"' {
+                in_string = true;
+                out.push(' ');
+                continue;
+            }
+            out.push(ch);
+        }
+
+        out
+    }
+
+    /// Whether `text` opens a raw string literal in CODE.
+    ///
+    /// A bare `contains("r\"")` would be wrong: it also matches a plain literal
+    /// that merely ENDS in the letter `r`, and adding a token-boundary rule
+    /// still matches the construct written inside a comment. Both cases occur in
+    /// the sibling gate's own text, so this tracks comment and literal state.
+    fn opens_raw_string(text: &str) -> bool {
+        for line in text.lines() {
+            let bytes = line.as_bytes();
+            let mut index = 0;
+            let mut in_string = false;
+
+            while index < bytes.len() {
+                let byte = bytes[index];
+
+                if in_string {
+                    match byte {
+                        b'\\' => index += 1,
+                        b'"' => in_string = false,
+                        _ => {}
+                    }
+                    index += 1;
+                    continue;
+                }
+                if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                    break;
+                }
+                if byte == b'"' {
+                    in_string = true;
+                    index += 1;
+                    continue;
+                }
+                if byte == b'r' {
+                    let starts_token = index == 0
+                        || !(bytes[index - 1].is_ascii_alphanumeric()
+                            || bytes[index - 1] == b'_');
+                    let hashed = bytes.get(index + 1) == Some(&b'#')
+                        && bytes.get(index + 2) == Some(&b'"');
+
+                    if starts_token
+                        && (bytes.get(index + 1) == Some(&b'"') || hashed)
+                    {
+                        return true;
+                    }
+                }
+                index += 1;
+            }
+        }
+
+        false
+    }
+
+    /// A `//` inside a raw string literal would truncate a line early and let
+    /// the gate miss code after it. This file contains no raw string literal,
+    /// and this test keeps that true rather than trusting it.
+    #[test]
+    fn the_gate_sees_no_raw_strings() {
+        assert!(
+            !opens_raw_string(SOURCE),
+            "a raw string literal would blind `code_only`; if one is added, \
+             teach the stripper about it rather than deleting this test"
+        );
+    }
+
+    /// The gate itself.
+    #[test]
+    fn no_capability_is_decided_by_this_crates_own_features() {
+        let offenders: Vec<usize> = SOURCE
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| code_only(line).contains(FORBIDDEN))
+            .map(|(index, _)| index + 1)
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "libinfo.rs decides a capability from its OWN feature set at \
+             line(s) {offenders:?}. Ask `curl_rs_lib::version` instead: a \
+             forwarded feature can be enabled on the engine alone, and then \
+             this crate's copy reads false while the linked library plainly \
+             has the capability."
+        );
+    }
+
+    /// The gate and its helpers must be able to fail.
+    #[test]
+    fn the_gate_is_not_vacuous() {
+        assert!(
+            code_only("        cfg!(feature = \"ftp\")").contains(FORBIDDEN),
+            "the macro form must be caught"
+        );
+        assert!(
+            code_only("    #[cfg(feature = \"ftp\")]").contains(FORBIDDEN),
+            "the plain attribute form must be caught"
+        );
+        assert!(
+            code_only("    #[cfg(not(feature = \"ftp\"))]").contains(FORBIDDEN),
+            "the negated attribute form must be caught -- this is the one \
+             that was actually present and actually missed"
+        );
+        assert!(
+            !code_only("        // cfg!(feature = \"ftp\") in prose")
+                .contains(FORBIDDEN),
+            "a comment must not trip the gate"
+        );
+        assert!(
+            !code_only("        let s = \"cfg!(feature = x\";")
+                .contains(FORBIDDEN),
+            "a string literal must not trip the gate"
+        );
+        assert!(opens_raw_string("let s = r\"x\";"), "a real prefix");
+        assert!(
+            !opens_raw_string("panic!(\"a literal ending in r\");"),
+            "a literal ending in the letter r is not a prefix"
+        );
     }
 }

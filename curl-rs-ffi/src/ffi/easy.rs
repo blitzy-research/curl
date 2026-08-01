@@ -1,3 +1,7 @@
+// Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+//
+// SPDX-License-Identifier: curl
+
 //! The `curl_easy_*` option-introspection exports.
 //!
 //! Supersedes `lib/easygetopt.c`.
@@ -66,10 +70,14 @@ use super::types::curl_easyoption;
 const ROWS: usize = EASY_OPTION_ROWS;
 
 // Asserts at compile time that the constant above really does describe
-// `EASY_OPTIONS`. `EASY_OPTION_ROWS` is a hand-written constant in `opts.rs`
-// (checked there against `lib/optiontable.pl`), and this is the second,
-// independent check that it matches the table it counts. The binding is
-// anonymous so that the assertion needs no reference to keep it alive.
+// `EASY_OPTIONS`. `EASY_OPTION_ROWS` is now DERIVED from that table --
+// `EASY_OPTIONS.len()` -- and pinned in `opts.rs` by a `const` assertion
+// against `lib/optiontable.pl`'s measured 324 rows, so this assertion can no
+// longer fail. It is retained deliberately rather than deleted: it is what
+// makes the array length below provably the table length AT THIS USE SITE,
+// and it is the check that would fire first if the authority were ever
+// reverted to a transcribed literal. The binding is anonymous so that the
+// assertion needs no reference to keep it alive.
 const _: () = assert!(EASY_OPTIONS.len() == ROWS);
 
 /// The value every field of an unwritten projection slot holds before

@@ -58,7 +58,7 @@
 # the pins in place BOTH PACKAGES ARE ABSENT FROM THE LOCKFILE ENTIRELY, so the
 # workaround that absence makes unnecessary is worth naming: `--no-deps` would
 # also sidestep a dependency manifest cargo cannot parse, but on this tree the
-# FULL form succeeds - `cargo +1.75.0 metadata --locked --offline` over the 321
+# FULL form succeeds - `cargo +1.75.0 metadata --locked --offline` over the 320
 # locked packages exits 0 and reports zero declaring a rust-version above 1.75
 # and zero with an edition above 2021. The tightest declaration in the lock is
 # 1.75 itself, held by this workspace's three crates and by russh 0.54.5 with
@@ -74,7 +74,7 @@
 # Per-target confirmation as well, which is the sufficient condition rather than
 # the necessary one. Filtering the graph with `--filter-platform` over each of
 # the four mandated triples, with and without the implementable feature set,
-# gives eight graphs of 258 to 261 packages whose maximum declared
+# gives eight graphs of 257 to 261 packages whose maximum declared
 # rust-version is 1.75 in every case - this workspace's own three crates,
 # nothing above them - and none of the eight contains an edition-2024
 # package:
@@ -88,12 +88,13 @@
 #                    --features "$FEATS"
 #   done
 #
-# The explicit fourteen-name list is used INSTEAD OF `--all-features`, and
-# deliberately so: `hickory-dns` is a reserved name that no crate can currently
-# back, and enabling it is a hard build failure raised in
-# curl-rs-lib/src/lib.rs. Cargo offers no "all features except one" selector, so
-# the implementable set is enumerated. The root Cargo.toml records the
-# measurement behind that reservation.
+# The list above may equally be replaced by `--all-features`, which this
+# workspace passes. `hickory-dns` is a declared name that no crate currently
+# backs, but enabling it builds and advertises nothing - the capability is
+# withheld through the absent `ENGINE_DNS` row in curl-rs-lib/src/version.rs
+# rather than through a build failure - so no "all features except one" selector
+# is needed. The root Cargo.toml records the measurement behind the missing
+# dependency.
 #
 # WHAT THE MEASUREMENT DOES NOT ESTABLISH, so it is not overread: the workspace
 # members are only partly delivered at this commit. The floor is verified for
@@ -102,15 +103,16 @@
 # than 1.75. A one-off run is the wrong instrument for that; the four-target
 # build matrix and `clippy::incompatible_msrv` are the right ones.
 #
-# Earlier revisions of Cargo.toml, clippy.toml, curl-rs/Cargo.toml and
-# curl-rs-ffi/Cargo.toml described a looser resolution - 46 packages above 1.75,
-# a floor of 1.88, home 0.5.12 pulled in by russh, clap_lex 1.1.0 as an
-# edition-2024 crate. Every one of those figures is refuted by the committed
+# A looser resolution is frequently quoted for this workspace - 46 packages
+# above 1.75, a floor of 1.88, home 0.5.12 pulled in by russh, clap_lex 1.1.0 as
+# an edition-2024 crate. Every one of those figures is refuted by the committed
 # lock, which resolves home 0.5.9 (rust-version 1.70.0) and clap_lex 1.0.1
 # (1.74) - but they are an accurate description of what a FRESH RESOLVE still
 # produces, because russh asks for `home ^0.5` and clap_builder for
-# `clap_lex ^1.0.0` and both ranges admit the edition-2024 releases. The pins
-# were tightened after that stale measurement was written (russh 0.54.5,
+# `clap_lex ^1.0.0` and both ranges admit the edition-2024 releases. Quoting
+# either number without saying which of the two graphs it describes is the
+# mistake to avoid. The pins were tightened after that measurement (russh
+# 0.54.5,
 # home 0.5.9, quinn-proto 0.11.14, icu_normalizer 1.5.0), the committed lockfile
 # is the only thing holding them there, and all five files now agree.
 #
@@ -135,15 +137,16 @@
 #     .github/workflows/rust-miri.yml, undefined-behaviour gate. DELIVERED.
 #   cargo +nightly build -Zbuild-std -Zsanitizer=address
 #     AddressSanitizer over the FFI surface,
-#     .github/workflows/rust-asan.yml. DELIVERED. Earlier revisions of this
-#     note, on both sides of it, described that workflow as still owed; it is
-#     on disk, and it installs its own dated nightly with rust-src for exactly
-#     the reason given below.
+#     .github/workflows/rust-asan.yml. DELIVERED - it is on disk, and it
+#     installs its own dated nightly with rust-src for exactly the reason
+#     given below.
 # Both of those legs also need rust-src, which is precisely why rust-src is
 # absent from `components` below: it belongs to the nightly toolchain they
 # install for themselves, not to the stable toolchain that builds and ships.
-# The delivered Rust workflows at this commit are exactly rust-build.yml,
-# rust-clippy.yml, rust-miri.yml and rust-audit.yml, alongside hygiene.yml.
+# The delivered Rust workflows at this commit are all nine gate workflows -
+# rust-build.yml, rust-clippy.yml, rust-test.yml, rust-miri.yml, rust-asan.yml,
+# rust-coverage.yml, rust-audit.yml, rust-abi.yml and curl-testsuite.yml -
+# alongside hygiene.yml, which is ten files under `.github/workflows/`.
 #
 # One open item bears directly on this line. The FFI shim reaches curl's four
 # variadic entry points - curl_easy_setopt, curl_easy_getinfo,

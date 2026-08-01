@@ -18,8 +18,8 @@
 //! call the engine's `message_for_c` for that family, and return the pointer.
 //! The 165 message strings live in `curl-rs-lib/src/error.rs` beside the
 //! discriminants they belong to, because a second copy in the ABI shim would
-//! be a mirrored source of truth -- exactly the defect review finding M-22 was
-//! filed against elsewhere in this crate. The engine appends the NUL at
+//! be a mirrored source of truth, which is the defect this layout avoids.
+//! The engine appends the NUL at
 //! compile time with `concat!`, so the pointer this file returns addresses a
 //! `&'static CStr` that costs nothing to produce and can never disagree with
 //! what a Rust caller sees.

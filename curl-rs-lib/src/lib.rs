@@ -106,6 +106,11 @@
 
 //! curl and libcurl: the protocol engine, in safe Rust.
 //!
+//! Comments throughout this crate cite `AAP <section>` -- the frozen
+//! migration specification that this implementation is measured against.
+//! Its section numbers are stable, and a citation marks a decision the
+//! specification fixes rather than one this code is free to change.
+//!
 //! This crate is the whole of libcurl's behaviour and the only crate in the
 //! workspace with protocol knowledge. The two crates beside it are thin
 //! adapters over this one and contain no protocol logic:
@@ -454,7 +459,7 @@
 //! AddressSanitizer continuous-integration legs, which name it per
 //! invocation.
 
-// FEATURE-SET PRECONDITION -- the one reserved-but-unimplementable name.
+// FEATURE-SET NOTE -- the one declared name with no crate behind it.
 //
 // `hickory-dns` is part of the fifteen-name feature vocabulary the plan
 // fixes, and it must stay in that vocabulary: the `Features:` banner in
@@ -462,10 +467,10 @@
 // `curlinfo`'s 29-entry table are all written against those fifteen names,
 // and deleting one would silently change three self-description surfaces.
 //
-// But no crate can currently back it, and the failure below exists so that
-// asking for it is IMPOSSIBLE TO MISS. The option space was measured from
-// the registry index, sorted by parsed semantic version, and the two halves
-// are disjoint:
+// The feature therefore EXISTS, is default-off, BUILDS, and advertises
+// nothing. It carries no dependency, and the option space that explains why
+// was measured from the registry index, sorted by parsed semantic version.
+// The two halves are disjoint:
 //
 //   hickory-resolver 0.24.0-0.25.2  clear the workspace MSRV (they declare
 //     1.67.0-1.71.1) but require hickory-proto ^0.24 / ^0.25, and every
@@ -482,42 +487,42 @@
 // report `advisories FAILED` on a DEFAULT build with the feature off. That
 // was measured, not predicted.
 //
-// WHY A HARD ERROR RATHER THAN A NO-OP. The previous shape of this feature
-// was `hickory-dns = []` - a bare cfg switch with nothing behind it - so
-// enabling it changed nothing at all while the documentation promised an
-// alternate resolver. Under the plan's own truthfulness rule,
-// over-reporting a capability is the named failure mode and under-reporting
-// is safe, so a silent success is the one outcome that must not happen. A
-// build that stops here is unambiguous and self-explaining.
+// HOW THE CAPABILITY IS WITHHELD, AND WHY NOT WITH A BUILD FAILURE.
 //
-// CONSEQUENCE FOR CI, stated so it is not discovered by surprise:
-// `--all-features` necessarily trips this error, and Cargo has no
-// "all features except one" selector. The feature-matrix legs therefore
-// enumerate the fourteen implementable features explicitly rather than
-// passing `--all-features`. That is the correct reading and not a
-// workaround - "all features" is not a meaningful configuration while one
-// of them is reserved.
+// The requirement is the truthfulness rule of AAP 0.6.5: over-reporting a
+// capability is the fatal failure mode, under-reporting is merely a skip.
+// So enabling this feature must NOT make `curl --version` name a resolver
+// that is not in the build. There are three ways to satisfy that and only
+// one of them is right.
 //
-// Delete this block, and only this block, when a hickory-resolver release
-// exists whose hickory-proto requirement admits >= 0.26.1 AND whose
-// declared rust-version satisfies this workspace's floor. Wire the
-// dependency in the root manifest at the same time.
-#[cfg(feature = "hickory-dns")]
-compile_error!(
-    "feature `hickory-dns` is reserved but not implementable at the pinned \
-     dependency set, and is deliberately a build failure rather than a \
-     silent no-op. Every hickory-resolver release that satisfies the \
-     workspace MSRV (0.24.0 through 0.25.2) requires a hickory-proto \
-     affected by RUSTSEC-2026-0119, and every release carrying that fix \
-     (0.26.0, 0.26.1) declares rust-version 1.88 and breaks the MSRV. \
-     Because cargo-deny and cargo-audit read Cargo.lock rather than the \
-     active feature set, declaring the crate as an optional dependency \
-     would add the advisory to every build, including default builds with \
-     this feature off. Build without this feature: the system resolver is \
-     the mandated default, and `dns::resolver` is where it belongs when that \
-     module lands -- it is not on disk at this checkpoint, so nothing is \
-     lost by refusing the alternative here."
-);
+//   * A bare `hickory-dns = []` cfg switch that the banner still keys off.
+//     WRONG, and it is what this feature used to be: enabling it added
+//     `hickory-resolver/0.25.2` to the banner with nothing behind it. That
+//     is over-reporting, the one outcome AAP 0.6.5 forbids.
+//   * `compile_error!` on the feature. Also wrong, and it is what this block
+//     used to contain. It converts a DECLARED feature into a hard build
+//     failure, which makes `--all-features` impossible for a workspace whose
+//     own `deny.toml` sets `all-features = true`, forces four workflows to
+//     enumerate fourteen feature names in lockstep instead, and breaks
+//     `rust-audit.yml`'s check that an enabled feature actually resolves
+//     something. A declared-but-unbuildable feature is a defect in its own
+//     right, not a safety measure.
+//   * `configured && implementation_ready`, which is the rule this workspace
+//     already applies to every other capability
+//     (`version.rs`: `compiled_in = configured && engine.is_present()`).
+//     `ENGINE_DNS` is `Engine::absent("curl-rs-lib/src/dns/resolver.rs")`,
+//     so `version_parts` withholds the resolver token no matter how the
+//     feature is set, and the feature compiles to nothing observable. This
+//     is under-reporting, which is safe.
+//
+// The third is what is implemented. The feature is a reserved NAME whose
+// engine is absent, recorded in exactly the same registry as the other
+// thirty-odd absent capabilities rather than in a special case here.
+//
+// Wire the dependency in the root manifest, and flip `ENGINE_DNS` to
+// `present`, when a hickory-resolver release exists whose hickory-proto
+// requirement admits >= 0.26.1 AND whose declared rust-version satisfies
+// this workspace's floor. Nothing in this file needs to change then.
 
 // MODULE INVENTORY -- 9 declarations, with the rest of the graph mapped below.
 //
@@ -1232,7 +1237,7 @@ pub use crate::version::{
 // enforcement, and a private path cannot be named from another crate.
 //
 // This is the standard private-module / public-re-export idiom, and it is
-// the whole of review finding M-13's resolution: WITHOUT this line the facade
+// load-bearing: WITHOUT this line the facade
 // would have to reimplement `lib/parsedate.c`, putting engine logic in a
 // crate whose stated job is the C ABI and nothing else. WITH it, the adapter
 // converts a `*const c_char` to a `&str`, calls this, and maps `None` to
@@ -1262,24 +1267,34 @@ pub use crate::util::parsedate::getdate;
 // internal comparators and no other crate has any business calling them.
 pub use crate::util::strcase::{strequal, strnequal};
 
-// The extended-attribute primitive and its capability predicate. Re-exported
-// for the same reason and by the same idiom as `getdate` above: they are the
-// two items in the `pub(crate) mod ffi` tree that a caller OUTSIDE this crate
-// reaches directly, and `ffi` is crate-private by enforcement.
+// THE EXTENDED-ATTRIBUTE PRIMITIVE IS NOT RE-EXPORTED HERE, and the absence is
+// deliberate rather than an omission.
 //
-// The caller is `curl-rs`, not `curl-rs-ffi`. `src/tool_xattr.c`'s `--xattr`
-// support belongs to the command-line tool, but its platform call has no safe
-// expression: `std` exposes no extended-attribute API, no such crate is among
-// the pins of specification 0.5.1, and `curl-rs/src/main.rs` carries
-// `#![forbid(unsafe_code)]` with no `mod ffi` to place a raw call behind. The
-// call therefore lives in this crate's one unsafe island and is reached from
-// there -- which is precisely the arrangement the tool's own module
-// documentation prescribed.
+// `pub use crate::ffi::sys::{set_fd_xattr, xattr_available};` stood here. Both
+// names were public, documented as the way `curl-rs` reaches `--xattr` support,
+// and consumed by nothing whatever -- the only mention of either outside its own
+// definition was a doctest. What the tool actually consumes is `set_file_xattr`,
+// in the platform-facade list below, and what decides whether to call it is
+// `version::supports_xattr`. Two more public names for the same capability were
+// two more ways for the answer to differ from itself.
 //
-// Deliberately TWO names, not the module. `pub use crate::ffi::sys;` would
-// expose the hostname query, the interface snapshot, the zone-id lookup and
-// the counting allocator, none of which any other crate needs.
-pub use crate::ffi::sys::{set_fd_xattr, xattr_available};
+// So the surface is now exactly one function and one predicate:
+//
+//   * `set_file_xattr` -- below, with the rest of the platform facade. It takes
+//     `BorrowedFd<'_>` and `&[u8]` names, and applies the `strlen(value)`
+//     measurement `src/tool_xattr.c:88-92` applies, which the withdrawn
+//     `set_fd_xattr` did not.
+//   * `version::supports_xattr` -- the engine-owned capability query, which
+//     answers from `ffi::sys::xattr_available` through the crate-internal path.
+//     `xattr_available` is `pub(crate)` accordingly: it has a real consumer, and
+//     that consumer is inside this crate.
+//
+// `set_fd_xattr` is gone rather than merely narrowed. A `pub(crate)` function
+// with no caller is dead code, and this one brought a second `unsafe`
+// implementation of `fsetxattr` with it: `SysCalls::fsetxattr` and
+// `XattrCalls::fsetxattr` were two seams, two `RealSys` impls and two SAFETY
+// blocks for one syscall. Removing the unused path removes one of them, which is
+// the direction AAP section 0.6.9 requires the unsafe surface to move in.
 // THE PLATFORM FACADE -- six functions and one guard, and the only names from
 // `mod ffi` that leave this crate.
 //
@@ -1375,11 +1390,29 @@ pub use crate::util::os_error_message;
 //    `unsafe` island, and each wrapper narrows what it exposes so that no
 //    `pub(crate)` type ever reaches a public signature.
 //
-// WHAT NEITHER SHAPE EXPOSES: no `libc` type and no raw pointer anywhere.
-// `RawFd` is `std::os::unix::io::RawFd`, a standard-library alias for `i32`.
-// The `unsafe` blocks are reachable from outside this crate only through these
-// ten names -- eleven with `memdebug` -- and each of them forms the raw pointer
-// it needs, uses it and drops it inside a single call.
+// WHAT NEITHER SHAPE EXPOSES: no `libc` type, no raw pointer and no raw
+// descriptor integer anywhere. The `unsafe` blocks are reachable from outside
+// this crate only through these ten names -- eleven with `memdebug` -- and each
+// of them forms the raw pointer it needs, uses it and drops it inside a single
+// call.
+//
+// EVERY DESCRIPTOR CROSSES AS `BorrowedFd<'_>`, NOT `RawFd`. The three
+// descriptor functions below took `std::os::unix::io::RawFd` -- a
+// standard-library alias, which is why it looked acceptable. It is not, and the
+// reason is the one thing an alias for `i32` cannot do: a descriptor integer
+// carries no lifetime, so nothing stops a caller passing one whose file has
+// already been closed, and nothing stops the kernel having reissued that same
+// number for an unrelated file in between. The call would then succeed against
+// the wrong file. `BorrowedFd<'_>` makes the borrow the compiler's business:
+// the descriptor provably outlives the call, and the integer is formed only
+// inside the island, at the `libc::` call itself.
+//
+// The caller already held the safe form. `curl-rs/src/output/formparse.rs`
+// reaches its descriptor through `io::Stdin::as_fd`, so passing `RawFd` meant
+// degrading a `BorrowedFd` to an integer at the call site and taking the
+// weaker guarantee for no gain. It now passes what it holds. `set_file_xattr`
+// took `BorrowedFd<'_>` from the start, so this makes the facade uniform rather
+// than introducing a new convention.
 
 /// The extent of `fd` when it is a regular file that can be read lazily.
 ///
@@ -1391,7 +1424,9 @@ pub use crate::util::os_error_message;
 /// C's compound condition collapses into its "buffer it instead" branch at
 /// `:140`: a pipe, a socket, a terminal, a directory, a closed descriptor and an
 /// unseekable one alike. A caller that receives [`None`] must buffer.
-pub fn regular_file_extent(fd: std::os::unix::io::RawFd) -> Option<(i64, i64)> {
+pub fn regular_file_extent(
+    fd: std::os::fd::BorrowedFd<'_>,
+) -> Option<(i64, i64)> {
     crate::ffi::regular_file_extent(fd)
 }
 
@@ -1413,7 +1448,7 @@ pub fn regular_file_extent(fd: std::os::unix::io::RawFd) -> Option<(i64, i64)> {
 /// Whatever `read(2)` reports: a closed or unreadable descriptor, or an
 /// interruption.
 pub fn read_file_descriptor(
-    fd: std::os::unix::io::RawFd,
+    fd: std::os::fd::BorrowedFd<'_>,
     buf: &mut [u8],
 ) -> std::io::Result<usize> {
     crate::ffi::read_fd(fd, buf)
@@ -1434,7 +1469,7 @@ pub fn read_file_descriptor(
 /// Whatever `lseek(2)` reports. An unseekable descriptor is the case
 /// `src/tool_formparse.c:245` turns into `CURL_SEEKFUNC_CANTSEEK`.
 pub fn seek_file_descriptor(
-    fd: std::os::unix::io::RawFd,
+    fd: std::os::fd::BorrowedFd<'_>,
     offset: i64,
 ) -> std::io::Result<()> {
     crate::ffi::seek_fd(fd, offset)
@@ -1465,7 +1500,7 @@ pub fn memdebug_init_from_env() -> bool {
 // the implementation is `pub(crate)` in a `pub(crate) mod`, and `curl-rs` is a
 // separate crate that cannot reach it.
 //
-// F25 spans three files that each render attacker-influenced text --
+// The rule spans three files that each render attacker-influenced text --
 // `curl-rs-lib/src/trace.rs`, `curl-rs-lib/src/tls/cipher_suite.rs` and
 // `curl-rs/src/output/msgs.rs`. The first two are inside this crate and call
 // `crate::trace::escape_controls` directly; only the third needs a bridge, so
@@ -2146,6 +2181,93 @@ mod source_policy {
             }
         }
         false
+    }
+
+    /// The C scalar widths live only in the FFI island.
+    ///
+    /// `core::ffi::c_int`, `c_uint` and `c_long` are the widths a C compiler
+    /// chose, and letting them into the engine's own types makes a native-width
+    /// assumption part of the engine API. The engine therefore speaks in
+    /// fixed-width Rust integers and the `c_*` spellings appear only where a
+    /// real C boundary is being crossed: `curl-rs-lib/src/ffi/`, the sanctioned
+    /// island, and `curl-rs-ffi`, which owns the ABI.
+    ///
+    /// This is not a distinction without a difference even though the two
+    /// coincide on all four targets of specification 0.8.3. The widths in
+    /// `include/curl/curl.h` are fixed by curl's ABI, not by the compiler, so
+    /// stating them as `i32` and `u32` records the contract; `c_int` records a
+    /// platform. The gate exists because the coincidence means a reintroduced
+    /// `c_int` would compile silently and never be noticed.
+    ///
+    /// Scoped to this crate. `curl-rs-ffi` is where the conversions belong, and
+    /// `curl-rs` is checked by its own gates for its own invariants.
+    #[test]
+    fn c_scalar_types_appear_only_inside_the_ffi_island() {
+        // The `ffi` directory is the one place in this crate permitted to name
+        // a C width, because it is the one place that calls C.
+        let island =
+            workspace_root().join("curl-rs-lib").join("src").join("ffi");
+
+        // Word-bounded so that an identifier merely CONTAINING one of these --
+        // `as_c_int`, `from_c_int`, both of which are method names kept for
+        // symmetry with the FFI crate -- is not mistaken for a type use.
+        const WIDTHS: [&str; 3] = ["c_int", "c_uint", "c_long"];
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut island_uses = 0usize;
+
+        for path in sources("curl-rs-lib") {
+            let inside_island = path.starts_with(&island);
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+            for (number, line) in text.lines().enumerate() {
+                let code = code_only(line);
+                for width in WIDTHS {
+                    if !mentions_word(&code, width) {
+                        continue;
+                    }
+                    if inside_island {
+                        island_uses += 1;
+                    } else {
+                        offenders.push(format!(
+                            "{}:{} names {width}",
+                            path.display(),
+                            number + 1
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "the engine must speak in fixed-width integers; \
+             move the conversion to curl-rs-ffi:\n{}",
+            offenders.join("\n")
+        );
+
+        // Non-vacuity: the island really does use them, so a scan that found
+        // nothing anywhere would be a broken scan rather than a clean bill.
+        assert!(
+            island_uses > 0,
+            "no C width found even inside src/ffi -- the gate is not scanning"
+        );
+    }
+
+    /// True when `haystack` contains `word` delimited by non-identifier bytes.
+    ///
+    /// Rust identifiers are `[A-Za-z0-9_]`, so `as_c_int` must not count as a
+    /// use of `c_int`: the byte before `c` is `_`, which is an identifier byte.
+    fn mentions_word(haystack: &str, word: &str) -> bool {
+        let bytes = haystack.as_bytes();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        haystack.match_indices(word).any(|(at, _)| {
+            let before_ok = at == 0 || !ident(bytes[at - 1]);
+            let end = at + word.len();
+            let after_ok = end == bytes.len() || !ident(bytes[end]);
+            before_ok && after_ok
+        })
     }
 
     #[test]

@@ -77,10 +77,10 @@ publish = false
 #
 # The inherited edition and MSRV come from AAP 0.8.3, which preserves the
 # directive verbatim: "Rust edition 2021, MSRV 1.75." That floor is MEASURED
-# AND MET. An earlier revision of this comment claimed the opposite - that
-# home 0.5.12 forced the edition2024 cargo feature and that 46 of 327 locked
-# crates exceeded 1.75, giving a lowest reachable value of 1.88 - and every
-# part of that is refuted by the committed lockfile: it resolves home 0.5.9
+# AND MET. The contrary claim - that home 0.5.12 forces the edition2024 cargo
+# feature and that 46 of 327 locked crates exceed 1.75, giving a lowest
+# reachable value of 1.88 - is refuted in every part by the committed
+# lockfile: it resolves home 0.5.9
 # (declared rust-version 1.70.0), and filtering the graph by each of the four
 # mandated targets, with and without the implementable feature set, yields a
 # maximum declared rust-version of 1.75 in all eight cases, that maximum being
@@ -215,7 +215,7 @@ cbindgen = { workspace = true }
 # (cbindgen-0.29.4/src/main.rs:323-328). Used as a library, `log`'s default
 # no-op logger discards every one of the 36 warn!/error! records in
 # src/bindgen/ and `generate()` returns Ok -- the measured fail-open behind
-# review finding C-04, where a live run warned "can't find mod ffi", exited 0
+# measured: a live run warned "can't find mod ffi", exited 0
 # and emitted a header containing neither CURLE_OK nor curl_easy_init.
 #
 # This adds a dependency EDGE and no new package: cbindgen already depends on

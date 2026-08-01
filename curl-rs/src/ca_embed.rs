@@ -181,8 +181,8 @@
 //! authoritative. The root `Cargo.toml` carries the canonical statement of that
 //! precedence.
 //!
-//! An earlier revision of this comment said the platform store is the fallback
-//! "exactly as in C". That is not what C does, and the oracle is explicit:
+//! The platform store is NOT an unconditional fallback "exactly as in C".
+//! That is not what C does, and the oracle is explicit:
 //! `lib/vtls/vtls.c:296-323` sets `native_ca_store = TRUE` only
 //! `#if defined(USE_APPLE_SECTRUST) || defined(CURL_CA_NATIVE)`, and applies
 //! `CURL_CA_PATH` and `CURL_CA_BUNDLE` only `#ifdef` -- so each of the three is

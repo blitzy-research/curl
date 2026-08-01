@@ -345,9 +345,9 @@ jobs:
           echo "DT_SONAME: ${soname}"
           # The soname must not leak onto the executables. Setting it through a
           # blanket rustflags entry rather than a cdylib-only link argument gives
-          # curl-rs and curlinfo a DT_SONAME too, which would advertise that the
-          # binaries provide libcurl.so.4.
-          for exe in target/release/curl-rs target/release/curlinfo; do
+          # both command-line binaries a DT_SONAME too, which would advertise that
+          # they provide libcurl.so.4.
+          for exe in target/release/curl target/release/curlinfo; do
             if [ -f "${exe}" ]; then
               leaked="$(objdump -p "${exe}" 2>/dev/null | awk '/SONAME/ { print $2; exit }')"
               if [ -n "${leaked}" ]; then
@@ -455,7 +455,7 @@ jobs:
                 ;;
               *)
                 echo "FAIL: a -lcurl consumer resolved ${recorded} to ${resolved:-<nothing>},"
-                echo 'which is not this build. That is the silent-substitution failure M-14'
+                echo 'which is not this build. That is a silent substitution'
                 echo 'describes: the consumer links and runs, against a different libcurl.'
                 exit 1
                 ;;
@@ -470,7 +470,7 @@ jobs:
           # native libraries the Rust standard library itself needs, so a C
           # program linking libcurl.a must name them, and the only place a
           # consumer can learn them is `curl-config --static-libs` or
-          # `pkg-config --libs --static libcurl`. Review finding M-21 recorded
+          # `pkg-config --libs --static libcurl`. The measured defect was
           # that both under-reported. Nothing else in this workflow would
           # notice: symbol parity inspects the shared object, and the example
           # corpus compiles but does not link.
@@ -497,7 +497,7 @@ jobs:
             -path '*curl-rs-ffi-*/out/staging' 2>/dev/null | head -1)"
           if [ -z "${staging}" ]; then
             echo 'FAIL: curl-rs-ffi produced no install staging tree, so there is no'
-            echo 'generated consumer metadata to test. See M-15.'
+            echo 'generated consumer metadata to test.'
             exit 1
           fi
           config="${staging}/bin/curl-config"
@@ -512,7 +512,7 @@ jobs:
           # other flag exactly as reported.
           printf 'int main(void) { return 0; }\n' > "${RUNNER_TEMP}/static_consumer.c"
 
-          # Both interfaces, because M-21 names both and they are read by
+          # Both interfaces, because both matter and they are read by
           # different consumers.
           cc_libs="$("${config}" --static-libs | sed 's#[^ ]*libcurl\.a##')"
           pc_libs="$(PKG_CONFIG_PATH="${PWD}/${pc_dir}" \
@@ -634,9 +634,20 @@ jobs:
         run: |
           set -eu
           # AAP 0.6.3 keeps include/curl/typecheck-gcc.h as a hand-maintained
-          # header of 258 curlcheck_ macros that cbindgen cannot express, and
+          # header of curlcheck_ macros that cbindgen cannot express, and
           # AAP 0.6.4 makes the example corpus valuable precisely because it
-          # exercises real call syntax THROUGH those macros. If the macros were
+          # exercises real call syntax THROUGH those macros.
+          #
+          # No macro count is quoted here on purpose. The figure most often
+          # quoted, 258, is that file's count of LINES mentioning the prefix
+          # rather than a count of macros; the measured figures, the duplicate
+          # definition behind them and the grep pattern
+          # they need are recorded once, at ENGINE_PUBLIC_HEADER in
+          # curl-rs-lib/src/version.rs. Restating them here would be a third
+          # copy to drift, and this step does not need the number: what it
+          # asserts is behavioural, not arithmetic.
+          #
+          # If the macros were
           # inert -- because the header stopped being included, or because
           # CURL_DISABLE_TYPECHECK crept into the flags -- leg B would degrade
           # into a plain syntax check while still reporting success.
@@ -707,7 +718,7 @@ jobs:
       - name: 'assert: this gate wrote nothing outside target/'
         run: |
           set -eu
-          # AAP 0.8.7 and finding M-15 both turn on this point: consumer metadata
+          # AAP 0.8.7 turns on this point: consumer metadata
           # such as curl-config and libcurl.pc must be generated into a staging
           # directory, never into the shared source root. If either appears here,
           # a build step wrote into the checkout.

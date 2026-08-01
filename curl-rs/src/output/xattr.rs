@@ -110,13 +110,6 @@
 //! `curl_rs_lib::easy`, both belonging to the call site in
 //! `curl-rs/src/operate/`.
 //!
-//! # Rules status and provenance
-//!
-//! No user-specified rules exist for this project: `review_rules` returns the
-//! single line "No user rules provided." Nothing in this file is attributed to
-//! a rule, and every constraint cited here is a requirement taken from the
-//! user's request -- binding, but a requirement, not a rule.
-//!
 //! # `fsetxattr` is reached through the engine's audited island
 //!
 //! `xattr()` at `src/tool_xattr.c:77-104` is the only place the C original

@@ -134,29 +134,32 @@ env:
   #                           named anyway so the requirement is visible
   CROSS_LINUX_PACKAGES: 'gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross'
 
-  # THE FOURTEEN IMPLEMENTABLE FEATURES, spelled out, and NEVER `--all-features`.
+  # ALL FIFTEEN DECLARED FEATURES, and `--all-features` is now the correct form.
   #
-  # The workspace declares fifteen optional features. Fourteen are
-  # implementable; the fifteenth, `hickory-dns`, is a reserved name that no
-  # crate can currently back - every hickory-resolver release satisfying the
-  # workspace floor requires a hickory-proto affected by RUSTSEC-2026-0119, and
-  # every release carrying the fix declares `rust-version 1.88` - so enabling
-  # it raises a deliberate `compile_error!` in curl-rs-lib/src/lib.rs. Cargo
-  # offers no "all except one" selector, so `--all-features` would fail this
-  # gate before a single line of the workspace was compiled, reporting a
-  # feature-set error wearing a build gate's name. Enumerating them is the only
-  # correct form, and rust-audit.yml and rust-miri.yml use the same list.
+  # This was an explicit fourteen-name list for one reason: `hickory-dns` used
+  # to raise a `compile_error!`, Cargo has no "all except one" selector, and
+  # `--all-features` therefore failed the gate on a feature-set error wearing a
+  # build gate's name. That is fixed at the source. The feature is still backed
+  # by no crate - every hickory-resolver release satisfying the workspace floor
+  # requires a hickory-proto affected by RUSTSEC-2026-0119, and every release
+  # carrying the fix declares `rust-version 1.88` - but it now BUILDS and
+  # advertises nothing, because curl-rs-lib/src/version.rs holds `ENGINE_DNS`
+  # absent and the resolver token is withheld at every feature setting. So
+  # `--all-features` is both admissible and strictly better than a list: a
+  # sixteenth feature added to the manifests is covered here automatically
+  # instead of being silently skipped until somebody updated two workflows in
+  # lockstep. deny.toml already audits with `all-features = true` for exactly
+  # that reason.
   #
   # The two names that matter most here are the two that are default-OFF and
   # therefore reach no other step in this file: `negotiate`, which compiles
   # curl-rs-lib/src/ffi/gss.rs and links a platform GSS-API provider, and
   # `memdebug`, which installs a counting `#[global_allocator]`. Neither is
-  # exercised by a default build at all, so without this list they would be
+  # exercised by a default build at all, so without this step they would be
   # shipped never having been compiled for any target.
   #
-  # Sorted alphabetically so that a name added to the manifests and forgotten
-  # here is visible in a diff rather than lost in an arbitrary ordering.
-  ALL_FEATURES: 'altsvc,brotli,cookies,doh,ftp,gzip,hsts,http2,http3,ssh,websockets,zstd,negotiate,memdebug'
+  # The fifteen, for the reader: altsvc, brotli, cookies, doh, ftp, gzip, hsts,
+  # http2, http3, ssh, websockets, zstd, negotiate, memdebug, hickory-dns.
 
   # What `negotiate` needs at LINK time on a Linux runner.
   #
@@ -175,38 +178,40 @@ env:
   # named as a Rust `link` attribute and only this one package is needed.
   NATIVE_LINK_PACKAGES: 'libkrb5-dev'
 
-  # THE RECORDED A4 DECISION, and the one thing in this file that is provisional.
+  # A4 IS OPEN, AND THIS FILE DELIBERATELY RECORDS NO DECISION ABOUT IT.
   #
-  # curl-rs-ffi/build.rs REFUSES to build aarch64-apple-darwin unless this
-  # variable is set to exactly `accept-unsupported-varargs`. That is not a
-  # nuisance check, it is the mechanism by which an open, escalated ambiguity
-  # cannot be crossed silently: measured against the compiled build script,
-  # the three other mandated triples build with the variable unset AND with it
-  # set, emitting zero warnings either way, while aarch64-apple-darwin exits
-  # non-zero with the full A4 explanation when it is unset or set to anything
-  # else, and exits zero with exactly ONE `cargo:warning=` naming A4 and the
-  # eleven affected exported symbols when it is set to the accepted value.
+  # curl-rs-ffi/build.rs REFUSES to build aarch64-apple-darwin unless
+  # CURL_RS_A4_VARIADIC_DECISION is set to exactly `accept-unsupported-varargs`.
+  # That variable is NOT set anywhere in this repository's workflows, and it must
+  # not be: specification 0.8.6 escalates A4 as requiring a decision from
+  # whoever set the requirements, and lists exactly three options -
   #
-  # WHY IT IS SET HERE RATHER THAN LEFT UNSET. Leaving it unset would make one
-  # of four mandated legs permanently red for a reason that is already known,
-  # already documented and not a property of the code being compiled, and gate
-  # 1 - "builds on all four targets" - could then never report anything at all.
-  # Setting it records the acceptance in ONE reviewable place instead, and the
-  # advisory it unlocks is not merely tolerated but ASSERTED by a step below:
-  # it must be present on aarch64-apple-darwin and absent on the other three.
-  # An advisory that is asserted cannot be lost, which is the property that
-  # makes recording the acceptance honest rather than a way of hiding it.
+  #   1. raise the minimum supported Rust version above 1.75 and implement the
+  #      four variadic entry points with c_variadic / VaList::next_arg;
+  #   2. drop aarch64-apple-darwin from the mandated target matrix;
+  #   3. accept that this target's varargs entry points are unsupported.
   #
-  # WHAT IT DOES NOT DO. It does not resolve A4. Specification 0.8.6 itself
-  # records three options - raise the minimum supported Rust version, drop
-  # aarch64-apple-darwin, or accept that this target's varargs entry points are
-  # unsupported - and only whoever set the requirements can choose among them.
-  # This variable records the third as the present state of affairs because it
-  # is the only one that lets the mandated matrix run; it is a one-line change
-  # to this block on the day a different choice is made. There is still no
-  # `continue-on-error` on that leg, no `if:` that skips it, and the triple is
-  # not removed.
-  CURL_RS_A4_VARIADIC_DECISION: 'accept-unsupported-varargs'
+  # - none of which a workflow may choose on its own behalf. Setting the variable
+  # here would take option 3 unilaterally AND would then report a leg whose
+  # variadic ABI is known-wrong as a SUCCESSFUL target build, which is the one
+  # outcome specification 0.8.6 calls out as worse than a red gate ("this defect
+  # would not surface in local testing, which makes silent acceptance the worst
+  # option").
+  #
+  # WHAT HAPPENS INSTEAD. The aarch64-apple-darwin leg of the matrix below runs
+  # in full and FAILS at the build step, by design, with the build script's own
+  # A4 diagnostic. The step asserts that the failure is precisely that refusal
+  # and nothing else, so the red leg carries a diagnosis rather than a mystery.
+  # There is no `continue-on-error`, no `if:` that skips the leg, and the triple
+  # is not removed: gate 1 reports three targets green and one blocked on an
+  # owner decision, which is the true state of affairs.
+  #
+  # THE ONE-LINE CHANGE, for whoever decides. Option 1 lifts the refusal at its
+  # root and needs no variable. Option 2 removes the triple from the matrix.
+  # Option 3 is a `CURL_RS_A4_VARIADIC_DECISION: 'accept-unsupported-varargs'`
+  # line in this block - and if it is ever added, the assertion step below must
+  # be inverted with it, because the build script then emits an advisory instead
+  # of refusing.
 
 jobs:
   # The gate proper: the four-target release build, warnings denied
@@ -223,7 +228,7 @@ jobs:
     # 30 minutes. The tree's common values are 5, 10 and 15, and its ceiling is
     # 45; the closest comparable job is rust-audit.yml at 30. This leg is
     # heavier than any of the C build jobs it descends from: a cold release
-    # build of the whole workspace over a locked graph of 328 packages, several
+    # build of the whole workspace over a locked graph of 320 packages, several
     # of which compile vendored C or assembly (the ring cryptographic provider
     # and the zstd bindings among them), with no cache restored. 30 leaves
     # headroom on a cold start. A timeout must never be the thing that fails a
@@ -326,7 +331,7 @@ jobs:
           # rust-audit.yml and are deliberately not duplicated here.
           #
           # `native_link` IS EMPTY ON THIS LEG AND ONLY ON THIS LEG, and it is
-          # what decides whether the fourteen-feature step below LINKS or only
+          # what decides whether the all-features step below LINKS or only
           # type-checks. The reason is specific: `negotiate` needs an aarch64
           # `libgssapi_krb5.so` in the cross sysroot, which means enabling the
           # arm64 dpkg architecture and pulling libkrb5-dev:arm64 from the
@@ -334,9 +339,9 @@ jobs:
           # whose failure would be indistinguishable from a link failure in the
           # code. `cargo check` type-checks src/ffi/gss.rs completely for this
           # triple without needing it, and the two Apple legs plus the x86_64
-          # Linux leg prove the LINK. That is exactly the division the review
-          # finding asks for: four-target all-feature checks, plus Linux and
-          # macOS native-link builds.
+          # Linux leg prove the LINK. That is the division this matrix is built
+          # around: four-target all-feature checks, plus Linux and macOS
+          # native-link builds.
           - target: 'aarch64-unknown-linux-gnu'
             image: 'ubuntu-latest'
             cross_toolchain: 'aarch64-linux'
@@ -459,7 +464,7 @@ jobs:
             nightly*|beta*)
               echo "FAIL: rust-toolchain.toml pins ${pinned}."
               echo 'Gate 1 builds on the pinned stable channel. Nightly belongs to rust-miri.yml,'
-              echo 'and to rust-asan.yml, which AAP section 0.3.1 specifies but which is not yet on disk.'
+              echo 'and to rust-asan.yml; both install their own dated nightly for themselves.'
               exit 1
               ;;
           esac
@@ -627,7 +632,7 @@ jobs:
           #
           # --workspace covers all three members in one invocation:
           #   curl-rs-lib   the engine, an rlib
-          #   curl-rs       two binaries, curl-rs and curlinfo
+          #   curl-rs       two binaries, curl and curlinfo
           #   curl-rs-ffi   a cdylib and a staticlib, named `curl` by its
           #                 [lib] table so the artifacts are libcurl.*
           #
@@ -662,10 +667,76 @@ jobs:
 
           if [ "${status}" -ne 0 ]; then
             echo "FAIL: the default-feature release build failed for ${MATRIX_TARGET}."
+
+            # aarch64-apple-darwin is EXPECTED to fail here while A4 is open,
+            # and the expectation is asserted rather than assumed: the failure
+            # must be the build script's A4 refusal and not some other defect
+            # hiding behind it. See this file's env block for why no workflow
+            # records an A4 decision on the requirement owner's behalf.
+            if [ "${MATRIX_TARGET}" = 'aarch64-apple-darwin' ]; then
+              if grep -q -F 'aarch64-apple-darwin cannot be built: its variadic ABI is known-wrong' "${log}"; then
+                echo 'DIAGNOSIS: this is open ambiguity A4 of specification 0.8.6, not a regression.'
+                echo 'Apple arm64 passes variadic arguments on the stack; the non-variadic Rust callees'
+                echo 'behind curl_easy_setopt, curl_easy_getinfo, curl_multi_setopt and curl_share_setopt'
+                echo 'read register x2, which such a caller never populates. The requirement owner must'
+                echo 'choose one of the three options the refusal prints. Until then this leg stays red on'
+                echo 'purpose: reporting a known-wrong ABI as a successful target build is not available.'
+                exit "${status}"
+              fi
+              echo 'DIAGNOSIS: aarch64-apple-darwin failed for a reason OTHER than the A4 refusal.'
+              echo 'A4 is a known, documented block; anything else on this target is a real defect and'
+              echo 'must be fixed rather than attributed to A4. The build log is above.'
+            fi
+
             exit "${status}"
           fi
 
           echo "the default-feature release build succeeded for ${MATRIX_TARGET} with warnings denied"
+
+          # THE ZERO-WARNING GATE.
+          #
+          # `RUSTFLAGS=-D warnings` denies rustc lints in workspace code, and the
+          # block comment above explains why it cannot see a cargo diagnostic: a
+          # `cargo:warning=` from a build script is reported in the log and does
+          # not affect the exit status. Calling the deny flag alone a zero-warning
+          # gate would therefore be inaccurate, so the remaining diagnostics are
+          # enumerated here and anything unenumerated fails the leg.
+          #
+          # The allow-list is deliberately short, exact and prefix-anchored. Every
+          # entry names a deterministic, reviewed advisory that this checkpoint
+          # cannot remove:
+          #
+          #   * the two include/curl/ advisories from curl-rs-ffi/build.rs, which
+          #     announce that the public headers were NOT regenerated because the
+          #     100-symbol export surface is incomplete. They disappear on their
+          #     own when the last export lands; until then they are the honest
+          #     report that the committed headers remain the ABI contract.
+          #   * cargo's future-incompatibility notice for russh 0.54.5, an
+          #     external crate this workspace pins exactly (specification 0.5.1)
+          #     and cannot patch. Recorded as dependency debt in Cargo.toml.
+          #
+          # An advisory that is NOT on this list fails the build, which is what
+          # makes the list a gate instead of a comment. Adding to it is a
+          # reviewable one-line change, and that is the point.
+          diagnostics="$(grep -E '^(warning|error)(:|\[)' "${log}" || true)"
+          unapproved="$(printf '%s\n' "${diagnostics}" \
+            | grep -v -F 'include/curl/ NOT regenerated:' \
+            | grep -v -F 'include/curl/ first missing exports:' \
+            | grep -v -F 'the following packages contain code that will be rejected by a future version of Rust' \
+            | grep -v -E '^[[:space:]]*$' || true)"
+
+          if [ -n "${unapproved}" ]; then
+            echo 'FAIL: the build emitted cargo diagnostics that are not on the reviewed allow-list.'
+            echo 'Gate 1 of specification 0.8.4 is a ZERO-WARNING gate, and a cargo diagnostic is a'
+            echo 'warning even though it does not change the exit status. Fix the cause, or - if the'
+            echo 'advisory is deliberate and reviewed - add it to the allow-list in this step.'
+            echo '::group::unapproved diagnostics'
+            printf '%s\n' "${unapproved}"
+            echo '::endgroup::'
+            exit 1
+          fi
+
+          echo 'no unapproved cargo diagnostics: the zero-warning gate covers rustc lints AND cargo output'
 
       - name: 'artifacts'
         run: |
@@ -675,7 +746,9 @@ jobs:
           # four artifacts this gate promises exist".
           #
           # The names are not arbitrary. curl-rs/Cargo.toml declares two [[bin]]
-          # targets, curl-rs and curlinfo. curl-rs-ffi/Cargo.toml declares
+          # targets, `curl` and `curlinfo` - the PACKAGE is curl-rs, the primary
+          # BINARY is curl, matching src/Makefile.am:49 so the artifact answers to
+          # the name every consumer types. curl-rs-ffi/Cargo.toml declares
           # [lib] name = "curl" with crate-type ["cdylib", "staticlib"], and
           # that name is the reason the library artifacts are libcurl.* rather
           # than libcurl_rs_ffi.* - a drop-in replacement has to be findable
@@ -705,7 +778,7 @@ jobs:
           echo '::endgroup::'
 
           missing=''
-          for artifact in curl-rs curlinfo "${shared}" libcurl.a; do
+          for artifact in curl curlinfo "${shared}" libcurl.a; do
             if [ ! -f "${out}/${artifact}" ]; then
               missing="${missing} ${artifact}"
             fi
@@ -727,7 +800,7 @@ jobs:
           # the symbol-and-header parity gate, which is required but not yet
           # added. This gate asks only whether the artifacts were built.
           echo '::group::artifact identity'
-          for artifact in curl-rs curlinfo "${shared}" libcurl.a; do
+          for artifact in curl curlinfo "${shared}" libcurl.a; do
             file -- "${out}/${artifact}"
           done
           echo '::endgroup::'
@@ -752,14 +825,13 @@ jobs:
           # and resolves to /lib/x86_64-linux-gnu/libcurl.so.4 - the SYSTEM C
           # libcurl. The consumer then runs successfully against a completely
           # different implementation, which no test of our artifact would
-          # notice. Review finding M-14.
+          # notice.
           #
           # Second, curl-config and libcurl.pc. Both are target-specific and
           # feature-specific, so a matrix of four builds cannot share one path;
           # curl-rs-ffi/build.rs writes them into OUT_DIR and into an install
           # staging tree beneath it. Collecting them here is what makes gate 1's
-          # output an installable set rather than four loose binaries. Review
-          # finding M-15.
+          # output an installable set rather than four loose binaries.
           out="target/${MATRIX_TARGET}/release"
 
           # ONE authority for every derived name, shared with rust-abi.yml, so
@@ -796,7 +868,7 @@ jobs:
             -maxdepth 3 -type d -path '*curl-rs-ffi-*/out/staging' 2>/dev/null | head -1)"
           if [ -z "${staging}" ]; then
             echo 'FAIL: curl-rs-ffi produced no install staging tree. It must render'
-            echo 'curl-config and libcurl.pc into OUT_DIR/staging; see M-15.'
+            echo 'curl-config and libcurl.pc into OUT_DIR/staging.'
             exit 1
           fi
           for rel in 'bin/curl-config' 'lib/pkgconfig/libcurl.pc'; do
@@ -822,7 +894,7 @@ jobs:
           # the build system being replaced and has no place in an install set.
           mkdir -p "${dist}/include/curl"
           find include/curl -maxdepth 1 -name '*.h' -exec cp {} "${dist}/include/curl/" \;
-          cp "${out}/curl-rs" "${out}/curlinfo" "${dist}/bin/"
+          cp "${out}/curl" "${out}/curlinfo" "${dist}/bin/"
           cp "${out}/libcurl.a" "${dist}/lib/"
           # -P so the symlinks are copied AS symlinks; without it the chain
           # would become three identical 4 MB regular files.
@@ -838,7 +910,7 @@ jobs:
       - name: 'assert: a static C consumer links through both generated interfaces'
         run: |
           set -eu
-          # THE FOUR-TARGET CLAUSE OF M-21. A Rust staticlib carries no record of
+          # THE FOUR-TARGET CLAUSE. A Rust staticlib carries no record of
           # the native libraries the Rust standard library itself needs, so a C
           # program linking libcurl.a must name them, and its only sources are
           # `curl-config --static-libs` and `pkg-config --libs --static libcurl`.
@@ -899,7 +971,7 @@ jobs:
           echo "pkg-config  Libs.private :${pc_libs}"
 
           # ONE AUTHORITY means the two must be identical, not merely similar.
-          # This is the property M-21 asks for and it is checked on every target,
+          # This is the required property and it is checked on every target,
           # including the cross ones that cannot be linked here.
           norm_cc="$(printf '%s\n' "${cc_libs}" | tr -s ' ' | sed 's/^ //; s/ $//')"
           norm_pc="$(printf '%s\n' "${pc_libs}" | tr -s ' ' | sed 's/^ //; s/ $//')"
@@ -908,7 +980,7 @@ jobs:
             echo "  curl-config: [${norm_cc}]"
             echo "  pkg-config : [${norm_pc}]"
             echo 'Both must be rendered from the single native-link authority in'
-            echo 'curl-rs-ffi/build.rs. See M-21.'
+            echo 'curl-rs-ffi/build.rs.'
             exit 1
           fi
           if [ -z "${norm_cc}" ]; then
@@ -962,19 +1034,23 @@ jobs:
           echo 'vacuity check: omitting the reported libraries fails, as required'
 
           fi
-      - name: 'assert: the A4 advisory is present on aarch64-apple-darwin and absent elsewhere'
+      - name: 'assert: no target was built under an A4 acceptance'
         run: |
-          # The counterpart to CURL_RS_A4_VARIADIC_DECISION being set in this
-          # file's env block. Recording an acceptance is only honest if the
-          # advisory it unlocks cannot then be lost, so it is asserted in BOTH
-          # directions: it must appear on the one target whose variadic ABI is
-          # known-wrong, and it must NOT appear on any other.
+          # THE COUNTERPART TO THIS FILE RECORDING NO A4 DECISION.
           #
-          # The reverse direction is the more valuable half. A change that made
-          # the advisory unconditional would look like a harmless widening and
-          # would in fact destroy the signal, because an advisory that is always
-          # printed tells a reader nothing about which target they are looking
-          # at.
+          # Only a target that BUILT reaches this step, and while A4 is open the
+          # set of such targets is exactly the three whose variadic ABI is sound.
+          # aarch64-apple-darwin cannot reach it: its build step refuses, with the
+          # diagnosis printed there.
+          #
+          # So the property to assert is absence, and it is worth asserting rather
+          # than assuming. curl-rs-ffi/build.rs emits its `A4 decision on record`
+          # advisory ONLY when an acceptance suppressed a refusal that would
+          # otherwise have fired. Seeing that advisory here would therefore mean
+          # one of two things, both of which must fail the gate: an acceptance has
+          # been reintroduced into the environment and a known-wrong ABI is being
+          # reported as a successful build, or the refusal's own conditions have
+          # widened to a target that is not Apple arm64.
           log="${RUNNER_TEMP}/build-default.log"
           if [ ! -s "${log}" ]; then
             echo 'FAIL: the build step produced no log, so there is nothing to assert on.'
@@ -988,34 +1064,28 @@ jobs:
           # Anchored on the exact prefix curl-rs-ffi/build.rs emits, not on the
           # bare token A4, so that the word appearing in a source comment that
           # rustc happens to quote cannot satisfy this assertion.
-          seen='no'
           if grep -q -F 'A4 decision on record (CURL_RS_A4_VARIADIC_DECISION=' "${log}"; then
-            seen='yes'
+            echo "FAIL: ${MATRIX_TARGET} was built under a recorded A4 acceptance."
+            echo 'No workflow in this repository may record that decision: specification 0.8.6 escalates A4'
+            echo 'to whoever set the requirements, and accepting it here would report an artifact whose'
+            echo 'variadic ABI is known-wrong as a successful target build. Remove'
+            echo 'CURL_RS_A4_VARIADIC_DECISION from the environment; see this file env block for the three'
+            echo 'options that are actually available.'
+            exit 1
           fi
 
-          case "${MATRIX_TARGET}" in
-            aarch64-apple-darwin)
-              if [ "${seen}" != 'yes' ]; then
-                echo 'FAIL: aarch64-apple-darwin built without the A4 variadic advisory.'
-                echo 'That advisory is the only thing announcing that eleven of the hundred exported symbols'
-                echo 'are not drop-in on this target. Losing it converts an open, escalated ambiguity into a'
-                echo 'silent one. curl-rs-ffi/build.rs owns the advisory; restore it there.'
-                exit 1
-              fi
-              echo 'aarch64-apple-darwin emitted the A4 advisory, as it must while A4 is open'
-              ;;
-            *)
-              if [ "${seen}" = 'yes' ]; then
-                echo "FAIL: ${MATRIX_TARGET} emitted the A4 variadic advisory, but A4 is specific to"
-                echo "aarch64-apple-darwin - Apple's arm64 ABI passes variadic arguments on the stack while"
-                echo 'standard AAPCS64 passes them in registers. An advisory printed on every target is a'
-                echo 'signal that has stopped carrying information. Narrow the condition in'
-                echo 'curl-rs-ffi/build.rs; do not relax this assertion.'
-                exit 1
-              fi
-              echo "${MATRIX_TARGET} emitted no A4 advisory, which is correct: A4 is specific to Apple arm64"
-              ;;
-          esac
+          echo "${MATRIX_TARGET} was built with no A4 acceptance in force, as every certifiable target must be"
+
+          # aarch64-apple-darwin must remain IN the matrix. A leg that is blocked
+          # on an owner decision is information; a leg that has been deleted is
+          # not, and deleting it is how option 2 would get taken by accident.
+          if ! grep -q -F "target: 'aarch64-apple-darwin'" "${GITHUB_WORKSPACE}/.github/workflows/rust-build.yml"; then
+            echo 'FAIL: aarch64-apple-darwin is no longer in this matrix.'
+            echo 'Dropping the triple IS option 2 of specification 0.8.6 A4, and it is not a workflow'
+            echo 'edit to make on the requirement owner behalf. Restore the matrix entry.'
+            exit 1
+          fi
+          echo 'aarch64-apple-darwin is still one of the four mandated matrix entries'
 
       - name: 'assert: the DEFAULT artifacts link no GSS-API'
         run: |
@@ -1141,7 +1211,7 @@ jobs:
 
           echo 'the MIT Kerberos development package is installed'
 
-      - name: 'check: the fourteen implementable features, all four targets'
+      - name: 'check: every declared feature, all four targets'
         env:
           RUSTFLAGS: '-D warnings'
         run: |
@@ -1166,21 +1236,20 @@ jobs:
           # different question and is asked by the next step, on the three legs
           # that can answer it natively.
           #
-          # ${ALL_FEATURES} rather than --all-features: the reason is in this
-          # file's env block, and it is that --all-features enables the reserved
-          # `hickory-dns` name and raises a deliberate compile_error!.
+          # --all-features, which this workspace can now pass; see this file's
+          # env block for why it used to be an explicit list and what changed.
           #
           # RUSTFLAGS is step-scoped here for the same reason it is on the build
           # step: a repo-wide deny would participate in Cargo's fingerprint and
           # destroy per-gate attribution.
-          echo "checking ${MATRIX_TARGET} with: ${ALL_FEATURES}"
+          echo "checking ${MATRIX_TARGET} with every declared feature"
           cargo check --locked --release --workspace \
             --target "${MATRIX_TARGET}" \
-            --features "${ALL_FEATURES}"
+            --all-features
 
-          echo "all fourteen implementable features type-check for ${MATRIX_TARGET} with warnings denied"
+          echo "all declared features type-check for ${MATRIX_TARGET} with warnings denied"
 
-      - name: 'build: the fourteen implementable features, natively linked'
+      - name: 'build: every declared feature, natively linked'
         # Every leg but the cross-compiled aarch64 Linux one; the matrix entry
         # for that leg explains why it checks rather than links.
         if: ${{ matrix.build.native_link }}
@@ -1200,10 +1269,10 @@ jobs:
           # the artifacts it leaves behind are the feature-built ones. That is
           # why the default no-GSS assertion runs BEFORE this step and not
           # after: the order is load-bearing, not incidental.
-          echo "building ${MATRIX_TARGET} with: ${ALL_FEATURES}"
+          echo "building ${MATRIX_TARGET} with every declared feature"
           cargo build --locked --release --workspace \
             --target "${MATRIX_TARGET}" \
-            --features "${ALL_FEATURES}"
+            --all-features
 
           # No `anchor` here, unlike the default no-GSS step above, and the
           # difference is not an oversight: this step PRINTS the listing rather
@@ -1226,7 +1295,7 @@ jobs:
 
           out="target/${MATRIX_TARGET}/release"
           missing=''
-          for artifact in curl-rs curlinfo "${shared}" libcurl.a; do
+          for artifact in curl curlinfo "${shared}" libcurl.a; do
             if [ ! -f "${out}/${artifact}" ]; then
               missing="${missing} ${artifact}"
             fi
@@ -1250,7 +1319,7 @@ jobs:
           ${lister} "${out}/${shared}"
           echo '::endgroup::'
 
-          echo "the fourteen implementable features LINK natively for ${MATRIX_TARGET}, GSS-API provider included"
+          echo "every declared feature LINKS natively for ${MATRIX_TARGET}, GSS-API provider included"
 
       - name: 'assert: this gate wrote nothing outside target/'
         run: |

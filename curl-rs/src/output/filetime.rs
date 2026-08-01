@@ -34,10 +34,6 @@
 //! its root carries `#![deny(unsafe_code)]` with exactly one exemption
 //! instead.
 //!
-//! No user-specified rules exist for this project, so nothing here is
-//! attributed to one: every constraint cited below is a requirement taken from
-//! the user's request, which is binding but is not a rule.
-//!
 //! # The two frozen texts
 //!
 //! The observable bytes are frozen, so both warnings are
@@ -159,12 +155,12 @@
 //! makes that guarantee structural rather than incidental.
 
 use std::fs::{self, FileTimes, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use crate::output::msgs::{warnf, warnf_bytes, MsgConfig};
+use crate::output::msgs::{warnf, warnf_bytes, DiagnosticSink, MsgConfig};
 
 /// The `int` [`getfiletime`] returns when the timestamp was read.
 ///
@@ -242,7 +238,7 @@ const EINVAL: i32 = 22;
 /// module documentation.
 #[allow(dead_code)]
 pub(crate) fn getfiletime(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
     filename: &Path,
     stamp: &mut i64,
@@ -299,7 +295,7 @@ pub(crate) fn getfiletime(
 /// `std`.
 #[allow(dead_code)]
 pub(crate) fn setfiletime(
-    sink: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,
     filetime: i64,
     filename: &Path,

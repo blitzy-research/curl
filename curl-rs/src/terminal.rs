@@ -50,13 +50,6 @@
 //! preservation mandate rules out. Nothing is decoded here: the bytes given
 //! are the bytes written.
 //!
-//! # Rules status and provenance
-//!
-//! No user-specified rules exist for this project: `review_rules` returns the
-//! single line "No user rules provided." Nothing in this file is attributed to
-//! a rule, and every constraint cited here is a requirement taken from the
-//! user's request -- binding, but a requirement, not a rule.
-//!
 //! # Both operating-system capabilities, reached without `unsafe`
 //!
 //! `#![forbid(unsafe_code)]` on `curl-rs/src/main.rs` covers this module, and

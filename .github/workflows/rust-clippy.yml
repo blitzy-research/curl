@@ -153,29 +153,38 @@ env:
 
   # THE FOURTEEN IMPLEMENTABLE FEATURES, and never `--all-features`.
   #
-  # Identical to the list in rust-build.yml, rust-audit.yml and rust-miri.yml,
-  # in the same order, so the four can be diffed against one another. The
-  # fifteenth declared feature, `hickory-dns`, is a reserved name that no crate
-  # can currently back and enabling it raises a deliberate `compile_error!` in
-  # curl-rs-lib/src/lib.rs; Cargo has no "all except one" selector, so
-  # `--all-features` would fail this gate on a feature-set error wearing a lint
-  # gate's name. The full reasoning lives in rust-build.yml's env block.
+  # This was an explicit fourteen-name list, matching rust-build.yml, because the
+  # fifteenth declared feature `hickory-dns` used to raise a `compile_error!` and
+  # Cargo has no "all except one" selector, so `--all-features` failed this gate
+  # on a feature-set error wearing a lint gate's name. That is fixed at the
+  # source: the feature still has no crate behind it, but it BUILDS and
+  # advertises nothing, so `--all-features` is admissible and covers a future
+  # sixteenth feature without an edit here. rust-build.yml's env block carries
+  # the full reasoning.
   #
-  # Two of the fourteen are default-OFF - `negotiate` and `memdebug` - and are
+  # Two of the fifteen are default-OFF - `negotiate` and `memdebug` - and are
   # therefore linted by no other step in this file. Their code is where a lint
   # is most likely to go unnoticed, since `negotiate` is the crate's entire
   # GSS-API binding and `memdebug` is a `#[global_allocator]`.
-  ALL_FEATURES: 'altsvc,brotli,cookies,doh,ftp,gzip,hsts,http2,http3,ssh,websockets,zstd,negotiate,memdebug'
 
-  # curl-rs-ffi's build script REFUSES to run unless this records an A4
-  # decision, and `cargo clippy --workspace` compiles curl-rs-ffi and therefore
-  # runs it. Measured: the value is entirely inert on this job's linux/x86_64
-  # host - zero warnings, identical behaviour set or unset - so it is here to
-  # keep the gate working if the runner ever changes, and to make the recorded
-  # acceptance visible in every workflow whose verdict depends on it.
-  # rust-build.yml's env block carries the full reasoning and is the one place
-  # to change when A4 is decided.
-  CURL_RS_A4_VARIADIC_DECISION: 'accept-unsupported-varargs'
+  # CURL_RS_A4_VARIADIC_DECISION IS DELIBERATELY NOT SET HERE.
+  #
+  # curl-rs-ffi's build script refuses to run when it is targeting
+  # aarch64-apple-darwin and no A4 decision is on record, and `cargo clippy
+  # --workspace` does run that build script. This job, though, is
+  # linux/x86_64-hosted and passes no `--target`, so the refusal's condition is
+  # never met: measured, the variable is entirely inert here - zero warnings,
+  # byte-identical output set or unset.
+  #
+  # It was previously set to 'accept-unsupported-varargs' anyway, to keep the
+  # gate working "if the runner ever changes". That is exactly backwards. If this
+  # job were ever moved to an Apple arm64 runner, a pre-set acceptance would let
+  # it lint an artifact whose variadic ABI is known-wrong and report a clean
+  # verdict, whereas an unset variable makes it stop and say so. Specification
+  # 0.8.6 escalates A4 to whoever set the requirements; a lint workflow is not
+  # the place a decision of that kind gets recorded, least of all as a
+  # contingency for a host change nobody has made. rust-build.yml's env block
+  # enumerates the three options that are actually available.
 
 jobs:
   clippy:
@@ -275,7 +284,7 @@ jobs:
             nightly*|beta*)
               echo "FAIL: rust-toolchain.toml pins ${pinned}."
               echo 'This gate runs on the pinned stable channel. Nightly belongs to rust-miri.yml,'
-              echo 'and to rust-asan.yml, which AAP section 0.3.1 specifies but which is not yet on disk.'
+              echo 'and to rust-asan.yml; both install their own dated nightly for themselves.'
               exit 1
               ;;
           esac
@@ -369,7 +378,7 @@ jobs:
           # the manifest, never a suppression in this workflow.
           cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      - name: 'clippy: the fourteen implementable features -- -D warnings'
+      - name: 'clippy: every declared feature -- -D warnings'
         run: |
           # THE FEATURE-GATED CODE, WHICH THE TWO STEPS ABOVE NEVER SEE.
           #
@@ -389,9 +398,10 @@ jobs:
           # free of test noise on the DEFAULT set, and repeating it would double
           # a type-check of the whole workspace for no new information.
           #
-          # ${ALL_FEATURES} and never --all-features; see this file's env block.
+          # --all-features, now that the workspace can pass it; see this file's
+          # env block for what used to prevent it.
           cargo clippy --locked --workspace --all-targets \
-            --features "${ALL_FEATURES}" -- -D warnings
+            --all-features -- -D warnings
 
       - name: 'rustfmt: cargo fmt --all -- --check'
         run: |

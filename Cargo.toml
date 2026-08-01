@@ -111,7 +111,7 @@ version = "8.19.0"
 # are later files of the same migration, not MSRV diagnostics. No dependency
 # emits any.
 #
-# 1.75 is a TIGHT floor, not a comfortable one. Of the 321 packages in the
+# 1.75 is a TIGHT floor, not a comfortable one. Of the 320 packages in the
 # lock, the highest declared `rust-version` anywhere is exactly 1.75, and it
 # belongs to this workspace's three crates together with russh 0.54.5,
 # russh-cryptovec 0.52.0, russh-util 0.52.0 and pageant 0.1.0 - the heaviest
@@ -139,7 +139,7 @@ version = "8.19.0"
 #
 # Both pins are downgrades of transitive build-time crates and change nothing
 # any mandated target links. After them, an UNFILTERED `cargo metadata
-# --offline` over the 321 locked packages reports ZERO with an edition above
+# --offline` over the 320 locked packages reports ZERO with an edition above
 # 2021 and ZERO declaring a rust-version above 1.75, which is the invariant
 # the floor rests on, and `wasip2` and `wit-bindgen` are absent from the
 # lockfile entirely - `wit-bindgen-rt` 0.39.0 is a DIFFERENT crate, wasi
@@ -149,7 +149,7 @@ version = "8.19.0"
 # Per-target confirmation as well, which is the sufficient
 # condition rather than the necessary one: filtering with
 # `--filter-platform` over each of the four mandated triples, with and
-# without the implementable feature set, gives eight graphs of 258 to 261
+# without the implementable feature set, gives eight graphs of 257 to 261
 # packages whose maximum declared rust-version is 1.75 in every case and none
 # of which contains an edition-2024 package. Re-check with the expressions in
 # the `msrv` job, not by inspection.
@@ -568,7 +568,28 @@ russh = { version = "=0.54.5", default-features = false, features = ["ring", "rs
 # must reproduce it 1:1 - names, aliases, argument arity, argument type and
 # default value, including the --no-<flag> negations generated for rows
 # flagged ARG_NO. clap_complete replaces scripts/completion.pl.
-clap = { version = "=4.5.61", features = ["derive", "env", "string", "wrap_help"] }
+#
+# TWO FEATURES ARE DELIBERATELY ABSENT, and the reason they cannot merely be
+# omitted from the member overlay is that CARGO UNIONS FEATURES ACROSS THE
+# GRAPH. A feature enabled here is enabled for every consumer; a member
+# declaring `features = ["derive"]` sets a floor, not a ceiling, and cannot
+# subtract. curl-rs/Cargo.toml rejects both of these with reasons, so leaving
+# them here would have defeated that rejection silently from one level up.
+#
+#   wrap_help  Reflows help output to the terminal width. AAP 0.8.1 freezes
+#              help output to reproduce src/tool_listhelp.c's 273-entry table
+#              verbatim, so reflowing it is a behaviour change, not a nicety.
+#              It is also what pulled terminal_size into the graph - measured:
+#              removing this feature removes terminal_size 0.4.4 entirely, and
+#              curl-rs/src/terminal.rs does the width probe itself through the
+#              sanctioned ffi/sys.rs island.
+#   string     Lets clap take owned `String` values for names and help text.
+#              The option inventory is a fixed compile-time table, so nothing
+#              here needs it.
+#
+# `env` is retained: it is the mechanism for the option defaults curl reads from
+# the environment, and it adds no dependency.
+clap = { version = "=4.5.61", features = ["derive", "env"] }
 clap_complete = "=4.5.67"
 
 # --- Public header generation (build dependency) --------------------------
@@ -639,11 +660,15 @@ socket2 = { version = "=0.6.5", features = ["all"] }
 # So the feature name is retained - AAP 0.5.2 fixes the vocabulary and
 # renaming or deleting a name would ripple into the version banner, the
 # capability table in curl-rs-ffi/build.rs and curlinfo's 29-entry table -
-# but it is backed by NO dependency, and enabling it is a HARD BUILD FAILURE
-# raised by a compile_error! in curl-rs-lib/src/lib.rs that states this
-# reasoning at the point of use. That is deliberate: an unimplementable
-# configuration must fail loudly rather than succeed silently, which is the
-# defect the earlier `hickory-dns = []` no-op had.
+# but it is backed by NO dependency, and enabling it BUILDS while advertising
+# nothing. The earlier `hickory-dns = []` no-op was a defect because the version
+# banner still keyed off the bare cfg, so enabling it over-reported a resolver
+# that was not there; the fix is the workspace's own
+# `configured && engine.is_present()` rule, with an absent `ENGINE_DNS` row in
+# curl-rs-lib/src/version.rs withholding the token at every feature setting.
+# A `compile_error!` was tried in between and removed: it stopped the
+# over-report but made a declared feature unbuildable, which broke
+# `--all-features` for a workspace whose deny.toml sets `all-features = true`.
 #
 # Nothing mandated is lost, and one measurement makes that concrete: this
 # checkpoint contains no `curl-rs-lib/src/dns/` module at all, so no line of
@@ -769,12 +794,38 @@ log = "=0.4.33"
 tracing = "=0.1.44"
 # Byte scanning for header and chunked-framing parsing (lib/curl_memrchr.c).
 memchr = "=2.8.3"
-# Content-type inference for MIME parts. This belongs to the engine's mime
-# module, not to the tool: the -F parser honours only an explicit
-# `;type=<content-type>`, while lib/mime.c's serialiser guesses from the
-# filename extension and falls back to application/octet-stream. Its answer set
-# must be narrowed to curl's own ten-extension table plus that fallback.
-mime_guess = "=2.0.5"
+#
+# Deliberate omission, recorded here because AAP 0.5.1's inventory names the
+# crate and its absence must not read as an oversight: `mime_guess` is NOT
+# declared. The inventory lists it at 2.0.5 for "content-type inference for -F
+# uploads", and this manifest previously carried a `mime_guess = "=2.0.5"` line.
+# The line was inert in the strictest sense - an unreferenced
+# [workspace.dependencies] entry is never resolved, so it never reached
+# Cargo.lock and `cargo tree -i mime_guess` answers "did not match any
+# packages". It specified nothing and guaranteed nothing.
+#
+# It is omitted rather than wired because wiring it would BREAK a frozen
+# contract, which makes this a stronger omission than an unused-pin cleanup.
+# curl's inference table is `ctts[]` at lib/mime.c:1629-1640 and holds exactly
+# ten entries - .gif, .jpg, .jpeg, .png, .svg, .txt, .htm, .html, .pdf and .xml
+# - with application/octet-stream for everything else. A general-purpose MIME
+# database is far larger, so it would answer where curl 8.x answers
+# application/octet-stream and emit Content-Type bytes curl never emits. AAP
+# 0.8.1 freezes those bytes and AAP 0.6.7 compares them with a byte-exact,
+# order-significant, full-string comparison across 1,476 fixtures. The only
+# behaviour-preserving implementation is a native transliteration of `ctts[]`
+# itself, which belongs to curl-rs-lib/src/mime/mod.rs and needs no dependency
+# at all - the same shape as the cookie-store omission above, where no crate
+# commits to the on-disk format the contract requires.
+#
+# So the requirement AAP 0.5.1 records is met in full, by owned code, with one
+# fewer dependency. The omission is additionally ENFORCED rather than narrated:
+# deny.toml bans the crate, so a future consumer fails the supply-chain gate
+# with a diagnostic naming the wire-freeze reason instead of quietly changing
+# emitted headers. That is the treatment `prefer-post-quantum` gets there, for
+# the same class of reason - a pure-Rust addition whose only cost is different
+# bytes on the wire.
+#
 # Development dependency only; used by the integration tests.
 tempfile = "=3.27.0"
 
@@ -826,12 +877,13 @@ tempfile = "=3.27.0"
 #                 to confirm the diagnosis: the graph resolves and bans,
 #                 licences and sources all still pass, but `cargo deny check
 #                 advisories` goes from ok to FAILED, which is AAP 0.8.4
-#                 gate 9. Enabling the feature is therefore a hard build
-#                 failure raised by a compile_error! in
-#                 curl-rs-lib/src/lib.rs rather than a silent no-op. The DNS
-#                 note above records the full derivation; when the conflict is
-#                 decided the pin belongs HERE, per AAP 0.4.2, with
-#                 `optional = true` on the member's side.
+#                 gate 9. Enabling the feature therefore builds and advertises
+#                 nothing: curl-rs-lib/src/version.rs holds `ENGINE_DNS` absent,
+#                 so the resolver token is withheld at every feature setting
+#                 rather than the feature being a silent no-op OR an
+#                 unbuildable declaration. The DNS note above records the full
+#                 derivation; when the conflict is decided the pin belongs HERE,
+#                 per AAP 0.4.2, with `optional = true` on the member's side.
 #
 #   memdebug      A counting GlobalAlloc reproducing the log format of
 #                 lib/memdebug.c (MEM <src>:<line> malloc(<n>) = <ptr> and

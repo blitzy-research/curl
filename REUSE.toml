@@ -13,6 +13,10 @@ SPDX-PackageDownloadLocation = "https://curl.se/"
 
 [[annotations]]
 path = [
+  "Cargo.lock",
+  "curl-rs-ffi/src/ffi/easy_option_oracle.txt",
+  "curl-rs-ffi/src/ffi/strerror_oracle.txt",
+  "curl-rs-lib/src/url/escape_oracle.txt",
   "docs/INSTALL",
   "docs/libcurl/symbols-in-versions",
   "docs/options-in-versions",

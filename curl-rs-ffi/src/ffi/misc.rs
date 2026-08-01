@@ -37,22 +37,29 @@
 //!   single allocation on first use, which has the same lifetime and the same
 //!   once-per-process cost.
 //!
-//! # Why the immortal storage is built lazily rather than as a `static`
+//! # Why the immortal storage is built lazily, and why only its ADDRESS is kept
 //!
 //! `curl_version_info_data` holds raw pointers, so it is neither `Send` nor
-//! `Sync` and cannot be a plain `static` without a wrapper. It is built once
-//! inside a [`OnceLock`] and then never mutated. The wrapper's `unsafe impl
-//! Sync` is sound because every pointer field addresses immortal, immutable
-//! data and the struct is written exactly once; the SAFETY comment on the impl
-//! states that.
+//! `Sync` and cannot be a plain `static`. Both immortal values here are
+//! therefore built on first use and leaked, and the [`OnceLock`] that guards
+//! each one stores a `usize` address rather than the value: `usize` is
+//! `Send + Sync` on its own, so no wrapper type and no hand-written
+//! `unsafe impl` is involved in either.
 //!
-//! C returns `curl_version_info_data *` -- a MUTABLE pointer into a mutable
-//! `static` -- so a caller has always been able to write through it and race
-//! with libcurl. That hazard belongs to the frozen signature (specification
-//! 0.8.1) and is reproduced rather than fixed: narrowing the return type to
-//! `const` would break every consumer that assigns it to a non-const variable.
+//! That choice is forced, not stylistic. C returns `curl_version_info_data *`
+//! -- a MUTABLE pointer into a mutable `static` -- so a caller has always been
+//! able to write through it and race with libcurl. That hazard belongs to the
+//! frozen signature (specification 0.8.1) and is reproduced rather than fixed:
+//! narrowing the return type to `const` would break every consumer that assigns
+//! it to a non-const variable. Reproducing it correctly means the returned
+//! pointer must carry WRITE provenance, and a pointer obtained by casting a
+//! shared reference does not, whatever the C prototype says. Since
+//! `OnceLock::get_or_init` can only ever yield a `&T`, the value cannot live
+//! inside the cell; `Box::into_raw` provides the write-capable pointer and the
+//! cell holds its address. See [`curl_version_info`] for the full account,
+//! including the earlier design this replaced.
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_long, c_uint, c_void};
 use core::ptr;
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
@@ -70,9 +77,7 @@ use super::types::curl_version_info_data;
 /// are deliberately out of scope, so no narrowing case exists to handle.
 type TimeT = i64;
 
-// ---------------------------------------------------------------------------
 // Immortal storage helpers.
-// ---------------------------------------------------------------------------
 
 /// Leaks a NUL-terminated copy of `text`, returning a pointer C may keep.
 ///
@@ -125,9 +130,7 @@ fn immortal_c_option(text: Option<&'static str>) -> *const c_char {
     }
 }
 
-// ---------------------------------------------------------------------------
 // curl_free
-// ---------------------------------------------------------------------------
 
 /// Releases a buffer libcurl allocated for the caller.
 ///
@@ -153,9 +156,7 @@ pub unsafe extern "C" fn curl_free(p: *mut c_void) {
     });
 }
 
-// ---------------------------------------------------------------------------
 // curl_getdate
-// ---------------------------------------------------------------------------
 
 /// Converts a date string to seconds since the Unix epoch.
 ///
@@ -206,9 +207,7 @@ pub unsafe extern "C" fn curl_getdate(
     })
 }
 
-// ---------------------------------------------------------------------------
 // curl_getenv
-// ---------------------------------------------------------------------------
 
 /// Reads an environment variable into a caller-owned buffer.
 ///
@@ -267,9 +266,7 @@ fn os_bytes(value: &std::ffi::OsStr) -> &[u8] {
     value.as_bytes()
 }
 
-// ---------------------------------------------------------------------------
 // curl_strequal / curl_strnequal
-// ---------------------------------------------------------------------------
 
 /// Case-insensitive comparison of two whole strings.
 ///
@@ -338,9 +335,7 @@ unsafe fn borrow<'a>(ptr: *const c_char) -> Option<&'a CStr> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // curl_version
-// ---------------------------------------------------------------------------
 
 /// Returns the version banner.
 ///
@@ -368,32 +363,7 @@ pub extern "C" fn curl_version() -> *mut c_char {
     })
 }
 
-// ---------------------------------------------------------------------------
 // curl_version_info
-// ---------------------------------------------------------------------------
-
-/// The immortal report, wrapped so it can live in a `OnceLock`.
-///
-/// `curl_version_info_data` holds raw pointers and so is neither `Send` nor
-/// `Sync`.
-struct ImmortalReport(curl_version_info_data);
-
-// SAFETY: the wrapped value is written exactly once, inside
-// `OnceLock::get_or_init`, and never mutated afterwards. Every pointer field
-// addresses storage leaked by `immortal_c_string` or `immortal_c_array`, so
-// nothing it points at can be dropped on any thread. Moving the wrapper
-// between threads therefore moves only immortal addresses, which is what
-// `Send` requires -- and `OnceLock<T>: Sync` needs `T: Send` as well as
-// `T: Sync`, which is why both impls are here.
-unsafe impl Send for ImmortalReport {}
-
-// SAFETY: the wrapped value is written exactly once, inside
-// `OnceLock::get_or_init`, and never mutated afterwards. Every pointer field
-// addresses storage leaked by `immortal_c_string` or `immortal_c_array`, which
-// is immortal and never written after construction. Sharing it across threads
-// therefore exposes only immutable, permanently-valid data, which is exactly
-// what `Sync` requires.
-unsafe impl Sync for ImmortalReport {}
 
 /// Returns the version and capability report.
 ///
@@ -403,20 +373,48 @@ unsafe impl Sync for ImmortalReport {}
 /// consumer simply reads fewer fields and `age` tells it how many are valid.
 ///
 /// The returned pointer addresses immortal storage the caller must not free.
+///
+/// # Why the address is leaked and stored as a `usize`
+///
+/// C's return type is `curl_version_info_data *` -- a mutable pointer into a
+/// mutable `static` -- so a caller has always been able to write through it.
+/// Specification 0.8.1 freezes that signature, so the write capability must be
+/// reproduced rather than narrowed away.
+///
+/// That rules out the obvious implementation. Holding the struct in a
+/// `OnceLock<ImmortalReport>` behind a hand-written `unsafe impl Send + Sync`,
+/// taking `&report.0` from `get_or_init` and casting it with `.cast_mut()`,
+/// does not work. **A pointer derived from a shared reference carries
+/// read-only provenance, and writing through it is undefined behaviour** no
+/// matter what the C prototype says -- `OnceLock::get_or_init` can only ever
+/// hand back a `&T`, so no cast performed on its result can produce a pointer a
+/// caller may legally write. Such a cast makes the compiler accept a claim the
+/// aliasing model does not, and it is exactly the shape Miri reports.
+///
+/// So the storage is leaked instead: `Box::into_raw` yields a pointer with
+/// write provenance and no borrow behind it, and only the ADDRESS is kept, in a
+/// `OnceLock<usize>`. That is the pattern [`curl_version`] above already uses
+/// for its banner, and adopting it here removes the wrapper struct and both
+/// `unsafe impl`s outright -- a `usize` is `Send + Sync` on its own, so there is
+/// no unsafe assertion left to get wrong. The leak is deliberate and bounded:
+/// one allocation per process, matching C's function-level `static`.
 #[no_mangle]
 pub extern "C" fn curl_version_info(
     stamp: c_int,
 ) -> *mut curl_version_info_data {
     let _ = stamp;
-    static REPORT: OnceLock<ImmortalReport> = OnceLock::new();
+    static REPORT: OnceLock<usize> = OnceLock::new();
 
     guard_ptr(|| {
-        let report = REPORT.get_or_init(|| ImmortalReport(build_report()));
-        // C's return type is a mutable pointer into a mutable `static`, so this
-        // cast reproduces the frozen signature rather than widening anything.
-        // See the module documentation. `ptr::from_ref` is stable only from
-        // 1.76 and the declared MSRV is 1.75, so the coercion is spelled out.
-        (&report.0 as *const curl_version_info_data).cast_mut()
+        let address = *REPORT
+            .get_or_init(|| Box::into_raw(Box::new(build_report())) as usize);
+        // Sound as a WRITE pointer because the address came from
+        // `Box::into_raw` and no reference to the allocation was ever formed:
+        // the `Box` was consumed, and a `usize` holds no borrow. Nothing else
+        // writes this cell, and `get_or_init` guarantees the initialiser runs
+        // exactly once even under concurrent first calls, so every caller
+        // receives the same address to the same live allocation.
+        address as *mut curl_version_info_data
     })
 }
 
@@ -424,32 +422,44 @@ pub extern "C" fn curl_version_info(
 ///
 /// Field for field, in the authority's order. Every value comes from
 /// `curl_rs_lib::version_info()`; nothing is decided here.
+///
+/// # Where the C widths are put on
+///
+/// The engine reports fixed-width Rust integers -- `u32`, `i32`, `i64` -- and
+/// this function is where they become `c_uint`, `c_int` and `c_long`. That
+/// split is deliberate: the engine must not carry native-width
+/// assumptions, so `core::ffi` types appear only in the crate that owns the C
+/// ABI. The casts are written out rather than left to inference even though the
+/// types coincide on all four targets of specification 0.8.3, because a silent
+/// coincidence is not a boundary -- naming the conversion is what makes this
+/// the one place a width is asserted, and curl's ABI fixes these widths in the
+/// header regardless of what any compiler would have chosen.
 fn build_report() -> curl_version_info_data {
     let info = curl_rs_lib::version_info();
 
     curl_version_info_data {
-        age: info.age.as_c_int(),
+        age: info.age.as_c_int() as c_int,
         version: immortal_c_string(info.version),
-        version_num: info.version_num,
+        version_num: info.version_num as c_uint,
         host: immortal_c_string(info.host),
-        features: info.features,
+        features: info.features as c_int,
         ssl_version: immortal_c_option(info.ssl_version),
-        ssl_version_num: info.ssl_version_num,
+        ssl_version_num: info.ssl_version_num as c_long,
         libz_version: immortal_c_option(info.libz_version),
         protocols: immortal_c_array(info.protocols),
         ares: immortal_c_option(info.ares),
-        ares_num: info.ares_num,
+        ares_num: info.ares_num as c_int,
         libidn: immortal_c_option(info.libidn),
-        iconv_ver_num: info.iconv_ver_num,
+        iconv_ver_num: info.iconv_ver_num as c_int,
         libssh_version: immortal_c_option(info.libssh_version),
-        brotli_ver_num: info.brotli_ver_num,
+        brotli_ver_num: info.brotli_ver_num as c_uint,
         brotli_version: immortal_c_option(info.brotli_version),
-        nghttp2_ver_num: info.nghttp2_ver_num,
+        nghttp2_ver_num: info.nghttp2_ver_num as c_uint,
         nghttp2_version: immortal_c_option(info.nghttp2_version),
         quic_version: immortal_c_option(info.quic_version),
         cainfo: immortal_c_option(info.cainfo),
         capath: immortal_c_option(info.capath),
-        zstd_ver_num: info.zstd_ver_num,
+        zstd_ver_num: info.zstd_ver_num as c_uint,
         zstd_version: immortal_c_option(info.zstd_version),
         hyper_version: immortal_c_option(info.hyper_version),
         gsasl_version: immortal_c_option(info.gsasl_version),
@@ -633,6 +643,47 @@ mod tests {
     #[test]
     fn the_report_pointer_is_the_same_on_every_call() {
         assert_eq!(curl_version_info(0), curl_version_info(11));
+    }
+
+    /// The returned pointer must be genuinely WRITABLE, because C's is.
+    ///
+    /// This is the assertion that distinguishes the current implementation from
+    /// the one it replaced. A `*mut` produced by casting a shared reference --
+    /// which is all `OnceLock::get_or_init` can ever yield -- compiles and even
+    /// appears to work, while being undefined behaviour the moment a caller
+    /// writes through it. Leaking the allocation with `Box::into_raw` and
+    /// keeping only its address gives a pointer with write provenance, and this
+    /// test exercises exactly that: it writes a field, reads it back, and
+    /// restores it.
+    ///
+    /// Run under `cargo miri test`, this fails loudly against the old design
+    /// and passes against this one, which is what makes it a regression guard
+    /// rather than a restatement.
+    #[test]
+    fn the_report_pointer_is_writable_as_the_c_signature_promises() {
+        let raw = curl_version_info(0);
+        assert!(!raw.is_null());
+
+        // SAFETY: `raw` addresses the single leaked `curl_version_info_data`
+        // built by `build_report`. The allocation is immortal, so the reference
+        // cannot dangle, and this test is the only writer -- no other test
+        // mutates the report, and `age` is restored before this one returns.
+        let report = unsafe { &mut *raw };
+
+        let original = report.age;
+        // A value no real report uses, so a stale read would be obvious.
+        report.age = 0x5A5A;
+        assert_eq!(
+            report.age, 0x5A5A,
+            "a write through the returned pointer must be observable, which is \
+             what C's mutable static permits and what a shared-reference cast \
+             cannot soundly provide"
+        );
+
+        // Restored so the process-wide report stays truthful for every other
+        // test in this module, whatever order the harness runs them in.
+        report.age = original;
+        assert_eq!(report.age, original);
     }
 
     /// Truncation at an interior NUL is the documented behaviour of the helper,

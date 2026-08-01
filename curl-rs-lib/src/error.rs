@@ -156,9 +156,25 @@
 //!   `CURLE_SSL_CACERT` for `CURLE_PEER_FAILED_VERIFICATION`. Those are
 //!   preprocessor macros over the enumerators reproduced here, not
 //!   enumerators in their own right, and they belong to the generated public
-//!   header. The one alias that is *not* a `CURLcode` macro,
-//!   `CURLM_CALL_MULTI_SOCKET`, does appear below, because a Rust caller needs
-//!   a real item to name.
+//!   header -- and so does the one alias that is not a `CURLcode` macro,
+//!   `CURLM_CALL_MULTI_SOCKET`. `include/curl/multi.h:83` defines it as
+//!   `#define CURLM_CALL_MULTI_SOCKET CURLM_CALL_MULTI_PERFORM` so that
+//!   socket-driven C reads naturally, and `curl-rs-ffi/build.rs` splices that
+//!   line into the generated `multi.h` verbatim, because cbindgen cannot express
+//!   a `#define` whose value is another identifier. That splice is the ONE
+//!   authoritative representation.
+//!
+//!   It is deliberately NOT mirrored here as
+//!   `pub const CURLM_CALL_MULTI_SOCKET: CURLMcode`. The reasoning that "a
+//!   Rust caller cannot name a C macro, so the alias is provided as a real
+//!   item" does not hold: no Rust caller names it and none is planned --
+//!   `curl-rs-ffi` reads the alias from the spliced header and `curl-rs` never
+//!   touches the multi C API -- so it would be a second definition of one ABI
+//!   value, maintained for a hypothetical consumer, in a module whose stated
+//!   rule two paragraphs above is that "restating even one identifier here
+//!   would create the second table that guarantees eventual drift". A Rust
+//!   caller that ever does need it should name
+//!   [`CURLMcode::CallMultiPerform`], which is the value the macro expands to.
 //! - **Internal `Curl_*` re-exports.** Nothing here is widened beyond what a
 //!   dependent genuinely consumes.
 //!
@@ -808,9 +824,11 @@ result_code! {
     /// observes: `lib/multi.c` sets it in 24 places and the loop at
     /// `lib/multi.c:2740`, `while((mresult == CURLM_CALL_MULTI_PERFORM) || ...)`,
     /// drains it before `curl_multi_perform` returns. It remains part of the
-    /// ABI, is aliased by [`CURLM_CALL_MULTI_SOCKET`], and
-    /// [`Self::is_ok`] reports `false` for it, matching the C tests that
-    /// compare against `CURLM_OK` alone.
+    /// ABI, the public header aliases it as the macro
+    /// `CURLM_CALL_MULTI_SOCKET` (`include/curl/multi.h:83`, spliced verbatim by
+    /// `curl-rs-ffi/build.rs` and deliberately not mirrored as a Rust item --
+    /// see this module's documentation), and [`Self::is_ok`] reports `false`
+    /// for it, matching the C tests that compare against `CURLM_OK` alone.
     ///
     /// Messages come from `curl_multi_strerror` (`lib/strerror.c:326-383`),
     /// whose `CURLM_LAST` arm is a bare `break` and therefore resolves to
@@ -855,19 +873,6 @@ result_code! {
         ]
     }
 }
-
-/// `CURLM_CALL_MULTI_SOCKET`, the alias of [`CURLMcode::CallMultiPerform`].
-///
-/// `include/curl/multi.h:83` defines it as a macro so that socket-driven code
-/// reads naturally:
-///
-/// > just to make code nicer when using `curl_multi_socket()` you can now check
-/// > for `CURLM_CALL_MULTI_SOCKET` too in the same style it works for
-/// > `curl_multi_perform()` and `CURLM_CALL_MULTI_PERFORM`
-///
-/// A Rust caller cannot name a C macro, so the alias is provided as a real
-/// item. It resolves to the identical integer, `-1`, which is asserted by test.
-pub const CURLM_CALL_MULTI_SOCKET: CURLMcode = CURLMcode::CallMultiPerform;
 
 result_code! {
     /// Every result a URL API function can report: `CURLUcode`.
@@ -1503,13 +1508,20 @@ mod tests {
         assert!(!CURLMcode::CallMultiPerform.is_ok());
     }
 
-    /// `CURLM_CALL_MULTI_SOCKET` resolves to the identical integer.
+    /// The value `CURLM_CALL_MULTI_SOCKET` expands to, asserted where it lives.
+    ///
+    /// `include/curl/multi.h:83` makes the alias a `#define` over
+    /// `CURLM_CALL_MULTI_PERFORM`, and `curl-rs-ffi/build.rs` carries that line
+    /// verbatim, so the alias itself has no Rust item to test. What this module
+    /// owns is the value it resolves to, and that is what a consumer comparing
+    /// against either spelling depends on: the integer `-1` and the C name
+    /// `CURLM_CALL_MULTI_PERFORM`. Both are asserted here so that removing the
+    /// mirrored `pub const` cost no coverage.
     #[test]
-    fn curlm_call_multi_socket_aliases_call_multi_perform() {
-        assert_eq!(CURLM_CALL_MULTI_SOCKET, CURLMcode::CallMultiPerform);
-        assert_eq!(CURLM_CALL_MULTI_SOCKET.as_i32(), -1);
+    fn the_value_the_call_multi_socket_alias_expands_to_is_pinned() {
+        assert_eq!(CURLMcode::CallMultiPerform.as_i32(), -1);
         assert_eq!(
-            CURLM_CALL_MULTI_SOCKET.c_name(),
+            CURLMcode::CallMultiPerform.c_name(),
             "CURLM_CALL_MULTI_PERFORM"
         );
     }

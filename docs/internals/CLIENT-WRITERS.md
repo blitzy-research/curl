@@ -332,10 +332,12 @@ locally overridden (`error[E0453]: allow(unsafe_code) incompatible with
 previous forbid`) and Agent Action Plan goal G1 permits only three crates, so
 the island cannot move into a fourth; `deny` is no weaker, since a stray
 `unsafe` block outside the island is a hard error rather than a warning. In
-`curl-rs` there is no island at all, so the delivered binary root
-`curl-rs/src/bin/curlinfo.rs` does carry `#![forbid(unsafe_code)]` literally;
-the crate root `curl-rs/src/main.rs` named in Agent Action Plan section 0.3.1
-is not yet on disk. The writer chain has no business in that island: holding
+`curl-rs` there is no island at all -- measured, that crate contains zero
+`unsafe` blocks and zero `#[allow(unsafe_code)]` attributes -- so both of its
+roots carry `#![forbid(unsafe_code)]` literally: the crate root
+`curl-rs/src/main.rs` named in Agent Action Plan section 0.3.1, and the
+diagnostic binary `curl-rs/src/bin/curlinfo.rs`.
+The writer chain has no business in that island: holding
 bytes and handing them to a callback asks for nothing that the safe subset does
 not already offer.
 

@@ -72,7 +72,7 @@
 # Why the soname link argument is NOT set here
 #
 # [target.<triple>].rustflags are not artifact-scoped. They reach every artifact
-# built for that triple - the curl-rs binary, the curlinfo binary and, when host
+# built for that triple - the `curl` binary, the `curlinfo` binary and, when host
 # equals target, build script executables - and not only curl-rs-ffi's cdylib.
 # Setting the soname here was measured to stamp DT_SONAME = libcurl.so.4 onto
 # both command-line binaries as well as the shared library, with no link error
@@ -81,12 +81,24 @@
 # libcurl.so.4.
 #
 # The correctly-scoped mechanism is a cdylib-only link argument emitted from
-# curl-rs-ffi/build.rs:
+# curl-rs-ffi/build.rs. Quoted verbatim, because a comment naming a directive
+# the build script does not emit sends the next reader hunting for the wrong
+# string:
 #
-#   println!("cargo:rustc-cdylib-link-arg=-Wl,--soname=libcurl.so.4");
+#   println!("cargo:rustc-link-arg-cdylib=-Wl,--soname=libcurl.so.4");
 #
-# which puts the soname on the cdylib alone and leaves both binaries clean. One
-# constraint on that line, because it is easy to get wrong: Cargo's newer
+# with a `-Wl,-install_name,@rpath/libcurl.4.dylib` form on macOS. Note the
+# suffix placement: `rustc-link-arg-cdylib`, NOT the older
+# `rustc-cdylib-link-arg` it is easily confused with. Cargo accepts
+# both, so that confusion cannot be caught by a build failure -- only by
+# reading curl-rs-ffi/build.rs, which emits the former at two sites. The
+# emitted form is the one measured to work: `readelf -d` on the resulting
+# library reports "Library soname: [libcurl.so.4]", a C consumer linked with
+# `-lcurl` records `DT_NEEDED: libcurl.so.4`, and neither binary carries a
+# soname.
+#
+# One further constraint on that line, because it is easy to get wrong: Cargo's
+# newer
 # double-colon spelling of build script directives postdates the declared MSRV
 # floor and fails outright on cargo 1.75 with "unsupported output in build
 # script". The single-colon form above is the only spelling that satisfies the
@@ -254,6 +266,13 @@ linker = "aarch64-linux-gnu-gcc"
 # that this one target's variadic entry points are unsupported and say so. No
 # workaround is attempted here. The triple is listed because the target matrix
 # mandates it, not because the variadic entry points are known good on it.
+#
+# WHERE THAT IS ENFORCED, so a reader of this file is not left with a caveat and
+# no consequence: curl-rs-ffi/build.rs REFUSES to build this triple until the
+# decision is recorded in CURL_RS_A4_VARIADIC_DECISION. No workflow in this
+# repository records it, and none may - the choice belongs to whoever set the
+# requirements. So this leg of the four-target gate is red on purpose, carrying
+# the refusal's diagnosis, rather than green with a footnote.
 
 # Cross toolchain for the aarch64 Linux leg
 #

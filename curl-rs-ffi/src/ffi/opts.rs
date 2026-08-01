@@ -1,3 +1,7 @@
+// Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+//
+// SPDX-License-Identifier: curl
+
 //! `CURLoption` identity and the `curl_easyoption` metadata authority.
 //!
 //! This module is the SOLE source of truth for option identity. AAP 0.1.2
@@ -81,7 +85,6 @@
 
 use core::ffi::c_uint;
 
-// ----------------------------------------------------------------------
 // Option type bases.
 //
 // `pub(crate)` is load-bearing. cbindgen would render a `pub` constant as
@@ -93,7 +96,6 @@ use core::ffi::c_uint;
 // (include/curl/curl.h:1127-1136) and are written here as aliases too,
 // because that is what makes `curl_easytype` impossible to recover from
 // `value / 10000`: three distinct bases share 10000.
-// ----------------------------------------------------------------------
 #[allow(dead_code)]
 pub(crate) const CURLOPTTYPE_LONG: i32 = 0;
 #[allow(dead_code)]
@@ -114,9 +116,7 @@ pub(crate) const CURLOPTTYPE_CBPOINT: i32 = CURLOPTTYPE_OBJECTPOINT;
 #[allow(dead_code)]
 pub(crate) const CURLOPTTYPE_VALUES: i32 = CURLOPTTYPE_LONG;
 
-// ----------------------------------------------------------------------
 // Metadata types, emitted into `include/curl/options.h`.
-// ----------------------------------------------------------------------
 
 /// The type of value a `CURLoption` takes, as reported by the
 /// `curl_easy_option_*` introspection API.
@@ -155,7 +155,6 @@ pub enum curl_easytype {
 #[allow(dead_code)]
 pub const CURLOT_FLAG_ALIAS: c_uint = 1 << 0;
 
-// ----------------------------------------------------------------------
 // The option enumeration, emitted into `include/curl/curl.h`.
 //
 // `cbindgen.toml:898` lists `CURLoption` under `[export] exclude`. AAP
@@ -164,7 +163,6 @@ pub const CURLOT_FLAG_ALIAS: c_uint = 1 << 0;
 // `CURL_H_GENERATED_DESPITE_EXCLUSION` (build.rs:3144) so the divergence
 // from the checked-in cbindgen configuration is deliberate and traceable
 // rather than looking like a configuration bug.
-// ----------------------------------------------------------------------
 
 /// Every `CURLOPT_*` identifier, with its integer pinned.
 /// Values are NOT contiguous and are NOT ordered: the enumeration
@@ -1691,14 +1689,12 @@ impl CURLoption {
     }
 }
 
-// ----------------------------------------------------------------------
 // The 19 `#define CURLOPT_*` aliases.
 //
 // Held here so the parity assertion AAP 0.1.2 requires has something to
 // assert against, and NOT exported: the emitted form has to keep its
 // `#ifndef CURL_NO_OLDIES` guards, which cbindgen cannot produce, so the
 // guarded blocks are carried verbatim. See the module documentation.
-// ----------------------------------------------------------------------
 
 /// One `#define CURLOPT_<old> <new>` line from the frozen header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1838,7 +1834,6 @@ pub(crate) const OPTION_ALIASES: &[OptionAlias] = &[
     },
 ];
 
-// ----------------------------------------------------------------------
 // The `curl_easyoption` metadata array.
 //
 // `struct curl_easyoption` itself is pinned verbatim (build.rs:849)
@@ -1851,7 +1846,6 @@ pub(crate) const OPTION_ALIASES: &[OptionAlias] = &[
 // name, with the sentinel last. `curl_easy_option_next` walks this array
 // in order and a consumer may rely on that order, so it is preserved
 // exactly rather than re-sorted.
-// ----------------------------------------------------------------------
 
 /// One row of the option metadata table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1871,15 +1865,18 @@ pub(crate) struct EasyOptionRow {
 
 impl EasyOptionRow {
     /// True when this row exists only for backward compatibility.
+    ///
+    /// `const` so that the row counts below can be COMPUTED from the table
+    /// rather than transcribed beside it.
     #[allow(dead_code)]
-    pub(crate) fn is_alias(&self) -> bool {
+    pub(crate) const fn is_alias(&self) -> bool {
         self.flags & CURLOT_FLAG_ALIAS != 0
     }
 
     /// True for a real, preferred option row -- neither an alias nor the
     /// sentinel.
     #[allow(dead_code)]
-    pub(crate) fn is_true_option(&self) -> bool {
+    pub(crate) const fn is_true_option(&self) -> bool {
         self.name.is_some() && !self.is_alias()
     }
 
@@ -3844,23 +3841,105 @@ pub(crate) const EASY_OPTIONS: &[EasyOptionRow] = &[
     },
 ];
 
-/// Rows in the table, including the sentinel. Measured against
-/// `lib/optiontable.pl` output.
+// The four row counts, DERIVED from [`EASY_OPTIONS`] rather than
+// transcribed beside it.
+//
+// Every one of these was previously a hand-written literal, which made the
+// table and its own description two independent populations: a row added or
+// removed without a matching edit here produced a silently wrong count, and
+// only `metadata_table_shape_matches_optiontable_pl` below would have caught
+// it, and only when tests ran. `curl-rs-ffi/src/ffi/easy.rs` uses
+// `EASY_OPTION_ROWS` as an array length, so a stale literal there was a
+// wrong-sized array rather than a wrong number in a comment.
+//
+// Computing them makes that class of drift unrepresentable instead of
+// detectable. The `const` assertions immediately below then pin the DATA to
+// the C oracle -- `perl lib/optiontable.pl < include/curl/curl.h` -- so the
+// derivation cannot quietly agree with itself while both halves drift away
+// from curl 8.19.0-DEV. Derivation and pinning answer different questions
+// and both are needed: derivation keeps the numbers honest about the table,
+// pinning keeps the table honest about curl.
+
+/// Rows flagged `CURLOT_FLAG_ALIAS`, counted over the table.
+///
+/// A `const fn` with an index loop rather than an iterator chain, because
+/// `Iterator::filter` is not callable in a `const` context on the pinned
+/// minimum toolchain.
+const fn count_alias_rows(rows: &[EasyOptionRow]) -> usize {
+    let mut aliases = 0;
+    let mut index = 0;
+    while index < rows.len() {
+        if rows[index].is_alias() {
+            aliases += 1;
+        }
+        index += 1;
+    }
+    aliases
+}
+
+/// Rows that terminate the table -- those whose C `name` is NULL.
+///
+/// Counted rather than assumed to be one, so that a second sentinel spliced
+/// into the middle of the table is a compile error rather than a silently
+/// truncated `curl_easy_option_next` walk.
+const fn count_sentinel_rows(rows: &[EasyOptionRow]) -> usize {
+    let mut sentinels = 0;
+    let mut index = 0;
+    while index < rows.len() {
+        if rows[index].name.is_none() {
+            sentinels += 1;
+        }
+        index += 1;
+    }
+    sentinels
+}
+
+/// Rows in the table, including the sentinel.
 #[allow(dead_code)]
-pub(crate) const EASY_OPTION_ROWS: usize = 324;
+pub(crate) const EASY_OPTION_ROWS: usize = EASY_OPTIONS.len();
 
 /// Rows excluding the sentinel.
 #[allow(dead_code)]
-pub(crate) const EASY_OPTION_REAL_ROWS: usize = 323;
+pub(crate) const EASY_OPTION_REAL_ROWS: usize =
+    EASY_OPTION_ROWS - count_sentinel_rows(EASY_OPTIONS);
 
 /// Rows flagged `CURLOT_FLAG_ALIAS`.
 #[allow(dead_code)]
-pub(crate) const EASY_OPTION_ALIAS_ROWS: usize = 15;
+pub(crate) const EASY_OPTION_ALIAS_ROWS: usize = count_alias_rows(EASY_OPTIONS);
 
 /// Rows describing a real, preferred option. Equals
 /// [`CURLoption::REAL_COUNT`].
 #[allow(dead_code)]
-pub(crate) const EASY_OPTION_TRUE_ROWS: usize = 308;
+pub(crate) const EASY_OPTION_TRUE_ROWS: usize =
+    EASY_OPTION_REAL_ROWS - EASY_OPTION_ALIAS_ROWS;
+
+// The oracle. These four numbers come from RUNNING the C generator,
+// `perl lib/optiontable.pl < include/curl/curl.h`, and counting its output
+// with brace-balanced scanning: 324 rows, of which 1 is the terminating
+// `{ NULL, CURLOPT_LASTENTRY, CURLOT_LONG, 0 }` and 15 carry
+// `CURLOT_FLAG_ALIAS`, leaving 308 preferred options.
+//
+// A `const` assertion rather than a test, because a test reports drift and
+// this refuses to build with it. `curl-rs-ffi/build.rs` re-derives the same
+// four counts by reading THIS FILE as text, so the numbers are checked from
+// both inside and outside the crate.
+const _: () = assert!(
+    EASY_OPTION_ROWS == 324,
+    "lib/optiontable.pl emits 324 rows including the sentinel"
+);
+const _: () = assert!(
+    count_sentinel_rows(EASY_OPTIONS) == 1,
+    "the table must end with exactly one NULL-name sentinel"
+);
+const _: () = assert!(
+    EASY_OPTION_ALIAS_ROWS == 15,
+    "lib/optiontable.pl emits 15 CURLOT_FLAG_ALIAS rows"
+);
+const _: () = assert!(
+    EASY_OPTION_TRUE_ROWS == 308,
+    "curl 8.19.0-DEV has 308 preferred options (291 CURLOPT plus 17 \
+     CURLOPTDEPRECATED)"
+);
 
 #[cfg(test)]
 mod tests {

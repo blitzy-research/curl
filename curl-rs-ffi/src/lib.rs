@@ -28,7 +28,8 @@
 //                    C typedefs (`include/curl/curl.h:469-473`) are
 //                    `unsafe extern "C" fn`. Calling one is inherently
 //                    unsafe: the pointer it returns is the application's.
-//   `mod ffi`     -- the 100 exported entry points. Every one is
+//   `mod ffi`     -- the exported entry points: all 100 at completion, the 24
+//                    defined at this commit. Every one is
 //                    `#[no_mangle] pub extern "C"` over raw C pointers.
 //   `mod tests`   -- must construct `unsafe extern "C" fn` hook
 //                    implementations to exercise `mod memory` against the
@@ -52,6 +53,11 @@
 #![deny(unsafe_code)]
 
 //! libcurl's C ABI, expressed in Rust.
+//!
+//! Comments throughout this crate cite `AAP <section>` -- the frozen
+//! migration specification that this implementation is measured against.
+//! Its section numbers are stable, and a citation marks a decision the
+//! specification fixes rather than one this code is free to change.
 //!
 //! This crate is the ABI facade that presents curl 8.19.0-DEV's exported C
 //! surface over the safe engine in `curl-rs-lib`. It marshals; it does not
@@ -91,10 +97,30 @@
 //! `#[no_mangle] pub extern "C"` definition; a duplicate is a link error
 //! and nothing builds. The partition below is therefore both disjoint and
 //! exhaustive, and it is the contract the `ffi/` modules must satisfy.
-//! None of those modules exists yet -- `curl-rs-ffi/src/` holds only this
-//! file at this commit -- so every `ffi/*.rs` named in this documentation,
-//! here and below, is a target rather than a description, and the crate
-//! exports nothing until they land.
+//!
+//! **The partition is PARTLY REALISED at this commit, and the table below is
+//! the target rather than an inventory.** The measured state, which every
+//! claim here is to be read against:
+//!
+//! * `curl-rs-ffi/src/ffi/` holds fifteen files: the six symbol-family modules
+//!   `easy`, `escape`, `global`, `misc`, `slist` and `strerror`; the
+//!   type-and-metadata modules `codes`, `handle`, `opts` and `types`; the
+//!   support modules `memory` and `panic_boundary`; `mod.rs`; and two oracle
+//!   fixtures. `multi`, `share`, `mime`, `form`, `url`, `ws` and `printf` are
+//!   still targets.
+//! * **24 of the 100 symbols are exported, 76 are not, and 0 extra symbols
+//!   leak.** Measured two independent ways that agree exactly: `nm -D
+//!   --defined-only` over the built `cdylib`, and `build.rs`'s
+//!   `undefined_abi_exports`, which parses `lib/libcurl.def` and this crate's
+//!   `#[no_mangle]` declarations. The crate therefore exports something, but it
+//!   is **not** a drop-in replacement yet, and nothing here should be read as
+//!   claiming otherwise.
+//! * Because the header is generated FROM this crate, an incomplete surface
+//!   would generate an incomplete header. `build.rs` refuses: while any of the
+//!   100 is undefined it writes no header at all and says so, leaving the
+//!   reviewed curl 8.19.0-DEV headers in place as the ABI contract. So the
+//!   partial state cannot silently degrade the contract - see
+//!   `generate_headers`.
 //!
 //! | Module | Count | Derivation |
 //! |---|---|---|
@@ -184,7 +210,8 @@
 //! # Panic containment
 //!
 //! An unwind that crosses the C boundary is undefined behaviour, so no
-//! panic may escape any of the 100 entry points. The containment
+//! panic may escape any entry point -- the rule covers all 100 names and is
+//! obeyed by each of the 24 defined today. The containment
 //! mechanism is code, not a build setting: `panic = "abort"` is prohibited
 //! in the release profile -- the workspace root sets `panic = "unwind"`
 //! explicitly -- because aborting would terminate the host application,
@@ -289,7 +316,11 @@
 //! modules under `ffi/`:
 //!
 //! * An entry point that **mutates** a handle routes through `guard_tx`
-//!   with that handle's [`panic_boundary::Poison`]. A panic poisons it.
+//!   with that handle's `Poison` flag -- `ffi::panic_boundary::Poison`, named
+//!   in prose rather than linked because both it and the module holding it are
+//!   `pub(crate)`, so an intra-doc link from this public page would be a
+//!   private-item link and `RUSTDOCFLAGS=-D warnings` rejects it. A panic
+//!   poisons it.
 //! * An entry point that only **reads** may use `guard`.
 //! * Every call on a poisoned handle returns the family-correct error
 //!   **without running its body**, so half-mutated state is never read.
@@ -421,13 +452,13 @@
 //! a reader looks for crate-wide caveats. None may be discovered by surprise
 //! later.
 //!
-//! **A4: RESOLVED, by a fourth option specification 0.8.6 did not have.**
-//! Four exported functions -- `curl_easy_setopt`, `curl_easy_getinfo`,
-//! `curl_multi_setopt` and `curl_share_setopt` -- are C-variadic in the
-//! header, and the design reaches them with a non-variadic Rust function
-//! taking one trailing pointer, which works because the option identifier
-//! already encodes its argument's type class (integer division by 10,000
-//! recovers the `CURLOPTTYPE_*` base).
+//! **A4: OPEN AND ESCALATED, with a candidate fourth option identified but
+//! not adopted.** Four exported functions -- `curl_easy_setopt`,
+//! `curl_easy_getinfo`, `curl_multi_setopt` and `curl_share_setopt` -- are
+//! C-variadic in the header, and the design reaches them with a non-variadic
+//! Rust function taking one trailing pointer, which works because the option
+//! identifier already encodes its argument's type class (integer division by
+//! 10,000 recovers the `CURLOPTTYPE_*` base).
 //!
 //! The hazard is real and was measured on both sides of the call, on all
 //! four targets. A C caller does not put the third argument in the same
@@ -451,9 +482,14 @@
 //! supported Rust version, drop the target, or accept that one target's
 //! variadic entry points are unsupported -- because the only remedy known
 //! at the time was `VaList` with `ap.next_arg`, stable far above the
-//! declared minimum of 1.75. There is a fourth, and it costs none of those
-//! three. A `core::arch::global_asm!` trampoline exported under the public
-//! symbol name relocates the argument and tail-calls the implementation:
+//! declared minimum of 1.75. A fourth is technically available and costs none
+//! of those three, and it is described below because a reader is entitled to
+//! know it exists. It is **not** treated as a resolution: specification 0.8.6
+//! escalates A4 to whoever set the requirements, so which way out is taken --
+//! including whether to take one the specification does not list -- is that
+//! person's decision and not this crate's. A `core::arch::global_asm!`
+//! trampoline exported under the public symbol name would relocate the
+//! argument and tail-call the implementation:
 //!
 //! ```text
 //! _curl_easy_setopt:
@@ -470,9 +506,10 @@
 //! the export set, and `llvm-objdump` shows precisely the four instructions
 //! above. No newer toolchain, no C compiler, no dropped target.
 //!
-//! Because none of the four has a Rust body yet, there is nothing to
-//! trampoline to today and therefore no mismatch to be exposed to. That is
-//! a fact about the current state, not a reason to rely on remembering it:
+//! Because none of the four has a Rust body yet, no trampoline is written and
+//! there is nothing to trampoline to, so the mechanism above is a validated
+//! candidate rather than something this crate contains. That is a fact about
+//! the current state, not a reason to rely on remembering it:
 //! `curl-rs-ffi/build.rs`'s `check_variadic_strategy` fails the build, **on
 //! every target**, if any of the four ever gains a plain non-variadic
 //! definition without a `global_asm!` trampoline exporting its label. It
@@ -483,7 +520,7 @@
 //! both broke specification 0.8.4 gate 1 -- zero warnings on all four
 //! targets -- and described a defect that was not present.
 //!
-//! **That decision is enforced, not merely recorded here.** A caveat in a
+//! **The escalation is enforced, not merely recorded here.** A caveat in a
 //! doc comment is exactly the "silent acceptance" the specification calls
 //! the worst option, so `build.rs`'s `check_variadic_abi` makes it
 //! impossible: building for `aarch64-apple-darwin` **fails** unless
@@ -494,9 +531,22 @@
 //! it actually suppresses a refusal the build says so. The two lists the
 //! gate reasons about are asserted against the verbatim header text this
 //! crate emits, and the eleven named in the next paragraph are asserted
-//! equal to the gate's own list by
-//! [`the_variadic_inventory_matches_the_build_gate`], so this
-//! documentation and that enforcement cannot drift apart.
+//! equal to the gate's own list by the `#[cfg(test)]` function
+//! `the_variadic_inventory_matches_the_build_gate` in this file, so this
+//! documentation and that enforcement cannot drift apart. (Named in prose
+//! rather than as an intra-doc link: a `#[cfg(test)]` item is absent from the
+//! documented crate, so a link to it resolves to nothing and rustdoc rejects
+//! it under `-D warnings`.)
+//!
+//! **Nothing in this repository sets that variable, and nothing may.** No
+//! workflow records an A4 decision -- `.github/workflows/rust-build.yml` says
+//! so in its env block, enumerates the three options there, and asserts on
+//! every matrix leg that reaches its assertion step that no acceptance was in
+//! force. The observable consequence is deliberate: gate 1 of specification
+//! 0.8.4 reports three targets green and `aarch64-apple-darwin` **red**, with
+//! the refusal above as its diagnosis. Reporting a known-wrong variadic ABI as
+//! a successful target build is the one outcome specification 0.8.6 singles out
+//! as worse than a red gate, because it "would not surface in local testing".
 //!
 //! **Fifteen of the 100 symbols, not four, have an argument shape stable
 //! Rust cannot express at the declared minimum.** Searching for the
@@ -520,9 +570,10 @@
 //! per-target `unsafe`, while the plain forms need `va_start`, which is
 //! unavailable at the declared minimum.
 //!
-//! **The trampoline that resolves A4 does not resolve these eleven, and the
-//! difference is worth stating precisely so the resolution above is not
-//! over-read.** That trampoline relocates exactly one argument from a known
+//! **The candidate trampoline would not reach these eleven even if it were
+//! adopted, and the difference is worth stating precisely so the paragraph
+//! above is not over-read.** That trampoline relocates exactly one argument
+//! from a known
 //! stack slot into a known register, which is sufficient because those four
 //! functions take a fixed three arguments. A format-driven function takes an
 //! unknown number of arguments of unknown types, so reaching them needs the
@@ -597,9 +648,9 @@
 //! module; `util` is `pub(crate)`, so a private path could not be named
 //! from here. `curl-rs-lib`'s crate root now re-exports exactly one name
 //! from that tree -- `curl_rs_lib::getdate`, backed by
-//! `curl-rs-lib/src/util/parsedate.rs` -- which is review finding M-13's
-//! resolution. It was closed by widening the ENGINE rather than by
-//! duplicating the parser here, because a copy would put engine logic in
+//! `curl-rs-lib/src/util/parsedate.rs`. That gap was closed by widening the
+//! ENGINE rather than by duplicating the parser here, because a copy would
+//! put engine logic in
 //! a crate whose job is the C ABI and nothing else; this crate's
 //! `curl_getdate` is left with a `*const c_char` to `&str` conversion and
 //! an `Option` to `time_t` mapping. The internal `Curl_getdate_capped`
@@ -611,16 +662,6 @@
 //!
 //! # Provenance of the constraints above
 //!
-//! No user-specified rules were provided for this project: the rules
-//! channel is empty, which was confirmed by reading it to end of document
-//! more than once. Nothing in this file derives from a rule, and no rule
-//! is cited anywhere in it, because there is none to cite. Every
-//! constraint recorded here comes from one of exactly two places: the
-//! migration plan's own requirements, which restate the user's request,
-//! or a fact measured in this repository and given with its path and line
-//! so it can be rechecked. Neither is a rule, and neither should be
-//! described as one. Where a claim could not be settled by reading, it was
-//! settled by building and running the thing in question, and it says so.
 // THE SAFETY INVARIANT for this crate, and the executable gate behind it.
 //
 // `#![deny(unsafe_code)]` is at the head of this file, and exactly ONE
@@ -658,8 +699,9 @@
 // NEVER add `#![allow(unsafe_code)]` at crate level, and NEVER add a second
 // `#[allow(unsafe_code)]` anywhere. Either one converts a checked invariant
 // back into a review obligation.
-// The 100 exported entry points, the two support modules every one of them
-// routes through, and the ABI types the generated header is built from.
+// The exported entry points -- 24 defined here at this commit, 100 at
+// completion -- the two support modules every one of them routes through, and
+// the ABI types the generated header is built from.
 //
 // The module is private on purpose: a `cdylib` exports what is declared
 // `#[no_mangle] pub extern "C"` regardless of the privacy of the module holding
@@ -1003,7 +1045,7 @@ mod unsafe_boundary {
 
 // The executable half of the capability-truthfulness contract.
 //
-// WHY THIS GATE EXISTS. Review finding M-22 recorded that the generated
+// WHY THIS GATE EXISTS. The generated
 // consumer metadata and the runtime `--version` banner "describe different
 // products": the metadata added `asyn-rr` and `HTTPSRR`, omitted the truthful
 // `HTTPS-proxy`, and under `memdebug` emitted `Debug` plus a nonstandard
@@ -1139,7 +1181,7 @@ mod capability_truthfulness {
 
 // The executable half of the cross-crate seam.
 //
-// Review finding M-13: `curl_getdate` is one of the 100 exported symbols and
+// `curl_getdate` is one of the 100 exported symbols and
 // needs a date parser, which lives in `curl-rs-lib`'s `pub(crate) mod util`.
 // A private path cannot be named across a crate boundary, so before the fix
 // this crate had exactly two options -- reimplement `lib/parsedate.c` here, or
@@ -1218,7 +1260,7 @@ mod engine_seam {
         assert!(curl_rs_lib::getdate("20011231").is_some());
     }
 
-    // -- The crate-root safety gate (finding 19) ---------------------------
+    // -- The crate-root safety gate ---------------------------
 
     #[test]
     fn the_audited_unsafe_allowances_are_exactly_three() {
@@ -1299,7 +1341,7 @@ mod engine_seam {
         );
     }
 
-    // -- The variadic inventory, bound to the build gate (finding 20) ------
+    // -- The variadic inventory, bound to the build gate ------
 
     /// The eleven names in this test, read out of the build script.
     ///
@@ -1414,7 +1456,7 @@ mod engine_seam {
         );
     }
 
-    // -- Redaction and poisoning at the boundary (finding 26) --------------
+    // -- Redaction and poisoning at the boundary --------------
 
     #[test]
     fn the_redacted_line_carries_no_payload_and_no_path() {
