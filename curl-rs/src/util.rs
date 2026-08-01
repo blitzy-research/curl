@@ -7,8 +7,8 @@
 //!
 //! # What this supersedes
 //!
-//! AAP section 0.4.1 maps this module onto two C translation units, and onto
-//! only the portable part of each:
+//! This module supersedes two C translation units, and only the portable part
+//! of each:
 //!
 //! - `src/tool_util.c:51-61` -- the POSIX arm of `tvrealnow()`, documented at
 //!   `src/tool_util.h:28-30` as "Return timeval of the REALTIME clock". That
@@ -28,9 +28,9 @@
 //!   function. This module honours the same mandate: it is the sole home for
 //!   local-time conversion in `curl-rs`.
 //!
-//! Four things in those files are deliberately absent, because AAP section
-//! 0.2.2 excludes Windows and the four mandated targets are Linux and macOS
-//! on x86_64 and aarch64: the `_WIN32` `FILETIME` arm of `tvrealnow`
+//! Four things in those files are deliberately absent, because Windows is out
+//! of scope and the four mandated targets are Linux and macOS on x86_64 and
+//! aarch64: the `_WIN32` `FILETIME` arm of `tvrealnow`
 //! (`src/tool_util.c:28-47`), the `localtime_s` arm of `toolx_localtime`
 //! (`src/toolx/tool_time.c:42-44`), `tool_ftruncate64`
 //! (`src/tool_util.c:81-97`, reachable only through the `USE_TOOL_FTRUNCATE`
@@ -50,58 +50,82 @@
 //!
 //! `format_trace_timestamp` takes the reading as an argument and never
 //! consults the clock itself; `wall_clock_now` is the only function here that
-//! touches `SystemTime`. That split is required rather than stylistic. AAP
-//! section 0.3.3 pattern P12 injects the clock so that behaviour depending on
-//! it can be exercised deterministically, and
-//! `docs/internals/TIME-KEEPING.md:135-141` restates it for this tree. Two
-//! concrete consequences: the rendered field can be unit-tested against a
-//! fixed input, and `curl-rs-lib`'s trace layer cannot end up stamping the
-//! same trace stream from a second, differently-read clock.
-//! `curl-rs/src/callbacks/debug.rs` therefore reads the clock once per line
-//! and passes the value through.
+//! touches `SystemTime`. That split is required rather than stylistic: the
+//! clock is injected so that behaviour depending on it can be exercised
+//! deterministically, and `docs/internals/TIME-KEEPING.md:135-141` restates it
+//! for this tree. Two concrete consequences: the rendered field can be
+//! unit-tested against a fixed input, and `curl-rs-lib`'s trace layer cannot
+//! end up stamping the same trace stream from a second, differently-read
+//! clock. `curl-rs/src/callbacks/debug.rs` must therefore read the clock once
+//! per line and pass the value through.
 //!
 //! Reading the clock needs no `unsafe` and no platform call:
 //! `docs/internals/TIME-KEEPING.md:147-148` records that "Reading a clock is
 //! a standard-library operation and does not belong in that island", the
 //! island being `curl-rs-lib/src/ffi/`.
 //!
-//! # Local time is unavailable here, and that is reported rather than hidden
+//! # Local time comes from the host through the engine, and a refusal is
+//! reported rather than hidden
 //!
 //! `toolx_localtime()` reaches `localtime_r()`, which needs libc and the
-//! host's timezone database. Neither is reachable from this crate, measured
+//! host's timezone database. Neither is reachable from *this* crate, measured
 //! rather than assumed:
 //!
 //! - `std` has no timezone-aware API at all. `std::time` yields only
 //!   epoch-relative durations, so it can name an instant but not a local
 //!   wall-clock reading.
-//! - No timezone crate is available. `curl-rs/Cargo.toml` declares exactly
-//!   `curl-rs-lib`, `clap`, `clap_complete` and `tokio`, and the workspace
-//!   manifest that AAP section 0.5.1 fixes contains no `chrono` and no `time`
-//!   at any version. Adding one would breach the supply-chain obligation in
-//!   AAP section 0.7, which pins the adopted set exactly.
-//! - `libc` is not a dependency of this crate, and `unsafe` is forbidden at
-//!   the crate root by AAP section 0.1.1 goal G6, so `libc::localtime_r` is
-//!   doubly out of reach.
-//! - `curl-rs-lib` exposes no local-time accessor. Its enumerated
-//!   `src/ffi/` surface covers the hostname query, interface enumeration,
-//!   `if_nametoindex`, the allocator hook and the GSS-API wrappers, and
-//!   nothing else; its `util` module is crate-private and therefore invisible
-//!   from here.
+//! - No timezone crate is available. `curl-rs/Cargo.toml` declares four
+//!   runtime dependencies -- `curl-rs-lib`, `clap`, `clap_complete` and
+//!   `tokio` -- together with two dev-dependencies, `tempfile` and `tokio`,
+//!   which are available to `#[cfg(test)]` code only and so cannot serve a
+//!   shipped code path in any case. The workspace manifest contains no
+//!   `chrono` and no `time` at any version, and adding one would breach the
+//!   supply-chain obligation to pin the adopted set exactly.
+//! - `libc` is not a dependency of this crate, and this crate grants no
+//!   `unsafe` exemption anywhere, so `libc::localtime_r` is doubly out of
+//!   reach.
 //!
-//! The gap is confined to one function, `local_utc_offset_secs`, which
-//! reports that the host offset is unknown. `local_time_hms` then fails, and
-//! `format_trace_timestamp` renders `00:00:00` -- which is exactly what the C
-//! tool renders on the same failure, because `src/tool_cb_dbg.c:43-44`
-//! zeroes the `struct tm` and formats it anyway. UTC is never substituted for
-//! local time, since a timestamp that silently shifts by the host's offset
-//! while still being labelled local time would be a behaviour change dressed
-//! up as a success. When `curl-rs-lib` grows a safe local-time accessor
-//! backed by `curl-rs-lib/src/ffi/sys.rs`, only `local_utc_offset_secs`
-//! changes; every caller and every test here already exercises both outcomes.
+//! So the call is made where it belongs. `curl-rs-lib` owns the platform
+//! island that AAP section 0.8.5 conflict C3 designates for exactly this --
+//! `curl-rs-lib/src/ffi/sys.rs` wraps `localtime_r` behind the injected
+//! `SysCalls` seam, with the `unsafe` block and its `// SAFETY:` justification
+//! confined there -- and publishes `curl_rs_lib::local_utc_offset_secs`. This
+//! crate consumes that and stays free of both `libc` and `unsafe`, which is
+//! what goal G6 asks for: not that the platform call be skipped, but that it
+//! live in one audited place.
 //!
-//! No test fixture regresses meanwhile. AAP section 0.6.7's byte-exact oracle
-//! compares the bytes the client sends, and trace output is not part of that
-//! comparison.
+//! An offset rather than a broken-down time crosses that boundary, and it is
+//! asked for **at the instant being rendered** rather than cached at start-up.
+//! A zone's offset is not a constant -- daylight-saving time moves it -- and
+//! `localtime_r` resolves it against the `time_t` handed to it, so a cached
+//! value would render the wrong local time for part of the year. Passing the
+//! same second that is about to be formatted is therefore not an
+//! implementation detail but the whole of the correctness argument, and it is
+//! what C does too: it calls `localtime_r` afresh for every traced line
+//! (`src/tool_cb_dbg.c:41-46`).
+//!
+//! The failure path is retained exactly as C has it. When the platform refuses
+//! -- `localtime_r` failing for a `time_t` its calendar arithmetic cannot
+//! represent, which is the condition `toolx_localtime()` answers with
+//! `CURLE_BAD_FUNCTION_ARGUMENT` -- `local_time_hms` fails and
+//! `format_trace_timestamp` renders `00:00:00`, because
+//! `src/tool_cb_dbg.c:43-44` zeroes the `struct tm` and formats it anyway. UTC
+//! is never substituted for local time: a timestamp that silently shifts by
+//! the host's offset while still wearing local time's label would be a
+//! behaviour change dressed up as a success.
+//!
+//! The zone lookup is injected for the same reason the clock is, and through
+//! the same shape: `UtcOffsetProvider` is a seam that `local_time_hms_with`
+//! and `format_trace_timestamp_with` are written against, so both outcomes are
+//! reachable in a test without the build host's `TZ` deciding what the
+//! assertions say. That matters more here than for the clock -- a test that
+//! asserted a particular local hour would pass in one time zone and fail in
+//! the next. Where the host's own answer is itself the thing under test, the
+//! tests below re-run themselves in a child process under an injected `TZ`
+//! rather than asserting against whatever zone the build host is in.
+//!
+//! No test fixture regresses meanwhile. The byte-exact oracle compares the
+//! bytes the client sends, and trace output is not part of that comparison.
 
 use core::cmp::Ordering;
 use std::fmt;
@@ -110,9 +134,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Seconds in a day, the modulus that turns an epoch count into a time of
 /// day. Unix time excludes leap seconds, so every day is exactly this long
 /// and no table lookup is involved.
+#[allow(dead_code)]
 const SECS_PER_DAY: i64 = 86_400;
 
 /// Microseconds in a second, the divisor `struct timeval` splits on.
+#[allow(dead_code)]
 const MICROS_PER_SEC: u32 = 1_000_000;
 
 /// A reading of the REALTIME clock: whole seconds since the Unix epoch plus a
@@ -129,6 +155,7 @@ const MICROS_PER_SEC: u32 = 1_000_000;
 /// `gettimeofday` reports a negative `tv_sec` for a clock set before 1970, so
 /// an unsigned field could not represent every value the C code can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct WallClockTime {
     /// Whole seconds since 1970-01-01T00:00:00Z, negative before it.
     epoch_secs: i64,
@@ -151,6 +178,7 @@ impl WallClockTime {
     /// largest possible carry is 4,294 seconds and saturation is unreachable
     /// in practice; it is written this way so that no arithmetic here can
     /// overflow in a release build.
+    #[allow(dead_code)]
     pub(crate) fn new(epoch_secs: i64, micros: u32) -> Self {
         let carry = i64::from(micros / MICROS_PER_SEC);
         Self {
@@ -173,6 +201,7 @@ impl WallClockTime {
 /// the epoch, and rather than aborting -- a panic in the command-line tool
 /// would itself be a behaviour change -- that case is normalised into the
 /// negative-seconds reading `gettimeofday` would have produced.
+#[allow(dead_code)]
 pub(crate) fn wall_clock_now() -> WallClockTime {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(since_epoch) => after_epoch_reading(since_epoch),
@@ -185,6 +214,7 @@ pub(crate) fn wall_clock_now() -> WallClockTime {
 ///
 /// Split out from `wall_clock_now` so that the conversion can be exercised
 /// against fixed inputs; the clock itself cannot be.
+#[allow(dead_code)]
 fn after_epoch_reading(since_epoch: Duration) -> WallClockTime {
     // as_secs() is a u64 count of whole seconds. A value beyond i64::MAX is
     // some 292 billion years away, but it is converted rather than cast so
@@ -201,6 +231,7 @@ fn after_epoch_reading(since_epoch: Duration) -> WallClockTime {
 /// second and is replaced by its complement. Reached only when the host clock
 /// is set before the epoch, which is why it is a separate, directly testable
 /// function rather than an inline arm.
+#[allow(dead_code)]
 fn before_epoch_reading(ago: Duration) -> WallClockTime {
     let whole = i64::try_from(ago.as_secs()).unwrap_or(i64::MAX);
     let frac = ago.subsec_micros();
@@ -226,6 +257,7 @@ fn before_epoch_reading(ago: Duration) -> WallClockTime {
 /// Unix time has no leap seconds, so the 60 and 61 that `localtime_r` may put
 /// in `tm_sec` cannot arise from an epoch count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct Hms {
     /// Hour of the day, `0..=23`.
     hour: u32,
@@ -242,6 +274,7 @@ impl Hms {
     /// sizeof(now));` and formats the zeroed structure regardless, so a
     /// failed conversion renders `00:00:00` rather than suppressing the
     /// field. This constant is that behaviour, named.
+    #[allow(dead_code)]
     const MIDNIGHT: Self = Self {
         hour: 0,
         minute: 0,
@@ -254,17 +287,22 @@ impl Hms {
 /// The counterpart of the non-`CURLE_OK` return of `toolx_localtime()`. C
 /// reports `CURLE_BAD_FUNCTION_ARGUMENT` there
 /// (`src/toolx/tool_time.c:45-49`), whose integer value is 43 --
-/// `include/curl/curl.h:570` annotates the enumerator `/* 43 */` -- and AAP
-/// section 0.6.1 makes those integers part of the frozen contract. The single
+/// `include/curl/curl.h:570` annotates the enumerator `/* 43 */` -- and those
+/// integers are part of the frozen contract. The single
 /// call site converts to the engine's `CURLcode` at the boundary, which is
 /// where the engine-facing types live; C's own caller never inspects which
 /// code came back, only whether one did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum TimeError {
     /// The host's offset from UTC could not be determined, so an epoch count
-    /// cannot be resolved to a local time of day. See the module
-    /// documentation for why this is currently unconditional and what closes
-    /// it.
+    /// cannot be resolved to a local time of day.
+    ///
+    /// Reached when the platform refuses the conversion -- `localtime_r`
+    /// failing, which it does for a `time_t` its calendar arithmetic cannot
+    /// represent and which it reports by returning a null pointer, or a
+    /// timezone database that yields an offset outside the plausible range.
+    /// UTC is not substituted; see the module documentation.
     LocalZoneUnknown,
 }
 
@@ -272,8 +310,8 @@ impl fmt::Display for TimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::LocalZoneUnknown => f.write_str(
-                "cannot determine the local time zone offset from the \
-                 command-line crate",
+                "cannot determine the local time zone offset for this \
+                 timestamp",
             ),
         }
     }
@@ -281,17 +319,35 @@ impl fmt::Display for TimeError {
 
 impl std::error::Error for TimeError {}
 
-/// The host's current offset from UTC, in seconds east of Greenwich.
+/// How a UTC offset is obtained for a given instant.
 ///
-/// This is the single point at which local-time support is missing, and it is
-/// the single function that changes when it arrives. The module
-/// documentation records the four independent measurements behind the `None`:
-/// `std` has no timezone API, no timezone crate is in the dependency set,
-/// `libc` plus `unsafe` are both unavailable here, and `curl-rs-lib` exposes
-/// no accessor. Returning `None` rather than guessing zero is the point --
-/// zero would be UTC wearing local time's label.
-fn local_utc_offset_secs() -> Option<i32> {
-    None
+/// The seam the module documentation calls for. `local_time_hms` is written
+/// against this rather than against the engine directly, so both outcomes --
+/// an offset and a refusal -- are reachable in a test without depending on
+/// the build host's `TZ`, and so the zone lookup sits in exactly one place
+/// just as the clock reading does.
+type UtcOffsetProvider = fn(i64) -> Option<i32>;
+
+/// The host's offset from UTC at `epoch_secs`, in seconds east of Greenwich.
+///
+/// The production [`UtcOffsetProvider`], and the only route from this crate to
+/// the host's timezone database. `localtime_r` is what answers underneath --
+/// the call `src/toolx/tool_time.c:36-61` makes and the one
+/// `scripts/checksrc.pl:97` bans everywhere else -- reached through
+/// [`curl_rs_lib::local_utc_offset_secs`] because
+/// `#![forbid(unsafe_code)]` covers this crate and AAP section 0.8.5 conflict
+/// C3 puts such calls in `curl-rs-lib/src/ffi/sys.rs`.
+///
+/// The offset is asked for **at an instant** rather than in general, which is
+/// what makes daylight-saving time correct: a zone's offset is not a constant,
+/// and `localtime_r` resolves it against the `time_t` it is given. Passing the
+/// same count that is about to be rendered is therefore not an implementation
+/// detail but the whole of the correctness argument.
+///
+/// [`None`] when the platform cannot answer. It is propagated rather than
+/// replaced by zero, because zero would be UTC wearing local time's label.
+fn local_utc_offset_secs(epoch_secs: i64) -> Option<i32> {
+    curl_rs_lib::local_utc_offset_secs(epoch_secs)
 }
 
 /// Splits an epoch second count into a time of day.
@@ -300,6 +356,7 @@ fn local_utc_offset_secs() -> Option<i32> {
 /// function applies no offset of its own. `rem_euclid` rather than `%` so
 /// that a pre-1970 count yields a remainder in `0..SECS_PER_DAY` instead of a
 /// negative one, which would render a negative hour.
+#[allow(dead_code)]
 fn hms_of_epoch_secs(epoch_secs: i64) -> Hms {
     let secs_of_day = epoch_secs.rem_euclid(SECS_PER_DAY);
     // secs_of_day is 0..=86_399, so each quotient below is at most 23 and
@@ -322,15 +379,36 @@ fn hms_of_epoch_secs(epoch_secs: i64) -> Hms {
 /// # Errors
 ///
 /// Returns `TimeError::LocalZoneUnknown` when the host's UTC offset cannot be
-/// determined, which is presently always. The module documentation states why
-/// and what closes it; the caller's response is fixed by C's, namely to
-/// render midnight.
+/// determined for this timestamp -- the same condition `toolx_localtime()`
+/// answers with `CURLE_BAD_FUNCTION_ARGUMENT`. The caller's response is fixed
+/// by C's, namely to render midnight (`src/tool_cb_dbg.c:43-44`).
+#[allow(dead_code)]
 pub(crate) fn local_time_hms(epoch_secs: i64) -> Result<Hms, TimeError> {
-    match local_utc_offset_secs() {
+    // The offset is asked for at this timestamp, not "now": a traced line
+    // carries the reading taken when it was emitted, and across a
+    // daylight-saving boundary the two offsets differ.
+    local_time_hms_with(local_utc_offset_secs, epoch_secs)
+}
+
+/// [`local_time_hms`] over an injected [`UtcOffsetProvider`].
+///
+/// Named to match the `*_with` pairs the engine's own platform layer uses, so
+/// the two halves of a seam read the same way on both sides of the crate
+/// boundary.
+fn local_time_hms_with(
+    offset_at: UtcOffsetProvider,
+    epoch_secs: i64,
+) -> Result<Hms, TimeError> {
+    match offset_at(epoch_secs) {
         // Folding the offset into the count before splitting it keeps the
         // arithmetic in one place and keeps this function honest about which
         // zone it produced: the offset is the only thing that distinguishes
         // local time from UTC here.
+        //
+        // Saturating rather than wrapping. A count within a day of `i64::MIN`
+        // or `i64::MAX` cannot be shifted by an offset without overflowing,
+        // and saturating there yields a time of day at the extreme rather than
+        // one wrapped to the far end of the range.
         Some(offset) => Ok(hms_of_epoch_secs(
             epoch_secs.saturating_add(i64::from(offset)),
         )),
@@ -340,7 +418,7 @@ pub(crate) fn local_time_hms(epoch_secs: i64) -> Result<Hms, TimeError> {
 
 /// Renders the `--trace-time` field for an already-taken clock reading.
 ///
-/// The format is frozen by AAP section 0.8.1 and reproduced exactly:
+/// The format is frozen and reproduced exactly:
 /// `src/tool_cb_dbg.c:149-150` writes `"%s.%06ld "` over the
 /// `"%02d:%02d:%02d"` that `hms_for_sec()` produces at `:45-46`, so the field
 /// is `HH:MM:SS.uuuuuu` followed by one space.
@@ -360,14 +438,29 @@ pub(crate) fn local_time_hms(epoch_secs: i64) -> Result<Hms, TimeError> {
 ///
 /// C memoises the hour-minute-second text and recomputes it only when the
 /// whole second changes (`src/tool_cb_dbg.c:37-48`). That cache is not
-/// reproduced: it is a performance optimization, and AAP section 0.1.1 makes
-/// performance an explicit non-goal while AAP section 0.8.2 forbids changes
-/// argued on speed grounds. Its absence is unobservable -- the rendered bytes
+/// reproduced: it is a performance optimization, performance is an explicit
+/// non-goal here, and a change argued on speed grounds is forbidden. Its
+/// absence is unobservable -- the rendered bytes
 /// are identical either way -- whereas reproducing it would need state that
 /// outlives the call, which is exactly the global mutable state this design
 /// does without.
+#[allow(dead_code)]
 pub(crate) fn format_trace_timestamp(now: WallClockTime) -> String {
-    let hms = local_time_hms(now.epoch_secs).unwrap_or(Hms::MIDNIGHT);
+    format_trace_timestamp_with(local_utc_offset_secs, now)
+}
+
+/// [`format_trace_timestamp`] over an injected [`UtcOffsetProvider`].
+///
+/// The seam is carried up to this level as well as down to
+/// [`local_time_hms_with`] so that the composed behaviour -- a refusal
+/// becoming `00:00:00` -- is assertable byte-for-byte without the build host's
+/// `TZ` deciding the answer.
+fn format_trace_timestamp_with(
+    offset_at: UtcOffsetProvider,
+    now: WallClockTime,
+) -> String {
+    let hms =
+        local_time_hms_with(offset_at, now.epoch_secs).unwrap_or(Hms::MIDNIGHT);
     render_trace_field(hms, now.micros)
 }
 
@@ -379,6 +472,7 @@ pub(crate) fn format_trace_timestamp(now: WallClockTime) -> String {
 /// resolution above it succeeded. `micros` is always below one second because
 /// `WallClockTime::new` normalises it, which is what holds the field to the
 /// sixteen characters the C buffer is sized for.
+#[allow(dead_code)]
 fn render_trace_field(hms: Hms, micros: u32) -> String {
     format!(
         "{:02}:{:02}:{:02}.{:06} ",
@@ -400,7 +494,7 @@ fn render_trace_field(hms: Hms, micros: u32) -> String {
 /// `--help`, and the protocol and parameter name lists of
 /// `src/tool_paramhlp.c` -- so ASCII folding gives byte-identical ordering
 /// while also being independent of `LC_CTYPE`. Independence is worth having:
-/// AAP section 0.7 makes reproducibility an obligation, and an ordering that
+/// reproducibility is an obligation, and an ordering that
 /// shifted with the ambient locale would make `--help` output depend on the
 /// environment that produced it.
 ///
@@ -413,6 +507,7 @@ fn render_trace_field(hms: Hms, micros: u32) -> String {
 /// matches C byte for byte. `Iterator::cmp` supplies the lexicographic rule
 /// `strcasecmp` uses, including that a prefix sorts before the string that
 /// extends it.
+#[allow(dead_code)]
 fn ascii_stricmp(p1: &str, p2: &str) -> Ordering {
     p1.bytes()
         .map(|b| b.to_ascii_lowercase())
@@ -435,6 +530,7 @@ fn ascii_stricmp(p1: &str, p2: &str) -> Ordering {
 /// are always present, because the C contract admits null and the `qsort`
 /// wrapper below dereferences whatever it is handed without checking. Dropping
 /// them would narrow a documented contract on the strength of today's callers.
+#[allow(dead_code)]
 pub(crate) fn struplocompare(p1: Option<&str>, p2: Option<&str>) -> Ordering {
     match (p1, p2) {
         (None, None) => Ordering::Equal,
@@ -464,9 +560,10 @@ pub(crate) fn struplocompare(p1: Option<&str>, p2: Option<&str>) -> Ordering {
 /// The ordering it produces is observable output, not an internal detail.
 /// `src/tool_getparam.c`'s `aliases[]` table carries the instruction that the
 /// array "MUST be alphasorted based on the 'lname'", the help listing is
-/// printed in this order, and AAP section 0.8.1 freezes the command-line
-/// surface. It delegates to `struplocompare` so that one definition of the
+/// printed in this order, and the command-line surface is frozen. It
+/// delegates to `struplocompare` so that one definition of the
 /// ordering serves both, exactly as the C pair does.
+#[allow(dead_code)]
 pub(crate) fn struplocompare4sort<S: AsRef<str>>(p1: &S, p2: &S) -> Ordering {
     struplocompare(Some(p1.as_ref()), Some(p2.as_ref()))
 }
@@ -475,10 +572,10 @@ pub(crate) fn struplocompare4sort<S: AsRef<str>>(p1: &S, p2: &S) -> Ordering {
 mod tests {
     use super::{
         after_epoch_reading, ascii_stricmp, before_epoch_reading,
-        format_trace_timestamp, hms_of_epoch_secs, local_time_hms,
-        local_utc_offset_secs, render_trace_field, struplocompare,
-        struplocompare4sort, wall_clock_now, Hms, TimeError, WallClockTime,
-        MICROS_PER_SEC,
+        format_trace_timestamp, format_trace_timestamp_with, hms_of_epoch_secs,
+        local_time_hms, local_time_hms_with, local_utc_offset_secs,
+        render_trace_field, struplocompare, struplocompare4sort,
+        wall_clock_now, Hms, TimeError, WallClockTime, MICROS_PER_SEC,
     };
     use core::cmp::Ordering;
     use std::error::Error;
@@ -497,7 +594,9 @@ mod tests {
     const ABC_NEXT: &str = "abd"; // spellchecker:disable-line
 
     /// Builds an `Hms` for a test without going through the zone resolution,
-    /// which cannot currently succeed.
+    /// so an expected time of day is stated outright rather than derived by
+    /// the same code the assertion is about. The zone resolution does succeed
+    /// now; this helper simply does not depend on it.
     fn hms(hour: u32, minute: u32, second: u32) -> Hms {
         Hms {
             hour,
@@ -685,37 +784,350 @@ mod tests {
         }
     }
 
-    // -- Local time is unavailable, and fails the way C fails --------------
+    // -- Local time comes from the host, and a refusal fails as C fails -----
 
-    #[test]
-    fn local_zone_is_reported_unknown_rather_than_guessed() {
-        // The single gap point. Returning Some(0) here would be UTC wearing
-        // local time's label, which is the outcome this design refuses.
-        assert_eq!(local_utc_offset_secs(), None);
+    /// A provider that refuses, standing in for a platform that cannot answer.
+    fn no_zone(_epoch: i64) -> Option<i32> {
+        None
+    }
+
+    /// A provider fixed at UTC, so a rendered field can be asserted
+    /// byte-for-byte whatever the build host's `TZ` happens to be.
+    fn utc(_epoch: i64) -> Option<i32> {
+        Some(0)
+    }
+
+    /// A provider fixed at `+05:30`, chosen because it is not a whole number
+    /// of hours: a half-hour zone catches an implementation that folded the
+    /// offset in as hours.
+    fn kolkata(_epoch: i64) -> Option<i32> {
+        Some(5 * 3_600 + 30 * 60)
+    }
+
+    /// A provider fixed at `-08:00`, so the westward sign is exercised too.
+    fn pacific(_epoch: i64) -> Option<i32> {
+        Some(-8 * 3_600)
     }
 
     #[test]
-    fn local_conversion_fails_with_the_documented_error() {
-        assert_eq!(local_time_hms(0), Err(TimeError::LocalZoneUnknown));
-        assert_eq!(
-            local_time_hms(1_700_000_000),
-            Err(TimeError::LocalZoneUnknown)
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
+    fn the_host_offset_is_asked_for_at_the_instant_being_rendered() {
+        // The production provider reaches `localtime_r` through the engine.
+        // Its value is the build host's and cannot be asserted, but two
+        // properties can, and both would fail against the previous body: it
+        // must answer, and it must answer for a real instant.
+        let now = local_utc_offset_secs(1_700_000_000)
+            .expect("the host resolves a present-day instant");
+
+        // Every real zone lies within 14 hours of UTC -- the widest offset in
+        // the IANA database is +14:00 for Kiritimati -- and the engine rejects
+        // anything that does not fit an i32 for that reason.
+        assert!(
+            (-14 * 3_600..=14 * 3_600).contains(&now),
+            "implausible offset {now}"
         );
-        assert_eq!(local_time_hms(i64::MIN), Err(TimeError::LocalZoneUnknown));
-        assert_eq!(local_time_hms(i64::MAX), Err(TimeError::LocalZoneUnknown));
+
+        // Asked per instant, so a second call for a different instant is a
+        // separate question rather than a cached answer. Both must resolve;
+        // whether they agree depends on the host's daylight-saving rules and
+        // is deliberately not asserted.
+        assert!(local_utc_offset_secs(0).is_some());
     }
 
     #[test]
-    fn failed_conversion_renders_midnight_without_panicking() {
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
+    fn the_production_conversion_uses_the_production_provider() {
+        // `local_time_hms` must be exactly `local_time_hms_with` over
+        // `local_utc_offset_secs` -- asserted by composing the two halves
+        // independently and comparing, so a future edit that reached for a
+        // different provider inside it would fail here.
+        for epoch in [0, 1_700_000_000, -1] {
+            let composed = local_time_hms_with(local_utc_offset_secs, epoch);
+            assert_eq!(local_time_hms(epoch), composed);
+        }
+    }
+
+    #[test]
+    fn a_refusing_provider_yields_the_documented_error() {
+        // The failure path, driven through the seam so it is reachable without
+        // a broken timezone database.
+        for epoch in [0, 1_700_000_000, i64::MIN, i64::MAX] {
+            assert_eq!(
+                local_time_hms_with(no_zone, epoch),
+                Err(TimeError::LocalZoneUnknown)
+            );
+        }
+    }
+
+    #[test]
+    fn the_offset_is_folded_in_before_the_split() {
+        // 1_700_000_000 is 22:13:20 UTC (asserted independently below).
+        let epoch = 1_700_000_000;
+
+        assert_eq!(local_time_hms_with(utc, epoch), Ok(hms(22, 13, 20)));
+        // +05:30 carries it past midnight into the next day: 03:43:20.
+        assert_eq!(local_time_hms_with(kolkata, epoch), Ok(hms(3, 43, 20)));
+        // -08:00 moves it back to 14:13:20 on the same day.
+        assert_eq!(local_time_hms_with(pacific, epoch), Ok(hms(14, 13, 20)));
+    }
+
+    #[test]
+    fn an_extreme_count_saturates_instead_of_wrapping() {
+        // A count at either bound cannot absorb an offset that pushes it
+        // further out. Saturating clamps to the bound, so the result is still
+        // a time of day; wrapping would land at the opposite end of the range
+        // and render an hour that is off by the whole span of `i64`.
+        assert_eq!(
+            local_time_hms_with(pacific, i64::MIN),
+            Ok(hms_of_epoch_secs(i64::MIN)),
+            "a westward offset at the lower bound clamps"
+        );
+        assert_eq!(
+            local_time_hms_with(kolkata, i64::MAX),
+            Ok(hms_of_epoch_secs(i64::MAX)),
+            "an eastward offset at the upper bound clamps"
+        );
+
+        // The other two corners do not saturate, and must stay exact rather
+        // than being clamped defensively: an offset that moves a bound inward
+        // is representable.
+        assert_eq!(
+            local_time_hms_with(kolkata, i64::MIN),
+            Ok(hms_of_epoch_secs(i64::MIN + (5 * 3_600 + 30 * 60))),
+        );
+        assert_eq!(
+            local_time_hms_with(pacific, i64::MAX),
+            Ok(hms_of_epoch_secs(i64::MAX - 8 * 3_600)),
+        );
+    }
+
+    #[test]
+    fn a_refused_conversion_renders_midnight_without_panicking() {
         // src/tool_cb_dbg.c:43-44 zeroes the struct tm and formats anyway,
         // so the hour-minute-second part is 00:00:00 while the microseconds
         // still come through.
-        let field = format_trace_timestamp(WallClockTime::new(0, 250_000));
+        let field = format_trace_timestamp_with(
+            no_zone,
+            WallClockTime::new(0, 250_000),
+        );
         assert_eq!(field, "00:00:00.250000 ");
 
-        let other =
-            format_trace_timestamp(WallClockTime::new(1_700_000_000, 7));
+        let other = format_trace_timestamp_with(
+            no_zone,
+            WallClockTime::new(1_700_000_000, 7),
+        );
         assert_eq!(other, "00:00:00.000007 ");
+    }
+
+    // -- The same answer taken from the host, and under an injected TZ --
+
+    /// A timestamp whose time of day cannot be midnight in any real zone.
+    ///
+    /// 1 700 000 000 is 2023-11-14 22:13:20 UTC. Every offset in use anywhere
+    /// is a whole number of minutes for a timestamp in this century, and
+    /// 22:13:20 is not, so no offset can carry it to 00:00:00. That makes
+    /// "renders midnight" a sound proof that the offset lookup failed, on any
+    /// host, without the test needing to know the host's zone.
+    const NOT_MIDNIGHT_ANYWHERE: i64 = 1_700_000_000;
+
+    #[test]
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
+    fn the_local_offset_is_the_engine_s_answer_and_not_a_hardcoded_one() {
+        // The property F16 restores: this crate delegates rather than
+        // pretending the offset is unknowable. Comparing against the engine
+        // rather than against a literal keeps the test host-independent.
+        for probe in [0, NOT_MIDNIGHT_ANYWHERE, -1, 253_402_300_799] {
+            assert_eq!(
+                local_utc_offset_secs(probe),
+                curl_rs_lib::local_utc_offset_secs(probe),
+                "the offset for {probe} must come straight from the engine"
+            );
+        }
+        // Guards the four assertions above against being vacuously true: if
+        // the engine answered None everywhere, a reverted body that also
+        // answered None would satisfy them.
+        assert!(
+            local_utc_offset_secs(NOT_MIDNIGHT_ANYWHERE).is_some(),
+            "this host cannot resolve a 2023 timestamp to local time, so the \
+             comparison above proves nothing; localtime_r is broken here"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
+    fn local_conversion_applies_the_offset_the_engine_reported() {
+        for probe in [0, NOT_MIDNIGHT_ANYWHERE, -1, i64::MIN, i64::MAX] {
+            let expected = match curl_rs_lib::local_utc_offset_secs(probe) {
+                Some(offset) => Ok(hms_of_epoch_secs(
+                    probe.saturating_add(i64::from(offset)),
+                )),
+                None => Err(TimeError::LocalZoneUnknown),
+            };
+            assert_eq!(local_time_hms(probe), expected, "at {probe}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
+    fn an_unrepresentable_timestamp_still_fails_the_way_c_fails() {
+        // localtime_r rejects a count that overflows a struct tm, which is the
+        // condition toolx_localtime reports as CURLE_BAD_FUNCTION_ARGUMENT.
+        // The Err arm is therefore reachable on a working host, not dead code.
+        assert_eq!(local_time_hms(i64::MAX), Err(TimeError::LocalZoneUnknown));
+        assert_eq!(local_time_hms(i64::MIN), Err(TimeError::LocalZoneUnknown));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
+    fn failed_conversion_renders_midnight_without_panicking() {
+        // src/tool_cb_dbg.c:43-44 zeroes the struct tm and formats it anyway,
+        // so the hour-minute-second part is 00:00:00 while the microseconds
+        // still come through. i64::MAX is the reachable way to reach that path.
+        let field =
+            format_trace_timestamp(WallClockTime::new(i64::MAX, 250_000));
+        assert_eq!(field, "00:00:00.250000 ");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
+    fn a_resolvable_timestamp_does_not_render_the_midnight_fallback() {
+        // The teeth for F16 on any host: before the fix every timestamp took
+        // the midnight path, so this assertion failed for all of them.
+        let field = format_trace_timestamp(WallClockTime::new(
+            NOT_MIDNIGHT_ANYWHERE,
+            7,
+        ));
+        assert!(
+            !field.starts_with("00:00:00"),
+            "{field} is the midnight fallback, so the offset lookup failed"
+        );
+        // Whole-minute offsets leave the seconds untouched, and 1 700 000 000
+        // is 20 seconds past a minute. True in every zone.
+        assert_eq!(
+            &field[6..],
+            "20.000007 ",
+            "the seconds must survive the offset unchanged"
+        );
+    }
+
+    /// The rendered field a child process must produce, and the zone to set.
+    ///
+    /// Both are POSIX `TZ` strings, which glibc resolves arithmetically and so
+    /// work on a host with no timezone database installed. `XXX-5` is five
+    /// hours *east*: 22:13:20 UTC becomes 03:13:20 the next day. `YYY+7` is
+    /// seven hours west: the same instant becomes 15:13:20.
+    const TZ_CASES: [(&str, &str); 3] = [
+        ("UTC0", "22:13:20.000007 "),
+        ("XXX-5", "03:13:20.000007 "),
+        ("YYY+7", "15:13:20.000007 "),
+    ];
+
+    /// Names the child test the way the libtest harness does.
+    ///
+    /// `module_path!()` is prefixed with the crate name, which `--exact` does
+    /// not want. Deriving the rest keeps this working in whichever crate the
+    /// file is compiled as part of.
+    fn child_test_path(function: &str) -> String {
+        let full = module_path!();
+        let within_crate = full.split_once("::").map_or(full, |(_, rest)| rest);
+        format!("{within_crate}::{function}")
+    }
+
+    const TZ_CHILD_VAR: &str = "BLITZY_UTIL_TZ_EXPECTED";
+
+    #[test]
+    #[cfg_attr(miri, ignore = "spawning a process is unsupported")]
+    fn trace_time_follows_the_host_zone_rather_than_utc() {
+        // This container runs in UTC, so a rendering taken here cannot tell
+        // local time apart from UTC -- the two coincide. Re-running this test
+        // as a child process under an injected TZ separates them, and does so
+        // without depending on what zone the host happens to be in.
+        //
+        // The child half is `tz_child_asserts_the_injected_zone` below. It is
+        // an ordinary test that returns immediately unless the variable is
+        // set, so a plain `cargo test` run costs nothing.
+        if std::env::var_os(TZ_CHILD_VAR).is_some() {
+            return;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(path) => path,
+            // Nothing to spawn; the assertions would be about the host.
+            Err(_) => return,
+        };
+        let child_name = child_test_path("tz_child_asserts_the_injected_zone");
+
+        for (zone, expected) in TZ_CASES {
+            let output = std::process::Command::new(&exe)
+                .args(["--exact", &child_name, "--nocapture"])
+                .env("TZ", zone)
+                .env(TZ_CHILD_VAR, expected)
+                .output();
+            let output = match output {
+                Ok(output) => output,
+                Err(_) => return,
+            };
+            assert!(
+                output.status.success(),
+                "under TZ={zone} the child expected {expected:?}:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
+    fn tz_child_asserts_the_injected_zone() {
+        // Inert unless spawned by the test above with both variables set.
+        let expected = match std::env::var(TZ_CHILD_VAR) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let field = format_trace_timestamp(WallClockTime::new(
+            NOT_MIDNIGHT_ANYWHERE,
+            7,
+        ));
+        assert_eq!(
+            field,
+            expected,
+            "TZ={:?} must render {expected:?}",
+            std::env::var("TZ")
+        );
+    }
+
+    #[test]
+    fn a_resolved_conversion_renders_the_local_time_of_day() {
+        // The outcome the previous body could never produce: a field that is
+        // not midnight. Driven at a fixed offset so the bytes are exact.
+        let field = format_trace_timestamp_with(
+            kolkata,
+            WallClockTime::new(1_700_000_000, 7),
+        );
+        assert_eq!(field, "03:43:20.000007 ");
+    }
+
+    #[test]
+    fn the_production_entry_point_renders_a_well_formed_field() {
+        // `format_trace_timestamp` consults the host, so its digits belong to
+        // the build host's zone and are not asserted. The layout is, since
+        // that is the frozen part: sixteen bytes, `HH:MM:SS.uuuuuu `.
+        let field =
+            format_trace_timestamp(WallClockTime::new(1_700_000_000, 7));
+
+        assert_eq!(field.len(), 16);
+        assert!(field.ends_with(".000007 "), "{field}");
+        let (hms_part, _) = field.split_at(8);
+        assert!(
+            hms_part
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| if i == 2 || i == 5 {
+                    b == b':'
+                } else {
+                    b.is_ascii_digit()
+                }),
+            "{field}"
+        );
     }
 
     #[test]
@@ -822,6 +1234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
     fn the_clock_reader_is_total() {
         // Cannot assert a value against a live clock, so assert the
         // invariants: it returns, it does not panic, the microsecond field is

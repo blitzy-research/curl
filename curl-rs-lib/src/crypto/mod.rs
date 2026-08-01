@@ -33,7 +33,7 @@
 //! the workspace manifests, because the behaviour being reproduced is
 //! defined by those files and not by this description.
 //!
-//! # 1. Why this directory exists
+//! # Why this directory exists
 //!
 //! curl hand-rolled every digest it needed. It had to work with whichever
 //! TLS library happened to be linked, and it had to keep working when none
@@ -53,11 +53,11 @@
 //!   base64 comes from `util/base64.rs` and never from here.
 //! * `cookies/` -- jar and cache identifiers.
 //!
-//! Nothing here is reachable from outside the crate. No exported libcurl
-//! symbol is a hash function, which is why `curl-rs-lib/src/lib.rs:629`
-//! declares this module `pub(crate)`.
+//! Nothing here is reachable from outside the crate. No exported libcurl symbol
+//! is a hash function, which is why the crate root declares this module
+//! `pub(crate)`.
 //!
-//! # 2. What was superseded, and by what
+//! # What was superseded, and by what
 //!
 //! Twelve C files, 3,103 lines, measured with `wc -l`:
 //!
@@ -89,7 +89,7 @@
 //! * `hmac` -- `hmac 0.12.1`, generic over the three digests above.
 //! * `rand` -- `rand 0.8.7`.
 //!
-//! # 3. Layering: this directory may use `util`; `util` may never use it
+//! # Layering: this directory may use `util`; `util` may never use it
 //!
 //! The dependency is one-directional. `crypto` may draw on `util` for
 //! buffers, base64 and string parsing; `util` must never draw on `crypto`.
@@ -117,12 +117,12 @@
 //!   `url/escape.rs`, even though `lib/rand.c:250` routes `Curl_rand_hex`
 //!   through `Curl_hexencode` in `lib/escape.c`.
 //!
-//! # 4. The version pins are load-bearing, not incidental
+//! # The version pins are load-bearing, not incidental
 //!
 //! The newest releases of `rand` (0.10.2), `sha2` (0.11.0) and `hmac`
 //! (0.13.0) all declare a minimum supported Rust version of 1.85, which the
 //! project's floor of 1.75 rules out. The adopted set is pinned exactly, in
-//! one place, at the workspace root -- `Cargo.toml:473-479` and `:505`:
+//! one place, in the workspace manifest's `[workspace.dependencies]`:
 //!
 //! ```text
 //!   sha1 = "=0.10.7"      md-5 = "=0.10.6"     hmac = "=0.12.1"
@@ -130,24 +130,25 @@
 //!   rand = "=0.8.7"       hex  = "=0.4.3"
 //! ```
 //!
-//! `curl-rs-lib/Cargo.toml:382-418` inherits every one of them with
+//! `curl-rs-lib/Cargo.toml` inherits every one of them with
 //! `{ workspace = true }` and restates no version. Do not add a
 //! cryptographic dependency here, and do not restate a version in the member
 //! manifest. Two independent consequences make the pins load-bearing:
 //!
-//! * **One `digest` generation.** The latest-version set would put
-//!   `digest 0.10` and `digest 0.11` in the same graph, and `Hmac<Sha1>`
-//!   would then fail to compile, because `Mac` and `Digest` would come from
-//!   different crates. That is a build break which only surfaces after the
-//!   manifests are written, so it is policed twice: `Cargo.lock:605-606`
-//!   shows `digest` present exactly once at 0.10.7, and `deny.toml:686` bans
-//!   `digest:>=0.11.0` outright so that a whole-graph migration to 0.11 --
-//!   which would leave no duplicate for `deny.toml:511` to catch -- still
-//!   fails. `hmac.rs` keeps a `Hmac<Sha1>` assertion in its test module to
-//!   hold the same guarantee from the compiler's side.
+//! * **One `digest` generation.** The latest-version set would put `digest
+//!   0.10` and `digest 0.11` in the same graph, and `Hmac<Sha1>` would then
+//!   fail to compile, because `Mac` and `Digest` would come from different
+//!   crates. That is a build break which only surfaces after the manifests
+//!   are written, so it is policed twice: `Cargo.lock:605-606` shows
+//!   `digest` present exactly once at 0.10.7, and `deny.toml`'s
+//!   `digest:>=0.11.0` entry bans it outright so that a whole-graph
+//!   migration to 0.11 -- which would leave no duplicate for that file's
+//!   `multiple-versions = "deny"` to catch -- still fails. `hmac.rs` keeps a
+//!   `Hmac<Sha1>` assertion in its test module to hold the same guarantee
+//!   from the compiler's side.
 //! * **`rand` is pinned to match the SSH transport.** `russh` is pinned at
-//!   `=0.54.5` (`Cargo.toml:415`) and its manifest requires `rand 0.8`,
-//!   `digest 0.10`, `hmac 0.12`, `sha1 0.10.5` and `sha2 0.10.6`
+//!   `=0.54.5` in the workspace manifest and its own manifest requires
+//!   `rand 0.8`, `digest 0.10`, `hmac 0.12`, `sha1 0.10.5` and `sha2 0.10.6`
 //!   (russh-0.54.5 `Cargo.toml:231-232`, `:145-146`, `:182-183`, `:263-264`,
 //!   `:267-268`), so `rand 0.8.7` is what this crate resolves to and it
 //!   carries `rand_core 0.6.4` across the whole SSH and elliptic-curve
@@ -162,22 +163,21 @@
 //!
 //! Nothing in this directory may enable a feature that unions a second
 //! cryptographic provider into the graph. The workspace pins `ring`
-//! explicitly, with `default-features = false`, on `quinn`
-//! (`Cargo.toml:296`), `rustls` (`:313`) and `tokio-rustls` (`:314`), and
-//! `deny.toml:611-612` bans `aws-lc-rs` and `aws-lc-sys` by name: that
-//! provider vendors C and assembly and needs CMake plus NASM, which breaks
-//! the cross-compiled aarch64 Linux leg. `rustls`'s `prefer-post-quantum`
-//! feature, which its own default set turns on, is deliberately left out of
-//! that explicit list for a related reason: it offers a hybrid key exchange
-//! that changes the bytes of the TLS ClientHello, which the byte-exact
-//! fixture comparison would reject.
+//! explicitly, with `default-features = false`, on `quinn`, `rustls` and
+//! `tokio-rustls`, and `deny.toml` bans `aws-lc-rs` and `aws-lc-sys` by name:
+//! that provider vendors C and assembly and needs CMake plus NASM, which
+//! breaks the cross-compiled aarch64 Linux leg. `rustls`'s
+//! `prefer-post-quantum` feature, which its own default set turns on, is
+//! deliberately left out of that explicit list for a related reason: it offers
+//! a hybrid key exchange that changes the bytes of the TLS ClientHello, which
+//! the byte-exact fixture comparison would reject.
 //!
-//! # 5. The licence banner is NOT uniform across this directory
+//! # The licence banner is NOT uniform across this directory
 //!
-//! Each banner was measured against its own C original with
-//! `sed -n '1,26p' <file>`, and they genuinely differ. Do not normalise
-//! them -- attribution is not boilerplate, and `reuse lint`
-//! (`.github/workflows/hygiene.yml:52`) reads what is actually in the file:
+//! The banners genuinely differ from one another, each carrying its own C
+//! original's attribution. Do not normalise them -- attribution is not
+//! boilerplate, and `reuse lint` (`.github/workflows/hygiene.yml:52`) reads
+//! what is actually in the file:
 //!
 //! ```text
 //!   file           lines  copyright line(s)                    ident
@@ -205,10 +205,10 @@
 //! `:161`, `:248` (NetBSD PR 58039 and GNU libmicrohttpd). `lib/hmac.c`
 //! and `lib/rand.c` carry none.
 //!
-//! # 6. What this directory deliberately does not contain
+//! # What this directory deliberately does not contain
 //!
-//! Each exclusion below was settled by measuring the C tree, not by
-//! preference, and each has a different owner:
+//! Each exclusion below follows from the C tree rather than from preference,
+//! and each has a different owner:
 //!
 //! * **No SHA-1.** curl has no SHA-1 module at all: `ls lib/sha1*` and
 //!   `ls lib/curl_sha1*` both find nothing, and `grep -rn 'Curl_sha1' lib/`
@@ -242,8 +242,8 @@
 //!   `crate::error::CURLcode`, whose discriminants are pinned to the C
 //!   values. Success is `Ok(())`, never `CURLcode::Ok`.
 //! * **No `tests/` subdirectory and no README.** Unit coverage lives in
-//!   `#[cfg(test)]` modules inside each sibling; `tests-rs/` holds the
-//!   integration tests.
+//!   `#[cfg(test)]` modules inside each sibling; integration tests belong to a
+//!   workspace-level test tree that does not exist yet.
 //!
 //! The five C unit tests that covered this code -- `tests/unit/unit1601.c`
 //! (MD5), `unit1611.c` (MD4), `unit1610.c` (SHA-256), `unit1612.c`
@@ -256,7 +256,7 @@
 //! make them link would destroy the encapsulation this crate depends on, so
 //! it is not done.
 //!
-//! # 7. How to read the re-export surface
+//! # How to read the re-export surface
 //!
 //! The re-exports below are explicit and never glob. A glob would make the
 //! surface unauditable and would silently re-export whatever a sibling adds
@@ -279,7 +279,7 @@
 //! two are separate lints, verified by measurement. Add a re-export without
 //! recording it in the contract block and the build tells you.
 //!
-//! # 8. Gates
+//! # Gates
 //!
 //! Every pattern below uses a character class so that these comment lines
 //! cannot match themselves -- the gates stay runnable against this file
@@ -288,9 +288,9 @@
 //! hygiene.yml:60-66 reports as a misspelling.
 //!
 //! ```sh
-//! # This file adds no exemption to the crate-root safety attribute at
-//! # lib.rs:126; the crate's sole exemption sits on `pub(crate) mod ffi`
-//! # at lib.rs:614-615. Must print nothing.
+//! # This file adds no exemption to the crate-root safety attribute; the
+//! # crate's sole exemption sits on the root's `mod ffi` declaration.
+//! # Must print nothing.
 //! grep -rnE '[u]nsafe' curl-rs-lib/src/crypto/
 //!
 //! # There is no `tls` feature. A cfg naming a feature that does not exist
@@ -315,22 +315,49 @@
 //! the seven length constants. There is no numeric cast anywhere here, so
 //! nothing can silently truncate.
 
-// `dead_code` is allowed for this directory, deliberately and with a reason.
+// `dead_code` is NOT allowed for this module as a whole. Every item below that
+// has no consumer yet carries its own `#[allow(dead_code)]`, written at the
+// item, so the suppression reads as an inventory rather than a blanket: each
+// one is load-bearing, deleting any one of them restores a warning, and an
+// item added later with no consumer is still reported. Each is removed when
+// its consumer lands. A module- or crate-scoped `#![allow(dead_code)]` would
+// instead silence the NEXT item somebody adds, which hides incomplete
+// scaffolding rather than recording it; the rule and the executable gate that
+// enforces it across the workspace live in `curl-rs-lib/src/lib.rs`
+// (`mod source_policy`).
 //
 // Every consumer named in section 1 -- `auth/`, `tls/`, `protocols/ws.rs`,
-// `cookies/` -- lives in a module this crate has yet to grow. Until they
-// exist, `grep -rn 'crypto::' curl-rs-lib/src curl-rs/src` finds only the
-// `pub(crate) mod crypto;` declaration at `curl-rs-lib/src/lib.rs:629`, so
-// every primitive here is genuinely unreferenced and each one would be
-// reported. That would break the zero-warnings build gate for a condition
-// that is a property of migration order rather than of this code. The same
-// justification, on the same grounds, is recorded in `ffi/mod.rs`.
+// `cookies/` -- lives in a module this crate has yet to grow. Until they exist,
+// `grep -rn 'crypto::' curl-rs-lib/src curl-rs/src` finds only the
+// `pub(crate) mod crypto;` declaration in `curl-rs-lib/src/lib.rs` and two
+// `version.rs` sites: a documentation reference to `crate::crypto::rand`, and
+// the one live call in the crate, `crate::crypto::sha512_256::available()`. So
+// nearly every item here is genuinely unreferenced and each one would be
+// reported, breaking the zero-warnings build gate for a condition that is a
+// property of migration order rather than of this code. The same justification,
+// on the same grounds, is recorded in `ffi/mod.rs`.
 //
-// This allow does NOT cover unused imports: `dead_code` and `unused_imports`
-// are separate lints, measured. That is why the contract block at the foot of
-// this file references every re-export, and why adding a re-export without
-// recording it there is reported as an unused import.
-#![allow(dead_code)]
+// SUPPRESSION IS PER ITEM, NOT PER MODULE. Each unreferenced item carries its
+// own `#[allow(dead_code)]`, written where the item is, and there is no
+// `#![allow(dead_code)]` on this module root -- `mod source_policy` in
+// `curl-rs-lib/src/lib.rs` rejects one, because a root-scoped level also
+// silences the NEXT item that loses its last caller, silently. The inventory of
+// per-item allows is the record of what is still waiting for a consumer.
+//
+// None of this touches unused imports: `dead_code` and `unused_imports` are
+// separate lints, measured. A `pub(crate) use` naming a module that does not
+// exist is E0432, and one that exists but is referenced by nothing is an unused
+// import; neither is silenced by a `dead_code` level. That is why the contract
+// block at the foot of this file references every re-export, and why adding a
+// re-export without recording it there is reported as an unused import.
+//
+// THE SIX PRIMITIVE MODULES ARE DECLARED, NOT DESCRIBED, because all six files
+// exist: `md5.rs`, `md4.rs`, `sha256.rs`, `sha512_256.rs`, `hmac.rs` and
+// `rand.rs`. A declaration without its file is E0583, which no `#[allow]`
+// reaches, so each one arrives with its file -- and each one has. The seven
+// length constants below are re-exported from the module that owns each digest
+// rather than restated here, so the C oracle for every value stays next to the
+// implementation it constrains.
 
 /// MD5, RFC 1321. Supersedes `lib/md5.c` and `lib/curl_md5.h` over
 /// `md-5 0.10.6`.
@@ -389,9 +416,7 @@ pub(crate) mod hmac;
 /// `hex_lower` at the foot of this file.
 pub(crate) mod rand;
 
-// ==========================================================================
 // Re-export group A -- digest and block lengths, disambiguated
-// ==========================================================================
 //
 // Each sibling names its own constants `DIGEST_LEN` and `BLOCK_LEN`, which is
 // right inside the module and useless across it: four of the six modules
@@ -415,9 +440,7 @@ pub(crate) use sha256::DIGEST_LEN as SHA256_DIGEST_LEN;
 pub(crate) use sha512_256::BLOCK_LEN as SHA512_256_BLOCK_LEN;
 pub(crate) use sha512_256::DIGEST_LEN as SHA512_256_DIGEST_LEN;
 
-// ==========================================================================
 // Re-export group B -- one-shot digests
-// ==========================================================================
 //
 // The whole-message form, which is what almost every call site in the C tree
 // used: `Curl_md5it`, `Curl_md4it`, `Curl_sha256it` and `Curl_sha512_256it`.
@@ -430,9 +453,7 @@ pub(crate) use md5::md5;
 pub(crate) use sha256::sha256;
 pub(crate) use sha512_256::sha512_256;
 
-// ==========================================================================
 // Re-export group C -- keyed digests
-// ==========================================================================
 //
 // The three concrete instantiations the C tree provided as parameter tables:
 // `Curl_HMAC_MD5` (`lib/md5.c:528-535`), `Curl_HMAC_SHA256`
@@ -451,9 +472,7 @@ pub(crate) use hmac::hmac_md5;
 pub(crate) use hmac::hmac_sha256;
 pub(crate) use hmac::hmac_sha512_256;
 
-// ==========================================================================
 // Re-export group D -- incremental digests
-// ==========================================================================
 //
 // `Md5Context` reproduces a real C API: `lib/curl_md5.h:59-63` declares
 // `Curl_MD5_init` / `_update` / `_final` over the `MD5_params` vtable at
@@ -476,9 +495,7 @@ pub(crate) use hmac::hmac_sha512_256;
 pub(crate) use md5::Md5Context;
 pub(crate) use sha256::Sha256Context;
 
-// ==========================================================================
 // Re-export group E -- randomness
-// ==========================================================================
 //
 // `Rng` is object-safe on purpose. `util/fopen.rs` needs random temporary
 // filenames but must not import this directory (section 3), so it accepts a
@@ -496,9 +513,7 @@ pub(crate) use rand::Rng;
 pub(crate) use rand::SystemRng;
 pub(crate) use rand::TestRng;
 
-// ==========================================================================
 // Shared policy owned by this file -- digest-to-ASCII rendering
-// ==========================================================================
 //
 // This is the one piece of behaviour that belongs to the directory as a whole
 // rather than to any single primitive, because every algorithm here is
@@ -514,6 +529,7 @@ pub(crate) use rand::TestRng;
 /// and need no terminator, so `hex_lower` returns 32 characters for a 16-byte
 /// digest; the constant keeps the correspondence with the C call site
 /// auditable, and any code that hands a buffer to C sizes it from here.
+#[allow(dead_code)]
 pub(crate) const MD5_HEX_BUF_LEN: usize = 33;
 
 /// Size of the C destination buffer for a SHA-256 digest rendered as ASCII.
@@ -523,6 +539,7 @@ pub(crate) const MD5_HEX_BUF_LEN: usize = 33;
 /// unsigned char *dest /* 65 bytes */)`, and `lib/http_aws_sigv4.c` uses the
 /// same 65 for its own `SHA256_HEX_LENGTH`. SHA-512/256 also produces 32
 /// bytes, so this length covers it too.
+#[allow(dead_code)]
 pub(crate) const SHA256_HEX_BUF_LEN: usize = 65;
 
 /// Render bytes as **lowercase** hexadecimal ASCII, with no separators and no
@@ -552,13 +569,12 @@ pub(crate) const SHA256_HEX_BUF_LEN: usize = 65;
 /// Hand-rolling a nibble table here would duplicate `hex` for no gain, and
 /// hex *decoding* is not this directory's business at all: `util/strparse.rs`
 /// owns that, mirroring `curlx_hexasciitable`.
+#[allow(dead_code)]
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     hex::encode(bytes)
 }
 
-// ==========================================================================
 // Value and existence contracts
-// ==========================================================================
 //
 // Two jobs, both discharged at compile time and both costing nothing at run
 // time. These are `const` items, so they are evaluated during compilation,
@@ -622,9 +638,7 @@ const _: () = {
     let _ = rand_alnum;
 };
 
-// ==========================================================================
 // Tests -- scoped to what this file itself owns
-// ==========================================================================
 //
 // The primitives are tested where they live: the assertions of
 // `tests/unit/unit1601.c` (MD5), `unit1611.c` (MD4), `unit1610.c`

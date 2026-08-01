@@ -4,23 +4,12 @@
 
 # Rust toolchain pin for the curl workspace: curl-rs-lib, curl-rs, curl-rs-ffi.
 #
-# This file replaces the compiler-detection machinery of the two C build
-# systems it supersedes. configure.ac:503 runs AC_CANONICAL_HOST to discover
-# the build triple and record it as CURL_OS, then configure.ac:575 runs
-# CURL_CHECK_COMPILER - defined at m4/curl-compilers.m4:33, where it probes ten
-# different C compilers in turn (DEC, HP-UX, IBM, Intel, clang, GNU, SGI
-# MIPSPro, SGI MIPS, SunPro, tiny-c) - before configure.ac:603-606 derives a
-# basic, debug, optimize and warning flag set for whichever one answered.
-# CMakeLists.txt arrives at the same place by its own route: the
-# project(CURL ... LANGUAGES C) call at CMakeLists.txt:64-66 triggers CMake's
-# compiler probe, CMakeLists.txt:113-131 then branches on CMAKE_C_COMPILER_ID
-# and CMakeLists.txt:135-137 on CMAKE_C_STANDARD.
-#
-# Nothing below guesses. rustup reads this file, selects exactly the toolchain
-# named here and provisions exactly the components and targets listed. The
-# compiler becomes a declared input to the build rather than a discovered
-# property of the machine, which is what makes every contributor and every
-# continuous-integration leg agree.
+# This file replaces the compiler detection the two superseded C build systems
+# performed - Autotools probing for one of ten C compilers and deriving a flag
+# set for whichever answered, CMake branching on CMAKE_C_COMPILER_ID. Nothing
+# below guesses: rustup selects exactly the toolchain named here and provisions
+# exactly the components and targets listed, so the compiler is a declared
+# input to the build rather than a discovered property of the machine.
 #
 # Companion configuration, deliberately kept in separate files:
 #   Cargo.toml          rust-version (the MSRV floor), edition, dependencies
@@ -47,24 +36,93 @@
 # must therefore also succeed, which is why the 1.75.0 toolchain is installed
 # alongside this pin and checked with `cargo +1.75.0 build --workspace`.
 #
-# Measured against the committed Cargo.lock rather than assumed: of the 328
-# locked packages - 325 externals plus the three workspace members - exactly
-# two declare a rust-version above 1.75, wasip2 1.0.4 at 1.87.0 and
-# wit-bindgen 0.57.1 at 1.85.0, and wit-bindgen is also the graph's only
-# edition-2024 manifest. Both are reachable solely through getrandom's
-# cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2"))
-# dependency, so neither enters the build graph of any target listed below. A
-# scratch crate over that same getrandom does compile under
-# `cargo +1.75.0 build`; it is only `cargo metadata`, which resolves every
-# platform at once, that trips over the edition-2024 manifest. The end-to-end
-# check cannot be completed at this commit, because the workspace members have
-# no sources yet and `cargo build` therefore stops while loading manifests, so
-# read 1.75 as clean on the necessary condition and not yet demonstrated.
-# Cargo.toml and clippy.toml still describe an earlier, looser resolution - 46
-# packages above 1.75, a floor of 1.88, home 0.5.12 pulled in by russh. The
-# pins were tightened after that measurement (russh 0.54.5, home 0.5.9,
-# quinn-proto 0.11.14, icu_normalizer 1.5.0), and the figures above are what
-# the lockfile at this commit actually contains.
+# Measured against the committed Cargo.lock rather than assumed, and measured
+# end-to-end rather than on a necessary condition alone.
+#
+# The floor is REACHED, not merely declared. Two lockfile pins hold it there,
+# and they are recorded because a bare `cargo update` would undo them and the
+# resulting failure would look like a mystery:
+#
+#   getrandom 0.3.3, not 0.3.4  - 0.3.4 swapped its WASI backend to `wasip2`,
+#                                 whose manifest declares rust-version 1.87.
+#   wasi      0.14.0, not 0.14.7 - 0.14.7 reaches `wit-bindgen 0.57.1`, which
+#                                 is EDITION 2024. Cargo 1.75 cannot PARSE an
+#                                 edition-2024 manifest, so the failure would
+#                                 surface for the whole graph, nowhere near its
+#                                 cause.
+#
+# Both sit on cc -> [build-dependencies] jobserver -> cfg(windows) getrandom ->
+# cfg(wasm32 + wasi + p2) wasi, so neither entered the build graph of any target
+# listed below in the first place; the obstruction was that `cargo metadata`
+# resolves every platform at once and parses manifests it will never build. With
+# the pins in place BOTH PACKAGES ARE ABSENT FROM THE LOCKFILE ENTIRELY, so the
+# workaround that absence makes unnecessary is worth naming: `--no-deps` would
+# also sidestep a dependency manifest cargo cannot parse, but on this tree the
+# FULL form succeeds - `cargo +1.75.0 metadata --locked --offline` over the 321
+# locked packages exits 0 and reports zero declaring a rust-version above 1.75
+# and zero with an edition above 2021. The tightest declaration in the lock is
+# 1.75 itself, held by this workspace's three crates and by russh 0.54.5 with
+# its two helper crates, so the floor is exact rather than generous.
+#
+# And the workspace's OWN code compiles there too, which is the half a
+# dependency scan cannot show: `cargo +1.75.0 build --locked --offline
+# --workspace` and `cargo +1.75.0 check --locked --offline --workspace
+# --all-targets` both exit 0 on this tree. Neither is warning-free - the
+# notices are `never used` items awaiting the modules that call them - and
+# none of the notices concerns the language version.
+#
+# Per-target confirmation as well, which is the sufficient condition rather than
+# the necessary one. Filtering the graph with `--filter-platform` over each of
+# the four mandated triples, with and without the implementable feature set,
+# gives eight graphs of 258 to 261 packages whose maximum declared
+# rust-version is 1.75 in every case - this workspace's own three crates,
+# nothing above them - and none of the eight contains an edition-2024
+# package:
+#
+#   FEATS=altsvc,brotli,cookies,doh,ftp,gzip,hsts,http2,http3,ssh,\
+#   websockets,zstd,negotiate,memdebug
+#   for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+#            x86_64-apple-darwin aarch64-apple-darwin; do
+#     cargo metadata --offline --format-version 1 --filter-platform "$t"
+#     cargo metadata --offline --format-version 1 --filter-platform "$t" \
+#                    --features "$FEATS"
+#   done
+#
+# The explicit fourteen-name list is used INSTEAD OF `--all-features`, and
+# deliberately so: `hickory-dns` is a reserved name that no crate can currently
+# back, and enabling it is a hard build failure raised in
+# curl-rs-lib/src/lib.rs. Cargo offers no "all features except one" selector, so
+# the implementable set is enumerated. The root Cargo.toml records the
+# measurement behind that reservation.
+#
+# WHAT THE MEASUREMENT DOES NOT ESTABLISH, so it is not overread: the workspace
+# members are only partly delivered at this commit. The floor is verified for
+# the code that EXISTS, and must be re-verified as the protocol, transfer, CLI
+# and FFI trees land, because code written later can reach for constructs newer
+# than 1.75. A one-off run is the wrong instrument for that; the four-target
+# build matrix and `clippy::incompatible_msrv` are the right ones.
+#
+# Earlier revisions of Cargo.toml, clippy.toml, curl-rs/Cargo.toml and
+# curl-rs-ffi/Cargo.toml described a looser resolution - 46 packages above 1.75,
+# a floor of 1.88, home 0.5.12 pulled in by russh, clap_lex 1.1.0 as an
+# edition-2024 crate. Every one of those figures is refuted by the committed
+# lock, which resolves home 0.5.9 (rust-version 1.70.0) and clap_lex 1.0.1
+# (1.74) - but they are an accurate description of what a FRESH RESOLVE still
+# produces, because russh asks for `home ^0.5` and clap_builder for
+# `clap_lex ^1.0.0` and both ranges admit the edition-2024 releases. The pins
+# were tightened after that stale measurement was written (russh 0.54.5,
+# home 0.5.9, quinn-proto 0.11.14, icu_normalizer 1.5.0), the committed lockfile
+# is the only thing holding them there, and all five files now agree.
+#
+# One further caveat, stated precisely because it is easy to misread as an MSRV
+# violation: newer releases of three mandated crates - clap 4.6.4, quinn 0.11.11
+# and russh 0.62.4 - and of rand 0.10.2 declare 1.85. That is exactly why the
+# specification selects the newest version of each crate that satisfies 1.75
+# rather than the newest outright. Advancing any pin to its latest release
+# breaks this floor; read the note beside a pin before changing it.
+#
+# Cargo.toml's rust-version comment carries the same record together with the
+# restore commands.
 #
 # The floor stays at 1.75 either way, because it was mandated: raising a
 # minimum supported version is a decision for whoever set it, not a
@@ -74,12 +132,18 @@
 # Nightly is deliberately not pinned here. Two validation gates need it, and
 # both name it explicitly per invocation, which overrides this pin:
 #   cargo +nightly miri test -p curl-rs-lib
-#     .github/workflows/rust-miri.yml, undefined-behaviour gate
+#     .github/workflows/rust-miri.yml, undefined-behaviour gate. DELIVERED.
 #   cargo +nightly build -Zbuild-std -Zsanitizer=address
-#     .github/workflows/rust-asan.yml, AddressSanitizer over the FFI surface
+#     AddressSanitizer over the FFI surface,
+#     .github/workflows/rust-asan.yml. DELIVERED. Earlier revisions of this
+#     note, on both sides of it, described that workflow as still owed; it is
+#     on disk, and it installs its own dated nightly with rust-src for exactly
+#     the reason given below.
 # Both of those legs also need rust-src, which is precisely why rust-src is
 # absent from `components` below: it belongs to the nightly toolchain they
 # install for themselves, not to the stable toolchain that builds and ships.
+# The delivered Rust workflows at this commit are exactly rust-build.yml,
+# rust-clippy.yml, rust-miri.yml and rust-audit.yml, alongside hygiene.yml.
 #
 # One open item bears directly on this line. The FFI shim reaches curl's four
 # variadic entry points - curl_easy_setopt, curl_easy_getinfo,
@@ -89,10 +153,10 @@
 # conventions, but Apple's arm64 ABI passes variadic arguments on the stack,
 # so on aarch64-apple-darwin the callee would read a register the caller never
 # filled, and it would do so silently. The remedy is the stabilised c_variadic
-# feature, which requires a toolchain newer than 1.75. A decision to raise the
-# MSRV for that reason would change this channel and the floor above together;
-# see the variadic-setter analysis and the escalated ambiguity A4 in the
-# specification.
+# feature, which requires a toolchain newer than 1.75. The MSRV floor and the
+# aarch64-apple-darwin target therefore cannot both be honoured as written, and
+# that conflict is unresolved: a decision to raise the MSRV for that reason
+# would change this channel and the floor above together.
 channel = "1.97.1"
 
 # Exactly the three components the validation gates require, and no more:
@@ -128,9 +192,9 @@ components = ["rustfmt", "clippy", "llvm-tools-preview"]
 # features - is what keeps this leg buildable at all: aws-lc-rs vendors C and
 # assembly and would add CMake and NASM to the cross build's requirements.
 #
-# aarch64-apple-darwin is the highest-severity open item in the plan. It is the
-# one target where the Apple variadic-ABI mismatch noted above bites, and the
-# failure mode is silence: no Linux-only test run can observe it. This
+# aarch64-apple-darwin carries the one unresolved ABI hazard in this workspace.
+# It is the only target where the Apple variadic mismatch noted above bites,
+# and the failure mode is silence: no Linux-only test run can observe it. This
 # container also has no Apple SDK, so both Apple targets compile here but need
 # cargo-zigbuild or a macOS runner to link. The triple is listed because the
 # target matrix mandates it, not because the varargs entry points are known

@@ -210,7 +210,7 @@
 //!   takes no such parameter, which is consistent with the C conversion API
 //!   applying no total-length rule either.
 //!
-//! Normalisation needs no separate step. `lib/idn.c:253` passes
+//! Normalization needs no separate step. `lib/idn.c:253` passes
 //! `IDN2_NFC_INPUT` ("Normalize input string using normalization form C"),
 //! and UTS-46 performs NFC as part of its own mapping stage -- measured:
 //! `a` followed by U+030A COMBINING RING ABOVE and precomposed U+00E5 both
@@ -285,7 +285,7 @@
 //! IPv4 address (0x499602D2) and re-spelling it in dotted-quad form, which
 //! happens in the URL parser before any IDN code is reached. `lib/idn.c` has
 //! no part in it. Whoever writes the sibling `super` module owns that
-//! normalisation; this module correctly leaves such a host alone, because
+//! normalization; this module correctly leaves such a host alone, because
 //! `is_ascii_name` reports it as ASCII and no conversion applies.
 //!
 //! 1. `to_ascii` of `<U+00E5>..b`: the oracle yields `xn--5ca..b`, this
@@ -391,31 +391,34 @@
 //! `test165`, `test763`, `test1034`, `test1035`, `test1448`, `test2046` and
 //! `test2047`.
 
-// `dead_code` is allowed for this module alone, and for one specific reason
-// rather than as a convenience: every consumer of these primitives lives in
-// another module -- the sibling `super` module, which backs the six exported
-// `curl_url_*` symbols, and the resolver, which reproduces
-// `Curl_idnconvert_hostname` -- so until those land each primitive is
-// legitimately unreferenced inside the crate, and the zero-warnings gate would
-// otherwise fail on code that is correct. Compiling the same file as a test
-// target, where this module's own tests supply the missing consumer, reports
-// nothing at all.
+// `dead_code` is NOT allowed for this module as a whole. Every item below that
+// has no consumer yet carries its own `#[allow(dead_code)]`, written at the
+// item, so the suppression reads as an inventory rather than a blanket: each
+// one is load-bearing, deleting any one of them restores a warning, and an
+// item added later with no consumer is still reported. Each is removed when
+// its consumer lands. A module- or crate-scoped `#![allow(dead_code)]` would
+// instead silence the NEXT item somebody adds, which hides incomplete
+// scaffolding rather than recording it; the rule and the executable gate that
+// enforces it across the workspace live in `curl-rs-lib/src/lib.rs`
+// (`mod source_policy`).
 //
-// The attribute is scoped as narrowly as the language allows: `dead_code` and
-// nothing else. This mirrors the identical, identically-reasoned attributes
-// already committed at `curl-rs-lib/src/ffi/sys.rs:139`,
-// `curl-rs-lib/src/ffi/mod.rs:212`, `curl-rs-lib/src/tls/cipher_suite.rs:129`,
-// `curl-rs-lib/src/tls/keylog.rs:216`, `curl-rs-lib/src/crypto/mod.rs:333` and
-// `curl-rs-lib/src/util/mod.rs:118`. No level for the `unsafe_code` lint is set
-// here, at any level, by design: the crate root denies it and this module
-// contains no `unsafe`, so the crate-wide guarantee must stay in force.
-#![allow(dead_code)]
+// Every consumer of these primitives lives in another module -- the sibling
+// `super` module, which backs the six exported `curl_url_*` symbols, and the
+// resolver, which reproduces `Curl_idnconvert_hostname` -- so until those
+// land each primitive is legitimately unreferenced inside the crate, and the
+// zero-warnings gate would otherwise fail on code that is correct. Compiling
+// this file as a test target, where the module's own tests supply the
+// missing consumer, reports nothing at all, which is why the allowances are
+// `allow` and not `expect`: an `expect` would go unfulfilled in that build.
+//
+// No level for the `unsafe_code` lint is set here, at any level, by design:
+// the crate root denies it and this module contains no `unsafe`, so the
+// crate-wide guarantee must stay in force.
 
 use crate::error::CURLcode;
 use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
 use std::borrow::Cow;
 
-// ===========================================================================
 // The UTS-46 parameters.
 //
 // Named constants rather than inline arguments so that the two call sites
@@ -425,19 +428,20 @@ use std::borrow::Cow;
 // convenience default, and none of them may be "tidied" into an `idna`
 // wrapper function, because every wrapper hard-codes at least one knob to a
 // value curl does not use.
-// ===========================================================================
 
 /// _UseSTD3ASCIIRules=false_, and no URL-forbidden set either.
 ///
 /// curl passes neither `IDN2_USE_STD3_ASCII_RULES` nor anything equivalent,
 /// so ASCII characters that STD3 would reject -- the underscore above all --
 /// must survive. Shared by both directions.
+#[allow(dead_code)]
 const DENY_LIST: AsciiDenyList = AsciiDenyList::EMPTY;
 
 /// _CheckHyphens=true_ for the A-label direction.
 ///
 /// Reproduces libidn2's *lookup* validation, which rejects a hyphen in the
 /// first, third, fourth or last position of a label.
+#[allow(dead_code)]
 const TO_ASCII_HYPHENS: Hyphens = Hyphens::Check;
 
 /// _VerifyDNSLength=true_, tolerating the root label's trailing dot.
@@ -445,6 +449,7 @@ const TO_ASCII_HYPHENS: Hyphens = Hyphens::Check;
 /// The 63-byte label bound and 253-byte name bound that `tests/data/test1035`
 /// depends on, without the outright rejection of a trailing dot that
 /// [`DnsLength::Verify`] would add.
+#[allow(dead_code)]
 const TO_ASCII_DNS_LENGTH: DnsLength = DnsLength::VerifyAllowRootDot;
 
 /// _CheckHyphens=false_ for the U-label direction.
@@ -452,6 +457,7 @@ const TO_ASCII_DNS_LENGTH: DnsLength = DnsLength::VerifyAllowRootDot;
 /// Reproduces `idn2_to_unicode_8z8z` (`lib/idn.c:286`), a conversion entry
 /// point that applies no hyphen policy at all. Not a copy-paste slip: see
 /// the asymmetry discussion in the module documentation.
+#[allow(dead_code)]
 const TO_UNICODE_HYPHENS: Hyphens = Hyphens::Allow;
 
 /// The `idna` version this module is compiled against.
@@ -463,9 +469,7 @@ const TO_UNICODE_HYPHENS: Hyphens = Hyphens::Allow;
 /// `Features:` banner, and the pair is kept honest by a test there.
 const IDNA_VERSION: &str = "1.1.0";
 
-// ===========================================================================
 // Curl_is_ASCII_name -- lib/idn.c:223-236
-// ===========================================================================
 
 /// Whether a hostname is plain ASCII, and therefore needs no conversion.
 ///
@@ -513,6 +517,7 @@ const IDNA_VERSION: &str = "1.1.0";
 ///   is_ascii_name(Some(b"\xc3\xa4.com")) == false // U+00E4 in UTF-8
 /// ```
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn is_ascii_name(host: Option<&[u8]>) -> bool {
     match host {
         // lib/idn.c:228-229 -- "bad input, consider it ASCII!"
@@ -521,9 +526,7 @@ pub(crate) fn is_ascii_name(host: Option<&[u8]>) -> bool {
     }
 }
 
-// ===========================================================================
 // Shared input validation
-// ===========================================================================
 
 /// Validates that a host is well-formed UTF-8, or fails the conversion.
 ///
@@ -542,19 +545,19 @@ pub(crate) fn is_ascii_name(host: Option<&[u8]>) -> bool {
 /// directions the identical failure mode, and because `Uts46::to_unicode`
 /// signals its failures through a value that also carries a lossy string --
 /// exactly the value that must never be returned to a caller.
+#[allow(dead_code)]
 fn validated_utf8(host: &[u8]) -> Result<&str, CURLcode> {
     std::str::from_utf8(host).map_err(|_| CURLcode::UrlMalformat)
 }
 
-// ===========================================================================
 // Transitional processing -- the fallback of lib/idn.c:263-265
-// ===========================================================================
 
 /// Whether a character is one of UTS-46's *deviation* characters.
 ///
 /// These are the four code points whose treatment differs between
 /// transitional and non-transitional processing, plus U+1E9E, which
 /// case-folds onto U+00DF and so shares its fate.
+#[allow(dead_code)]
 fn is_deviation(c: char) -> bool {
     matches!(
         c,
@@ -584,7 +587,8 @@ fn is_deviation(c: char) -> bool {
 ///
 /// Borrowing is preserved when there is nothing to map, so the common case
 /// -- the overwhelming majority of hostnames -- allocates nothing. That is a
-/// side effect of the shape, not an optimisation being pursued.
+/// side effect of the shape, not an optimization being pursued.
+#[allow(dead_code)]
 fn transitional_map(input: &str) -> Cow<'_, str> {
     if !input.chars().any(is_deviation) {
         return Cow::Borrowed(input);
@@ -602,15 +606,14 @@ fn transitional_map(input: &str) -> Cow<'_, str> {
     Cow::Owned(mapped)
 }
 
-// ===========================================================================
 // idn_decode / Curl_idn_decode -- Unicode host to A-label
-// ===========================================================================
 
 /// One UTS-46 _ToASCII_ attempt with this module's fixed parameters.
 ///
 /// `None` on any validity error, which is all `idn_to_ascii` needs in order
 /// to decide whether to make its second attempt. `idna::Errors` carries no
 /// discriminated detail in 1.1.0, so nothing is lost by collapsing it.
+#[allow(dead_code)]
 fn uts46_to_ascii(input: &str) -> Option<String> {
     Uts46::new()
         .to_ascii(
@@ -637,6 +640,7 @@ fn uts46_to_ascii(input: &str) -> Option<String> {
 /// empty-result rejection belongs to `Curl_idn_decode`. Collapsing them
 /// would make a successful-but-empty first attempt trigger a retry, which
 /// the C code does not do.
+#[allow(dead_code)]
 fn idn_to_ascii(input: &str) -> Result<String, CURLcode> {
     // Attempt 1 -- IDN2_NFC_INPUT | IDN2_NONTRANSITIONAL (lib/idn.c:253-261).
     // NFC is supplied by UTS-46's own mapping stage.
@@ -685,6 +689,7 @@ fn idn_to_ascii(input: &str) -> Result<String, CURLcode> {
 ///   to_ascii "xn--4cab6c.se"             -> Ok("xn--4cab6c.se")
 ///   to_ascii b"invalid-\xe2\x90.local"   -> Err(UrlMalformat)
 /// ```
+#[allow(dead_code)]
 pub(crate) fn to_ascii(host: &[u8]) -> Result<String, CURLcode> {
     let input = validated_utf8(host)?;
     let decoded = idn_to_ascii(input)?;
@@ -696,9 +701,7 @@ pub(crate) fn to_ascii(host: &[u8]) -> Result<String, CURLcode> {
     Ok(decoded)
 }
 
-// ===========================================================================
 // idn_encode / Curl_idn_encode -- A-label to U-label
-// ===========================================================================
 
 /// The conversion of `idn_encode` (`lib/idn.c:282-300`).
 ///
@@ -722,6 +725,7 @@ pub(crate) fn to_ascii(host: &[u8]) -> Result<String, CURLcode> {
 /// what `docs/libcurl/curl_url_get.md:104-114` requires -- a punycode name
 /// that "cannot be converted to IDN correctly" yields
 /// `CURLUE_BAD_HOSTNAME`, not a best-effort string.
+#[allow(dead_code)]
 fn idn_to_unicode(puny: &str) -> Result<String, CURLcode> {
     let (unicode, verdict) =
         Uts46::new().to_unicode(puny.as_bytes(), DENY_LIST, TO_UNICODE_HYPHENS);
@@ -770,14 +774,13 @@ fn idn_to_unicode(puny: &str) -> Result<String, CURLcode> {
 ///   to_unicode(b"example.com")       == Ok("example.com")
 ///   to_unicode(b"xn--zzzzzz.se")     == Err(UrlMalformat)
 /// ```
+#[allow(dead_code)]
 pub(crate) fn to_unicode(host: &[u8]) -> Result<String, CURLcode> {
     let puny = validated_utf8(host)?;
     idn_to_unicode(puny)
 }
 
-// ===========================================================================
 // Capability reporting -- idn_present, lib/version.c:407-416 and :496
-// ===========================================================================
 
 /// Whether an internationalised-domain-name implementation is present.
 ///
@@ -821,7 +824,6 @@ pub fn version_string() -> Option<&'static str> {
     Some(IDNA_VERSION)
 }
 
-// ===========================================================================
 // Tests
 //
 // `tests/unit/*.c` and `tests/libtest/*.c` are C programs that link a debug
@@ -840,14 +842,16 @@ pub fn version_string() -> Option<&'static str> {
 //     a 63-host corpus driven through `curl_url_get(CURLUPART_HOST, ...)` in
 //     both flag directions, compared hex-for-hex against this module behind
 //     the same `lib/urlapi.c:1401-1420` gate. 119 of 126 comparisons are
-//     byte-identical; the seven that are not are each covered by a test
-//     below that names the cause. A test asserting a divergence is therefore
+//     byte-identical. Five of the seven that are not are each covered by a
+//     `divergence_*` test below that names the cause; the remaining two are
+//     the numeric-host case, which belongs to the URL parser rather than
+//     here, and `numeric_hosts_pass_through_untouched` proves this module
+//     does not produce them. A test asserting a divergence is therefore
 //     doing real work: it makes an `idna` upgrade that changes the behaviour
 //     fail loudly here rather than silently on the wire.
 //
 // Nothing below touches the network, the filesystem, the clock or the
 // environment, so the whole module runs under Miri.
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -857,9 +861,7 @@ mod tests {
     /// expect verbatim.
     const AAO_SE_ALABEL: &str = "xn--4cab6c.se";
 
-    // -----------------------------------------------------------------
     // Curl_is_ASCII_name -- lib/idn.c:223-236
-    // -----------------------------------------------------------------
 
     #[test]
     fn absent_host_is_ascii() {
@@ -916,9 +918,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // Fixture-derived acceptance -- these are the real gate
-    // -----------------------------------------------------------------
 
     #[test]
     fn test165_converts_both_of_its_hosts() {
@@ -985,9 +985,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // tests/libtest/lib1560.c:206-239 -- the URL API's own corpus
-    // -----------------------------------------------------------------
 
     #[test]
     fn lib1560_round_trips_raksmorgas() {
@@ -1019,9 +1017,7 @@ mod tests {
         assert_eq!(to_ascii(fancy.as_bytes()), Ok("curl.se".to_string()));
     }
 
-    // -----------------------------------------------------------------
     // Round-trips across scripts
-    // -----------------------------------------------------------------
 
     #[test]
     fn latin_round_trip() {
@@ -1095,9 +1091,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // The empty-result asymmetry -- lib/idn.c:317-320 vs :341-342
-    // -----------------------------------------------------------------
 
     #[test]
     fn to_ascii_rejects_an_empty_result_and_to_unicode_does_not() {
@@ -1127,9 +1121,7 @@ mod tests {
         assert_eq!(to_unicode(b""), Ok(String::new()));
     }
 
-    // -----------------------------------------------------------------
     // UTF-8 validation -- rejected, never repaired
-    // -----------------------------------------------------------------
 
     #[test]
     fn ill_formed_utf8_is_rejected_in_both_directions() {
@@ -1171,9 +1163,7 @@ mod tests {
         assert_eq!(validated_utf8(b"ok"), Ok("ok"));
     }
 
-    // -----------------------------------------------------------------
     // The transitional fallback -- lib/idn.c:263-265
-    // -----------------------------------------------------------------
 
     #[test]
     fn the_transitional_fallback_is_reached_and_is_necessary() {
@@ -1249,9 +1239,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // The UTS-46 parameters, each pinned by the measurement that chose it
-    // -----------------------------------------------------------------
 
     #[test]
     fn the_deny_list_is_empty_so_std3_characters_survive() {
@@ -1324,10 +1312,10 @@ mod tests {
     }
 
     #[test]
-    fn normalisation_form_c_is_applied_by_the_mapping_stage() {
+    fn normalization_form_c_is_applied_by_the_mapping_stage() {
         // lib/idn.c:253 passes IDN2_NFC_INPUT. Decomposed `a` + U+030A
         // COMBINING RING ABOVE and precomposed U+00E5 must agree, which
-        // they only do if NFC runs. No separate normalisation step is
+        // they only do if NFC runs. No separate normalization step is
         // therefore needed.
         assert_eq!(
             to_ascii("a\u{30a}.se".as_bytes()),
@@ -1348,9 +1336,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // Failure paths in the U-label direction
-    // -----------------------------------------------------------------
 
     #[test]
     fn invalid_punycode_is_rejected_by_to_unicode() {
@@ -1381,9 +1367,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // Totality: nothing here may panic, whatever arrives
-    // -----------------------------------------------------------------
 
     #[test]
     fn no_input_causes_a_panic() {
@@ -1459,9 +1443,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // Divergences from the C oracle, asserted so a regression is loud
-    // -----------------------------------------------------------------
 
     #[test]
     fn divergence_an_empty_interior_label_is_rejected() {
@@ -1549,9 +1531,39 @@ mod tests {
         assert_eq!(to_ascii(host.as_bytes()), Err(CURLcode::UrlMalformat));
     }
 
-    // -----------------------------------------------------------------
+    #[test]
+    fn numeric_hosts_pass_through_untouched() {
+        // The two of seven oracle comparisons that are NOT this module's
+        // behaviour. curl 8.19.0-DEV returns `73.150.2.210` for the host
+        // `1234567890` in both flag directions, because `curl_url_set` reads
+        // the label as the 32-bit integer 0x499602D2 and re-spells it in
+        // dotted-quad form before any IDN code runs. `lib/idn.c` has no part
+        // in it: the label is ASCII, so the `lib/urlapi.c:1401-1420` gate
+        // never reaches a conversion, and calling one anyway is a no-op.
+        assert!(is_ascii_name(Some(b"1234567890")));
+        assert_eq!(to_ascii(b"1234567890"), Ok("1234567890".to_string()));
+        assert_eq!(to_unicode(b"1234567890"), Ok("1234567890".to_string()));
+        // The dotted-quad spelling is never synthesised here; the sibling
+        // `super` module owns that normalization.
+        for host in [&b"1234567890"[..], &b"123.456.789.0"[..]] {
+            // Both directions must SUCCEED and return the input verbatim.
+            // Asserting the whole `Result` rather than inspecting an `Ok` arm
+            // matters: a version that skipped the `Err` case would pass
+            // vacuously if a future change started rejecting these hosts, and
+            // "is not rewritten" is exactly the claim being made. Measured:
+            // both hosts yield `Ok` with the identical string in both
+            // directions.
+            let expected = Ok(String::from_utf8_lossy(host).into_owned());
+            assert_eq!(to_ascii(host), expected, "to_ascii rewrote {host:?}");
+            assert_eq!(
+                to_unicode(host),
+                expected,
+                "to_unicode rewrote {host:?}"
+            );
+        }
+    }
+
     // Capability reporting
-    // -----------------------------------------------------------------
 
     #[test]
     fn idn_is_available_and_the_predicate_is_total() {

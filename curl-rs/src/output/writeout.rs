@@ -5,9 +5,9 @@
 //! `--write-out`: the 72-variable table, the mini-language and the two frozen
 //! JSON forms.
 //!
-//! This module supersedes two C translation units. AAP section 0.4.1 assigns
-//! it `src/tool_writeout.c` (871 lines) and `src/tool_writeout_json.c` (163
-//! lines) with the note "`--write-out` variables and JSON form; output
+//! This module supersedes two C translation units, `src/tool_writeout.c`
+//! (871 lines) and `src/tool_writeout_json.c` (163 lines): the `--write-out`
+//! variables and their JSON form, with output
 //! frozen". It owns six things and nothing else:
 //!
 //! 1. The variable table -- 72 rows, byte-wise alphabetical
@@ -25,18 +25,15 @@
 //!
 //! # Almost every byte here is frozen
 //!
-//! AAP section 0.3.4 names "the `--write-out` variable set from
-//! `src/tool_writeout*.c`" among the terminal surfaces that are "migration
-//! targets, not design decisions", and AAP section 0.8.1 freezes them
-//! together with the rest of the command-line contract. AAP section 0.8.2 is
-//! blunt about the consequence: "a refactor that produces
-//! different-but-arguably-better output has failed."
+//! The `--write-out` variable set is a migration target, not a design
+//! decision, and it is frozen together with the rest of the command-line
+//! contract. The consequence is blunt: a refactor that produces
+//! different-but-arguably-better output has failed.
 //!
 //! The output is not merely documented, it is asserted. These fixtures in
 //! this tree compare the bytes this module writes, and they are read-only
-//! reference material -- AAP section 0.8.1: "a failing fixture is evidence of
-//! an implementation defect. Editing a fixture to make it pass is
-//! prohibited."
+//! reference material: a failing fixture is evidence of an implementation
+//! defect, and editing a fixture to make it pass is prohibited.
 //!
 //! * `tests/data/test970`, `test972` -- the entire `%{json}` line: 68 keys
 //!   on one line with `"curl_version"` last.
@@ -52,19 +49,6 @@
 //!   `%{exitcode}` and `%{errormsg}` together.
 //! * `tests/data/test1981` -- `%time{%d/%b/%Y %H:%M:%S.%f %z %Z}`. Gated on
 //!   the `Debug` feature, so it skips in this build -- see below.
-//!
-//! # Rules status and provenance
-//!
-//! No user-specified rules exist for this project. `review_rules` returns the
-//! single line "No user rules provided.", checked with the default window and
-//! again with an explicit full-document range that reads to end-of-document,
-//! both returning that identical line; this corroborates AAP section 0.7.
-//! Nothing in this file is attributed to a rule, and none was invented. Every
-//! constraint cited here is an AAP requirement taken from the user's request
-//! (AAP section 0.8) -- binding, but a requirement, not a rule. Describing
-//! them as rules would, in AAP section 0.7's own words, "misrepresent where
-//! they came from". Where no requirement speaks, enterprise-standard best
-//! practice governs; the absence of rules is not permission to lower the bar.
 //!
 //! # The table order is functional, not cosmetic
 //!
@@ -84,13 +68,12 @@
 //! # Everything engine-owned arrives by injection
 //!
 //! C threads `struct per_transfer *per` through every writer and calls
-//! `curl_easy_getinfo`, `curl_easy_header`, `curl_url_*` and `curl_version`
-//! on it. This module instead takes three narrow ports -- [`TransferFacts`],
+//! `curl_easy_getinfo`, `curl_easy_header`, `curl_url_*` and `curl_version` on
+//! it. This module instead takes three narrow ports -- [`TransferFacts`],
 //! [`UrlParser`] and [`Clock`] -- plus two plain values, [`WriteOut::outcome`]
-//! and [`WriteOut::version`]. That is AAP section 0.3.3 pattern P12
-//! (dependency injection), and it is what makes every byte in the tables
-//! above assertable in a unit test with no network, no clock and no engine
-//! handle.
+//! and [`WriteOut::version`]. Injecting them is what makes every byte in the
+//! tables above assertable in a unit test with no network, no clock and no
+//! engine handle.
 //!
 //! The adapter that satisfies the ports lives with the operation driver
 //! (`curl-rs/src/operate/`), and its obligations are stated on each port:
@@ -100,14 +83,13 @@
 //!   `CURLU*` constant is defined, redefined or remapped in this file.**
 //!   Those live in `curl-rs-ffi/src/ffi/opts.rs` and `codes.rs` and are
 //!   mirrored in `curl-rs-lib`; the selectors here are names, never numbers.
-//! * [`UrlParser`] must be backed by `curl_rs_lib::url`, whose parsing quirks
-//!   AAP section 0.4.1 deliberately preserves. The exact flag set is part of
+//! * [`UrlParser`] must be backed by `curl_rs_lib::url`, which deliberately
+//!   preserves curl's own parsing quirks. The exact flag set is part of
 //!   the port's contract, because it differs from the one
 //!   `curl-rs/src/output/xattr.rs` uses.
 //! * [`WriteOut::version`] must be `curl_rs_lib::version::version()`, the
-//!   single owner of the banner. Cargo metadata is never consulted: AAP
-//!   section 0.6.7 records that the reported version is compared by the
-//!   fixtures.
+//!   single owner of the banner. Cargo metadata is never consulted, because
+//!   the reported version is compared by the fixtures.
 //!
 //! # The self-name invariant
 //!
@@ -119,54 +101,48 @@
 //! `env!("CARGO_PKG_NAME")`, `env!("CARGO_BIN_NAME")` and
 //! `std::env::args()` are never consulted.
 //!
-//! # The `%time{}` conversion specifiers
+//! # `%time{}`: curl's pre-pass, then the platform's `strftime`
 //!
-//! `outtime` (`:521-600`) rewrites `%f`, `%z` and `%Z` itself and hands the
-//! rest to the platform `strftime` against `curlx_gmtime`, which is
-//! `gmtime_r` on all four mandated targets (`lib/curlx/timeval.c:251-270`).
-//! No date-and-time crate is declared in `curl-rs/Cargo.toml` and none is
-//! added, so the calendar breakdown and the specifier set are implemented
-//! here from `std` arithmetic. UTC needs no timezone database, which is why
-//! the `GAP #3` recorded in `curl-rs/src/util.rs` -- `std` has no timezone
-//! API -- does not apply: that gap is about *local* time.
+//! `outtime` (`:521-600`) is two steps, and this module keeps them apart the
+//! same way. First it rewrites `%f`, `%z` and `%Z` itself (`:563-579`) --
+//! curl's own substitutions, made *because* the platform cannot be trusted
+//! with them, and `%f` is not a `strftime` conversion at all. Then it hands
+//! the rewritten format to `curlx_gmtime` followed by the platform `strftime`
+//! (`:581-588`).
 //!
-//! Every specifier below was measured against glibc 2.42 `strftime` with a C
-//! probe over six timestamps, including the ISO-week edge case
-//! 1136073600 (2006-01-01, a Sunday) where `%V` is 52 and `%G` is 2005.
+//! Both steps are reproduced by their counterparts: [`rewrite_time_format`]
+//! for the pre-pass, and [`curl_rs_lib::strftime_gmt`] -- which performs the
+//! `gmtime_r` and `strftime` pair inside the engine's sanctioned
+//! operating-system island -- for the formatting. **The conversion set is not
+//! reimplemented here, and must not be.**
 //!
-//! | Supported | Meaning in the C locale |
-//! |---|---|
-//! | `%f` | microseconds, six digits -- curl's own, via the pre-pass |
-//! | `%a` `%A` | abbreviated and full weekday name |
-//! | `%b` `%h` `%B` | abbreviated and full month name |
-//! | `%c` | `%a %b %e %H:%M:%S %Y` |
-//! | `%C` | century, two digits |
-//! | `%d` `%e` | day of month, zero- and space-padded |
-//! | `%D` `%x` | `%m/%d/%y` |
-//! | `%F` | `%Y-%m-%d` |
-//! | `%g` `%G` | ISO 8601 week-based year, two and four digits |
-//! | `%H` `%k` | hour 00-23, zero- and space-padded |
-//! | `%I` `%l` | hour 01-12, zero- and space-padded |
-//! | `%j` | day of year, 001-366 |
-//! | `%m` `%M` `%S` | month, minute, second |
-//! | `%n` `%t` | newline, tab |
-//! | `%p` `%P` | `AM`/`PM` and `am`/`pm` |
-//! | `%r` | `%I:%M:%S %p` |
-//! | `%R` `%T` `%X` | `%H:%M`, `%H:%M:%S`, `%H:%M:%S` |
-//! | `%s` | seconds since the epoch |
-//! | `%u` `%w` | ISO weekday 1-7 and weekday 0-6 |
-//! | `%U` `%V` `%W` | week of year, Sunday-first, ISO 8601 and Monday-first |
-//! | `%y` `%Y` | year, two and four digits |
-//! | `%z` `%Z` | `+0000` and `UTC` via the pre-pass; a bare pair never
-//!   reaches the formatter, so `GMT` appears only through `%OZ`/`%EZ` |
-//! | `%%` | a literal `%` |
-//! | `%E<c>` `%O<c>` | the unmodified conversion, where glibc accepts `<c>` |
+//! The reason is `LC_TIME`. `src/tool_operate.c:2271` calls
+//! `setlocale(LC_ALL, "")`, so the tool adopts the environment's locale, and
+//! the locale decides what several conversions produce: `%a`, `%A`, `%b`,
+//! `%B` and `%h` are localised names; `%p` and `%P` are localised and may be
+//! empty; `%c`, `%x`, `%X` and `%r` take wholly different layouts; and which
+//! letters the `%E` and `%O` modifiers accept is locale-defined too. A table
+//! of English names reproduces exactly one locale -- the `C` one -- and
+//! silently diverges from the C tool on every host whose environment names
+//! another, which is the class of behaviour change AAP section 0.8.1 freezes.
+//! Delegating makes the bytes identical by construction rather than by a table
+//! that would have to be kept in step with two C libraries across four
+//! targets.
 //!
-//! Anything else is emitted verbatim, `%q` as `%q`, which is what glibc does;
-//! so is a trailing lone `%`. The rendered result is capped at 255 bytes,
-//! because C formats into `char output[256]` (`:529`) and `strftime` returns
-//! zero -- writing nothing at all -- when the result plus its terminator does
-//! not fit. Measured: 255 literal bytes render, 256 render nothing.
+//! Three consequences follow, and all three are C's rather than ours:
+//!
+//! * an unsupported conversion is whatever the platform does with it -- glibc
+//!   and the BSD implementation behind the two Apple targets both emit `%`
+//!   and the character verbatim, so `%q` comes out as `%q`;
+//! * a bare `%z` or `%Z` never reaches the formatter, because the pre-pass
+//!   consumed it, so the platform's `+0000` and `GMT` appear only through
+//!   `%Ez`/`%Oz` and `%EZ`/`%OZ`;
+//! * the rendered result is capped at 255 bytes, because C formats into
+//!   `char output[256]` (`:529`) and `strftime` returns zero -- writing
+//!   nothing at all -- when the result plus its terminator does not fit.
+//!
+//! `%time{}` renders UTC, so no timezone database is consulted and the local
+//! time discussed in `curl-rs/src/util.rs` is a separate question.
 //!
 //! # Six documented translation differences
 //!
@@ -198,13 +174,12 @@
 //!    as `debug_assert!`.
 //! 4. **The `DEBUGBUILD` `CURL_TIME` override is not implemented.**
 //!    `:549-559` lets a debug build replace the `%time{}` clock reading from
-//!    the environment. AAP section 0.6.6 records that this build deliberately
-//!    does not advertise `Debug`, and `DEBUGBUILD` is not one of the 15
-//!    canonical Cargo features, so the path is documented here and left out.
-//!    The consequence is stated rather than hidden: `tests/data/test1981`
-//!    gates on `<features>Debug`, so it skips instead of running. The
-//!    sanctioned seam for a fixed clock is the [`Clock`] port, which the
-//!    tests use.
+//!    the environment. This build deliberately does not advertise `Debug`, and
+//!    `DEBUGBUILD` is not one of the 15 canonical Cargo features, so the path
+//!    is documented here and left out. The consequence is stated rather than
+//!    hidden: `tests/data/test1981` gates on `<features>Debug`, so it skips
+//!    instead of running. The sanctioned seam for a fixed clock is the
+//!    [`Clock`] port, which the tests use.
 //! 5. **`strlen` truncation is preserved.** `jsonWriteString`
 //!    (`src/tool_writeout_json.c:89`) measures its input with `strlen`, so a
 //!    NUL byte ends the string. A C string cannot carry an interior NUL, but
@@ -214,8 +189,7 @@
 //!    `gettimeofday` inside `outtime`, so two `%time{}` uses in one format
 //!    string can observe two different microsecond readings. The [`Clock`]
 //!    port is consulted per occurrence for that reason, and never at build
-//!    time: AAP section 0.7 requires reproducible builds, so no timestamp is
-//!    baked in.
+//!    time: builds must be reproducible, so no timestamp is baked in.
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
@@ -225,9 +199,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::output::msgs::ERROR_PREFIX;
 
-// ===========================================================================
 // The injected ports: what this module needs from the engine, and no more
-// ===========================================================================
 
 /// A reading of the wall clock: whole seconds since the Unix epoch plus a
 /// microsecond remainder.
@@ -241,6 +213,7 @@ use crate::output::msgs::ERROR_PREFIX;
 /// either: `:570` renders it with `%06u`, which pads but never truncates. A
 /// port is expected to supply `0..=999_999`, as `gettimeofday` guarantees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct WallClock {
     /// Whole seconds since 1970-01-01T00:00:00Z, negative before it.
     pub(crate) secs: i64,
@@ -254,6 +227,7 @@ pub(crate) struct WallClock {
 /// against a fixed instant, which is also the seam that replaces the
 /// `DEBUGBUILD`-only `CURL_TIME` override of `:549-559`; see translation
 /// difference 4 in this module's documentation.
+#[allow(dead_code)]
 pub(crate) trait Clock {
     /// One reading, taken now.
     ///
@@ -265,10 +239,10 @@ pub(crate) trait Clock {
 
 /// The production [`Clock`]: the host's real-time clock.
 ///
-/// Reads [`SystemTime::now`] at run time, never at build time -- AAP section
-/// 0.7 requires reproducible builds, so nothing here is baked into the
-/// binary.
+/// Reads [`SystemTime::now`] at run time, never at build time: builds must be
+/// reproducible, so nothing here is baked into the binary.
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
 pub(crate) struct SystemClock;
 
 impl Clock for SystemClock {
@@ -318,6 +292,7 @@ impl Clock for SystemClock {
 /// `%{header_json}` lowercases it explicitly
 /// (`src/tool_writeout_json.c:136`, `:154`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct HeaderRef<'a> {
     /// `struct curl_header.name`, in the case the server sent.
     pub(crate) name: &'a [u8],
@@ -335,6 +310,7 @@ pub(crate) struct HeaderRef<'a> {
 ///
 /// Aliased so that [`TransferFacts::certinfo`] can return a slice of chains
 /// without a nested generic that would trip clippy's `type_complexity`.
+#[allow(dead_code)]
 pub(crate) type CertChain = Vec<Vec<u8>>;
 
 /// The result of the transfer whose facts are being written out.
@@ -349,6 +325,7 @@ pub(crate) type CertChain = Vec<Vec<u8>>;
 /// `CURLcode` type stays in `curl-rs-lib`, and the adapter converts at the
 /// boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct TransferOutcome<'a> {
     /// The `CURLcode` as an integer; `0` is `CURLE_OK`.
     pub(crate) code: i32,
@@ -360,6 +337,7 @@ pub(crate) struct TransferOutcome<'a> {
 impl TransferOutcome<'_> {
     /// Whether the transfer failed, i.e. C's truthiness test on
     /// `per_result` (`:253`, `:763`).
+    #[allow(dead_code)]
     fn failed(&self) -> bool {
         self.code != 0
     }
@@ -367,13 +345,14 @@ impl TransferOutcome<'_> {
 
 /// A `CURLINFO` whose value is a C `long`.
 ///
-/// `long` is 64 bits on all four mandated targets (AAP section 0.1.1 goal
-/// G8), so [`TransferFacts::long_info`] reports it as an `i64` with no loss.
+/// `long` is 64 bits on all four mandated targets, so
+/// [`TransferFacts::long_info`] reports it as an `i64` with no loss.
 ///
 /// These are names, not numbers: the numeric `CURLINFO` values live in
 /// `curl-rs-ffi/src/ffi/opts.rs` and are mirrored in `curl-rs-lib`, and
 /// nothing here redefines or remaps one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum LongInfo {
     /// `CURLINFO_HEADER_SIZE`, behind `size_header`.
     HeaderSize,
@@ -411,6 +390,7 @@ pub(crate) enum LongInfo {
 /// Every one of the nine is a `*_TIME_T` variant, which is why
 /// [`write_time`] can divide unconditionally by one million (`:64-65`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum TimeInfo {
     /// `CURLINFO_APPCONNECT_TIME_T`, behind `time_appconnect`.
     AppConnect,
@@ -434,6 +414,7 @@ pub(crate) enum TimeInfo {
 
 /// A `CURLINFO` whose value is a plain `curl_off_t`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum OffsetInfo {
     /// `CURLINFO_CONN_ID`, behind `conn_id`.
     ConnId,
@@ -456,8 +437,9 @@ pub(crate) enum OffsetInfo {
 /// Reported as bytes, not as `str`: C hands the pointer straight to `fputs`
 /// (`:311`), so a value that is not valid UTF-8 reaches the terminal as the
 /// bytes the server sent. Going through `String` would substitute U+FFFD and
-/// change the emitted bytes, which AAP section 0.8.1 does not permit.
+/// change the emitted bytes, which is not permitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum StringInfo {
     /// `CURLINFO_CONTENT_TYPE`, behind `content_type`.
     ContentType,
@@ -487,6 +469,7 @@ pub(crate) enum StringInfo {
 /// variant it can render, so a row can never ask for a `long` to be read as a
 /// string. `CURLINFO_NONE` is `None` on the row itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum Info {
     /// Read with [`TransferFacts::long_info`].
     Long(LongInfo),
@@ -509,6 +492,7 @@ pub(crate) enum Info {
 /// stands for a `curl_easy_getinfo` that returned non-`CURLE_OK`, or for a
 /// `NULL` pointer that it filled in successfully, both of which leave C's
 /// `valid` flag false (`:56-57`, `:200-201`).
+#[allow(dead_code)]
 pub(crate) trait TransferFacts {
     /// `curl_easy_getinfo(per->curl, <which>, &longinfo)` (`:333`).
     fn long_info(&self, which: LongInfo) -> Option<i64>;
@@ -600,6 +584,7 @@ pub(crate) trait TransferFacts {
 /// twenty `url.*` and `urle.*` variables cover. Names, not numbers: the
 /// numeric values belong to the URL API in `curl-rs-lib`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum UrlPart {
     /// `CURLUPART_SCHEME`.
     Scheme,
@@ -631,6 +616,7 @@ pub(crate) enum UrlPart {
 /// this module -- no handle, an unmapped part, no effective URL -- and the two
 /// the port can hit are named here so the contract stays legible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum UrlPartFailure {
     /// `curl_url_set(uh, CURLUPART_URL, url, ...)` failed: C's `rc = 2`
     /// (`:146-148`).
@@ -643,10 +629,10 @@ pub(crate) enum UrlPartFailure {
 /// The URL parser behind the twenty `url.*` and `urle.*` variables.
 ///
 /// Implementations must be backed by `curl_rs_lib::url`, the engine's own URL
-/// API. AAP section 0.4.1 records that `curl-rs-lib/src/url/mod.rs`
-/// deliberately preserves "curl's parsing quirks", which is precisely what
-/// fidelity here requires; the `url` crate is not used and nothing is
-/// hand-rolled.
+/// API. `curl-rs-lib/src/url/mod.rs` is to preserve curl's own parsing quirks
+/// deliberately, which is precisely what fidelity here requires; the `url`
+/// crate is not used and nothing is hand-rolled.
+#[allow(dead_code)]
 pub(crate) trait UrlParser {
     /// Parse `url` and return one component of it.
     ///
@@ -685,6 +671,7 @@ pub(crate) trait UrlParser {
 /// and the clock. Borrowed rather than owned so that one transfer's facts can
 /// be written out repeatedly -- once for `%{json}` and once for a plain
 /// format, say -- without copying anything.
+#[allow(dead_code)]
 pub(crate) struct WriteOut<'a> {
     /// The transfer being reported.
     pub(crate) facts: &'a dyn TransferFacts,
@@ -711,6 +698,7 @@ pub(crate) struct WriteOut<'a> {
 /// for the duration of one [`our_write_out`] call, exactly as C's
 /// `fclose_stream` flag governs a `FILE *` that lives no longer than the
 /// call.
+#[allow(dead_code)]
 pub(crate) struct WriteOutSinks<'a> {
     /// Where the format string writes by default (`:718`).
     pub(crate) stdout: &'a mut dyn Write,
@@ -719,16 +707,16 @@ pub(crate) struct WriteOutSinks<'a> {
     pub(crate) stderr: &'a mut dyn Write,
 }
 
-// ===========================================================================
 // Constants, every one of them taken from the two C files
-// ===========================================================================
 
 /// Microseconds in a second: the divisor and modulus of
 /// `src/tool_writeout.c:64-65`.
+#[allow(dead_code)]
 const MICROS_PER_SEC: u32 = 1_000_000;
 
 /// [`MICROS_PER_SEC`] in the width `writeTime` divides in, since
 /// `CURLINFO_*_TIME_T` values are `curl_off_t`.
+#[allow(dead_code)]
 const MICROS_PER_SEC_I64: i64 = 1_000_000;
 
 /// `MAX_WRITEOUT_NAME_LENGTH` (`src/tool_writeout.c:518`).
@@ -742,6 +730,7 @@ const MICROS_PER_SEC_I64: i64 = 1_000_000;
 /// Exceeding it is not a lookup failure. C's `else break` at `:759` leaves the
 /// whole `while` loop, so the remainder of the format string is dropped
 /// silently, with no diagnostic. See [`our_write_out`].
+#[allow(dead_code)]
 const MAX_WRITEOUT_NAME_LENGTH: usize = 24;
 
 /// `MAX_JSON_STRING` (`src/tool_writeout_json.c:30`).
@@ -750,6 +739,7 @@ const MAX_WRITEOUT_NAME_LENGTH: usize = 24;
 /// `len + used + 1 > toobig` rule the longest *escaped* string that can be
 /// written is 99,999 bytes. Beyond it `jsonquoted` fails and
 /// [`json_write_string`] writes nothing at all -- not even `""`.
+#[allow(dead_code)]
 const MAX_JSON_STRING: usize = 100_000;
 
 /// `char hname[256]`, "holds the longest header field name"
@@ -757,10 +747,12 @@ const MAX_JSON_STRING: usize = 100_000;
 ///
 /// A longer name is not an error: `:666` simply skips the lookup, and `:700`
 /// still advances past the closing brace.
+#[allow(dead_code)]
 const MAX_HEADER_NAME: usize = 256;
 
 /// `char fname[512]`, "holds the longest filename"
 /// (`src/tool_writeout.c:815`).
+#[allow(dead_code)]
 const MAX_OUTPUT_FILENAME: usize = 512;
 
 /// `char output[256]`, "max output time length"
@@ -770,6 +762,7 @@ const MAX_OUTPUT_FILENAME: usize = 512;
 /// and C only writes when it returns non-zero (`:587-589`), so a `%time{}`
 /// whose result reaches 256 bytes emits nothing. Measured against glibc: 255
 /// literal bytes render, 256 render nothing.
+#[allow(dead_code)]
 const MAX_TIME_OUTPUT: usize = 256;
 
 /// `curlx_dyn_init(&format, 1024)`, the cap on the *rewritten* `%time{}`
@@ -779,14 +772,15 @@ const MAX_TIME_OUTPUT: usize = 256;
 /// `len + used + 1 > toobig` rule the rewritten format can reach 1023 bytes.
 /// Beyond it C leaves `result` set, skips the whole `if(!result)` block at
 /// `:580` and writes nothing -- while still advancing past the closing brace.
+#[allow(dead_code)]
 const MAX_TIME_FORMAT: usize = 1024;
 
 /// `INT_MAX`, the ceiling the `%{urlnum}` validity test applies
 /// (`src/tool_writeout.c:397`).
 ///
 /// Written as a literal rather than derived from `i32::MAX` so that no cast
-/// appears in a constant. `int` is 32 bits on all four mandated targets (AAP
-/// section 0.1.1 goal G8).
+/// appears in a constant. `int` is 32 bits on all four mandated targets.
+#[allow(dead_code)]
 const URLNUM_CEILING: i64 = 2_147_483_647;
 
 /// The frozen unknown-variable diagnostic, minus its prefix and its argument.
@@ -796,11 +790,10 @@ const URLNUM_CEILING: i64 = 2_147_483_647;
 /// (int)vlen, ptr)`. Note what it is not: it does not go through `errorf`, so
 /// it is neither line-wrapped nor gated on `--silent`. The `curl: ` prefix
 /// comes from [`ERROR_PREFIX`], the crate's single owner of those six bytes.
+#[allow(dead_code)]
 const UNKNOWN_VARIABLE_TEXT: &str = "unknown --write-out variable: '";
 
-// ===========================================================================
 // The row type and the table
-// ===========================================================================
 
 /// The `writeoutid` enumeration of `src/tool_writeout.h:30-105`.
 ///
@@ -816,12 +809,13 @@ const UNKNOWN_VARIABLE_TEXT: &str = "unknown --write-out variable: '";
 ///
 /// No discriminant is written, because none is part of any contract. These
 /// identifiers are internal to the C tool -- unlike `CURLcode` or
-/// `CURLoption`, they never cross the library boundary, so AAP section
-/// 0.6.1's integer-pinning requirement does not reach them. The one place C
+/// `CURLoption`, they never cross the library boundary, so the
+/// integer-pinning requirement does not reach them. The one place C
 /// relies on their *order* is the `vid >= VAR_INPUT_URLESCHEME` test at `:91`,
 /// which selects the effective-URL family; that is expressed here as an
 /// explicit match in [`url_source_and_part`] instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum VarId {
     AppConnectTime,
     Cert,
@@ -908,6 +902,7 @@ pub(crate) enum VarId {
 /// `None` on the row is C's `NULL`: not "unsupported" but "handled specially
 /// in the dispatch switch" (`src/tool_writeout.c:761-786`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum Writer {
     /// `writeTime` (`src/tool_writeout.c:44-79`), nine rows.
     Time,
@@ -925,6 +920,7 @@ pub(crate) enum Writer {
 /// The four C columns, in the same order, so the two tables can be compared
 /// line by line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct WriteOutVar {
     /// The name between the braces of `%{...}`.
     pub(crate) name: &'static str,
@@ -939,6 +935,7 @@ pub(crate) struct WriteOutVar {
 
 /// A row rendered by `writeString` whose value is a `CURLINFO` string, or
 /// none at all.
+#[allow(dead_code)]
 const fn text(
     name: &'static str,
     id: VarId,
@@ -965,6 +962,7 @@ const fn text(
 /// CURLINFO_HTTP_VERSION which returns the version as a long, however it is
 /// output as a string", so that the JSON reads `"http_version": "1.1"` and
 /// never `"http_version": 1.1`.
+#[allow(dead_code)]
 const fn text_from_long(
     name: &'static str,
     id: VarId,
@@ -979,6 +977,7 @@ const fn text_from_long(
 }
 
 /// A row rendered by `writeLong`.
+#[allow(dead_code)]
 const fn long(
     name: &'static str,
     id: VarId,
@@ -997,6 +996,7 @@ const fn long(
 
 /// A row rendered by `writeTime`. Every one of the nine has a `CURLINFO`,
 /// which is why C's `else DEBUGASSERT(0)` at `:59-61` is unreachable.
+#[allow(dead_code)]
 const fn time(name: &'static str, id: VarId, info: TimeInfo) -> WriteOutVar {
     WriteOutVar {
         name,
@@ -1007,6 +1007,7 @@ const fn time(name: &'static str, id: VarId, info: TimeInfo) -> WriteOutVar {
 }
 
 /// A row rendered by `writeOffset`.
+#[allow(dead_code)]
 const fn offset(
     name: &'static str,
     id: VarId,
@@ -1028,6 +1029,7 @@ const fn offset(
 ///
 /// Exactly five rows: `header_json`, `json`, `onerror`, `stderr` and
 /// `stdout`. `certs` is *not* one of them; `:432` gives it `writeString`.
+#[allow(dead_code)]
 const fn special(name: &'static str, id: VarId) -> WriteOutVar {
     WriteOutVar {
         name,
@@ -1051,6 +1053,7 @@ const fn special(name: &'static str, id: VarId) -> WriteOutVar {
 /// constructor per writer kind means the type system now guarantees the
 /// pairing that C's table maintains only by convention: a `writeLong` row
 /// cannot name a string `CURLINFO`.
+#[allow(dead_code)]
 pub(crate) const VARIABLES: &[WriteOutVar] = &[
     text("certs", VarId::Cert, None),
     offset("conn_id", VarId::ConnId, Some(OffsetInfo::ConnId)),
@@ -1227,6 +1230,7 @@ pub(crate) const VARIABLES: &[WriteOutVar] = &[
 /// would compare as the shorter prefix there; a `&[u8]` cannot lose bytes
 /// that way, and the format string this is called with comes from a C string
 /// in every real invocation, so the distinction is unobservable.
+#[allow(dead_code)]
 pub(crate) fn find_variable(name: &[u8]) -> Option<&'static WriteOutVar> {
     VARIABLES
         .binary_search_by(|var| var.name.as_bytes().cmp(name))
@@ -1234,15 +1238,14 @@ pub(crate) fn find_variable(name: &[u8]) -> Option<&'static WriteOutVar> {
         .and_then(|index| VARIABLES.get(index))
 }
 
-// ===========================================================================
 // The four writers
-// ===========================================================================
 
 /// `curl_mfprintf(stream, "\"%s\":", wovar->name)`, the JSON key and its
 /// colon (`src/tool_writeout.c:68`, `:307`, `:363`, `:409`).
 ///
 /// Every row name is an ASCII identifier, so no escaping is needed and C
 /// applies none.
+#[allow(dead_code)]
 fn write_json_key(out: &mut dyn Write, name: &str) -> io::Result<()> {
     write!(out, "\"{name}\":")
 }
@@ -1252,6 +1255,7 @@ fn write_json_key(out: &mut dyn Write, name: &str) -> io::Result<()> {
 ///
 /// In plain output the same case writes nothing at all, which is why every
 /// writer guards this on `use_json`.
+#[allow(dead_code)]
 fn write_json_null(out: &mut dyn Write, name: &str) -> io::Result<()> {
     write!(out, "\"{name}\":null")
 }
@@ -1262,9 +1266,10 @@ fn write_json_null(out: &mut dyn Write, name: &str) -> io::Result<()> {
 /// `writeTime` prints with the *unsigned* conversion (`:70-71`) while
 /// `writeOffset` prints with the signed one (`:411`), and the difference is
 /// only observable for a negative input -- which no `CURLINFO_*_TIME_T` ever
-/// produces. Preserved anyway, because AAP section 0.1.1 puts faithfulness
-/// ahead of tidiness. The byte round trip is an exact reinterpretation and
+/// produces. Preserved anyway, because faithfulness comes ahead of tidiness.
+/// The byte round trip is an exact reinterpretation and
 /// needs no cast.
+#[allow(dead_code)]
 fn as_unsigned(value: i64) -> u64 {
     u64::from_ne_bytes(value.to_ne_bytes())
 }
@@ -1276,6 +1281,7 @@ fn as_unsigned(value: i64) -> u64 {
 /// every one of the nine time variables. In JSON the number follows the key
 /// unquoted (`:67-71`), making these the only JSON values that are neither
 /// strings nor produced by an integer writer.
+#[allow(dead_code)]
 fn write_time(
     out: &mut dyn Write,
     var: &WriteOutVar,
@@ -1312,6 +1318,7 @@ fn write_time(
 /// `http_code` and `http_connect` to three digits with `%03ld` (`:365-366`)
 /// while JSON always uses the bare `%ld` (`:363`). So a 99 response prints as
 /// `099` from `%{http_code}` and as `99` inside `%{json}`.
+#[allow(dead_code)]
 fn write_long(
     out: &mut dyn Write,
     var: &WriteOutVar,
@@ -1357,6 +1364,7 @@ fn write_long(
 /// Eight rows, seven from a `CURLINFO` and `urlnum` computed. The one quirk
 /// is `urlnum`'s validity test: `per->urlnum <= INT_MAX` (`:397`), so a URL
 /// index above 2,147,483,647 renders as nothing rather than as a number.
+#[allow(dead_code)]
 fn write_offset(
     out: &mut dyn Write,
     var: &WriteOutVar,
@@ -1398,6 +1406,7 @@ fn write_offset(
 ///
 /// Zero when the transfer produced no certificate information, which is what
 /// `%{num_certs}` shows for a plain HTTP transfer.
+#[allow(dead_code)]
 fn certificate_count(ctx: &WriteOut<'_>) -> i64 {
     match ctx.facts.certinfo() {
         // `num_of_certs` is an `int` in C, so a chain longer than `INT_MAX`
@@ -1415,6 +1424,7 @@ fn certificate_count(ctx: &WriteOut<'_>) -> i64 {
 /// an empty vector when there is no certificate information at all (`:250`),
 /// which `tests/data/test970` pins as `"certs":""` -- an empty string, not
 /// `null`.
+#[allow(dead_code)]
 fn certificate_text(ctx: &WriteOut<'_>) -> Option<Vec<u8>> {
     let chains = ctx.facts.certinfo()?;
     let mut buf: Vec<u8> = Vec::new();
@@ -1454,6 +1464,7 @@ fn certificate_text(ctx: &WriteOut<'_>) -> Option<Vec<u8>> {
 /// `true` in the first position means "the effective URL", i.e.
 /// `CURLINFO_EFFECTIVE_URL` (`:92`); `false` means `per->url`, the URL as
 /// typed (`:96`).
+#[allow(dead_code)]
 fn url_source_and_part(id: VarId) -> Option<(bool, UrlPart)> {
     let mapped = match id {
         VarId::InputUrlScheme => (false, UrlPart::Scheme),
@@ -1495,6 +1506,7 @@ fn url_source_and_part(id: VarId) -> Option<(bool, UrlPart)> {
 ///   which is the ordinary "this URL has no user" answer.
 /// * 4 -- the identifier maps to no component; unreachable given the table.
 /// * 5 -- `CURLINFO_EFFECTIVE_URL` was unavailable.
+#[allow(dead_code)]
 fn url_part(ctx: &WriteOut<'_>, id: VarId) -> Option<Vec<u8>> {
     let (effective, part) = url_source_and_part(id)?;
     let url = if effective {
@@ -1515,6 +1527,7 @@ fn url_part(ctx: &WriteOut<'_>, id: VarId) -> Option<Vec<u8>> {
 /// [`json_write_string`] with lowercasing off (`:307-308`). An unavailable
 /// value writes `"name":null` in JSON and nothing in plain output
 /// (`:313-316`).
+#[allow(dead_code)]
 fn write_string(
     out: &mut dyn Write,
     var: &WriteOutVar,
@@ -1548,6 +1561,7 @@ fn write_string(
 /// the two are indistinguishable on purpose: [`string_borrowed`] answers
 /// `None` for every row handled here, so the fall-through in [`write_string`]
 /// cannot pick up a value that this function declined to produce.
+#[allow(dead_code)]
 fn string_built(var: &WriteOutVar, ctx: &WriteOut<'_>) -> Option<Vec<u8>> {
     // Only the `CURLINFO_NONE` rows reach C's switch at `:205`.
     if var.info.is_some() {
@@ -1575,6 +1589,7 @@ fn string_built(var: &WriteOutVar, ctx: &WriteOut<'_>) -> Option<Vec<u8>> {
 /// The nine string `CURLINFO` rows (`:199-202`), the `long`-backed
 /// `http_version` row (`:185-198`) and three of the computed rows
 /// (`:252-270`).
+#[allow(dead_code)]
 fn string_borrowed<'a>(
     var: &WriteOutVar,
     ctx: &WriteOut<'a>,
@@ -1623,6 +1638,7 @@ fn string_borrowed<'a>(
 /// the C table compares against; the enumeration itself is owned by
 /// `curl-rs-ffi` and mirrored in `curl-rs-lib`, and nothing here redefines
 /// it.
+#[allow(dead_code)]
 fn http_version_text(version: Option<i64>) -> Option<&'static [u8]> {
     match version? {
         // CURL_HTTP_VERSION_NONE
@@ -1647,6 +1663,7 @@ fn http_version_text(version: Option<i64>) -> Option<&'static [u8]> {
 /// writer -- the value `ourWriteOutJSON` tests before appending its comma
 /// (`:107-109`). A `None` writer is one of the five specially dispatched rows
 /// and produces `false`, matching C's `mappings[i].writefunc &&` guard.
+#[allow(dead_code)]
 fn write_variable(
     out: &mut dyn Write,
     var: &WriteOutVar,
@@ -1663,16 +1680,14 @@ fn write_variable(
     Ok(true)
 }
 
-// ===========================================================================
 // The JSON forms, hand written because every byte of them is frozen
-// ===========================================================================
 
 /// `jsonquoted` (`src/tool_writeout_json.c:37-82`).
 ///
 /// Escapes `in` into `out` as a JSON string body, *without* the surrounding
 /// quotes -- the C signature's own promise. Three properties make this
 /// unreproducible with a general serialiser, which is why it is written out
-/// here and why AAP obligation O4 forbids adding one:
+/// here and why adding a general serialiser is forbidden:
 ///
 /// * bytes below 32 that have no short escape become `\u00xx` with
 ///   **lowercase** hexadecimal digits (`:68`), where most serialisers emit
@@ -1690,6 +1705,7 @@ fn write_variable(
 /// C's dynbuf reports `CURLE_TOO_LARGE`. `out` is then left with whatever had
 /// already been appended, and the caller is expected to discard it whole --
 /// C frees the buffer.
+#[allow(dead_code)]
 fn json_quoted(
     input: &[u8],
     out: &mut Vec<u8>,
@@ -1752,6 +1768,7 @@ fn json_quoted(
 ///
 /// `Err(())` when the append would exceed `capacity`, mirroring
 /// `CURLE_TOO_LARGE`.
+#[allow(dead_code)]
 fn append_limited(
     out: &mut Vec<u8>,
     bytes: &[u8],
@@ -1775,6 +1792,7 @@ fn append_limited(
 /// C reaches this with `strlen(in)`, so a value carrying an embedded NUL is
 /// truncated there. The same truncation is applied here rather than passing
 /// the whole slice, because the two must agree byte for byte.
+#[allow(dead_code)]
 fn json_write_string(
     out: &mut dyn Write,
     input: &[u8],
@@ -1811,6 +1829,7 @@ fn json_write_string(
 /// be moved out of last place. The C comment at `:112-113` records the
 /// arrangement: the variables are alphabetical, and `curl_version`, "which is
 /// not actually a --write-out variable", is last.
+#[allow(dead_code)]
 fn write_out_json(out: &mut dyn Write, ctx: &WriteOut<'_>) -> io::Result<()> {
     out.write_all(b"{")?;
     for var in VARIABLES {
@@ -1844,6 +1863,7 @@ fn write_out_json(out: &mut dyn Write, ctx: &WriteOut<'_>) -> io::Result<()> {
 /// advances even for the multi-value siblings the body skips. Here the cursor
 /// and the flag are separate, which makes the advance unconditional by
 /// construction rather than by aliasing.
+#[allow(dead_code)]
 fn header_json(out: &mut dyn Write, ctx: &WriteOut<'_>) -> io::Result<()> {
     out.write_all(b"{")?;
 
@@ -1898,227 +1918,7 @@ fn header_json(out: &mut dyn Write, ctx: &WriteOut<'_>) -> io::Result<()> {
     out.write_all(b"\n}")
 }
 
-// ===========================================================================
 // %time{}: the UTC calendar and the strftime subset
-// ===========================================================================
-
-/// Seconds in a day.
-const SECS_PER_DAY: i64 = 86_400;
-
-/// Days from 0000-03-01 to 1970-01-01, the shift that puts the leap day at the
-/// end of the cycle and makes the era arithmetic below branch-free.
-const DAYS_TO_EPOCH: i64 = 719_468;
-
-/// Days in the 400-year Gregorian cycle.
-const DAYS_PER_ERA: i64 = 146_097;
-
-/// The C-locale abbreviated weekday names, Sunday first: `%a`.
-const WEEKDAY_ABBREV: [&str; 7] =
-    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-/// The C-locale weekday names, Sunday first: `%A`.
-const WEEKDAY_FULL: [&str; 7] = [
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-];
-
-/// The C-locale abbreviated month names, January first: `%b` and `%h`.
-const MONTH_ABBREV: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
-    "Nov", "Dec",
-];
-
-/// The C-locale month names, January first: `%B`.
-const MONTH_FULL: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-];
-
-/// Cumulative days before each month in a common year, used for `%j`.
-const DAYS_BEFORE_MONTH: [i64; 12] =
-    [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-
-/// The conversion characters glibc accepts after `%E`.
-///
-/// Measured, not assumed: for each of these the modified form produces exactly
-/// the same bytes as the unmodified conversion in the `C.UTF-8` locale that
-/// `tests/runtests.pl:493` sets, and for every other character glibc emits
-/// `%E` and the character verbatim. The era representations these request do
-/// not exist in that locale, so POSIX's fall-back rule applies.
-const ERA_MODIFIER_ACCEPTS: &[u8] = b"cCnpPrRstTuxXyYzZ%";
-
-/// The conversion characters glibc accepts after `%O`.
-///
-/// Measured the same way as [`ERA_MODIFIER_ACCEPTS`]. The set is wider, and
-/// notably excludes `a`, `A`, `c`, `D`, `F`, `x`, `X` and `Y`, which come out
-/// verbatim.
-const NUMERIC_MODIFIER_ACCEPTS: &[u8] = b"bBCdegGhHIjklmMnpPrRsStTuUVwWyzZ%";
-
-/// Broken-down UTC time: the fields of `struct tm` that the supported
-/// conversions read, plus the epoch second for `%s`.
-///
-/// Produced by [`civil_time`], which stands in for `curlx_gmtime`
-/// (`lib/curlx/timeval.c:251-270`, a `gmtime_r` wrapper). Fields are held in
-/// their natural human ranges rather than `struct tm`'s biased ones -- a full
-/// year instead of `tm_year`, a one-based month instead of `tm_mon` -- because
-/// every conversion here wants the natural form and the bias would only be
-/// added back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CivilTime {
-    /// The full proleptic Gregorian year, e.g. 2025.
-    year: i64,
-    /// Month, 1 to 12.
-    month: i64,
-    /// Day of the month, 1 to 31.
-    day: i64,
-    /// Hour, 0 to 23.
-    hour: i64,
-    /// Minute, 0 to 59.
-    minute: i64,
-    /// Second, 0 to 59. Never 60: a Unix timestamp has no leap second, so
-    /// `%S`'s documented range of "00 to 60" is reachable only on a platform
-    /// whose clock reports one.
-    second: i64,
-    /// Day of the week, 0 for Sunday.
-    weekday: i64,
-    /// Day of the year, 0 for 1 January.
-    yday: i64,
-    /// The input second count, for `%s`.
-    epoch: i64,
-}
-
-/// Division that rounds towards negative infinity.
-///
-/// Needed because a pre-1970 timestamp is negative and C's `/` truncates
-/// towards zero, which would put 1969-12-31T23:59:59Z on the wrong day.
-/// `gmtime_r` gets this right, so the calendar arithmetic here must too.
-fn floor_div(numerator: i64, denominator: i64) -> i64 {
-    let quotient = numerator / denominator;
-    if (numerator % denominator != 0) && ((numerator < 0) != (denominator < 0))
-    {
-        quotient.saturating_sub(1)
-    } else {
-        quotient
-    }
-}
-
-/// The non-negative remainder that pairs with [`floor_div`].
-fn floor_mod(numerator: i64, denominator: i64) -> i64 {
-    numerator.saturating_sub(
-        floor_div(numerator, denominator).saturating_mul(denominator),
-    )
-}
-
-/// Whether `year` is a Gregorian leap year.
-fn is_leap_year(year: i64) -> bool {
-    (floor_mod(year, 4) == 0 && floor_mod(year, 100) != 0)
-        || floor_mod(year, 400) == 0
-}
-
-/// Break a Unix timestamp down into UTC calendar fields: `curlx_gmtime`.
-///
-/// `None` where `gmtime_r` would fail. glibc reports failure when the year
-/// cannot be represented in `struct tm`'s `int tm_year`, and the same bound is
-/// applied here so that an extreme clock reading produces no output rather
-/// than a nonsensical date -- which is what C does, since `:587` only writes
-/// when `curlx_gmtime` succeeded.
-fn civil_time(secs: i64) -> Option<CivilTime> {
-    let days = floor_div(secs, SECS_PER_DAY);
-    let within_day = floor_mod(secs, SECS_PER_DAY);
-
-    // Howard Hinnant's `civil_from_days`, which is exact over the whole range
-    // of `i64` days and needs no lookup table.
-    let shifted = days.checked_add(DAYS_TO_EPOCH)?;
-    let era = floor_div(shifted, DAYS_PER_ERA);
-    // Day of era, 0..=146096.
-    let doe = shifted.checked_sub(era.checked_mul(DAYS_PER_ERA)?)?;
-    // Year of era, 0..=399.
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe.checked_add(era.checked_mul(400)?)?;
-    // Day of the year counted from 1 March, 0..=365.
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    // Month index counted from March, 0..=11.
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    if month <= 2 {
-        year = year.checked_add(1)?;
-    }
-
-    // `struct tm.tm_year` is `int` and holds `year - 1900`; glibc's
-    // `gmtime_r` fails rather than truncate.
-    let biased = year.checked_sub(1900)?;
-    if i32::try_from(biased).is_err() {
-        return None;
-    }
-
-    // 1970-01-01 was a Thursday, so the epoch day is weekday 4.
-    let weekday = floor_mod(days.checked_add(4)?, 7);
-
-    let month_index = usize::try_from(month.checked_sub(1)?).ok()?;
-    let before = *DAYS_BEFORE_MONTH.get(month_index)?;
-    let leap_adjust = i64::from(month > 2 && is_leap_year(year));
-    let yday = before + leap_adjust + day - 1;
-
-    Some(CivilTime {
-        year,
-        month,
-        day,
-        hour: within_day / 3600,
-        minute: (within_day / 60) % 60,
-        second: within_day % 60,
-        weekday,
-        yday,
-        epoch: secs,
-    })
-}
-
-/// The number of ISO 8601 weeks in `year`, either 52 or 53.
-fn iso_weeks_in_year(year: i64) -> i64 {
-    // The weekday of 31 December, expressed as an offset, is what decides it:
-    // a year has 53 weeks when it starts on a Thursday or, being a leap year,
-    // on a Wednesday.
-    let p = |y: i64| {
-        let leaps = floor_div(y, 4) - floor_div(y, 100) + floor_div(y, 400);
-        floor_mod(y + leaps, 7)
-    };
-    if p(year) == 4 || p(year.saturating_sub(1)) == 3 {
-        53
-    } else {
-        52
-    }
-}
-
-/// The ISO 8601 week-based year and week number: `%G`, `%g` and `%V`.
-fn iso_week(time: &CivilTime) -> (i64, i64) {
-    // Monday is 1 and Sunday is 7, the ISO convention.
-    let iso_weekday = if time.weekday == 0 { 7 } else { time.weekday };
-    // `yday` is zero based, and the formula wants it one based.
-    let week = (time.yday + 1 - iso_weekday + 10) / 7;
-    if week < 1 {
-        let previous = time.year.saturating_sub(1);
-        (previous, iso_weeks_in_year(previous))
-    } else if week > iso_weeks_in_year(time.year) {
-        (time.year.saturating_add(1), 1)
-    } else {
-        (time.year, week)
-    }
-}
 
 /// The `%time{}` pre-pass (`src/tool_writeout.c:563-579`).
 ///
@@ -2138,12 +1938,13 @@ fn iso_week(time: &CivilTime) -> (i64, i64) {
 /// One consequence worth naming: `%Z` here yields `UTC`, whereas a `%Z` that
 /// does reach `strftime` -- reachable only as `%EZ` or `%OZ` -- yields `GMT`.
 /// `docs/cmdline-opts/write-out.md` documents the `GMT` form for `%Z`, and
-/// `tests/data/test1981` asserts the `UTC` form. The fixture is the contract
-/// (AAP section 0.8.1), so the code follows the fixture and the documentation
+/// `tests/data/test1981` asserts the `UTC` form. The fixture is the contract,
+/// so the code follows the fixture and the documentation
 /// discrepancy is left as it is -- correcting a manual page is not this file's
 /// business.
 ///
 /// `None` where the rewritten format would reach [`MAX_TIME_FORMAT`].
+#[allow(dead_code)]
 fn rewrite_time_format(format: &[u8], micros: u32) -> Option<Vec<u8>> {
     let capacity = MAX_TIME_FORMAT.saturating_sub(1);
     let mut out: Vec<u8> = Vec::new();
@@ -2177,209 +1978,73 @@ fn rewrite_time_format(format: &[u8], micros: u32) -> Option<Vec<u8>> {
 /// Zero padded to six digits and never truncated, so a clock reporting more
 /// than a second's worth of microseconds -- which `gettimeofday` does not --
 /// would widen the field rather than lose digits, exactly as `%06u` does.
+#[allow(dead_code)]
 fn format_micros(micros: u32) -> String {
     format!("{micros:06}")
 }
 
-/// The supported subset of `strftime`, always in UTC
-/// (`src/tool_writeout.c:582-589`).
-///
-/// The 41 conversions listed in this module's documentation, plus the `%E` and
-/// `%O` modifier handling measured against glibc. Anything else is emitted
-/// verbatim -- `%` followed by the character -- which is what both glibc and
-/// the BSD implementation behind the two Apple targets do for an unknown
-/// conversion. A trailing lone `%` is emitted as itself.
-///
-/// `None` when the result reaches [`MAX_TIME_OUTPUT`], which is `strftime`
-/// returning zero and C then writing nothing at all (`:587-589`). The check is
-/// applied as the buffer grows rather than at the end, so a pathological
-/// format cannot make this allocate without bound.
-fn strftime_utc(format: &[u8], time: &CivilTime) -> Option<Vec<u8>> {
-    // `sizeof(output)` includes room for the terminator, so the longest
-    // renderable result is one byte shorter.
-    let capacity = MAX_TIME_OUTPUT.saturating_sub(1);
-    let mut out: Vec<u8> = Vec::new();
-    let mut index = 0usize;
-
-    while let Some(&byte) = format.get(index) {
-        if byte != b'%' {
-            append_limited(&mut out, &[byte], capacity).ok()?;
-            index = index.saturating_add(1);
-            continue;
-        }
-
-        // Look past the `%`, allowing for one `E` or `O` modifier.
-        let (conversion, width) = match format.get(index.saturating_add(1)) {
-            Some(&modifier @ (b'E' | b'O')) => {
-                let accepts = if modifier == b'E' {
-                    ERA_MODIFIER_ACCEPTS
-                } else {
-                    NUMERIC_MODIFIER_ACCEPTS
-                };
-                match format.get(index.saturating_add(2)) {
-                    Some(&letter) if accepts.contains(&letter) => {
-                        (Some(letter), 3usize)
-                    }
-                    // Not accepted: `%E` or `%O` and the letter go out as
-                    // they came in, and the letter is not consumed as a
-                    // conversion.
-                    _ => (None, 2usize),
-                }
-            }
-            Some(&letter) => (Some(letter), 2usize),
-            // A trailing lone `%`.
-            None => (None, 1usize),
-        };
-
-        match conversion {
-            Some(letter) => {
-                let rendered = render_conversion(letter, time);
-                match rendered {
-                    Some(text) => {
-                        append_limited(&mut out, text.as_bytes(), capacity)
-                            .ok()?;
-                    }
-                    // Unknown conversion: `%` and the letter, verbatim.
-                    None => {
-                        append_limited(&mut out, b"%", capacity).ok()?;
-                        append_limited(&mut out, &[letter], capacity).ok()?;
-                    }
-                }
-            }
-            None => {
-                // The `%` plus whatever of the modifier was consumed.
-                let literal = format.get(index..index.saturating_add(width))?;
-                append_limited(&mut out, literal, capacity).ok()?;
-            }
-        }
-        index = index.saturating_add(width);
-    }
-
-    Some(out)
-}
-
-/// One `strftime` conversion, or `None` if the character is not one this
-/// module supports.
-///
-/// The compound conversions expand to their C-locale definitions and are
-/// rendered by recursion, so `%c` and its parts can never disagree.
-fn render_conversion(letter: u8, time: &CivilTime) -> Option<String> {
-    let weekday = usize::try_from(time.weekday).ok()?;
-    let month = usize::try_from(time.month.checked_sub(1)?).ok()?;
-    let rendered = match letter {
-        b'a' => (*WEEKDAY_ABBREV.get(weekday)?).to_string(),
-        b'A' => (*WEEKDAY_FULL.get(weekday)?).to_string(),
-        b'b' | b'h' => (*MONTH_ABBREV.get(month)?).to_string(),
-        b'B' => (*MONTH_FULL.get(month)?).to_string(),
-        // "In the POSIX locale this is equivalent to
-        // `%a %b %e %H:%M:%S %Y`" -- docs/cmdline-opts/write-out.md.
-        b'c' => expand(b"%a %b %e %H:%M:%S %Y", time)?,
-        b'C' => format!("{:02}", time.year.div_euclid(100)),
-        b'd' => format!("{:02}", time.day),
-        b'D' => expand(b"%m/%d/%y", time)?,
-        b'e' => format!("{:2}", time.day),
-        b'F' => expand(b"%Y-%m-%d", time)?,
-        b'g' => format!("{:02}", iso_week(time).0.rem_euclid(100)),
-        b'G' => format!("{}", iso_week(time).0),
-        b'H' => format!("{:02}", time.hour),
-        b'I' => format!("{:02}", hour_12(time.hour)),
-        b'j' => format!("{:03}", time.yday.saturating_add(1)),
-        b'k' => format!("{:2}", time.hour),
-        b'l' => format!("{:2}", hour_12(time.hour)),
-        b'm' => format!("{:02}", time.month),
-        b'M' => format!("{:02}", time.minute),
-        // Neither `%n` nor `%t` appears in curl's manual, but the C code hands
-        // the format to the platform `strftime`, which implements both on all
-        // four mandated targets, so both are supported here.
-        b'n' => "\n".to_string(),
-        b'p' => if time.hour < 12 { "AM" } else { "PM" }.to_string(),
-        b'P' => if time.hour < 12 { "am" } else { "pm" }.to_string(),
-        b'r' => expand(b"%I:%M:%S %p", time)?,
-        b'R' => expand(b"%H:%M", time)?,
-        b's' => format!("{}", time.epoch),
-        b'S' => format!("{:02}", time.second),
-        b't' => "\t".to_string(),
-        b'T' | b'X' => expand(b"%H:%M:%S", time)?,
-        b'u' => format!("{}", if time.weekday == 0 { 7 } else { time.weekday }),
-        // "starting with the first Sunday as the first day of week 01".
-        b'U' => format!("{:02}", (time.yday + 7 - time.weekday) / 7),
-        b'V' => format!("{:02}", iso_week(time).1),
-        b'w' => format!("{}", time.weekday),
-        // The same, with Monday as the first day of the week.
-        b'W' => {
-            let from_monday = floor_mod(time.weekday.saturating_sub(1), 7);
-            format!("{:02}", (time.yday + 7 - from_monday) / 7)
-        }
-        b'x' => expand(b"%m/%d/%y", time)?,
-        b'y' => format!("{:02}", time.year.rem_euclid(100)),
-        b'Y' => format!("{}", time.year),
-        // Reachable only as `%Ez` or `%Oz`, since the pre-pass consumes a
-        // bare `%z`. glibc renders the offset of the `struct tm`
-        // `curlx_gmtime` filled, which is always zero.
-        b'z' => "+0000".to_string(),
-        // Likewise reachable only as `%EZ` or `%OZ`, and `gmtime_r` names the
-        // zone `GMT`.
-        b'Z' => "GMT".to_string(),
-        b'%' => "%".to_string(),
-        _ => return None,
-    };
-    Some(rendered)
-}
-
-/// Render a compound conversion's C-locale expansion.
-///
-/// Kept separate so that `%c`, `%D`, `%F`, `%r`, `%R`, `%T`, `%x` and `%X` are
-/// defined in terms of the same primitives they are documented as, rather than
-/// duplicated.
-fn expand(pattern: &[u8], time: &CivilTime) -> Option<String> {
-    let mut out = String::new();
-    let mut index = 0usize;
-    while let Some(&byte) = pattern.get(index) {
-        if byte == b'%' {
-            let letter = *pattern.get(index.saturating_add(1))?;
-            out.push_str(&render_conversion(letter, time)?);
-            index = index.saturating_add(2);
-        } else {
-            out.push(char::from(byte));
-            index = index.saturating_add(1);
-        }
-    }
-    Some(out)
-}
-
-/// The twelve-hour clock reading for `%I` and `%l`: midnight and noon are
-/// both 12.
-fn hour_12(hour: i64) -> i64 {
-    match floor_mod(hour, 12) {
-        0 => 12,
-        other => other,
-    }
-}
-
 /// Everything `%time{}` does between reading the clock and writing the bytes.
 ///
-/// `None` where C writes nothing: an empty rewritten format (`:587` tests
-/// `curlx_dyn_len(&format)`), a format the pre-pass could not hold, a
-/// timestamp `curlx_gmtime` rejects, or a result that does not fit
-/// `char output[256]`.
+/// Two steps, both C's. The pre-pass rewrites `%f`, `%z` and `%Z`
+/// ([`rewrite_time_format`], `:566-579`), and the rewritten format then goes
+/// to `curlx_gmtime` followed by the platform `strftime` (`:581-588`) --
+/// reached through [`curl_rs_lib::strftime_gmt`], which performs that exact
+/// pair.
+///
+/// # Why the platform's `strftime` and not a Rust one
+///
+/// Because `LC_TIME` decides what several of the conversions produce, and the
+/// tool sets the locale: `src/tool_operate.c:2271` calls
+/// `setlocale(LC_ALL, "")`. In a French locale glibc renders `%A` for a
+/// Wednesday as `mercredi` and `%p` as an empty string; `%c`, `%x`, `%X` and
+/// `%r` take wholly different layouts; and which letters `%E` and `%O` accept
+/// is itself locale-defined. A table of English names cannot reproduce any of
+/// that, and hard-coding one would make the output of this tool differ from
+/// the C tool's on every host whose environment names a locale -- the class of
+/// behaviour change AAP section 0.8.1 freezes.
+///
+/// So the conversion is not reimplemented. Handing the format to the same
+/// function C hands it to makes the bytes identical by construction rather
+/// than by a table that has to be kept in step with one C library on four
+/// targets. The formatting is deliberately the *only* thing delegated: the
+/// pre-pass stays here because it is curl's own, not `strftime`'s -- `%f` is
+/// not a `strftime` conversion at all, and `%z`/`%Z` are substituted precisely
+/// *because* the platform cannot be trusted with them (`:563-565`).
+///
+/// # Errors
+///
+/// `None` wherever C writes nothing, which is the whole of the `:587`
+/// condition plus the two `result` checks above it:
+///
+/// * a rewritten format that reached [`MAX_TIME_FORMAT`] -- C leaves `result`
+///   set and skips the `if(!result)` block at `:580`;
+/// * an empty rewritten format -- `:587` tests `curlx_dyn_len(&format)`;
+/// * a timestamp `gmtime_r` rejects -- `:583` tests `curlx_gmtime`'s return;
+/// * `strftime` returning zero, which covers both an empty result and one that
+///   does not fit `char output[256]` (`:529`).
+///
+/// One further case has no C counterpart and is answered rather than ignored:
+/// a rewritten format containing an interior NUL cannot be a C format string,
+/// so nothing is written. C never meets it, because its format is already a
+/// C string by the time `outtime` scans for the closing brace, so a NUL would
+/// have truncated the whole `--write-out` value before this point.
+#[allow(dead_code)]
 fn format_time(format: &[u8], reading: WallClock) -> Option<Vec<u8>> {
     let rewritten = rewrite_time_format(format, reading.micros)?;
     if rewritten.is_empty() {
         return None;
     }
-    let time = civil_time(reading.secs)?;
-    let rendered = strftime_utc(&rewritten, &time)?;
-    if rendered.is_empty() {
-        // `strftime` returns zero for an empty result too, and C only writes
-        // when it returned non-zero.
-        return None;
-    }
-    Some(rendered)
+
+    // `char output[256]` (`:529`), sized exactly as C sizes it so that the
+    // "does not fit, so write nothing" boundary falls in the same place.
+    let mut output = [0u8; MAX_TIME_OUTPUT];
+    let written =
+        curl_rs_lib::strftime_gmt(&rewritten, reading.secs, &mut output)?;
+
+    Some(output.get(..written)?.to_vec())
 }
 
-// ===========================================================================
 // %header{}: the separator escapes and the header lookup
-// ===========================================================================
 
 /// `separator` (`src/tool_writeout.c:602-636`).
 ///
@@ -2393,6 +2058,7 @@ fn format_time(format: &[u8], reading: WallClock) -> Option<Vec<u8>> {
 /// `%header{this:all:-{\}-}`.
 ///
 /// An unrecognised escape emits **both** characters, as at the top level.
+#[allow(dead_code)]
 fn separator(sep: &[u8], out: &mut dyn Write) -> io::Result<()> {
     let mut index = 0usize;
     while let Some(&byte) = sep.get(index) {
@@ -2423,6 +2089,7 @@ fn separator(sep: &[u8], out: &mut dyn Write) -> io::Result<()> {
 }
 
 /// The parsed inside of a `%header{...}` construct.
+#[allow(dead_code)]
 struct HeaderRequest<'a> {
     /// The header field name.
     name: &'a [u8],
@@ -2445,6 +2112,7 @@ struct HeaderRequest<'a> {
 /// instructions -- the `strncmp` at `:660` looks at `b:al` and fails.
 ///
 /// `None` when there is no closing brace, which is C's `else` at `:702-703`.
+#[allow(dead_code)]
 fn parse_header_request(body: &[u8]) -> Option<HeaderRequest<'_>> {
     // `end = strchr(ptr, '}')`, repeated while the brace is escaped.
     let mut end = body.iter().position(|&byte| byte == b'}')?;
@@ -2509,6 +2177,7 @@ fn parse_header_request(body: &[u8]) -> Option<HeaderRequest<'_>> {
 /// that fails (`:674-692`). So it covers every request in a redirect chain up
 /// to the first one that did not carry the header --
 /// `tests/data/test764` exercises exactly that with `-L`.
+#[allow(dead_code)]
 fn output_header(
     out: &mut dyn Write,
     ctx: &WriteOut<'_>,
@@ -2558,9 +2227,7 @@ fn output_header(
     Ok(Some(resume))
 }
 
-// ===========================================================================
 // The unknown-variable diagnostic
-// ===========================================================================
 
 /// `curl_mfprintf(tool_stderr, "curl: unknown --write-out variable: '%.*s'\n",
 /// (int)vlen, ptr)` (`src/tool_writeout.c:793-795`).
@@ -2579,6 +2246,7 @@ fn output_header(
 ///
 /// C's `%.*s` stops at a NUL as well as at `vlen`, but the name is a slice of
 /// the format string, which is a C string, so it cannot contain one.
+#[allow(dead_code)]
 fn write_unknown_variable(out: &mut dyn Write, name: &[u8]) -> io::Result<()> {
     out.write_all(ERROR_PREFIX.as_bytes())?;
     out.write_all(UNKNOWN_VARIABLE_TEXT.as_bytes())?;
@@ -2586,9 +2254,7 @@ fn write_unknown_variable(out: &mut dyn Write, name: &[u8]) -> io::Result<()> {
     out.write_all(b"'\n")
 }
 
-// ===========================================================================
 // The driver: ourWriteOut and its sink handling
-// ===========================================================================
 
 /// Which stream the format string is writing to at this moment.
 ///
@@ -2598,6 +2264,7 @@ fn write_unknown_variable(out: &mut dyn Write, name: &[u8]) -> io::Result<()> {
 /// exactly the three points C calls `curlx_fclose`: on `%{stdout}` (`:769`),
 /// on `%{stderr}` (`:775`), on a second `%output{}` (`:826`), and when the
 /// function returns (`:869`).
+#[allow(dead_code)]
 enum Target {
     /// `stdout`, the initial sink (`:718`).
     Stdout,
@@ -2608,6 +2275,7 @@ enum Target {
 }
 
 /// The stream the next write goes to.
+#[allow(dead_code)]
 fn active<'s, 'a>(
     sinks: &'s mut WriteOutSinks<'a>,
     target: &'s mut Target,
@@ -2625,6 +2293,7 @@ fn active<'s, 'a>(
 /// either C file, and the driver must not abandon the format string on a
 /// failure: a `%output{}` file that cannot be written to must still let a
 /// later `%{stderr}` produce its output. See translation difference 2.
+#[allow(dead_code)]
 fn ignore<T>(_result: io::Result<T>) {}
 
 /// Open the file a `%output{}` construct names
@@ -2632,12 +2301,13 @@ fn ignore<T>(_result: io::Result<T>) {}
 ///
 /// `append` selects `FOPEN_APPENDTEXT` over `FOPEN_WRITETEXT`, which on the
 /// four mandated targets are plain `"a"` and `"w"` (`lib/curl_setup.h`); the
-/// text-mode distinction is a Windows-only concern and Windows is out of scope
-/// (AAP section 0.2.2). `curlx_fopen` is `fopen` itself outside a memory-debug
+/// text-mode distinction is a Windows-only concern and Windows is out of
+/// scope. `curlx_fopen` is `fopen` itself outside a memory-debug
 /// build (`lib/curlx/fopen.h`), so no wrapper behaviour is being skipped.
 ///
 /// The name arrives as bytes and stays bytes: a path is not required to be
 /// UTF-8, and converting through a `String` would reject names C accepts.
+#[allow(dead_code)]
 fn open_output(name: &[u8], append: bool) -> Option<File> {
     let path = OsStr::from_bytes(name);
     let mut options = OpenOptions::new();
@@ -2665,6 +2335,7 @@ fn open_output(name: &[u8], append: bool) -> Option<File> {
 /// **from just after the opener**, not from the `%`. C reaches that through a
 /// `continue` in one case (`:747`) and through leaving the pointer advanced in
 /// the other three (`:598`, `:704`, `:834`); the effect is identical.
+#[allow(dead_code)]
 pub(crate) fn our_write_out(
     format: Option<&[u8]>,
     ctx: &WriteOut<'_>,
@@ -2774,6 +2445,7 @@ pub(crate) fn our_write_out(
 ///   C copies it into, and C then `break`s out of the *whole* loop (`:759`),
 ///   discarding the rest of the format string with no diagnostic at all. That
 ///   is reported here by setting `done`.
+#[allow(dead_code)]
 fn expand_variable(
     format: &[u8],
     at: usize,
@@ -2833,6 +2505,7 @@ fn expand_variable(
 
 /// The `%time{...}` construct: `outtime` (`src/tool_writeout.c:521-600`),
 /// returning the index scanning resumes at.
+#[allow(dead_code)]
 fn expand_time(
     format: &[u8],
     at: usize,
@@ -2874,6 +2547,7 @@ fn expand_time(
 /// * **the sink changes only if the open succeeded** (`:823-829`). A
 ///   `%output{/nonexistent/path}` is silently ignored and the rest of the
 ///   format string keeps going to the previous sink.
+#[allow(dead_code)]
 fn redirect_output(
     format: &[u8],
     at: usize,
@@ -2909,11 +2583,9 @@ fn redirect_output(
     opened.saturating_add(offset).saturating_add(1)
 }
 
-// ===========================================================================
 // Tests
-// ===========================================================================
 //
-// AAP section 0.8.7 relocates the coverage of `tests/unit` into the crates,
+// The coverage of `tests/unit` moves into the crates,
 // because a Rust static library does not export `pub(crate)` items and those C
 // programs therefore cannot link whatever the quality of the implementation.
 // These are that relocation for this file: they assert the frozen bytes, not
@@ -2934,9 +2606,7 @@ mod tests {
     use core::cmp::Ordering;
     use std::io::Read;
 
-    // -----------------------------------------------------------------------
     // Test doubles for the three injected ports
-    // -----------------------------------------------------------------------
 
     /// A [`Clock`] frozen at one reading.
     struct FixedClock(WallClock);
@@ -3158,9 +2828,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // Helpers
-    // -----------------------------------------------------------------------
 
     /// A clock reading matching `tests/data/test1981`'s `CURL_TIME=1754037103`,
     /// whose microsecond field that fixture derives as `1754037103 % 1000000`.
@@ -3246,9 +2914,7 @@ mod tests {
         show(&out)
     }
 
-    // -----------------------------------------------------------------------
     // The table
-    // -----------------------------------------------------------------------
 
     /// `src/tool_writeout.c:431-516` holds exactly 72 rows, measured with
     /// `grep -c '^  { "'` over lines 432 to 515.
@@ -3433,9 +3099,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The four writers
-    // -----------------------------------------------------------------------
 
     /// `secs.%06us` from a microsecond count (`src/tool_writeout.c:63-71`), and
     /// `0.000013` is the value `tests/data/test970` pins for all nine time
@@ -3788,9 +3452,7 @@ mod tests {
         assert_eq!(show(&out), "");
     }
 
-    // -----------------------------------------------------------------------
     // The JSON forms
-    // -----------------------------------------------------------------------
 
     /// `jsonquoted` (`src/tool_writeout_json.c:37-82`): the seven short
     /// escapes, lowercase `\u00xx` below 32, and raw pass-through from 128 up.
@@ -4137,9 +3799,7 @@ mod tests {
         assert_eq!(plain(b"%{header_json}", &facts), "{\n}");
     }
 
-    // -----------------------------------------------------------------------
     // The mini-language
-    // -----------------------------------------------------------------------
 
     /// Literal bytes pass through, and `%%` is one `%`
     /// (`src/tool_writeout.c:731-735`).
@@ -4213,7 +3873,7 @@ mod tests {
     /// ` %{http_code`, which is unknown, and everything through the brace is
     /// consumed. Preserved because a format string in the wild may depend on
     /// it, and because "fixing" it would be exactly the kind of
-    /// different-but-arguably-better change AAP section 0.8.2 forbids.
+    /// different-but-arguably-better change that is forbidden.
     #[test]
     fn the_closing_brace_search_is_greedy() {
         let facts = FakeFacts {
@@ -4422,9 +4082,7 @@ mod tests {
         assert_eq!(show(&err), "1 says 22\n");
     }
 
-    // -----------------------------------------------------------------------
     // %header{}
-    // -----------------------------------------------------------------------
 
     /// The headers of `tests/data/test1670`, whose expectations this and the
     /// next test reproduce.
@@ -4561,9 +4219,7 @@ mod tests {
         assert_eq!(plain(&format, &facts), "tail");
     }
 
-    // -----------------------------------------------------------------------
     // %output{}
-    // -----------------------------------------------------------------------
 
     /// `%output{file}` truncates and `%output{>>file}` appends
     /// (`src/tool_writeout.c:806-831`), and the file is closed when the format
@@ -4660,9 +4316,7 @@ mod tests {
         assert_eq!(text, "infile");
     }
 
-    // -----------------------------------------------------------------------
     // %time{}
-    // -----------------------------------------------------------------------
 
     /// `tests/data/test1981` in full: `%d/%b/%Y %H:%M:%S.%f %z %Z` at
     /// `CURL_TIME=1754037103`.
@@ -4693,6 +4347,82 @@ mod tests {
         // Reaching `strftime` through a modifier gives the platform's own
         // answers, which differ from the substitutions above.
         assert_eq!(plain(b"%time{%EZ|%Ez}", &facts), "GMT|+0000");
+    }
+
+    /// The instant [`fixture_clock`] is frozen at, for the two tests below
+    /// that call the platform directly and need the same second.
+    const FIXTURE_SECS: i64 = 1_754_037_103;
+
+    /// Every conversion is rendered by the platform `strftime`, not by a table
+    /// in this module.
+    ///
+    /// `LC_TIME` decides what `%a`, `%A`, `%b`, `%B`, `%h`, `%c`, `%p`, `%P`,
+    /// `%r`, `%x` and `%X` produce, and which letters `%E` and `%O` accept is
+    /// locale-defined too. `src/tool_operate.c:2271` calls
+    /// `setlocale(LC_ALL, "")`, so the C tool's answers follow the
+    /// environment's locale and a table of English names cannot reproduce
+    /// them.
+    ///
+    /// Only the `C`, `C.utf8` and `POSIX` locales are installed on this build
+    /// host -- `/usr/share/i18n/locales` is empty, so no other can even be
+    /// generated -- which means a localised rendering cannot be *observed*
+    /// here. The guarantee is therefore asserted structurally, which is
+    /// stronger than an observation would be: `%time{}` must emit exactly what
+    /// the platform emits for the same format. A reintroduced table would
+    /// agree in the C locale and diverge in every other one, and it would fail
+    /// this assertion as soon as it stopped being a pass-through.
+    #[test]
+    fn the_conversions_are_rendered_by_the_platform_strftime() {
+        let facts = FakeFacts::default();
+        for letter in [
+            "a", "A", "b", "B", "h", "c", "p", "P", "r", "x", "X", "C", "d",
+            "e", "F", "G", "g", "H", "I", "j", "k", "l", "m", "M", "R", "s",
+            "S", "T", "u", "U", "V", "w", "W", "y", "Y", "Ec", "Ex", "EY",
+            "OB", "Oy", "Od", "q", "%",
+        ] {
+            let inside = format!("%{letter}");
+            let mut buffer = [0u8; MAX_TIME_OUTPUT];
+            let expected = curl_rs_lib::strftime_gmt(
+                inside.as_bytes(),
+                FIXTURE_SECS,
+                &mut buffer,
+            )
+            .map_or_else(String::new, |written| {
+                show(buffer.get(..written).unwrap_or_default())
+            });
+
+            let format = format!("%time{{{inside}}}");
+            assert_eq!(
+                plain(format.as_bytes(), &facts),
+                expected,
+                "%{letter} must come from the platform"
+            );
+        }
+    }
+
+    /// The pre-pass covers exactly what `strftime` does not, which is why it
+    /// runs first rather than being folded into the delegation.
+    #[test]
+    fn the_pre_pass_covers_what_strftime_does_not() {
+        let facts = FakeFacts::default();
+
+        // `%f` is curl's own invention -- `:569` calls it "sub-seconds" -- and
+        // no `strftime` implements it. Handed to the platform it comes back
+        // verbatim, so a `%time{%f}` that produced digits can only have been
+        // rewritten before the call.
+        let mut buffer = [0u8; MAX_TIME_OUTPUT];
+        let written =
+            curl_rs_lib::strftime_gmt(b"%f", FIXTURE_SECS, &mut buffer)
+                .expect("an unknown conversion still renders as itself");
+        assert_eq!(show(buffer.get(..written).unwrap_or_default()), "%f");
+        assert_eq!(plain(b"%time{%f}", &facts), "037103");
+
+        // `%z` and `%Z` do reach the platform, and it answers differently from
+        // the pre-pass -- which is precisely why `:564-565` substitutes them.
+        // The bare forms are the pre-pass's; the modified forms are the
+        // platform's.
+        assert_eq!(plain(b"%time{%z|%Z}", &facts), "+0000|UTC");
+        assert_eq!(plain(b"%time{%Oz|%OZ}", &facts), "+0000|GMT");
     }
 
     /// The microsecond field is six digits, zero padded and never truncated.
@@ -4935,9 +4665,7 @@ mod tests {
         assert_eq!(reading.micros.cmp(&MICROS_PER_SEC), Ordering::Less);
     }
 
-    // -----------------------------------------------------------------------
     // The driver as a whole
-    // -----------------------------------------------------------------------
 
     /// No `--write-out` at all writes nothing (`:725-726`).
     #[test]

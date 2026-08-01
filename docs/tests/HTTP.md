@@ -11,11 +11,13 @@ nghttpx servers to perform various tests beyond the capabilities of the
 standard curl test suite.
 
 This suite drives the curl command-line binary externally rather than linking
-against the library, so it exercises whatever binary it is pointed at. The
-specified `Rust` command-line binary, `curl-rs`, therefore substitutes for the
-C binary without any change to this suite, to `conftest.py`, to the `testenv`
-package, to the server configuration or to any test case. The suite and its
-servers are retained unchanged.
+against the library, so it exercises whatever binary it is pointed at. That
+property is what lets the specified `Rust` command-line binary, `curl-rs`,
+substitute for the C binary with no change to this suite, to `conftest.py`, to
+the `testenv` package, to the server configuration or to any test case. The
+suite and its servers are retained unchanged. The substitution itself is not
+available yet: the `curl-rs` binary has no entry point on disk, so nothing here
+has been run against it.
 
 # Usage
 
@@ -218,12 +220,13 @@ escape is the `%alternatives[a,b]` construct together with the `<strip>` and
 tag that carries these expectations is documented in
 [`FILEFORMAT`](FILEFORMAT.md).
 
-The specified HTTP/1.1 request writer in `curl-rs-lib` therefore owns
-request-line composition and header serialization itself, emitting headers in
-curl's exact order. The `hyper` `crate` is specified for connection
+The HTTP/1.1 request writer specified for `curl-rs-lib` is therefore required
+to own request-line composition and header serialization itself, and to emit
+headers in curl's exact order. The `hyper` `crate` is specified for connection
 management, keep-alive and framing. Header emission policy and ordering remain
 curl's own, and are specified to be reproduced by the `Rust` implementation
-rather than delegated.
+rather than delegated. No such writer is on disk yet, so none of this has been
+measured against the corpus.
 
 ### HTTP/2 and HTTP/3 boundaries
 
@@ -248,8 +251,11 @@ servers, not the capabilities of the binary under test.
 The `CurlClient` helper already adds the local CA to the command line so the
 connections to the test servers are verified, as documented above, and that
 arrangement is unaffected. For the specified target, rustls is the sole TLS
-implementation at every configuration, certificate validation is on by
-default, and `--insecure` emits a warning on stderr before proceeding.
+implementation at every configuration and certificate validation is on by
+default. The warning that `--insecure` prints on stderr before the transfer
+proceeds is delivered in `curl-rs`, and no verbosity option suppresses it,
+`--silent` included; what is still absent is the option parsing that would
+reach it and the TLS backend whose verification it reports on.
 
 ### What does not change
 

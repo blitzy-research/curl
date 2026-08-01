@@ -4,8 +4,8 @@
 
 //! `--create-dirs`: the directory hierarchy behind an output template.
 //!
-//! This module supersedes one C translation unit. AAP section 0.4.1 assigns it
-//! `src/tool_dirhie.c` (135 lines) with the note "`--create-dirs`". The C
+//! This module supersedes one C translation unit, `src/tool_dirhie.c`
+//! (135 lines), which implements `--create-dirs`. The C
 //! purpose comment at `src/tool_dirhie.c:73-78` states the contract, and is
 //! carried here because it is the reason the last path component is skipped:
 //!
@@ -92,17 +92,18 @@
 //! on: `AlreadyExists` for `EEXIST` and `PermissionDenied` for `EACCES`. The
 //! kinds for the other four -- `StorageFull`, `ReadOnlyFilesystem`,
 //! `FilesystemQuotaExceeded` and `InvalidFilename` -- are all unstable and so
-//! unavailable at the declared MSRV of 1.75 (AAP section 0.8.3). The match is
+//! unavailable at the declared MSRV of 1.75. The match is
 //! therefore on [`std::io::Error::raw_os_error`], which is safe, stable `std`,
 //! against the per-operating-system constants in [`errno`].
 //!
 //! Those constants are declared locally rather than imported, because `libc` is
-//! **not** a dependency of this crate: `curl-rs/Cargo.toml` lists exactly
-//! `curl-rs-lib`, `clap`, `clap_complete` and `tokio`. Adding one for four
-//! integers would widen the supply-chain surface that AAP section 0.7 keeps
-//! under `cargo audit` and `cargo deny`, so the values are written down with
-//! their provenance instead. No syscall is made through any binding here; the
-//! whole module is expressed in `std`.
+//! **not** a dependency of this crate: `curl-rs/Cargo.toml` lists four runtime
+//! dependencies -- `curl-rs-lib`, `clap`, `clap_complete` and `tokio` -- plus
+//! two dev-dependencies, `tempfile` and `tokio`, which reach `#[cfg(test)]`
+//! code only. Adding one for four integers would widen the supply-chain surface
+//! that AAP section 0.7 keeps under `cargo audit` and `cargo deny`, so the
+//! values are written down with their provenance instead. No syscall is made
+//! through any binding here; the whole module is expressed in `std`.
 //!
 //! # Byte-safe paths
 //!
@@ -122,25 +123,12 @@
 //!
 //! [`create_dir_hierarchy`] is a thin wrapper over
 //! [`create_dir_hierarchy_with`], which takes the directory-creating operation
-//! as a parameter. This is the dependency injection AAP section 0.3.3 lists as
-//! pattern P12, and it is what makes the errno branches testable at all: the
-//! process running the tests is frequently `root`, and `root` bypasses the
-//! discretionary access check, so a real unreadable directory does *not* yield
-//! `EACCES`. Injecting the operation also keeps the six texts and the
-//! tolerance rule under test without depending on a full filesystem or a
-//! read-only mount.
-//!
-//! # Rules status and provenance
-//!
-//! No user-specified rules exist for this project. `review_rules` returns the
-//! single line "No user rules provided.", read with an explicit range covering
-//! the whole document, which corroborates AAP section 0.7. Nothing here is
-//! attributed to a rule and none was invented. Every constraint cited is an
-//! AAP requirement taken from the user's request (AAP section 0.8) -- binding,
-//! but a requirement, not a rule; describing them as rules would, in AAP
-//! section 0.7's own words, "misrepresent where they came from". Where no
-//! requirement speaks, enterprise-standard best practice governs: the absence
-//! of rules is not permission to lower the bar.
+//! as a parameter. That injection is what makes the errno branches testable at
+//! all: the process running the tests is frequently `root`, and `root`
+//! bypasses the discretionary access check, so a real unreadable directory
+//! does *not* yield `EACCES`. Injecting the operation also keeps the six texts
+//! and the tolerance rule under test without depending on a full filesystem or
+//! a read-only mount.
 
 use std::ffi::OsStr;
 use std::fs::DirBuilder;
@@ -159,18 +147,20 @@ use crate::output::msgs::{self, MsgConfig};
 /// `lib/curl_setup.h:684` defines `DIR_CHAR` as `"/"`. The two-character
 /// `"\\/"` form at `src/tool_dirhie.c:82` is guarded by
 /// `defined(_WIN32) || defined(__DJGPP__)`, neither of which is in the
-/// four-target matrix of AAP section 0.1.1 goal G8, so a single byte is the
+/// four-target matrix, so a single byte is the
 /// complete delimiter set here and `strspn`/`strcspn` collapse to byte scans.
+#[allow(dead_code)]
 const PATH_DELIMITER: u8 = b'/';
 
 /// The mode passed to every directory creation: `0o750`, `rwxr-x---`.
 ///
 /// `src/tool_dirhie.c:123` is `mkdir(curlx_dyn_ptr(&dirbuf), (mode_t)0000750)`.
-/// This is security-relevant configuration, so AAP section 0.7 requires it to
-/// be explicit rather than defaulted: it is neither `0777` nor `0755` nor
+/// This is security-relevant configuration and is therefore explicit rather
+/// than defaulted: it is neither `0777` nor `0755` nor
 /// whatever the platform would apply on its own. As with `mkdir(2)`, the
 /// process umask still clears bits from it -- that is the kernel's behaviour in
 /// both languages and is not a difference.
+#[allow(dead_code)]
 const DIR_MODE: u32 = 0o750;
 
 /// The `errno` values `show_dir_errno` switches on, per operating system.
@@ -210,14 +200,17 @@ const DIR_MODE: u32 = 0o750;
 mod errno {
     /// `EACCES`: permission denied. Tolerated by the walk, per
     /// `src/tool_dirhie.c:124`.
+    #[allow(dead_code)]
     pub(super) const EACCES: i32 = 13;
 
     /// `EEXIST`: the directory is already there. Tolerated by the walk, per
     /// `src/tool_dirhie.c:124`.
+    #[allow(dead_code)]
     pub(super) const EEXIST: i32 = 17;
 
     /// `ENOSPC`: no space left on the device. Linux and macOS agree on `28`.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(dead_code)]
     pub(super) const ENOSPC: Option<i32> = Some(28);
 
     /// `ENOSPC` is not defined for this target, mirroring C's absent
@@ -227,6 +220,7 @@ mod errno {
 
     /// `EROFS`: read-only file system. Linux and macOS agree on `30`.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(dead_code)]
     pub(super) const EROFS: Option<i32> = Some(30);
 
     /// `EROFS` is not defined for this target, mirroring C's absent
@@ -236,6 +230,7 @@ mod errno {
 
     /// `ENAMETOOLONG`: the path or a component of it is too long.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub(super) const ENAMETOOLONG: Option<i32> = Some(36);
 
     /// `ENAMETOOLONG`: the path or a component of it is too long.
@@ -249,6 +244,7 @@ mod errno {
 
     /// `EDQUOT`: the disk quota has been exhausted.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub(super) const EDQUOT: Option<i32> = Some(122);
 
     /// `EDQUOT`: the disk quota has been exhausted.
@@ -268,8 +264,8 @@ mod errno {
 /// bytes. C's `%s` reads a `char *` and copies the bytes it finds, and the name
 /// it is given -- `curlx_dyn_ptr(&dirbuf)` at `:125` -- is a filesystem path,
 /// which on Unix need not be valid UTF-8. Formatting through `Display` would
-/// substitute U+FFFD and change the emitted bytes, which AAP section 0.8.1 does
-/// not permit; two `&str` halves around a byte slice keep them exact.
+/// substitute U+FFFD and change the emitted bytes, which the frozen-output
+/// rule does not permit; two `&str` halves around a byte slice keep them exact.
 ///
 /// Every text is reproduced verbatim, including the two that C spells as a pair
 /// of adjacent string literals. The joins are the easiest thing in this file to
@@ -288,6 +284,7 @@ mod errno {
 /// wrapping -- not the texts. Hoisting them there would create a second source
 /// of truth and guarantee drift.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 struct DirErrorText {
     /// Everything before the `%s`.
     before: &'static str,
@@ -304,12 +301,14 @@ struct DirErrorText {
 /// tolerance test contradict each other in appearance only. Both are ported
 /// faithfully rather than reconciled, and this arm is exercised directly by the
 /// tests so it is neither dead nor unverified.
+#[allow(dead_code)]
 const EACCES_TEXT: DirErrorText = DirErrorText {
     before: "You do not have permission to create ",
     after: "",
 };
 
 /// `src/tool_dirhie.c:47`: `The directory name %s is too long`.
+#[allow(dead_code)]
 const ENAMETOOLONG_TEXT: DirErrorText = DirErrorText {
     before: "The directory name ",
     after: " is too long",
@@ -319,6 +318,7 @@ const ENAMETOOLONG_TEXT: DirErrorText = DirErrorText {
 ///
 /// The only one of the six that begins with the substituted name, so `before`
 /// is empty.
+#[allow(dead_code)]
 const EROFS_TEXT: DirErrorText = DirErrorText {
     before: "",
     after: " resides on a read-only file system",
@@ -329,6 +329,7 @@ const EROFS_TEXT: DirErrorText = DirErrorText {
 ///
 /// C spells this as two adjacent literals; the join contributes exactly one
 /// space, between `will` and `contain`.
+#[allow(dead_code)]
 const ENOSPC_TEXT: DirErrorText = DirErrorText {
     before: "No space left on the file system that will contain the \
              directory ",
@@ -340,6 +341,7 @@ const ENOSPC_TEXT: DirErrorText = DirErrorText {
 ///
 /// C spells this as two adjacent literals; the join contributes exactly one
 /// space, between `you` and `exceeded`.
+#[allow(dead_code)]
 const EDQUOT_TEXT: DirErrorText = DirErrorText {
     before: "Cannot create directory ",
     after: " because you exceeded your quota",
@@ -349,6 +351,7 @@ const EDQUOT_TEXT: DirErrorText = DirErrorText {
 ///
 /// The `default:` arm at `:67-69`. It catches every `errno` the five named arms
 /// do not, and also every value the platform leaves undefined -- see [`errno`].
+#[allow(dead_code)]
 const DEFAULT_TEXT: DirErrorText = DirErrorText {
     before: "Error creating directory ",
     after: "",
@@ -362,6 +365,7 @@ const DEFAULT_TEXT: DirErrorText = DirErrorText {
 /// [`io::ErrorKind`] set does express is then honoured so that such an error
 /// still reaches a sensible arm, and everything else falls to [`DEFAULT_TEXT`]
 /// exactly as C's `default:` does.
+#[allow(dead_code)]
 fn dir_error_text(error: &io::Error) -> DirErrorText {
     let code = match error.raw_os_error() {
         Some(code) => Some(code),
@@ -399,6 +403,7 @@ fn dir_error_text(error: &io::Error) -> DirErrorText {
 /// The result is not bounded here. `crate::output::msgs` applies C's
 /// `char buffer[1024]` limit (`src/tool_msgs.c:41`, `:46`) inside the channel,
 /// so bounding it twice would risk two different truncation points.
+#[allow(dead_code)]
 fn render_dir_error(text: DirErrorText, name: &[u8]) -> Vec<u8> {
     let capacity = text
         .before
@@ -418,14 +423,15 @@ fn render_dir_error(text: DirErrorText, name: &[u8]) -> Vec<u8> {
 /// C reads the ambient `errno`; the error is passed explicitly here, because
 /// `std` returns it rather than leaving it in thread-local state. C reaches the
 /// diagnostic stream and the `--silent`/`--show-error` gates through globals;
-/// both are parameters here, which is what AAP section 0.1.2 prescribes when it
-/// replaces the C god-struct with "per-module structs with explicit ownership",
-/// and what makes the six texts assertable against a captured sink.
+/// both are parameters here, replacing the C god-struct with explicit
+/// ownership, and that is what makes the six texts assertable against a
+/// captured sink.
 ///
 /// Emission goes through [`msgs::errorf_bytes`], the byte-string flavour of
 /// `errorf`, so the `curl: ` prefix (`src/tool_msgs.c:32`), the
 /// `!silent || show_error` gate (`:131`) and the line wrapping (`:37-73`) all
 /// stay in their single owner while the path bytes stay verbatim.
+#[allow(dead_code)]
 fn show_dir_errno(
     sink: &mut dyn Write,
     config: &MsgConfig,
@@ -455,6 +461,7 @@ fn show_dir_errno(
 /// operating system supplied one. The kinds are consulted only when
 /// [`io::Error::raw_os_error`] is `None`, which means the error did not come
 /// from `mkdir(2)` at all and so has no `errno` for C to have compared.
+#[allow(dead_code)]
 fn is_tolerated(error: &io::Error) -> bool {
     match error.raw_os_error() {
         Some(code) => code == errno::EACCES || code == errno::EEXIST,
@@ -476,6 +483,7 @@ fn is_tolerated(error: &io::Error) -> bool {
 /// `recursive(true)` this would become the recursive `std::fs` helper and would
 /// silently acquire all four of the behaviours the module documentation
 /// prohibits, including swallowing `EEXIST` before [`is_tolerated`] can see it.
+#[allow(dead_code)]
 fn make_directory(path: &Path) -> io::Result<()> {
     let mut builder = DirBuilder::new();
     builder.recursive(false);
@@ -495,6 +503,7 @@ fn make_directory(path: &Path) -> io::Result<()> {
 /// `create` is called once per directory component, in order, with the
 /// accumulated path -- never with the final component, and never with a
 /// normalised path.
+#[allow(dead_code)]
 fn create_dir_hierarchy_with<F>(
     outfile: &Path,
     sink: &mut dyn Write,
@@ -576,7 +585,7 @@ where
 
         // `:123-124` -- create it, tolerating only the two documented errno
         // values. `skip` from `:96` and `:104-114` is Windows and MSDOS only
-        // (drive-letter handling) and is out of scope per AAP section 0.2.2, so
+        // (drive-letter handling) and is out of scope, so
         // it is always false on the four mandated targets and is not ported.
         if let Err(error) = create(Path::new(OsStr::from_bytes(accumulated))) {
             if !is_tolerated(&error) {
@@ -636,6 +645,7 @@ where
 /// );
 /// ```
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn create_dir_hierarchy(
     outfile: &Path,
     sink: &mut dyn Write,
@@ -646,7 +656,7 @@ pub(crate) fn create_dir_hierarchy(
 
 #[cfg(test)]
 mod tests {
-    //! AAP section 0.8.7 relocates the coverage of `tests/unit` into the
+    //! The coverage of `tests/unit` moves into the
     //! crates, because a Rust static library does not export `pub(crate)`
     //! items and the C unit tests therefore cannot link against them. These
     //! assertions are that relocation for `src/tool_dirhie.c`.
@@ -736,13 +746,11 @@ mod tests {
             .collect()
     }
 
-    // =======================================================================
     // The constants. Both are frozen values, so both are pinned directly.
-    // =======================================================================
 
-    /// `src/tool_dirhie.c:123` -- `mkdir(..., (mode_t)0000750)`. AAP section
-    /// 0.7 makes security-relevant configuration explicit, and a silent change
-    /// from `0750` to a wider mode is precisely the regression this catches.
+    /// `src/tool_dirhie.c:123` -- `mkdir(..., (mode_t)0000750)`. The mode is
+    /// security-relevant configuration, and a silent change from `0750` to a
+    /// wider mode is precisely the regression this catches.
     #[test]
     fn the_directory_mode_is_0750() {
         assert_eq!(DIR_MODE, 0o750);
@@ -767,9 +775,7 @@ mod tests {
         assert!(errno::EDQUOT.is_some());
     }
 
-    // =======================================================================
     // The component walk -- `src/tool_dirhie.c:95-130`.
-    // =======================================================================
 
     /// The traversal, traced from the C for twelve path shapes.
     ///
@@ -877,9 +883,7 @@ mod tests {
         }
     }
 
-    // =======================================================================
     // Mode and tolerance, against a real filesystem.
-    // =======================================================================
 
     /// The umask in force, derived without a syscall.
     ///
@@ -975,9 +979,7 @@ mod tests {
         Ok(())
     }
 
-    // =======================================================================
     // Tolerance and failure -- `src/tool_dirhie.c:123-127`.
-    // =======================================================================
 
     /// `:124` with the comment at `:121` -- "Ignore access denied error to
     /// allow traversal." An `EACCES` on every component must still leave the
@@ -1121,15 +1123,13 @@ mod tests {
         assert_eq!(dir_error_text(&other), DEFAULT_TEXT);
     }
 
-    // =======================================================================
     // The six frozen texts -- `src/tool_dirhie.c:36-71`.
-    // =======================================================================
 
     /// Each of the six literals, exactly as C spells it.
     ///
     /// The two that C writes as a pair of adjacent literals are the point of
     /// this test: `:57-58` and `:63-64` must join with exactly one space, and
-    /// nothing may be reworded, recased or repunctuated (AAP section 0.8.1).
+    /// nothing may be reworded, recased or repunctuated.
     #[test]
     fn each_frozen_text_matches_the_c_literal() {
         assert_eq!(
@@ -1257,10 +1257,8 @@ mod tests {
         assert_eq!(reassemble(&emitted), message);
     }
 
-    // =======================================================================
     // The diagnostic channel -- `crate::output::msgs` owns it, and the six
     // texts must obey its gates.
-    // =======================================================================
 
     /// `src/tool_msgs.c:131` -- `!global->silent || global->showerror`.
     ///

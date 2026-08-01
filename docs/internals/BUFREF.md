@@ -174,13 +174,18 @@ shape is available: no copy that the C code performs is claimed to disappear.
 Removing one would be a behavior change dressed as an improvement, which is
 out of scope.
 
-`#![forbid(unsafe_code)]` is specified at the root of `curl-rs-lib`, with a
-single narrowly allowed island under `curl-rs-lib/src/ffi/` for the operating
-system calls that have no safe expression, and a mandatory `// SAFETY:`
-comment on every `unsafe` block there. A buffer reference has no business in
-that island. The one place where a raw pointer and a caller-supplied
-destructor genuinely survive is the public C ABI surface, and that surface is
-confined to `curl-rs-ffi`.
+The safety invariant at the root of `curl-rs-lib` is `#![deny(unsafe_code)]`
+plus exactly one `#[allow(unsafe_code)]`, on `mod ffi` -- the single narrowly
+allowed island under `curl-rs-lib/src/ffi/` for the operating system calls that
+have no safe expression, where every `unsafe` block carries a mandatory
+`// SAFETY:` comment. It is `deny` and not `forbid` because `forbid` cannot be
+locally overridden (`error[E0453]: allow(unsafe_code) incompatible with
+previous forbid`) and Agent Action Plan goal G1 permits only three crates, so
+the island cannot move into a fourth; `deny` is no weaker, since a stray
+`unsafe` block outside the island is a hard error rather than a warning. A
+buffer reference has no business in that island. The one place where a raw
+pointer and a caller-supplied destructor genuinely survive is the public C ABI
+surface, and that surface is confined to `curl-rs-ffi`.
 
 For the sibling buffer modules, see [dynbuf](DYNBUF.md) and [bufq](BUFQ.md).
 [`curlx`](CURLX.md) covers how the wider `lib/curlx/` set maps.

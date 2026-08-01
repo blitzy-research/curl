@@ -1,0 +1,177 @@
+E -2	Unknown error
+E -1	Unknown error
+E 0	No error
+E 1	Unsupported protocol
+E 2	Failed initialization
+E 3	URL using bad/illegal format or missing URL
+E 4	A requested feature, protocol or option was not found built-in in this libcurl due to a build-time decision.
+E 5	Could not resolve proxy name
+E 6	Could not resolve hostname
+E 7	Could not connect to server
+E 8	Weird server reply
+E 9	Access denied to remote resource
+E 10	FTP: The server failed to connect to data port
+E 11	FTP: unknown PASS reply
+E 12	FTP: Accepting server connect has timed out
+E 13	FTP: unknown PASV reply
+E 14	FTP: unknown 227 response format
+E 15	FTP: cannot figure out the host in the PASV response
+E 16	Error in the HTTP2 framing layer
+E 17	FTP: could not set file type
+E 18	Transferred a partial file
+E 19	FTP: could not retrieve (RETR failed) the specified file
+E 20	Unknown error
+E 21	Quote command returned error
+E 22	HTTP response code said error
+E 23	Failed writing received data to disk/application
+E 24	Unknown error
+E 25	Upload failed (at start/before it took off)
+E 26	Failed to open/read local data from file/application
+E 27	Out of memory
+E 28	Timeout was reached
+E 29	Unknown error
+E 30	FTP: command PORT failed
+E 31	FTP: command REST failed
+E 32	Unknown error
+E 33	Requested range was not delivered by the server
+E 34	Unknown error
+E 35	SSL connect error
+E 36	Could not resume download
+E 37	Could not read a file:// file
+E 38	LDAP: cannot bind
+E 39	LDAP: search failed
+E 40	Unknown error
+E 41	Unknown error
+E 42	Operation was aborted by an application callback
+E 43	A libcurl function was given a bad argument
+E 44	Unknown error
+E 45	Failed binding local connection end
+E 46	Unknown error
+E 47	Number of redirects hit maximum amount
+E 48	An unknown option was passed in to libcurl
+E 49	Malformed option provided in a setopt
+E 50	Unknown error
+E 51	Unknown error
+E 52	Server returned nothing (no headers, no data)
+E 53	SSL crypto engine not found
+E 54	Can not set SSL crypto engine as default
+E 55	Failed sending data to the peer
+E 56	Failure when receiving data from the peer
+E 57	Unknown error
+E 58	Problem with the local SSL certificate
+E 59	Could not use specified SSL cipher
+E 60	SSL peer certificate or SSH remote key was not OK
+E 61	Unrecognized or bad HTTP Content or Transfer-Encoding
+E 62	Unknown error
+E 63	Maximum file size exceeded
+E 64	Requested SSL level failed
+E 65	Send failed since rewinding of the data stream failed
+E 66	Failed to initialise SSL crypto engine
+E 67	Login denied
+E 68	TFTP: File Not Found
+E 69	TFTP: Access Violation
+E 70	Disk full or allocation exceeded
+E 71	TFTP: Illegal operation
+E 72	TFTP: Unknown transfer ID
+E 73	Remote file already exists
+E 74	TFTP: No such user
+E 75	Unknown error
+E 76	Unknown error
+E 77	Problem with the SSL CA cert (path? access rights?)
+E 78	Remote file not found
+E 79	Error in the SSH layer
+E 80	Failed to shut down the SSL connection
+E 81	Socket not ready for send/recv
+E 82	Failed to load CRL file (path? access rights?, format?)
+E 83	Issuer check against peer certificate failed
+E 84	FTP: The server did not accept the PRET command.
+E 85	RTSP CSeq mismatch or invalid CSeq
+E 86	RTSP session error
+E 87	Unable to parse FTP file list
+E 88	Chunk callback failed
+E 89	The max connection limit is reached
+E 90	SSL public key does not match pinned public key
+E 91	SSL server certificate status verification FAILED
+E 92	Stream error in the HTTP/2 framing layer
+E 93	API function called from within callback
+E 94	An authentication function returned an error
+E 95	HTTP/3 error
+E 96	QUIC connection error
+E 97	proxy handshake error
+E 98	SSL Client Certificate required
+E 99	Unrecoverable error in select/poll
+E 100	A value or data field grew larger than allowed
+E 101	ECH attempted but failed
+E 102	Unknown error
+E 103	Unknown error
+E 104	Unknown error
+E 105	Unknown error
+M -2	Unknown error
+M -1	Please call curl_multi_perform() soon
+M 0	No error
+M 1	Invalid multi handle
+M 2	Invalid easy handle
+M 3	Out of memory
+M 4	Internal error
+M 5	Invalid socket argument
+M 6	Unknown option
+M 7	The easy handle is already added to a multi handle
+M 8	API function called from within callback
+M 9	Wakeup is unavailable or failed
+M 10	A libcurl function was given a bad argument
+M 11	Operation was aborted by an application callback
+M 12	Unrecoverable error in select/poll
+M 13	Unknown error
+M 14	Unknown error
+M 15	Unknown error
+M 16	Unknown error
+S -2	CURLSHcode unknown
+S -1	CURLSHcode unknown
+S 0	No error
+S 1	Unknown share option
+S 2	Share currently in use
+S 3	Invalid share handle
+S 4	Out of memory
+S 5	Feature not enabled in this library
+S 6	CURLSHcode unknown
+S 7	CURLSHcode unknown
+S 8	CURLSHcode unknown
+S 9	CURLSHcode unknown
+U -2	CURLUcode unknown
+U -1	CURLUcode unknown
+U 0	No error
+U 1	An invalid CURLU pointer was passed as argument
+U 2	An invalid 'part' argument was passed as argument
+U 3	Malformed input to a URL function
+U 4	Port number was not a decimal number between 0 and 65535
+U 5	Unsupported URL scheme
+U 6	URL decode error, most likely because of rubbish in the input
+U 7	A memory function failed
+U 8	Credentials was passed in the URL when prohibited
+U 9	An unknown part ID was passed to a URL API function
+U 10	No scheme part in the URL
+U 11	No user part in the URL
+U 12	No password part in the URL
+U 13	No options part in the URL
+U 14	No host part in the URL
+U 15	No port part in the URL
+U 16	No query part in the URL
+U 17	No fragment part in the URL
+U 18	No zoneid part in the URL
+U 19	Bad file:// URL
+U 20	Bad fragment
+U 21	Bad hostname
+U 22	Bad IPv6 address
+U 23	Bad login part
+U 24	Bad password
+U 25	Bad path
+U 26	Bad query
+U 27	Bad scheme
+U 28	Unsupported number of slashes following scheme
+U 29	Bad user
+U 30	libcurl lacks IDN support
+U 31	A value or data field is larger than allowed
+U 32	CURLUcode unknown
+U 33	CURLUcode unknown
+U 34	CURLUcode unknown
+U 35	CURLUcode unknown

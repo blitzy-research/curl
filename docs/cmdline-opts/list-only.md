@@ -35,12 +35,13 @@ When retrieving a specific email from POP3, this switch forces a LIST command
 to be performed instead of RETR. This is particularly useful if the user wants
 to see if a specific message-id exists on the server and what size it is.
 
-Note: This build performs no `POP3` or `POP3S` transfers, so read the
-paragraph above as a description of the command curl sends rather than as a
-transfer it performs. curl still parses and accepts the option, yet a transfer
-using either scheme fails with `CURLE_UNSUPPORTED_PROTOCOL`, and neither
-scheme appears in the `Protocols:` line of the --version output. The FTP, SFTP
-and FILE behavior described on this page is unaffected.
+Note: transfers for `POP3` and `POP3S` are outside the specified scope of this
+rewrite, so read the paragraph above as a description of the command curl
+sends rather than as a transfer it carries out. Accepting and parsing the
+option is still specified, with a transfer using either scheme then failing
+with `CURLE_UNSUPPORTED_PROTOCOL`. Neither scheme appears in the `Protocols:`
+line of the --version output. The FTP, SFTP and FILE behavior described on
+this page is unaffected by that boundary.
 
 For FILE, this option has no effect yet as directories are always listed in
 this mode.

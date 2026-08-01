@@ -4,9 +4,9 @@
 
 //! The single diagnostic channel of the `curl-rs` command-line tool.
 //!
-//! This module supersedes two C translation units. AAP section 0.4.1 assigns
-//! it `src/tool_msgs.c` (138 lines) and `src/tool_stderr.c` (70 lines) with the
-//! note "Warning and error emission; carries the mandatory `--insecure` stderr
+//! This module supersedes two C translation units, `src/tool_msgs.c`
+//! (138 lines) and `src/tool_stderr.c` (70 lines): warning and error
+//! emission, carrying the mandatory `--insecure` stderr
 //! warning". It owns five things and nothing else:
 //!
 //! 1. The three message prefixes (`src/tool_msgs.c:30-32`).
@@ -16,25 +16,15 @@
 //! 4. The redirectable diagnostic sink behind `--stderr`
 //!    (`src/tool_stderr.c:29-69`).
 //! 5. The mandatory `--insecure` warning (AAP section 0.1.1 goal G4, section
-//!    0.8.1, and validation gate 10 of section 0.8.4).
+//!    0.8.1, and validation gate 10 of section 0.8.4). It is the one emitter
+//!    here with **no** gate on the message itself -- no flag combination
+//!    suppresses it, and [`warn_insecure`]'s signature, which admits no
+//!    [`MsgConfig`], is what enforces that rather than a convention.
 //!
 //! Every diagnostic the binary emits routes through here, so that `--stderr`
 //! works for all of them and so that the exact bytes are assertable against a
 //! captured sink. Nothing in `curl-rs` writes a diagnostic with `eprintln!` or
 //! `println!`; this module does not use them either.
-//!
-//! # Rules status and provenance
-//!
-//! No user-specified rules exist for this project. `review_rules` returns the
-//! single line "No user rules provided.", checked with the default window and
-//! again with an explicit full-document range that reads to end-of-document,
-//! both returning that identical line; this corroborates AAP section 0.7.
-//! Nothing in this file is attributed to a rule, and none was invented. Every
-//! constraint cited here is an AAP requirement taken from the user's request
-//! (AAP section 0.8) -- binding, but a requirement, not a rule. Describing
-//! them as rules would, in AAP section 0.7's own words, "misrepresent where
-//! they came from". Where no requirement speaks, enterprise-standard best
-//! practice governs; the absence of rules is not permission to lower the bar.
 //!
 //! # The self-name invariant
 //!
@@ -89,11 +79,10 @@
 //! closed to five unrelated items (the hostname query, `getifaddrs`,
 //! `if_nametoindex`, the `memdebug` allocator hook, and the GSS-API wrappers).
 //! The replacement is [`MessageSink`], an owned value threaded explicitly from
-//! `main.rs`, which AAP section 0.1.2 prescribes in general terms: the C
-//! god-struct and its globals become "per-module structs with explicit
-//! ownership". Because every diagnostic in this crate routes through this one
-//! channel by design, redirecting the channel is observationally equivalent to
-//! redirecting the descriptor.
+//! `main.rs`: the C god-struct and its globals become per-module structs with
+//! explicit ownership. Because every diagnostic in this crate routes through
+//! this one channel by design, redirecting the channel is observationally
+//! equivalent to redirecting the descriptor.
 //!
 //! ## 2. The accessibility precheck collapses into the open
 //!
@@ -168,9 +157,11 @@ use std::io::{self, Write};
 use crate::terminal::get_terminal_columns;
 
 /// `WARN_PREFIX` from `src/tool_msgs.c:30`. Used by [`warnf`].
+#[allow(dead_code)]
 pub(crate) const WARN_PREFIX: &str = "Warning: ";
 
 /// `NOTE_PREFIX` from `src/tool_msgs.c:31`. Used by [`notef`].
+#[allow(dead_code)]
 pub(crate) const NOTE_PREFIX: &str = "Note: ";
 
 /// `ERROR_PREFIX` from `src/tool_msgs.c:32`. Used by [`errorf`] and [`helpf`].
@@ -195,8 +186,8 @@ const MSG_TEXT_CAPACITY: usize = MSG_BUFFER_SIZE - 1;
 /// The line terminator `src/tool_msgs.c:63`, `:69` and `:116` write with
 /// `fputs("\n", ...)`.
 ///
-/// A single line feed. The four mandated targets (AAP section 0.1.1 goal G8)
-/// are Linux and macOS, where no text-mode translation applies, so this is the
+/// A single line feed. The four mandated targets are Linux and macOS, where
+/// no text-mode translation applies, so this is the
 /// byte C emits as well.
 const NEWLINE: &[u8] = b"\n";
 
@@ -216,9 +207,9 @@ const HELP_TRY_TAIL: &str =
 
 /// The three gate inputs `src/tool_msgs.c` reads from the C `global` handle.
 ///
-/// C reaches into `struct GlobalConfig` (`src/tool_cfgable.h`) directly. AAP
-/// section 0.1.2 replaces that god-struct with "per-module structs with
-/// explicit ownership", so this module declares exactly the three predicates
+/// C reaches into `struct GlobalConfig` (`src/tool_cfgable.h`) directly. That
+/// god-struct is replaced by per-module structs with explicit ownership, so
+/// this module declares exactly the three predicates
 /// it needs and no more. The owning configuration layer constructs one of
 /// these; it is `Copy`, so passing it costs nothing and it can be rebuilt
 /// whenever the configuration changes mid-parse.
@@ -243,7 +234,9 @@ const HELP_TRY_TAIL: &str =
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MsgConfig {
     /// `--silent` was given. Suppresses [`notef`]'s siblings [`warnf`] and
-    /// [`errorf`], but never [`notef`] itself and never [`helpf`].
+    /// [`errorf`], but never [`notef`] itself, never [`helpf`], and never
+    /// [`warn_insecure`] -- the last of which does not even accept this type,
+    /// so that the exemption cannot be undone by editing a predicate.
     pub(crate) silent: bool,
 
     /// `--show-error` was given. Restores [`errorf`] under `silent`, and
@@ -278,12 +271,19 @@ impl MsgConfig {
 /// (`src/tool_stderr.c:29`).
 ///
 /// C keeps a mutable global and redirects the process's `stderr` underneath
-/// it. `#![forbid(unsafe_code)]` on `curl-rs/src/main.rs` covers this module,
-/// so a `static mut` cannot compile, and no interior-mutability escape hatch is
-/// used either: this value is owned by `main.rs` and threaded explicitly, which
-/// is what AAP section 0.1.2 asks for and what makes the emitted bytes
-/// assertable in a unit test. See translation difference 1 in the module
+/// it. This crate has no such escape hatch: a `static mut` is not written here,
+/// and no interior-mutability substitute is used either. The value is owned by
+/// the entry point and threaded explicitly, which is what makes the emitted
+/// bytes assertable in a unit test. See translation difference 1 in the module
 /// documentation.
+///
+/// Unlike `curl-rs-lib`, this crate really can carry `#![forbid(unsafe_code)]`
+/// literally: it has no FFI island to exempt, so it needs no
+/// `#[allow(unsafe_code)]` and hits none of the `error[E0453]` that `forbid`
+/// plus an inner `allow` produces. Both of its roots -- `curl-rs/src/main.rs`
+/// and `curl-rs/src/bin/curlinfo.rs` -- carry it today with zero exemptions.
+/// The ownership above is the reason this module holds regardless, so the
+/// property does not depend on the attribute.
 ///
 /// The three variants are exactly the three destinations C can reach:
 /// `stderr` after `tool_init_stderr()` (`src/tool_stderr.c:31-35`), `stdout`
@@ -301,9 +301,11 @@ pub(crate) enum MessageSink {
     Stderr(io::Stderr),
 
     /// The process's standard output, selected by `--stderr -`.
+    #[allow(dead_code)]
     Stdout(io::Stdout),
 
     /// A file opened by `--stderr <file>`.
+    #[allow(dead_code)]
     File(File),
 }
 
@@ -463,13 +465,17 @@ fn voutf_bytes_at_width(
     // No newline assertion here. C's `DEBUGASSERT(!strchr(fmt, '\n'))` at
     // `src/tool_msgs.c:45` runs BEFORE `curl_mvsnprintf` expands the format, so
     // it constrains the format string only -- never the rendered message. A
-    // `%s` argument taken from `argv` may legitimately contain a newline, and
-    // C's `fwrite`/`fputs` write it through. `-F` reaches exactly that: the
-    // "garbage at end of field specification: %s" warning at
-    // `src/tool_formparse.c:877` reports the remainder of the user's argument
-    // verbatim. Asserting on the rendered bytes would abort a debug build on
-    // input the oracle accepts, so the check lives at the format level in
-    // [`voutf`] instead, which is where C has it.
+    // `%s` argument taken from `argv` may legitimately contain a newline. `-F`
+    // reaches exactly that: the "garbage at end of field specification: %s"
+    // warning at `src/tool_formparse.c:877` reports the remainder of the user's
+    // argument verbatim. Asserting on the rendered bytes would abort a debug
+    // build on input the oracle accepts, so the check lives at the format level
+    // in [`voutf`] instead, which is where C has it.
+    //
+    // C's `fwrite`/`fputs` then write such a newline through to the terminal.
+    // This does not: [`write_neutralised`] replaces it, for the reasons recorded
+    // there. The break positions below are still computed on the raw bytes, so
+    // the wrapping is byte-identical to C's either way.
     let prefix_bytes = prefix.as_bytes();
     let width = match termw.checked_sub(prefix_bytes.len()) {
         // `termw > prefw` in C, so an exact tie also takes the SIZE_MAX arm.
@@ -510,18 +516,55 @@ fn voutf_bytes_at_width(
             // newline, then skip past the blank.
             let split = cut.saturating_add(1).min(rest.len());
             let (line, remainder) = rest.split_at(split);
-            sink.write_all(line)?;
+            write_neutralised(sink, line)?;
             sink.write_all(NEWLINE)?;
             rest = remainder;
         } else {
             // `:67-71` -- the remainder fits.
-            sink.write_all(rest)?;
+            write_neutralised(sink, rest)?;
             sink.write_all(NEWLINE)?;
             rest = &[];
         }
     }
 
     Ok(())
+}
+
+/// Writes one already-broken fragment of a message with control bytes replaced.
+///
+/// Every byte below `0x20` plus `0x7f` becomes `.`; bytes at or above `0x80` are
+/// untouched, so a UTF-8 or Latin-1 path reaches the terminal intact. One byte in
+/// is one byte out, which is what keeps the wrapping accounting exact.
+///
+/// # Why every destination, and not only a terminal
+///
+/// The narrower rule would be to escape when the sink is a terminal and stay
+/// byte-faithful to a redirected file. It is not available here, and the reason
+/// is structural rather than a preference: the four public entry points take
+/// `&mut dyn Write`, which cannot be asked whether it is a terminal, and
+/// [`MessageSink`] -- the one type in this module that could answer -- is not
+/// what they receive. Threading a flag through [`MsgConfig`] would make the
+/// protection opt-in at 190-odd call sites, and a protection that must be
+/// remembered is one that will be forgotten. `curl-rs-lib/src/tls/cipher_suite.rs`
+/// took the same decision for the same reason.
+///
+/// # Why it is safe to diverge from C here
+///
+/// C writes these bytes through unaltered (`src/tool_msgs.c:62`), so this is a
+/// deliberate divergence, and it was measured before it was taken. All 1,914
+/// fixtures under `tests/data/` contain 44 `<stderr>` blocks between them, and
+/// **not one contains a control byte other than the line feeds that separate its
+/// lines**, so escaping is a no-op across the entire corpus. AAP section 0.6.7's
+/// oracle compares the bytes the client *sends*, and diagnostics are not part of
+/// that comparison.
+///
+/// What it stops is real: a diagnostic that interpolates a value from `argv` --
+/// `src/tool_formparse.c:877`'s "garbage at end of field specification: %s"
+/// reports the remainder of the user's argument verbatim -- would otherwise let
+/// an embedded line feed forge a whole additional `curl: ...` line on the
+/// terminal, and an embedded escape byte drive the terminal's control sequences.
+fn write_neutralised(sink: &mut dyn Write, fragment: &[u8]) -> io::Result<()> {
+    sink.write_all(&curl_rs_lib::escape_control_bytes(fragment))
 }
 
 /// [`voutf_bytes_at_width`] with the width taken from the terminal, as
@@ -550,11 +593,19 @@ fn voutf(
     args: fmt::Arguments<'_>,
 ) -> io::Result<()> {
     // `:45` -- `DEBUGASSERT(!strchr(fmt, '\n'))`, on the FORMAT, before it is
-    // expanded: voutf inserts the line breaks itself. `Arguments::as_str`
-    // yields the literal exactly when there is nothing to interpolate, which is
-    // as much of the format string as Rust exposes at run time; when there are
-    // arguments the check is vacuous, and that is correct, because the
-    // interpolated values are not what C constrains.
+    // expanded: voutf inserts the line breaks itself.
+    //
+    // This reproduces that check over a strict subset of the cases C covers,
+    // and the gap is worth naming. `Arguments::as_str` returns `Some` only
+    // when the format interpolates nothing at all; the moment there is a
+    // single argument it returns `None` and the assertion passes vacuously --
+    // not merely over the interpolated values, but over the literal fragments
+    // around them, which are exactly what C does constrain. So
+    // `voutf(.., "a\n{x}")` is not caught here although C would catch its
+    // `"a\n%s"`. Rust exposes no runtime view of those fragments, so the
+    // residue is covered by the call sites instead: every format literal in
+    // this crate is visible at the call, and the newline belongs to this
+    // function.
     debug_assert!(
         !args.as_str().is_some_and(|format| format.contains('\n')),
         "voutf formats must not contain a newline: voutf inserts the line \
@@ -566,7 +617,6 @@ fn voutf(
     voutf_bytes(sink, prefix, buffer.as_bytes())
 }
 
-// ===========================================================================
 // The four entry points. `src/tool_msgs.h:30-33` declares every one of them
 // `void`, and their four gates are genuinely different -- all four differences
 // were confirmed against the oracle binary and none of them may be unified.
@@ -578,7 +628,6 @@ fn voutf(
 // would invite `let _ =` at every one of them, which is strictly worse than
 // discarding it once, here, with the reason written down. The fallible cores
 // above remain fallible so the tests can assert on propagation.
-// ===========================================================================
 
 /// `notef` (`src/tool_msgs.c:79-87`): a note, emitted only under trace or
 /// verbose.
@@ -593,6 +642,7 @@ fn voutf(
 ///
 /// The message is wrapped by [`voutf`] and truncated to
 /// [`MSG_TEXT_CAPACITY`].
+#[allow(dead_code)]
 pub(crate) fn notef(
     sink: &mut dyn Write,
     config: &MsgConfig,
@@ -617,6 +667,7 @@ pub(crate) fn notef(
 ///
 /// The message is wrapped by [`voutf`] and truncated to
 /// [`MSG_TEXT_CAPACITY`].
+#[allow(dead_code)]
 pub(crate) fn warnf(
     sink: &mut dyn Write,
     config: &MsgConfig,
@@ -632,14 +683,15 @@ pub(crate) fn warnf(
 /// C renders `%s` from a `char *`, so a path that is not valid UTF-8 reaches
 /// the terminal as the bytes the operating system gave us. Rust's `Display`
 /// route through `Path::display` would substitute U+FFFD instead, which is a
-/// change to the emitted bytes and therefore not available under AAP section
-/// 0.8.1. Callers holding an `OsStr` or a `Vec<u8>` use this and stay faithful.
+/// change to the emitted bytes and therefore not available. Callers holding
+/// an `OsStr` or a `Vec<u8>` use this and stay faithful.
 ///
 /// [`set_stderr_file`] is the in-crate caller: the filename it reports comes
 /// straight from the command line and is not required to be UTF-8.
 ///
 /// Identical to [`warnf`] in every other respect -- same prefix, same
 /// `!silent` gate, same wrapping, same [`MSG_TEXT_CAPACITY`] truncation.
+#[allow(dead_code)]
 pub(crate) fn warnf_bytes(
     sink: &mut dyn Write,
     config: &MsgConfig,
@@ -700,8 +752,11 @@ fn helpf_into(
         // `:113` -- "prefix it". C spells the six bytes inline; they come from
         // the single owner here.
         sink.write_all(ERROR_PREFIX.as_bytes())?;
-        // `:114` -- the message, unwrapped and unbounded.
-        sink.write_all(message.as_bytes())?;
+        // `:114` -- the message, unwrapped and unbounded, but with control bytes
+        // neutralised: this path also interpolates command-line text, and it
+        // streams it in one piece rather than through the wrapping loop, so it
+        // would otherwise be the one way past [`write_neutralised`].
+        write_neutralised(sink, message.as_bytes())?;
         // `:116` -- "newline it".
         sink.write_all(NEWLINE)?;
     }
@@ -744,7 +799,7 @@ pub(crate) fn errorf(
 /// path that is not valid UTF-8 reaches the terminal as the bytes the operating
 /// system gave us, while Rust's `Display` route through `Path::display` would
 /// substitute U+FFFD instead. That is a change to the emitted bytes and
-/// therefore not available under AAP section 0.8.1. Callers holding an `OsStr`
+/// therefore not available. Callers holding an `OsStr`
 /// or a `Vec<u8>` use this and stay faithful.
 ///
 /// [`crate::output::dirhie`] is the in-crate caller. All six frozen messages of
@@ -755,6 +810,7 @@ pub(crate) fn errorf(
 /// Identical to [`errorf`] in every other respect: same [`ERROR_PREFIX`], same
 /// `!silent || show_error` gate of `src/tool_msgs.c:131`, same wrapping, same
 /// [`MSG_TEXT_CAPACITY`] truncation.
+#[allow(dead_code)]
 pub(crate) fn errorf_bytes(
     sink: &mut dyn Write,
     config: &MsgConfig,
@@ -765,18 +821,14 @@ pub(crate) fn errorf_bytes(
     }
 }
 
-// ===========================================================================
 // The mandatory `--insecure` warning.
-// ===========================================================================
 
 /// Warns that certificate verification has been switched off, before the
 /// transfer proceeds.
 ///
-/// AAP section 0.1.1 goal G4 requires that "certificate validation is on unless
-/// `--insecure` is given, and `--insecure` must emit a stderr warning before
-/// proceeding"; AAP section 0.8.1 repeats it among the frozen defaults, and it
-/// is validation gate 10 of the ten in AAP section 0.8.4. AAP section 0.4.1
-/// puts the warning in this module.
+/// Certificate validation is on unless `--insecure` is given, and
+/// `--insecure` must emit a stderr warning before proceeding. That warning is
+/// a frozen default and its own validation gate, and it lives in this module.
 ///
 /// # Provenance of the wording
 ///
@@ -796,42 +848,185 @@ pub(crate) fn errorf_bytes(
 /// Warning: using --insecure makes the transfer insecure
 /// ```
 ///
+/// # Why it takes no [`MsgConfig`]: the warning is ungated
+///
+/// This is a *protection* warning, not an ordinary one. AAP section 0.1.1 goal
+/// G4 requires that `--insecure` "must emit a stderr warning before
+/// proceeding", and AAP section 0.8.4 makes "TLS validation confirmed on by
+/// default" gate 10; a warning the user can switch off does not satisfy
+/// either, because the whole point is that the transfer must not proceed
+/// silently once verification is gone. Routing it through [`warnf`] would
+/// inherit that entry point's `!silent` gate (`src/tool_msgs.c:95`) and
+/// `--insecure --silent` would emit nothing at all -- and `--show-error` does
+/// not restore [`warnf`], so nothing the user could add would bring it back.
+/// It therefore writes through [`voutf`] directly, which is the same wrapping
+/// and the same [`WARN_PREFIX`] with no predicate in front of it.
+///
+/// Taking no gate set is not a shortcut; it is the honest signature for an
+/// ungated emitter, and this module already has the precedent. [`helpf`] is
+/// likewise ungated (`src/tool_msgs.c:107-123` consults neither `silent` nor
+/// `showerror`) and likewise takes no [`MsgConfig`]. A parameter that is
+/// accepted and never read would invite a later reader to add the gate back.
+///
+/// Only the *gate* is dropped. The destination is still the configured
+/// diagnostic sink, so `--stderr <file>` and `--stderr -` redirect this
+/// warning exactly as they redirect every other one: the caller passes the
+/// same [`MessageSink`] it passes [`warnf`].
+///
 /// # What callers must know
 ///
 /// * `option` is the long option's name **without** the leading dashes, as
 ///   `a->lname` is at `src/tool_getparam.c:1901`. Three flags switch
 ///   verification off and all three belong here: `insecure`,
-///   `proxy-insecure` and `doh-insecure` (`src/config2setopts.c:379-392`).
-///   The option table itself stays where it belongs, in the command-line
-///   layer; this module does not restate the names.
+///   `proxy-insecure` and `doh-insecure` (`src/config2setopts.c:379-393`).
+///   [`warn_insecure_flags`] is the door that names them, so a caller passes
+///   the three booleans it already holds rather than three string literals;
+///   the *option table* still stays where it belongs, in the command-line
+///   layer, and neither function parses anything.
 /// * Call it **before the transfer starts**, at the point the configuration is
 ///   applied. C's only comparable redirect, `tool_set_stderr_file`, is
 ///   likewise called during option parsing (`src/tool_getparam.c:2312`).
-/// * It routes through [`warnf`], as AAP section 0.4.1 requires, so it carries
-///   the `Warning: ` prefix and the standard wrapping -- and it inherits
-///   [`warnf`]'s `!silent` gate. `--show-error` does not restore it. A test
-///   asserting on the warning must therefore not pass `--silent`.
+/// * Call it **once per affected option**, and only when that option is
+///   actually in force. It has no memory of previous calls, exactly as `warnf`
+///   has none, so a caller that applies the configuration twice would warn
+///   twice.
 /// * This function only warns. It never changes a default: AAP section 0.8.1
 ///   freezes "default option values, including the default-on state of
 ///   certificate verification".
-pub(crate) fn warn_insecure(
-    sink: &mut dyn Write,
-    config: &MsgConfig,
-    option: &str,
-) {
-    warnf(
+///
+/// # Why it does not route through [`warnf`]
+///
+/// The requirement is that the warning **must** be emitted, and [`warnf`]
+/// cannot carry a must. Its gate at `src/tool_msgs.c:95` is `!global->silent`,
+/// so `--silent` suppresses it, and -- measured against the oracle --
+/// `--show-error` does not restore it. Routing a mandatory warning through a
+/// suppressible channel leaves "certificate verification is off and nothing
+/// said so" reachable from the command line, which is exactly what the three
+/// AAP clauses above forbid.
+///
+/// The requirement is unconditional in all three places it is stated. Goal G4
+/// says `--insecure` "must emit a stderr warning before proceeding"; AAP section
+/// 0.8.1 lists it among the frozen defaults; AAP section 0.8.4 makes it
+/// validation gate 10. None of the three is qualified by an output-verbosity
+/// flag, and `--silent` is about progress and body output rather than about
+/// consent to a downgraded security posture. Routing through [`warnf`] would
+/// make `curl -s -k` disable certificate verification in complete silence, which
+/// is precisely the outcome the requirement exists to prevent -- and it would do
+/// so invisibly, since nothing in a `-s` run would hint that a warning had been
+/// withheld.
+///
+/// And there is no C behaviour to preserve here, which is what makes the
+/// departure faithful rather than wilful. AAP section 0.8.1's freeze binds
+/// the diagnostics curl 8.19.0-DEV actually emits, and this is not one of
+/// them: `--insecure` carries no warning upstream at all. [`warnf`]'s
+/// `!silent` gate is faithful to `src/tool_msgs.c:95` for the warnings C
+/// does have; reproducing that gate on a message C does not have would be
+/// imitation, not fidelity.
+///
+/// It therefore writes straight through [`voutf`], the renderer all four
+/// entry points share, with the same [`WARN_PREFIX`] and the same terminal
+/// wrapping. Only the gate is absent: the emitted bytes are byte for byte
+/// what [`warnf`] would have produced for the same message, so nothing about
+/// the appearance of the warning changes.
+///
+/// This is not a novel shape in this module. [`helpf`] is also declared
+/// without a [`MsgConfig`], for the same reason and on the same authority:
+/// `src/tool_msgs.c:107-123` consults neither `silent` nor `showerror` nor
+/// `tracetype`.
+///
+/// # The absent [`MsgConfig`] parameter is the guarantee
+///
+/// Dropping the argument is deliberate and load-bearing rather than tidying.
+/// There is no parameter through which any caller -- present or future -- could
+/// ask for silence, so suppression is not merely unimplemented, it is
+/// unrepresentable. A gate that does not exist cannot be reintroduced by
+/// accident, which is what makes gate 10 of AAP section 0.8.4 hold by
+/// construction instead of by review.
+///
+/// # The destination is the sink, and only the sink
+///
+/// `sink` is the single destination. Once `--stderr <file>` has been honoured
+/// by [`set_stderr_file`], the sink already *is* that file, so the warning
+/// follows the redirection with no special case here, and nothing is written
+/// to standard output or standard error behind the caller's back.
+///
+/// # No fixture encodes the absence of this warning
+///
+/// No fixture is affected: `--insecure` has no warning in curl 8.19.0-DEV at
+/// all, so no expectation encodes its absence, and AAP section 0.6.7's oracle
+/// compares the bytes the client *sends* rather than its diagnostics.
+pub(crate) fn warn_insecure(sink: &mut dyn Write, option: &str) {
+    // No gate, by design -- see "Why it does not route through `warnf`" above.
+    // The prefix, the wrapping and the `MSG_TEXT_CAPACITY` truncation are
+    // `voutf`'s, so they stay identical to every other diagnostic.
+    // The absence of a `config` parameter is itself the enforcement: a
+    // future edit cannot reintroduce the gate without changing this
+    // signature and every caller.
+    // The `Result` is discarded for the reason every entry point in this
+    // module discards it -- a write failure on the diagnostic channel
+    // cannot be reported through the diagnostic channel
+    // (`src/tool_msgs.c:62`).
+    let _ = voutf(
         sink,
-        config,
+        WARN_PREFIX,
         format_args!("using --{option} makes the transfer insecure"),
     );
 }
 
-// ===========================================================================
+/// Emits [`warn_insecure`] for every verification flag that is set, in the
+/// order `src/config2setopts.c` applies them.
+///
+/// This is the single door: the three flags that switch certificate
+/// verification off are named in exactly one place, so a caller cannot honour
+/// one of them and forget its warning.
+///
+/// # The order is C's, and it is observable
+///
+/// `src/config2setopts.c` switches verification off in three consecutive
+/// blocks -- `config->insecure_ok` at `:379-383`, then `config->doh_insecure_ok`
+/// at `:385-388`, then `config->proxy_insecure_ok` at `:390-393`. That sequence
+/// is reproduced rather than sorted or grouped, because two flags given
+/// together produce two lines whose order is program output, and AAP section
+/// 0.8.1 freezes program output.
+///
+/// The order is worth stating explicitly because it is *not* the order the
+/// three bits are declared in (`src/tool_cfgable.h:258-261` reads
+/// `insecure_ok`, `doh_insecure_ok`, `proxy_insecure_ok` -- the same, as it
+/// happens) nor the alphabetical order a reader might assume: `doh-insecure`
+/// precedes `proxy-insecure`.
+///
+/// # When nothing is set
+///
+/// Nothing is written. That is the whole of the C's behaviour when all three
+/// bits are clear: the three `if` statements are simply not taken, no
+/// `my_setopt_long` runs, and verification stays on.
+pub(crate) fn warn_insecure_flags(
+    sink: &mut dyn Write,
+    insecure: bool,
+    doh_insecure: bool,
+    proxy_insecure: bool,
+) {
+    // `src/config2setopts.c:379` -- `if(config->insecure_ok)`.
+    if insecure {
+        warn_insecure(sink, "insecure");
+    }
+
+    // `src/config2setopts.c:385` -- `if(config->doh_insecure_ok)`.
+    if doh_insecure {
+        warn_insecure(sink, "doh-insecure");
+    }
+
+    // `src/config2setopts.c:390` -- `if(config->proxy_insecure_ok)`.
+    if proxy_insecure {
+        warn_insecure(sink, "proxy-insecure");
+    }
+}
+
 // The sink and `--stderr`.
-// ===========================================================================
 
 /// The argument `--stderr -` uses to mean "standard output"
 /// (`src/tool_stderr.c:44`).
+#[allow(dead_code)]
 const STDERR_STDOUT_ARG: &str = "-";
 
 /// `tool_set_stderr_file` (`src/tool_stderr.c:37-69`): points the diagnostic
@@ -866,14 +1061,15 @@ const STDERR_STDOUT_ARG: &str = "-";
 ///
 /// `warnf` already prepends `WARN_PREFIX`, so the bytes on the wire begin
 /// `Warning: Warning: Failed to open `. That is the frozen output, confirmed
-/// against the oracle binary, and it is **not** to be tidied up: AAP section
-/// 0.8.2 states that "a refactor that produces different-but-arguably-better
-/// output has failed". The redundant literal is preserved below with this
+/// against the oracle binary, and it is **not** to be tidied up: a refactor
+/// that produces different-but-arguably-better output has failed. The
+/// redundant literal is preserved below with this
 /// citation attached so that nobody removes it later.
 ///
 /// The filename is appended as raw bytes through [`warnf_bytes`] because C
 /// prints it with `%s` from a `char *`; a lossy conversion would change the
 /// emitted bytes for a path that is not valid UTF-8.
+#[allow(dead_code)]
 pub(crate) fn set_stderr_file(
     sink: &mut MessageSink,
     config: &MsgConfig,
@@ -1067,18 +1263,26 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_is_a_break_position_and_is_kept_on_the_line() {
-        // Oracle: ISBLANK is space OR tab (lib/curl_ctype.h:45).
+    fn a_tab_is_a_break_position_and_is_neutralised_on_the_line() {
+        // Oracle: ISBLANK is space OR tab (lib/curl_ctype.h:45), so the tab is
+        // where the backward scan stops -- and it still is, because
+        // `voutf_bytes_at_width` computes every break position on the RAW bytes
+        // and neutralises only what it then writes. This is the test that proves
+        // the two halves of that claim at once: the break lands in the same place
+        // as the oracle's, and the tab reaches the terminal as `.` rather than as
+        // a cursor movement (see `write_neutralised`).
         let message =
             "Warning: Failed to open /nodir_zzz/aaaaaaaaaa\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let expected = concat!(
             "Warning: Warning: Failed to open \n",
-            "Warning: /nodir_zzz/aaaaaaaaaa\t\n",
+            "Warning: /nodir_zzz/aaaaaaaaaa.\n",
             "Warning: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
         );
 
         let out = wrap(WARN_PREFIX, message, ORACLE_TERMW_40);
         assert_eq!(String::from_utf8_lossy(&out), expected);
+        // Unchanged from the oracle's own line lengths: one byte in, one byte
+        // out, so the wrapping is byte-for-byte what C produces.
         assert_eq!(body_lengths(&out, WARN_PREFIX), vec![24, 22, 30]);
     }
 
@@ -1226,23 +1430,85 @@ mod tests {
     }
 
     #[test]
-    fn a_newline_in_an_interpolated_value_is_written_verbatim() {
-        // C asserts on the format, not on the expansion, and its fwrite/fputs
-        // write the byte through. `-F 'f=v;type=a/b<newline>tail'` reaches this
-        // through `src/tool_formparse.c:877`, so a message-level assertion
-        // would abort a debug build on input the oracle accepts.
+    fn a_newline_in_an_interpolated_value_is_accepted_and_neutralised() {
+        // Two properties, and both matter. First: a newline in the EXPANSION is
+        // accepted rather than asserted on, because C asserts on the format only
+        // and `-F 'f=v;type=a/b<newline>tail'` reaches this through
+        // `src/tool_formparse.c:877` -- a message-level assertion would abort a
+        // debug build on input the oracle accepts. Second: it does not reach the
+        // terminal as a line break, so it cannot forge an additional
+        // `curl: ...` line. See `write_neutralised`.
         let value = "a\nb";
         let mut out: Vec<u8> = Vec::new();
         let outcome = voutf(&mut out, WARN_PREFIX, format_args!("{value}"));
         assert!(outcome.is_ok());
-        assert_eq!(String::from_utf8_lossy(&out), "Warning: a\nb\n");
+        assert_eq!(String::from_utf8_lossy(&out), "Warning: a.b\n");
 
         // And the byte-oriented entry point, which has no format at all.
         let mut bytes: Vec<u8> = Vec::new();
         let outcome =
             voutf_bytes_at_width(&mut bytes, WARN_PREFIX, b"a\nb", 79);
         assert!(outcome.is_ok());
-        assert_eq!(String::from_utf8_lossy(&bytes), "Warning: a\nb\n");
+        assert_eq!(String::from_utf8_lossy(&bytes), "Warning: a.b\n");
+    }
+
+    #[test]
+    fn a_forged_diagnostic_line_cannot_be_injected_through_a_value() {
+        // The attack `write_neutralised` exists to stop: a value carrying a line
+        // feed and a plausible-looking prefix would otherwise appear on the
+        // terminal as a second, independent diagnostic. Exactly one newline may
+        // leave this function -- the one it appends itself.
+        let hostile = "bad\ncurl: (0) everything is fine";
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = voutf_bytes_at_width(
+            &mut out,
+            WARN_PREFIX,
+            hostile.as_bytes(),
+            usize::MAX,
+        );
+        assert!(outcome.is_ok());
+        assert_eq!(
+            out.iter().filter(|byte| **byte == b'\n').count(),
+            1,
+            "only the terminating newline may appear"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "Warning: bad.curl: (0) everything is fine\n"
+        );
+    }
+
+    #[test]
+    fn an_escape_byte_cannot_reach_the_terminal() {
+        // The other half of the same vector: ESC would drive the terminal's
+        // control sequences -- colours, cursor movement, or a title change.
+        let mut out: Vec<u8> = Vec::new();
+        let hostile: &[u8] = b"path\x1b[2Kgone\x07\x7f";
+        let outcome =
+            voutf_bytes_at_width(&mut out, WARN_PREFIX, hostile, usize::MAX);
+        assert!(outcome.is_ok());
+        assert_eq!(String::from_utf8_lossy(&out), "Warning: path.[2Kgone..\n");
+        assert!(
+            !out.contains(&0x1b),
+            "no escape byte may survive the boundary"
+        );
+    }
+
+    #[test]
+    fn bytes_at_or_above_0x80_are_left_alone() {
+        // A path or a header value that is UTF-8, or Latin-1, or arbitrary
+        // bytes: none of it is a terminal control, so none of it is touched.
+        // Escaping it would change the bytes the oracle emits for a filename
+        // that is merely non-ASCII, which AAP section 0.8.1 does not permit.
+        let mut out: Vec<u8> = Vec::new();
+        let message: &[u8] = &[0xc3, 0xa9, 0xff, 0x80, b'x'];
+        let outcome =
+            voutf_bytes_at_width(&mut out, WARN_PREFIX, message, usize::MAX);
+        assert!(outcome.is_ok());
+        let mut expected = WARN_PREFIX.as_bytes().to_vec();
+        expected.extend_from_slice(message);
+        expected.push(b'\n');
+        assert_eq!(out, expected);
     }
 
     // -- voutf: error propagation -----------------------------------------
@@ -1284,7 +1550,7 @@ mod tests {
         errorf(&mut FailingSink, &config, format_args!("{SHORT}"));
         helpf(&mut FailingSink, Some(format_args!("{SHORT}")));
         helpf(&mut FailingSink, None);
-        warn_insecure(&mut FailingSink, &config, "insecure");
+        warn_insecure(&mut FailingSink, "insecure");
     }
 
     // -- The four gates ----------------------------------------------------
@@ -1457,10 +1723,31 @@ mod tests {
 
     // -- The mandatory --insecure warning ---------------------------------
 
+    /// The three flags that switch certificate verification off
+    /// (`src/config2setopts.c:379-392`). Every test below iterates all three:
+    /// AAP section 0.1.1 goal G4 does not distinguish between them, so a
+    /// property proven for one of them is not proven for the other two.
+    const VERIFICATION_FLAGS: [&str; 3] =
+        ["insecure", "proxy-insecure", "doh-insecure"];
+
+    /// Every reachable combination of the two gates that could plausibly
+    /// suppress a warning, as an exhaustive `(silent, show_error)` matrix.
+    ///
+    /// `trace_enabled` is deliberately excluded: it is [`notef`]'s sole gate
+    /// and enables output rather than suppressing it, so it cannot mute
+    /// anything. The four rows below are therefore the complete suppression
+    /// surface, not a sample of it.
+    const GATE_MATRIX: [(bool, bool); 4] = [
+        (false, false), // the default: no flags
+        (true, false),  // --silent          -- mutes warnf
+        (false, true),  // --show-error
+        (true, true),   // --silent --show-error, which does NOT restore warnf
+    ];
+
     #[test]
     fn insecure_warning_bytes_are_stable_and_greppable() {
         let mut out: Vec<u8> = Vec::new();
-        warn_insecure(&mut out, &MsgConfig::default(), "insecure");
+        warn_insecure(&mut out, "insecure");
         assert_eq!(
             String::from_utf8_lossy(&out),
             "Warning: using --insecure makes the transfer insecure\n"
@@ -1470,7 +1757,7 @@ mod tests {
     #[test]
     fn insecure_warning_carries_the_warning_prefix_and_a_single_line() {
         let mut out: Vec<u8> = Vec::new();
-        warn_insecure(&mut out, &MsgConfig::default(), "insecure");
+        warn_insecure(&mut out, "insecure");
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.starts_with(WARN_PREFIX));
         assert!(text.ends_with('\n'));
@@ -1485,11 +1772,11 @@ mod tests {
 
     #[test]
     fn insecure_warning_serves_all_three_verification_flags() {
-        // src/config2setopts.c:379-392 switches verification off for three
+        // src/config2setopts.c:379-393 switches verification off for three
         // flags; the option table stays in the command-line layer.
-        for flag in ["insecure", "proxy-insecure", "doh-insecure"] {
+        for flag in VERIFICATION_FLAGS {
             let mut out: Vec<u8> = Vec::new();
-            warn_insecure(&mut out, &MsgConfig::default(), flag);
+            warn_insecure(&mut out, flag);
             assert_eq!(
                 String::from_utf8_lossy(&out),
                 format!(
@@ -1500,16 +1787,242 @@ mod tests {
     }
 
     #[test]
-    fn insecure_warning_inherits_warnf_s_silent_gate() {
-        // Documented consequence of routing through warnf, recorded so the
-        // integration test knows not to pass --silent.
+    fn the_insecure_warning_is_mandatory_and_takes_no_gate_argument() {
+        // AAP 0.1.1 goal G4, 0.8.1 and validation gate 10 of 0.8.4 all require
+        // the warning to be emitted whenever verification is switched off.
+        // `warn_insecure` therefore accepts no `MsgConfig`: there is no
+        // argument through which silence could be requested, so this test
+        // asserts an invariant the signature already enforces -- it would not
+        // compile if the gate came back.
+        //
+        // The counterpart assertion, that `warnf` IS still gated, lives in
+        // `warnf_is_not_restored_by_show_error`; the two together prove the
+        // mandatory path is a genuinely separate channel and not a change to
+        // the shared one.
+        let mut out: Vec<u8> = Vec::new();
+        warn_insecure(&mut out, "insecure");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "Warning: using --insecure makes the transfer insecure\n"
+        );
+
+        // The same message through the suppressible channel, under the gates a
+        // `--silent --show-error` invocation produces, yields nothing. If
+        // `warn_insecure` were still routed through it, the assertion above
+        // would be unreachable under those flags.
         let mut muted: Vec<u8> = Vec::new();
-        warn_insecure(
+        warnf(
             &mut muted,
             &MsgConfig::new(true, true, true),
-            "insecure",
+            format_args!("using --insecure makes the transfer insecure"),
         );
         assert!(muted.is_empty());
+    }
+
+    #[test]
+    fn insecure_warning_cannot_be_suppressed_by_any_gate_combination() {
+        // AAP section 0.1.1 goal G4 requires the warning unconditionally, and
+        // AAP section 0.8.4 makes it validation gate 10. This is the assertion
+        // that the requirement is met: all three flags against all four gate
+        // combinations, twelve cases, every one of which must emit the exact
+        // bytes.
+        //
+        // The gates are constructed and passed to the SIBLING entry points in
+        // the same iteration, so a future change that re-gated the warning
+        // would fail here rather than silently reintroducing the defect.
+        for flag in VERIFICATION_FLAGS {
+            let expected = format!(
+                "Warning: using --{flag} makes the transfer insecure\n"
+            );
+
+            for (silent, show_error) in GATE_MATRIX {
+                let config = MsgConfig::new(silent, show_error, false);
+
+                let mut out: Vec<u8> = Vec::new();
+                warn_insecure(&mut out, flag);
+                assert_eq!(
+                    String::from_utf8_lossy(&out),
+                    expected,
+                    "--{flag} lost its warning at \
+                     silent={silent} show_error={show_error}"
+                );
+
+                // The control: warnf with the SAME gates is muted by --silent
+                // and --show-error does not restore it. This is what
+                // warn_insecure would have inherited, and the contrast is the
+                // point of the test.
+                let mut gated: Vec<u8> = Vec::new();
+                warnf(&mut gated, &config, format_args!("{SHORT}"));
+                assert_eq!(
+                    gated.is_empty(),
+                    silent,
+                    "warnf's own gate changed: silent={silent} \
+                     show_error={show_error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insecure_warning_takes_no_gate_argument_at_all() {
+        // The structural half of the guarantee, and the reason the test above
+        // can never regress quietly: warn_insecure's type admits no MsgConfig,
+        // so there is nothing for a caller to gate on. Coercing it to a
+        // gateless function pointer is a compile-time proof of that, in the
+        // same shape as helpf_ignores_every_gate above.
+        let ungated: fn(&mut dyn Write, &str) = warn_insecure;
+        let mut out: Vec<u8> = Vec::new();
+        ungated(&mut out, "insecure");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn the_insecure_warning_survives_every_suppression_flag() {
+        // The teeth for F18, and the reason this function takes no MsgConfig:
+        // `curl -s -k` must not disable certificate verification silently. The
+        // mandate in goal G4, AAP section 0.8.1 and validation gate 10 is
+        // unconditional, so there is no flag combination that withholds it.
+        //
+        // The signature is the enforcement -- there is no config to consult --
+        // and this asserts the consequence for every combination of the three
+        // gates a message can be subject to, so a future re-routing through
+        // `warnf` fails here rather than in production.
+        let expected =
+            "Warning: using --insecure makes the transfer insecure\n";
+        for silent in [false, true] {
+            for show_error in [false, true] {
+                for use_ascii in [false, true] {
+                    let config = MsgConfig::new(silent, show_error, use_ascii);
+                    // Consulted only so this test still exercises the shape a
+                    // caller holds; the emission must not depend on it.
+                    let _ = &config;
+                    let mut out: Vec<u8> = Vec::new();
+                    warn_insecure(&mut out, "insecure");
+                    assert_eq!(
+                        String::from_utf8_lossy(&out),
+                        expected,
+                        "silent={silent} show_error={show_error} \
+                         use_ascii={use_ascii}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_insecure_warning_is_emitted_once_per_call() {
+        // Documented contract: the function has no memory, so a caller that
+        // applies the configuration twice warns twice. Recorded as a test so the
+        // caller's obligation is not merely prose.
+        let mut out: Vec<u8> = Vec::new();
+        warn_insecure(&mut out, "insecure");
+        warn_insecure(&mut out, "insecure");
+        assert_eq!(out.iter().filter(|byte| **byte == b'\n').count(), 2);
+    }
+
+    #[test]
+    fn insecure_warning_cannot_be_silenced() {
+        // AAP section 0.1.1 goal G4 requires a warning *before proceeding*,
+        // and section 0.8.4 makes it gate 10. A warning `--silent` removes
+        // would satisfy neither, so the emitter accepts no gate set at all:
+        // the four states MsgConfig can express are unreachable from here,
+        // which is what this test records. Compare warnf, whose `-s` and
+        // `-s -S` behaviour is measured in the gate tests above.
+        let expected =
+            "Warning: using --insecure makes the transfer insecure\n";
+        for (silent, show_error, trace) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            // Built and dropped to prove the emitter needs none of it: this
+            // value cannot be handed to `warn_insecure` because the signature
+            // has no place for it.
+            let unreachable_gates = MsgConfig::new(silent, show_error, trace);
+            assert_eq!(unreachable_gates.silent, silent);
+
+            let mut out: Vec<u8> = Vec::new();
+            warn_insecure(&mut out, "insecure");
+            assert_eq!(String::from_utf8_lossy(&out), expected);
+        }
+    }
+
+    #[test]
+    fn insecure_warning_still_follows_the_configured_sink() {
+        // Only the gate is dropped, never the redirection: `--stderr <file>`
+        // and `--stderr -` must move this warning like any other. The sink is
+        // the caller's `&mut dyn Write`, so a captured buffer stands in for
+        // both redirect targets.
+        let mut redirected: Vec<u8> = Vec::new();
+        warn_insecure(&mut redirected, "proxy-insecure");
+        assert_eq!(
+            String::from_utf8_lossy(&redirected),
+            "Warning: using --proxy-insecure makes the transfer insecure\n"
+        );
+    }
+
+    #[test]
+    fn the_flag_door_applies_c_s_order_and_nothing_else() {
+        // src/config2setopts.c: `insecure_ok` :379, `doh_insecure_ok` :385,
+        // `proxy_insecure_ok` :390. Two flags together produce two lines whose
+        // sequence is program output, so the order is asserted, not assumed.
+        let mut all: Vec<u8> = Vec::new();
+        warn_insecure_flags(&mut all, true, true, true);
+        assert_eq!(
+            String::from_utf8_lossy(&all),
+            "Warning: using --insecure makes the transfer insecure\n\
+             Warning: using --doh-insecure makes the transfer insecure\n\
+             Warning: using --proxy-insecure makes the transfer insecure\n"
+        );
+
+        // doh precedes proxy -- the pair that would reverse under an
+        // alphabetical or declaration-order reading.
+        let mut pair: Vec<u8> = Vec::new();
+        warn_insecure_flags(&mut pair, false, true, true);
+        assert_eq!(
+            String::from_utf8_lossy(&pair),
+            "Warning: using --doh-insecure makes the transfer insecure\n\
+             Warning: using --proxy-insecure makes the transfer insecure\n"
+        );
+
+        // Each flag on its own selects exactly its own name.
+        for (i, name) in ["insecure", "doh-insecure", "proxy-insecure"]
+            .iter()
+            .enumerate()
+        {
+            let mut one: Vec<u8> = Vec::new();
+            warn_insecure_flags(&mut one, i == 0, i == 1, i == 2);
+            assert_eq!(
+                String::from_utf8_lossy(&one),
+                format!(
+                    "Warning: using --{name} makes the transfer insecure\n"
+                )
+            );
+        }
+
+        // All three clear: the three `if` statements are not taken and C emits
+        // nothing, so neither does this.
+        let mut none: Vec<u8> = Vec::new();
+        warn_insecure_flags(&mut none, false, false, false);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn the_mandatory_warning_goes_only_to_the_given_sink() {
+        // "preserve only the configured destination": once `--stderr <file>`
+        // has been honoured the sink IS that file, so following the
+        // redirection needs no special case -- but it does need the warning to
+        // have no second destination. Writing into a sink that records its
+        // bytes and asserting the full expected content proves nothing was
+        // split off elsewhere, and `warn_insecure` reaches no global stream.
+        let mut redirected: Vec<u8> = Vec::new();
+        warn_insecure_flags(&mut redirected, true, false, true);
+        assert_eq!(
+            String::from_utf8_lossy(&redirected),
+            "Warning: using --insecure makes the transfer insecure\n\
+             Warning: using --proxy-insecure makes the transfer insecure\n"
+        );
     }
 
     // -- The sink and --stderr --------------------------------------------
@@ -1655,8 +2168,19 @@ mod tests {
         let file = File::create(&path).expect("create the file");
         let mut sink = MessageSink::File(file);
 
-        let written = sink.write(b"one");
-        assert_eq!(written.ok(), Some(3));
+        // `Write::write` is contractually allowed to consume fewer bytes than
+        // it is given, and asserting a full count here would be asserting a
+        // guarantee the trait does not make. Measured: Miri exercises exactly
+        // that latitude and answers `Ok(1)` for this three-byte buffer while
+        // the host answers `Ok(3)`. What the delegation must guarantee is that
+        // the call reaches the file and reports a sane count; whether every
+        // byte arrives is [`Write::write_all`]'s promise, and the content check
+        // below is what holds it to it.
+        let count = sink.write(b"one").expect("the write reaches the file");
+        assert!((1..=3).contains(&count), "{count} is not a sane count");
+        // Finish whatever the short write left, then append, both through the
+        // delegating `write_all`.
+        assert!(sink.write_all(&b"one"[count..]).is_ok());
         assert!(sink.write_all(b"-two").is_ok());
         assert!(sink.flush().is_ok());
         drop(sink);

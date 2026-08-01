@@ -24,7 +24,8 @@ flag values are accepted: answered, deleted, draft, flagged, and
 seen. The currently accepted flag values are used to set flags on
 IMAP uploads.
 
-This build performs no IMAP or IMAPS transfers. curl accepts this
-option and parses its flag list, yet a transfer using either
-scheme fails with `CURLE_UNSUPPORTED_PROTOCOL`, and the
-`Protocols:` line in the --version output names neither scheme.
+Transfers for IMAP and IMAPS are outside the specified scope of
+this rewrite, and the `Protocols:` line of the --version output
+names neither scheme. Accepting this option and parsing its flag
+list are still specified, with a transfer using either scheme
+then failing with `CURLE_UNSUPPORTED_PROTOCOL`.

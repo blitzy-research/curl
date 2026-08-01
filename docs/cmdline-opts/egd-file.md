@@ -17,7 +17,8 @@ Example:
 # `--egd-file`
 
 Deprecated option (added in 7.84.0). curl accepts the option and ignores
-it, as the TLS implementation provides its own random data.
+it, and the specified TLS implementation is required to provide its own
+random data.
 
 The argument is the path name to the Entropy Gathering Daemon socket. The
 socket was used to seed the random engine for SSL connections.

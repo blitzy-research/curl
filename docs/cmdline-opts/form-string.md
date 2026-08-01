@@ -22,8 +22,9 @@ have no special meaning. Use this in preference to --form if there is any
 possibility that the string value may accidentally trigger the @ or \<
 features of --form.
 
-This build performs no SMTP, SMTPS, IMAP or IMAPS transfers, and those schemes
-are absent from the `Protocols:` line in the --version output. curl accepts
-this option and composes the MIME part from the given string, yet an SMTP or
-IMAP transfer then fails with `CURLE_UNSUPPORTED_PROTOCOL`; HTTP and HTTPS
-multipart form use is fully supported.
+Transfers for SMTP, SMTPS, IMAP and IMAPS are outside the specified scope of
+this rewrite, and those four schemes are withheld from the `Protocols:` line
+of the --version output. The option is still specified to be accepted and the
+MIME part composed from the given string, with an SMTP or IMAP transfer then
+failing with `CURLE_UNSUPPORTED_PROTOCOL`. HTTP and HTTPS multipart form use
+stays within the specified scope.

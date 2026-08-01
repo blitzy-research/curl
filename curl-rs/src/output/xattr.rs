@@ -4,9 +4,9 @@
 
 //! Extended attributes recorded alongside a saved download.
 //!
-//! This module supersedes one C translation unit and its header. AAP section
-//! 0.4.1 assigns it `src/tool_xattr.c` (130 lines) with the note "Extended
-//! attributes on saved files"; `src/tool_xattr.h` (49 lines) supplies the
+//! This module supersedes one C translation unit and its header:
+//! `src/tool_xattr.c` (130 lines), which writes extended attributes on saved
+//! files, while `src/tool_xattr.h` (49 lines) supplies the
 //! build gate and the no-support fallback that this module reproduces.
 //!
 //! It owns exactly four things and nothing else:
@@ -26,8 +26,8 @@
 //! # The four attributes, in order
 //!
 //! The mapping table has two rows, but `fwrite_xattr` writes **four**
-//! attributes. The order is part of the behaviour being preserved (AAP
-//! section 0.8.1) and is reproduced exactly:
+//! attributes. The order is part of the behaviour being preserved and is
+//! reproduced exactly:
 //!
 //! ```text
 //! 1. user.creator          = "curl"                    :111
@@ -52,7 +52,7 @@
 //! `user.mime_type` carries the **server's** `Content-Type` response header,
 //! by way of `CURLINFO_CONTENT_TYPE`. It is never inferred from the filename
 //! or from the file's contents, which is why no content-type-guessing crate
-//! is a dependency of this workspace (AAP section 0.5.1).
+//! is a dependency of this workspace.
 //!
 //! # Why the engine is reached through injected ports
 //!
@@ -66,18 +66,39 @@
 //! traits declared in this module and implemented by the caller -- for one
 //! measured reason and one design reason.
 //!
-//! The measured reason: neither engine module is among this file's declared
-//! dependencies, and neither exists yet in this checkout. `cargo metadata`
-//! reports "failed to load manifest for workspace member `curl-rs-lib` ...
-//! no targets specified in the manifest", because the engine's crate root and
-//! its `url` and `easy` modules are generated separately. Writing
-//! `use curl_rs_lib::url::...` would therefore mean guessing a type name and
-//! method signature that cannot be checked, and a wrong guess breaks the
-//! whole workspace build rather than just this file.
+//! The measured reason: the two engine items this module would need do not
+//! exist yet, and the failure is a **name-resolution** failure at compile time,
+//! not a manifest one. Both halves of that were measured rather than assumed,
+//! because the distinction decides what a reader should go and look at.
 //!
-//! The design reason: AAP section 0.3.3 pattern P12 makes dependency
-//! injection the sanctioned mechanism precisely so that a module can be
-//! "testable to the mandated ... coverage without live network access". The
+//! The manifest and the dependency graph are sound.
+//! `cargo metadata --locked --offline --format-version 1` exits 0 and prints
+//! nothing on standard error, and the graph it returns lists a `lib` target
+//! named `curl_rs_lib` for the engine crate. `curl-rs-lib` is a declared
+//! dependency of this crate and resolves normally.
+//!
+//! What fails is naming the items. Compiling a probe that mentions both yields
+//! two *different* errors, and the difference is the useful part:
+//!
+//! ```text
+//! error[E0433]: cannot find `Url` in `url`
+//! error[E0433]: cannot find `easy` in `curl_rs_lib`
+//! ```
+//!
+//! `curl_rs_lib::url` is a real module -- the engine declares it to host
+//! `url::idn` -- but the URL type the C original uses is not in it yet.
+//! `curl_rs_lib::easy` does not exist at all: the engine's crate root records
+//! it among the subsystems that are specified target design and not yet
+//! declared, because a `mod` line without its file is `E0583`, a hard error no
+//! `#[allow]` can reach.
+//!
+//! Writing `use curl_rs_lib::url::...` or `use curl_rs_lib::easy::...` would
+//! therefore mean guessing a type name and a method signature that nothing can
+//! check, and a wrong guess breaks the workspace build rather than just this
+//! file.
+//!
+//! The design reason: dependency injection is the sanctioned mechanism
+//! precisely so that a module stays testable without live network access. The
 //! ports below are what let the four-attribute sequence be asserted against a
 //! recording fake instead of against a real file system.
 //!
@@ -91,17 +112,12 @@
 //!
 //! # Rules status and provenance
 //!
-//! No user-specified rules exist for this project. `review_rules` returns the
-//! single line "No user rules provided.", checked with the default window and
-//! again with an explicit full-document range, both returning that identical
-//! line; this corroborates AAP section 0.7. Nothing in this file is
-//! attributed to a rule. Every constraint cited here is an AAP requirement
-//! taken from the user's request (AAP section 0.8) -- binding, but a
-//! requirement, not a rule. Where no requirement speaks,
-//! enterprise-standard best practice governs; the absence of rules is not
-//! permission to lower the bar.
+//! No user-specified rules exist for this project: `review_rules` returns the
+//! single line "No user rules provided." Nothing in this file is attributed to
+//! a rule, and every constraint cited here is a requirement taken from the
+//! user's request -- binding, but a requirement, not a rule.
 //!
-//! # The gap: `fsetxattr` is unreachable, and upstream supplies the answer
+//! # `fsetxattr` is reached through the engine's audited island
 //!
 //! `xattr()` at `src/tool_xattr.c:77-104` is the only place the C original
 //! touches the operating system, and it does so in two platform forms:
@@ -113,64 +129,76 @@
 //!
 //! The six-argument form is macOS, the five-argument form is Linux, and
 //! between them they cover all four targets in the mandated matrix. A third
-//! arm at `:93-100` uses FreeBSD's and MidnightBSD's `extattr_set_fd`; AAP
-//! section 0.2.2 puts those platforms out of scope and it is not reproduced.
+//! arm at `:93-100` uses FreeBSD's and MidnightBSD's `extattr_set_fd`; those
+//! platforms are out of scope and it is not reproduced.
 //!
-//! Four independent measurements close off every ordinary route to that
-//! syscall, and they were taken rather than assumed:
+//! Three independent measurements close off every route to that syscall from
+//! *this* crate, and they were taken rather than assumed:
 //!
 //! 1. `std` has no extended-attribute API at all.
-//! 2. No extended-attribute crate is among the workspace pins (AAP section
-//!    0.5.1), and `curl-rs/Cargo.toml` declares exactly four dependencies --
-//!    the engine, `clap`, `clap_complete` and `tokio` -- none of which offers
-//!    one. Adding a dependency to reach a syscall is not this file's call.
+//! 2. No extended-attribute crate is among the workspace pins, and
+//!    `curl-rs/Cargo.toml` declares four runtime dependencies -- the engine,
+//!    `clap`, `clap_complete` and `tokio` -- none of which offers one. Its two
+//!    dev-dependencies, `tempfile` and `tokio`, reach `#[cfg(test)]` code only
+//!    and so could not serve a shipped path even if one of them did. Adding a
+//!    dependency to reach a syscall is not this file's call.
 //! 3. `#![forbid(unsafe_code)]` on `curl-rs/src/main.rs` covers this module,
 //!    and this crate has no `mod ffi`, so there is no `#[allow(unsafe_code)]`
 //!    anywhere in it to place the call behind.
-//! 4. `curl-rs-lib` exposes no accessor. Searching the whole engine crate for
-//!    `xattr` returns nothing, and the `curl-rs-lib/src/ffi/` surface that
-//!    AAP section 0.8.5 conflict C3 reserves for genuine operating-system
-//!    residue is closed to five unrelated items: its `SysCalls` trait carries
-//!    exactly three methods -- `gethostname`, `ifaddrs` and
-//!    `if_nametoindex` -- beside the `memdebug` allocator hook and the
-//!    GSS-API wrappers. Every one of them is `pub(crate)`, so the module is
-//!    invisible to this crate in any case.
+//!    That literal `forbid` is available here precisely because there is
+//!    nothing to exempt: in `curl-rs-lib`, `forbid` plus the inner `allow`
+//!    its FFI island needs is `error[E0453]`, so that root carries
+//!    `#![deny(unsafe_code)]` with exactly one exemption instead.
+//!    `curl-rs/src/main.rs`, `curl-rs/src/bin/curlinfo.rs` and
+//!    `curl-rs/build.rs` all carry the literal `forbid` with zero exemptions.
 //!
-//! So the syscall cannot be issued from here. What this module does instead
-//! is not an invention: it is a build configuration that upstream curl itself
-//! ships. `src/tool_xattr.h:45-47` reads
+//! None of that means the attribute goes unwritten. AAP section 0.8.5 conflict
+//! C3 designates `curl-rs-lib/src/ffi/sys.rs` as the single audited island for
+//! exactly this kind of residue, and it publishes
+//! `curl_rs_lib::set_file_xattr`: one safe signature over both platform forms,
+//! with the `unsafe` block and its `// SAFETY:` justification confined there and
+//! the wrapper exercised through the injected `SysCalls` seam. `set_file_xattr`
+//! in this module is the adapter onto C's error convention and nothing more.
+//!
+//! That division is the point of goal G6 rather than a concession to it: the
+//! requirement is not that the platform call be skipped, but that it live in one
+//! place that can be audited. Everything else in this module -- the attribute
+//! names, their order, the skip and abort rules, and `stripcredentials` -- is
+//! implemented and tested here, in safe code.
+//!
+//! # The `errno` travels, because C's warning is built from it
+//!
+//! The call site is `src/tool_operate.c:632-640`:
 //!
 //! ```text
-//! #else
-//! #define fwrite_xattr(a, b, c) 0
-//! #endif
+//! rc = fwrite_xattr(curl, per->url, fileno(outs->stream));
+//! if(rc) {
+//!   char errbuf[STRERROR_LEN];
+//!   warnf("Error setting extended attributes on '%s': %s", outs->filename,
+//!         curlx_strerror(errno, errbuf, sizeof(errbuf)));
+//! }
 //! ```
 //!
-//! When extended attributes are unavailable, upstream's own definition makes
-//! `fwrite_xattr` evaluate to `0`: no attributes are written, and success is
-//! reported. Combined with the call site's `if(rc)` guard at
-//! `src/tool_operate.c:635`, that means **no diagnostic is emitted** -- the
-//! observable behaviour is identical to a real curl built without
-//! `USE_XATTR`. Reproducing that arm is the faithful translation of the gap
-//! rather than a fudge, and it is the same reasoning by which
-//! `curl-rs/src/terminal.rs` adopted `src/tool_getpass.c:145-149`'s own
-//! `#else` arm for password echo.
+//! The `%s` is filled from **`errno`**, not from `rc`. So a failure has to
+//! carry the number the syscall set, or the warning cannot be reproduced --
+//! which is why [`XattrFailure`] holds an `Option<i32>` rather than being the
+//! unit struct a `Result<(), ()>`-shaped reading would suggest. Its two
+//! constructors are the two routes C has: [`XattrFailure::from_errno`] for a
+//! failed `fsetxattr`, and [`XattrFailure::without_errno`] for the bare
+//! `return 1` at `src/tool_xattr.c:124`, which sets no `errno` at all.
 //!
-//! The consequence is deliberately confined to one function body. Everything
-//! else in this module -- the attribute names, their order, the skip and
-//! abort rules, and `stripcredentials` -- is fully implemented and fully
-//! tested, so closing the gap means changing `set_file_xattr` and nothing
-//! else.
+//! The system text itself is rendered by
+//! [`curl_rs_lib::os_error_message`] -- the one shared helper every
+//! diagnostic in the workspace derives its `strerror` text from -- so
+//! `curlx_strerror` has exactly one counterpart rather than one per call
+//! site.
 //!
-//! Two knock-on effects are recorded here so they are not rediscovered by
-//! accident. `src/curlinfo.c:176-181` prints `xattr: ` followed by `ON` or
-//! `OFF` from `#ifndef USE_XATTR`, so while this gap stands the diagnostic
-//! binary must report `xattr: OFF`; that file belongs to another module and
-//! is not touched here. This is the fourth instance of the same
-//! structural pattern in this crate, after terminal width via
-//! `ioctl(TIOCGWINSZ)` and password echo via `termios` in
-//! `curl-rs/src/terminal.rs`, and local-time conversion in
-//! `curl-rs/src/util.rs`.
+//! One knock-on effect is recorded so it is not rediscovered by accident.
+//! `src/curlinfo.c:176-181` prints `xattr: ` followed by `ON` or `OFF` from
+//! `#ifndef USE_XATTR`. Attributes are now written, so the diagnostic binary
+//! must report `xattr: ON`; `curl-rs/src/bin/curlinfo.rs` owns that line and
+//! `the_diagnostic_binary_agrees_that_xattr_is_on` below is the assertion that
+//! keeps the two artifacts from drifting apart.
 //!
 //! # The `CURL_FAKE_XATTR` hook is documented, not implemented
 //!
@@ -179,8 +207,8 @@
 //! `"%s => %s\n"` through `curl_mprintf` -- to standard output, not standard
 //! error -- and returns success without calling the syscall.
 //!
-//! It is not reproduced. AAP section 0.6.6 records the decision not to
-//! advertise the `Debug` feature at all, which is what `DEBUGBUILD` backs, so
+//! It is not reproduced. The `Debug` feature is deliberately never
+//! advertised, and that is what `DEBUGBUILD` backs, so
 //! reproducing a `DEBUGBUILD`-only branch would add a code path that no
 //! configuration can reach. It is noted because it shows the shape upstream
 //! chose for a testable seam, and this module reaches the same end by
@@ -191,8 +219,8 @@
 //!
 //! `src/tool_xattr.c:44` marks `stripcredentials` with `/* @unittest: 1621 */`.
 //! That test is `tests/tunit/tool1621.c`, driven by the fixture
-//! `tests/data/test1621`, and it checks eighteen inputs. AAP section 0.8.7
-//! relocates such coverage into the crate, so the corpus is preserved here
+//! `tests/data/test1621`, and it checks eighteen inputs. Such coverage moves
+//! into the crate, so the corpus is preserved here
 //! verbatim and its assertions are split according to who owns them:
 //!
 //! ```text
@@ -217,11 +245,11 @@
 //! ```
 //!
 //! Every row's *outcome* is decided by URL parsing, which belongs to
-//! `curl-rs-lib/src/url/`; AAP section 0.4.1 records that that module
-//! deliberately preserves "curl's parsing quirks" rather than delegating to a
-//! general-purpose URL crate, and fixture `tests/data/test1621` exercises it
-//! end to end. What *this* module decides, and what the tests below pin, is
-//! the operation sequence, the exact flag sets, and how failure propagates.
+//! `curl-rs-lib/src/url/`, which deliberately preserves curl's own parsing
+//! quirks rather than delegating to a general-purpose URL crate, and fixture
+//! `tests/data/test1621` exercises it end to end. What *this* module decides,
+//! and what the tests below pin, is the operation sequence, the exact flag
+//! sets, and how failure propagates.
 //!
 //! One row is worth singling out because it is the observable signature of
 //! the flag set: `https://foo@example.com` yields `https://example.com/` with
@@ -232,10 +260,12 @@
 //! that it cannot.
 
 use std::fmt;
+use std::io;
 use std::os::fd::BorrowedFd;
 
 /// The attribute naming the program that saved the file
 /// (`src/tool_xattr.c:111`).
+#[allow(dead_code)]
 const ATTR_CREATOR: &str = "user.creator";
 
 /// The value written to [`ATTR_CREATOR`], byte for byte as
@@ -249,17 +279,19 @@ const ATTR_CREATOR: &str = "user.creator";
 /// `src/tool_help.c:240` prints `Usage: curl [options...] <url>`. Deriving it
 /// from Cargo metadata or from the invoked executable's name would write the
 /// wrong bytes, so the literal is spelled out here.
+#[allow(dead_code)]
 const CREATOR: &str = "curl";
 
 /// The attribute recording where the file came from, credentials removed
 /// (`src/tool_xattr.c:125`).
+#[allow(dead_code)]
 const ATTR_ORIGIN_URL: &str = "user.xdg.origin.url";
 
 /// Which piece of transfer metadata a mapping row asks for.
 ///
 /// A symbolic stand-in for C's `CURLINFO` values that deliberately carries
-/// **no integer**. AAP section 0.6.1 pins every public enumerator's numeric
-/// value; those integers are owned by `curl-rs-ffi/src/ffi/opts.rs` and
+/// **no integer**. Every public enumerator's numeric value is pinned, and
+/// those integers are owned by `curl-rs-ffi/src/ffi/opts.rs` and
 /// mirrored in the engine, and a second definition here could only drift from
 /// them. The two selectors stand for `CURLINFO_CONTENT_TYPE`
 /// (`include/curl/curl.h:2939`, declared as `CURLINFO_STRING + 18`) and
@@ -267,6 +299,7 @@ const ATTR_ORIGIN_URL: &str = "user.xdg.origin.url";
 /// Resolving a selector to its integer belongs to the adapter over
 /// `curl_rs_lib::easy`, not here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum InfoSelector {
     /// `CURLINFO_REFERER`: the `Referer` header curl sent.
     Referer,
@@ -279,6 +312,7 @@ pub(crate) enum InfoSelector {
 
 /// One row of C's `mappings[]` table (`src/tool_xattr.c:31-34`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 struct XattrMapping {
     /// C's `const char *attr`, commented "name of the xattr" at
     /// `src/tool_xattr.c:32`.
@@ -302,6 +336,7 @@ struct XattrMapping {
 /// Rust slice carries its own length, so that sentinel has nothing left to
 /// do and is not reproduced: iterating this slice visits the same two rows in
 /// the same order and stops in the same place.
+#[allow(dead_code)]
 const MAPPINGS: &[XattrMapping] = &[
     XattrMapping {
         attr: "user.xdg.referrer.url",
@@ -320,6 +355,7 @@ const MAPPINGS: &[XattrMapping] = &[
 /// `CURLUPART_PASSWORD` (`:74`). Carries no integer, for the same reason as
 /// [`InfoSelector`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum UrlPart {
     /// `CURLUPART_URL`.
     Url,
@@ -345,6 +381,7 @@ pub(crate) enum UrlPart {
 /// shows the former is correct. Since neither of those bits has a variant
 /// here, the mistake cannot be made even by copying the wrong line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum UrlFlags {
     /// C's literal `0`, passed at `src/tool_xattr.c:56`, `:60` and `:64`.
     NoFlags,
@@ -359,8 +396,9 @@ pub(crate) enum UrlFlags {
 /// C compares a `CURLUcode` against zero and branches without ever inspecting
 /// which code came back -- `if(uc) goto error` at `src/tool_xattr.c:53`,
 /// `:57`, `:61` and `:65`. This type carries no code both for that reason and
-/// because those integers are pinned elsewhere (AAP section 0.6.1).
+/// because those integers are pinned elsewhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct UrlApiFailure;
 
 impl fmt::Display for UrlApiFailure {
@@ -377,13 +415,73 @@ impl std::error::Error for UrlApiFailure {}
 /// (`src/tool_xattr.c:128`). It reaches non-zero by two routes -- `xattr()`'s
 /// own return value (`:103`) and the bare `return 1` taken when
 /// `stripcredentials` fails (`:124`) -- and neither it nor its caller ever
-/// tells them apart, because the warning at `src/tool_operate.c:636-638` is
-/// built from `errno` rather than from the returned value. The two routes
-/// therefore collapse into one opaque failure here. `Err` means exactly what
-/// C's non-zero means, and the caller's only correct response is the one C
-/// takes: warn.
+/// tells them apart by the returned value. `Err` means exactly what C's
+/// non-zero means, and the caller's only correct response is the one C takes:
+/// warn.
+///
+/// # Why it carries an `errno`
+///
+/// The warning is **not** built from the returned value:
+///
+/// ```text
+/// warnf("Error setting extended attributes on '%s': %s", outs->filename,
+///       curlx_strerror(errno, errbuf, sizeof(errbuf)));   /* :637-638 */
+/// ```
+///
+/// It reads `errno`, which the failing `fsetxattr` set. Reproducing that
+/// diagnostic byte-for-byte therefore requires the number to travel from the
+/// syscall to the warning, so it travels in this value rather than in a
+/// thread-global that Rust does not expose.
+///
+/// The two routes differ in exactly one respect, and the difference is C's:
+///
+/// * A failed `fsetxattr` sets `errno`, so [`Self::errno`] is `Some`.
+/// * The `return 1` at `:124` sets no `errno` at all, so [`Self::errno`] is
+///   `None`. C's warning still prints one there -- whatever value happened to
+///   be left in `errno` by some earlier call -- which is a stale read rather
+///   than a described behaviour. `None` records that no number was produced
+///   and leaves the caller to decide, instead of inventing one here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct XattrFailure;
+#[allow(dead_code)]
+pub(crate) struct XattrFailure {
+    errno: Option<i32>,
+}
+
+impl XattrFailure {
+    /// The failure a syscall reported, carrying the `errno` it set.
+    #[allow(dead_code)]
+    pub(crate) const fn from_errno(errno: i32) -> Self {
+        Self { errno: Some(errno) }
+    }
+
+    /// The `return 1` route at `src/tool_xattr.c:124`, which sets no `errno`.
+    #[allow(dead_code)]
+    pub(crate) const fn without_errno() -> Self {
+        Self { errno: None }
+    }
+
+    /// The `errno` for the `%s` of `src/tool_operate.c:637-638`, if there is
+    /// one.
+    #[allow(dead_code)]
+    pub(crate) const fn errno(self) -> Option<i32> {
+        self.errno
+    }
+
+    /// The operating-system text the warning's `%s` interpolates, if there is
+    /// an `errno` to render.
+    ///
+    /// `curlx_strerror(errno, errbuf, sizeof(errbuf))`, rendered through
+    /// [`curl_rs_lib::os_error_message`] so that every diagnostic in the
+    /// workspace derives its system text from one helper. Composing the
+    /// surrounding warning is the caller's business: that format string is
+    /// frozen CLI output owned by the call site, exactly as it is in C.
+    #[allow(dead_code)]
+    pub(crate) fn os_error_text(self) -> Option<String> {
+        self.errno.map(|errno| {
+            curl_rs_lib::os_error_message(&io::Error::from_raw_os_error(errno))
+        })
+    }
+}
 
 impl fmt::Display for XattrFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -397,6 +495,7 @@ impl std::error::Error for XattrFailure {}
 ///
 /// Implemented by the call site over `curl_rs_lib::easy`, for the reasons in
 /// the module documentation.
+#[allow(dead_code)]
 pub(crate) trait TransferInfo {
     /// The string metadata for `info`, or `None` when there is none.
     ///
@@ -417,9 +516,10 @@ pub(crate) trait TransferInfo {
 /// One URL handle: the port for `curl_url_set` and `curl_url_get`.
 ///
 /// Implemented by the call site over `curl_rs_lib::url`, whose parsing
-/// AAP section 0.4.1 records as deliberately preserving "curl's parsing
-/// quirks". Every parsing decision belongs to that implementation; this
-/// module only chooses the operations and their flags.
+/// deliberately preserves curl's own quirks. Every parsing decision belongs to
+/// that implementation; this module only chooses the operations and their
+/// flags.
+#[allow(dead_code)]
 pub(crate) trait CurlUrlApi {
     /// Sets `part`, or removes it when `value` is `None`.
     ///
@@ -447,6 +547,7 @@ pub(crate) trait CurlUrlApi {
 }
 
 /// Creation of URL handles: the port for `curl_url`.
+#[allow(dead_code)]
 pub(crate) trait UrlApiFactory {
     /// A fresh, empty URL handle, or `None` if one cannot be created.
     ///
@@ -456,13 +557,13 @@ pub(crate) trait UrlApiFactory {
     ///
     /// The handle is boxed so this trait stays object-safe. Dropping the box
     /// replaces C's explicit `curl_url_cleanup(u)`, which C must call on both
-    /// the success path (`:68`) and the error path (`:73`) -- the RAII
-    /// boundary AAP section 0.3.3 pattern P8 calls for, and one that cannot be
-    /// forgotten on either path.
+    /// the success path (`:68`) and the error path (`:73`) -- an RAII
+    /// boundary that cannot be forgotten on either path.
     fn new_url(&self) -> Option<Box<dyn CurlUrlApi>>;
 }
 
-/// Where an attribute is actually recorded: the seam that isolates the gap.
+/// Where an attribute is actually recorded: the seam that isolates the
+/// syscall, and the seam the tests substitute at.
 ///
 /// Private deliberately. The only production implementation is
 /// [`FileXattrWriter`]; the only other is the recording fake in this module's
@@ -470,6 +571,7 @@ pub(crate) trait UrlApiFactory {
 /// touching a file system and without an environment variable
 /// (contrast C's `CURL_FAKE_XATTR` hook, discussed in the module
 /// documentation).
+#[allow(dead_code)]
 trait XattrWriter {
     /// Records one attribute under `attr` with the exact bytes `value`.
     fn write_xattr(
@@ -480,6 +582,7 @@ trait XattrWriter {
 }
 
 /// The production writer: attributes destined for an open file descriptor.
+#[allow(dead_code)]
 struct FileXattrWriter<'fd> {
     /// The descriptor C receives as `int fd` (`src/tool_xattr.c:77`).
     ///
@@ -500,9 +603,7 @@ impl XattrWriter for FileXattrWriter<'_> {
     }
 }
 
-/// Sets one extended attribute on an open file. **This is the one
-/// unimplemented operation in this module, and the only body that changes when
-/// the capability arrives.**
+/// Sets one extended attribute on an open file, through the engine.
 ///
 /// # What C does here
 ///
@@ -520,74 +621,77 @@ impl XattrWriter for FileXattrWriter<'_> {
 /// `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. C's third arm
 /// at `:93-100` uses FreeBSD's and MidnightBSD's `extattr_set_fd` and returns
 /// `rc < 0 ? -1 : 0` because that call returns a length rather than a status;
-/// AAP section 0.2.2 puts those platforms out of scope and it is not
-/// reproduced.
+/// those platforms are out of scope and it is not reproduced.
 ///
-/// # Why no workaround is taken
+/// # Why the call is made in the engine rather than here
 ///
-/// Each of the four ordinary routes is closed, and each was measured rather
-/// than assumed:
+/// Three of the ordinary local routes to the syscall are closed, and each was
+/// measured rather than assumed: `std` exposes no extended-attribute API, no
+/// extended-attribute crate is among the workspace pins -- `curl-rs/Cargo.toml`
+/// declares four runtime dependencies, the engine, `clap`, `clap_complete` and
+/// `tokio`, and adding a fifth to reach a syscall is not this file's decision
+/// -- and `unsafe` is unavailable, because `#![forbid(unsafe_code)]` on
+/// `curl-rs/src/main.rs` covers this module and this crate has no `mod ffi` to
+/// place a raw call behind. The module documentation records each with its
+/// measurement, and why `curl-rs-lib` carries `#![deny(unsafe_code)]` with one
+/// exemption instead. What is left is not a gap: the fourth route is open, and
+/// it is the sanctioned one -- the engine's audited island makes the call.
 ///
-/// * `std` exposes no extended-attribute API, so there is nothing safe to
-///   call.
-/// * No extended-attribute crate is among the workspace pins (AAP section
-///   0.5.1). `curl-rs/Cargo.toml` declares exactly four dependencies -- the
-///   engine, `clap`, `clap_complete` and `tokio` -- and adding a fifth to
-///   reach a syscall is not this file's decision to take.
-/// * `unsafe` is unavailable: `#![forbid(unsafe_code)]` on
-///   `curl-rs/src/main.rs` covers this module, and this crate has no
-///   `mod ffi` and therefore no `#[allow(unsafe_code)]` to place a raw call
-///   behind.
-/// * `curl-rs-lib` exposes no accessor. Searching the engine crate for
-///   `xattr` returns nothing, and the `curl-rs-lib/src/ffi/` surface reserved
-///   for genuine operating-system residue is closed to five unrelated items:
-///   its `SysCalls` trait carries exactly `gethostname`, `ifaddrs` and
-///   `if_nametoindex`, beside the `memdebug` allocator hook and the GSS-API
-///   wrappers. Every item there is `pub(crate)`, so that module is invisible
-///   to this crate regardless.
+/// AAP section 0.8.5 conflict C3 answers that by designating
+/// `curl-rs-lib/src/ffi/sys.rs` as the single audited island for operating-system
+/// residue, and `curl_rs_lib::set_file_xattr` is the wrapper it publishes: one
+/// signature over both the five-argument Linux form and the six-argument macOS
+/// form, with the `unsafe` block and its `// SAFETY:` justification confined
+/// there. This function is the adapter between that and C's error convention,
+/// and nothing more.
 ///
-/// # What is done instead, and what is observable
+/// [`curl_rs_lib::set_file_xattr`] selects between the five-argument and
+/// six-argument forms behind that one signature, so no platform conditional
+/// appears in this crate, and it reports failure as an [`io::Error`] carrying
+/// the `errno` the syscall set. That number is what
+/// `src/tool_operate.c:637-638` interpolates, so it is preserved here in
+/// [`XattrFailure`] rather than discarded.
 ///
-/// `src/tool_xattr.h:45-47` is upstream curl's own definition for a build
-/// without extended-attribute support:
+/// # What the engine reports, and how it maps
 ///
-/// ```text
-/// #else
-/// #define fwrite_xattr(a, b, c) 0
-/// #endif
-/// ```
+/// The engine distinguishes an impossible attribute name from a platform
+/// refusal. C does not: `xattr()` collapses every failure into `-1` and
+/// `src/tool_operate.c:635` inspects only whether one occurred. Both
+/// therefore become one [`XattrFailure`] here -- carrying the `errno` when
+/// there is one -- which is what keeps the first-error-wins accounting in
+/// [`fwrite_xattr_with`] identical to C's. A refusal is routine rather than
+/// exceptional, since a filesystem need not support extended attributes at
+/// all, and C treats it that way: it warns once and completes the transfer.
+/// `--xattr` is opt-in, so no default path is affected either.
 ///
-/// Reporting success without writing anything is therefore a configuration
-/// curl itself ships, not a novel degradation. The observable consequences
-/// are exactly those of a real curl compiled without `USE_XATTR`: no
-/// attribute appears on the saved file, and because `src/tool_operate.c:635`
-/// warns only `if(rc)`, **no diagnostic is emitted**. `--xattr` is opt-in, so
-/// no default-path behaviour changes either.
+/// # Errors
 ///
-/// # Closing it
+/// Returns [`XattrFailure::from_errno`] with the syscall's `errno` whenever
+/// `fsetxattr` fails -- most commonly `ENOTSUP` on a file system mounted
+/// without extended-attribute support, or `EPERM` on one that forbids the
+/// `user.` namespace. C's caller warns and carries on, and nothing here
+/// escalates that.
 ///
-/// One addition to the engine suffices: a safe `pub(crate)` wrapper in
-/// `curl-rs-lib/src/ffi/sys.rs` covering both the five-argument Linux form and
-/// the six-argument macOS form behind a single signature that returns a
-/// `Result`, re-exported so this crate can reach it. This function is then the
-/// only place that changes, and it already receives every argument such a
-/// wrapper needs.
+/// An [`io::Error`] with no raw `errno` cannot arise from this call, since the
+/// engine builds it with `io::Error::last_os_error`. Should the standard
+/// library ever produce one anyway, it is reported as a failure without a
+/// number rather than being silently mapped onto a plausible-looking one.
+#[allow(dead_code)]
 fn set_file_xattr(
     fd: BorrowedFd<'_>,
     attr: &str,
     value: &[u8],
 ) -> Result<(), XattrFailure> {
-    // All three arguments are deliberately left unconsumed: with the syscall
-    // unavailable there is nothing to hand them to. They are named rather
-    // than underscore-prefixed so that this signature stays the exact
-    // counterpart of C's
-    // `xattr(int fd, const char *attr, const char *value)`
-    // (src/tool_xattr.c:77-79), which is what makes the eventual one-body
-    // change a body change and not a signature change.
-    let _ = (fd, attr, value);
-
-    // src/tool_xattr.h:46 -- `#define fwrite_xattr(a, b, c) 0`.
-    Ok(())
+    // `attr` crosses as bytes: the engine wrapper builds the `CString` the
+    // syscall needs, because appending the NUL is its side of the boundary.
+    // `value` is passed with its own length rather than NUL-terminated, which
+    // is C's `strlen(value)` at `:89`/`:91` computed on the Rust side.
+    curl_rs_lib::set_file_xattr(fd, attr.as_bytes(), value).map_err(|error| {
+        match error.raw_os_error() {
+            Some(errno) => XattrFailure::from_errno(errno),
+            None => XattrFailure::without_errno(),
+        }
+    })
 }
 
 /// The counterpart of C's `xattr()` (`src/tool_xattr.c:77-104`): the
@@ -596,6 +700,7 @@ fn set_file_xattr(
 /// Split from [`set_file_xattr`] so that the guard applies to every writer,
 /// the production one and the test fake alike, exactly as C's guard applies
 /// ahead of every platform arm.
+#[allow(dead_code)]
 fn set_xattr(
     sink: &mut dyn XattrWriter,
     attr: &str,
@@ -644,6 +749,7 @@ fn set_xattr(
 /// does for its own purpose -- would append `:443` to every HTTPS origin
 /// recorded on disk. [`UrlFlags`] cannot express that flag, so the sequence
 /// below is the only one this module can perform.
+#[allow(dead_code)]
 pub(crate) fn stripcredentials(
     urls: &dyn UrlApiFactory,
     url: &str,
@@ -679,6 +785,7 @@ pub(crate) fn stripcredentials(
 /// The whole of `fwrite_xattr`'s logic (`src/tool_xattr.c:108-129`) lives here,
 /// parameterised by the writer so that the sequence can be observed. The
 /// public entry point [`fwrite_xattr`] supplies the production writer.
+#[allow(dead_code)]
 fn fwrite_xattr_with(
     info: &dyn TransferInfo,
     urls: &dyn UrlApiFactory,
@@ -713,7 +820,11 @@ fn fwrite_xattr_with(
     // src/tool_xattr.c:123-124 -- `if(!nurl) return 1;`. C returns non-zero
     // *without* writing the attribute, and without consulting `err`; the
     // caller's warning follows. `ok_or` reproduces that exactly.
-    let stripped = stripcredentials(urls, url).ok_or(XattrFailure)?;
+    //
+    // This route sets no `errno`, so the failure carries none:
+    // `XattrFailure::without_errno` is documented against this exact line.
+    let stripped =
+        stripcredentials(urls, url).ok_or(XattrFailure::without_errno())?;
 
     // src/tool_xattr.c:125 -- the fourth and last attribute. C frees `nurl` at
     // :126; `stripped` drops at the end of this function.
@@ -735,15 +846,19 @@ fn fwrite_xattr_with(
 ///
 /// # Errors
 ///
-/// `Err(XattrFailure)` is C's non-zero return, and the caller's response is
-/// fixed by C's: warn once, naming the output file, and carry on
+/// [`XattrFailure`] is C's non-zero return, and the caller's response is fixed
+/// by C's: warn once, naming the output file and the `errno` text, and carry on
 /// (`src/tool_operate.c:636-638`). `Ok(())` is C's zero, on which the caller
 /// emits nothing at all.
 ///
-/// While the capability gap described on `set_file_xattr` stands, the only way
-/// this returns `Err` is a `stripcredentials` failure, since no attribute
-/// write can fail. That is the same outcome a real curl built without
-/// `USE_XATTR` produces, by way of `src/tool_xattr.h:46`.
+/// Two routes reach it, and they differ in what the warning can say. A failed
+/// `fsetxattr` supplies an `errno`, so [`XattrFailure::os_error_text`] yields
+/// the text for the warning's `%s`; a `stripcredentials` failure -- C's
+/// `return 1` at `src/tool_xattr.c:124` -- supplies none, and yields `None`.
+/// A platform refusal is routine rather than exceptional -- a filesystem need
+/// not support extended attributes -- and C collapses it into the same
+/// non-zero return, warning once and carrying on.
+#[allow(dead_code)]
 pub(crate) fn fwrite_xattr(
     info: &dyn TransferInfo,
     urls: &dyn UrlApiFactory,
@@ -776,6 +891,21 @@ mod tests {
     /// What the URL API returns for [`CREDENTIALED`] once both parts are
     /// removed. Note the absence of `:443`, discussed on `UrlFlags`.
     const STRIPPED: &str = "https://example.com/file.bin";
+
+    /// The `errno` the recording fake reports when it refuses a write.
+    ///
+    /// `ENOTSUP` is 95 on both Linux targets and 45 on both Apple ones, so it
+    /// is taken from the platform rather than written down; a literal would be
+    /// wrong on half the mandated matrix. The number itself is incidental --
+    /// what the tests assert is that whichever number the syscall produced
+    /// reaches the caller unchanged, since `src/tool_operate.c:637-638`
+    /// interpolates it.
+    #[cfg(target_os = "linux")]
+    const REFUSAL_ERRNO: i32 = 95;
+
+    /// `ENOTSUP` on the two Apple targets. See the Linux definition above.
+    #[cfg(not(target_os = "linux"))]
+    const REFUSAL_ERRNO: i32 = 45;
 
     /// The upstream `@unittest: 1621` corpus, transcribed from
     /// `tests/tunit/tool1621.c:39-67`. `None` is C's `"(null)"`.
@@ -876,7 +1006,12 @@ mod tests {
             if self.refuse_call == Some(self.calls) {
                 // A refused write records nothing, matching a failed
                 // `fsetxattr`: the attribute does not appear on the file.
-                return Err(XattrFailure);
+                //
+                // ENOTSUP is the errno a real refusal carries most often --
+                // a file system mounted without extended-attribute support --
+                // so the fake reports it and the tests can assert that the
+                // number reaches the caller rather than being dropped.
+                return Err(XattrFailure::from_errno(REFUSAL_ERRNO));
             }
             self.written.push(Written {
                 attr: attr.to_owned(),
@@ -1044,9 +1179,7 @@ mod tests {
         ]
     }
 
-    // ------------------------------------------------------------------
     // stripcredentials -- the relocated `@unittest: 1621` coverage
-    // ------------------------------------------------------------------
 
     #[test]
     fn stripcredentials_removes_the_user_and_the_password() {
@@ -1208,9 +1341,7 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
     // The mapping table
-    // ------------------------------------------------------------------
 
     #[test]
     fn the_mapping_table_holds_exactly_the_two_documented_rows() {
@@ -1224,9 +1355,7 @@ mod tests {
         assert_eq!(MAPPINGS[1].info, InfoSelector::ContentType);
     }
 
-    // ------------------------------------------------------------------
     // fwrite_xattr -- order, values, skipping and aborting
-    // ------------------------------------------------------------------
 
     #[test]
     fn the_four_attributes_are_written_in_c_order() {
@@ -1341,7 +1470,9 @@ mod tests {
 
         let got = fwrite_xattr_with(&info, &urls, CREDENTIALED, &mut writer);
 
-        assert_eq!(got, Err(XattrFailure));
+        // The refusal's errno survives the return, because
+        // `src/tool_operate.c:637-638` interpolates it into the warning.
+        assert_eq!(got, Err(XattrFailure::from_errno(REFUSAL_ERRNO)));
         assert_eq!(writer.names(), vec!["user.creator"]);
     }
 
@@ -1355,7 +1486,7 @@ mod tests {
 
         let got = fwrite_xattr_with(&info, &urls, CREDENTIALED, &mut writer);
 
-        assert_eq!(got, Err(XattrFailure));
+        assert_eq!(got, Err(XattrFailure::from_errno(REFUSAL_ERRNO)));
         assert_eq!(writer.names(), Vec::<&str>::new());
         // The URL was never touched either, because :121 is not reached.
         assert_eq!(urls.ops(), Vec::new());
@@ -1369,7 +1500,7 @@ mod tests {
 
         let got = fwrite_xattr_with(&info, &urls, CREDENTIALED, &mut writer);
 
-        assert_eq!(got, Err(XattrFailure));
+        assert_eq!(got, Err(XattrFailure::from_errno(REFUSAL_ERRNO)));
         assert_eq!(
             writer.names(),
             vec!["user.creator", "user.xdg.referrer.url"]
@@ -1387,16 +1518,17 @@ mod tests {
 
         let got = fwrite_xattr_with(&info, &urls, CREDENTIALED, &mut writer);
 
-        assert_eq!(got, Err(XattrFailure));
+        // This route sets no errno, so the failure carries none -- C's warning
+        // prints whatever stale value `errno` held, which is not a described
+        // behaviour and is not invented here.
+        assert_eq!(got, Err(XattrFailure::without_errno()));
         assert_eq!(
             writer.names(),
             vec!["user.creator", "user.xdg.referrer.url", "user.mime_type",]
         );
     }
 
-    // ------------------------------------------------------------------
-    // The setting primitive, and the capability gap
-    // ------------------------------------------------------------------
+    // The setting primitive, and the syscall behind it
 
     #[test]
     fn an_absent_value_is_a_no_op_that_reports_success() {
@@ -1422,58 +1554,168 @@ mod tests {
         assert_eq!(writer.value_of("user.mime_type"), Some(&[0xff, 0x00][..]));
     }
 
-    #[test]
-    fn the_unavailable_primitive_reports_success_without_writing() {
-        // The gap, asserted. src/tool_xattr.h:46 defines the no-support build
-        // as `#define fwrite_xattr(a, b, c) 0`, so success is the contract.
-        //
-        // The descriptor is deliberately arbitrary and is deliberately never
-        // touched -- that is the whole assertion. An already-open standard
-        // descriptor is used rather than a temporary file precisely so the
-        // test cannot depend on a file system that may or may not support
-        // extended attributes.
-        let stdin = std::io::stdin();
-
-        let got = set_file_xattr(stdin.as_fd(), ATTR_CREATOR, b"curl");
-
-        assert_eq!(got, Ok(()));
+    /// A descriptor on which `fsetxattr` is guaranteed to fail, and which the
+    /// test creates for itself.
+    ///
+    /// `xattr(7)` restricts the `user.` namespace to regular files and
+    /// directories, so a socket is refused -- measured here as `EPERM`. macOS
+    /// keeps extended attributes in the file system and a socket has no file
+    /// system behind it, so the refusal is `ENOTSUP` there. Both carry an
+    /// `errno`, which is what these tests assert; neither number is written
+    /// down, because the point is that whichever one the platform produced
+    /// arrives intact.
+    ///
+    /// A socket pair rather than any path on disk, and that choice is load
+    /// bearing three times over. A temporary file would make the outcome
+    /// depend on whether the build host's file system carries extended
+    /// attributes at all. A path under `/dev` would depend on the node still
+    /// being the device it is supposed to be -- during this work `/dev/null`
+    /// was, for a while, replaced by an ordinary file, which would have turned
+    /// this assertion into a silent success *and* left an attribute behind on
+    /// a real file. A bound socket, in turn, would need a port or a path that a
+    /// parallel run could collide with. `UnixStream::pair` needs none of them:
+    /// it is an anonymous pair of descriptors created and dropped inside the
+    /// test.
+    fn unattributable() -> std::os::unix::net::UnixStream {
+        let (end, _other) = std::os::unix::net::UnixStream::pair()
+            .expect("a socket pair needs no external resource");
+        end
     }
 
     #[test]
-    fn the_production_path_reports_success_while_the_gap_stands() {
-        // The consequence the caller sees: src/tool_operate.c:635 warns only
-        // `if(rc)`, so a zero return means no diagnostic at all -- identical
-        // to a real curl built without USE_XATTR.
+    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
+    fn the_primitive_issues_the_syscall_and_reports_its_errno() {
+        // The finding this closes: the body used to discard all three
+        // arguments and return `Ok(())`, so `--xattr` wrote nothing and
+        // reported nothing. A refusal proves the syscall is now reached --
+        // a silent stub cannot produce an `errno`.
+        let sock = unattributable();
+
+        let got = set_file_xattr(sock.as_fd(), ATTR_CREATOR, b"curl");
+
+        let failure = got.expect_err("a socket refuses user.* attributes");
+        assert!(
+            failure.errno().is_some(),
+            "the errno must survive for src/tool_operate.c:637-638"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
+    fn a_reported_errno_renders_without_the_rust_annotation() {
+        // What the warning's `%s` interpolates. `curlx_strerror` yields the
+        // bare system text, so the `(os error N)` that Rust appends must be
+        // gone -- which is the shared helper's job, not this module's.
+        let sock = unattributable();
+
+        let failure = set_file_xattr(sock.as_fd(), ATTR_CREATOR, b"curl")
+            .expect_err("a socket refuses user.* attributes");
+
+        let text = failure
+            .os_error_text()
+            .expect("a syscall refusal always carries an errno");
+        assert!(!text.is_empty());
+        assert!(!text.contains("(os error"), "{text}");
+    }
+
+    #[test]
+    fn a_failure_without_an_errno_renders_no_system_text() {
+        // The `return 1` route at src/tool_xattr.c:124. There is no number to
+        // render, and one is not invented.
+        assert_eq!(XattrFailure::without_errno().errno(), None);
+        assert_eq!(XattrFailure::without_errno().os_error_text(), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
+    fn an_interior_nul_in_the_name_cannot_reach_the_syscall() {
+        // The engine wrapper builds the C string the syscall needs, so a name
+        // that cannot be one is refused with EINVAL before any call is made.
+        // EINVAL is 22 on all four mandated targets, so the number is exact
+        // here rather than probed. The attribute names in this module are
+        // fixed ASCII literals, so this is a total-function guarantee rather
+        // than a reachable path.
+        let sock = unattributable();
+
+        let got = set_file_xattr(sock.as_fd(), "user.\0creator", b"curl");
+
+        assert_eq!(got, Err(XattrFailure::from_errno(22)));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
+    fn the_production_path_reaches_the_real_syscall() {
+        // src/tool_xattr.c:111 -- the creator write is first and
+        // unconditional, so a descriptor that refuses attributes fails there
+        // and the sequence stops, exactly as `!err` at :114 requires.
+        //
+        // This is the end-to-end assertion that `fwrite_xattr` wires
+        // `FileXattrWriter` to the operating system: over the injected writer
+        // the sequence tests above pass whatever the platform does, but this
+        // one cannot.
         let info = FakeInfo::both();
         let urls = FakeUrls::answering(STRIPPED);
-        let stdin = std::io::stdin();
+        let sock = unattributable();
 
-        let got = fwrite_xattr(&info, &urls, CREDENTIALED, stdin.as_fd());
+        let got = fwrite_xattr(&info, &urls, CREDENTIALED, sock.as_fd());
 
-        assert_eq!(got, Ok(()));
+        let failure = got.expect_err("a socket refuses user.* attributes");
+        assert!(failure.errno().is_some());
+        // src/tool_xattr.c:121 is not reached, so the URL is never touched.
+        assert_eq!(urls.ops(), Vec::new());
     }
 
     #[test]
-    fn the_production_path_still_reports_a_stripcredentials_failure() {
-        // While the gap stands this is the only route to a non-zero return,
-        // and it must survive: it is the one case where the caller's warning
-        // is correct.
-        let info = FakeInfo::both();
-        let urls = FakeUrls::refusing(UrlRefusal::Creation);
-        let stdin = std::io::stdin();
-
-        let got = fwrite_xattr(&info, &urls, CREDENTIALED, stdin.as_fd());
-
-        assert_eq!(got, Err(XattrFailure));
+    fn the_diagnostic_binary_agrees_that_xattr_is_on() {
+        // src/curlinfo.c:176-181 prints `xattr: ON` or `OFF` from
+        // `#ifndef USE_XATTR`. Attributes are written now, so the diagnostic
+        // binary must say ON, and this is the assertion that makes a future
+        // disagreement between the two artifacts fail rather than mislead.
+        //
+        // `curlinfo` is a separate binary target, so its table cannot be
+        // imported; the row is read from its source instead. The assertion is on
+        // the constant the row is built from rather than on the rendered token,
+        // because that constant is what decides the token.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../curl-rs/src/bin/curlinfo.rs"
+        );
+        let source = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            // Reachable when this file is compiled outside the workspace
+            // layout; the assertion would then be about the harness.
+            Err(_) => return,
+        };
+        let row = source
+            .lines()
+            .find(|line| line.contains("Capability::new(\"xattr: \""))
+            .unwrap_or_default();
+        // Either form decides ON on the mandated targets, and the row is
+        // required to use one of them. `ALWAYS_COMPILED_IN` states it flatly;
+        // `use_xattr()` derives it, conjoining the engine wrapper's presence
+        // with the `linux`/`macos` `cfg` whose arms that wrapper compiles, so
+        // it also reports OFF on a platform AAP 0.2.2 puts out of scope. The
+        // derived form is what this tree carries, and it is the stronger of the
+        // two; what the assertion forbids is a row that decides the question
+        // some other way.
+        assert!(
+            row.contains("ALWAYS_COMPILED_IN") || row.contains("use_xattr()"),
+            "curlinfo.rs must build the xattr row from ALWAYS_COMPILED_IN or \
+             from the derived use_xattr() predicate now that attributes are \
+             written, found: {row}"
+        );
+        assert!(
+            !row.contains("NOT_DETERMINABLE") && !row.contains("NOT_PRESENT"),
+            "the xattr row must no longer claim the capability is absent or \
+             unknowable, found: {row}"
+        );
     }
 
-    // ------------------------------------------------------------------
     // The error types are reportable
-    // ------------------------------------------------------------------
 
     #[test]
     fn both_failures_render_and_are_errors() {
-        let xattr: &dyn std::error::Error = &XattrFailure;
+        let xattr: &dyn std::error::Error = &XattrFailure::without_errno();
         let url: &dyn std::error::Error = &UrlApiFailure;
 
         assert_eq!(

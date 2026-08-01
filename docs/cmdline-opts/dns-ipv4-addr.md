@@ -21,5 +21,9 @@ Example:
 Specify the source IP address for outgoing IPv4 DNS requests. The argument
 should be a single IPv4 address.
 
-This build resolves names with the system resolver and does not use c-ares, so
-this option is accepted and has no effect.
+Name resolution is specified to run through the system resolver rather than
+c-ares, so `curl_version_info` reports no c-ares. On a build that reports
+none, curl rejects this option while parsing the command line, with `the
+installed libcurl version does not support this`, and that rejection is the
+frozen behavior of the option rather than a new one. The resolver modules
+that would give the option meaning are not on disk.

@@ -2,14 +2,17 @@
 <!-- SPDX-License-Identifier: curl -->
 # PROTOCOLS
 curl supports numerous protocols, or put in URL terms: schemes. Your
-particular build may not support them all. The sections below cover the 33
-schemes curl registers, while this build performs transfers for exactly nine of
-them: `file`, `ftp`, `ftps`, `http`, `https`, `scp`, `sftp`, `ws` and `wss`.
-curl recognizes each of the other 24 registered schemes when it parses a URL,
-yet a transfer request for one of them fails with `CURLE_UNSUPPORTED_PROTOCOL`.
-The `Protocols:` line in the --version output names only those nine schemes,
-so read a section below as a description of the scheme itself rather than as a
-claim about what this build transfers.
+particular build may not support them all. The sections below are one per
+protocol family rather than one per scheme, and between them they cover all 33
+schemes curl registers; where a family name is parenthesized, as in FTP(S), the
+single section covers every scheme in that family. Transfers are specified for
+exactly nine of the 33: `file`, `ftp`, `ftps`, `http`, `https`, `scp`, `sftp`,
+`ws` and `wss`. Each of the other 24 registered schemes is specified to be
+recognized when curl parses a URL, with a transfer request for one of them
+failing with `CURLE_UNSUPPORTED_PROTOCOL`. The `Protocols:` line in the
+--version output names only those nine schemes, so read a section below as a
+description of the protocol family itself rather than as a claim about what a
+given build transfers.
 ## DICT
 Lets you lookup words using online dictionaries.
 ## FILE
@@ -39,7 +42,10 @@ Downloading from a pop3 server means getting an email. With or without using
 TLS.
 ## RTMP(S)
 The **Realtime Messaging Protocol** is primarily used to serve streaming media
-and curl can download it.
+and curl can download it. This is the largest of the parenthesized families and
+registers six schemes rather than two: `rtmp` and `rtmpe` default to port 1935,
+`rtmpt` and `rtmpte` default to the HTTP port, and `rtmps` and `rtmpts` default
+to the HTTPS port.
 ## RTSP
 curl supports RTSP 1.0 downloads.
 ## SCP

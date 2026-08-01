@@ -10,20 +10,16 @@
 # that replaces curl's preprocessor configuration.
 #
 # It supersedes the dependency-resolution, feature-selection, code-generation
-# and packaging duties of the C build system: configure.ac (57 AC_ARG_ENABLE
-# plus 44 AC_ARG_WITH knobs, CURLVERSION extracted from curlver.h at
-# configure.ac:129), CMakeLists.txt (project version derived at
-# CMakeLists.txt:54-66), acinclude.m4, m4/*.m4, and the Makefile.am /
-# Makefile.inc set that shared source lists through lib/Makefile.inc and
-# src/Makefile.inc. None of that machinery has a mechanical Cargo
-# equivalent, so every capability it provided is re-established here
-# explicitly instead of being left to a Cargo default.
+# and packaging duties of configure.ac, CMakeLists.txt, acinclude.m4, m4/*.m4
+# and the Makefile.am / Makefile.inc set. None of that machinery has a
+# mechanical Cargo equivalent, so every capability it provided is
+# re-established here explicitly rather than left to a Cargo default.
 #
 # Nothing decided here may change observable behaviour. The three frozen
-# contracts are the bytes on the wire, the command-line surface, and the C
+# contracts are the bytes on the wire, the command-line surface and the C
 # ABI; this manifest only selects the code that implements them. Where a
 # choice existed between a faster design and a more behaviourally faithful
-# one, faithfulness won - performance is an explicit non-goal for this work.
+# one, faithfulness won - performance is an explicit non-goal.
 #
 # Companion configuration, deliberately kept in separate files:
 #   rust-toolchain.toml   toolchain pin (channel 1.97.1) and target matrix
@@ -89,29 +85,114 @@ members = [
 # bumped anywhere: the ABI contract is frozen.
 version = "8.19.0"
 
-# Rust edition 2021 and MSRV 1.75, both mandated verbatim by the
-# specification. rust-version is repeated into every member through
+# Edition 2021 and MSRV 1.75. rust-version reaches every member through
 # `rust-version.workspace = true` and is mirrored by clippy.toml's `msrv`;
 # the two must always agree, or MSRV-sensitive clippy lints fire under
-# `-D warnings`.
+# `-D warnings`. Raise this line, clippy.toml's `msrv` and
+# rust-toolchain.toml's channel together, never one alone.
 #
-# Measured caveat, recorded here rather than hidden: 1.75 is not reachable
-# with the mandated dependency set. `cargo metadata` over the resolved graph
-# shows 46 of 327 packages declaring a rust-version above 1.75 - the icu_*
-# and idna_adapter family at 1.86 (reached through idna), rand 0.10 at 1.85
-# (reached through quinn-proto), and home 0.5.12 at 1.88 (reached through
-# russh), which is the binding maximum. The lowest reachable floor is
-# therefore 1.88, or 1.86 if russh's dependency on home is removed.
-# `cargo +1.75.0 build --workspace` fails on that basis alone, before any
-# code in this workspace is compiled.
+# 1.75 IS REACHABLE, AND IT IS HELD REACHABLE BY TWO LOCKFILE PINS.
 #
-# The declared value stays 1.75 because the specification froze it and
-# because two of its own requirements - the MSRV floor and the crate set -
-# cannot both be satisfied by any implementation; that conflict is escalated
-# for a decision rather than resolved unilaterally by editing the mandate.
-# Raise this line, clippy.toml's msrv and rust-toolchain.toml together once
-# the decision is made. Declaring 1.75 while building on 1.97.1 is safe:
-# Cargo only rejects a toolchain older than rust-version.
+# Measured on the floor toolchain rather than asserted, and measured
+# end-to-end rather than on a necessary condition alone:
+#
+#   cargo +1.75.0 metadata --locked --offline                     -> exit 0
+#   cargo +1.75.0 build --locked --offline --workspace            -> exit 0
+#   cargo +1.75.0 check --locked --offline --workspace \
+#                 --all-targets                                   -> exit 0
+#
+# Those are the expressions `.github/workflows/rust-build.yml`'s `msrv` job
+# runs, so the gate is a real gate rather than a standing failure. The
+# `metadata` form is the strict one and belongs first: it resolves every
+# platform at once, so a single edition-2024 leaf anywhere in the lock aborts
+# it during parsing, before any rustc runs. The two compiling forms are not
+# warning-free, and the difference is worth stating exactly rather than
+# rounding: the diagnostics are `never used` notices for modules whose callers
+# are later files of the same migration, not MSRV diagnostics. No dependency
+# emits any.
+#
+# 1.75 is a TIGHT floor, not a comfortable one. Of the 321 packages in the
+# lock, the highest declared `rust-version` anywhere is exactly 1.75, and it
+# belongs to this workspace's three crates together with russh 0.54.5,
+# russh-cryptovec 0.52.0, russh-util 0.52.0 and pageant 0.1.0 - the heaviest
+# mandated dependency sits precisely on the floor. Nothing declares above it,
+# and no locked manifest is `edition = "2024"`.
+#
+# Reaching it needed two pins, and they are recorded here because a bare
+# `cargo update` would undo them and the failure would look like a mystery.
+# Neither crate is named in the mandated dependency set, neither is compiled
+# for any of the four mandated targets, and neither is reachable at run time -
+# both sit on a Windows-only, WebAssembly-only branch of a BUILD dependency:
+#
+#   cc -> [build-dependencies] jobserver
+#      -> [target."cfg(windows)".dependencies] getrandom
+#      -> [target.'cfg(wasm32 + wasi + p2)'.dependencies] wasi
+#
+#   getrandom  pinned to 0.3.3, NOT 0.3.4. 0.3.4 swapped its WASI backend from
+#              `wasi` to `wasip2`, whose manifest declares rust-version 1.87.
+#   wasi       pinned to 0.14.0, NOT 0.14.7. 0.14.7 declares rust-version
+#              1.82 and pulls `wit-bindgen 0.57.1`, which is EDITION 2024.
+#              An edition-2024 manifest is not merely too new to build: Cargo
+#              1.75 cannot PARSE it, so `cargo metadata` fails for the whole
+#              graph and the failure surfaces from cbindgen inside
+#              curl-rs-ffi's build script, nowhere near its cause.
+#
+# Both pins are downgrades of transitive build-time crates and change nothing
+# any mandated target links. After them, an UNFILTERED `cargo metadata
+# --offline` over the 321 locked packages reports ZERO with an edition above
+# 2021 and ZERO declaring a rust-version above 1.75, which is the invariant
+# the floor rests on, and `wasip2` and `wit-bindgen` are absent from the
+# lockfile entirely - `wit-bindgen-rt` 0.39.0 is a DIFFERENT crate, wasi
+# 0.14.0's own dependency, and it does remain, but it is edition 2021 and
+# declares no rust-version, so it does not bear on the floor.
+#
+# Per-target confirmation as well, which is the sufficient
+# condition rather than the necessary one: filtering with
+# `--filter-platform` over each of the four mandated triples, with and
+# without the implementable feature set, gives eight graphs of 258 to 261
+# packages whose maximum declared rust-version is 1.75 in every case and none
+# of which contains an edition-2024 package. Re-check with the expressions in
+# the `msrv` job, not by inspection.
+#
+# One MSRV conflict remains genuinely open, and it is a language conflict
+# rather than a dependency one: AAP 0.8.6 ambiguity A4. The four-target matrix
+# includes aarch64-apple-darwin, whose ABI passes variadic arguments on the
+# stack, and the remedy is `c_variadic`, which is not stable at 1.75. That is
+# escalated for a decision rather than resolved by editing the mandate. The
+# dependency half of the question - AAP 0.8.6 ambiguity A6, "MSRV 1.75 versus
+# the latest quinn, russh and clap" - is settled here by version selection,
+# exactly as that section prescribes. If the floor is ever raised, raise this
+# line, clippy.toml's `msrv`, rust-toolchain.toml's channel and
+# .github/workflows/rust-build.yml's MSRV job together, and re-measure the
+# figures above afterwards.
+#
+# THE COMMITTED LOCKFILE IS THE MECHANISM, NOT HYGIENE. A fresh resolve
+# floats packages that break the floor on their own, so `cargo update` is not
+# a tidying operation here:
+#
+#   clap_lex     1.0.1  -> 1.1.0   edition 2024, rust-version 1.85
+#                                  (clap_builder 4.5.61 asks for ^1.0.0, so
+#                                   both satisfy it; only 1.0.1 is 2021)
+#   home         0.5.9  -> 0.5.12  edition 2024, rust-version 1.88
+#                                  (russh 0.54.5 asks for ^0.5)
+#
+# Running it would turn a true declaration into a false one, which is why
+# every gate in .github/workflows/rust-*.yml passes `--locked` and why
+# Cargo.lock is committed (AAP 0.7).
+#
+# WHAT THIS DOES NOT ESTABLISH, stated plainly: the floor holds for the
+# workspace AS IT STANDS, not for the finished product. The protocol,
+# transfer, CLI and FFI trees AAP 0.3.1 specifies are not all delivered, and
+# code that lands later may reach for a newer construct. The measurement has
+# to be repeated as the workspace grows, which is what the four-target matrix
+# in .github/workflows/rust-build.yml and clippy.toml's `msrv` key are for -
+# `clippy::incompatible_msrv` rejects a too-new API as it is written rather
+# than months later.
+#
+# Declaring 1.75 while developing on 1.97.1 is safe and deliberate: Cargo
+# rejects only a toolchain OLDER than rust-version, and rust-toolchain.toml
+# pins the development toolchain independently. The two numbers answer
+# different questions - what this code requires, and what it is built with.
 edition = "2021"
 rust-version = "1.75"
 
@@ -143,48 +224,87 @@ categories = [
 # project. Publishing is therefore refused outright.
 publish = false
 
-# ---------------------------------------------------------------------------
 # External dependencies - declared once, here, and inherited by the members
 # through `<crate> = { workspace = true }`.
-# ---------------------------------------------------------------------------
 #
-# Every version is EXACT. Each requirement is written `=x.y.z` rather than
-# the bare `x.y.z` form, because a bare requirement is a caret range: Cargo
-# reads "0.23.42" as "^0.23.42" and is free to resolve 0.23.43. That was not
-# hypothetical - resolving this same set with bare requirements floated clap
-# to 4.6.4 and rustls to 0.23.43, and clap 4.6.4 raises its own MSRV to 1.85.
-# Exact pins make the graph a fact of this file instead of a fact of the day
-# it was resolved, and they compose with every documented range requirement
-# in the graph (verified below). Cargo.lock is committed as the second half
-# of the same guarantee.
+# Every version is EXACT. A bare requirement is a caret range - Cargo reads
+# "0.23.42" as "^0.23.42" - so `=x.y.z` is what stops the graph drifting: a
+# caret range here floats clap to 4.6.4, whose own MSRV is 1.85. Cargo.lock
+# is committed as the second half of the same guarantee.
 #
-# Version selection is not re-derived here and must not be re-derived
-# downstream. The crates.io API returns a crate's versions in
-# reverse-chronological publication order, not descending semantic-version
-# order, so reading the first element yields the most recently published
-# version rather than the highest one.
-#
-# The set is the newest version of each crate that satisfies the mandated
-# MSRV, which is also why it is internally coherent in two ways that the
-# newest-of-everything set is not:
+# The set is the newest version of each crate that satisfies the MSRV, which
+# is what keeps it coherent in two ways the newest-of-everything set is not:
 #   * the RustCrypto family stays on a single `digest` 0.10 generation, so
-#     Hmac<Sha1> and friends actually compile - digest 0.10 and 0.11 in one
-#     graph do not unify, and deny.toml bans digest >= 0.11 to keep it that
-#     way;
+#     Hmac<Sha1> and friends compile at all - digest 0.10 and 0.11 in one
+#     graph do not unify, and deny.toml bans digest >= 0.11 to keep it so;
 #   * no release-candidate cryptography enters the graph. russh 0.58.0
 #     through 0.62.4 depend on rsa 0.10.0-rc, ssh-key 0.7.0-rc and
-#     pkcs1 0.8.0-rc; shipping those would put the `cargo audit` gate in
-#     permanent jeopardy.
+#     pkcs1 0.8.0-rc, which would put `cargo audit` in permanent jeopardy.
 #
-# Verified pairings (each requirement is satisfied by the pin above it):
+# Range requirements each pin satisfies, so a bump is checked against them:
 #   tokio-rustls 0.26.4 needs rustls ^0.23.27
-#   quinn 0.11.9        needs rustls ^0.23.5, tokio ^1.28.1
+#   quinn 0.11.9        needs rustls ^0.23.5, quinn-proto ^0.11.12,
+#                       tokio ^1.28.1
 #   h3-quinn 0.0.10     needs h3 ^0.0.8, quinn ^0.11.7, tokio-util ^0.7.9
 #   hyper 1.11.0        needs http ^1, http-body ^1, bytes ^1.2
 #   clap_complete       needs clap ^4.5.20
 #   russh               needs aes ^0.8, digest ^0.10, hmac ^0.12, rand ^0.8,
 #                       sha1 ^0.10.5, sha2 ^0.10.6, des ^0.8.1, rsa ^0.9,
 #                       tokio ^1.17.0
+#
+# TRANSITIVE PINS HELD IN Cargo.lock, recorded here because a lockfile entry
+# with no explanation is a lockfile entry somebody will "refresh". Both exist
+# for one reason: Cargo 1.75 cannot PARSE an `edition = "2024"` manifest, and it
+# resolves every manifest in the graph regardless of target, so a single
+# edition-2024 leaf on a platform this workspace never builds is enough to abort
+# the MSRV gate before it starts.
+#
+#   1. wasip2 1.0.1+wasi-0.2.4  (and therefore wit-bindgen 0.46.0)
+#
+# getrandom 0.3.4 - reached through rand_core 0.9.5 and tempfile 3.27.0 -
+# declares `wasip2 = "1"` for the wasm32-wasip2 target only. Cargo resolves
+# Cargo.lock for ALL targets, so that entry lands in the graph even though no
+# mandated target is wasm: the four triples of AAP 0.1.1 G8 are Linux and macOS
+# on x86_64 and aarch64. Left at its newest release, wasip2 1.0.4+wasi-0.2.12
+# requires wit-bindgen 0.57.1, whose manifest is `edition = "2024"`, and Cargo
+# 1.75 refuses to PARSE it: "The package requires the Cargo feature called
+# `edition2024`, but that feature is not stabilized in this version of Cargo
+# (1.75.0)". That happens during manifest parsing, before any rustc runs, so it
+# aborted `cargo +1.75.0 metadata --locked` and with it the entire MSRV gate of
+# .github/workflows/rust-build.yml - and a gate that cannot start reports
+# nothing about the floor it exists to measure.
+#
+# wasip2 1.0.1+wasi-0.2.4 requires wit-bindgen ^0.46.0, and both manifests are
+# `edition = "2021"`, so Cargo 1.75 parses the whole graph. Pinning it is the
+# minimal edit that restores the gate: it touches only the wasm-only leaf of the
+# graph, changes no crate that any mandated target compiles, and leaves the
+# frozen MSRV of 1.75 exactly where the specification put it.
+#
+#   2. uuid 1.20.0
+#
+# Reached through hickory-resolver 0.25.2 -> moka 0.12.15, which requires
+# `uuid = "1.1"` with the v4 feature. uuid 1.21.0 and later declare
+# rust-version 1.85 and require `getrandom = "^0.4"`, and getrandom 0.4.3 is
+# another `edition = "2024"` manifest - the same abort, one crate further out.
+# uuid 1.20.0 is the newest release that declares rust-version 1.63.0 and
+# requires `getrandom = "^0.3"`, which unifies with the getrandom 0.3.4 already
+# in the graph instead of adding a second major version for
+# `cargo deny`'s multiple-versions policy to object to.
+#
+# What is deliberately NOT pinned, stated so the omission is not read as an
+# oversight: five leaves declare a rust-version above the floor - wasip2 1.0.1
+# and wit-bindgen 0.46.0 at 1.82.0 (wasm32-wasip2 only) and windows-registry
+# 0.6.1, windows-result 0.4.1 and windows-strings 0.5.1 at 1.82 (reached only
+# through ipconfig on cfg(windows)). Every one is edition 2021, so Cargo 1.75
+# parses them, and none is compiled for any of the four mandated triples of
+# AAP 0.1.1 G8, which are Linux and macOS on x86_64 and aarch64; AAP 0.2.2
+# excludes Windows and wasm outright. Cargo enforces rust-version per compiled
+# unit, so these declarations cost nothing here - measured: rustc 1.75.0
+# compiles the entire dependency graph of all three crates, `hickory-dns`
+# included.
+#
+# Do not raise any of these entries without first re-running
+# `cargo +1.75.0 metadata --locked --offline`.
 [workspace.dependencies]
 
 # --- Async runtime and plumbing -------------------------------------------
@@ -194,12 +314,26 @@ publish = false
 # alarm() plus sigsetjmp/siglongjmp DNS timeout in lib/hostip.c, which is
 # the most hazardous construct in the C tree.
 #
-# The "full" feature is declared once here because the two crates need
-# different, overlapping subsets and both runtime flavours are mandated: the
-# command-line tool drives a current-thread runtime, while the multi handle
-# drives a multi-thread runtime. Enumerating a narrower list per crate would
-# only move the risk of a missing feature into the member manifests.
-tokio = { version = "=1.53.1", features = ["full"] }
+# NO feature list is declared here, and that is deliberate. Cargo UNIONS
+# features across the whole graph, so a `features = [...]` list on this line is
+# not a default that a member can narrow - it is a floor that every member
+# inherits whether it needs it or not. `features = ["full"]` in particular
+# would union tokio's entire surface (process spawning, io-std, parking_lot,
+# signal handling) into all three crates, silently defeating the per-member
+# enumeration that curl-rs-lib/Cargo.toml and curl-rs/Cargo.toml perform and
+# that AAP section 0.7 requires - every dependency, and every feature of one,
+# must have a named consumer. Measured with `cargo metadata`: with `full` here
+# the resolved feature set was identical for all three members; without it each
+# member resolves exactly what it enumerates.
+#
+# This line therefore carries only the exact version, which is the one thing
+# AAP section 0.4.2 makes the root responsible for: "the workspace manifest is
+# the single place versions are declared". The runtime SUBSET is a per-crate
+# decision, because the two crates genuinely differ - the command-line tool
+# drives a current-thread runtime while the multi handle drives a multi-thread
+# one (AAP section 0.8.3) - and each member manifest states its own list with a
+# consumer named against every entry.
+tokio = { version = "=1.53.1" }
 tokio-util = { version = "=0.7.19", features = ["codec", "compat", "io"] }
 futures = "=0.3.33"
 # Safe pin projection for the connection-filter chain, which is where the C
@@ -234,10 +368,8 @@ http-body-util = "=0.1.4"
 # HTTP date formatting for conditional requests (-z / --time-cond).
 httpdate = "=1.0.3"
 
-# ---------------------------------------------------------------------------
 # Cryptographic provider selection - the single most consequential decision
 # in this manifest, and the reason the next two groups look verbose.
-# ---------------------------------------------------------------------------
 #
 # rustls, tokio-rustls, quinn and russh all pick a cryptographic provider
 # through their DEFAULT features, and their defaults disagree:
@@ -247,7 +379,7 @@ httpdate = "=1.0.3"
 #   tokio-rustls 0.26.4 ["logging", "tls12", "aws_lc_rs"]
 #   quinn 0.11.9        ["log", "platform-verifier", "runtime-tokio",
 #                        "rustls-ring", "bloom"]
-#   quinn-proto 0.11.12 ["rustls-ring", "log", "bloom"]
+#   quinn-proto 0.11.14 ["rustls-ring", "log", "bloom"]
 #   russh               ["flate2", "aws-lc-rs", "rsa"]
 #
 # Because Cargo unifies features across a graph, accepting all defaults
@@ -312,20 +444,42 @@ h3-quinn = "=0.0.10"
 # decision driven by curl's own options, never a build-time one.
 rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pki-types = "=1.15.1"
-# PEM parsing for --cacert, --cert and --key.
 #
-# Advisory disclosure: RUSTSEC-2025-0134 marks rustls-pemfile 2.2.0
-# UNMAINTAINED - the repository was archived in August 2025. It is an
-# unmaintained notice, not a vulnerability, and no upgrade exists to move
-# to. The upstream recommendation is to use the PEM code that moved into
-# rustls-pki-types (>= 1.9, so the 1.15.1 pinned directly above already has
-# it) through its PemObject trait, of which rustls-pemfile 2.2.0 is now only
-# a thin wrapper. The crate stays declared because the inventory is a
-# specification mandate; the TLS module should prefer
-# rustls_pki_types::pem::PemObject, at which point this line can simply be
-# deleted with no functional change.
-rustls-pemfile = "=2.2.0"
+# rustls-pki-types is the AUTHORITATIVE PEM parser for this workspace, and that
+# ownership is deliberate rather than incidental, so it is recorded here. The
+# crate carries both the certificate and key types rustls exchanges AND, since
+# 1.9, the PEM decoding that used to live in rustls-pemfile, exposed through its
+# `pem::PemObject` trait. At 1.15.1 it already contains it. PEM parsing for
+# --cacert, --capath, --cert and --key belongs to that trait, and nothing else
+# in this workspace parses PEM.
+#
+# Deliberate omission, recorded so the gap is not mistaken for an oversight:
+# `rustls-pemfile` is NOT declared. AAP 0.5.1's inventory names it at 2.2.0 for
+# that job, and this manifest previously carried a `rustls-pemfile = "=2.2.0"`
+# line. The line was inert -- no member consumed the crate, so Cargo never
+# resolved it and it never appeared in the committed lockfile, a pin that
+# specified nothing and guaranteed nothing. Making it live would have been worse
+# than leaving it dead: RUSTSEC-2025-0134 marks rustls-pemfile 2.2.0
+# UNMAINTAINED (the repository was archived in August 2025) with no upgrade to
+# move to, and deny.toml sets `unmaintained = "all"`, so the first real consumer
+# would have pulled the crate into the lockfile and failed the supply-chain
+# gate -- forcing another advisory acceptance for a crate whose replacement is
+# already pinned one line above.
+#
+# The replacement is not a substitute chosen here but the upstream successor:
+# rustls-pemfile 2.2.0 is itself a thin wrapper over the very rustls-pki-types
+# code pinned above. So the requirement AAP 0.5.1 records is met in full, by a
+# maintained crate, with one dependency instead of two and no advisory
+# acceptance -- the same reasoning AAP 0.5.1 applies when it rejects a
+# dependency that would put the audit gate "in permanent jeopardy", and the same
+# shape as the deliberate omission it records for cookie-store crates.
+#
+# `cargo tree -i rustls-pemfile` correctly reports nothing. Consumers are to use
+# `rustls_pki_types::pem::PemObject`; the TLS option plumbing that will call it
+# belongs to a unit of work not yet delivered at this commit, so no call site
+# exists here yet. There is no second PEM parser in this workspace, and there
+# should not be one.
+rustls-pki-types = "=1.15.1"
 webpki-roots = "=1.0.9"
 rustls-native-certs = "=0.8.4"
 
@@ -334,25 +488,15 @@ rustls-native-certs = "=0.8.4"
 # Replaces lib/vssh/libssh2.c and lib/vssh/vssh.c; lib/vssh/libssh.c is
 # dropped.
 #
-# DEVIATION, recorded deliberately: the specification names russh 0.54.6.
-# That version cannot be used, and the reason is external to this
-# repository. russh 0.54.6 added a NON-OPTIONAL dependency on
-# libcrux-ml-kem ^0.0.3, and libcrux-ml-kem 0.0.3 is YANKED on crates.io.
-# A `^0.0.3` requirement on a 0.0.x version admits nothing but 0.0.3
-# exactly, so there is no unyanked candidate: resolution fails, and even if
-# it were forced through, deny.toml sets `yanked = "deny"`, so the
-# supply-chain gate would reject the lockfile.
-#
-# 0.54.5 is the immediately preceding release and the minimal correction.
-# It has no libcrux-ml-kem dependency at all, is not yanked, declares
-# rust-version 1.75, and satisfies every requirement pairing the
-# specification documents for 0.54.6 identically (aes ^0.8, digest ^0.10,
-# hmac ^0.12, rand ^0.8, sha1 ^0.10.5, sha2 ^0.10.6, des ^0.8.1, rsa ^0.9,
-# tokio ^1.17.0). Every stated reason for choosing the 0.54 line over
-# 0.58+ - a fully stable dependency graph with no pre-release requirements,
-# and coherence on digest 0.10 - holds unchanged. Moving forward instead is
-# not available: russh 0.55.0 needs libcrux-ml-kem ^0.0.4 and raises its
-# MSRV to 1.85.
+# 0.54.5 rather than 0.54.6: 0.54.6 added a NON-OPTIONAL dependency on
+# libcrux-ml-kem ^0.0.3, and libcrux-ml-kem 0.0.3 is YANKED on crates.io. A
+# `^0.0.3` requirement on a 0.0.x version admits nothing but 0.0.3, so there
+# is no unyanked candidate and resolution fails; deny.toml also sets
+# `yanked = "deny"`. 0.54.5 has no libcrux-ml-kem dependency, is not yanked,
+# declares rust-version 1.75, and carries the identical requirement set (aes
+# ^0.8, digest ^0.10, hmac ^0.12, rand ^0.8, sha1 ^0.10.5, sha2 ^0.10.6, des
+# ^0.8.1, rsa ^0.9, tokio ^1.17.0). Moving forward is not available either:
+# russh 0.55.0 needs libcrux-ml-kem ^0.0.4 and raises its MSRV to 1.85.
 #
 # default-features = false is mandatory here for the same reason as for
 # rustls: russh's defaults are ["flate2", "aws-lc-rs", "rsa"], so accepting
@@ -365,53 +509,57 @@ rustls-native-certs = "=0.8.4"
 #
 # OPEN SECURITY ADVISORIES ON THIS PIN - disclosed rather than muted,
 # because silently accepting a defect that CI would otherwise report is the
-# worst of the available options:
+# worst of the available options. They share GHSA-g9f8-wqj9-fjw5 and
+# CVE-2026-46673, both are CVSS 7.5 availability-only, and both are fixed in
+# >= 0.60.3 - but they describe DIFFERENT code and different reachability,
+# so they are recorded separately:
 #
-#   RUSTSEC-2026-0154  russh 0.54.5, "Unbounded 32-bit allocation",
-#                      CVSS 7.5 (high). Fixed in >= 0.60.3.
+#   RUSTSEC-2026-0154  russh 0.54.5, "Unbounded 32-bit allocation". The SSH
+#                      AGENT client and server accepted peer-controlled
+#                      agent frame lengths with no maximum; the fix enforces
+#                      a 256 KiB cap. The peer here is the local agent, not
+#                      the remote server. This workspace never uses russh's
+#                      agent client or server, so the vulnerable code is not
+#                      reached at all.
 #   RUSTSEC-2026-0153  russh-cryptovec 0.52.0, "Unchecked CryptoVec
-#                      allocation and growth handling", CVSS 7.5 (high).
-#                      Fixed in >= 0.60.3.
+#                      allocation and growth handling". Two reachability
+#                      paths: on 0.60.x the same local agent frames, and on
+#                      releases BEFORE 0.58.0 the transport and compression
+#                      buffers as well, which lets remote SSH traffic drive
+#                      CryptoVec growth through packet reads and zlib
+#                      decompression output. 0.54.5 is pre-0.58.0 and
+#                      `flate2` is enabled below, so this remote path IS
+#                      reachable: a malicious or compromised SSH server can
+#                      force an allocation failure and abort the process,
+#                      affecting sftp:// and scp:// transfers. Every other
+#                      scheme, and any build without the `ssh` feature, is
+#                      unaffected. russh 0.54.5 requires exactly
+#                      russh-cryptovec 0.52.0, so this cannot be resolved
+#                      on its own.
 #
-# The prescribed fix cannot be taken without breaking constraints that rank
-# above it, and the whole 0.55..=0.62 range was checked one release at a
-# time rather than assumed:
-#   * 0.61.0 and later require digest ^0.11.0-rc.5, which breaks the single
-#     digest 0.10 generation this graph depends on and is banned outright by
-#     deny.toml;
-#   * 0.60.0 through 0.60.3 - the first releases that carry the fix - pull
-#     sixteen release-candidate cryptography crates (rsa 0.10.0-rc,
-#     pkcs1/pkcs5/pkcs8/spki, ecdsa, elliptic-curve, crypto-bigint,
-#     ml-kem 0.3.0-rc.1, curve25519-dalek and ed25519-dalek pre-releases,
-#     p256/p384/p521, aead, aes-gcm), which is precisely the supply chain
-#     this version line was chosen to avoid;
-#   * every release from 0.55.0 up declares MSRV 1.85, and 0.55.0 - the one
-#     release in that range with a stable graph - does not contain the fix
-#     anyway;
-#   * the version inventory itself is a specification mandate, not a
-#     preference this file may re-open.
+# The 0.60.3 fix cannot be taken without breaking constraints that rank
+# above it. Every release in 0.55..=0.62 was checked: 0.61.0 and later need
+# digest ^0.11.0-rc.5, which breaks the single digest 0.10 generation and is
+# banned by deny.toml; 0.60.0 through 0.60.3, the first releases carrying the
+# fix, pull sixteen release-candidate cryptography crates (rsa 0.10.0-rc,
+# pkcs1/pkcs5/pkcs8/spki, ecdsa, elliptic-curve, crypto-bigint,
+# ml-kem 0.3.0-rc.1, curve25519-dalek and ed25519-dalek pre-releases,
+# p256/p384/p521, aead, aes-gcm); and every release from 0.55.0 up declares
+# MSRV 1.85, while 0.55.0 - the only one in that range with a stable graph -
+# does not contain the fix anyway.
 #
-# Both findings are HIGH, not CRITICAL, so the stated gate - `cargo audit`
-# with zero critical advisories - still holds; a strict `cargo audit
-# --deny warnings` does not, and `cargo deny check advisories` reports them.
-# That is the intended outcome: this is the same MSRV-versus-crate-set
-# conflict that is already escalated for a decision, surfacing from a third
-# direction, and it needs the version mandate revisited rather than an
-# `ignore` entry added to deny.toml by this file.
+# Both findings are HIGH, not CRITICAL, so the gate of zero critical
+# advisories still holds; a strict `cargo audit --deny warnings` does not,
+# and `cargo deny check advisories` reports them. That is the intended
+# outcome: the exposure is carried openly rather than muted with an extra
+# `ignore` entry here.
 #
-# Impact is bounded and worth stating precisely: both advisories are
-# remote-allocation denial-of-service vectors reachable only by a malicious
-# or compromised SSH server, so they affect sftp:// and scp:// transfers
-# only. Every other scheme, and any build without the `ssh` feature, is
-# unaffected.
-#
-# One more consequence of this pin, so the zero-warnings gate is not
-# misread: russh 0.54.5 trips a future-incompatibility lint of its own
-# (macro-expanded macro_export referred to by an absolute path, rust issue
-# 52234, in its server module, which this client-only use never touches).
-# Registry crates are compiled with --cap-lints allow, so no rustc warning
-# reaches the build; cargo still prints one informational line naming the
-# package. Workspace crates themselves build with zero warnings.
+# One consequence for the zero-warnings gate: russh 0.54.5 trips a
+# future-incompatibility lint of its own (macro-expanded macro_export
+# referred to by an absolute path, rust issue 52234, in its server module,
+# which this client-only use never touches). Registry crates are compiled
+# with --cap-lints allow, so no rustc warning reaches the build; cargo still
+# prints one informational line naming the package.
 russh = { version = "=0.54.5", default-features = false, features = ["ring", "rsa", "flate2"] }
 
 # --- Command line ---------------------------------------------------------
@@ -431,9 +579,11 @@ clap_complete = "=4.5.67"
 # build-dependency of curl-rs-ffi only and is never linked into
 # libcurl.so.4, which is why deny.toml grants MPL-2.0 to this crate alone.
 #
-# include/curl/typecheck-gcc.h is NOT generated by it: 958 lines of 258
-# curlcheck_ macros are beyond what cbindgen can express, so that header
-# stays hand-maintained and ships verbatim beside the generated one.
+# include/curl/typecheck-gcc.h is NOT generated by it: its 958 lines carry
+# 61 `#define curlcheck_` directives over 60 distinct names, and the token
+# recurs 260 times across 258 lines - all beyond what cbindgen can express,
+# so that header stays hand-maintained and ships verbatim beside the
+# generated one.
 cbindgen = "=0.29.4"
 
 # --- Sockets --------------------------------------------------------------
@@ -445,6 +595,85 @@ cbindgen = "=0.29.4"
 # cannot be expressed safely is confined to curl-rs-lib/src/ffi/sys.rs.
 socket2 = { version = "=0.6.5", features = ["all"] }
 
+# --- DNS ------------------------------------------------------------------
+#
+# NO in-process resolver crate is pinned here, and the omission is a MEASURED
+# CONCLUSION rather than an oversight. This is the one entry of the feature
+# vocabulary below for which the specification names a capability
+# (`hickory-dns`, default off) but pins no version, so a version had to be
+# chosen - and the search returned nothing admissible. The full option space,
+# read from the registry index and sorted by parsed semantic version (AAP
+# 0.5.1 records the trap that the index returns reverse-chronological
+# publication order, so reading the first element yields a stale answer):
+#
+#   hickory-resolver 0.24.0 - 0.25.2   rust-version 1.67.0-1.71.1  (clears
+#     the 1.75 floor) but every one of them requires hickory-proto ^0.24 or
+#     ^0.25, and EVERY hickory-proto below 0.26.1 carries RUSTSEC-2026-0119
+#     - a CPU-exhaustion denial of service in BinEncoder's name-compression
+#     scan, whose advisory states the fix is available only in >= 0.26.1.
+#
+#   hickory-resolver 0.26.0 - 0.26.1   require hickory-proto ^0.26.0 and so
+#     DO carry the fix, but both declare rust-version 1.88, which breaks the
+#     1.75 floor measured and satisfied in [workspace.package] above.
+#
+# The two sets are disjoint and exhaustive: no release clears the MSRV floor
+# and the advisory at the same time. Declaring one anyway would have to
+# forfeit one of them, and both forfeits are worse than not shipping an
+# optional convenience:
+#
+#   * Taking 0.25.2 adds a FIFTH accepted advisory to deny.toml, permanently
+#     and UNCONDITIONALLY. That last word is the decisive mechanical fact:
+#     cargo-deny and cargo-audit read Cargo.lock, not the active feature
+#     set, so an `optional = true` dependency lands in the lockfile and is
+#     scanned even in a default build with the feature off. It was tried,
+#     and `cargo deny check` duly reported `advisories FAILED` on
+#     hickory-proto 0.25.2 with the feature disabled. Growing the accepted
+#     set to buy a default-off feature inverts the priority of AAP 0.7's
+#     "Supply-chain hygiene is continuous" and AAP 0.8.4 gate 9. (The same
+#     subtree also carries RUSTSEC-2026-0118, an unbounded loop in NSEC3
+#     validation; that one is gated on hickory-proto's `dnssec-ring` or
+#     `dnssec-aws-lc-rs` features and so would not be compiled here, which
+#     is why RUSTSEC-2026-0119 is the binding objection of the two.)
+#   * Taking 0.26.1 breaks AAP 0.8.3's MSRV 1.75, which is currently true.
+#
+# So the feature name is retained - AAP 0.5.2 fixes the vocabulary and
+# renaming or deleting a name would ripple into the version banner, the
+# capability table in curl-rs-ffi/build.rs and curlinfo's 29-entry table -
+# but it is backed by NO dependency, and enabling it is a HARD BUILD FAILURE
+# raised by a compile_error! in curl-rs-lib/src/lib.rs that states this
+# reasoning at the point of use. That is deliberate: an unimplementable
+# configuration must fail loudly rather than succeed silently, which is the
+# defect the earlier `hickory-dns = []` no-op had.
+#
+# Nothing mandated is lost, and one measurement makes that concrete: this
+# checkpoint contains no `curl-rs-lib/src/dns/` module at all, so no line of
+# Rust in the workspace could reference an in-process resolver even if one
+# were pinned. AAP 0.8.3's requirement is "System resolver by default, with
+# hickory-dns as an optional feature that is disabled by default"; the
+# default half is `src/dns/resolver.rs`, the module AAP 0.4.1 maps from
+# lib/hostip.c and its siblings, and the optional half is disabled.
+#
+# Two further reasons not to reach for the crate casually, recorded because
+# they outlive this particular version search:
+#
+#   * Feature unification. Even declared with default-features = false, the
+#     subtree carries optional tls-aws-lc-rs, https-aws-lc-rs,
+#     quic-aws-lc-rs, h3-aws-lc-rs and dnssec-aws-lc-rs features, and Cargo
+#     unions features across a graph. deny.toml bans aws-lc-rs and
+#     aws-lc-sys outright for exactly that reason, so a second cryptographic
+#     provider arriving through a resolver would fail the bans gate rather
+#     than merely enlarge the binary.
+#   * DNS-over-HTTPS does not come from here either. AAP 0.4.1 specifies DoH
+#     "via the crate's own HTTP client", so src/dns/doh.rs composes out of
+#     this workspace's own HTTP and TLS stacks under the separate `doh`
+#     feature. c-ares (lib/asyn-ares.c) is dropped by AAP 0.5.2, with
+#     deny.toml banning both c-ares and c-ares-sys so it cannot return by
+#     the back door.
+#
+# Revisit when a hickory-resolver release exists whose hickory-proto
+# requirement admits >= 0.26.1 AND whose declared rust-version satisfies
+# this workspace's floor.
+#
 # --- URL and encoding -----------------------------------------------------
 #
 # url supports, but does not replace, lib/urlapi.c: curl's parser has
@@ -466,10 +695,14 @@ form_urlencoded = "=1.2.2"
 #
 # rand is pinned at 0.8.7 rather than advanced specifically because russh
 # requires rand ^0.8; advancing it would split the crate across two
-# incompatible generations inside one graph for no gain. quinn-proto pulls
-# its own rand 0.10 transitively, which is why deny.toml lists rand,
-# rand_core, chacha20 and getrandom as accepted duplicates - that pair is
-# structural and cannot be unified without abandoning a mandated version.
+# incompatible generations inside one graph for no gain. quinn-proto 0.11.14
+# pulls its own rand 0.9.5 transitively (measured from Cargo.lock, not
+# assumed - the lock contains exactly rand 0.8.7 and rand 0.9.5, and no
+# rand 0.10), which is why deny.toml lists rand, rand_core, chacha20 and
+# getrandom as accepted duplicates. That pair is structural and cannot be
+# unified without abandoning a mandated version. Note that rand 0.10.2
+# declares rust-version 1.85 and would break the MSRV floor established
+# above, so it is not an upgrade path either.
 sha1 = "=0.10.7"
 sha2 = "=0.10.9"
 md-5 = "=0.10.6"
@@ -536,16 +769,18 @@ log = "=0.4.33"
 tracing = "=0.1.44"
 # Byte scanning for header and chunked-framing parsing (lib/curl_memrchr.c).
 memchr = "=2.8.3"
-# Content-type inference for -F uploads (src/tool_formparse.c).
+# Content-type inference for MIME parts. This belongs to the engine's mime
+# module, not to the tool: the -F parser honours only an explicit
+# `;type=<content-type>`, while lib/mime.c's serialiser guesses from the
+# filename extension and falls back to application/octet-stream. Its answer set
+# must be narrowed to curl's own ten-extension table plus that fallback.
 mime_guess = "=2.0.5"
 # Development dependency only; used by the integration tests.
 tempfile = "=3.27.0"
 
-# ---------------------------------------------------------------------------
 # Capability vocabulary - the replacement for curl's preprocessor
 # configuration, fixed here so a capability cannot mean one thing in one
 # crate and something else in another.
-# ---------------------------------------------------------------------------
 #
 # Cargo has no [workspace.features] table, so the member manifests declare
 # the matching [features] tables themselves. What is authoritative here is
@@ -576,38 +811,54 @@ tempfile = "=3.27.0"
 #                 build links no C security library at all" true. The
 #                 binding is confined to curl-rs-lib/src/ffi/gss.rs.
 #
-#   hickory-dns   The system resolver is the default, with hickory-dns as
-#                 an optional feature that is disabled by default. It is
-#                 deliberately absent from [workspace.dependencies] above:
-#                 whichever member gates on it declares it there as
-#                 `optional = true`, so that a default build neither
-#                 downloads nor compiles it, and it must not be pinned to a
-#                 version that raises the workspace MSRV.
+#   hickory-dns   SPECIFIED TARGET BEHAVIOUR, not delivered. The system
+#                 resolver is to be the default, with hickory-dns as an
+#                 optional feature disabled by default. The name belongs to
+#                 AAP 0.5.2's frozen vocabulary and is kept, but it is absent
+#                 from [workspace.dependencies] above for a measured reason:
+#                 the only release satisfying the 1.75 floor is
+#                 hickory-resolver 0.25.2, which pulls hickory-proto 0.25.2,
+#                 and that carries RUSTSEC-2026-0118 (recorded in the local
+#                 advisory database with `patched = []` -- no fixed version
+#                 exists at all) and RUSTSEC-2026-0119 (`patched =
+#                 [">= 0.26.1"]`). Both fixes live only in the 0.26 line,
+#                 which declares MSRV 1.88. Adding it was BUILT AND REVERTED
+#                 to confirm the diagnosis: the graph resolves and bans,
+#                 licences and sources all still pass, but `cargo deny check
+#                 advisories` goes from ok to FAILED, which is AAP 0.8.4
+#                 gate 9. Enabling the feature is therefore a hard build
+#                 failure raised by a compile_error! in
+#                 curl-rs-lib/src/lib.rs rather than a silent no-op. The DNS
+#                 note above records the full derivation; when the conflict is
+#                 decided the pin belongs HERE, per AAP 0.4.2, with
+#                 `optional = true` on the member's side.
 #
 #   memdebug      A counting GlobalAlloc reproducing the log format of
 #                 lib/memdebug.c (MEM <src>:<line> malloc(<n>) = <ptr> and
-#                 its calloc/strdup/realloc/free siblings, plus the LIMIT,
-#                 FD, FILE and ADDR records that tests/memanalyzer.pm
-#                 parses). It is needed only if the decision to withhold
+#                 its calloc/strdup/wcsdup/realloc/free siblings, plus the
+#                 LIMIT, FD, FILE and BT records that tests/memanalyzer.pm
+#                 parses). Those five are the complete set of record
+#                 prefixes: every curl_dbg_log() call site in
+#                 lib/memdebug.c was read, and `grep -c ADDR
+#                 lib/memdebug.c` returns 0 - the record at
+#                 lib/memdebug.c:136 is `BT %s:%d -- %s\n`, the
+#                 USE_BACKTRACE-gated back-trace line that
+#                 tests/memanalyzer.pm:116 matches with /^BT/ and discards.
+#                 tests/memanalyzer.pm:349 does retain a legacy ^ADDR branch,
+#                 but no emitter in the C tree ever feeds it, so naming ADDR
+#                 here would describe a record that cannot occur. The same
+#                 measurement is recorded against the code that has to
+#                 produce these bytes, in curl-rs-lib/src/ffi/sys.rs.
+#
+#                 The feature is needed only if the decision to withhold
 #                 the "Debug" feature from the version banner is reversed,
 #                 because the harness gates every allocation-cap and
 #                 leak check on that banner token. Off by default keeps
 #                 those 28 <limits> fixtures inert rather than failing.
 #
-# This vocabulary replaces 101 measured configure.ac knobs (57
-# AC_ARG_ENABLE plus 44 AC_ARG_WITH) - among them alt-svc, brotli, cookies,
-# doh, ftp, http, hsts, nghttp2, ngtcp2, nghttp3, libssh2, ntlm,
-# negotiate-auth, websockets, zlib and zstd - of which roughly ninety
-# select a capability and the remainder configure build plumbing that Cargo
-# handles natively.
-#
-# More precisely, the three separate jobs that `#include "curl_setup.h"`
-# performed in nearly every C translation unit now separate cleanly:
-#   feature selection    -> Cargo [features], resolved when the build graph
-#                           is constructed rather than by the preprocessor
-#   platform detection   -> #[cfg(target_os = ...)] / #[cfg(target_arch = ...)]
-#   shared declarations  -> ordinary `use` statements against the module
-#                           that owns each type
+# This vocabulary replaces the 101 configure.ac knobs (57 AC_ARG_ENABLE plus
+# 44 AC_ARG_WITH), of which roughly ninety select a capability and the rest
+# configure build plumbing Cargo handles natively.
 #
 # Advertising a capability that is not implemented is worse than omitting
 # one: the test harness parses the Features: and Protocols: lines of
@@ -647,18 +898,18 @@ optional = [
 
 # Continuous-integration tooling. These are installed by the workflows with
 # `cargo install --locked --version <v>`; they are NOT dependencies of any
-# crate and must never appear in [workspace.dependencies]. Pinned here so
-# that rust-coverage.yml, rust-audit.yml and rust-build.yml install exactly
-# these versions rather than whatever is newest on the day they run.
+# crate and must never appear in [workspace.dependencies]. Pinned here so that
+# each installing workflow gets exactly these versions rather than whatever is
+# newest on the day it runs. rust-audit.yml installs cargo-audit and cargo-deny
+# from these pins, and rust-coverage.yml installs cargo-llvm-cov; both
+# workflows are on disk.
 [workspace.metadata.curl-rs.ci-tools]
 cargo-llvm-cov = "0.8.7"                # >= 80% on protocols/ and transfer/
 cargo-audit = "0.22.2"                  # zero critical advisories
 cargo-deny = "0.20.2"                   # licence and duplicate-version policy
 cross = "0.2.5"                         # aarch64-unknown-linux-gnu leg
 
-# ---------------------------------------------------------------------------
 # Build profiles - deliberately conservative.
-# ---------------------------------------------------------------------------
 #
 # Performance is an explicit non-goal of this work: no latency target and no
 # throughput requirement exists anywhere in the requirements, and a change

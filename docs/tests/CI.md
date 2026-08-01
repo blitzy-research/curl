@@ -17,15 +17,28 @@ covers the retained C build:
 - it still builds fine on Windows with all supported MSVC versions
 - it follows rudimentary code style rules
 - the release tarball (the "dist") still works
+- different TLS backends and options still compile and pass tests
+
+The last item stays on this list and is not superseded. The C tree is retained
+as the reference oracle for the migration, and its matrices in `linux.yml`,
+`macos.yml`, `windows.yml` and `http3-linux.yml` still exercise OpenSSL,
+GnuTLS, wolfSSL, mbedTLS, Schannel, rustls-ffi and MultiSSL. That is a
+statement about the retained C build only. The single-rustls rule in the next
+section governs the `Rust` target, and the two do not conflict, because they
+describe two different artifacts.
 
 The release-tarball item there is specific to Autotools packaging. In the
 specified target design that distribution check is replaced rather than
 carried forward, because a `Cargo` `workspace` has no Autotools distribution
 tarball to package.
 
-The specified `Rust` target is verified for the following. Every item here
-describes target state, and none of the gates behind it is present in this
-checkout:
+The specified `Rust` target is verified for the following. All nine of the
+specified workflow files are on disk in this checkout, so every item below is
+backed by a workflow that is committed. That is not the same as an item that
+passes today: several of those gates guard parts of the target design that have
+not been built yet, and each says so where it is listed. The
+[Specified Rust workflows](#specified-rust-workflows) section records the full
+inventory and the status of each gate:
 
 - the release build of the whole `workspace` is warning-free on each of the
   four specified targets `x86_64-unknown-linux-gnu`,
@@ -38,7 +51,12 @@ checkout:
 - rustls is the sole TLS implementation at every configuration: not as a
   default, not behind a feature flag and not as a fallback. Certificate
   validation is on by default, and `--insecure` emits a warning on stderr
-  before proceeding.
+  before proceeding. The emitter behind that last requirement is delivered:
+  `curl-rs/src/output/msgs.rs` routes the warning so that no verbosity gate can
+  suppress it, and asserts as much across every combination of the silent and
+  show-error gates, for `--insecure`, `--proxy-insecure` and `--doh-insecure`
+  alike. The option parsing that would reach it is not yet on disk, so the
+  end-to-end behavior remains target state while the emitter is real.
 - every fixture eligible under the honestly advertised feature and protocol
   set passes unmodified.
 
@@ -83,10 +101,21 @@ Consider the following table while looking at pull request failures:
 | Linux / macOS / Windows / ...       | stable | all errors and failures    |
 | Fuzzer                              | stable | fuzzing results            |
 | Code analyzers                      | stable | new findings               |
-| checkdocs / checksrc / dist / ...   | stable | all errors and failures    |
+| Docs / URLs / Hygiene / ...         | stable | all errors and failures    |
 | AppVeyor                            | stable | all errors and failures    |
 | buildbot/curl_Schannel ...          | stable | all errors and failures    |
 | curl.curl (linux ...)               | stable | all errors and failures    |
+
+The `Rust` checks - `Rust build`, `Rust lint`, `Rust tests`,
+`Rust undefined behaviour`, `Rust sanitizer`, `Rust coverage`,
+`Rust supply chain`, `Rust ABI parity` and `curl test suite` - are all
+committed. Several of them are red today because they guard parts of the
+target design that have not been built yet, so a red X on one of those reports
+that condition rather than a defect in the check. The
+[Specified Rust workflows](#specified-rust-workflows) section below gives the
+inventory and says which is which. The `checksrc` and Autotools distribution
+checks that this table listed previously no longer exist as workflows; see the
+end of that same section.
 
 Sometimes the tests fail or run slowly due to a dependency service temporarily
 having issues, for example package downloads, or virtualized (non-native)
@@ -128,7 +157,7 @@ options.
 
 As of October 2025 `@bagder`, `@mback2k`, `@jay`, `@vszakats`, `@dfandrich`
 and `@danielgustafsson` have administrator access to the AppVeyor CI
-environment.  Additional admins/group members can be added on request.
+environment. Additional admins/group members can be added on request.
 
 The tests are configured in `appveyor.yml`.
 
@@ -145,46 +174,109 @@ admins/group members can be added on request.
 
 ## Specified Rust workflows
 
-The gates below are specified for the target design. None of these workflow
-files is present in this checkout, so nothing here describes a job that runs
-today. The design places one gate in one file, so that a failure names its
-own cause:
+All nine gates below are present in `.github/workflows/` and run on push and
+pull request. One gate lives in one file, so that a failure names its own
+cause.
 
-- `rust-build.yml` is specified for the release build of the whole
-  `workspace`, warning-free, across the four-target matrix.
-- `rust-clippy.yml` is specified for `cargo clippy` across the `workspace`
-  with warnings promoted to errors.
-- `rust-test.yml` is specified for the full `cargo test` run across the
-  `workspace`.
-- `rust-miri.yml` is specified for `Miri` over `curl-rs-lib`, requiring no
-  undefined behavior.
-- `rust-asan.yml` is specified for `ASan` across the `FFI` surface, requiring
-  no errors.
-- `rust-coverage.yml` is specified for `cargo llvm-cov`, requiring at least
-  80% line coverage on `curl-rs-lib/src/protocols/` and
-  `curl-rs-lib/src/transfer/`. That figure is the minimum the gate demands
-  of those two module trees, never a result claimed for the code.
-- `rust-audit.yml` is specified for a dependency advisory scan that requires
-  no critical findings, together with a policy check over dependency
-  licensing and duplicate versions.
-- `rust-abi.yml` is specified for exported-symbol parity against
-  `lib/libcurl.def`, the sole export authority, which lists exactly 100
-  names. The same gate compiles all 129 standalone programs under
-  `docs/examples/` against the generated public header. Those programs are
-  compiled and never edited.
-- `curl-testsuite.yml` is specified for the retained Perl harness driven
-  against the specified `Rust` binary through its documented
-  binary-selection option, judged by the eligible-fixture criterion above.
+Several of them are RED today, and deliberately so. Each guards a part of the
+target design that has not been built yet, and each fails with a message that
+names the missing subject rather than passing over an empty set. A gate that
+went green because the thing it measures does not exist would be worse than no
+gate at all: it would report success for work that was never done. Where a gate
+is currently red, the entry below says so and says why.
 
-Four of the checks that guard the retained C build lose their purpose once
-the build system is replaced, and the target design replaces rather than
-edits them: the comparison of the two build systems has nothing left to
-compare, the Autotools distribution check has no Autotools distribution, the
-C style check is superseded by `clippy` and `rustfmt` over `Rust` code, and
-the Windows cross-build targets a platform outside the four-target matrix.
-Each of those is a property of the specified target design.
+One committed file is deliberately absent from the nine. `hygiene.yml` is not
+one of the specified `Rust` gates, but two of its jobs reach the `Rust` target
+and it is worth naming for that reason: its `badwords` step reads
+`curl-rs-lib/src`, `curl-rs/src` and `curl-rs-ffi/src` by name, and `codespell`
+runs over every tracked file, so the prose in the `Rust` sources is gated even
+though it is not behavior; and its `checksrc` job grades the public C headers,
+eight of which `curl-rs-ffi` generates. Both are described again at the end of
+this section.
+
+- `rust-build.yml` (gate 1) builds the whole `workspace` in release mode,
+  warning-free, across the four-target matrix, and separately checks that the
+  crates still compile on the pinned minimum supported `Rust` version.
+- `rust-clippy.yml` (gate 2) runs `cargo clippy` across the `workspace` with
+  warnings promoted to errors.
+- `rust-test.yml` (gate 3) runs the full `cargo test` across the `workspace`,
+  both with default features and with all features. It enumerates the test
+  executables `cargo` plans to build and then requires every one of them to
+  appear in the run, so a suite that silently stopped being compiled cannot go
+  unnoticed. The `unsafe_boundary` and `source_policy` checks that enforce the
+  crate-level `unsafe` policy live in `#[cfg(test)]` modules, which makes them
+  this gate's responsibility rather than the build's.
+- `curl-testsuite.yml` (gate 4) drives the retained Perl harness against the
+  `Rust` binary through the harness's own `-c` binary-selection option, judged
+  by the eligible-fixture criterion above. Not one file under `tests/` is
+  modified, and the gate asserts that before and after the run. **Red today:**
+  the binary cannot yet answer `--version`, and the harness reads that output to
+  decide which fixtures are eligible, so the gate stops there with an
+  explanation instead of reporting a wall of consequential failures.
+- `rust-miri.yml` (gate 5) runs `Miri` over `curl-rs-lib`, requiring no
+  undefined behavior, on a dated nightly pinned in the workflow so that an
+  unchanged commit cannot gain or lose findings as the aliasing model evolves.
+- `rust-asan.yml` (gate 6) runs the tests under `AddressSanitizer` across the
+  `FFI` surface, requiring no errors. It re-reads the compiled test binaries and
+  requires each to carry the sanitizer runtime, so the gate cannot quietly
+  decay into a second copy of gate 3 if the instrumentation flags stop taking
+  effect.
+- `rust-abi.yml` (gate 7) checks exported-symbol parity against
+  `lib/libcurl.def`, the sole export authority, which lists exactly 100 names.
+  The comparison is symmetric: a missing symbol breaks an existing consumer, and
+  an extra one enlarges the public surface beyond curl 8.19.0-DEV. The same gate
+  compiles all 129 standalone programs under `docs/examples/` against the
+  generated public header; they are compiled and never edited. That compilation
+  is a differential -- every program is built twice, once against the committed
+  headers and once against the generated ones, and only a program that the
+  committed headers compile and the generated headers do not counts as a
+  failure. Seven of the 129 do not compile against the committed headers either,
+  for reasons belonging to the corpus rather than to this workspace, and the
+  differential subtracts them without a hand-maintained skip list.
+  **Red today, for two independent reasons:** none of the 100 symbols is
+  exported yet, and the generated header is missing whole families of type
+  declarations, so it breaks C programs that the committed header builds.
+- `rust-coverage.yml` (gate 8) runs `cargo llvm-cov` and requires at least 80%
+  line coverage on `curl-rs-lib/src/protocols/` and `curl-rs-lib/src/transfer/`.
+  That figure is the minimum the gate demands of those two module trees, never a
+  result claimed for the code. The per-tree arithmetic is computed explicitly
+  rather than delegated to a whole-workspace threshold, because a workspace total
+  can sit comfortably above 80% while either mandated tree contributes nothing at
+  all. **Red today:** neither module tree exists yet, and the gate says so rather
+  than scoring an empty set.
+- `rust-audit.yml` (gate 9) scans dependency advisories and requires no critical
+  findings, alongside a policy check over dependency licensing and duplicate
+  versions. Its accepted-advisory list is symmetric and self-expiring: an
+  advisory that is reported but not accepted fails, and so does one that is
+  accepted but no longer reported.
+
+Gate 10 of the ten, that certificate validation is on by default, is asserted by
+integration tests rather than by a workflow of its own, and therefore runs as
+part of gate 3.
+
+Four of the checks that guarded the retained C build lost their purpose once the
+build system was replaced, and they have been removed rather than edited: the
+comparison of the two build systems had nothing left to compare, the Autotools
+distribution check had no Autotools distribution, the C style check is superseded
+by `clippy` and `rustfmt` over `Rust` code, and the Windows cross-build targeted a
+platform outside the four-target matrix.
+
+The C style check is the one of those four that is superseded only in part,
+and the split matters. `scripts/checksrc-all.pl` graded two populations: the C
+implementation sources under `lib/` and `src/`, which the `Rust` tree
+supersedes, and the twelve public C headers under `include/curl/`, which it
+does not, because those headers remain the C ABI contract and eight of them
+are generated by `curl-rs-ffi`. `clippy` and `rustfmt` replace the first half
+only. The second half is graded by a `checksrc` job in `hygiene.yml`, which
+runs `scripts/checksrc.pl` over `include/curl` alone, so `scripts/checksrc.pl`
+stays on disk. That job is independent of exported-symbol parity: compiling a
+header proves it is usable, and says nothing about whether it is well-formed.
 
 The jobs described earlier on this page verify the retained C build: the
-static analysis and sanitizer jobs, the documentation and style checks, the
-distribution check, AppVeyor, the Schannel buildbot and Circle CI. None of
-them validates the specified `Rust` target.
+static analysis and sanitizer jobs, the documentation and style checks,
+AppVeyor, the Schannel buildbot and Circle CI. None of them compiles the
+specified `Rust` target. Two of them touch it without compiling it: the header
+`checksrc` job just described grades the twelve public C headers, eight of
+which `curl-rs-ffi` generates, and `hygiene.yml` runs its prose checks over
+`curl-rs-lib/src`, `curl-rs/src` and `curl-rs-ffi/src` as well as over the C
+sources.

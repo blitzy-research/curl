@@ -21,22 +21,36 @@ Display information about curl and the libcurl version it uses.
 The first line includes the full version of curl, libcurl and other 3rd party
 libraries linked with the executable.
 
-This line names the TLS library in use. This build links exactly one TLS
-implementation, `rustls`, which means no C TLS library is linked and curl
-performs no TLS backend selection at start-up.
+This line may contain one or more TLS libraries. curl can be built to support
+more than one TLS library which then makes curl - at start-up - select which
+particular backend to use for this invocation. The ones that are *not*
+selected are then listed within parentheses, and such a build also has
+`MultiSSL` set as a feature.
 
-Because a single implementation is linked, the line never lists an alternative
-backend within parentheses, and the `CURL_SSL_BACKEND` environment variable
-has no other backend to name.
+Exactly one TLS implementation is specified for this rewrite, `rustls`, with no
+C TLS library linked, so there is no start-up selection to make: nothing is
+listed within parentheses, `MultiSSL` is withheld, and the `CURL_SSL_BACKEND`
+environment variable has no other backend to name. The feature table that
+withholds `MultiSSL` is delivered in `curl-rs-lib` and its tests assert the
+withholding; the TLS backend itself, and with it the version line that would
+report the backend, are not on disk yet.
+
+Where a C build of curl names `c-ares` on this line, this build names nothing:
+it resolves with the system resolver. A build that enables the optional,
+default-off in-process resolver names `hickory-resolver` and its version in
+that position instead, so the line always states which resolver is actually
+compiled in.
 
 The second line (starts with `Release-Date:`) shows the release date.
 
 The third line (starts with `Protocols:`) shows all protocols that libcurl
-reports to support. This build transfers nine schemes and names exactly those:
-`file`, `ftp`, `ftps`, `http`, `https`, `scp`, `sftp`, `ws` and `wss`. curl
-registers 33 schemes in total and recognizes each of the other 24 when it
-parses a URL, yet withholds them from this line, and a transfer request for
-one of those schemes fails with `CURLE_UNSUPPORTED_PROTOCOL`.
+reports to support. Nine schemes are named on it here: `file`, `ftp`, `ftps`,
+`http`, `https`, `scp`, `sftp`, `ws` and `wss`. That list is delivered in
+`curl-rs-lib`, and its tests assert both the list itself and the withholding
+of every other scheme. curl registers 33 schemes in total; recognizing each of
+the remaining 24 while parsing a URL, and failing a transfer request for one of
+them with `CURLE_UNSUPPORTED_PROTOCOL`, is specified target behavior, because
+the protocol modules are not on disk yet.
 
 The fourth line (starts with `Features:`) shows specific features libcurl
 reports to offer. The sections below document the feature tokens curl knows
@@ -48,9 +62,15 @@ Support for the Alt-Svc: header is provided.
 
 ## `AsynchDNS`
 This curl uses asynchronous name resolves. This build resolves names with the
-system resolver, driven by the asynchronous runtime, rather than with c-ares,
-and `hickory-dns` is an optional alternative that stays out of the default
-build.
+system resolver, driven by the asynchronous runtime, rather than with c-ares.
+The `hickory-dns` build feature that was intended to offer an in-process
+alternative is a reserved name with no implementation: enabling it fails the
+build deliberately, because no release of the resolver crate both satisfies the
+project's minimum Rust version and carries the fix for RUSTSEC-2026-0119. The
+system resolver is therefore the only resolver in every configuration. The
+resolver modules themselves are not on disk yet, so this token is withheld from
+the reported feature set until they land -- under-reporting a capability costs a
+skipped fixture, while over-reporting one costs a failure.
 
 ## `brotli`
 Support for automatic brotli compression over HTTP(S).
@@ -63,8 +83,11 @@ conversion fall outside its supported targets, which are Linux and macOS on
 
 ## `Debug`
 This curl uses a libcurl built with Debug. This enables more error-tracking
-and memory debugging etc. For curl-developers only. This build does not report
-this feature by default.
+and memory debugging etc. For curl-developers only. This build never reports
+this feature, in any configuration. The `memdebug` build feature supplies the
+allocation log the test harness reads, but it deliberately does not turn this
+token on, because the token also promises internal behavior changes that this
+build does not make.
 
 ## `ECH`
 This feature means ECH support is present. This build does not report it,
@@ -78,9 +101,11 @@ uses no libgsasl, and the SASL protocols that library served are not
 implemented.
 
 ## `GSS-API`
-GSS-API is supported. This build reports this token only when built with its
-non-default `negotiate` feature against the GSS-API the operating system
-provides.
+GSS-API is supported. This build reports this token only when both conditions
+hold: it was built with its non-default `negotiate` feature, and a runtime
+probe finds a usable GSS-API in the operating system. A host can have the
+feature compiled in while the library itself is unusable, and reporting the
+token in that case would promise a mechanism that cannot run.
 
 ## `HSTS`
 HSTS support is present.
@@ -101,11 +126,14 @@ This curl supports IDN - international domain names.
 You can use IPv6 with this.
 
 ## `Kerberos`
-Kerberos V5 authentication is supported. This build does not report this
-feature. The FTP Kerberos level was removed in 8.17.0, which makes
+Kerberos V5 authentication is supported. Kerberos is reached through GSS-API
+here, so this token is reported only for a build made with the non-default
+`negotiate` feature, exactly as `GSS-API` and `SPNEGO` are, and then only when
+the runtime probe finds a usable GSS-API library -- one build condition and one
+runtime probe, shared by all three tokens. The FTP Kerberos level is a separate
+matter: it was removed in 8.17.0, which makes
 `CURLOPT_KRBLEVEL` return `CURLE_NOT_BUILT_IN` and leaves --krb without
-function. Kerberos through HTTP Negotiate is a separate feature, described
-under `GSS-API` and `SPNEGO`.
+function.
 
 ## `Largefile`
 This curl supports transfers of large files, files larger than 2GB.
@@ -115,8 +143,9 @@ Automatic decompression (via gzip, deflate) of compressed files over HTTP is
 supported.
 
 ## `MultiSSL`
-This feature means curl supports multiple TLS backends. This build links
-exactly one TLS implementation, `rustls`, and therefore never reports it.
+This feature means curl supports multiple TLS backends. Exactly one TLS
+implementation is specified here, `rustls`, so this token is withheld
+unconditionally and its withholding is asserted by test.
 
 ## `NTLM`
 NTLM authentication is supported.
@@ -130,15 +159,20 @@ PSL is short for Public Suffix List and means that this curl has been built
 with knowledge about "public suffixes".
 
 ## `SPNEGO`
-SPNEGO authentication is supported. This build reports this token only when
-built with its non-default `negotiate` feature against the GSS-API the
-operating system provides.
+SPNEGO authentication is supported. This build reports this token under exactly
+the conditions described under `GSS-API`, because SPNEGO is reachable only
+through GSS-API, so the two share one build condition and one runtime probe.
 
 ## `SSL`
-SSL versions of various protocols are supported, such as HTTPS and FTPS.
+SSL versions of various protocols are supported, such as HTTPS and FTPS. This
+token is reported unconditionally, because TLS is not an optional part of
+`curl-rs-lib`, while the backend that carries out those transfers is not on
+disk yet.
 
 ## `SSLS-EXPORT`
-This build supports TLS session export/import, like with the --ssl-sessions.
+This feature means the build supports TLS session export and import, like with
+the --ssl-sessions option. This token is withheld here, matching the reference
+build, where session export is off by default and documented as experimental.
 
 ## `SSPI`
 SSPI is supported. SSPI is a Windows security interface, and Windows falls

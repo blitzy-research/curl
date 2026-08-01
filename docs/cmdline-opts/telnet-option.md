@@ -17,9 +17,10 @@ Example:
 
 # `--telnet-option`
 
-This build does not implement `TELNET` transfers, so the `Protocols:` line in
-the --version output omits the scheme. curl accepts this option and parses a
-telnet URL, yet the transfer itself fails with `CURLE_UNSUPPORTED_PROTOCOL`.
+Transfers for `TELNET` are outside the specified scope of this rewrite, so the
+`Protocols:` line of the --version output withholds the scheme. Accepting this
+option and parsing a telnet URL are still specified, with the transfer itself
+then failing with `CURLE_UNSUPPORTED_PROTOCOL`.
 
 Pass options to the telnet protocol. Supported options are:
 

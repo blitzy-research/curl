@@ -2,31 +2,24 @@
 #
 # SPDX-License-Identifier: curl
 
-# ===========================================================================
 # cbindgen configuration -- the ONLY one in this workspace
-# ===========================================================================
 #
 # Role. curl-rs-ffi/build.rs loads this file and drives cbindgen 0.29.4 with
 # it to regenerate include/curl/curl.h and its generated siblings from the
-# Rust source of curl-rs-ffi. AAP 0.4.1, the authoritative enumeration, maps
-# exactly one cbindgen configuration and places it here:
-#   "curl-rs-ffi/cbindgen.toml | CREATE | include/curl/curl.h | Header
-#    generation config including the verbatim prologue required by 0.6"
-# AAP 0.3.1's workspace-root block also mentions a bare cbindgen.toml; an
-# exhaustive listing of the repository root confirmed none exists, and 0.4.1
-# governs. Do NOT add a second configuration anywhere.
+# Rust source of curl-rs-ffi. This is the only cbindgen configuration in the
+# workspace; an exhaustive listing of the repository root confirmed there is
+# no second one. Do NOT add one.
 #
-# Why this file matters more than its size suggests. AAP 0.1.2 records that
-# the direction of generation INVERTS relative to the C build: there,
-# lib/optiontable.pl read include/curl/curl.h to emit easyoptions.c
-# (lib/Makefile.am:179-180); here Rust source is the source of truth and
-# include/curl/curl.h is an OUTPUT. Everything that consumes the public
-# header therefore consumes this file's decisions -- including the 129
-# programs in docs/examples/, which AAP 0.6.4 identifies as "the gate the
-# prior attempt failed".
+# Why this file matters more than its size suggests. The direction of
+# generation INVERTS relative to the C build: there, lib/optiontable.pl read
+# include/curl/curl.h to emit easyoptions.c (lib/Makefile.am:179-180); here
+# Rust source is the source of truth and include/curl/curl.h is an OUTPUT.
+# Everything that consumes the public header therefore consumes this file's
+# decisions -- including the 129 programs in docs/examples/, which compile
+# against it and are the strictest check on it.
 #
 # Tool version. cbindgen 0.29.4, pinned once in the root manifest's
-# [workspace.dependencies] (AAP 0.5.1) and declared as this crate's only
+# [workspace.dependencies] and declared as this crate's only
 # build dependency (curl-rs-ffi/Cargo.toml [build-dependencies]). Every key
 # below was checked against that version's own schema, read from
 # cbindgen-0.29.4/src/bindgen/config.rs in the vendored registry source.
@@ -35,27 +28,6 @@
 # a silently ignored line. Measured: appending one bogus key made cbindgen
 # exit 101 with "unknown field ... expected one of ...". Never suppress such
 # a diagnostic; fix the key.
-#
-# Rules status. review_rules returns the single line "No user rules
-# provided.", read to end of document twice and byte-identical both times.
-# That corroborates AAP 0.7, which records the same result. There are no
-# user-specified rules, none are invented here, and zero files entered scope
-# by rule. The absence of rules is not permission to lower the bar:
-# enterprise-standard best practice governs.
-#
-# Provenance discipline. The preservation mandate (AAP 0.8.1), the
-# prohibitions (0.8.2), the technology directives (0.8.3), the ten
-# validation gates (0.8.4), the conflict resolutions (0.8.5), the escalated
-# ambiguities (0.8.6) and the documented deviations (0.8.7) are AAP
-# REQUIREMENTS derived from the user's request -- not user-specified rules.
-# They are binding, and they are never described as rules, because AAP 0.7
-# warns that doing so "would misrepresent where they came from and would
-# obscure the fact that the rules channel is genuinely empty."
-#
-# Evidence discipline. AAP 0.7: "Claims are evidenced, not asserted." Every
-# non-obvious statement below cites an AAP section, a repository path and
-# line, or a command that was actually run. Where a measurement contradicts
-# a received belief, the measurement is recorded and the belief corrected.
 #
 # Text hygiene, and why this file is deliberately plain ASCII.
 # scripts/spacecheck.pl walks `git ls-files` and rejects, for any path not in
@@ -79,9 +51,7 @@
 # under include/curl/ contains a three-single-quote sequence, so the literal
 # form can hold them all.
 
-# ---------------------------------------------------------------------------
 # What cbindgen CANNOT express, established before anything was configured
-# ---------------------------------------------------------------------------
 # Configuring around these four facts is the entire job of this file.
 #
 # (a) CURL_DEPRECATED sits in two positions no emitter has a mechanism for.
@@ -91,8 +61,8 @@
 #     and between a function's return type and its name:
 #         CURL_EXTERN CURLMcode CURL_DEPRECATED(7.19.5, "Use ...")
 #         curl_multi_socket(CURLM *multi_handle, curl_socket_t s, int *rh);
-#     Full attribution of all 50, measured rather than assumed, because the
-#     commonly cited list is incomplete:
+#     Full attribution of all 50, because the commonly cited list is
+#     incomplete:
 #       curl.h enums   curl_sslbackend 7, CURLformoption 18, CURLFORMcode 8,
 #                      CURLINFO 9                                     (= 42)
 #       curl.h #define :43, :58 (the two CURL_DEPRECATED definitions),
@@ -116,19 +86,21 @@
 #       include/curl/curlver.h        78  all #define, including the
 #                                         function-like CURL_VERSION_BITS and
 #                                         CURL_AT_LEAST_VERSION
-#       include/curl/typecheck-gcc.h 958  61 "#define curlcheck_" macro
-#                                         definitions among 258 total
-#                                         curlcheck_ token occurrences
-#                                         (measured; AAP 0.6.3's "258
-#                                         curlcheck_ macros" is the
-#                                         occurrence count, not the
-#                                         definition count). AAP 0.6.3:
-#                                         "cbindgen has no way to express it.
-#                                         It is carried as a hand-maintained
-#                                         header shipped verbatim beside the
-#                                         generated one, and it must remain
+#       include/curl/typecheck-gcc.h 958  61 "#define curlcheck_" directives,
+#                                         60 distinct names because
+#                                         curlcheck_cb_data is defined twice
+#                                         (once behind an #if 0). 260
+#                                         curlcheck_ token occurrences spread
+#                                         over 258 lines, and that line count
+#                                         is where the figure "258 curlcheck_
+#                                         macros" comes from: it is neither a
+#                                         macro count nor an occurrence count.
+#                                         cbindgen cannot express any of it,
+#                                         so the header is hand-maintained and
+#                                         shipped verbatim beside the
+#                                         generated one, and it must stay
 #                                         correct because the 129 example
-#                                         programs compile with it active."
+#                                         programs compile with it active.
 #     Nothing in this file names any of the four as a generation target, and
 #     build.rs carries the matching guard as a separate mandatory check.
 #
@@ -154,9 +126,7 @@
 #     `includes` and `sys_includes` lists, so no_includes is set and every
 #     include directive lives verbatim in `header`.
 
-# ---------------------------------------------------------------------------
 # Language and layout
-# ---------------------------------------------------------------------------
 
 # C, not C++. The public headers are C; C++ consumers are served by the
 # `#ifdef __cplusplus` / `extern "C" {` wrapper, which is verbatim in
@@ -180,7 +150,26 @@ language = "C"
 # today, so the gate is currently green and must stay green. The single
 # exemption is a line containing " https://", excused by checksrc.pl:588.
 # .editorconfig independently sets max_line_length = 79 for [*.{c,h}].
-line_length = 79
+#
+# The value is 70, NOT 79, and the nine-column gap is measured rather than
+# guessed. For a function-pointer typedef cbindgen weighs only the type
+# itself: it excludes the leading `typedef ` (8 columns) and the terminating
+# `;` (1). Measured with line_length = 79 and again with 78, the declaration
+#     typedef size_t (*curl_formget_callback)(void *arg, const char *buf,
+#                                             size_t len);
+# was emitted on ONE line of exactly 80 columns and tripped build.rs's
+# HEADER_MAX_COLUMNS guard, because cbindgen had weighed it as 80 - 9 = 71
+# and found 71 within budget. Lowering the budget to 40 made it wrap, which
+# confirms the setting does reach the typedef writer and that only the
+# accounting is offset. 79 - 9 = 70 is therefore the largest budget that
+# cannot emit an 80-column line.
+#
+# The guard in build.rs remains the authority and is deliberately NOT
+# relaxed: it enforces the include/curl/Makefile.am:36 rule, and
+# `awk 'length>79'` must stay at zero lines across all twelve headers. If a
+# future prototype overflows despite this budget, the guard fails the build
+# and names the line -- which is the intended behaviour, not a regression.
+line_length = 70
 
 # Two-space indentation, and no tabs anywhere. .editorconfig sets
 # indent_size = 2 for [*.{c,h}], the twelve headers all follow it, and
@@ -190,7 +179,7 @@ tab_width = 2
 # Deterministic line endings. Matches rustfmt.toml's newline_style = "Unix"
 # and satisfies spacecheck.pl, which rejects any non-LF EOL for this file
 # type. Never "native": that would make the generated header depend on the
-# machine that ran the build, and AAP 0.7 requires reproducible builds.
+# machine that ran the build, and a build must be reproducible.
 line_endings = "LF"
 
 # FALSE, and this is a measured decision rather than an omission.
@@ -232,7 +221,7 @@ cpp_compat = false
 # `trailer`, both verbatim.
 
 # #pragma once appears in none of curl's public headers. Emitting it would
-# add a non-standard directive to the frozen contract of AAP 0.8.1.
+# add a non-standard directive to a frozen contract.
 pragma_once = false
 
 # All include directives live verbatim in `header`; see limit (d). With
@@ -246,9 +235,10 @@ includes = []
 # Would emit "/* Generated with cbindgen:VERSION */" (clike.rs write_headers)
 # and "/* Package version: X */" respectively. Both change whenever a version
 # changes, producing a spurious diff in a TRACKED, REVIEWED file on every
-# build and turning the rust-abi.yml gate into noise. .gitignore deliberately
-# does not ignore include/curl/*.h, because those headers are the reviewed
-# ABI contract. AAP 0.7: "Builds are reproducible."
+# build, which would turn the header-parity gate in
+# .github/workflows/rust-abi.yml into noise. .gitignore deliberately does not
+# ignore include/curl/*.h, because those headers are the reviewed ABI contract,
+# and a build must be reproducible.
 include_version = false
 package_version = false
 
@@ -309,8 +299,7 @@ documentation_length = "full"
 # Left at the default (false). Fetching sources for dependencies on all
 # targets is what lets cbindgen resolve a type defined behind a #[cfg] on
 # another target; restricting it could silently drop a declaration from the
-# public header, which AAP 0.8.1 forbids. Recorded explicitly so the value
-# reads as a decision.
+# public header, and the public header is frozen.
 only_target_dependencies = false
 
 # Deterministic by construction: no date, no time, no cbindgen version, no
@@ -326,14 +315,11 @@ autogen_warning = '''
    The source of truth is the Rust crate curl-rs-ffi; for the option
    identifiers and their metadata it is curl-rs-ffi/src/ffi/opts.rs, and
    for the error codes it is curl-rs-ffi/src/ffi/codes.rs. */'''
-# ---------------------------------------------------------------------------
-# `header` -- the verbatim prologue, curl.h:1-148 byte for byte
-# ---------------------------------------------------------------------------
-# AAP 0.6.3 asks for "a verbatim header prologue pinning these five
-# declarations exactly as the C headers spell them". In practice the prologue
-# is far larger than five typedefs, because everything cbindgen cannot express
-# has to live here. The eleven blocks below are curl.h lines 1 through 148
-# reproduced without a byte changed, in curl.h's own order:
+# `header` -- the verbatim prologue, curl.h:1-148 byte for byte The prologue has
+# to pin the five handle declarations exactly as the C headers spell them, and
+# in practice it is far larger than five typedefs, because everything cbindgen
+# cannot express has to live here. The eleven blocks below are curl.h lines 1
+# through 148 reproduced without a byte changed, in curl.h's own order:
 #
 #   (1)  :1-2     include guard open -- see limit (c); NOT include_guard
 #   (2)  :3-25    the 23-line boxed banner, carrying the ASCII curl logo, the
@@ -371,10 +357,10 @@ autogen_warning = '''
 #   (7)  :65-103  the ten platform-guarded system includes -- see limit (d).
 #   (8)  :105-107 the extern "C" open -- see cpp_compat above for why this is
 #                 verbatim rather than generated.
-#   (9)  :109-110 TWO OF THE FIVE HANDLE DECLARATIONS, and AAP 0.6.3's
-#                 central finding. `typedef void CURL;` and
-#                 `typedef void CURLSH;` are void, NOT opaque structs. AAP
-#                 0.6.3: "cbindgen's natural output for an opaque Rust type
+#   (9)  :109-110 TWO OF THE FIVE HANDLE DECLARATIONS, and the reason this
+#                 prologue exists. `typedef void CURL;` and
+#                 `typedef void CURLSH;` are void, NOT opaque structs.
+#                 cbindgen's natural output for an opaque Rust type
 #                 is `typedef struct X X;`, which diverges from all three and
 #                 changes the type of every handle-passing call. Consumers
 #                 that assign a `CURL *` to a `void *` -- a widespread idiom,
@@ -404,8 +390,8 @@ autogen_warning = '''
 #                 CURL_SOCKET_BAD to match, all behind its own idempotence
 #                 guard.
 #
-# DELIBERATELY NOT HERE, and this is the documented choice AAP asks for: the
-# CURLOPTTYPE_* bases and the CURLOPT / CURLOPTDEPRECATED generator macros.
+# DELIBERATELY NOT HERE, and the reason is recorded so the omission reads as a
+# choice: the CURLOPTTYPE_* bases and the CURLOPT / CURLOPTDEPRECATED macros.
 # They sit at curl.h:1109-1136, roughly a thousand lines into the body and
 # immediately before the CURLoption enum at :1142 that they spell. Hoisting
 # them into the prologue would move them and break byte-fidelity for no gain,
@@ -427,12 +413,12 @@ autogen_warning = '''
 #     #define CURLOPTTYPE_SLISTPOINT  CURLOPTTYPE_OBJECTPOINT
 #     #define CURLOPTTYPE_CBPOINT     CURLOPTTYPE_OBJECTPOINT
 #     #define CURLOPTTYPE_VALUES      CURLOPTTYPE_LONG
-# The arithmetic those five bases define is not decoration. AAP 0.6.2: "the
-# option identifier already encodes the argument's type class" -- integer
-# division of an option value by 10000 recovers its base -- and "the
-# arithmetic encoding that looks like a historical curiosity is precisely
-# what makes the design type-safe." It is what lets the single-trailing-
-# pointer setters described under [fn] be sound.
+# The arithmetic those five bases define is not decoration: the option
+# identifier already encodes the argument's type class, since integer division
+# of an option value by 10000 recovers its base. That encoding looks like a
+# historical curiosity and is in fact what makes the design type-safe. It is
+# what lets the single-trailing-pointer setters described under [fn] be
+# sound.
 #
 # The string below MUST NOT end with a newline: cbindgen writes `header` and
 # then calls new_line() itself, so a trailing newline here would produce a
@@ -587,9 +573,7 @@ typedef int curl_socket_t;
 #endif
 #define curl_socket_typedef
 #endif /* curl_socket_typedef */'''
-# ---------------------------------------------------------------------------
 # `trailer` -- the verbatim epilogue, curl.h:3308-3344 byte for byte
-# ---------------------------------------------------------------------------
 # Four blocks, in curl.h's own order. Line numbers were measured, not
 # inherited: the extern "C" close is at :3308-3310, one line earlier than is
 # commonly cited.
@@ -620,7 +604,7 @@ typedef int curl_socket_t;
 #                   parameter list is spelled `(handle,opt,param)` with NO
 #                   spaces after the commas, unlike the other three. It is
 #                   reproduced exactly, because normalising it would be an
-#                   unrequested change to a frozen file (AAP 0.8.1).
+#                   unrequested change to a frozen file.
 #   (4) :3343-3344  a blank line, then the guard close
 #                   `#endif /* CURLINC_CURL_H */`.
 #
@@ -674,18 +658,15 @@ trailer = '''
 
 #endif /* CURLINC_CURL_H */'''
 
-# ---------------------------------------------------------------------------
 # [parse] -- read this crate and nothing else
-# ---------------------------------------------------------------------------
 [parse]
 # false, and this is the mechanism that gives internal linkage real
 # enforcement. cbindgen must not walk into curl-rs-lib, whose internals are
-# pub(crate) and must never reach the public header. AAP 0.4.2 contrasts the
-# two regimes directly: C declares internals extern in a header and relies on
-# a Curl_ prefix so they are "private by convention, visible to the linker",
-# whereas Rust makes them "private by enforcement --
-# pub(crate) fn cf_setup_insert_after(...)". Parsing dependencies would
-# quietly undo that and leak engine types into the ABI contract.
+# pub(crate) and must never reach the public header. C declares internals
+# extern in a header and relies on a Curl_ prefix, so they are private by
+# convention but visible to the linker; Rust makes them private by
+# enforcement. Parsing dependencies would quietly undo that and leak engine
+# types into the ABI contract.
 parse_deps = false
 # Belt and braces. With parse_deps false this list is inert, but it is
 # declared so that flipping that flag cannot silently pull either of this
@@ -696,39 +677,35 @@ exclude = ["curl-rs-lib", "libc"]
 [parse.expand]
 # Empty on purpose. Macro expansion runs `cargo expand`, which requires a
 # nightly toolchain, and rust-toolchain.toml pins the workspace to stable
-# 1.97.1. Enabling it would break every build on the pinned toolchain and
-# would make the generated header depend on a compiler this project does not
-# ship with. Nothing in curl-rs-ffi's public surface is macro-generated: the
-# option identifiers come from an ordinary const table in
-# curl-rs-ffi/src/ffi/opts.rs, which AAP 0.1.2 requires to be the SINGLE
-# source of truth for both the generated enumeration and the
-# curl_easy_option_by_name / _by_id / _next introspection API backed by
-# struct curl_easyoption (include/curl/options.h:51-56). Two populations of
-# that data would drift, and the drift would be invisible until a consumer
-# looked an option up by name and got the wrong identifier.
+# 1.97.1. Enabling it would break every build on the pinned toolchain and would
+# make the generated header depend on a compiler this project does not ship
+# with. Nothing in curl-rs-ffi's public surface is macro-generated: the option
+# identifiers come from an ordinary const table in curl-rs-ffi/src/ffi/opts.rs,
+# which must be the SINGLE source of truth for both the generated enumeration
+# and the curl_easy_option_by_name / _by_id / _next introspection API backed by
+# struct curl_easyoption (include/curl/options.h:51-56). Two populations of that
+# data would drift, and the drift would be invisible until a consumer looked an
+# option up by name and got the wrong identifier.
 crates = []
 
-# ---------------------------------------------------------------------------
 # [defines] -- deliberately EMPTY, and that is a decision
-# ---------------------------------------------------------------------------
 # This table maps Rust cfg predicates onto C preprocessor symbols so that a
 # conditionally compiled item is emitted inside an #ifdef. Not one entry is
 # justified here, for a reason that goes to the heart of the contract:
 #
-#   AAP 0.8.1 freezes the libcurl API, including "the integer value behind
-#   every public enumerator". A [defines]-driven #ifdef would make the public
-#   header vary with build configuration, so the same header would describe
-#   different ABIs depending on which features were selected. That is exactly
-#   what the preservation mandate forbids.
+#   The libcurl API is frozen, including the integer value behind every
+#   public enumerator. A [defines]-driven #ifdef would make the public header
+#   vary with build configuration, so the same header would describe
+#   different ABIs depending on which features were selected.
 #
-#   AAP 0.2.2 makes the case concrete. The 24 unimplemented schemes are "out
-#   of scope for implementation but not for the ABI": their CURLPROTO_*
+#   The concrete case is the 24 unimplemented schemes: out of scope for
+#   implementation but NOT for the ABI. Their CURLPROTO_*
 #   constants (curl.h:1080-1107) and the stub schemes' CURLoption entries
 #   must appear UNCONDITIONALLY, and a request for one of them returns
 #   CURLE_UNSUPPORTED_PROTOCOL at run time. Honest reporting happens through
 #   the Protocols: line of curl --version, which the harness parses, NOT
-#   through #ifdefs in the header. Handled that way, AAP 0.6.5 measured that
-#   283 fixtures skip cleanly; handled with #ifdefs, consumers would compile
+#   through #ifdefs in the header. Handled that way, 283 fixtures skip
+#   cleanly; handled with #ifdefs, consumers would compile
 #   against a header that silently lost declarations.
 #
 # The fifteen Cargo features (curl-rs-ffi/Cargo.toml [features]) are all pure
@@ -738,21 +715,19 @@ crates = []
 # error to report rather than to encode here.
 [defines]
 
-# ---------------------------------------------------------------------------
 # [export] -- partition the surface; keep cbindgen away from what it cannot
 #             express
-# ---------------------------------------------------------------------------
 [export]
 # Six kinds, and the two omissions are the load-bearing part.
 #
 #   OMITTED "globals". Measured: lines 2-101 of lib/libcurl.def contain 100
 #   names and every one is a function; zero data symbols are exported. The
-#   symbol-parity gate of AAP 0.8.4 looks for text symbols
-#   (nm -D --defined-only ... | grep ' T curl_'). Allowing globals could only
-#   ever add a symbol that fails that comparison.
+#   symbol-parity gate looks for text symbols (nm -D --defined-only ... | grep '
+#   T curl_'). Allowing globals could only ever add a symbol that fails that
+#   comparison.
 #
-#   OMITTED "opaque". This is the mechanical guard for AAP 0.6.3's central
-#   finding. cbindgen renders an opaque Rust type as `typedef struct X X;`.
+#   OMITTED "opaque". This is the mechanical guard for the handle-typedef
+#   problem. cbindgen renders an opaque Rust type as `typedef struct X X;`.
 #   For CURL, CURLM and CURLSH that is simply wrong -- they are
 #   `typedef void` (curl.h:109, curl.h:110, multi.h:57) -- and for CURLU it
 #   is wrong in a subtler way, because urlapi.h:107 spells it
@@ -780,9 +755,25 @@ item_types = ["enums", "structs", "unions", "typedefs", "constants", "functions"
 # a consumer uses it.
 #
 # The list is therefore complete rather than minimal: it names every one of
-# curl's public enums that is NOT excluded. Measured: 31 declarations of the
-# form `} NAME;` close an anonymous typedef under include/curl/, five are
-# excluded below, and these are the remaining 26.
+# curl's public enums that is NOT excluded, and every generated callback
+# typedef. Measured against the twelve frozen headers: 35 declarations of the
+# form `} NAME;` close an anonymous `typedef enum`, five are excluded below
+# (CURLFORMcode, CURLINFO, CURLformoption, CURLoption, curl_sslbackend), and
+# these are the remaining 30.
+#
+# CORRECTED. This comment previously read "31 declarations ... these are the
+# remaining 26", which was wrong twice over: the true total is 35, and
+# curlfiletype, curliocmd, curlioerr and curlsocktype appeared in NEITHER
+# list, so the "complete" claim was false and those four enums were silently
+# absent from the generated header. They are included below.
+#
+# The 34 callback typedefs are listed for the same reason as the enums: with
+# no exported prototypes referencing them yet, none is reachable from an
+# exported signature, so each would be omitted. The 35th public callback,
+# curl_sshkeycallback, is deliberately NOT here -- its fourth parameter is
+# `enum curl_khmatch`, a bare enum tag the authority never typedefs, and
+# cbindgen emits only anonymous `typedef enum { .. } NAME;` so it declares no
+# tag to refer to. That one prototype is verbatim in build.rs.
 include = [
   "CURLcode",
   "CURLHcode",
@@ -810,15 +801,53 @@ include = [
   "curl_proxytype",
   "curl_TimeCond",
   "curl_usessl",
+  "curlfiletype",
+  "curliocmd",
+  "curlioerr",
+  "curlsocktype",
+
+  # The 34 generated callback typedefs (see the note above).
+  "curl_calloc_callback",
+  "curl_chunk_bgn_callback",
+  "curl_chunk_end_callback",
+  "curl_closesocket_callback",
+  "curl_conv_callback",
+  "curl_debug_callback",
+  "curl_fnmatch_callback",
+  "curl_formget_callback",
+  "curl_free_callback",
+  "curl_hstsread_callback",
+  "curl_hstswrite_callback",
+  "curl_ioctl_callback",
+  "curl_lock_function",
+  "curl_malloc_callback",
+  "curl_multi_timer_callback",
+  "curl_notify_callback",
+  "curl_prereq_callback",
+  "curl_progress_callback",
+  "curl_push_callback",
+  "curl_read_callback",
+  "curl_realloc_callback",
+  "curl_resolver_start_callback",
+  "curl_seek_callback",
+  "curl_socket_callback",
+  "curl_sockopt_callback",
+  "curl_sshhostkeycallback",
+  "curl_ssl_ctx_callback",
+  "curl_strdup_callback",
+  "curl_trailer_callback",
+  "curl_unlock_function",
+  "curl_write_callback",
+  "curl_xferinfo_callback",
 ]
 
 # Everything cbindgen must not emit, grouped by the reason it cannot. Each
-# group carries its justification, because AAP 0.7 treats the ABI as a
-# contract and an unexplained exclusion is precisely how a declaration
-# disappears from it unnoticed. The names are the C names cbindgen would
+# group carries its justification, because the ABI is a contract and an
+# unexplained exclusion is precisely how a declaration disappears from it
+# unnoticed. The names are the C names cbindgen would
 # emit; no renaming is configured, so they are also the Rust names.
 #
-# GROUP 1 -- the five handle declarations, pinned verbatim (AAP 0.6.3).
+# GROUP 1 -- the five handle declarations, pinned verbatim.
 #   CURL, CURLSH   curl.h:109-110, `typedef void`
 #   CURLM          multi.h:57, `typedef void`
 #   CURLU          urlapi.h:107, `typedef struct Curl_URL CURLU;`
@@ -833,9 +862,9 @@ include = [
 #
 # GROUP 3 -- the five enums whose members carry CURL_DEPRECATED between the
 # enumerator name and its value. The reason is sharper than "cbindgen has no
-# mechanism", and it was measured rather than assumed. cbindgen 0.29.4 DOES
-# have a mechanism -- [enum] deprecated_variant_with_note -- and it places
-# the attribute in exactly the right position:
+# mechanism". cbindgen 0.29.4 DOES have a mechanism -- [enum]
+# deprecated_variant_with_note -- and it places the attribute in exactly the
+# right position:
 #     CURLE_OBSOLETE20 CURL_DEPRECATED(8.3.0, "8.3.0") = 20,
 # It still cannot be used, for two reasons found by reading
 # cbindgen-0.29.4/src/bindgen/ir/annotation.rs:70-100 and confirming the
@@ -865,9 +894,9 @@ include = [
 #
 # GROUP 5 -- the prototypes. Two overlapping problems, both measured:
 #   Variadic:    cbindgen will not emit `...` from a non-variadic Rust
-#                function, and AAP 0.6.2 measured that a genuinely
-#                C-variadic extern "C" Rust function fails on stable with
-#                error[E0658] (tracking issue 44930). The Rust side is
+#                function, and a genuinely C-variadic extern "C" Rust
+#                function fails on stable with error[E0658] (tracking
+#                issue 44930). The Rust side is
 #                therefore non-variadic with a single trailing *mut c_void
 #                and C calls it through the variadic prototype in the header.
 #   Decorated:   [fn] deprecated_with_note emits the attribute BEFORE the
@@ -927,18 +956,71 @@ exclude = [
   # Group 5b: variadic AND CURL_DEPRECATED (curl.h:2632-2635)
   "curl_formadd",
   # Group 5c: CURL_DEPRECATED after the return type (curl.h:2658, curl.h:2668,
-  # multi.h:317, multi.h:325). AAP 0.8.2 forbids removing a deprecated
-  # exported symbol, so all four stay DECLARED -- verbatim, with their
+  # multi.h:317, multi.h:325). A deprecated exported symbol may not be
+  # removed, so all four stay DECLARED -- verbatim, with their
   # attribute intact -- and all four remain in the 100-symbol parity set.
   "curl_formget",
   "curl_formfree",
   "curl_multi_socket",
   "curl_multi_socket_all",
+  # Group 5e: twelve prototypes whose FROZEN signature names a type that this
+  # crate's Rust spelling cannot ask cbindgen to produce. All four reasons were
+  # measured against the generated output and against gcc; none is a matter of
+  # taste, and AAP 0.8.1 freezes parameter lists and return types, so the
+  # frozen declaration is carried verbatim instead.
+  #
+  #   REASON 1 -- an enum where the Rust parameter or return must be a plain
+  #   integer. Measured against the frozen libcurl.so.4.8.0: curl_easy_strerror
+  #   answers for -2, curl_easy_option_by_id answers for 0, -1, 99999 and
+  #   INT_MAX, and curl_version_info answers for values that are not CURLversion
+  #   variants. A C caller may therefore legally pass any int, and materialising
+  #   such a value in a Rust #[repr(C)] enum parameter is undefined behaviour.
+  #   cbindgen has no directive that declares a parameter as an enum type while
+  #   the Rust type is an integer, so it emitted `int error` for the four
+  #   strerror functions, `int` returns for curl_global_init and
+  #   curl_global_init_mem, `int id` for curl_easy_option_by_id and
+  #   `int stamp` for curl_version_info.
+  #
+  #   REASON 2 -- a tag-form struct in the signature. curl_easyoption is already
+  #   excluded above (group 4) because curl.h declares it with a tag and no
+  #   typedef, so cbindgen rendered the three introspection prototypes as
+  #   `const curl_easyoption *`, which is not a valid C type name without the
+  #   `struct` keyword and which gcc rejects outright.
+  #
+  #   REASON 3 -- a leaked internal type. The frozen curl_getdate returns
+  #   `time_t`; the engine's type is i64, and cbindgen emitted
+  #   `typedef int64_t TimeT;` into the public curl.h along with
+  #   `TimeT curl_getdate(...)`. That adds a new public type to a frozen ABI.
+  #   Excluding the prototype removes the typedef with it, because no other
+  #   exported signature references it.
+  #
+  #   REASON 4 -- const qualification. curl_global_sslset's out-parameter is
+  #   `const curl_ssl_backend ***avail` in the frozen header; cbindgen emitted
+  #   `const curl_ssl_backend *const **avail`, which is a qualification
+  #   mismatch at every call site.
+  #
+  # The symbols themselves are still defined and exported by this crate; only
+  # the DECLARATION is hand-written. `check_export_coverage` in build.rs counts
+  # them as verbatim, and VERBATIM_FUNCTIONS is 31 rather than 19 because of
+  # these twelve.
+  "curl_easy_strerror",
+  "curl_multi_strerror",
+  "curl_share_strerror",
+  "curl_url_strerror",
+  "curl_global_init",
+  "curl_global_init_mem",
+  "curl_global_sslset",
+  "curl_getdate",
+  "curl_version_info",
+  "curl_easy_option_by_name",
+  "curl_easy_option_by_id",
+  "curl_easy_option_next",
   # Group 5d: the ten mprintf prototypes, every one carrying
   # CURL_TEMP_PRINTF(n, m) on the next line; five are variadic and five take
   # a va_list, which would additionally require the <stdarg.h> that
   # no_includes suppresses (mprintf.h:56-79)
   "curl_mprintf",
+  "curl_off_t",
   "curl_mfprintf",
   "curl_msprintf",
   "curl_msnprintf",
@@ -956,9 +1038,9 @@ exclude = [
 # `renaming_overrides_prefixing` is absent for the same reason: with no
 # prefix and no renaming there is nothing for it to arbitrate.
 #
-# No [export.rename] table and no [export.mangle] table. AAP 0.8.1 freezes
-# every exported name and AAP 0.8.4 gate 7 asserts the set by nm parity
-# against lib/libcurl.def, so not one of the 100 functions may be renamed. No
+# No [export.rename] table and no [export.mangle] table. Every exported name
+# is frozen and the set is asserted by nm parity against lib/libcurl.def, so
+# not one of the 100 functions may be renamed. No
 # legitimate case exists in this crate either: curl-rs-ffi/src/ffi/*.rs
 # spells each item with its C name, which is what makes the `exclude` list
 # above readable as C names.
@@ -973,14 +1055,12 @@ exclude = [
 # `trailer` are applied. The four headers named as non-targets in limit (b)
 # are never written by any of those passes.
 
-# ---------------------------------------------------------------------------
 # [enum] -- integer exactness is the entire point
-# ---------------------------------------------------------------------------
-# AAP 0.6.1: "A C program compiled against curl 8.x embeds the numeric value
-# of every enumerator it uses. Reproducing the names without the numbers
-# produces a library that links and then misbehaves -- an error compared
-# against CURLE_SSL_CONNECT_ERROR matches a different condition entirely,
-# with no diagnostic anywhere."
+# A C program compiled against curl 8.x embeds the numeric value of every
+# enumerator it uses. Reproducing the names without the numbers produces a
+# library that links and then misbehaves: an error compared against
+# CURLE_SSL_CONNECT_ERROR matches a different condition entirely, with no
+# diagnostic anywhere.
 #
 # The facts every emitted enum must satisfy, all measured in this tree so a
 # reviewer can check them from here:
@@ -999,11 +1079,12 @@ exclude = [
 #   CURLE_OBSOLETE20/24/29/32/34/40/41/44/46/50/51/57/62/75/76 -- and every
 #   one must be present, because omitting a single placeholder shifts every
 #   later code by one. ORDINAL INFERENCE IS PROHIBITED:
-#   curl-rs-ffi/src/ffi/codes.rs writes all 103 discriminants explicitly and
-#   cbindgen must emit them explicitly, which it does when the Rust
-#   discriminants are explicit. Do not be misled by the four further
-#   CURLE_OBSOLETE10/12/16 names near curl.h:660-664: those are back-compat
-#   #defines OUTSIDE the enum and are not placeholders within it.
+#   curl-rs-ffi/src/ffi/codes.rs is to write all 103 discriminants
+#   explicitly, and cbindgen then emits them explicitly, which it does
+#   whenever the Rust discriminants are explicit. Do not be misled by the
+#   four further CURLE_OBSOLETE10/12/16 names near curl.h:660-664: those
+#   are back-compat #defines OUTSIDE the enum and are not placeholders
+#   within it.
 #
 # CURLoption -- excluded above, but its arithmetic is recorded here because
 #   the same table drives the introspection API. Measured: 291 `CURLOPT(`
@@ -1022,9 +1103,9 @@ exclude = [
 #   CURLOPT_HEADERDATA (:727), and so on to CURLOPT_RTSPHEADER at :2306.
 #
 # curl_sslbackend -- excluded above; 15 members explicitly numbered 0 to 14,
-#   with CURLSSLBACKEND_RUSTLS = 14 at curl.h:166. AAP 0.1.1 G4 relies on
-#   that value already existing, so curl_global_sslset reports a rustls
-#   backend without inventing an enumerant.
+#   with CURLSSLBACKEND_RUSTLS = 14 at curl.h:166. That value already
+#   exists, so curl_global_sslset reports a rustls backend without inventing
+#   an enumerant.
 #
 # CURLMcode -- generated, and its FIRST discriminant is NEGATIVE:
 #   CURLM_CALL_MULTI_PERFORM = -1 at multi.h:60, with CURLM_OK = 0 next.
@@ -1070,15 +1151,13 @@ private_default_tagged_enum_constructor = false
 # set explicitly so the value reads as a decision rather than a default.
 enum_class = false
 # No variant renaming is configured anywhere in this table. The key that
-# would do it is absent by design: every enumerator name is frozen by
-# AAP 0.8.1, and a renamed enumerator is an ABI break that compiles.
+# would do it is absent by design: every enumerator name is frozen, and a
+# renamed enumerator is an ABI break that compiles.
 # `cast_assert_name`, `must_use`, `deprecated`, `deprecated_variant` and the
 # two *_with_note formats are likewise absent -- see GROUP 3 above for the
 # measured reason the deprecation formats cannot be used.
 
-# ---------------------------------------------------------------------------
 # [struct] -- no operators, no constructors, nothing C would not accept
-# ---------------------------------------------------------------------------
 # Every one of curl's 18 public structs is excluded above, so this table
 # governs nothing today. It is declared in full anyway, because the defaults
 # it pins are what keep a future addition from silently emitting C++ into a C
@@ -1098,10 +1177,10 @@ enum_class = false
 # Consumers write msg->data.result directly, so the field name `data` and
 # BOTH union member names `whatever` and `result` are part of the ABI.
 # cbindgen names anonymous unions itself, so the shape is not reproducible;
-# the struct is pinned verbatim in the multi.h prologue instead. AAP 0.6.3
-# requires the layout be "asserted by test", which a #[cfg(test)] module in
-# curl-rs-ffi/src/ffi/handle.rs does by checking size_of, align_of and every
-# field offset.
+# the struct is pinned verbatim in the multi.h prologue instead. Its layout
+# must be asserted by test, which a #[cfg(test)] module in
+# curl-rs-ffi/src/ffi/handle.rs is to do by checking size_of, align_of and
+# every field offset.
 #
 # The other 17 are curl_blob (easy.h:34-38, with CURL_BLOB_COPY 1 and
 # CURL_BLOB_NOCOPY 0 at easy.h:31-32), curl_slist, curl_waitfd
@@ -1112,10 +1191,9 @@ enum_class = false
 # curl_version_info_data, curl_ssl_backend, curl_header, curl_ws_frame,
 # curl_easyoption, curl_hstsentry and curl_index.
 #
-# curl_slist KEEPS ITS C SHAPE ONLY AT THE BOUNDARY. AAP 0.1.2 and AAP 0.6.9
-# are explicit that internally it is a Vec: the intrusive linked list is one
-# of the constructs the rewrite exists to remove. Nothing should try to make
-# the header describe the internal representation.
+# curl_slist KEEPS ITS C SHAPE ONLY AT THE BOUNDARY. Internally it is a Vec: the
+# intrusive linked list is one of the constructs the rewrite exists to remove.
+# Nothing should try to make the header describe the internal representation.
 [struct]
 derive_constructor = false
 derive_eq = false
@@ -1132,9 +1210,7 @@ associated_constants_in_body = false
 # proves. `must_use`, `deprecated`, `deprecated_with_note` and
 # `rename_associated_constant` are absent for want of any use.
 
-# ---------------------------------------------------------------------------
 # [fn] -- prototypes
-# ---------------------------------------------------------------------------
 [fn]
 # YES, THIS WORKS, and it answers the one open question this file was asked
 # to settle. Verified by building a crate and running cbindgen 0.29.4: the
@@ -1147,10 +1223,9 @@ associated_constants_in_body = false
 # decoration -- an undecorated prototype would fail to import correctly on
 # Windows and would differ from the frozen declaration.
 #
-# MEASURED LIMIT, recorded rather than glossed. write_function_with_layout
-# emits the prefix and then calls write_space(), which writes a NEWLINE when
-# the layout is Vertical. So a prototype too long for `line_length` comes out
-# as
+# MEASURED LIMIT. write_function_with_layout emits the prefix and then calls
+# write_space(), which writes a NEWLINE when the layout is Vertical. So a
+# prototype too long for `line_length` comes out as
 #     CURL_EXTERN
 #     CURLcode curl_easy_ssls_export(CURL *handle,
 #                                    curl_ssls_export_cb *export_fn,
@@ -1191,8 +1266,8 @@ sort_by = "None"
 #     CURL_EXTERN CURLSHcode curl_share_setopt(CURLSH *share,
 #                                              CURLSHoption option, ...);
 # (easy.h:42, easy.h:59, multi.h:429-430, curl.h:3080-3081; the two-line
-# spellings there are curl.h's own wrapping.) AAP 0.6.2 measured that the
-# Rust side must be NON-variadic, taking one trailing *mut c_void, because a
+# spellings there are curl.h's own wrapping.) The Rust side must be
+# NON-variadic, taking one trailing *mut c_void, because a
 # true C-variadic extern "C" Rust function fails on stable rustc with
 # error[E0658] (tracking issue 44930); C then calls it through the variadic
 # prototype above. That was proven end to end -- a C driver compiled against
@@ -1203,28 +1278,40 @@ sort_by = "None"
 # encodes the argument's type class, so integer division of the option value
 # by 10000 recovers its CURLOPTTYPE_* base before the slot is read.
 #
-# 32-BIT PORTABILITY IS DELIBERATELY FORFEITED AND MUST NOT BE CLAIMED
-# (AAP 0.6.2): a single register-width slot holds a curl_off_t only where
-# off_t fits a register, and all four mandated targets are 64-bit.
+# 32-BIT PORTABILITY IS DELIBERATELY FORFEITED AND MUST NOT BE CLAIMED: a
+# single register-width slot holds a curl_off_t only where off_t fits a
+# register, and all four mandated targets are 64-bit.
 #
-# ESCALATED, AAP 0.8.6 A4, and NOT silently accepted. On
+# ESCALATED AND ENFORCED BY A HARD BUILD FAILURE, never silently accepted. On
 # aarch64-apple-darwin -- one of the four required targets -- Apple's arm64
 # ABI passes variadic arguments ON THE STACK, while the non-variadic Rust
 # callee reads register x2 (measured codegen: "mov x0, x2; ret"). Caller and
-# callee would disagree and, in AAP 0.6.2's words, "The failure is silent."
+# callee would disagree, and the failure is SILENT.
 # The remedy is c_variadic, whose current API is ap.next_arg::<T>() with
 # VaArgSafe sealed and NOT implemented for raw pointers (which must be read
 # as usize and cast); it is stable only on nightly 1.99 and so exceeds the
 # mandated MSRV 1.75. Two of the user's own requirements cannot both be met
 # by any implementation. The three options -- raise the MSRV, drop that
 # target, or accept that one target's varargs entry points are unsupported --
-# are all user decisions, and AAP 0.6.2 calls silent acceptance "the worst
-# option", which is why it is written down at the file that pins the
-# prototypes.
+# are all user decisions.
+#
+# Silent acceptance is the worst of them, so it is impossible rather than
+# merely discouraged. build.rs's check_variadic_abi REFUSES to build for
+# aarch64-apple-darwin unless the decision is on record as
+# CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs, and it refuses on
+# ANY target if src/ffi/printf.rs or src/ffi/form.rs appears while the
+# decision is unrecorded -- those two own the eleven exports (the ten
+# curl_m*printf forms and curl_formadd) that have no ABI-correct expression
+# at MSRV 1.75 on any target at all. A cargo:warning would not have been
+# enough: it is not a refusal, and the build gate requires a warning-free
+# build, so a permanent warning is one that is either suppressed or scrolled
+# past. The one warning the gate does emit fires only where the recorded
+# acceptance actually suppressed a refusal, so the three targets whose
+# variadic ABI is sound stay warning-free and that gate keeps meaning
+# something. This file pins the prototypes; build.rs stops the build. Neither
+# may be changed without the other.
 
-# ---------------------------------------------------------------------------
 # [const] -- #define, never static const
-# ---------------------------------------------------------------------------
 # Verified by running it: with both allow_* false, a public Rust const emits
 # as `#define NAME value`, which is curl.h's own form. With
 # allow_static_const true it would become a `static const` definition in a
@@ -1257,9 +1344,7 @@ allow_static_const = false
 allow_constexpr = false
 sort_by = "None"
 
-# ---------------------------------------------------------------------------
 # Tables deliberately absent, so nothing is added back by accident
-# ---------------------------------------------------------------------------
 # [layout] -- `packed` and `aligned_n` would stamp a packing or alignment
 #   attribute on every generated struct. curl's public structs use the
 #   platform's natural layout, and forcing either would change the ABI of
@@ -1278,3 +1363,35 @@ sort_by = "None"
 # `after_includes` -- unused: with no_includes set there is no include
 #   section for it to follow, and everything it might carry is already in the
 #   verbatim prologue in its correct position.
+
+# [export.rename] -- spell tag-only structs with the `struct` keyword
+#
+# NECESSARY, and proven so rather than assumed. These five structs are
+# declared in the frozen headers in TAG form only --  `struct curl_slist { .. };`
+# -- and are never typedef'd, so the bare name is not a type in C. Measured
+# with gcc against the frozen headers:
+#
+#     typedef CURLSTScode (*probe)(CURL *easy, curl_hstsentry *e, void *userp);
+#     error: unknown type name 'curl_hstsentry'
+#
+# With `style = "type"` cbindgen refers to a struct by its bare name, which
+# produced exactly that invalid C in five generated callback prototypes
+# (curl_hstsread_callback, curl_hstswrite_callback, curl_trailer_callback,
+# curl_push_callback and curl_opensocket_callback). The header still compiled
+# as far as the build script was concerned -- the Rust built, every count
+# matched and the column guard passed -- so nothing but compiling the emitted
+# C could have caught it.
+#
+# Renaming the referenced type to include the keyword is the narrowest fix.
+# `style` is global: switching it to "tag" or "both" would also change how the
+# 19 generated enums are declared, and their `typedef enum { .. } NAME;` form
+# is already verified EXACT against the authority on name, value and order.
+#
+# curl_khkey is tag-only too but needs no entry: its only referent,
+# curl_sshkeycallback, is written verbatim.
+[export.rename]
+"curl_hstsentry" = "struct curl_hstsentry"
+"curl_index" = "struct curl_index"
+"curl_pushheaders" = "struct curl_pushheaders"
+"curl_slist" = "struct curl_slist"
+"curl_sockaddr" = "struct curl_sockaddr"

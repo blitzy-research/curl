@@ -20,7 +20,10 @@ Set TLS authentication type. Currently, the only supported option is `SRP`,
 for TLS-SRP (RFC 5054). If --tlsuser and --tlspassword are specified but
 --tlsauthtype is not, then this option defaults to `SRP`.
 
-This build has no TLS-SRP support, so this option and its companions
---tlsuser and --tlspassword have no usable effect. curl rejects each of them
-because the installed libcurl reports no such support, and the `Features:`
-line of the --version output accordingly omits `TLS-SRP`.
+The option needs a libcurl built with TLS-SRP support. TLS-SRP is outside the
+specified scope of this rewrite, so the `Features:` line of the --version
+output withholds `TLS-SRP`, and on a build that withholds it curl rejects this
+option and its companions --tlsuser and --tlspassword while parsing the
+command line. That rejection is the frozen behavior of the options rather than
+a new one. The withheld feature name is delivered; the parser that reports the
+rejection is not on disk.

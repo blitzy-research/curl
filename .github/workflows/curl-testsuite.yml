@@ -1,0 +1,449 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Validation gate 4 of the ten that guard the Rust workspace: THE curl 8.x TEST
+# SUITE, RUN UNMODIFIED.
+#
+# The gate, verbatim: the curl 8.x suite passing for every eligible fixture.
+# This file adds the binary-injection bridge, a build of the retained C mock
+# servers, and assertions that the run was not vacuous. Nothing else.
+#
+# It does nothing further. The build lives in rust-build.yml, lint in
+# rust-clippy.yml, the Rust tests in rust-test.yml, undefined behaviour in
+# rust-miri.yml, the sanitizer in rust-asan.yml, symbol and header parity in
+# rust-abi.yml, coverage in rust-coverage.yml, and supply chain in
+# rust-audit.yml. One workflow per validation gate, so that a failure names its
+# own cause.
+#
+# NOT ONE FILE UNDER tests/ IS MODIFIED, AND THAT IS THE POINT
+#
+# AAP 0.2.2 makes the 1,914 fixtures under tests/data immutable inputs: "a
+# failing fixture is evidence of an implementation defect, never a reason to
+# edit the fixture". The suite is therefore DRIVEN, not adapted. tests/runtests.pl
+# accepts `-c <path>` to select the binary under test -- it assigns
+# $DBGCURL=$CURL=$ARGV[1] at tests/runtests.pl:2344 -- so the Rust executable
+# substitutes for the C one without the harness knowing. `-vc` and `-ac` point
+# the server-verification and auxiliary curl at the SYSTEM curl, which avoids
+# the bootstrap circularity of asking the binary under test to confirm that the
+# servers it is about to be tested against came up correctly.
+#
+# WHY THIS GATE IS RED TODAY: THE BINARY CANNOT ANSWER --version
+#
+# Measured: `target/release/curl-rs --version` exits 4 and prints "option
+# parsing is not built in; no command-line option can be honoured by this
+# build". AAP 0.4.1 assigns the 282-row option table to curl-rs/src/cli/args.rs
+# and it has not landed.
+#
+# That is not merely one missing feature. AAP 0.6.5 establishes that the harness
+# READS the binary's own --version output during start-up and believes it:
+# tests/runtests.pl:640-730 parses the `Protocols:` line through
+# parseprotocols() and the `Features:` line into a 52-name feature map, and 874
+# of the 1,914 fixtures gate on <features>. A binary that cannot describe itself
+# leaves the harness unable to decide which fixtures are even eligible, so the
+# run is meaningless rather than merely failing. The gate therefore checks the
+# self-description FIRST and stops there, with a message that names the cause,
+# instead of reporting a wall of unexplained fixture failures.
+#
+# The asymmetry AAP 0.6.5 records governs what the answer must eventually say:
+# under-reporting a capability makes a fixture SKIP, over-reporting makes it RUN
+# AND FAIL. Truthful advertisement is the optimal strategy, not merely the
+# honest one.
+#
+# WHAT "THE SUITE PASSES" MEANS, QUANTIFIED
+#
+# AAP 0.6.5 reconciles the corpus by <server> requirement. The nine in-scope
+# schemes account for roughly 1,413 fixtures, about 73.8%: http 1029, ftp 257,
+# sftp 40, https 38, file 27, scp 13, ftps 9. The 13 stubbed schemes account for
+# 283 fixtures, about 14.8% -- smtp 91, imap 73, pop3 54, mqtt 22, tftp 18,
+# rtsp 10, gopher 6, telnet 4, smb 2, dict 2, ldap 1 -- and those SKIP
+# legitimately, because the `Protocols:` line does not advertise them. So the
+# success criterion is "every fixture eligible under the advertised feature and
+# protocol set passes", never a bare 100%.
+#
+# TrackMemory is deliberately NOT advertised, per the AAP 0.6.6 decision. The
+# harness gates its entire memory-checking block on that feature at
+# tests/runtests.pl:1759 and derives it from the banner at :660, so the 28
+# fixtures carrying <limits> allocation caps become inert. The cost is stated
+# rather than hidden: 98 fixtures require Debug and will skip, and torture-test
+# is not applicable.
+#
+# THE MOCK SERVERS, AND A GAP IN THE PLAN
+#
+# AAP 0.2.1 retains tests/server/* as REFERENCE material -- "the mock protocol
+# servers, which remain C and remain in use" -- while the same section replaces
+# both build systems in full. Nothing in the plan then assigns a build path for
+# that retained C code, which is a genuine gap.
+#
+# Measured, the gap is not yet blocking. tests/server/ builds as a single unity
+# translation unit: tests/server/CMakeLists.txt:29 generates servers.c through
+# scripts/mk-unity.pl and :37 declares add_executable(servers EXCLUDE_FROM_ALL),
+# so an explicit target build produces it. `cmake --build <dir> --target servers`
+# succeeds and yields a 144 KB binary that dispatches on its first argument.
+# Building servers.c by hand does NOT work -- lib/curl_setup.h:140 needs the
+# curl_config.h that only the configured build tree provides, and without it the
+# compile dies on "too small curl_off_t" -- so the configured CMake tree is
+# load-bearing, not incidental.
+#
+# This gate therefore prefers an externally supplied binary through
+# CURL_TEST_SERVERS, falls back to building the retained CMake target, and fails
+# with an explicit explanation if neither is available. When the CMake tree is
+# finally removed, that fallback disappears and the gap becomes blocking; the
+# assertion below is written so the failure says so.
+
+name: 'curl test suite'
+
+on:
+  push:
+    branches:
+      - master
+      - '*/ci'
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}'
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # Colour escapes corrupt the log scraping that the assertions below perform.
+  CARGO_TERM_COLOR: never
+  # A transient registry failure should not be read as a fixture regression.
+  CARGO_NET_RETRY: '3'
+  # Incremental artifacts are useless in a one-shot CI job.
+  CARGO_INCREMENTAL: '0'
+  # The exact stable pin from rust-toolchain.toml.
+  STABLE_TOOLCHAIN: '1.97.1'
+  # The harness, its bridge option, and the corpus. Read-only, all of it.
+  HARNESS: 'tests/runtests.pl'
+  # AAP 0.6.5. Used only to detect a corpus that has shrunk unnoticed; the
+  # eligible subset is decided by the harness, never by this number.
+  CORPUS_EXPECTED: '1914'
+
+jobs:
+  testsuite:
+    name: 'curl fixture corpus against the Rust binary'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'install the pinned stable toolchain'
+        run: |
+          set -eu
+          if [ -z "${STABLE_TOOLCHAIN}" ]; then
+            echo "FAIL: STABLE_TOOLCHAIN is empty."
+            exit 1
+          fi
+          rustup toolchain install "${STABLE_TOOLCHAIN}" --profile minimal --no-self-update
+          rustup default "${STABLE_TOOLCHAIN}"
+
+      - name: 'toolchain and harness prerequisites'
+        run: |
+          set -eu
+          rustc --version
+          cargo --version
+          perl --version | sed -n '2p'
+          cmake --version | head -1
+          # The system curl is used for -vc and -ac only, never as the subject.
+          curl --version | head -1
+
+      - name: 'assert: the pinned stable toolchain is the active one'
+        run: |
+          set -eu
+          have="$(rustc --version | awk '{print $2}')"
+          if [ "${have}" != "${STABLE_TOOLCHAIN}" ]; then
+            echo "FAIL: rustc reports ${have} but this gate is pinned to ${STABLE_TOOLCHAIN}."
+            exit 1
+          fi
+          echo "stable ${have} active"
+
+      - name: 'assert: the harness and its corpus are intact and unmodified'
+        run: |
+          set -eu
+          if [ ! -f "${HARNESS}" ]; then
+            echo "FAIL: ${HARNESS} is absent. It is the suite, and AAP 0.2.1 keeps it"
+            echo "as reference material that this gate drives rather than replaces."
+            exit 1
+          fi
+          # The bridge contract. If -c ever stopped selecting the binary under
+          # test, this gate would silently exercise whatever curl happened to be
+          # on PATH and report a meaningless pass.
+          # The single quotes are load-bearing and must NOT become double
+          # quotes: the pattern is Perl source, and $ARGV is a Perl variable
+          # that the shell would otherwise expand to nothing, silently turning
+          # this into a search for `elsif( eq "-c")` that can never match.
+          # shellcheck disable=SC2016
+          if ! grep -q 'elsif($ARGV\[0\] eq "-c")' "${HARNESS}"; then
+            echo "FAIL: ${HARNESS} no longer parses the -c option, so there is no"
+            echo "documented way to point the suite at the Rust binary. Injecting"
+            echo "the binary any other way would mean modifying the harness, which"
+            echo "AAP 0.2.2 forbids."
+            exit 1
+          fi
+          for opt in '-vc' '-ac'; do
+            if ! grep -q "elsif(\$ARGV\[0\] eq \"${opt}\")" "${HARNESS}"; then
+              echo "FAIL: ${HARNESS} no longer parses ${opt}, which this gate needs to"
+              echo "point server verification at the system curl instead of at the"
+              echo "binary under test."
+              exit 1
+            fi
+          done
+          echo "${HARNESS}: -c, -vc and -ac all present"
+          corpus="$(find tests/data -maxdepth 1 -name 'test*' | wc -l | tr -d ' ')"
+          echo "corpus: ${corpus} fixture file(s)"
+          if [ "${corpus}" -eq 0 ]; then
+            echo 'FAIL: tests/data/test* matched nothing. The corpus IS the behavioural'
+            echo 'specification (AAP 0.6.7 records 1,476 byte-exact wire oracles), and'
+            echo 'an empty corpus would let this gate pass without testing anything.'
+            exit 1
+          fi
+          if [ "${corpus}" -lt "${CORPUS_EXPECTED}" ]; then
+            echo "FAIL: the corpus holds ${corpus} fixtures but ${CORPUS_EXPECTED} are"
+            echo 'expected. Fixtures are immutable inputs under AAP 0.2.2; if one has'
+            echo 'been deleted, that is a modification of the specification and needs a'
+            echo 'deliberate decision rather than a quietly smaller test run.'
+            exit 1
+          fi
+          # Belt and braces: prove the corpus and harness are byte-identical to
+          # the committed state, so "unmodified" is asserted and not assumed.
+          if [ -n "$(git status --porcelain tests/ 2>/dev/null)" ]; then
+            echo 'FAIL: files under tests/ are modified in this checkout. The suite must'
+            echo 'pass UNMODIFIED; adjusting a fixture or the harness to accommodate the'
+            echo 'implementation is expressly forbidden by AAP 0.2.2.'
+            git status --porcelain tests/
+            exit 1
+          fi
+          echo 'tests/ is byte-identical to the committed state'
+
+      - name: 'fetch the locked dependency graph'
+        run: |
+          set -eu
+          cargo fetch --locked
+
+      - name: 'build the Rust command-line binary'
+        run: |
+          set -eu
+          cargo build --locked --release --bin curl-rs < /dev/null
+          ls -l target/release/curl-rs
+
+      - name: 'assert: the binary can describe itself to the harness'
+        run: |
+          set -eu
+          # AAP 0.6.5: the harness runs `curl --version` at start-up and parses
+          # the Protocols: and Features: lines to decide which fixtures are
+          # eligible. This is a machine-read contract, so it is checked before a
+          # single fixture runs. Without it the harness cannot classify anything
+          # and every downstream failure would be a symptom of this one cause.
+          banner="${RUNNER_TEMP}/version.txt"
+          # The status is captured on its own line. Testing the command directly
+          # with `if !` would consume $? and report 0 for every failure, which
+          # would hide the very exit code the message is meant to name.
+          set +e
+          ./target/release/curl-rs --version > "${banner}" 2>&1
+          rc=$?
+          set -e
+          if [ "${rc}" -ne 0 ]; then
+            echo "FAIL: 'curl-rs --version' exited ${rc}. The test harness reads this"
+            echo 'output during start-up (tests/runtests.pl:640-730) and uses it to'
+            echo 'decide which of the 1,914 fixtures are eligible, so the suite cannot'
+            echo 'be run at all until the binary can describe itself.'
+            echo ''
+            echo 'what it printed:'
+            sed 's/^/  /' "${banner}"
+            echo ''
+            echo 'AAP 0.4.1 assigns the 282-row option table from src/tool_getparam.c'
+            echo 'to curl-rs/src/cli/args.rs; until that lands, --version cannot be'
+            echo 'honoured and this gate cannot proceed.'
+            exit 1
+          fi
+          echo 'version banner:'
+          sed 's/^/  /' "${banner}"
+          missing=''
+          grep -q '^Protocols:' "${banner}" || missing="${missing} Protocols:"
+          grep -q '^Features:' "${banner}" || missing="${missing} Features:"
+          if [ -n "${missing}" ]; then
+            echo ''
+            echo "FAIL: the banner lacks:${missing}"
+            echo 'parseprotocols() and the 52-name feature map are built from exactly'
+            echo 'those two lines. Without them the harness treats every capability as'
+            echo 'absent and skips almost the whole corpus, which would look like a'
+            echo 'pass while testing nothing.'
+            exit 1
+          fi
+          # AAP 0.6.6: withholding Debug is a deliberate decision, because it
+          # makes the 28 <limits> fixtures inert rather than failing on a Rust
+          # allocation profile that cannot match C's. Assert the decision holds,
+          # so it cannot be reversed by accident.
+          if grep -q '^Features:.*Debug' "${banner}"; then
+            echo ''
+            echo 'FAIL: the banner advertises Debug. tests/runtests.pl:660 derives'
+            echo 'TrackMemory from that token and :1759 then enables allocation-cap'
+            echo 'and leak checking, which AAP 0.6.6 records as unmeetable by a Rust'
+            echo 'allocator. Advertising it converts 28 inert fixtures into failures.'
+            exit 1
+          fi
+          echo 'the binary describes itself; Protocols: and Features: are both present'
+
+      - name: 'provide the retained C mock servers'
+        run: |
+          set -eu
+          # Preferred: a binary supplied by the caller, so this gate does not
+          # depend on the C build system surviving.
+          if [ -n "${CURL_TEST_SERVERS:-}" ]; then
+            if [ ! -x "${CURL_TEST_SERVERS}" ]; then
+              echo "FAIL: CURL_TEST_SERVERS=${CURL_TEST_SERVERS} is not an executable."
+              exit 1
+            fi
+            cp "${CURL_TEST_SERVERS}" tests/server/servers
+            echo "using the externally supplied servers binary"
+          else
+            # Fallback: build the retained CMake target. tests/server/CMakeLists.txt
+            # marks it EXCLUDE_FROM_ALL, so it must be named explicitly.
+            if [ ! -f CMakeLists.txt ] || [ ! -f tests/server/CMakeLists.txt ]; then
+              echo 'FAIL: no servers binary was supplied through CURL_TEST_SERVERS, and'
+              echo 'the CMake tree that builds tests/server/ is no longer present.'
+              echo ''
+              echo 'This is the gap recorded in the header of this file: AAP 0.2.1 keeps'
+              echo 'the C mock servers as in-use reference material while replacing both'
+              echo 'build systems, without assigning a replacement build path for them.'
+              echo 'Supply a prebuilt binary through CURL_TEST_SERVERS, or restore a'
+              echo 'build path for tests/server/.'
+              exit 1
+            fi
+            build="${RUNNER_TEMP}/c-oracle"
+            cmake -S . -B "${build}" -DBUILD_TESTING=ON > "${RUNNER_TEMP}/cmake-configure.log" 2>&1 || {
+              echo 'FAIL: configuring the C tree failed, so the mock servers cannot be'
+              echo 'built. The servers need the generated curl_config.h that only a'
+              echo 'configured build tree provides; compiling servers.c directly dies on'
+              echo '"too small curl_off_t".'
+              tail -30 "${RUNNER_TEMP}/cmake-configure.log"
+              exit 1
+            }
+            cmake --build "${build}" --target servers -j"$(nproc)" \
+              > "${RUNNER_TEMP}/cmake-servers.log" 2>&1 || {
+              echo 'FAIL: building the servers target failed.'
+              tail -30 "${RUNNER_TEMP}/cmake-servers.log"
+              exit 1
+            }
+            built="${build}/tests/server/servers"
+            if [ ! -x "${built}" ]; then
+              echo "FAIL: the servers target reported success but ${built} is absent."
+              exit 1
+            fi
+            cp "${built}" tests/server/servers
+            echo "built the servers unity binary from the retained CMake target"
+          fi
+          # globalconfig.pm:118 sets SRVDIR to ./server/ relative to tests/, so
+          # the binary must sit at tests/server/servers.
+          ls -l tests/server/servers
+          if ! ./tests/server/servers 2>&1 | grep -q 'Pass servername'; then
+            echo 'FAIL: the servers binary does not behave like the unity dispatcher the'
+            echo 'harness drives; it should ask for a server name when given none.'
+            exit 1
+          fi
+          echo 'the servers binary dispatches on its first argument, as the harness expects'
+
+      - name: 'the gate: run the fixture corpus against the Rust binary'
+        run: |
+          set -eu
+          # -c injects the binary under test. -vc and -ac point server
+          # verification at the system curl, so the subject is never asked to
+          # vouch for its own test environment.
+          system_curl="$(command -v curl)"
+          cd tests
+          set +e
+          perl ./runtests.pl \
+            -c "${GITHUB_WORKSPACE}/target/release/curl-rs" \
+            -vc "${system_curl}" \
+            -ac "${system_curl}" \
+            > "${RUNNER_TEMP}/runtests.log" 2>&1
+          echo "$?" > "${RUNNER_TEMP}/runtests.rc"
+          set -e
+          tail -40 "${RUNNER_TEMP}/runtests.log"
+          echo "runtests.pl exit status: $(cat "${RUNNER_TEMP}/runtests.rc")"
+
+      - name: 'assert: the run was not vacuous, and every eligible fixture passed'
+        run: |
+          set -eu
+          log="${RUNNER_TEMP}/runtests.log"
+          rc="$(cat "${RUNNER_TEMP}/runtests.rc")"
+          if [ ! -s "${log}" ]; then
+            echo 'FAIL: the harness produced no output at all.'
+            exit 1
+          fi
+          # A harness that skipped everything exits 0 and looks like success. AAP
+          # 0.6.5 puts roughly 1,413 fixtures in scope, so a run that tested a
+          # handful has not exercised the implementation regardless of its status.
+          ran="$(grep -cE '^TEST [0-9]+ (OK|FAILED)' "${log}" || true)"
+          okc="$(grep -cE '^TEST [0-9]+ OK' "${log}" || true)"
+          failc="$(grep -cE '^TEST [0-9]+ FAILED' "${log}" || true)"
+          echo "fixtures executed: ${ran} (ok ${okc}, failed ${failc})"
+          if [ "${ran}" -eq 0 ]; then
+            echo 'FAIL: not one fixture executed. Either every fixture was skipped --'
+            echo 'which means the advertised Protocols:/Features: set is empty or wrong'
+            echo '-- or the harness aborted during start-up. A run that tests nothing'
+            echo 'must never be reported as a pass.'
+            echo ''
+            echo 'harness output:'
+            sed -n '1,60p' "${log}"
+            exit 1
+          fi
+          if [ "${failc}" -ne 0 ]; then
+            echo "FAIL: ${failc} fixture(s) failed. Under AAP 0.2.2 a failing fixture is"
+            echo 'evidence of an implementation defect and must never be resolved by'
+            echo 'editing the fixture.'
+            echo ''
+            grep -E '^TEST [0-9]+ FAILED' "${log}" | sed 's/^/  /'
+            exit 1
+          fi
+          if [ "${rc}" -ne 0 ]; then
+            echo "FAIL: every executed fixture passed but the harness exited ${rc}, so"
+            echo 'something outside the per-fixture verdicts went wrong -- a server that'
+            echo 'would not start, or a start-up check that failed.'
+            exit 1
+          fi
+          echo "every one of the ${ran} eligible fixtures passed"
+
+      - name: 'upload the harness log'
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtests-log
+          path: '${{ runner.temp }}/runtests.log'
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 'assert: the suite ran unmodified and nothing leaked into the checkout'
+        if: always()
+        run: |
+          set -eu
+          # The servers binary was copied into tests/server/ and the build
+          # regenerated include/curl/. Remove both, then require that tests/ is
+          # pristine: the whole claim of this gate is that the suite passed
+          # WITHOUT being adapted, so the corpus must be byte-identical after the
+          # run as well as before it.
+          rm -f tests/server/servers
+          git checkout -- include/curl/ 2>/dev/null || true
+          if [ -n "$(git status --porcelain tests/ 2>/dev/null)" ]; then
+            echo 'FAIL: files under tests/ differ after the run. The suite must pass'
+            echo 'unmodified; a fixture or harness file changed while it executed.'
+            git status --porcelain tests/
+            exit 1
+          fi
+          echo 'tests/ is unchanged: the suite ran unmodified'

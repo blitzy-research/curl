@@ -235,8 +235,11 @@ The functions above are implemented in `lib/curlx/strparse.c`, and their
 prototypes and error codes are declared in `lib/curlx/strparse.h`. Those two
 files are the reference oracle for this parsing layer: they define the accepted
 syntax and the error boundaries that the migration to a `Rust` `workspace`
-preserves. Nothing in this section exists yet. The C sources remain the working
-implementation, and everything named below is specified target state.
+preserves. No successor to `lib/curlx/strparse.c` exists yet, so the C sources
+remain the working implementation and the parsing module named below is
+specified target state. Of the consumers listed later on this page, one --
+`curl-rs/src/cli/paramhlp.rs` -- has been delivered; the rest are specified
+target state as well, and each is marked where it appears.
 
 ### The contract the C sources define
 
@@ -311,7 +314,9 @@ arrives from outside into a decision.
 
 - Command-line argument parsing, at `curl-rs/src/cli/args.rs` and
   `curl-rs/src/cli/paramhlp.rs`, reads numbers, sizes, lists and protocol names
-  out of arguments.
+  out of arguments. `paramhlp.rs` is delivered; `args.rs` is not yet on disk,
+  which is why `paramhlp.rs` does not compile on its own today -- it imports
+  `super::args::ParameterError`.
 - The configuration-file reader at `curl-rs/src/config/parseconfig.rs` reads
   the same option spellings out of a file instead of out of an argument vector,
   quoted values included.
@@ -324,11 +329,19 @@ arrives from outside into a decision.
 
 ### Safety and verification
 
-`#![forbid(unsafe_code)]` is specified at the root of the `curl-rs-lib` and
-`curl-rs` `crates`, with one narrowly allowed island at `curl-rs-lib/src/ffi/`,
-where every `unsafe` block carries a mandatory `// SAFETY:` comment. Parsing
-has no business in that island. Slice indexing is bounds-checked, so a parser
-expressed over slices needs nothing from it.
+The safety invariant at the root of `curl-rs-lib` is `#![deny(unsafe_code)]`
+plus exactly one `#[allow(unsafe_code)]`, on `mod ffi` -- the one narrowly
+allowed island at `curl-rs-lib/src/ffi/`, where every `unsafe` block carries a
+mandatory `// SAFETY:` comment. It is `deny` and not `forbid` because `forbid`
+cannot be locally overridden (`error[E0453]: allow(unsafe_code) incompatible
+with previous forbid`) and Agent Action Plan goal G1 permits only three
+crates, so the island cannot move into a fourth; `deny` is no weaker, since a
+stray `unsafe` block outside the island is a hard error rather than a warning.
+In `curl-rs` there is no island at all, so the delivered binary root
+`curl-rs/src/bin/curlinfo.rs` does carry `#![forbid(unsafe_code)]` literally;
+the crate root `curl-rs/src/main.rs` named in Agent Action Plan section 0.3.1
+is not yet on disk. Parsing has no business in that island. Slice indexing is
+bounds-checked, so a parser expressed over slices needs nothing from it.
 
 Fidelity is asserted against the fixture corpus under `tests/data`, where a
 fixture can pin the exact bytes the client sends. A parser that accepts a

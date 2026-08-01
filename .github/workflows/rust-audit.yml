@@ -2,34 +2,26 @@
 #
 # SPDX-License-Identifier: curl
 
-# Validation gate 9 of the ten that guard the Rust workspace: SUPPLY CHAIN.
+# The SUPPLY-CHAIN gate for the Rust workspace.
 #
 # This workflow runs `cargo audit` and `cargo deny`, and it asserts that the
 # cryptographic-provider pinning written into the manifests actually took
-# effect in the resolved dependency graph. It does nothing else. The build
-# lives in rust-build.yml, the lint gate in rust-clippy.yml, the tests in
-# rust-test.yml, coverage in rust-coverage.yml, undefined behaviour in
-# rust-miri.yml, the sanitizer in rust-asan.yml, symbol and header parity in
-# rust-abi.yml, and the curl fixture corpus in curl-testsuite.yml. One
-# workflow per validation gate, so that a failure names its own cause.
+# effect in the resolved dependency graph. It does nothing else. One workflow
+# per validation gate, so that a failure names its own cause: the build is
+# rust-build.yml's, lint rust-clippy.yml's, the tests rust-test.yml's,
+# undefined behaviour rust-miri.yml's, the sanitizer rust-asan.yml's, coverage
+# rust-coverage.yml's, symbol and public-header parity rust-abi.yml's, and the
+# curl fixture corpus curl-testsuite.yml's. All nine are on disk, alongside
+# hygiene.yml, which carries the spelling and prohibited-wording checks.
 #
-# Why this file exists at all, stated plainly: an earlier attempt at this
-# rewrite left four things unfinished, and one of them was that `cargo audit`
-# was never executed. That gap is designed out from the start here rather
-# than deferred to the end.
-#
-# Two standing obligations are made mechanical by this file:
-#
-#   Supply-chain hygiene is continuous. `cargo audit` and `cargo deny` run in
-#   continuous integration on every push and every pull request, and weekly on
-#   a schedule, because an advisory database changes without the repository
-#   changing.
-#
-#   Security-relevant configuration is explicit, never defaulted. The manifests
-#   declare `default-features = false` with an explicit cryptographic provider
-#   on rustls, tokio-rustls and quinn, and they omit `platform-verifier`. A
-#   comment in a manifest is not a gate; the assertions below are what turn
-#   that intent into one.
+# Two obligations are made mechanical here. Supply-chain hygiene is
+# continuous - `cargo audit` and `cargo deny` run on every push and pull
+# request and weekly on a schedule, because an advisory database changes
+# without the repository changing. And security-relevant configuration is
+# explicit, never defaulted: the manifests declare `default-features = false`
+# with an explicit cryptographic provider on rustls, tokio-rustls and quinn and
+# omit `platform-verifier`. A comment in a manifest is not a gate; the
+# assertions below are what turn that intent into one.
 
 name: 'Rust supply chain'
 
@@ -38,12 +30,11 @@ name: 'Rust supply chain'
     branches:
       - master
       - '*/ci'
-    # A deny-list, deliberately, and never a `paths:` allow-list. An allow-list
-    # would have to name Cargo.toml, Cargo.lock, deny.toml and every member
-    # manifest, and the day somebody forgot one is the day a dependency change
-    # merged without this gate ever firing - which is precisely when it must
-    # fire. The four entries below are the same ones the C build workflows
-    # ignore: none of them can affect crate resolution.
+    # A deny-list, never a `paths:` allow-list. An allow-list would have to name
+    # Cargo.toml, Cargo.lock, deny.toml and every member manifest, and the day
+    # one was forgotten is the day a dependency change merged without this gate
+    # firing. The four entries below are the same ones the C build workflows
+    # ignore: none can affect crate resolution.
     paths-ignore:
       - '.circleci/**'
       - 'appveyor.*'
@@ -292,11 +283,10 @@ jobs:
           report="${RUNNER_TEMP}/cargo-audit-report.txt"
 
           # `cargo audit` exits 1 the moment it finds anything at all, at any
-          # severity. The gate this file has to enforce is narrower and
-          # sharper: zero CRITICAL advisories. Those are not the same
-          # statement, so the exit code alone cannot express the gate. The
-          # status is captured in order to evaluate the real condition, never
-          # in order to soften it.
+          # severity, while the gate is narrower: zero CRITICAL advisories.
+          # Those are not the same statement, so the exit code alone cannot
+          # express the gate. The status is captured in order to evaluate the
+          # real condition, never in order to soften it.
           #
           # Nothing here is a suppression. There is no --ignore flag on the
           # invocation, no continue-on-error on the step, and no if: always()
@@ -308,19 +298,18 @@ jobs:
           #     deny.toml, whatever its severity
           #   * a report that is empty or that never scanned the lockfile
           #
-          # The third condition makes this strictly stronger than the gate as
-          # specified. A newly disclosed advisory fails immediately, and there
-          # are exactly two ways to make it pass: change the dependency in the
-          # manifests, or record a reasoned acceptance with a removal condition
-          # in deny.toml. Neither can happen inside this file, which is the
-          # point - the decision belongs in the policy file, in a reviewable
-          # diff, and never in the workflow that checks it.
+          # The third condition makes this strictly stronger than zero-critical.
+          # A newly disclosed advisory fails immediately, and there are exactly
+          # two ways to make it pass: change the dependency in the manifests, or
+          # record a reasoned acceptance with a removal condition in deny.toml.
+          # Neither can happen inside this file - the decision belongs in the
+          # policy file, in a reviewable diff, never in the workflow that checks
+          # it.
           #
-          # cargo-audit has no --locked flag - verified against
-          # `cargo audit --help`, whose options are --color, --db, --deny,
-          # --file, --ignore, --no-yanked, --no-fetch, --stale, --target-arch
-          # and --target-os. It reads the lockfile directly, and if none is
-          # present it will GENERATE one, which is exactly the silent
+          # cargo-audit has no --locked flag; its options are --color, --db,
+          # --deny, --file, --ignore, --no-yanked, --no-fetch, --stale,
+          # --target-arch and --target-os. It reads the lockfile directly, and
+          # if none is present it will GENERATE one - exactly the silent
           # regeneration that must never happen under a gate whose verdict is a
           # statement about the committed lockfile. --file names the file
           # explicitly and the existence check below refuses to proceed without
@@ -400,7 +389,175 @@ jobs:
             echo 'Do not add an --ignore flag here. deny.toml is where an acceptance is reviewable.'
             exit 1
           fi
-          echo "cargo audit: $(wc -l < "${reported}") advisory identifier(s), zero critical, every one reviewed in deny.toml"
+
+          # And now the same comparison in the other direction, which is the
+          # half that decides whether this list is a bounded acceptance or a
+          # permanent blind spot.
+          #
+          # An accepted advisory that cargo audit no longer reports is an entry
+          # that has outlived its cause: the dependency moved, the advisory was
+          # withdrawn, or the vulnerable crate left the graph. Left in place it
+          # still reads as a reviewed risk, and worse, it keeps a line in the
+          # ignore list that nothing is checking any more - which is exactly how
+          # a disclosure becomes cover. Failing here forces the entry to be
+          # deleted in the same change that removed its cause, so the register
+          # is exactly tight at every commit and every entry is self-expiring.
+          stale="$(comm -13 "${reported}" "${accepted}")"
+          if [ -n "${stale}" ]; then
+            echo 'FAIL: deny.toml still accepts advisories that cargo audit no longer reports:'
+            echo "${stale}"
+            echo 'Each of these has outlived its cause. Delete the entry from deny.toml.'
+            echo 'An ignore entry that nothing reports is not a reviewed risk, it is an unchecked exemption.'
+            exit 1
+          fi
+          echo "cargo audit: $(wc -l < "${reported}") advisory identifier(s), zero critical, accepted set exactly tight"
+
+      - name: 'advisory acceptances are justified and self-expiring'
+        run: |
+          # deny.toml states five mandatory fields for every accepted advisory
+          # and a removal condition for each. Those rules are worth exactly as
+          # much as their enforcement, so they are enforced here rather than
+          # left to review: an entry that omits any of them is a silenced alarm
+          # wearing the costume of a justified risk.
+          #
+          # The parse walks the file once and attributes to each
+          # `{ id = "RUSTSEC-..." }` line the contiguous comment block that
+          # immediately precedes it, which is the layout deny.toml documents and
+          # uses. A blank line or a non-comment line ends a block, so an entry
+          # cannot borrow the justification written for the entry above it.
+          missing="$(awk '
+            /^[[:space:]]*#/ { block = block $0 "\n"; next }
+            /^[[:space:]]*\{[[:space:]]*id[[:space:]]*=[[:space:]]*"/ {
+              id = $0
+              sub(/^[^"]*"/, "", id)
+              sub(/".*$/,   "", id)
+              need = "Accepted Severity Category Reached[[:space:]]by Fixed[[:space:]]in Remove[[:space:]]this[[:space:]]entry"
+              n = split(need, want, " ")
+              for (i = 1; i <= n; i++) {
+                if (block !~ want[i]) { print id " is missing: " want[i] }
+              }
+              if (block !~ /Aliases/) { print id " is missing: Aliases" }
+              block = ""
+              next
+            }
+            { block = "" }
+          ' deny.toml)"
+          if [ -n "${missing}" ]; then
+            echo 'FAIL: an advisory acceptance in deny.toml is not fully justified.'
+            echo "${missing}"
+            echo 'Every entry needs the advisory ID, the acceptance date, the measured severity, the'
+            echo 'category, its aliases, the path that reaches it, the version that fixes it, and the'
+            echo 'condition that lets the entry be deleted. An entry without all of them is not a'
+            echo 'justified risk.'
+            exit 1
+          fi
+
+          # One removal condition is machine-checkable today, so it is checked
+          # today. RUSTSEC-2026-0185 is carried for exactly one reason: the fix,
+          # quinn-proto >= 0.11.15, declares rust-version 1.85 while this
+          # workspace mandates 1.75. The instant the floor reaches 1.85 that
+          # reason evaporates and the entry must go with it - otherwise a
+          # decision taken elsewhere silently leaves a HIGH advisory accepted
+          # for a constraint that no longer exists.
+          msrv="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([0-9.]*\)".*/\1/p' Cargo.toml | head -1)"
+          if [ -z "${msrv}" ]; then
+            echo 'FAIL: could not read rust-version from Cargo.toml, so the removal triggers below cannot be evaluated.'
+            exit 1
+          fi
+          msrv_minor="$(echo "${msrv}" | cut -d. -f2)"
+          echo "workspace rust-version: ${msrv} (minor ${msrv_minor})"
+
+          # Three of the six acceptances are blocked by one thing and one thing
+          # only: the fix declares a rust-version above this workspace's floor.
+          # Each is paired below with the floor that unblocks it, so raising the
+          # MSRV cannot quietly leave a stale acceptance behind - the decision
+          # surfaces here, in the gate, on the very commit that raises it.
+          #
+          # quinn-proto  >= 0.11.15 declares 1.85
+          # hickory-*    the fix for both hickory entries is hickory-proto
+          #              >= 0.26.1, which ships only with hickory-resolver
+          #              0.26.x, declaring 1.88
+          expired=''
+          check_msrv_trigger() {
+            floor="$1"
+            advisory="$2"
+            remedy="$3"
+            if [ "${msrv_minor}" -ge "${floor}" ] 2>/dev/null; then
+              if grep -q "id = \"${advisory}\"" deny.toml; then
+                echo "EXPIRED: rust-version is ${msrv}, so the fix for ${advisory} is now admissible."
+                echo "  remedy: ${remedy}"
+                expired="${expired} ${advisory}"
+              else
+                echo "${advisory}: correctly removed now that the floor admits the fix."
+              fi
+            else
+              echo "${advisory}: still blocked - the fix needs rust-version 1.${floor}, the floor is ${msrv}."
+            fi
+          }
+          check_msrv_trigger 85 'RUSTSEC-2026-0185' 'cargo update -p quinn-proto --precise 0.11.16, then delete the entry'
+          check_msrv_trigger 88 'RUSTSEC-2026-0119' 'cargo update -p hickory-resolver, then delete both hickory entries'
+          check_msrv_trigger 88 'RUSTSEC-2026-0118' 'cargo update -p hickory-resolver, then delete both hickory entries'
+          if [ -n "${expired}" ]; then
+            echo "FAIL: advisory acceptances have expired and must be deleted from deny.toml:${expired}"
+            echo 'An acceptance justified only by the MSRV floor stops being justified the moment the floor moves.'
+            exit 1
+          fi
+
+          count="$(sed -n 's/^[[:space:]]*{[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' deny.toml | sort -u | wc -l)"
+          echo "advisory acceptances: ${count}, each with a written justification and a removal condition"
+
+      - name: 'the default build contains none of the optional-feature advisories'
+        run: |
+          # Two of the six acceptances - RUSTSEC-2026-0118 and
+          # RUSTSEC-2026-0119 - are reached only through hickory-resolver, an
+          # optional dependency behind the default-off `hickory-dns` feature.
+          # deny.toml says they are therefore absent from every artifact a
+          # default build produces. That claim is worth nothing unless something
+          # checks it, because a stray `default = [...]` edit, or any crate in
+          # the graph growing a non-optional dependency on the resolver, would
+          # silently move two accepted vulnerabilities into every shipped
+          # libcurl.so.4 while leaving the register looking unchanged.
+          #
+          # `cargo tree` with the default feature set resolves exactly what a
+          # default build compiles, so an empty result here IS the proof.
+          # --no-dev-dependencies keeps a test-only path from being mistaken for
+          # a shipped one, and both workspace members that produce artifacts are
+          # checked, not just the library.
+          status=0
+          for pkg in curl-rs-lib curl-rs curl-rs-ffi; do
+            found="$(cargo tree --locked --offline --package "${pkg}" \
+                       --edges normal,build --prefix none --no-dedupe 2>/dev/null \
+                     | grep -E '^(hickory|ipconfig|resolv-conf|moka)' | sort -u || true)"
+            if [ -n "${found}" ]; then
+              echo "FAIL: ${pkg}'s DEFAULT feature set resolves the optional resolver stack:"
+              echo "${found}"
+              status=1
+            else
+              echo "${pkg}: default graph is free of the optional resolver stack"
+            fi
+          done
+          if [ "${status}" -ne 0 ]; then
+            echo
+            echo 'RUSTSEC-2026-0118 and RUSTSEC-2026-0119 are accepted in deny.toml on the express'
+            echo 'grounds that no default artifact contains the affected code. Either restore'
+            echo 'hickory-dns to default-off, or re-justify both entries as unconditional.'
+            exit 1
+          fi
+
+          # And the converse, so the feature is not a placebo either: enabling
+          # it must actually bring the resolver in. A feature a user can turn on
+          # and observe nothing from misdescribes the build, which is the defect
+          # this dependency was pinned to fix.
+          enabled="$(cargo tree --locked --offline --package curl-rs-lib \
+                       --features hickory-dns --edges normal --prefix none --no-dedupe 2>/dev/null \
+                     | grep -E '^hickory-resolver ' | sort -u || true)"
+          if [ -z "${enabled}" ]; then
+            echo 'FAIL: enabling hickory-dns does not pull hickory-resolver into the graph.'
+            echo 'The feature would be a no-op, which is exactly what the'
+            echo 'hickory-dns = [dep:hickory-resolver] declaration exists to prevent.'
+            exit 1
+          fi
+          echo "hickory-dns enabled resolves: ${enabled}"
 
       - name: 'cargo deny check -- advisories, licenses, bans, sources'
         run: |
@@ -475,6 +632,231 @@ jobs:
             echo "OK ${target}: advisories, licenses, bans, sources"
           done
 
+      - name: 'assert: re-scanned with every ignore DISABLED, the advisory set is EXACTLY the reviewed one'
+        run: |
+          # THE PROMISE deny.toml MAKES, KEPT HERE.
+          #
+          # deny.toml's [advisories] ignore list carries four reviewed
+          # acceptances, and the reason text of the first one states in writing
+          # that "rust-audit.yml re-scans with ignores disabled and asserts this
+          # exact four-ID set". This step is that re-scan. A policy file that
+          # promises a check which does not exist is worse than one that admits
+          # an acceptance, so the promise is discharged rather than trusted.
+          #
+          # WHY THE STEP ABOVE IS NOT ALREADY THIS. `cargo deny check
+          # advisories` HONOURS the ignore list, so it says nothing about what
+          # the list is hiding. `cargo audit` does not read deny.toml at all -
+          # and there is deliberately no .cargo/audit.toml in this tree, which
+          # is what keeps that true - so the earlier cargo-audit step does see
+          # every advisory, but it asserts only that each REPORTED identifier is
+          # among the accepted ones. That is one direction of a set comparison.
+          # Both directions matter, and they fail for different reasons:
+          #
+          #   reported but not accepted   a NEW advisory. Nobody has reviewed it.
+          #   accepted but not reported   a STALE acceptance. The advisory no
+          #                               longer applies - usually because a
+          #                               dependency moved - and the ignore is
+          #                               now silently suppressing nothing while
+          #                               claiming a reviewed exception. Left in
+          #                               place, it would also suppress a FUTURE
+          #                               advisory with the same identifier.
+          #
+          # Only the second direction catches a fix that has already landed, so
+          # it is the direction that keeps the acceptances honest over time.
+          #
+          # The re-scan runs cargo-deny against a COPY of deny.toml whose ignore
+          # array has been emptied, which is the only way to see through the
+          # list without editing the committed policy. The copy lives in
+          # RUNNER_TEMP; the tracked file is not touched, and the final step of
+          # this job asserts as much.
+          policy="${RUNNER_TEMP}/deny-no-ignores.toml"
+          awk 'BEGIN { skip = 0 }
+               /^ignore = \[/ { print "ignore = []"; skip = 1; next }
+               skip && /^\]/   { skip = 0; next }
+               !skip' deny.toml > "${policy}"
+
+          # The transformation is asserted, not assumed. If the array's shape
+          # ever changes so that this awk stops matching, the copy would still
+          # carry the ignores and the re-scan would silently become a repeat of
+          # the step above - a check that had quietly stopped checking.
+          if ! grep -q -x -F 'ignore = []' "${policy}"; then
+            echo 'FAIL: could not empty the ignore list in the deny.toml copy.'
+            echo 'The awk above expects the ignore array to open at column 1 and to close with a bracket'
+            echo 'at column 1. deny.toml has been reformatted; fix the transformation, not this assertion.'
+            exit 1
+          fi
+          survivors="$(sed -n 's/^[[:space:]]*{[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${policy}" | grep -c . || true)"
+          if [ "${survivors}" -ne 0 ]; then
+            echo "FAIL: ${survivors} advisory acceptance(s) survived in the ignore-free copy."
+            exit 1
+          fi
+
+          report="${RUNNER_TEMP}/deny-no-ignores.log"
+          rescan_status=0
+          cargo deny --locked --config "${policy}" check advisories > "${report}" 2>&1 || rescan_status=$?
+          echo '::group::cargo deny check advisories, with every ignore disabled'
+          cat "${report}"
+          echo '::endgroup::'
+          echo "the ignore-free re-scan exited ${rescan_status}; a non-zero status here is expected"
+
+          # A non-zero status is EXPECTED here and is not the verdict: the whole
+          # point is to see the advisories the committed policy accepts, and it
+          # is reported above rather than acted on. The verdict is the set
+          # comparison below. What would be wrong is a status that indicated
+          # cargo-deny itself had failed, and an empty report is how that would
+          # look.
+          if [ ! -s "${report}" ]; then
+            echo 'FAIL: the ignore-free re-scan produced no output, so there is nothing to compare.'
+            exit 1
+          fi
+
+          rescanned="${RUNNER_TEMP}/rescanned-ids.txt"
+          accepted="${RUNNER_TEMP}/accepted-ids.txt"
+          grep -o -E 'RUSTSEC-[0-9]{4}-[0-9]{4}' "${report}" | sort -u > "${rescanned}"
+          # Anchored on the opening brace exactly as the cargo-audit step is, so
+          # that an identifier quoted in the surrounding prose cannot be mistaken
+          # for a reviewed acceptance.
+          sed -n 's/^[[:space:]]*{[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' deny.toml | sort -u > "${accepted}"
+
+          echo '::group::the two sets'
+          echo '-- reported with every ignore disabled'
+          cat "${rescanned}"
+          echo '-- accepted in deny.toml, each with a written reason and a removal condition'
+          cat "${accepted}"
+          echo '::endgroup::'
+
+          fresh="$(comm -23 "${rescanned}" "${accepted}")"
+          stale="$(comm -13 "${rescanned}" "${accepted}")"
+          verdict=0
+          if [ -n "${fresh}" ]; then
+            echo 'FAIL: advisories that deny.toml has never reviewed:'
+            echo "${fresh}"
+            echo 'Remedy: change the dependency in the manifests, or record a reasoned acceptance with a'
+            echo 'removal condition in deny.toml. Never an --ignore flag in this workflow.'
+            verdict=1
+          fi
+          if [ -n "${stale}" ]; then
+            echo 'FAIL: deny.toml accepts advisories that no longer apply to this graph:'
+            echo "${stale}"
+            echo 'A stale ignore is not harmless. It claims a reviewed exception that is doing nothing,'
+            echo 'and it would silently suppress any future advisory issued under the same identifier.'
+            echo 'Each entry names its own removal condition; delete the ones whose condition is met.'
+            verdict=1
+          fi
+          if [ "${verdict}" -ne 0 ]; then
+            exit 1
+          fi
+
+          # The count, stated out loud. Four is not a target to be met but the
+          # number that is currently reviewed; the assertion that matters is the
+          # set equality above, and this line is what makes a change in the
+          # number visible in the log at a glance.
+          echo "the ignore-free re-scan reports exactly the $(grep -c . "${accepted}") advisory identifier(s) deny.toml reviews, and no others"
+
+      - name: 'assert: the graph without ssh and http3 is advisory-free'
+        run: |
+          # WHERE THE ACCEPTED ADVISORIES LIVE, PROVED RATHER THAN ASSERTED IN
+          # PROSE.
+          #
+          # All four reviewed acceptances are behind an optional protocol
+          # feature: RUSTSEC-2026-0185 is quinn-proto and reaches the graph only
+          # through `http3`, and RUSTSEC-2023-0071, RUSTSEC-2026-0154 and
+          # RUSTSEC-2026-0153 are rsa, russh and russh-cryptovec, which reach it
+          # only through `ssh`. deny.toml says so in each reason; this step
+          # checks it.
+          #
+          # WHY IT MATTERS, AND WHAT IT DOES AND DOES NOT LICENCE. The review
+          # finding that produced this step asks for the affected features to be
+          # upgraded or disabled. Upgrading is measurably unavailable - every
+          # fixing release of each of the four either declares a minimum newer
+          # than the workspace floor or depends on release-candidate
+          # cryptography, and deny.toml records the evidence per entry - and
+          # disabling is not available either, because the specification's
+          # feature vocabulary marks only `negotiate`, `hickory-dns` and
+          # `memdebug` as default-off, so `http3` and `ssh` are mandated
+          # default-on. What IS available, and is what this step establishes, is
+          # that the exposure is CONFINED and that a consumer who does not need
+          # those two protocols has an advisory-free configuration. That is a
+          # weaker statement than "no advisories" and it is stated as such; it
+          # is not a licence to leave the acceptances unreviewed, which is what
+          # the step above prevents.
+          #
+          # The mechanism is a resolution, not a build, and deliberately not a
+          # second lockfile. `cargo audit` reads Cargo.lock, and a lockfile is
+          # the UNION of every optional dependency regardless of features, so it
+          # cannot answer a per-feature question at all. Asking cargo to
+          # generate a narrower lockfile would rewrite the committed one, which
+          # this job must never do. `cargo tree` with the narrowed feature set
+          # answers exactly the right question - which packages are REACHABLE -
+          # and touches nothing.
+          minimal='altsvc,brotli,cookies,doh,ftp,gzip,hsts,http2,websockets,zstd'
+          echo "resolving curl-rs-lib with --no-default-features --features ${minimal}"
+          echo '(the default set minus ssh and minus http3; negotiate, hickory-dns and memdebug are'
+          echo 'default-off already and add no dependency that is not already present)'
+
+          # Every affected crate, including the two that merely carry the
+          # affected ones in: quinn and h3 are named so that a future advisory
+          # against either is caught by the same assertion.
+          affected='quinn quinn-proto h3 h3-quinn rsa russh russh-cryptovec'
+
+          for target in ${CARGO_TARGETS}; do
+            tree="${RUNNER_TEMP}/minimal-tree-${target}.txt"
+            if ! cargo tree --locked --target "${target}" -p curl-rs-lib \
+                 --no-default-features --features "${minimal}" \
+                 --prefix none > "${tree}"; then
+              echo "FAIL: cargo tree could not resolve the minimal feature set for ${target}."
+              exit 1
+            fi
+            if [ ! -s "${tree}" ]; then
+              echo "FAIL: the minimal resolution for ${target} is empty, so this assertion would be vacuous."
+              exit 1
+            fi
+
+            found=''
+            for crate in ${affected}; do
+              if grep -q -E "^${crate} v" "${tree}"; then
+                found="${found} ${crate}"
+              fi
+            done
+            if [ -n "${found}" ]; then
+              echo "FAIL: ${target} reaches an advisory-affected crate with ssh and http3 disabled:${found}"
+              echo 'That contradicts every reason recorded in deny.toml, which localises all four accepted'
+              echo 'advisories to those two optional features. Either a feature now pulls the crate in'
+              echo 'unconditionally, or a new dependency edge has appeared. Find it; do not widen this list.'
+              exit 1
+            fi
+            echo "OK ${target}: none of [${affected} ] is reachable without ssh and http3"
+          done
+
+          # NON-VACUITY, and this half is the one that makes the loop above mean
+          # something. A typo in the crate names, or a cargo-tree output format
+          # that stopped matching the anchored pattern, would make every check
+          # above pass for the wrong reason. So the same pattern is required to
+          # FIND those crates in the DEFAULT resolution, where they must all be
+          # present.
+          full="${RUNNER_TEMP}/default-tree.txt"
+          if ! cargo tree --locked --target x86_64-unknown-linux-gnu -p curl-rs-lib \
+               --prefix none > "${full}"; then
+            echo 'FAIL: cargo tree could not resolve the default feature set.'
+            exit 1
+          fi
+          absent=''
+          for crate in ${affected}; do
+            if ! grep -q -E "^${crate} v" "${full}"; then
+              absent="${absent} ${crate}"
+            fi
+          done
+          if [ -n "${absent}" ]; then
+            echo "FAIL: these crates are not in the DEFAULT resolution either:${absent}"
+            echo 'The assertion above therefore proved nothing about them. Either they have genuinely left'
+            echo 'the graph - in which case the matching deny.toml acceptances are stale and the previous'
+            echo 'step should have said so - or the pattern used to look for them has stopped matching.'
+            exit 1
+          fi
+
+          echo 'every advisory-affected crate IS present with the default features and is NOT present'
+          echo 'without ssh and http3, so the accepted advisories are confined to those two features'
+
       - name: 'assert: no C TLS, compression or SSH library, and ring present'
         run: |
           # WHY THIS STEP AND THE NEXT ONE EXIST
@@ -484,7 +866,7 @@ jobs:
           # to ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"]
           # and tokio-rustls 0.26.4 to ["logging", "tls12", "aws_lc_rs"], while
           # quinn 0.11.9 defaults to ["log", "platform-verifier",
-          # "runtime-tokio", "rustls-ring", "bloom"] and quinn-proto 0.11.12 to
+          # "runtime-tokio", "rustls-ring", "bloom"] and quinn-proto 0.11.14 to
           # ["rustls-ring", "log", "bloom"]. Cargo unifies features across a
           # graph, so accepting all of those defaults links BOTH providers into
           # one binary. Four consequences follow, and not one of them is
@@ -509,25 +891,24 @@ jobs:
           # platform-verifier. These two steps are what make that a merge gate
           # instead of a comment.
           #
-          # HONEST CAVEAT, recorded rather than papered over: neither ring nor
-          # aws-lc-rs is pure Rust - both contain C and assembly. The
-          # constraint is satisfied in the sense that matters, which is that no
-          # C TLS LIBRARY is linked: rustls implements the TLS state machine,
-          # the record layer and certificate verification in Rust, and the
-          # provider supplies only primitives. ring is chosen as the more
-          # portable and more readily cross-compiled of the two. Had the intent
-          # been "no C or assembly whatsoever", no rustls configuration would
-          # satisfy it and the requirement would be unmeetable as written. That
-          # disclosure is NOT a licence to relax the aws-lc-rs ban, and the ban
-          # stays.
+          # HONEST CAVEAT: neither ring nor aws-lc-rs is pure Rust - both
+          # contain C and assembly. The constraint is satisfied in the sense
+          # that matters, which is that no C TLS LIBRARY is linked: rustls
+          # implements the TLS state machine, the record layer and certificate
+          # verification in Rust, and the provider supplies only primitives.
+          # ring is chosen as the more portable and more readily cross-compiled
+          # of the two. Had the intent been "no C or assembly whatsoever", no
+          # rustls configuration would satisfy it and the requirement would be
+          # unmeetable as written. That disclosure is NOT a licence to relax the
+          # aws-lc-rs ban, and the ban stays.
           graph_dir="${RUNNER_TEMP}/curl-rs-depgraph"
           fail=0
 
           # Every crate below is also banned in deny.toml, so `cargo deny check
           # bans` covers the same ground. This is a second, independent reading
           # of the same graph that does not depend on the policy file having
-          # been found, parsed and applied - which is worth having in the one
-          # gate whose job is to distrust assumptions.
+          # been found, parsed and applied - independence that matters in the
+          # one gate whose job is to distrust assumptions.
           #
           #   aws-lc-rs, aws-lc-sys   the competing provider and its vendored
           #                           C and assembly, per the four consequences

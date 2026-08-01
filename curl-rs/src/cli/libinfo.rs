@@ -37,26 +37,14 @@
 //! `:192-198` and whose body runs `:200-210`), and `:191-192` for the
 //! `feature_libssh2` derivation, which is measured here at `:187-188`.
 //!
-//! # No user-specified rules exist for this project
-//!
-//! `review_rules` returns the single line "No user rules provided.", checked
-//! with the default window and again with an explicit full-document range,
-//! both returning that identical line. Nothing below is therefore attributed
-//! to a rule, and none is invented. The constraints cited here are AAP
-//! requirements taken from the user's request (AAP 0.8) -- binding, but
-//! requirements rather than rules, a distinction AAP 0.7 asks to be kept
-//! because blurring it "would obscure the fact that the rules channel is
-//! genuinely empty". Where no requirement speaks, enterprise-standard best
-//! practice governs; the absence of rules is not permission to lower the bar.
-//!
 //! # The ownership transformation
 //!
 //! `src/tool_libinfo.c` declares twenty-two mutable file-scope globals and
 //! sixteen `bool`s, every one of them `extern` in `src/tool_libinfo.h:30-65`,
 //! and `get_libcurl_info()` populates them by side effect. Here there is one
-//! owned value, [`LibInfo`], returned by [`get_libcurl_info`]. AAP 0.1.2
-//! replaces the C tree's shared mutable state with "per-module structs with
-//! explicit ownership", so the tool's configuration layer owns the value --
+//! owned value, [`LibInfo`], returned by [`get_libcurl_info`]. The C tree's
+//! shared mutable state becomes per-module structs with explicit ownership,
+//! so the tool's configuration layer owns the value --
 //! the C call site is `src/tool_cfgable.c:235` -- and hands `&LibInfo` down.
 //! There is no module-level mutable state here of any kind, and no free
 //! function that reads any.
@@ -71,7 +59,7 @@
 //! [`get_libcurl_info`], so that pre-initialization state cannot be observed
 //! at all and the defensive empty list is not needed.
 //!
-//! # This module owns the data; `cli/help.rs` owns the printer
+//! # This module owns the data; `cli/help.rs` is to own the printer
 //!
 //! The split is deliberate and must not be blurred. `tool_version_info()` is
 //! defined in `src/tool_help.c:311-386`, so the `--version` *output* belongs
@@ -85,7 +73,7 @@
 //!
 //! This module owns the data that printer reads, and nothing else. It writes
 //! nowhere: there is no output macro, no writer parameter and no side effect
-//! on any stream. `cli/help.rs` reads exactly five things from here --
+//! on any stream. `cli/help.rs` is to read exactly five things from here --
 //! [`LibInfo::built_in_protos`], [`LibInfo::feature_names`],
 //! [`LibInfo::feature_count`], [`LibInfo::version`] and
 //! [`LibInfo::is_debug`], the last standing in for the private `is_debug()`
@@ -96,7 +84,7 @@
 //! `tests/runtests.pl` runs `curl --version` during start-up and parses the
 //! `Protocols:` and `Features:` lines (`:650-661`), then uses the result to
 //! decide which of the 1,914 fixtures under `tests/data/` may run. 874 of
-//! them gate on `<features>`, and the asymmetry is decisive (AAP 0.6.5):
+//! them gate on `<features>`, and the asymmetry is decisive:
 //!
 //! > Under-reporting a capability makes a fixture skip; over-reporting makes
 //! > it run and fail. Truthful advertisement is therefore the optimal
@@ -128,7 +116,7 @@
 //! 28 fixtures carrying a `<limits>` block inert -- their ceilings are caps
 //! rather than equalities (`$lim_allocs = 1000`, `$lim_max = 1000000`), and a
 //! Rust allocation pattern will not match a C one. That is the decision
-//! AAP 0.6.6 records. **The cost, stated rather than buried: 98 fixtures
+//! taken. **The cost, stated rather than buried: 98 fixtures
 //! require `Debug` and will skip, and `make torture-test` is not applicable**
 //! -- it hard-requires the feature and dies without it
 //! (`tests/runtests.pl:846-849`). The remedy, should that trade ever be
@@ -147,7 +135,7 @@
 //! keys on a `rustls-ffi` token rather than on the word `rustls`, because the
 //! C backend reports the version of *rustls-ffi*. This implementation uses
 //! rustls natively, so emitting that token would misdescribe it.
-//! AAP 0.8.6 ambiguity A8 resolves the trade-off in favour of accuracy, and
+//! The trade-off is resolved in favour of accuracy, and
 //! the engine's banner therefore reads `rustls/<crate version>`, which does
 //! not match. The rustls-gated fixtures skip, consistent with the
 //! under-report-is-safe asymmetry above. **Do not "fix" this by faking the
@@ -189,16 +177,15 @@
 //! asserts the no-duplicates premise, which is what licenses the substitution
 //! -- and it is a substitution, not an approximation. No raw pointer, no
 //! address comparison and no address-taking accessor appears anywhere below;
-//! the crate root forbids the escape hatch outright (AAP 0.1.1 goal G6) and
-//! this crate has no `ffi` module, so nothing under `curl-rs/src/` carries an
-//! exemption.
+//! this crate has no `ffi` module and nothing under `curl-rs/src/` carries an
+//! `#[allow(unsafe_code)]`, so there is no escape hatch to reach for.
 //!
 //! One genuine C quirk survives intact. When a protocol is not built in, the
 //! C token is NULL, so two "absent" tokens compare *equal* at
 //! `src/config2setopts.c:541`. `Option::None == Option::None` is likewise
 //! `true`, so [`LibInfo::proto_token`] reproduces it exactly. That is
-//! deliberate; AAP 0.8.2 forbids a behaviour change justified as an
-//! improvement, so it is not "fixed".
+//! deliberate: a behaviour change justified as an improvement is forbidden,
+//! so it is not "fixed".
 //!
 //! # Nothing was missing from the engine
 //!
@@ -223,7 +210,7 @@
 //! Package metadata, the binary name, the zeroth argument and the standard
 //! library's platform constants are all excluded as identity sources: using
 //! any of them would break the `--version` first token, the default
-//! `User-Agent` that 1,476 fixtures compare byte for byte (AAP 0.6.7) and the
+//! `User-Agent` that 1,476 fixtures compare byte for byte, and the
 //! `curl: (N)` error prefix. The host triplet comes from the engine's `host`
 //! field for the same reason.
 
@@ -233,16 +220,14 @@ use std::borrow::Cow;
 use curl_rs_lib::error::{CURLcode, Error};
 use curl_rs_lib::version;
 
-// ===========================================================================
 // The two hard-coded scheme tokens, and the SSH prefix test
-// ===========================================================================
 
 /// `proto_ipfs` -- `src/tool_libinfo.c:47`.
 ///
 /// A literal rather than a library-derived name, guarded in C by
 /// `#ifndef CURL_DISABLE_IPFS` (`src/tool_libinfo.c:46-49`). There is no
 /// Cargo feature standing in for that guard, and inventing a sixteenth would
-/// contradict AAP 0.5.2's fixed vocabulary, so the token is unconditional.
+/// contradict the fixed feature vocabulary, so the token is unconditional.
 ///
 /// Two consequences are preserved exactly, and both matter:
 ///
@@ -254,9 +239,11 @@ use curl_rs_lib::version;
 ///   URL's scheme against this token and its sibling without regard to case
 ///   and, on a match, assigns the token *without* calling `proto_token` -- the
 ///   C comment reads "short-circuit proto_token, we know it is ipfs or ipns".
+#[allow(dead_code)]
 const PROTO_IPFS: &str = "ipfs";
 
 /// `proto_ipns` -- `src/tool_libinfo.c:48`. See [`PROTO_IPFS`].
+#[allow(dead_code)]
 const PROTO_IPNS: &str = "ipns";
 
 /// The seven bytes `src/tool_libinfo.c:187-188` compares against
@@ -265,12 +252,11 @@ const PROTO_IPNS: &str = "ipns";
 /// The C test is `!strncmp("libssh2", curlinfo->libssh_version, 7)`, which is
 /// **case-sensitive** -- unlike every other comparison in that file, which
 /// goes through `curl_strequal`. See [`libssh2_present`].
+#[allow(dead_code)]
 const LIBSSH2_VERSION_PREFIX: &str = "libssh2";
 
-// ===========================================================================
 // The nine protocols the tool is interested in
 // src/tool_libinfo.c:37-45 (the tokens) and :51-65 (the table)
-// ===========================================================================
 
 /// Which of the nine interned tokens a [`ProtoNameSlot`] row binds.
 ///
@@ -281,6 +267,7 @@ const LIBSSH2_VERSION_PREFIX: &str = "libssh2";
 /// exhaustively, adding a slot without binding it becomes a compile error
 /// rather than a token that is silently never set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 enum ProtoSlot {
     /// `proto_file` -- `src/tool_libinfo.c:37`.
     File,
@@ -304,6 +291,7 @@ enum ProtoSlot {
 
 /// One row of `possibly_built_in[]` -- `struct proto_name_tokenp`,
 /// `src/tool_libinfo.c:51-54`.
+#[allow(dead_code)]
 struct ProtoNameSlot {
     /// `proto_name` -- `src/tool_libinfo.c:52`.
     proto_name: &'static str,
@@ -314,13 +302,13 @@ struct ProtoNameSlot {
 /// `possibly_built_in[]` -- `src/tool_libinfo.c:54-65`, verbatim.
 ///
 /// These are the nine schemes the command-line tool has dedicated behaviour
-/// for, and the list is frozen: AAP 0.8.2 forbids a behaviour change
-/// justified as an improvement, so `ws` and `wss` are **not** added and
+/// for, and the list is frozen: a behaviour change justified as an
+/// improvement is forbidden, so `ws` and `wss` are **not** added and
 /// `rtsp` and `tftp` are **not** removed. Two follow-on facts make that read
 /// as a decision rather than an oversight:
 ///
 /// - `rtsp` and `tftp` are among the 24 schemes this implementation stubs
-///   (AAP 0.2.2), so the engine does not advertise them and their two slots
+///   so the engine does not advertise them and their two slots
 ///   simply stay unset. That is correct and truthful, not a gap.
 /// - `ws` and `wss` still resolve through [`LibInfo::proto_token`], because
 ///   that function searches the engine's **full** list rather than this table
@@ -329,6 +317,7 @@ struct ProtoNameSlot {
 ///
 /// The C array carries a `{NULL, NULL}` terminator at `:64`; a Rust slice
 /// carries its own length, so there is none here.
+#[allow(dead_code)]
 const POSSIBLY_BUILT_IN: &[ProtoNameSlot] = &[
     ProtoNameSlot {
         proto_name: "file",
@@ -368,11 +357,9 @@ const POSSIBLY_BUILT_IN: &[ProtoNameSlot] = &[
     },
 ];
 
-// ===========================================================================
 // The features the tool is interested in
 // src/tool_libinfo.h:50-65 (the predicates) and
 // src/tool_libinfo.c:84-121 (the table)
-// ===========================================================================
 
 /// Which of the table-driven predicates a [`FeatureNamePresent`] row sets.
 ///
@@ -385,6 +372,7 @@ const POSSIBLY_BUILT_IN: &[ProtoNameSlot] = &[
 /// instead (`src/tool_libinfo.c:187-188`), which is why no row below carries
 /// it and why [`libssh2_present`] exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 enum FeatureSlot {
     /// `feature_altsvc` -- `src/tool_libinfo.h:50`.
     Altsvc,
@@ -420,6 +408,7 @@ enum FeatureSlot {
 
 /// One row of `maybe_feature[]` -- `struct feature_name_presentp`,
 /// `src/tool_libinfo.c:84-88`.
+#[allow(dead_code)]
 struct FeatureNamePresent {
     /// `feature_name` -- `src/tool_libinfo.c:85`. Casing is contractual: the
     /// harness matches several of these names case-sensitively, so they are
@@ -441,7 +430,7 @@ struct FeatureNamePresent {
 /// **preserved rather than tidied**: `SSLS-EXPORT` sits after `SSPI` rather
 /// than before it. The order is observable, because the bitmask fallback in
 /// [`feature_names_from_bitmask`] emits names in table order, so re-sorting
-/// the rows would change that output. AAP 0.8.2 rules that out.
+/// the rows would change that output, which is ruled out.
 ///
 /// Two rows carry a bitmask of `0`, `ECH` and `SSLS-EXPORT`. They can never
 /// be selected by the fallback's bit test and are matched by name only, in
@@ -453,6 +442,7 @@ struct FeatureNamePresent {
 ///
 /// The C array carries a `{NULL, NULL, 0}` terminator at `:120`; a Rust slice
 /// carries its own length, so there is none here.
+#[allow(dead_code)]
 const MAYBE_FEATURE: &[FeatureNamePresent] = &[
     // Keep alphabetically sorted -- src/tool_libinfo.c:89.
     FeatureNamePresent {
@@ -610,9 +600,7 @@ const MAYBE_FEATURE: &[FeatureNamePresent] = &[
     },
 ];
 
-// ===========================================================================
 // The two derived state groups
-// ===========================================================================
 
 /// The nine interned tokens of `src/tool_libinfo.c:37-45`.
 ///
@@ -620,6 +608,7 @@ const MAYBE_FEATURE: &[FeatureNamePresent] = &[
 /// tool has no token for it. Grouped rather than spread across [`LibInfo`]
 /// so that [`intern_protocol_tokens`] can be exercised on its own.
 #[derive(Default)]
+#[allow(dead_code)]
 struct ProtoTokens {
     file: Option<&'static str>,
     ftp: Option<&'static str>,
@@ -639,6 +628,7 @@ impl ProtoTokens {
     /// C. That is what makes every caller that asks for the same scheme
     /// receive the identical string, which is the interning contract
     /// `src/tool_libinfo.c:192-198` describes.
+    #[allow(dead_code)]
     fn set(&mut self, slot: ProtoSlot, name: &'static str) {
         // Exhaustive on purpose: a new slot that nothing binds becomes a
         // compile error here rather than a token that is silently never set.
@@ -663,6 +653,7 @@ impl ProtoTokens {
 /// at `src/tool_libinfo.c:67-82`. Fifteen are set from [`MAYBE_FEATURE`];
 /// `libssh2` is set from the SSH version token instead.
 #[derive(Default)]
+#[allow(dead_code)]
 struct FeaturePredicates {
     altsvc: bool,
     brotli: bool,
@@ -692,6 +683,7 @@ struct FeaturePredicates {
 
 impl FeaturePredicates {
     /// `*p->feature_presentp = TRUE;` -- `src/tool_libinfo.c:181`.
+    #[allow(dead_code)]
     fn set(&mut self, slot: FeatureSlot) {
         // Exhaustive for the same reason as `ProtoTokens::set`.
         match slot {
@@ -714,9 +706,7 @@ impl FeaturePredicates {
     }
 }
 
-// ===========================================================================
 // LibInfo -- what the twenty-two globals became
-// ===========================================================================
 
 /// Everything the command-line tool knows about the library it is driving.
 ///
@@ -725,6 +715,7 @@ impl FeaturePredicates {
 /// the only constructor, then pass `&LibInfo` to whatever needs it -- the C
 /// call site is `src/tool_cfgable.c:235`, so the tool's configuration layer
 /// is the owner.
+#[allow(dead_code)]
 pub(crate) struct LibInfo {
     /// `curlinfo` -- `src/tool_libinfo.c:32`. The engine's own payload,
     /// borrowed rather than copied so that this value and the engine can never
@@ -757,6 +748,7 @@ impl LibInfo {
     // -- the version-info payload, src/tool_libinfo.h:30 -------------------
 
     /// `curlinfo` -- the whole payload, for the fields no accessor names.
+    #[allow(dead_code)]
     pub(crate) fn curlinfo(&self) -> &'static version::VersionInfo {
         self.curlinfo
     }
@@ -767,6 +759,7 @@ impl LibInfo {
     ///
     /// Queried, never duplicated: `curl-rs-lib/src/version.rs` is the single
     /// owner of the version string, so no literal copy exists here.
+    #[allow(dead_code)]
     pub(crate) fn version(&self) -> &'static str {
         self.curlinfo.version
     }
@@ -781,18 +774,21 @@ impl LibInfo {
     /// that fallback is never needed and is deliberately not reimplemented
     /// from platform constants, which AAP 0.6.7 rules out as an identity
     /// source.
+    #[allow(dead_code)]
     pub(crate) fn host(&self) -> &'static str {
         self.curlinfo.host
     }
 
     /// `curlinfo->age` -- gates the `feature_names` preference at
     /// `src/tool_libinfo.c:162`.
+    #[allow(dead_code)]
     pub(crate) fn age(&self) -> version::CURLversion {
         self.curlinfo.age
     }
 
     /// `curlinfo->features` -- the bitmask. Used only by the fallback path at
     /// `src/tool_libinfo.c:169`; the names are the primary source.
+    #[allow(dead_code)]
     pub(crate) fn features(&self) -> c_int {
         self.curlinfo.features
     }
@@ -800,16 +796,18 @@ impl LibInfo {
     /// `curlinfo->ares_num` -- non-zero only when c-ares is linked.
     ///
     /// `src/tool_getparam.c:2361,2367,2391,2398` rejects the four `--dns-*`
-    /// options when this is zero, because those options need c-ares. AAP 0.5.2
-    /// replaces c-ares with the system resolver, so the engine reports zero
+    /// options when this is zero, because those options need c-ares. c-ares is
+    /// replaced by the system resolver, so the engine reports zero
     /// and those four options are refused -- the same refusal a C build
     /// without c-ares gives, so parity rather than a deviation.
+    #[allow(dead_code)]
     pub(crate) fn ares_num(&self) -> c_int {
         self.curlinfo.ares_num
     }
 
     /// `curlinfo->libssh_version` -- the raw SSH token, before the prefix
     /// test in [`libssh2_present`].
+    #[allow(dead_code)]
     pub(crate) fn libssh_version(&self) -> Option<&'static str> {
         self.curlinfo.libssh_version
     }
@@ -822,6 +820,7 @@ impl LibInfo {
     /// this array, the extra one being C's NULL terminator. A Rust slice
     /// carries its own length, so no terminator is exposed and a caller
     /// reproducing that copy needs only [`LibInfo::proto_count`] entries.
+    #[allow(dead_code)]
     pub(crate) fn built_in_protos(&self) -> &'static [&'static str] {
         self.built_in_protos
     }
@@ -834,6 +833,7 @@ impl LibInfo {
     /// `:391`) and `:403` clamps it "in case of surprises". The `tests`
     /// module checks the bound here so the assertion downstream can never be
     /// the first place a surprise is noticed.
+    #[allow(dead_code)]
     pub(crate) fn proto_count(&self) -> usize {
         self.built_in_protos.len()
     }
@@ -848,6 +848,7 @@ impl LibInfo {
     /// Callers compare the result with `==`. See this module's header for why
     /// that is *identical* to the C comparison of interned addresses, and for
     /// the one C quirk it preserves: two absent tokens compare equal.
+    #[allow(dead_code)]
     pub(crate) fn proto_token(
         &self,
         proto: Option<&str>,
@@ -867,26 +868,31 @@ impl LibInfo {
     }
 
     /// `proto_file` -- `src/tool_libinfo.c:37`.
+    #[allow(dead_code)]
     pub(crate) fn proto_file(&self) -> Option<&'static str> {
         self.protos.file
     }
 
     /// `proto_ftp` -- `src/tool_libinfo.c:38`.
+    #[allow(dead_code)]
     pub(crate) fn proto_ftp(&self) -> Option<&'static str> {
         self.protos.ftp
     }
 
     /// `proto_ftps` -- `src/tool_libinfo.c:39`.
+    #[allow(dead_code)]
     pub(crate) fn proto_ftps(&self) -> Option<&'static str> {
         self.protos.ftps
     }
 
     /// `proto_http` -- `src/tool_libinfo.c:40`.
+    #[allow(dead_code)]
     pub(crate) fn proto_http(&self) -> Option<&'static str> {
         self.protos.http
     }
 
     /// `proto_https` -- `src/tool_libinfo.c:41`.
+    #[allow(dead_code)]
     pub(crate) fn proto_https(&self) -> Option<&'static str> {
         self.protos.https
     }
@@ -895,22 +901,26 @@ impl LibInfo {
     ///
     /// Always absent in this build: `rtsp` is one of the 24 stubbed schemes
     /// (AAP 0.2.2), so the engine does not advertise it.
+    #[allow(dead_code)]
     pub(crate) fn proto_rtsp(&self) -> Option<&'static str> {
         self.protos.rtsp
     }
 
     /// `proto_scp` -- `src/tool_libinfo.c:43`.
+    #[allow(dead_code)]
     pub(crate) fn proto_scp(&self) -> Option<&'static str> {
         self.protos.scp
     }
 
     /// `proto_sftp` -- `src/tool_libinfo.c:44`.
+    #[allow(dead_code)]
     pub(crate) fn proto_sftp(&self) -> Option<&'static str> {
         self.protos.sftp
     }
 
     /// `proto_tftp` -- `src/tool_libinfo.c:45`. Always absent, for the same
     /// reason as [`LibInfo::proto_rtsp`].
+    #[allow(dead_code)]
     pub(crate) fn proto_tftp(&self) -> Option<&'static str> {
         self.protos.tftp
     }
@@ -920,11 +930,13 @@ impl LibInfo {
     /// Not an `Option`, unlike the nine above, and the difference is the
     /// point: this is a literal the tool defines, so it is never absent even
     /// though the engine never lists the scheme. See [`PROTO_IPFS`].
+    #[allow(dead_code)]
     pub(crate) fn proto_ipfs(&self) -> &'static str {
         PROTO_IPFS
     }
 
     /// `proto_ipns` -- `src/tool_libinfo.c:48`. See [`LibInfo::proto_ipfs`].
+    #[allow(dead_code)]
     pub(crate) fn proto_ipns(&self) -> &'static str {
         PROTO_IPNS
     }
@@ -937,6 +949,7 @@ impl LibInfo {
     /// printer re-sorts a copy case-insensitively before display
     /// (`src/tool_help.c:372-376`); that is `cli/help.rs`'s business, not
     /// this module's, so the order here is left alone.
+    #[allow(dead_code)]
     pub(crate) fn feature_names(&self) -> &[&'static str] {
         &self.feature_names
     }
@@ -947,6 +960,7 @@ impl LibInfo {
     /// row, because `src/tool_libinfo.c:184` increments outside the inner
     /// match. `src/tool_help.c:358,365,367` sizes its display copy from this,
     /// so an undercount would truncate the printed line.
+    #[allow(dead_code)]
     pub(crate) fn feature_count(&self) -> usize {
         self.feature_count
     }
@@ -959,6 +973,7 @@ impl LibInfo {
     /// output; the printer only decides what to do with the answer.
     ///
     /// False in this build, by design. See this module's header for the cost.
+    #[allow(dead_code)]
     pub(crate) fn is_debug(&self) -> bool {
         self.feature_names
             .iter()
@@ -966,54 +981,63 @@ impl LibInfo {
     }
 
     /// `feature_altsvc` -- read at `src/tool_getparam.c:2603`.
+    #[allow(dead_code)]
     pub(crate) fn feature_altsvc(&self) -> bool {
         self.features.altsvc
     }
 
     /// `feature_brotli` -- read at `src/tool_getparam.c:1839`, where
     /// `--compressed` needs any one of brotli, libz or zstd.
+    #[allow(dead_code)]
     pub(crate) fn feature_brotli(&self) -> bool {
         self.features.brotli
     }
 
     /// `feature_hsts` -- read at `src/tool_getparam.c:2609`.
+    #[allow(dead_code)]
     pub(crate) fn feature_hsts(&self) -> bool {
         self.features.hsts
     }
 
     /// `feature_http2` -- read at `src/tool_getparam.c:1765,1771,2015`.
+    #[allow(dead_code)]
     pub(crate) fn feature_http2(&self) -> bool {
         self.features.http2
     }
 
     /// `feature_http3` -- read at `src/tool_getparam.c:1777,1784`.
+    #[allow(dead_code)]
     pub(crate) fn feature_http3(&self) -> bool {
         self.features.http3
     }
 
     /// `feature_httpsproxy` -- read at `src/tool_getparam.c:2015`.
+    #[allow(dead_code)]
     pub(crate) fn feature_httpsproxy(&self) -> bool {
         self.features.httpsproxy
     }
 
     /// `feature_libz` -- read at `src/tool_getparam.c:1839`. See
     /// [`LibInfo::feature_brotli`].
+    #[allow(dead_code)]
     pub(crate) fn feature_libz(&self) -> bool {
         self.features.libz
     }
 
     /// `feature_libssh2` -- read at `src/tool_getparam.c:2690`.
     ///
-    /// False in this build. AAP 0.5.2 replaces libssh2 with `russh`, so the
+    /// False in this build. libssh2 is replaced by `russh`, so the
     /// truthful SSH token matches neither the `libssh2` prefix this predicate
     /// tests for nor the `libssh/` spelling, and the libssh-gated fixtures
     /// skip. That is the correct outcome under the under-report-is-safe
     /// asymmetry in this module's header.
+    #[allow(dead_code)]
     pub(crate) fn feature_libssh2(&self) -> bool {
         self.features.libssh2
     }
 
     /// `feature_ntlm` -- read at `src/tool_getparam.c:1857,1874`.
+    #[allow(dead_code)]
     pub(crate) fn feature_ntlm(&self) -> bool {
         self.features.ntlm
     }
@@ -1023,6 +1047,7 @@ impl LibInfo {
     /// False unless the non-default `negotiate` Cargo feature is on, because
     /// the engine withholds the `SPNEGO` name otherwise (AAP 0.8.5
     /// conflict C2).
+    #[allow(dead_code)]
     pub(crate) fn feature_spnego(&self) -> bool {
         self.features.spnego
     }
@@ -1033,42 +1058,45 @@ impl LibInfo {
     /// `ARG_TLS` is `0x40` (`src/tool_getparam.h:326`) and is set on 61 of the
     /// 282 alias rows, including `--dump-ca-embed`
     /// (`src/tool_getparam.c:128`); every one of them is refused with
-    /// `PARAM_LIBCURL_DOESNT_SUPPORT` when this is false. `cli/args.rs`
-    /// implements that gate and this accessor is what it reads.
+    /// `PARAM_LIBCURL_DOESNT_SUPPORT` when this is false. `cli/args.rs` is to
+    /// implement that gate, and this accessor is what it will read.
     ///
     /// This module only *reports* that TLS exists. It decides nothing about
     /// certificate verification, which AAP 0.8.1 freezes as on by default.
+    #[allow(dead_code)]
     pub(crate) fn feature_ssl(&self) -> bool {
         self.features.ssl
     }
 
     /// `feature_tls_srp` -- read at
     /// `src/tool_getparam.c:2696,2702,2708,2723,2729,2735`.
+    #[allow(dead_code)]
     pub(crate) fn feature_tls_srp(&self) -> bool {
         self.features.tls_srp
     }
 
     /// `feature_zstd` -- read at `src/tool_getparam.c:1839`. See
     /// [`LibInfo::feature_brotli`].
+    #[allow(dead_code)]
     pub(crate) fn feature_zstd(&self) -> bool {
         self.features.zstd
     }
 
     /// `feature_ech` -- read at `src/tool_getparam.c:1232`.
+    #[allow(dead_code)]
     pub(crate) fn feature_ech(&self) -> bool {
         self.features.ech
     }
 
     /// `feature_ssls_export` -- read at `src/tool_getparam.c:2306` and
     /// `src/tool_operate.c:2354,2373`.
+    #[allow(dead_code)]
     pub(crate) fn feature_ssls_export(&self) -> bool {
         self.features.ssls_export
     }
 }
 
-// ===========================================================================
 // The four steps of get_libcurl_info, each on its own so each is testable
-// ===========================================================================
 
 /// `curl_version_info(CURLVERSION_NOW)` -- `src/tool_libinfo.c:142`.
 ///
@@ -1087,6 +1115,7 @@ impl LibInfo {
 /// *new* failure condition, on an empty protocol list for instance, was
 /// rejected: C proceeds happily in that case and returns `CURLE_OK`, so
 /// erroring would be a behaviour change, which AAP 0.8.2 prohibits.
+#[allow(dead_code)]
 fn version_info_payload() -> Option<&'static version::VersionInfo> {
     Some(version::version_info())
 }
@@ -1104,6 +1133,7 @@ fn version_info_payload() -> Option<&'static version::VersionInfo> {
 /// body never sets: `result` is `CURLE_OK` at `:138` and is not assigned
 /// anywhere in the loop, so the condition is constant and has no counterpart
 /// here.
+#[allow(dead_code)]
 fn intern_protocol_tokens(
     built_in_protos: &'static [&'static str],
 ) -> ProtoTokens {
@@ -1135,13 +1165,14 @@ fn intern_protocol_tokens(
 /// **Unreachable in this workspace**, and reproduced anyway. The engine
 /// reports `CURLVERSION_TWELFTH` (`include/curl/curl.h:3109`), which is at
 /// least `CURLVERSION_ELEVENTH`, so [`get_libcurl_info`] always takes the
-/// preferred branch. AAP 0.8.2 forbids dropping behaviour on the grounds that
+/// preferred branch. Dropping behaviour on the grounds that
 /// the current configuration cannot reach it, and the `tests` module drives
 /// this function directly so it is covered rather than merely present.
 ///
 /// C writes into the file-scope `fnames[CURL_ARRAYSIZE(maybe_feature)]`
 /// (`:123`), 31 slots for at most 30 names plus a NULL terminator. The
 /// returned vector needs no terminator, so its capacity is the row count.
+#[allow(dead_code)]
 fn feature_names_from_bitmask(features: c_int) -> Vec<&'static str> {
     let mut names = Vec::with_capacity(MAYBE_FEATURE.len());
 
@@ -1167,6 +1198,7 @@ fn feature_names_from_bitmask(features: c_int) -> Vec<&'static str> {
 /// only recognised names would truncate the printed `Features:` line. The
 /// engine reports several such names -- `HTTPSRR` and `asyn-rr` among them --
 /// that this thirty-row table has no entry for.
+#[allow(dead_code)]
 fn derive_feature_predicates(
     feature_names: &[&'static str],
 ) -> (FeaturePredicates, usize) {
@@ -1204,6 +1236,7 @@ fn derive_feature_predicates(
 /// difference is preserved: `LIBSSH2/1.11.0` is false here just as it is in C.
 /// A token shorter than the prefix is false in both, because `strncmp` stops
 /// at the terminating byte.
+#[allow(dead_code)]
 fn libssh2_present(libssh_version: Option<&str>) -> bool {
     match libssh_version {
         Some(token) => token.starts_with(LIBSSH2_VERSION_PREFIX),
@@ -1225,6 +1258,7 @@ fn libssh2_present(libssh_version: Option<&str>) -> bool {
 /// See [`version_info_payload`] for why that arm cannot be reached here and
 /// why it is kept regardless. The type is exactly the engine's
 /// `error::CurlResult<LibInfo>`, spelled out here for clarity.
+#[allow(dead_code)]
 pub(crate) fn get_libcurl_info() -> Result<LibInfo, Error> {
     // Step 1 -- src/tool_libinfo.c:141-144.
     let curlinfo = match version_info_payload() {
@@ -1278,6 +1312,48 @@ pub(crate) fn get_libcurl_info() -> Result<LibInfo, Error> {
     })
 }
 
+// A synthetic scheme list, for tests only
+
+#[cfg(test)]
+impl LibInfo {
+    /// A [`LibInfo`] describing a hypothetical engine that serves
+    /// `protocols`, with everything else exactly as the real engine reports
+    /// it.
+    ///
+    /// The `--proto` and `--proto-redir` grammar of
+    /// `src/tool_paramhlp.c:395-510` is a property of the parser, not of the
+    /// scheme list it is handed: the modifiers, the `all` keyword, the
+    /// 31-byte truncation, the empty-token skip and the alphabetic sort all
+    /// behave identically whatever the engine advertises. Exercising that
+    /// grammar against the live list only works while the live list is
+    /// non-empty, and `curl_rs_lib::version::ENGINE_PROTOCOLS` withholds every
+    /// scheme until the protocol engine exists -- so the live list is
+    /// deliberately empty today, which would leave every grammar assertion
+    /// either vacuous or inverted.
+    ///
+    /// Overriding the two protocol fields and nothing else is what keeps that
+    /// coverage honest. The version payload, the feature names and the sixteen
+    /// derived predicates all still come from [`get_libcurl_info`], so this
+    /// value cannot be used to assert a capability the build does not have --
+    /// only to ask what the parser does with a scheme list.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`get_libcurl_info`]'s only error, which see.
+    pub(crate) fn with_protocols(
+        protocols: &'static [&'static str],
+    ) -> Result<Self, Error> {
+        let mut info = get_libcurl_info()?;
+
+        // The pair `get_libcurl_info` derives together at Step 2, so they are
+        // replaced together and can never disagree.
+        info.built_in_protos = protocols;
+        info.protos = intern_protocol_tokens(protocols);
+
+        Ok(info)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1289,7 +1365,7 @@ mod tests {
     /// at the point the count is produced.
     const MAX_PROTOS: usize = 34;
 
-    /// The 24 schemes AAP 0.2.2 stubs, which must never be advertised.
+    /// The 24 stubbed schemes, which must never be advertised.
     ///
     /// `tests/runtests.pl:840-843` turns every advertised protocol into a
     /// harness feature as well, so naming one of these would convert 283
@@ -1300,7 +1376,7 @@ mod tests {
         "rtmpts", "rtsp", "smb", "smbs", "smtp", "smtps", "telnet", "tftp",
     ];
 
-    /// The nine schemes this implementation serves (AAP 0.6.5).
+    /// The nine schemes this implementation serves.
     const IN_SCOPE_SCHEMES: &[&str] = &[
         "file", "ftp", "ftps", "http", "https", "scp", "sftp", "ws", "wss",
     ];
@@ -1452,7 +1528,16 @@ mod tests {
 
     #[test]
     fn proto_token_folds_ascii_case_and_rejects_the_unknown() {
-        let info = libinfo();
+        // Case folding is a property of the lookup at
+        // src/tool_libinfo.c:206-208, so it is asked of a known scheme list
+        // rather than of the live one -- which is empty while
+        // version::ENGINE_PROTOCOLS is absent and would make the three
+        // assertions below vacuous. `advertised_protocols_never_exceed_the_
+        // nine_in_scope_schemes` is where the live list is asserted.
+        let info = match LibInfo::with_protocols(IN_SCOPE_SCHEMES) {
+            Ok(info) => info,
+            Err(error) => panic!("with_protocols() failed: {error}"),
+        };
 
         assert_eq!(info.proto_token(Some("http")), Some("http"));
         assert_eq!(info.proto_token(Some("HTTP")), Some("http"));
@@ -1574,26 +1659,34 @@ mod tests {
 
     // -- 9. the Protocols: contract ---------------------------------------
 
-    /// Which of the nine in-scope schemes this feature selection earns,
-    /// row-for-row against the engine's own gating and in the same (already
-    /// sorted) order.
+    /// Which of the nine in-scope schemes this build earns, row-for-row
+    /// against the engine's own gating and in the same (already sorted) order.
     ///
-    /// The mapping is AAP 0.5.2's feature map: `file`, `http` and `https` are
+    /// A scheme is earned only when BOTH of its preconditions hold. The Cargo
+    /// feature is AAP 0.5.2's feature map: `file`, `http` and `https` are
     /// unconditional because everything else layers over HTTP, while `ftp`,
-    /// `ssh` and `websockets` each carry two schemes. Restating it here rather
-    /// than reading the engine's table back makes this an independent
-    /// cross-check of that table instead of a tautology.
+    /// `ssh` and `websockets` each carry two schemes. The engine is
+    /// `version::ENGINE_PROTOCOLS` for every row plus `version::ENGINE_TLS` for
+    /// the three `s`-suffixed ones, because a scheme with no module to
+    /// implement it cannot be served whatever its feature says.
+    ///
+    /// Restating both halves here rather than reading the engine's table back
+    /// makes this an independent cross-check of that table instead of a
+    /// tautology.
     fn expected_schemes() -> Vec<&'static str> {
+        const ENGINE: bool = version::ENGINE_PROTOCOLS.is_present();
+        const SECURE: bool = ENGINE && version::ENGINE_TLS.is_present();
+
         const GATED: &[(&str, bool)] = &[
-            ("file", true),
-            ("ftp", cfg!(feature = "ftp")),
-            ("ftps", cfg!(feature = "ftp")),
-            ("http", true),
-            ("https", true),
-            ("scp", cfg!(feature = "ssh")),
-            ("sftp", cfg!(feature = "ssh")),
-            ("ws", cfg!(feature = "websockets")),
-            ("wss", cfg!(feature = "websockets")),
+            ("file", ENGINE),
+            ("ftp", cfg!(feature = "ftp") && ENGINE),
+            ("ftps", cfg!(feature = "ftp") && SECURE),
+            ("http", ENGINE),
+            ("https", SECURE),
+            ("scp", cfg!(feature = "ssh") && ENGINE),
+            ("sftp", cfg!(feature = "ssh") && ENGINE),
+            ("ws", cfg!(feature = "websockets") && ENGINE),
+            ("wss", cfg!(feature = "websockets") && SECURE),
         ];
 
         GATED
@@ -1604,13 +1697,13 @@ mod tests {
     }
 
     #[test]
-    fn advertised_protocols_are_the_nine_in_scope_schemes() {
+    fn advertised_protocols_never_exceed_the_nine_in_scope_schemes() {
         let info = libinfo();
         let advertised = info.built_in_protos();
 
         // The half of the contract that holds under every feature
-        // combination, and the half that matters: never a scheme AAP 0.2.2
-        // stubs. tests/runtests.pl:840-843 registers every advertised
+        // combination, and the half that matters: never a stubbed scheme.
+        // tests/runtests.pl:840-843 registers every advertised
         // protocol as a harness feature as well, so one over-report converts
         // 283 clean skips into failures.
         for stubbed in STUBBED_SCHEMES {
@@ -1628,37 +1721,63 @@ mod tests {
 
         // The other half: exactly -- neither more nor less -- what the
         // selected features serve. Under-reporting is safe for the harness
-        // (AAP 0.6.5) but it is still not truthful, so it is asserted too.
+        // but it is still not truthful, so it is asserted too.
         assert_eq!(
             advertised,
             expected_schemes().as_slice(),
             "the advertised set must be exactly what the features serve"
         );
 
-        // With the shipped defaults that is all nine, which is the
-        // configuration AAP 0.6.5 measures its 73.8% eligibility against.
-        if cfg!(feature = "ftp")
+        // With the shipped defaults and both engines present that is all nine,
+        // which is the configuration AAP 0.6.5 measures its 73.8% eligibility
+        // against. While either engine is absent the same contract says the
+        // set is empty, and both branches are asserted so neither reading is
+        // left untested.
+        let full_features = cfg!(feature = "ftp")
             && cfg!(feature = "ssh")
-            && cfg!(feature = "websockets")
-        {
+            && cfg!(feature = "websockets");
+        let engines = version::ENGINE_PROTOCOLS.is_present()
+            && version::ENGINE_TLS.is_present();
+        if full_features && engines {
             assert_eq!(
                 advertised, IN_SCOPE_SCHEMES,
                 "AAP 0.6.5: the nine schemes this implementation serves"
             );
         }
+        if !version::ENGINE_PROTOCOLS.is_present() {
+            assert!(
+                advertised.is_empty(),
+                "no scheme may be advertised without a protocol engine"
+            );
+        }
 
         // The dedicated tokens follow from the list rather than from this
-        // module's opinion of it: bound exactly when the name is advertised.
-        assert_eq!(info.proto_file(), Some("file"));
-        assert_eq!(info.proto_http(), Some("http"));
-        assert_eq!(info.proto_https(), Some("https"));
-        assert_eq!(info.proto_ftp(), cfg!(feature = "ftp").then_some("ftp"));
-        assert_eq!(info.proto_ftps(), cfg!(feature = "ftp").then_some("ftps"));
-        assert_eq!(info.proto_scp(), cfg!(feature = "ssh").then_some("scp"));
-        assert_eq!(info.proto_sftp(), cfg!(feature = "ssh").then_some("sftp"));
+        // module's opinion of it: bound exactly when the name is advertised,
+        // which is the feature and the engine together.
+        let engine = version::ENGINE_PROTOCOLS.is_present();
+        let secure = engine && version::ENGINE_TLS.is_present();
+        assert_eq!(info.proto_file(), engine.then_some("file"));
+        assert_eq!(info.proto_http(), engine.then_some("http"));
+        assert_eq!(info.proto_https(), secure.then_some("https"));
+        assert_eq!(
+            info.proto_ftp(),
+            (cfg!(feature = "ftp") && engine).then_some("ftp")
+        );
+        assert_eq!(
+            info.proto_ftps(),
+            (cfg!(feature = "ftp") && secure).then_some("ftps")
+        );
+        assert_eq!(
+            info.proto_scp(),
+            (cfg!(feature = "ssh") && engine).then_some("scp")
+        );
+        assert_eq!(
+            info.proto_sftp(),
+            (cfg!(feature = "ssh") && engine).then_some("sftp")
+        );
 
         // rtsp and tftp keep their table rows (src/tool_libinfo.c:57,64) and
-        // stay unbound regardless, because AAP 0.2.2 stubs both schemes. That
+        // stay unbound regardless, because both schemes are stubbed. That
         // is the correct, truthful outcome, not a gap to be filled.
         assert_eq!(info.proto_rtsp(), None);
         assert_eq!(info.proto_tftp(), None);
@@ -1667,8 +1786,14 @@ mod tests {
         // table -- yet they still tokenize, because proto_token searches the
         // engine's full list (src/tool_libinfo.c:200-210).
         let ws = cfg!(feature = "websockets");
-        assert_eq!(info.proto_token(Some("ws")), ws.then_some("ws"));
-        assert_eq!(info.proto_token(Some("wss")), ws.then_some("wss"));
+        assert_eq!(
+            info.proto_token(Some("ws")),
+            (ws && engine).then_some("ws")
+        );
+        assert_eq!(
+            info.proto_token(Some("wss")),
+            (ws && secure).then_some("wss")
+        );
     }
 
     // -- 10. the Features: contract ---------------------------------------
@@ -1679,7 +1804,7 @@ mod tests {
         let names = info.feature_names();
         assert!(!names.is_empty(), "the engine must describe itself");
 
-        // AAP 0.6.6. tests/runtests.pl:658-661 derives both TrackMemory and
+        // tests/runtests.pl:658-661 derives both TrackMemory and
         // Debug from /Debug/i, and :1759 gates all memory checking on the
         // former. Cost: 98 fixtures skip and torture-test is not applicable
         // (tests/runtests.pl:846-849).
@@ -1689,7 +1814,7 @@ mod tests {
         );
         assert!(!info.is_debug(), "so the pre-warning stays suppressed too");
 
-        // AAP 0.8.6 ambiguity A8: tests/runtests.pl:585-586 keys the harness's
+        // tests/runtests.pl:585-586 keys the harness's
         // rustls feature off a rustls-ffi token. This build uses rustls
         // natively and says so, so the token must not appear anywhere.
         for name in names {
@@ -1699,17 +1824,33 @@ mod tests {
             );
         }
 
-        // AAP 0.8.5 conflict C2: with `negotiate` off -- the default -- none of
-        // the three GSS-API-backed names may be claimed.
-        if !cfg!(feature = "negotiate") {
-            for withheld in ["GSS-API", "SPNEGO", "Kerberos"] {
+        // AAP 0.8.5 conflict C2 plus 0.6.5: the three GSS-API-backed names may
+        // be claimed only when the ENGINE says so.
+        //
+        // Asked of the engine, NOT of `cfg!(feature = "negotiate")` here. This
+        // crate merely forwards `negotiate = ["curl-rs-lib/negotiate"]`, and
+        // Cargo allows the engine's feature to be enabled on its own
+        // (`--features curl-rs-lib/negotiate`), in which case a local `cfg!`
+        // reads false while the engine genuinely has the capability. An earlier
+        // revision asserted against the local `cfg!` and failed in exactly that
+        // configuration -- a cross-crate `cfg!` cannot decide another crate's
+        // capability, which is the same mistake M-02 removes from the
+        // diagnostic and banner surfaces.
+        for name in ["GSS-API", "SPNEGO", "Kerberos"] {
+            assert_eq!(
+                names.contains(&name),
+                version::has_feature(name),
+                "{name} must be advertised exactly when the engine reports it"
+            );
+            if names.contains(&name) {
+                let row = version::feature(name).expect("the row must exist");
                 assert!(
-                    !names.contains(&withheld),
-                    "{withheld} must not be advertised without `negotiate`"
+                    row.compiled_in(),
+                    "{name} cannot be advertised without being compiled in"
                 );
             }
-            assert!(!info.feature_spnego());
         }
+        assert_eq!(info.feature_spnego(), version::has_feature("SPNEGO"));
     }
 
     #[test]
@@ -1733,9 +1874,18 @@ mod tests {
         assert_eq!(info.feature_ech(), advertises("ECH"));
         assert_eq!(info.feature_ssls_export(), advertises("SSLS-EXPORT"));
 
-        // The ARG_TLS gate at src/tool_getparam.c:2991 depends on this one,
-        // and TLS is unconditional in this workspace (AAP 0.1.1 goal G4).
-        assert!(info.feature_ssl(), "TLS is not switchable off");
+        // The ARG_TLS gate at src/tool_getparam.c:2991 depends on this one.
+        // AAP 0.1.1 goal G4 makes TLS unswitchable, so no Cargo feature may
+        // appear in this claim -- but unswitchable is not the same as present,
+        // and the claim is withheld until the backend module exists. The
+        // predicate therefore tracks version::ENGINE_TLS and nothing else,
+        // which is also what makes --proto https and the ARG_TLS options
+        // refuse rather than pretend while the engine is absent.
+        assert_eq!(
+            info.feature_ssl(),
+            version::ENGINE_TLS.is_present(),
+            "the SSL claim is the TLS engine's presence, and only that"
+        );
     }
 
     // -- 11. NTLM_WB -------------------------------------------------------
@@ -1807,7 +1957,7 @@ mod tests {
         // real triplet.
         assert!(!info.host().is_empty());
 
-        // c-ares is replaced by the system resolver (AAP 0.5.2), so the four
+        // c-ares is replaced by the system resolver, so the four
         // --dns-* options at src/tool_getparam.c:2361,2367,2391,2398 are
         // refused exactly as they are by a C build without c-ares.
         assert_eq!(info.ares_num(), 0);
@@ -1818,9 +1968,8 @@ mod tests {
         // src/tool_version.h:28 -- CURL_NAME is "curl" even though the Cargo
         // binary is named curl-rs. Nothing in this module derives identity
         // from package metadata, from the binary name, from the zeroth
-        // argument or from a platform constant; all of them are excluded by
-        // AAP 0.6.7, because the default User-Agent is byte-compared by 1,476
-        // fixtures.
+        // argument or from a platform constant; all of them are excluded,
+        // because the default User-Agent is byte-compared by 1,476 fixtures.
         assert_eq!(version::CURL_NAME, "curl");
     }
 

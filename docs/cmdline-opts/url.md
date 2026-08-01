@@ -28,11 +28,13 @@ protocol is used, otherwise it assumes HTTP. Scheme guessing can be avoided by
 providing a full URL including the scheme, or disabled by setting a default
 protocol, see --proto-default for details.
 
-Scheme guessing itself is fully implemented, and a guess that lands on FTP or
-on the HTTP fallback works normally. This build registers and parses DICT,
-IMAP, LDAP, POP3 and SMTP without implementing their transfers, so a transfer
-using one of those five schemes fails with `CURLE_UNSUPPORTED_PROTOCOL` and
-those schemes are absent from the `Protocols:` line of the --version output.
+Scheme guessing is specified to keep its current behavior, so a guess that
+lands on FTP or on the HTTP fallback stays within the specified scope. Of the
+schemes a guess can produce, DICT, IMAP, LDAP, POP3 and SMTP are registered
+and parsed without their transfers being in scope, so a transfer using one of
+those five is specified to fail with `CURLE_UNSUPPORTED_PROTOCOL`, and the
+`Protocols:` line of the --version output withholds them. The withheld list is
+delivered; the URL parser that does the guessing is not on disk.
 
 To control where the contents of a retrieved URL is written instead of the
 default stdout, use the --output or the --remote-name options. When retrieving

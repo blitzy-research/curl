@@ -53,10 +53,8 @@ curl-*.tar.bz2
 curl-*.tar.gz
 curl-*.tar.xz
 curl-*.zip
-curl-config
 depcomp
 install-sh
-libcurl.pc
 libtool
 ltmain.sh
 missing

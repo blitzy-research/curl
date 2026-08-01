@@ -75,7 +75,7 @@
 //!   the `HAVE_FCNTL_O_NONBLOCK` branch, `fcntl(F_GETFL)` then
 //!   `fcntl(F_SETFL, flags | O_NONBLOCK)`, which is precisely
 //!   `socket2::Socket::set_nonblocking`. The short-circuit at `nonblock.c:57`
-//!   is a pure optimisation and performance is an explicit non-goal. The
+//!   is a pure optimization and performance is an explicit non-goal. The
 //!   Amiga `IoctlSocket`, Windows `ioctlsocket` and Orbis `SO_NONBLOCK`
 //!   branches at `nonblock.c:65-88` are excluded platforms.
 //! * `getsockname` / `getpeername` (`lib/cf-socket.c:1006,1996`,
@@ -128,20 +128,32 @@
 //! real family is `AF_PACKET` or `AF_LINK` could over-read the allocation and
 //! trip AddressSanitizer.
 
-// `dead_code` is allowed for this module alone, and for one specific reason
-// rather than as a convenience: every consumer of these wrappers lives in
-// another module -- `dns/if2ip.rs` for the interface snapshot, `protocols/mod.rs`
-// and `url/` for the zone-id lookup, and `lib.rs` for the optional allocator --
-// so until those land each wrapper is legitimately unreferenced inside the
-// crate, and the zero-warnings gate would otherwise fail on code that is
-// correct. No lint level for `unsafe_code` is set here, at any level, by
-// design: see the module documentation above.
-#![allow(dead_code)]
+// `dead_code` is NOT allowed for this module as a whole. Every item below that
+// has no consumer yet carries its own `#[allow(dead_code)]`, written at the
+// item, so the suppression reads as an inventory rather than a blanket: each
+// one is load-bearing, deleting any one of them restores a warning, and an
+// item added later with no consumer is still reported. Each is removed when
+// its consumer lands. A module- or crate-scoped `#![allow(dead_code)]` would
+// instead silence the NEXT item somebody adds, which hides incomplete
+// scaffolding rather than recording it; the rule and the executable gate that
+// enforces it across the workspace live in `curl-rs-lib/src/lib.rs`
+// (`mod source_policy`).
+//
+// The consumers named above are all in other modules -- `dns/if2ip.rs` for
+// the interface snapshot, `protocols/mod.rs` and `url/` for the zone-id
+// lookup, and `lib.rs` for the optional allocator -- so until they land each
+// wrapper is legitimately unreferenced and the zero-warnings gate
+// (AAP section 0.8.4) would otherwise fail on code that is correct. No lint
+// level for `unsafe_code` is set here, at any level, by design: see the
+// module documentation above.
 
+use core::mem::MaybeUninit;
 use core::ptr;
 use std::ffi::{CStr, CString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::io::RawFd;
 
 use crate::error::{CURLcode, CodeResult};
 
@@ -153,11 +165,40 @@ use crate::error::{CURLcode, CodeResult};
 /// declares `char localhost[HOSTNAME_MAX + 1]` and passes
 /// `sizeof(localhost)` at `lib/smtp.c:191` -- so the effective `namelen` in C
 /// is 1025, and [`gethostname`] uses exactly that many bytes.
+#[allow(dead_code)]
 pub(crate) const HOSTNAME_MAX: usize = 1024;
 
-// ===========================================================================
+/// `O_NOFOLLOW`, for [`std::os::unix::fs::OpenOptionsExt::custom_flags`].
+///
+/// Re-exported from `libc` rather than spelled as a literal because the value
+/// is not the same on every mandated target -- `0o400000` on Linux and
+/// `0x0000_0100` on macOS -- so a hard-coded number would silently mean
+/// something else on one of the four. `libc` is the crate's only description
+/// of platform constants and it lives here, which is why this constant lives
+/// here too: nothing outside this directory names `libc`, and this keeps that
+/// property while still letting `tls/keylog.rs` ask the kernel not to follow a
+/// symbolic link.
+///
+/// Not a syscall and not `unsafe`: an integer, evaluated at compile time. It is
+/// grouped with the seam below only because that is where the platform lives.
+///
+/// The flag refuses the *final* path component when it is a symbolic link. It
+/// says nothing about the directories leading to it, so a caller that must also
+/// resist a redirected parent needs `O_PATH`-style directory traversal, which
+/// no curl behaviour requires.
+pub(crate) const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
+
+/// `O_CLOEXEC`, for [`std::os::unix::fs::OpenOptionsExt::custom_flags`].
+///
+/// Rust's [`std::fs::File`] already opens every descriptor with this flag set,
+/// so passing it changes nothing today. It is passed anyway, and exported for
+/// that purpose, because the property matters -- a key log descriptor must not
+/// survive into a child process -- and a guarantee that is stated in the call
+/// is a guarantee a reader can check. `tls/keylog.rs` asserts the resulting
+/// descriptor really carries it rather than trusting either layer.
+pub(crate) const O_CLOEXEC: i32 = libc::O_CLOEXEC;
+
 // The syscall seam
-// ===========================================================================
 
 /// One address of one interface, copied out of operating-system memory.
 ///
@@ -217,10 +258,20 @@ pub(crate) enum RawIfAddr {
 /// the real calls; `mod tests` substitutes a pure-Rust fake and thereby covers
 /// every branch of the surrounding logic under Miri.
 ///
-/// The trait is deliberately narrow. It exposes the three primitives that have
-/// no safe equivalent and nothing else, and every method returns owned data so
-/// that no raw pointer or foreign-owned allocation can escape an
-/// implementation.
+/// The trait is deliberately narrow. It exposes only primitives that have no
+/// safe equivalent -- the ones `socket2` and `std` between them do not cover --
+/// and every method returns owned data so that no raw pointer or foreign-owned
+/// allocation can escape an implementation. AAP section 0.6.9 fixes the
+/// membership test: socket options, non-blocking flags, `getsockname` and
+/// `getpeername` are absorbed by `socket2` and are therefore absent here, while
+/// the hostname query, `getifaddrs`, `if_nametoindex`, `fsetxattr`, `geteuid`
+/// and the descriptor primitives behind a lazily read upload -- `lseek`,
+/// `fstat` and `read` -- genuinely remain.
+///
+/// Terminal handling, broken-down time and the locale are seams of their own --
+/// [`TerminalCalls`], [`TimeCalls`] and [`XattrCalls`] -- rather than more
+/// methods here, so that a module faking one concern is not made to fake the
+/// others. The reasoning is recorded on each of them.
 pub(crate) trait SysCalls {
     /// Fills `buf` with the local hostname, as `gethostname(2)` does.
     ///
@@ -244,6 +295,75 @@ pub(crate) trait SysCalls {
     /// `0`, which is never a valid index, so the mapping is exact and loses
     /// nothing.
     fn if_nametoindex(&self, name: &CStr) -> Option<u32>;
+
+    /// Sets one extended attribute on an open file descriptor.
+    ///
+    /// `name` is the attribute name as a C string, which is what both platform
+    /// prototypes take. `value` is the raw bytes; its length is passed
+    /// explicitly, so the value is **not** required to be NUL-terminated and
+    /// may contain interior NULs -- unlike `name`.
+    ///
+    /// The two platform forms differ in arity, and the difference is absorbed
+    /// here rather than leaked to callers: `src/tool_xattr.c:89-91` selects
+    /// between `fsetxattr(fd, attr, value, len, 0, 0)` under
+    /// `HAVE_FSETXATTR_6` and `fsetxattr(fd, attr, value, len, 0)` under
+    /// `HAVE_FSETXATTR_5`. Both extra arguments are zero in the C, so a single
+    /// Rust signature loses nothing.
+    ///
+    /// # Errors
+    ///
+    /// The operating system's error, unmodified. C reduces the outcome to
+    /// `err = -1` at `src/tool_xattr.c:90` and then reports `errno` through
+    /// `curlx_strerror` at `src/tool_operate.c:637-638`, so the errno is part
+    /// of the observable behaviour and is preserved rather than collapsed into
+    /// a bare failure.
+    fn fsetxattr(
+        &self,
+        fd: BorrowedFd<'_>,
+        name: &CStr,
+        value: &[u8],
+    ) -> io::Result<()>;
+
+    /// The effective user id of the calling process.
+    ///
+    /// Total: `geteuid(2)` cannot fail. Used to decide whether a file this
+    /// process is about to write secrets into is owned by this process,
+    /// which is a hardening check with no counterpart in the C tree.
+    fn effective_uid(&self) -> u32;
+
+    /// The descriptor's current offset, as `ftell` reports it for a stream.
+    ///
+    /// `lseek(fd, 0, SEEK_CUR)`, which is what `ftell(stdin)` reduces to for an
+    /// unbuffered descriptor. Reproduces `src/tool_formparse.c:128`'s
+    /// `origin = ftell(stdin)`.
+    fn fd_offset(&self, fd: RawFd) -> io::Result<i64>;
+
+    /// The size of `fd` when it refers to a regular file, otherwise [`None`].
+    ///
+    /// `fstat(fd, &sbuf)` followed by `S_ISREG(sbuf.st_mode)`, the pair
+    /// `src/tool_formparse.c:131-135` uses to decide whether standard input can
+    /// be read lazily. A descriptor that is a pipe, a socket, a terminal or a
+    /// directory yields `Ok(None)` -- not an error, because C treats it as an
+    /// ordinary "buffer it instead" answer rather than a failure.
+    fn fd_regular_size(&self, fd: RawFd) -> io::Result<Option<i64>>;
+
+    /// Reads from `fd` into `buf`, as `read(2)` does.
+    ///
+    /// Stands in for `fread(buffer, 1, nitems, stdin)`
+    /// (`src/tool_formparse.c:216`). It reads the descriptor rather than a
+    /// buffered stream deliberately: the same descriptor is repositioned by
+    /// [`SysCalls::seek_fd`] for a retry, and a user-space buffer between the
+    /// two would still hold bytes from before the seek. C has no such hazard
+    /// because `fseek` on a `FILE *` discards its own buffer.
+    fn read_fd(&self, fd: RawFd, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Repositions `fd` to an absolute offset, as `fseek(.., SEEK_SET)` does.
+    ///
+    /// Reproduces `curlx_fseek(stdin, offset, SEEK_SET)`
+    /// (`src/tool_formparse.c:244`), where the offset already includes the
+    /// origin. A failure is the non-zero `fseek` return that `:245` turns into
+    /// `CURL_SEEKFUNC_CANTSEEK`.
+    fn seek_fd(&self, fd: RawFd, offset: i64) -> io::Result<()>;
 }
 
 /// The real operating system.
@@ -275,7 +395,12 @@ impl SysCalls for RealSys {
         // assumed to be NUL-terminated -- POSIX permits truncation without a
         // terminator -- and `gethostname_with` forces one, reproducing
         // lib/curl_gethostname.c:84.
-        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+        let rc = unsafe {
+            libc::gethostname(
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+            )
+        };
 
         if rc == 0 {
             Ok(())
@@ -319,7 +444,8 @@ impl SysCalls for RealSys {
             // `read_unaligned` then copies that single pointer without assuming
             // the node is aligned. The list is terminated by a null `ifa_next`,
             // which the loop condition tests before the next dereference.
-            cursor = unsafe { ptr::addr_of!((*cursor).ifa_next).read_unaligned() };
+            cursor =
+                unsafe { ptr::addr_of!((*cursor).ifa_next).read_unaligned() };
         }
 
         Ok(nodes)
@@ -339,6 +465,168 @@ impl SysCalls for RealSys {
         } else {
             Some(index)
         }
+    }
+
+    fn fsetxattr(
+        &self,
+        fd: BorrowedFd<'_>,
+        name: &CStr,
+        value: &[u8],
+    ) -> io::Result<()> {
+        // The two arities are `src/tool_xattr.c:89-91`'s two arms, selected on
+        // the target rather than on a configure probe. `HAVE_FSETXATTR_6` is
+        // Darwin's six-argument form and `HAVE_FSETXATTR_5` is the Linux
+        // five-argument one; both trailing arguments are literal zeros in the C
+        // and are literal zeros here.
+        //
+        // A target outside the mandated matrix reaches neither arm and gets
+        // `ENOTSUP`, which is what `src/tool_xattr.h:45-47`'s `#else` arm
+        // amounts to -- except that this reports the failure instead of
+        // silently claiming success, and `xattr_available` tells a caller in
+        // advance so the call is never made.
+        #[cfg(target_os = "macos")]
+        // SAFETY: Darwin's `fsetxattr(int, const char *, const void *, size_t,
+        // u_int32_t, int)` reads `name` as a NUL-terminated C string and reads
+        // exactly `size` bytes from `value`; it writes through neither. `fd` is
+        // a `BorrowedFd`, so it is a live descriptor for the duration of the
+        // call by construction. `CStr::as_ptr` gives a pointer to a live,
+        // NUL-terminated sequence; `value.as_ptr()` with `value.len()` gives a
+        // pointer valid for exactly that many reads, and an empty slice yields
+        // a dangling-but-aligned pointer with a length of zero, which the
+        // kernel never dereferences. `position` is 0 (required for anything but
+        // a resource fork) and `options` is 0 (no `XATTR_NOFOLLOW`,
+        // `XATTR_CREATE` or `XATTR_REPLACE`), matching the C literally.
+        let rc = unsafe {
+            libc::fsetxattr(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast::<libc::c_void>(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+
+        #[cfg(target_os = "linux")]
+        // SAFETY: Linux's `fsetxattr(int, const char *, const void *, size_t,
+        // int)` reads `name` as a NUL-terminated C string and reads exactly
+        // `size` bytes from `value`; it writes through neither. `fd` is a
+        // `BorrowedFd`, so it is a live descriptor for the duration of the call
+        // by construction. `CStr::as_ptr` gives a pointer to a live,
+        // NUL-terminated sequence; `value.as_ptr()` with `value.len()` gives a
+        // pointer valid for exactly that many reads, and an empty slice yields
+        // a dangling-but-aligned pointer with a length of zero, which the
+        // kernel never dereferences. `flags` is 0 -- neither `XATTR_CREATE` nor
+        // `XATTR_REPLACE` -- so an existing attribute is overwritten and a
+        // missing one is created, which is the C's behaviour.
+        let rc = unsafe {
+            libc::fsetxattr(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast::<libc::c_void>(),
+                value.len(),
+                0,
+            )
+        };
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let rc = {
+            let _ = (fd, name, value);
+            -1
+        };
+
+        if rc == 0 {
+            Ok(())
+        } else {
+            // `src/tool_operate.c:637-638` renders `errno` through
+            // `curlx_strerror`, so the errno is observable and is carried out
+            // rather than replaced with a generic failure.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            return Err(io::Error::last_os_error());
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
+    }
+
+    fn effective_uid(&self) -> u32 {
+        // Returned directly, with no conversion: `uid_t` is exactly `u32` on
+        // both mandated platforms, so there is nothing to convert and clippy
+        // rejects any attempt to write one. The declared return type is what
+        // pins the assumption.
+        //
+        // SAFETY: `geteuid` takes no argument, touches no caller memory and is
+        // specified never to fail, so there is no precondition to uphold and no
+        // error channel to consult.
+        unsafe { libc::geteuid() }
+    }
+
+    fn fd_offset(&self, fd: RawFd) -> io::Result<i64> {
+        // SAFETY: `lseek` takes three scalars, touches no caller memory and
+        // reports every failure through its return value. A closed or
+        // unseekable `fd` is therefore a runtime error, not undefined
+        // behaviour.
+        let offset = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        if offset < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // `off_t` is 64-bit on all four mandated targets, which AAP section
+        // 0.6.2 records as load-bearing for this workspace, so the value is
+        // already an `i64` and needs no conversion.
+        Ok(offset)
+    }
+
+    fn fd_regular_size(&self, fd: RawFd) -> io::Result<Option<i64>> {
+        // SAFETY: `core::mem::zeroed::<libc::stat>()` is sound for the same
+        // reason it is for `libc::termios` -- the type is a plain aggregate of
+        // integers and nested integer aggregates on both mandated platforms,
+        // with no member for which an all-zero bit pattern would be invalid,
+        // and no member is read before `fstat` has written it.
+        let mut info: libc::stat = unsafe { core::mem::zeroed() };
+
+        // SAFETY: `fstat` writes one `struct stat` through its second argument
+        // and reads nothing else through it. The pointer is derived from a
+        // live, initialised, properly aligned local that outlives the call, and
+        // the borrow ends when the call returns.
+        let queried = unsafe { libc::fstat(fd, &mut info) };
+        if queried != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // `S_ISREG(m)` is `(m & S_IFMT) == S_IFREG`; the macro is not exposed
+        // by the `libc` crate, so the mask is written out.
+        if (info.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Ok(None);
+        }
+        Ok(Some(info.st_size))
+    }
+
+    fn read_fd(&self, fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+        let capacity = buf.len();
+        let ptr = buf.as_mut_ptr().cast::<libc::c_void>();
+
+        // SAFETY: `read` writes at most `capacity` bytes through `ptr` and
+        // reads nothing through it. `ptr` is derived from a live, properly
+        // aligned mutable slice of exactly `capacity` bytes that outlives the
+        // call, the borrow ends when the call returns, and every failure is
+        // reported through the return value.
+        let read = unsafe { libc::read(fd, ptr, capacity) };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // `read` is non-negative here and cannot exceed `capacity`, which the
+        // call itself guarantees, so the narrowing is exact.
+        Ok(read as usize)
+    }
+
+    fn seek_fd(&self, fd: RawFd, offset: i64) -> io::Result<()> {
+        // SAFETY: as for `fd_offset` -- three scalars, no caller memory, and
+        // every failure reported through the return value.
+        let moved = unsafe { libc::lseek(fd, offset, libc::SEEK_SET) };
+        if moved < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -431,7 +719,8 @@ unsafe fn read_if_node(node: *const libc::ifaddrs) -> IfNode {
         // assumed. Reading only this field cannot over-read even when the real
         // family is `AF_PACKET` or `AF_LINK`, because every `sockaddr` variant
         // begins with it.
-        let family = unsafe { ptr::addr_of!((*addr_ptr).sa_family).read_unaligned() };
+        let family =
+            unsafe { ptr::addr_of!((*addr_ptr).sa_family).read_unaligned() };
 
         // `sa_family_t` is `u16` on Linux and `u8` on Darwin; widening either to
         // the `c_int` that the `AF_*` constants are spelled as is exact.
@@ -443,7 +732,8 @@ unsafe fn read_if_node(node: *const libc::ifaddrs) -> IfNode {
                 // and `sin_addr` lies within it. `addr_of!` plus
                 // `read_unaligned` copies only that field, so nothing beyond the
                 // 16 bytes an `AF_INET` node always has is touched.
-                let raw = unsafe { ptr::addr_of!((*sin).sin_addr).read_unaligned() };
+                let raw =
+                    unsafe { ptr::addr_of!((*sin).sin_addr).read_unaligned() };
                 // `s_addr` is held in network byte order, so its in-memory bytes
                 // ARE the dotted-quad octets; `to_ne_bytes` yields them in that
                 // order on a little-endian and a big-endian host alike.
@@ -455,13 +745,17 @@ unsafe fn read_if_node(node: *const libc::ifaddrs) -> IfNode {
                 // is a `struct sockaddr_in6`, so both fields read here lie
                 // within the pointee. `addr_of!` plus `read_unaligned` copies
                 // each one without assuming the node is 4-byte aligned.
-                let raw = unsafe { ptr::addr_of!((*sin6).sin6_addr).read_unaligned() };
+                let raw = unsafe {
+                    ptr::addr_of!((*sin6).sin6_addr).read_unaligned()
+                };
                 // SAFETY: as immediately above -- `sin6_scope_id` is a field of
                 // the same `struct sockaddr_in6` that the family identified, and
                 // is read the same way. This is the value lib/if2ip.c:138-139
                 // reads and without which a link-local `--interface` cannot
                 // work.
-                let scope_id = unsafe { ptr::addr_of!((*sin6).sin6_scope_id).read_unaligned() };
+                let scope_id = unsafe {
+                    ptr::addr_of!((*sin6).sin6_scope_id).read_unaligned()
+                };
                 Some(RawIfAddr::V6 {
                     octets: raw.s6_addr,
                     scope_id,
@@ -476,9 +770,7 @@ unsafe fn read_if_node(node: *const libc::ifaddrs) -> IfNode {
     IfNode { name, addr }
 }
 
-// ===========================================================================
 // gethostname -- supersedes lib/curl_gethostname.c:44-96
-// ===========================================================================
 
 /// The local machine's **un-qualified** hostname.
 ///
@@ -524,8 +816,8 @@ unsafe fn read_if_node(node: *const libc::ifaddrs) -> IfNode {
 ///   true. Modern curl never puts the real hostname in an NTLM message:
 ///   `lib/vauth/ntlm.c:579-581` declares
 ///   `static const char host[] = "WORKSTATION";` with the comment "The fixed
-///   hostname we provide, in order to not leak our real local host name", and
-///   the Type-1 message at `lib/vauth/ntlm.c:448` uses
+///   hostname we provide, in order to not leak our real local host
+///   name", and the Type-1 message at `lib/vauth/ntlm.c:448` uses
 ///   `const char *host = ""; /* empty */` while `:459` discards the `hostname`
 ///   parameter outright with `(void)hostname;`. **`auth/ntlm.rs` must hard-code
 ///   `"WORKSTATION"` for Type-3 and `""` for Type-1 and must not call this
@@ -556,6 +848,7 @@ unsafe fn read_if_node(node: *const libc::ifaddrs) -> IfNode {
 /// introducing a new failure mode would be a behaviour change, so invalid
 /// sequences are replaced through [`String::from_utf8_lossy`]. In practice a
 /// hostname is ASCII; this path exists so that a hostile one cannot panic.
+#[allow(dead_code)]
 pub(crate) fn gethostname() -> CodeResult<String> {
     gethostname_with(&RealSys)
 }
@@ -565,6 +858,7 @@ pub(crate) fn gethostname() -> CodeResult<String> {
 /// Separated so that every branch above -- the forced terminator, the first-dot
 /// truncation, the error mapping and the non-UTF-8 path -- is reachable under
 /// Miri, which cannot call `gethostname(2)`.
+#[allow(dead_code)]
 pub(crate) fn gethostname_with(sys: &dyn SysCalls) -> CodeResult<String> {
     // Byte-for-byte the buffer the sole C call site uses: `lib/smtp.c:187`
     // declares `char localhost[HOSTNAME_MAX + 1]` and `lib/smtp.c:191` passes
@@ -604,10 +898,8 @@ pub(crate) fn gethostname_with(sys: &dyn SysCalls) -> CodeResult<String> {
     Ok(String::from_utf8_lossy(&host[..dot]).into_owned())
 }
 
-// ===========================================================================
 // Interface enumeration -- supersedes the HAVE_GETIFADDRS body of
 // lib/if2ip.c:92-174
-// ===========================================================================
 
 /// One interface address, owned.
 ///
@@ -615,12 +907,44 @@ pub(crate) fn gethostname_with(sys: &dyn SysCalls) -> CodeResult<String> {
 /// operating-system memory, so it remains valid after `freeifaddrs(3)` has run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InterfaceAddr {
-    /// `ifa_name`, decoded losslessly where it is UTF-8.
+    /// `ifa_name`, as the kernel reported it: raw bytes, no trailing NUL.
     ///
-    /// Comparison against a user-supplied `--interface` value is the caller's
-    /// job and is **case-insensitive** in C (`lib/if2ip.c:113` uses
-    /// `curl_strequal`); this field is the raw name, unfolded.
-    pub(crate) name: String,
+    /// # Why bytes and not a `String`
+    ///
+    /// An interface name is an arbitrary NUL-terminated byte string as far as
+    /// both mandated kernels are concerned. Linux permits any byte except
+    /// `/` and NUL in an `IFNAMSIZ`-bounded name -- `ip link set dev NAME`
+    /// accepts UTF-8, Latin-1 and outright invalid sequences alike -- and the
+    /// C tree never decodes it: `lib/if2ip.c:113` hands `iface->ifa_name`
+    /// straight to `curl_strequal`, which folds ASCII and compares bytes.
+    ///
+    /// Decoding through [`String::from_utf8_lossy`] would replace every
+    /// invalid sequence with U+FFFD, and that replacement is not reversible:
+    /// the name could then never again equal the `--interface` value the user
+    /// typed, nor the zone identifier parsed out of an IPv6 URL, so
+    /// `--interface` and `%<zoneid>` would silently stop working on exactly
+    /// the hosts whose names need care. Keeping the bytes is what makes the
+    /// comparison possible at all.
+    ///
+    /// `OsString` was the alternative the same information supports, and is
+    /// rejected on the grounds that it buys nothing here: on all four mandated
+    /// targets it *is* a `Vec<u8>` behind `OsStrExt`, this value is never used
+    /// as a path, and both of its consumers -- [`CString::new`] for
+    /// [`if_nametoindex`] and `util::strcase`'s `curl_strequal` for the name
+    /// comparison -- want bytes, so an `OsString` would only add a conversion
+    /// at each end.
+    ///
+    /// # Comparison is the caller's job
+    ///
+    /// This field is the raw name, **unfolded**. Comparison against a
+    /// user-supplied `--interface` value is case-insensitive in C
+    /// (`lib/if2ip.c:113` uses `curl_strequal`), and the ASCII-folding byte
+    /// comparison that reproduces it belongs to `util::strcase`, which
+    /// supersedes `lib/strcase.c` and `lib/strequal.c` and backs the exported
+    /// `curl_strequal`. It is deliberately not duplicated here: this module
+    /// enumerates, it does not decide, and a second folding implementation
+    /// would be a second thing to keep in step.
+    pub(crate) name: Vec<u8>,
 
     /// The address itself.
     pub(crate) addr: IpAddr,
@@ -673,12 +997,16 @@ pub(crate) struct InterfaceAddr {
 /// `bindlocal` then retries the string as a hostname. Surfacing it as an error
 /// here loses no information and keeps the syscall's outcome visible; silently
 /// returning an empty list would hide it.
+#[allow(dead_code)]
 pub(crate) fn interface_addrs() -> CodeResult<Vec<InterfaceAddr>> {
     interface_addrs_with(&RealSys)
 }
 
 /// [`interface_addrs`] over an injected [`SysCalls`].
-pub(crate) fn interface_addrs_with(sys: &dyn SysCalls) -> CodeResult<Vec<InterfaceAddr>> {
+#[allow(dead_code)]
+pub(crate) fn interface_addrs_with(
+    sys: &dyn SysCalls,
+) -> CodeResult<Vec<InterfaceAddr>> {
     let nodes = sys.ifaddrs().map_err(|_| CURLcode::InterfaceFailed)?;
     let mut addrs = Vec::with_capacity(nodes.len());
 
@@ -691,17 +1019,22 @@ pub(crate) fn interface_addrs_with(sys: &dyn SysCalls) -> CodeResult<Vec<Interfa
         };
 
         // lib/if2ip.c:112 -- `if(iface->ifa_addr->sa_family == af)`. Only the two
-        // internet families carry an address this layer can represent; see
+        // Internet families carry an address this layer can represent; see
         // `interface_names` for the family-mismatch case the C handles at
-        // `:163-166`.
+        // `lib/if2ip.c:163-166`.
         let (addr, scope_id) = match raw {
             RawIfAddr::V4(octets) => (IpAddr::V4(Ipv4Addr::from(octets)), 0),
-            RawIfAddr::V6 { octets, scope_id } => (IpAddr::V6(Ipv6Addr::from(octets)), scope_id),
+            RawIfAddr::V6 { octets, scope_id } => {
+                (IpAddr::V6(Ipv6Addr::from(octets)), scope_id)
+            }
             RawIfAddr::Unrepresentable => continue,
         };
 
+        // The name moves across unchanged. No decoding happens anywhere on
+        // this path, so a name the kernel reported as non-UTF-8 still compares
+        // equal to the `--interface` value the user typed.
         addrs.push(InterfaceAddr {
-            name: String::from_utf8_lossy(&node.name).into_owned(),
+            name: node.name,
             addr,
             scope_id,
         });
@@ -715,7 +1048,7 @@ pub(crate) fn interface_addrs_with(sys: &dyn SysCalls) -> CodeResult<Vec<Interfa
 /// # Why this exists alongside [`interface_addrs`]
 ///
 /// Because [`InterfaceAddr::addr`] is an [`IpAddr`], the snapshot cannot
-/// represent an interface that has no internet address at all -- and on both
+/// represent an interface that has no Internet address at all -- and on both
 /// mandated operating systems such an interface still appears in the list, with
 /// an `AF_PACKET` node on Linux or an `AF_LINK` node on Darwin.
 ///
@@ -744,24 +1077,31 @@ pub(crate) fn interface_addrs_with(sys: &dyn SysCalls) -> CodeResult<Vec<Interfa
 /// # Errors
 ///
 /// [`CURLcode::InterfaceFailed`], on the same terms as [`interface_addrs`].
-pub(crate) fn interface_names() -> CodeResult<Vec<String>> {
+#[allow(dead_code)]
+pub(crate) fn interface_names() -> CodeResult<Vec<Vec<u8>>> {
     interface_names_with(&RealSys)
 }
 
 /// [`interface_names`] over an injected [`SysCalls`].
-pub(crate) fn interface_names_with(sys: &dyn SysCalls) -> CodeResult<Vec<String>> {
+///
+/// Each name is the kernel's own bytes, for the reasons given on
+/// [`InterfaceAddr::name`]: this list exists so a caller can reproduce the
+/// `curl_strequal(iface->ifa_name, interf)` comparison at `lib/if2ip.c:164`,
+/// and a lossy decode would make that comparison unable to succeed.
+#[allow(dead_code)]
+pub(crate) fn interface_names_with(
+    sys: &dyn SysCalls,
+) -> CodeResult<Vec<Vec<u8>>> {
     let nodes = sys.ifaddrs().map_err(|_| CURLcode::InterfaceFailed)?;
 
     Ok(nodes
-        .iter()
+        .into_iter()
         .filter(|node| node.addr.is_some())
-        .map(|node| String::from_utf8_lossy(&node.name).into_owned())
+        .map(|node| node.name)
         .collect())
 }
 
-// ===========================================================================
 // if_nametoindex -- supersedes the call at lib/url.c:1615
-// ===========================================================================
 
 /// Resolves an IPv6 zone identifier to a numeric scope id.
 ///
@@ -773,6 +1113,13 @@ pub(crate) fn interface_names_with(sys: &dyn SysCalls) -> CodeResult<Vec<String>
 /// The wrapper is total and free of side effects: it neither logs nor mutates
 /// anything, which keeps it usable from the URL parser without dragging a
 /// handle into this module.
+///
+/// The parameter is bytes rather than `&str` deliberately. A zone identifier
+/// is the substring of a URL between `%` and the closing `]`, and
+/// `lib/url.c:1615` passes it to `if_nametoindex` exactly as it was received;
+/// nothing on the C path decodes it, and nothing here does either, so a name
+/// that is not valid UTF-8 still resolves. [`CString`] is built straight from
+/// these bytes, which is the only construction that can preserve them.
 ///
 /// # Errors
 ///
@@ -791,20 +1138,921 @@ pub(crate) fn interface_names_with(sys: &dyn SysCalls) -> CodeResult<Vec<String>
 /// that text -- `grep -rl "Invalid zoneid" tests/data/` finds nothing -- but
 /// turning a logged diagnostic into a hard failure would still be a behaviour
 /// change.
-pub(crate) fn if_nametoindex(name: &str) -> CodeResult<u32> {
+#[allow(dead_code)]
+pub(crate) fn if_nametoindex(name: &[u8]) -> CodeResult<u32> {
     if_nametoindex_with(&RealSys, name)
 }
 
 /// [`if_nametoindex`] over an injected [`SysCalls`].
-pub(crate) fn if_nametoindex_with(sys: &dyn SysCalls, name: &str) -> CodeResult<u32> {
-    let cname = CString::new(name).map_err(|_| CURLcode::BadFunctionArgument)?;
+#[allow(dead_code)]
+pub(crate) fn if_nametoindex_with(
+    sys: &dyn SysCalls,
+    name: &[u8],
+) -> CodeResult<u32> {
+    // Built from the caller's bytes verbatim. `CString::new` appends the
+    // terminator and rejects an interior NUL; it performs no validation and no
+    // transformation of what precedes it, so the name the kernel sees is the
+    // name the URL carried.
+    let cname =
+        CString::new(name).map_err(|_| CURLcode::BadFunctionArgument)?;
 
     sys.if_nametoindex(&cname).ok_or(CURLcode::InterfaceFailed)
 }
 
-// ===========================================================================
+// Extended attributes -- supersedes the primitive at src/tool_xattr.c:77-104
+
+/// Whether this target provides the extended-attribute write primitive.
+///
+/// The authority for `USE_XATTR`, and therefore for the `xattr: ` row of
+/// `src/curlinfo.c:176-181`, which prints `OFF` from `#ifndef USE_XATTR`.
+///
+/// # How the answer is computed
+///
+/// `src/tool_xattr.h:28-36` defines `USE_XATTR` from one of two probes: a
+/// configure-detected `HAVE_FSETXATTR` (the `<sys/xattr.h>` route, which covers
+/// both Linux and Darwin), or a FreeBSD/MidnightBSD version macro selecting
+/// `extattr_set_fd`. Those are *platform* tests, not `--disable-` switches, so
+/// this predicate is a `cfg!` over the target rather than over a Cargo feature.
+///
+/// Both operating systems in the four-target matrix provide `fsetxattr(2)`,
+/// with `libc 0.2.189` declaring the five-argument Linux form and the
+/// six-argument Darwin form, so the answer is `true` on all four targets. It is
+/// nonetheless written as a target test rather than as a bare `true`: a target
+/// outside the matrix reports `OFF` truthfully instead of inheriting an
+/// unexamined `ON`, and under-reporting a capability is the safe direction
+/// (AAP section 0.6.5).
+///
+/// The BSD `extattr_set_fd` arm has no counterpart here because no BSD is in
+/// the matrix; adding one would be a claim this workspace cannot test.
+///
+/// # Examples
+///
+/// ```
+/// // Every target in the mandated matrix provides the primitive.
+/// assert!(curl_rs_lib::xattr_available());
+/// ```
+pub fn xattr_available() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
+/// Sets one extended attribute on an open file descriptor.
+///
+/// The safe counterpart of the platform call inside `xattr()` at
+/// `src/tool_xattr.c:77-104`, and the residue that closes the gap recorded on
+/// `curl-rs/src/output/xattr.rs`: `std` exposes no extended-attribute API, no
+/// extended-attribute crate is among the workspace pins (AAP section 0.5.1),
+/// and `curl-rs` forbids `unsafe` outright, so the call has to live in this
+/// module and be reached from there.
+///
+/// `pub` rather than `pub(crate)` for exactly one reason, and it is the reason
+/// the crate root's visibility policy gives: `curl-rs` demonstrably needs it.
+/// The crate root re-exports this single name, not the module, so the rest of
+/// the operating-system residue stays private.
+///
+/// # What it does not do
+///
+/// It does not decide *whether* to write. C's `if(value)` guard at
+/// `src/tool_xattr.c:82` skips the whole body when the value pointer is null,
+/// and that guard belongs to the tool, beside the attribute table it protects;
+/// reproducing it here would put the same condition in two places. An empty
+/// `value` is therefore written as an empty attribute, which is what C does
+/// when handed a non-null pointer to an empty string.
+///
+/// It also does not reproduce the `CURL_FAKE_XATTR` seam of
+/// `src/tool_xattr.c:83-88`. That seam is inside `#ifdef DEBUGBUILD`, prints
+/// through `curl_mprintf` to standard output, and belongs to the tool that owns
+/// the standard-output stream, not to a syscall wrapper.
+///
+/// # Errors
+///
+/// * The operating system's error, unmodified, when the call fails. C reduces
+///   it to `err = -1` and then reports `errno` through `curlx_strerror`
+///   (`src/tool_operate.c:637-638`), so the errno is observable and is carried
+///   out rather than collapsed.
+/// * [`io::ErrorKind::InvalidInput`] when `name` contains an interior NUL and
+///   therefore cannot be a C string. An attribute name reaches this from the
+///   tool's own table, but the error is returned rather than unwrapped for the
+///   same reason [`if_nametoindex`] returns one: nothing in this module may
+///   panic on its input.
+/// * [`io::ErrorKind::Unsupported`] on a target outside the matrix, where
+///   [`xattr_available`] is `false`. C's `#else` arm at
+///   `src/tool_xattr.h:45-47` instead reports success without writing; the
+///   difference is confined to a platform this workspace does not build for,
+///   and reporting the truth is the safer of the two.
+pub fn set_fd_xattr(
+    fd: BorrowedFd<'_>,
+    name: &str,
+    value: &[u8],
+) -> io::Result<()> {
+    set_fd_xattr_with(&RealSys, fd, name, value)
+}
+
+/// [`set_fd_xattr`] over an injected [`SysCalls`].
+///
+/// The injection point exists for the same reason the rest of the trait does:
+/// `cargo +nightly miri test` is a required gate and Miri cannot call a foreign
+/// function, so the name conversion and the error mapping are covered under
+/// Miri through a pure-Rust fake.
+pub(crate) fn set_fd_xattr_with(
+    sys: &dyn SysCalls,
+    fd: BorrowedFd<'_>,
+    name: &str,
+    value: &[u8],
+) -> io::Result<()> {
+    let cname = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an extended attribute name cannot contain an interior NUL",
+        )
+    })?;
+
+    sys.fsetxattr(fd, &cname, value)
+}
+
+// Terminal attributes -- supersedes ttyecho() (src/tool_getpass.c:125-160)
+// and the ioctl probe inside get_terminal_columns() (src/terminal.c:56-63)
+
+/// The terminal attributes captured before `ECHO` was cleared.
+///
+/// Opaque by construction: the `termios` it carries is a private field, so no
+/// consumer -- inside this crate or outside it -- can name a `libc` type
+/// through this value. The only operations offered are "restore this" and "is
+/// there anything to restore".
+///
+/// [`None`] models the state C is left in when `tcgetattr` fails.
+/// `src/tool_getpass.c:127-129` declares `withecho` and `noecho` as
+/// **function-scope `static` variables**, so a failed `tcgetattr` leaves
+/// `withecho` all-zero and the restoring `tcsetattr` at `:155` then hands the
+/// kernel an attribute set that describes no terminal. On the only occasion
+/// this happens in practice -- a descriptor that is not a terminal -- that
+/// call fails with `ENOTTY` and changes nothing, which is why the C is safe by
+/// accident rather than by design. Representing "nothing was captured"
+/// explicitly and skipping the restore reproduces the observable outcome
+/// exactly while removing the possibility of writing a zeroed attribute set
+/// to a real terminal on any other `tcgetattr` failure.
+#[derive(Clone, Copy)]
+pub(crate) struct SavedTerminal {
+    attrs: Option<libc::termios>,
+}
+
+impl SavedTerminal {
+    /// Nothing was captured, so there is nothing to put back.
+    pub(crate) const fn unavailable() -> Self {
+        Self { attrs: None }
+    }
+
+    /// Whether attributes were captured and can therefore be restored.
+    #[allow(dead_code)]
+    pub(crate) const fn is_restorable(&self) -> bool {
+        self.attrs.is_some()
+    }
+}
+
+/// The terminal calls `ttyecho` and `get_terminal_columns` perform.
+///
+/// A seam of its own rather than three more methods on [`SysCalls`], for two
+/// reasons. [`SysCalls`] is documented as exposing the hostname, interface and
+/// descriptor primitives and nothing else, and widening it would
+/// force `dns/if2ip.rs` to supply a fake for terminal handling it never
+/// touches. Keeping one trait per concern keeps every fake as small as the
+/// logic it drives.
+///
+/// Both echo methods are **total**: they return no error, because the C
+/// ignores the return value of every one of `tcgetattr`, `tcsetattr` and
+/// `ioctl`. Inventing a failure channel the C does not have would invite a
+/// caller to act on it and diverge.
+pub(crate) trait TerminalCalls {
+    /// `tcgetattr`, clear `ECHO`, `tcsetattr(TCSANOW)`
+    /// (`src/tool_getpass.c:136-139`).
+    ///
+    /// Returns what was captured, so that the restore can put it back.
+    fn echo_disable(&self, fd: BorrowedFd<'_>) -> SavedTerminal;
+
+    /// `tcsetattr(TCSAFLUSH, &withecho)` (`src/tool_getpass.c:155`).
+    ///
+    /// The action differs from the disabling call on purpose. C uses
+    /// `TCSANOW` to clear the bit -- take effect immediately, discard
+    /// nothing -- and `TCSAFLUSH` to put it back, which additionally
+    /// discards input that arrived while echo was off. That asymmetry is
+    /// what stops the newline terminating the password from being echoed
+    /// after the fact, so it is reproduced rather than tidied.
+    fn echo_restore(&self, fd: BorrowedFd<'_>, saved: &SavedTerminal);
+
+    /// `ioctl(fd, TIOCGWINSZ, &ts)` then `ts.ws_col` (`src/terminal.c:62-63`).
+    ///
+    /// [`None`] when the `ioctl` fails, which is C's `cols` staying `0`.
+    /// The value is returned **unfiltered**: the `cols < 10000` test at
+    /// `src/terminal.c:80` sits outside the `ioctl` in C and belongs to the
+    /// caller, so applying it here would move a documented CLI bound into the
+    /// operating-system layer.
+    fn window_columns(&self, fd: BorrowedFd<'_>) -> Option<u32>;
+}
+
+impl TerminalCalls for RealSys {
+    fn echo_disable(&self, fd: BorrowedFd<'_>) -> SavedTerminal {
+        let mut current = MaybeUninit::<libc::termios>::uninit();
+
+        // SAFETY: `libc::tcgetattr` writes a complete `struct termios` through
+        // its second argument and reads nothing through it.
+        // `MaybeUninit::as_mut_ptr` yields a properly aligned, uniquely
+        // borrowed pointer to storage of exactly that size and type, which is
+        // the only requirement the call has. `fd.as_raw_fd()` is the descriptor
+        // behind a live `BorrowedFd`, so it is open for at least the duration
+        // of this call. The return value is inspected before the storage is
+        // read, and the storage is left untouched on failure.
+        let rc =
+            unsafe { libc::tcgetattr(fd.as_raw_fd(), current.as_mut_ptr()) };
+        if rc != 0 {
+            return SavedTerminal::unavailable();
+        }
+
+        // SAFETY: `tcgetattr` returned `0`, which POSIX specifies as having
+        // filled every field of the structure, so the storage is initialised.
+        let saved = unsafe { current.assume_init() };
+
+        // `src/tool_getpass.c:137-138` -- copy, then clear one bit. The copy is
+        // what makes the original restorable.
+        let mut noecho = saved;
+        noecho.c_lflag &= !libc::ECHO;
+
+        // SAFETY: `libc::tcsetattr` reads a complete `struct termios` through
+        // its third argument and writes nothing through it. `&noecho` is a
+        // fully initialised value of that type. The descriptor is valid as
+        // above. The result is discarded because `src/tool_getpass.c:139`
+        // discards it too; a caller must not be able to tell success from
+        // failure here, because C cannot.
+        let _ =
+            unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSANOW, &noecho) };
+
+        SavedTerminal { attrs: Some(saved) }
+    }
+
+    fn echo_restore(&self, fd: BorrowedFd<'_>, saved: &SavedTerminal) {
+        let Some(attrs) = saved.attrs.as_ref() else {
+            // Nothing was captured; see [`SavedTerminal`] for why skipping is
+            // the faithful action rather than restoring a zeroed structure.
+            return;
+        };
+
+        // SAFETY: identical to the `tcsetattr` above -- the call reads the
+        // referenced `termios` and writes nothing through it, `attrs` borrows a
+        // fully initialised value produced by a successful `tcgetattr`, and the
+        // descriptor is live for the duration of the call. `TCSAFLUSH` rather
+        // than `TCSANOW` reproduces `src/tool_getpass.c:155`.
+        let _ =
+            unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSAFLUSH, attrs) };
+    }
+
+    fn window_columns(&self, fd: BorrowedFd<'_>) -> Option<u32> {
+        let mut size = MaybeUninit::<libc::winsize>::uninit();
+
+        // SAFETY: `TIOCGWINSZ` is a read-only request whose argument is a
+        // pointer to one `struct winsize`, which the kernel fills and never
+        // reads. `MaybeUninit::as_mut_ptr` yields an aligned, uniquely borrowed
+        // pointer to storage of exactly that size and type; passing any other
+        // type for this request would be the error, and the type is named here
+        // rather than inferred. The descriptor is live for the call. The return
+        // value is inspected before the storage is read.
+        let rc = unsafe {
+            libc::ioctl(fd.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr())
+        };
+        if rc != 0 {
+            return None;
+        }
+
+        // SAFETY: the `ioctl` returned `0`, so the kernel wrote a complete
+        // `struct winsize`.
+        let size = unsafe { size.assume_init() };
+
+        // `ws_col` is `unsigned short`, so the widening is exact and the value
+        // can never be negative -- which is why `src/terminal.c:80`'s
+        // `cols >= 0` half is always true on this platform and only the
+        // `cols < 10000` half discriminates.
+        Some(u32::from(size.ws_col))
+    }
+}
+
+/// Terminal echo, suppressed for as long as this value lives.
+///
+/// The RAII counterpart of the `ttyecho(FALSE, fd)` / `ttyecho(TRUE, fd)` pair
+/// at `src/tool_getpass.c:174` and `:186`. Restoration happens in [`Drop`], so
+/// it runs on the normal path, on an early `return`, and on an unwind --
+/// which the C cannot claim, because a `longjmp` or an `abort` between its two
+/// calls would leave the terminal with echo off.
+///
+/// # Ordering, and why [`Self::restore`] exists
+///
+/// C emits the newline **before** re-enabling echo:
+///
+/// ```text
+/// if(disabled) {
+///   fputs("\n", tool_stderr);       /* src/tool_getpass.c:185 */
+///   (void)ttyecho(TRUE, fd);        /* src/tool_getpass.c:186 */
+/// }
+/// ```
+///
+/// A guard that only restored in `Drop` would leave that order to the accident
+/// of where the value happens to fall out of scope, so [`Self::restore`]
+/// consumes the guard and restores immediately. Write the newline, then call
+/// it; `Drop` remains as the unwind safety net and does nothing a second time.
+pub struct EchoGuard<'a> {
+    sys: &'a dyn TerminalCalls,
+    fd: BorrowedFd<'a>,
+    saved: SavedTerminal,
+    restored: bool,
+}
+
+impl<'a> EchoGuard<'a> {
+    /// Whether the caller should treat echo as having been disabled.
+    ///
+    /// **Always `true`**, and that is not a simplification. The C returns
+    /// `TRUE` unconditionally once it has taken the `HAVE_TERMIOS_H` branch
+    /// (`src/tool_getpass.c:148`), having discarded the result of both
+    /// `tcgetattr` and `tcsetattr`. Only the `#else` arm at `:145-149`, where
+    /// neither header exists, returns `FALSE`, and neither mandated target
+    /// selects it.
+    ///
+    /// The distinction is observable and therefore not negotiable. The value
+    /// is what `src/tool_getpass.c:183` tests before emitting the extra
+    /// newline to standard error, and `tests/runtests.pl` runs curl with
+    /// standard input redirected -- so `tcgetattr` fails, yet the C still
+    /// emits that newline. Deriving this from
+    /// `SavedTerminal::is_restorable` instead -- named in plain text here
+    /// because that type is crate-private and an intra-doc link from this
+    /// public method to it would be unresolvable for an outside reader --
+    /// would suppress a byte the C build writes.
+    pub const fn echo_disabled(&self) -> bool {
+        true
+    }
+
+    /// Restores the saved attributes now, consuming the guard.
+    ///
+    /// Call this after writing the newline described on the type, so the two
+    /// happen in C's order.
+    pub fn restore(mut self) {
+        self.restore_once();
+    }
+
+    /// The single restore path, shared by [`Self::restore`] and [`Drop`].
+    fn restore_once(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
+        self.sys.echo_restore(self.fd, &self.saved);
+    }
+}
+
+impl Drop for EchoGuard<'_> {
+    fn drop(&mut self) {
+        self.restore_once();
+    }
+}
+
+/// Clears the terminal's `ECHO` bit until the returned guard is dropped.
+///
+/// `fd` is borrowed rather than owned, and the guard cannot outlive it, so the
+/// descriptor is still open when the restore runs. `src/tool_getpass.c:170-172`
+/// opens `/dev/tty` read-only and falls back to standard input, and
+/// `:189-190` closes the descriptor only when it is not standard input;
+/// choosing the descriptor and closing it are the caller's business, and
+/// `BorrowedFd` is what keeps this function out of that decision.
+pub fn disable_echo(fd: BorrowedFd<'_>) -> EchoGuard<'_> {
+    // `&RealSys` is promoted to a `'static` reference: `RealSys` is a unit
+    // struct with no interior mutability and no destructor, so this introduces
+    // neither a `static mut` nor a lazily initialised singleton.
+    disable_echo_with(&RealSys, fd)
+}
+
+/// [`disable_echo`] over an injected [`TerminalCalls`].
+pub(crate) fn disable_echo_with<'a>(
+    sys: &'a dyn TerminalCalls,
+    fd: BorrowedFd<'a>,
+) -> EchoGuard<'a> {
+    let saved = sys.echo_disable(fd);
+
+    EchoGuard {
+        sys,
+        fd,
+        saved,
+        restored: false,
+    }
+}
+
+/// The terminal's width in columns, as `src/terminal.c:62-63` reads it.
+///
+/// The descriptor is **standard input**, which is what the C hard-codes at
+/// `src/terminal.c:59` and `:62` -- not standard output and not standard
+/// error. That choice is load-bearing: under `tests/runtests.pl` standard
+/// input is redirected, so the probe fails in the C build too and the width
+/// falls back to 79.
+///
+/// The result is unfiltered. `src/terminal.c:80` applies
+/// `cols >= 0 && cols < 10000` and `:83-84` supplies the 79 fallback; both
+/// are CLI-side policy and belong to `curl-rs/src/terminal.rs`.
+pub fn terminal_columns() -> Option<u32> {
+    terminal_columns_with(&RealSys)
+}
+
+/// [`terminal_columns`] over an injected [`TerminalCalls`].
+pub(crate) fn terminal_columns_with(sys: &dyn TerminalCalls) -> Option<u32> {
+    // `io::Stdin` implements `AsFd`, so descriptor 0 is borrowed through a safe
+    // standard-library handle rather than reconstructed from the raw number.
+    // Nothing here locks or reads it.
+    let stdin = io::stdin();
+
+    sys.window_columns(stdin.as_fd())
+}
+
+// Extended attributes -- supersedes xattr() (src/tool_xattr.c:76-102)
+
+/// The extended-attribute call, behind one signature for both operating
+/// systems.
+pub(crate) trait XattrCalls {
+    /// `fsetxattr(fd, name, value, value.len(), ...)`.
+    ///
+    /// The two mandated operating systems spell this differently and the C
+    /// selects between them with `HAVE_FSETXATTR_6` and `HAVE_FSETXATTR_5`
+    /// (`src/tool_xattr.c:88-92`): macOS takes six arguments, with a
+    /// `position` before the flags, and Linux takes five. Both extra
+    /// arguments are `0` in C, and both spellings collapse into this one
+    /// method so that no caller has to know which target it is building for.
+    fn fsetxattr(
+        &self,
+        fd: BorrowedFd<'_>,
+        name: &CStr,
+        value: &[u8],
+    ) -> io::Result<()>;
+}
+
+impl XattrCalls for RealSys {
+    fn fsetxattr(
+        &self,
+        fd: BorrowedFd<'_>,
+        name: &CStr,
+        value: &[u8],
+    ) -> io::Result<()> {
+        // SAFETY: `fsetxattr` reads `name` as a NUL-terminated C string and
+        // reads exactly `value.len()` bytes through the value pointer; it
+        // writes through neither. `CStr::as_ptr` yields the first, and
+        // `value.as_ptr()` with `value.len()` yields the second over a
+        // uniquely borrowed slice, so the read cannot overrun. An empty
+        // `value` gives a dangling-but-aligned pointer with a length of `0`,
+        // which no read touches. The descriptor is live for the whole call.
+        // The trailing zero is C's own literal at `src/tool_xattr.c:91`.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe {
+            libc::fsetxattr(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast::<libc::c_void>(),
+                value.len(),
+                0,
+            )
+        };
+
+        // SAFETY: as for the Linux arm above. Darwin's form takes two
+        // trailing arguments rather than one -- `position` and `options` --
+        // and both are C's own literals at `src/tool_xattr.c:89`.
+        #[cfg(target_os = "macos")]
+        let rc = unsafe {
+            libc::fsetxattr(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast::<libc::c_void>(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+/// Records one extended attribute on an open file.
+///
+/// Supersedes `xattr()` at `src/tool_xattr.c:76-102`, whose whole body is one
+/// platform-selected `fsetxattr` call. The absent-value guard at `:82` and the
+/// `CURL_FAKE_XATTR` debug short-circuit at `:84-87` are CLI-side policy and
+/// stay in `curl-rs/src/output/xattr.rs`, which already separates them.
+///
+/// # The value length reproduces `strlen`, deliberately
+///
+/// C measures the value with `strlen(value)` (`src/tool_xattr.c:89`), so a
+/// value containing an interior NUL is written only up to that byte. The
+/// truncation happens here because in C it happens inside the function this
+/// one supersedes. Values reaching this path come from `curl_easy_getinfo`
+/// and are NUL-terminated C strings in the first place, so the case is
+/// theoretical -- but reproducing it costs one line and removes a difference
+/// that would otherwise have to be argued about.
+///
+/// # Errors
+///
+/// The platform error, carrying its `errno`, so a caller can render the
+/// diagnostic C composes at `src/tool_operate.c:637-639`:
+/// `warnf("Error setting extended attributes on '%s': %s", ...,
+/// curlx_strerror(errno, ...))`. C reads the thread-global `errno` after the
+/// call returns; Rust has no such global to consult, so the number travels
+/// inside [`io::Error`] instead and
+/// [`io::Error::raw_os_error`] recovers it.
+///
+/// A `name` containing an interior NUL cannot be a C string and yields
+/// `EINVAL` without any call being made. The attribute names are fixed ASCII
+/// literals in the C tree (`user.creator`, `user.xdg.origin.url`,
+/// `user.xdg.referrer.url`, `user.mime_type`), so this is a total-function
+/// guarantee rather than a reachable path.
+pub fn set_file_xattr(
+    fd: BorrowedFd<'_>,
+    name: &[u8],
+    value: &[u8],
+) -> io::Result<()> {
+    set_file_xattr_with(&RealSys, fd, name, value)
+}
+
+/// [`set_file_xattr`] over an injected [`XattrCalls`].
+pub(crate) fn set_file_xattr_with(
+    sys: &dyn XattrCalls,
+    fd: BorrowedFd<'_>,
+    name: &[u8],
+    value: &[u8],
+) -> io::Result<()> {
+    let name = CString::new(name)
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+
+    // `strlen(value)` -- see the note on the wrapper.
+    let end = value.iter().position(|&byte| byte == 0);
+    let measured = match end {
+        Some(index) => value.get(..index).unwrap_or_default(),
+        None => value,
+    };
+
+    sys.fsetxattr(fd, &name, measured)
+}
+
+// Broken-down time and the locale -- supersedes the curlx_gmtime/strftime
+// pair at src/tool_writeout.c:581-588, the local-time rendering behind
+// --trace-time, and the setlocale calls at src/tool_operate.c:2271-2272
+
+/// The time and locale calls that have no safe equivalent.
+///
+/// Every one of these is a C library function rather than a system call, and
+/// every one of them is here for the same reason: its result depends on
+/// process-wide state -- the time zone database and the current locale -- that
+/// no Rust crate in this workspace's dependency set reads.
+pub(crate) trait TimeCalls {
+    /// `localtime_r(&epoch, &tm)` then `tm.tm_gmtoff`.
+    ///
+    /// The signed offset in seconds that must be added to UTC to obtain local
+    /// time at `epoch`, or [`None`] when the conversion fails. The offset is
+    /// asked for **at a given instant** rather than in the abstract, because
+    /// it changes across a daylight-saving transition and a trace line
+    /// written either side of one must carry the offset that applied then.
+    fn utc_offset_secs(&self, epoch: i64) -> Option<i64>;
+
+    /// `strftime(out, out.len(), format, gmtime_r(&epoch))`.
+    ///
+    /// The number of bytes written, or [`None`] when `strftime` returns `0`.
+    /// `src/tool_writeout.c:588` treats that as "write nothing at all", so
+    /// the two outcomes -- did not fit, and produced nothing -- collapse
+    /// exactly as they do in C.
+    ///
+    /// The broken-down time is built **inside** the implementation, from
+    /// `gmtime_r`, rather than being passed in. That is what makes the result
+    /// byte-identical to C: `curlx_gmtime` is `gmtime_r`, and the fields it
+    /// sets that a hand-built structure would have to guess at --
+    /// `tm_gmtoff`, `tm_zone`, `tm_isdst` -- are exactly the ones a locale's
+    /// own `%c`, `%x`, `%X` or `%r` expansion may go on to read.
+    fn strftime_gmt(
+        &self,
+        format: &CStr,
+        epoch: i64,
+        out: &mut [u8],
+    ) -> Option<usize>;
+
+    /// `setlocale(LC_ALL, "")` followed by `setlocale(LC_NUMERIC, "C")`.
+    ///
+    /// `false` if either call fails. Reproduces
+    /// `src/tool_operate.c:2271-2272` exactly, including the order and the
+    /// deliberate reversal of `LC_NUMERIC`: the tool wants the user's locale
+    /// for time and messages, and the C locale for numbers, so that a decimal
+    /// point stays a decimal point.
+    fn set_locale_from_environment(&self) -> bool;
+}
+
+impl TimeCalls for RealSys {
+    fn utc_offset_secs(&self, epoch: i64) -> Option<i64> {
+        let when = libc::time_t::try_from(epoch).ok()?;
+        let mut broken = MaybeUninit::<libc::tm>::uninit();
+
+        // SAFETY: `localtime_r` reads one `time_t` through its first argument
+        // and writes a complete `struct tm` through its second, reading nothing
+        // through it. `&when` borrows a live, initialised local, and
+        // `MaybeUninit::as_mut_ptr` yields an aligned, uniquely borrowed
+        // to storage of exactly the right type and size. The returned pointer
+        // aliases that same storage and is used only for the null test, never
+        // dereferenced, so no aliasing rule is engaged.
+        let result = unsafe { libc::localtime_r(&when, broken.as_mut_ptr()) };
+        if result.is_null() {
+            return None;
+        }
+
+        // SAFETY: `localtime_r` returned non-null, which POSIX specifies as
+        // having filled the structure.
+        let broken = unsafe { broken.assume_init() };
+
+        // `tm_gmtoff` is `c_long`, which is `i64` on all four mandated targets,
+        // so this is an annotated binding rather than a conversion -- writing
+        // `i64::from` here would be a conversion between one type and itself,
+        // which `clippy::useless_conversion` rejects. On a target where
+        // `c_long` were narrower this line would fail to compile, which is the
+        // right outcome: the FFI design forfeits 32-bit deliberately
+        // (AAP 0.6.2), and a compile error at the exact site beats a silent
+        // widening on a platform nothing else here supports.
+        let offset: i64 = broken.tm_gmtoff;
+
+        Some(offset)
+    }
+
+    fn strftime_gmt(
+        &self,
+        format: &CStr,
+        epoch: i64,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        if out.is_empty() {
+            // `strftime` is specified over a buffer with room for at least the
+            // terminator; a zero-length one has no valid outcome, and handing
+            // C library a one-past-the-end pointer is not one either. The
+            // wrapper rejects this case too, which is where it is covered by
+            // test; this copy is a local guarantee, so the SAFETY note below
+            // does not have to reason about who called.
+            return None;
+        }
+
+        let when = libc::time_t::try_from(epoch).ok()?;
+        let mut broken = MaybeUninit::<libc::tm>::uninit();
+
+        // SAFETY: `gmtime_r` has the same contract as `localtime_r` above --
+        // it reads one `time_t`, writes one complete `struct tm`, and returns
+        // a pointer aliasing the storage it filled. The pointer is used only
+        // for the null test, never dereferenced. This is `curlx_gmtime`
+        // (`src/tool_writeout.c:581`).
+        let result = unsafe { libc::gmtime_r(&when, broken.as_mut_ptr()) };
+        if result.is_null() {
+            return None;
+        }
+
+        // SAFETY: non-null return means the structure is initialised.
+        let broken = unsafe { broken.assume_init() };
+
+        // SAFETY: `strftime` writes at most `maxsize` bytes -- terminator
+        // included -- through the first argument and never reads it; it reads
+        // `format` as a NUL-terminated C string and reads the `struct tm`
+        // through the last argument. `out.as_mut_ptr()` with `out.len()` covers
+        // a live, uniquely borrowed slice of exactly that many initialised
+        // bytes, `CStr::as_ptr` supplies the terminated format, and `&broken`
+        // borrows the fully initialised structure `gmtime_r` just produced.
+        // `libc::c_char` is `i8` on all four mandated targets and shares size
+        // and alignment with `u8`, so the cast changes only signedness. The
+        // return value is a length that never exceeds `maxsize`.
+        let written = unsafe {
+            libc::strftime(
+                out.as_mut_ptr().cast::<libc::c_char>(),
+                out.len(),
+                format.as_ptr(),
+                &broken,
+            )
+        };
+
+        if written == 0 {
+            None
+        } else {
+            Some(written)
+        }
+    }
+
+    fn set_locale_from_environment(&self) -> bool {
+        // Two NUL-terminated literals, so no allocation and no fallible
+        // conversion stands between the caller and the call.
+        const FROM_ENVIRONMENT: &[u8] = b"\0";
+        const C_LOCALE: &[u8] = b"C\0";
+
+        // SAFETY: `setlocale` reads its second argument as a NUL-terminated C
+        // string and writes nothing through it. Both literals above are
+        // NUL-terminated `&'static [u8]`, so the pointers are valid for the
+        // whole program. The returned pointer addresses storage the C library
+        // owns; it is used only for the null test and is never dereferenced,
+        // retained or freed, which is what keeps this free of the lifetime
+        // hazard `setlocale`'s return value otherwise carries.
+        let all = unsafe {
+            libc::setlocale(
+                libc::LC_ALL,
+                FROM_ENVIRONMENT.as_ptr().cast::<libc::c_char>(),
+            )
+        };
+        if all.is_null() {
+            return false;
+        }
+
+        // SAFETY: as above.
+        let numeric = unsafe {
+            libc::setlocale(
+                libc::LC_NUMERIC,
+                C_LOCALE.as_ptr().cast::<libc::c_char>(),
+            )
+        };
+
+        !numeric.is_null()
+    }
+}
+
+/// The local time zone's offset from UTC, in seconds, at `epoch`.
+///
+/// Positive east of Greenwich. [`None`] when the platform cannot answer, which
+/// a caller must render as UTC rather than as a guess -- exactly what
+/// `curl-rs/src/util.rs` does with it.
+///
+/// The offset is narrowed to [`i32`] because that is the width the trace
+/// formatter needs and because the narrowing is where an implausible value
+/// gets rejected: every real offset lies within 14 hours of UTC, so a value
+/// that does not fit is a broken time zone database, not a location.
+pub fn local_utc_offset_secs(epoch: i64) -> Option<i32> {
+    local_utc_offset_secs_with(&RealSys, epoch)
+}
+
+/// [`local_utc_offset_secs`] over an injected [`TimeCalls`].
+pub(crate) fn local_utc_offset_secs_with(
+    sys: &dyn TimeCalls,
+    epoch: i64,
+) -> Option<i32> {
+    i32::try_from(sys.utc_offset_secs(epoch)?).ok()
+}
+
+/// Formats `epoch` in UTC with the platform's `strftime`, into `out`.
+///
+/// Returns the number of bytes written, or [`None`] when nothing should be
+/// written at all -- `strftime` returning `0`, which
+/// `src/tool_writeout.c:588` tests before its `fputs`.
+///
+/// # Why the platform's implementation and not a Rust one
+///
+/// Because the output is locale-dependent and the C tool sets the locale.
+/// `src/tool_operate.c:2271` calls `setlocale(LC_ALL, "")`, so `LC_TIME`
+/// governs `%a`, `%A`, `%b`, `%B`, `%h`, `%c`, `%p`, `%r`, `%x` and `%X`, and
+/// a table of English names cannot reproduce them. `src/tool_writeout.c:588`
+/// hands the format to the platform `strftime`, and so does this.
+///
+/// # Errors
+///
+/// [`None`] also when `format` contains an interior NUL -- it cannot then be
+/// a C format string -- and when `out` is empty. Neither is reachable from
+/// `%time{}`, whose format is delimited by `}` and whose buffer is C's
+/// `char output[256]` (`src/tool_writeout.c:529`), but both are answered
+/// rather than assumed away because a `--write-out` format is user input.
+pub fn strftime_gmt(
+    format: &[u8],
+    epoch: i64,
+    out: &mut [u8],
+) -> Option<usize> {
+    strftime_gmt_with(&RealSys, format, epoch, out)
+}
+
+/// [`strftime_gmt`] over an injected [`TimeCalls`].
+pub(crate) fn strftime_gmt_with(
+    sys: &dyn TimeCalls,
+    format: &[u8],
+    epoch: i64,
+    out: &mut [u8],
+) -> Option<usize> {
+    if out.is_empty() {
+        // Rejected on this side of the seam so that the guarantee holds for
+        // every implementation of `TimeCalls`, not only `RealSys`, and so that
+        // it is reachable by test without a real `strftime`. `RealSys` repeats
+        // the check as a local invariant of its own `unsafe` block.
+        return None;
+    }
+
+    let format = CString::new(format).ok()?;
+
+    sys.strftime_gmt(&format, epoch, out)
+}
+
+/// Adopts the environment's locale, keeping numbers in the C locale.
+///
+/// `false` when the platform refuses either half. Reproduces
+/// `src/tool_operate.c:2271-2272`.
+///
+/// # This mutates process-wide state, and that is the point
+///
+/// `setlocale` is the one call in this module with a global effect, which is
+/// why it is a single explicit function rather than something done lazily on
+/// first use. It must be called **once, from the command-line tool's start-up,
+/// before any thread is spawned**, exactly where C calls it -- the C library's
+/// locale is not thread-safe to change once other threads are running. Its
+/// owner is therefore `curl-rs/src/operate/mod.rs`, which supersedes
+/// `src/tool_operate.c`; no library path may call it, because a library that
+/// changes its host process's locale is a defect.
+///
+/// Until that owner calls it, the process stays in the `"C"` locale, and every
+/// [`strftime_gmt`] result is the C locale's -- which is what an unlocalised
+/// build produces and is byte-identical to the English names it would
+/// otherwise have to hard-code.
+pub fn set_locale_from_environment() -> bool {
+    set_locale_from_environment_with(&RealSys)
+}
+
+/// [`set_locale_from_environment`] over an injected [`TimeCalls`].
+pub(crate) fn set_locale_from_environment_with(sys: &dyn TimeCalls) -> bool {
+    sys.set_locale_from_environment()
+}
+
+// Process identity -- the safe side
+
+/// The effective user id of this process.
+///
+/// Total, because `geteuid(2)` is. Used by `tls/keylog.rs` to reject a
+/// pre-existing `SSLKEYLOGFILE` owned by somebody else before writing session
+/// secrets into it.
+pub(crate) fn effective_uid() -> u32 {
+    effective_uid_with(&RealSys)
+}
+
+/// [`effective_uid`] over an injected [`SysCalls`].
+pub(crate) fn effective_uid_with(sys: &dyn SysCalls) -> u32 {
+    sys.effective_uid()
+}
+
+// Descriptor extent, reads and seeks -- the safe side
+//
+// These three exist for one caller: `curl-rs/src/output/formparse.rs` decides
+// whether standard input is a regular file it can read lazily, and reads and
+// repositions it if so. `src/tool_formparse.c:121-143,216,244` does it with
+// `fileno`, `ftell`, `fstat`, `fread` and `fseek` on the `stdin` stream.
+
+/// The extent of `fd` when it is a regular file that can be read lazily.
+///
+/// `Some((origin, size))` where `origin` is the descriptor's current offset and
+/// `size` is the file's total length -- exactly the pair
+/// `src/tool_formparse.c:128,131-135` gathers before deciding not to buffer.
+///
+/// [`None`] is the ordinary answer, not an error: it covers a pipe, a socket, a
+/// terminal, a directory, a closed descriptor and an unseekable one alike,
+/// because C's compound condition at `:131-135` collapses all of them into the
+/// same "buffer it instead" branch at `:140`. C additionally requires
+/// `origin >= 0`, which a successful `lseek` already guarantees.
+pub(crate) fn regular_file_extent(fd: RawFd) -> Option<(i64, i64)> {
+    regular_file_extent_with(&RealSys, fd)
+}
+
+/// [`regular_file_extent`] over an injected [`SysCalls`].
+pub(crate) fn regular_file_extent_with(
+    sys: &dyn SysCalls,
+    fd: RawFd,
+) -> Option<(i64, i64)> {
+    // Ordered as the C's `&&` chain is, so a descriptor that cannot report its
+    // offset is never also stat'ed.
+    let origin = sys.fd_offset(fd).ok()?;
+    let size = sys.fd_regular_size(fd).ok()??;
+    Some((origin, size))
+}
+
+/// Reads from `fd` into `buf`, returning the number of bytes placed there.
+///
+/// `Ok(0)` is end of input, which is what a short `fread` without `ferror`
+/// means at `src/tool_formparse.c:216-219`.
+pub(crate) fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    read_fd_with(&RealSys, fd, buf)
+}
+
+/// [`read_fd`] over an injected [`SysCalls`].
+pub(crate) fn read_fd_with(
+    sys: &dyn SysCalls,
+    fd: RawFd,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    sys.read_fd(fd, buf)
+}
+
+/// Repositions `fd` to `offset`, counted from the start of the file.
+pub(crate) fn seek_fd(fd: RawFd, offset: i64) -> io::Result<()> {
+    seek_fd_with(&RealSys, fd, offset)
+}
+
+/// [`seek_fd`] over an injected [`SysCalls`].
+pub(crate) fn seek_fd_with(
+    sys: &dyn SysCalls,
+    fd: RawFd,
+    offset: i64,
+) -> io::Result<()> {
+    sys.seek_fd(fd, offset)
+}
+
 // The counting allocator -- feature `memdebug`, DEFAULT OFF
-// ===========================================================================
 
 /// An allocation log in the format `tests/memanalyzer.pm` parses.
 ///
@@ -901,7 +2149,7 @@ pub(crate) fn if_nametoindex_with(sys: &dyn SysCalls, name: &str) -> CodeResult<
 pub(crate) mod memdebug {
     use core::cell::Cell;
     use core::ptr;
-    use core::sync::atomic::{AtomicI64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::ffi::OsString;
     use std::fs::File;
@@ -1035,7 +2283,11 @@ pub(crate) mod memdebug {
     }
 
     /// `lib/memdebug.c:257` -- `MEM %s:%d calloc(%zu,%zu) = %p\n`, no space.
-    pub(crate) fn calloc_record(count: usize, size: usize, addr: usize) -> Option<Record> {
+    pub(crate) fn calloc_record(
+        count: usize,
+        size: usize,
+        addr: usize,
+    ) -> Option<Record> {
         build(format_args!(
             "MEM {}:{} calloc({},{}) = {}\n",
             SOURCE,
@@ -1047,7 +2299,11 @@ pub(crate) mod memdebug {
     }
 
     /// `lib/memdebug.c:349` -- `MEM %s:%d realloc(%p, %zu) = %p\n`, one space.
-    pub(crate) fn realloc_record(old: usize, size: usize, addr: usize) -> Option<Record> {
+    pub(crate) fn realloc_record(
+        old: usize,
+        size: usize,
+        addr: usize,
+    ) -> Option<Record> {
         build(format_args!(
             "MEM {}:{} realloc({}, {}) = {}\n",
             SOURCE,
@@ -1115,7 +2371,7 @@ pub(crate) mod memdebug {
     ///
     /// Exists as an RAII token for two reasons. It lowers the flag in `Drop`, so
     /// no path -- including an unwind -- can leave a thread permanently unable to
-    /// log. And it lets [`TrackingAllocator::realloc`] hold the lock *across* the
+    /// log, and it lets [`TrackingAllocator::realloc`] hold the lock *across* the
     /// reallocation, which is the ordering guarantee `lib/memdebug.c:330-332`
     /// spells out: the record must be written under the same lock, "as we get
     /// out-of-order log entries otherwise, since another thread might alloc the
@@ -1233,7 +2489,14 @@ pub(crate) mod memdebug {
     }
 
     /// Applies `countcheck()` to the process-wide cap.
+    ///
+    /// The single choke point through which every allocation passes, and
+    /// therefore the one place the cap can be armed from without an
+    /// initialization hook -- see [`ensure_limit_armed`] for why that is
+    /// necessary and why it is also faithful.
     fn capped(func: &str) -> bool {
+        ensure_limit_armed();
+
         take_allocation(&LIMIT) && deny(func)
     }
 
@@ -1276,6 +2539,241 @@ pub(crate) mod memdebug {
     /// own allocations.
     pub(crate) fn set_memlimit(allocations: u32) -> bool {
         arm_cap(&LIMIT, allocations)
+    }
+
+    /// Parses a `CURL_MEMLIMIT` value the way `curlx_str_number` does.
+    ///
+    /// # Why this function exists at all
+    ///
+    /// Without it the cap is unreachable in production. `src/tool_main.c:117-125`
+    /// is the *only* caller of `curl_dbg_memlimit()` outside the test programs:
+    ///
+    /// ```c
+    /// env = curl_getenv("CURL_MEMLIMIT");
+    /// if(env) {
+    ///   curl_off_t num;
+    ///   const char *p = env;
+    ///   if(!curlx_str_number(&p, &num, LONG_MAX))
+    ///     curl_dbg_memlimit((long)num);
+    ///   curl_free(env);
+    /// }
+    /// ```
+    ///
+    /// and `tests/runner.pm:508` is what sets the variable, once per torture
+    /// iteration, clearing it again at `:526`. `STRE_OK` is `0`, so the
+    /// apparently inverted `if(!...)` applies the limit when the parse
+    /// *succeeded*.
+    ///
+    /// # The grammar, reproduced exactly
+    ///
+    /// `str_num_base` (`lib/curlx/strparse.c`) with base 10 is stricter than
+    /// [`str::parse`] in three ways and laxer in one, and all four matter:
+    ///
+    /// * No sign is accepted. `-5` fails at the first character, because `-` is
+    ///   not a digit, so it does not become a huge unsigned value.
+    /// * No leading whitespace is accepted, for the same reason.
+    /// * At least one digit is required, so an empty value is `STRE_NO_NUM` and
+    ///   arms nothing -- which is what makes clearing the variable work.
+    /// * Trailing non-digits are *not* an error. The C stops at the first one and
+    ///   returns `STRE_OK`, and `tool_main.c` ignores the remainder, so `10abc`
+    ///   is a limit of ten.
+    ///
+    /// Values above `LONG_MAX` are `STRE_OVERFLOW` and arm nothing, matching the
+    /// `max` argument the C passes.
+    ///
+    /// # Saturation
+    ///
+    /// [`set_memlimit`] counts in [`u32`] while the C counts in `long`. A value
+    /// between `u32::MAX` and `LONG_MAX` therefore saturates instead of
+    /// overflowing. This is observationally exact: the cap only ever matters when
+    /// it is reached, and a process cannot perform four billion allocations
+    /// inside one torture iteration. The alternative -- widening the counter --
+    /// would cost a wider atomic on the hot path of every allocation for a
+    /// distinction nothing can observe.
+    fn memlimit_from_env(value: Option<OsString>) -> Option<u32> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // Bytes rather than a `&str`: the environment is not required to hold
+        // UTF-8, and rejecting a value for that reason would be a behaviour the C
+        // does not have. The digits this grammar accepts are ASCII either way.
+        let raw = value?;
+        let bytes = raw.as_bytes();
+
+        // `if(!valid_digit(*p, m)) return STRE_NO_NUM;` -- the first byte decides
+        // whether there is a number here at all.
+        let mut digits = bytes.iter().copied().take_while(u8::is_ascii_digit);
+        let first = digits.next()?;
+
+        // `LONG_MAX` on every mandated target, which is what the C passes as
+        // `max`. Accumulating in `i64` and checking against this bound reproduces
+        // the C's overflow test rather than approximating it.
+        const LONG_MAX: i64 = i64::MAX;
+
+        let mut num = i64::from(first - b'0');
+        for digit in digits {
+            let n = i64::from(digit - b'0');
+
+            // `if(num > ((max - n) / base)) return STRE_OVERFLOW;` -- the C
+            // checks before multiplying, so the multiplication itself can never
+            // overflow. Transcribed rather than replaced by `checked_mul`,
+            // because the two agree on every input and the transcription is what
+            // a reader can verify against the source.
+            if num > (LONG_MAX - n) / 10 {
+                return None;
+            }
+
+            num = num * 10 + n;
+        }
+
+        // The saturating step documented above. `num` is non-negative by
+        // construction -- no sign was accepted -- so this cannot wrap.
+        Some(u32::try_from(num).unwrap_or(u32::MAX))
+    }
+
+    /// Suppresses allocator bookkeeping on this thread while alive.
+    ///
+    /// [`Logger::enter`] cannot serve this purpose, even though it raises the
+    /// same flag: it returns [`None`] when no log destination is configured, and
+    /// `CURL_MEMLIMIT` is independent of `CURL_MEMDEBUG`. `lib/memdebug.c` keeps
+    /// them independent in exactly the same way -- `countcheck()` writes its
+    /// `LIMIT` line to standard error at `:193-194` whether or not a log file was
+    /// ever opened -- so a cap must still work with logging switched off.
+    struct Bookkeeping;
+
+    impl Bookkeeping {
+        /// [`Some`] only when this thread was not already inside bookkeeping.
+        fn enter() -> Option<Self> {
+            let entered = IN_LOG.try_with(|flag| {
+                if flag.get() {
+                    false
+                } else {
+                    flag.set(true);
+                    true
+                }
+            });
+
+            if matches!(entered, Ok(true)) {
+                Some(Self)
+            } else {
+                None
+            }
+        }
+    }
+
+    impl Drop for Bookkeeping {
+        fn drop(&mut self) {
+            // `try_with` rather than `with`: during thread teardown the
+            // thread-local may already be destroyed, and that must not panic
+            // inside a `Drop` running in the allocator.
+            let _ = IN_LOG.try_with(|flag| flag.set(false));
+        }
+    }
+
+    /// Whether the environment has been consulted for a cap yet.
+    ///
+    /// Separate from [`LIMIT`] because "no cap was requested" and "the question
+    /// has not been asked" are different states, and conflating them would make
+    /// the environment be read on every single allocation.
+    static LIMIT_ARMED: AtomicBool = AtomicBool::new(false);
+
+    /// Arms the process-wide cap from `CURL_MEMLIMIT`, at most once.
+    ///
+    /// # Why this is lazy rather than eager
+    ///
+    /// Reading the environment allocates, so it cannot happen unguarded inside
+    /// the allocator, and there is no earlier hook to do it from: this crate is a
+    /// library, `#[global_allocator]` has no initialization callback, and
+    /// `curl-rs/src/main.rs` -- the analogue of the C's `tool_main.c` -- is
+    /// outside this checkpoint's file set. Doing it on first use keeps the cap
+    /// working end-to-end today, and [`init_from_env`] additionally exposes it as
+    /// an explicit hook for that `main` to call when it lands.
+    ///
+    /// # What laziness costs, measured rather than estimated
+    ///
+    /// Arming on the first allocation means the allocations the Rust runtime
+    /// performs before `main` are counted, whereas the C's counting begins
+    /// partway through `main()`. Measured on this platform with a probe that
+    /// installs [`TrackingAllocator`] as the `#[global_allocator]`: exactly two
+    /// allocations precede `main`, so `CURL_MEMLIMIT=1` and `=2` deny inside
+    /// start-up and abort through `handle_alloc_error` (`SIGABRT`), while `>=3`
+    /// reaches `main` and denies where expected. The offset is a constant two,
+    /// not a leak.
+    ///
+    /// That is disclosed rather than smoothed over, but it is inert in practice
+    /// for an independent reason: torture mode is the only consumer of small
+    /// caps, and `tests/runtests.pl:847-849` hard-requires the `Debug` feature,
+    /// which this build deliberately withholds (AAP section 0.6.6). Closing the
+    /// gap properly needs the arming call to move into the command-line tool's
+    /// `main`, exactly where `src/tool_main.c:117-125` has it -- which is what
+    /// [`init_from_env`] exists for, and why it is `pub(crate)` rather than
+    /// private.
+    ///
+    /// # Why the fast path must stay this cheap
+    ///
+    /// It runs before every allocation in the process. It is one relaxed atomic
+    /// load and a branch; the environment is touched only on the first few calls,
+    /// and only from a thread that is not already inside bookkeeping.
+    fn ensure_limit_armed() {
+        if LIMIT_ARMED.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // A re-entrant allocation -- one performed *by* the environment read
+        // below -- takes this branch and leaves the flag clear, so the next
+        // non-re-entrant allocation retries. That is why this is not a `Once`:
+        // the work must be abandonable, not merely skipped.
+        let Some(_suppressed) = Bookkeeping::enter() else {
+            return;
+        };
+
+        // `swap` rather than `store`, so that two threads racing here cannot both
+        // read the environment and both call `arm_cap`. The loser observes `true`
+        // and does nothing.
+        if LIMIT_ARMED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        if let Some(limit) =
+            memlimit_from_env(std::env::var_os("CURL_MEMLIMIT"))
+        {
+            arm_cap(&LIMIT, limit);
+        }
+    }
+
+    /// Applies `CURL_MEMLIMIT` explicitly, reproducing `src/tool_main.c:117-125`.
+    ///
+    /// Idempotent, and safe to call from anywhere. [`ensure_limit_armed`] already
+    /// performs the same work on first allocation, so this exists so that the
+    /// command-line tool can arm the cap at the same point in start-up that the C
+    /// does, rather than leaving the timing to whichever allocation happens
+    /// first.
+    ///
+    /// Returns whether a cap was armed by *this* call: [`false`] both when the
+    /// variable is absent or unparsable and when a cap was already in place,
+    /// which mirrors `curl_dbg_memlimit()`'s `if(!memlimit)` guard.
+    ///
+    /// # A measured caveat on that return value
+    ///
+    /// In a process that has already allocated -- which is every process, since
+    /// the runtime allocates before `main` -- [`ensure_limit_armed`] will have
+    /// read the environment first, so this returns [`false`] even though a cap
+    /// *is* armed and came from the same variable. Verified with the probe
+    /// described on [`ensure_limit_armed`]: the hook reported `false` in all six
+    /// environment cases, while the cap itself engaged correctly in each case
+    /// where the value was parsable. The return value therefore answers "did I
+    /// arm it", not "is a cap in force", and a caller wanting the latter should
+    /// not infer it from here.
+    pub(crate) fn init_from_env() -> bool {
+        let already = LIMIT_ARMED.swap(true, Ordering::Relaxed);
+
+        if already {
+            return false;
+        }
+
+        match memlimit_from_env(std::env::var_os("CURL_MEMLIMIT")) {
+            Some(limit) => arm_cap(&LIMIT, limit),
+            None => false,
+        }
     }
 
     /// A `GlobalAlloc` that logs every operation in `memanalyzer.pm`'s format.
@@ -1391,7 +2889,12 @@ pub(crate) mod memdebug {
         // unchanged. This method is overridden rather than left to the default
         // implementation precisely so that one `realloc` record is written where
         // the default would have emitted an unrelated `malloc`/`free` pair.
-        unsafe fn realloc(&self, block: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe fn realloc(
+            &self,
+            block: *mut u8,
+            layout: Layout,
+            new_size: usize,
+        ) -> *mut u8 {
             if capped("realloc") {
                 return ptr::null_mut();
             }
@@ -1403,9 +2906,10 @@ pub(crate) mod memdebug {
             // must be written under the same lock, "as we get out-of-order log
             // entries otherwise, since another thread might alloc the memory
             // released by realloc() before otherwise would log it". The C takes
-            // its debug mutex at :334 and logs through `curl_dbg_log_locked` at
-            // :349; holding this guard does the same. When logging is disabled
-            // there is no lock and no ordering to preserve.
+            // its debug mutex at `:334` and logs through
+            // `curl_dbg_log_locked` at `:349`; holding this guard does the
+            // same. When logging is disabled there is no lock and no ordering
+            // to preserve.
             let mut logger = Logger::enter();
 
             // SAFETY: `GlobalAlloc::realloc`'s contract obliges this method's
@@ -1438,7 +2942,8 @@ pub(crate) mod memdebug {
 
         #[test]
         fn malloc_record_matches_memdebug_c_228() {
-            let record = malloc_record(135, 0x7f_2a_00_10).expect("record fits");
+            let record =
+                malloc_record(135, 0x7f_2a_00_10).expect("record fits");
             let text = record.as_str().expect("record is ASCII");
 
             assert!(text.starts_with(&mem_prefix()), "{text}");
@@ -1531,7 +3036,21 @@ pub(crate) mod memdebug {
 
         /// An unwritable destination must disable logging silently. `/` is a
         /// directory on every mandated target, so `File::create` fails there.
+        ///
+        /// Ignored under Miri because the assertion is about what the operating
+        /// system refuses, and Miri's isolation refuses `open` before the
+        /// operating system is ever consulted -- "unsupported operation: `open`
+        /// not available when isolation is enabled". The gate this crate is held
+        /// to (`.github/workflows/rust-miri.yml`) deliberately passes no
+        /// `-Zmiri-disable-isolation`, so the only alternatives are to skip this
+        /// one assertion or to weaken the interpreter for the whole run. Note
+        /// that a single un-ignored offender aborts the entire Miri run rather
+        /// than failing one test, so this matters to every other test here.
         #[test]
+        #[cfg_attr(
+            miri,
+            ignore = "File::create is refused by Miri's isolation before the OS sees it"
+        )]
         fn an_unwritable_destination_does_not_panic() {
             assert!(File::create("/").ok().map(Mutex::new).is_none());
         }
@@ -1562,6 +3081,159 @@ pub(crate) mod memdebug {
         /// `#[global_allocator]` would deny the test binary's own allocations
         /// once the cap ran out -- which `handle_alloc_error` reports by
         /// aborting the process, taking every other test with it.
+        /// `CURL_MEMLIMIT` unset, or set to nothing, arms nothing.
+        ///
+        /// Both must be inert: `tests/runner.pm:526` clears the variable after
+        /// each torture iteration, and `str_num_base` reports `STRE_NO_NUM` for
+        /// an empty string because its first byte is not a digit.
+        #[test]
+        fn an_absent_or_empty_memlimit_arms_nothing() {
+            assert_eq!(memlimit_from_env(None), None);
+            assert_eq!(memlimit_from_env(Some(OsString::from(""))), None);
+        }
+
+        /// A plain decimal value is taken verbatim, zero included.
+        ///
+        /// Zero is not a no-op: `countcheck()` denies on `memsize <= 0`
+        /// (`lib/memdebug.c:186`), so a cap of zero denies the next
+        /// allocation. `135` is the count `tests/data/test1` records.
+        #[test]
+        fn a_decimal_memlimit_is_taken_verbatim() {
+            assert_eq!(memlimit_from_env(Some(OsString::from("0"))), Some(0));
+            assert_eq!(memlimit_from_env(Some(OsString::from("1"))), Some(1));
+            assert_eq!(
+                memlimit_from_env(Some(OsString::from("135"))),
+                Some(135)
+            );
+            assert_eq!(
+                memlimit_from_env(Some(OsString::from("0135"))),
+                Some(135),
+                "leading zeros are digits like any other"
+            );
+        }
+
+        /// Trailing non-digits end the number without failing it.
+        ///
+        /// `str_num_base` stops at the first non-digit and returns `STRE_OK`, and
+        /// `src/tool_main.c:121-122` ignores whatever `p` was left pointing at.
+        /// This is laxer than [`str::parse`] and the difference is deliberate.
+        #[test]
+        fn trailing_non_digits_are_ignored_rather_than_rejected() {
+            assert_eq!(
+                memlimit_from_env(Some(OsString::from("10abc"))),
+                Some(10)
+            );
+            assert_eq!(memlimit_from_env(Some(OsString::from("7 "))), Some(7));
+            assert_eq!(
+                memlimit_from_env(Some(OsString::from("42,99"))),
+                Some(42)
+            );
+        }
+
+        /// A value that does not begin with a digit is `STRE_NO_NUM`.
+        ///
+        /// The sign cases matter most: `str_num_base` never accepts `-` or `+`,
+        /// so a negative value arms nothing instead of becoming an enormous
+        /// unsigned cap. Leading whitespace is rejected for the same reason.
+        #[test]
+        fn a_value_not_starting_with_a_digit_arms_nothing() {
+            for value in ["-5", "+5", " 5", "\t5", "abc", "x1", ".5"] {
+                assert_eq!(
+                    memlimit_from_env(Some(OsString::from(value))),
+                    None,
+                    "{value:?} must not arm a cap"
+                );
+            }
+        }
+
+        /// A value above `LONG_MAX` is `STRE_OVERFLOW` and arms nothing.
+        #[test]
+        fn an_overflowing_memlimit_arms_nothing() {
+            // i64::MAX + 1, and a value far beyond any width.
+            assert_eq!(
+                memlimit_from_env(Some(OsString::from("9223372036854775808"))),
+                None
+            );
+            assert_eq!(
+                memlimit_from_env(Some(OsString::from(
+                    "99999999999999999999999"
+                ))),
+                None
+            );
+        }
+
+        /// A value between `u32::MAX` and `LONG_MAX` saturates rather than wraps.
+        #[test]
+        fn a_huge_but_valid_memlimit_saturates() {
+            assert_eq!(
+                memlimit_from_env(Some(OsString::from("9223372036854775807"))),
+                Some(u32::MAX),
+                "LONG_MAX is a valid cap in the C and must not wrap here"
+            );
+            assert_eq!(
+                memlimit_from_env(Some(OsString::from("4294967295"))),
+                Some(u32::MAX),
+                "u32::MAX itself is exact"
+            );
+            assert_eq!(
+                memlimit_from_env(Some(OsString::from("4294967296"))),
+                Some(u32::MAX)
+            );
+        }
+
+        /// A non-UTF-8 environment value is parsed, not rejected.
+        ///
+        /// The C reads bytes, so a stray invalid byte after the digits must not
+        /// change the outcome. Rejecting the value for not being UTF-8 would be
+        /// a behaviour the C does not have.
+        #[test]
+        fn a_non_utf8_memlimit_still_parses() {
+            use std::os::unix::ffi::OsStringExt as _;
+
+            let value = OsString::from_vec(vec![b'1', b'2', 0xFF, 0xFE]);
+
+            assert_eq!(memlimit_from_env(Some(value)), Some(12));
+        }
+
+        /// The environment-driven arming path never touches the global cap here.
+        ///
+        /// [`ensure_limit_armed`] and [`init_from_env`] arm [`LIMIT`], which is
+        /// the counter this test binary's own `#[global_allocator]` consults, so
+        /// exercising them here could abort the whole binary -- the same hazard
+        /// documented on [`arm_cap`]. The parsing is therefore covered through
+        /// [`memlimit_from_env`], which is pure, and this test records that the
+        /// separation is deliberate by asserting the global is still disarmed.
+        #[test]
+        fn the_environment_path_leaves_the_global_cap_alone() {
+            assert_eq!(
+                LIMIT.load(Ordering::Relaxed),
+                NO_LIMIT,
+                "no test may arm the process-wide allocation cap"
+            );
+        }
+
+        /// The re-entrancy guard is exclusive per thread, and releases.
+        ///
+        /// This is what stops the environment read inside [`ensure_limit_armed`]
+        /// from recursing into the allocator bookkeeping that called it.
+        #[test]
+        fn bookkeeping_is_exclusive_and_releases() {
+            {
+                let outer = Bookkeeping::enter();
+                assert!(outer.is_some(), "the first entry must succeed");
+                assert!(
+                    Bookkeeping::enter().is_none(),
+                    "a nested entry must be refused, which is what breaks the \
+                     recursion"
+                );
+            }
+
+            assert!(
+                Bookkeeping::enter().is_some(),
+                "the flag must be lowered again on drop"
+            );
+        }
+
         #[test]
         fn the_process_cap_is_one_shot() {
             // Exercised over a LOCAL counter, never over the process-wide
@@ -1643,7 +3315,8 @@ pub(crate) mod memdebug {
             unsafe {
                 allocator.dealloc(
                     grown,
-                    Layout::from_size_align(128, layout.align()).expect("valid layout"),
+                    Layout::from_size_align(128, layout.align())
+                        .expect("valid layout"),
                 );
             }
 
@@ -1657,7 +3330,8 @@ pub(crate) mod memdebug {
             // SAFETY: `alloc_zeroed` returned a non-null block of
             // `layout.size()` readable bytes, which is exactly the slice built
             // here, and nothing else aliases it.
-            let bytes = unsafe { core::slice::from_raw_parts(zeroed, layout.size()) };
+            let bytes =
+                unsafe { core::slice::from_raw_parts(zeroed, layout.size()) };
             assert!(bytes.iter().all(|&byte| byte == 0));
 
             // SAFETY: `zeroed` is currently allocated by this allocator with
@@ -1667,14 +3341,16 @@ pub(crate) mod memdebug {
     }
 }
 
-// ===========================================================================
 // Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    // Needed only here: the production wrappers take a `BorrowedFd` that a
+    // caller has already produced, so nothing outside the tests converts one.
+    use std::os::fd::AsFd;
+    use std::panic::{self, AssertUnwindSafe};
 
     /// A pure-Rust [`SysCalls`] with scripted answers.
     ///
@@ -1696,10 +3372,27 @@ mod tests {
         ifaddrs: Result<Vec<IfNode>, i32>,
         /// The index `if_nametoindex` reports, if any.
         index: Option<u32>,
+        /// The `errno` `fsetxattr` reports, or [`None`] for success.
+        xattr_errno: Option<i32>,
         /// The buffer's first byte as the seam received it.
         observed_first_byte: Cell<Option<u8>>,
         /// The bytes, including the terminator, that `if_nametoindex` received.
         observed_name: RefCell<Option<Vec<u8>>>,
+        /// The name (with terminator) and value `fsetxattr` received.
+        observed_xattr: RefCell<Option<(Vec<u8>, Vec<u8>)>>,
+        /// The uid `effective_uid` reports.
+        uid: u32,
+        /// The offset `fd_offset` reports, or the `errno` it reports.
+        fd_offset: Result<i64, i32>,
+        /// The size `fd_regular_size` reports: `Ok(None)` is "not a regular
+        /// file", which is an answer rather than a failure.
+        fd_regular_size: Result<Option<i64>, i32>,
+        /// Bytes `read_fd` hands out, consumed from the front, or its `errno`.
+        fd_bytes: RefCell<Result<Vec<u8>, i32>>,
+        /// What `seek_fd` reports.
+        fd_seek: Result<(), i32>,
+        /// Every offset `seek_fd` received, in order.
+        observed_seeks: RefCell<Vec<i64>>,
     }
 
     impl FakeSys {
@@ -1708,11 +3401,39 @@ mod tests {
                 hostname: Ok(Vec::new()),
                 ifaddrs: Ok(Vec::new()),
                 index: None,
+                xattr_errno: None,
                 observed_first_byte: Cell::new(None),
                 observed_name: RefCell::new(None),
+                observed_xattr: RefCell::new(None),
+                uid: 0,
+                fd_offset: Ok(0),
+                fd_regular_size: Ok(None),
+                fd_bytes: RefCell::new(Ok(Vec::new())),
+                fd_seek: Ok(()),
+                observed_seeks: RefCell::new(Vec::new()),
             }
         }
 
+        fn failing_xattr(errno: i32) -> Self {
+            Self {
+                xattr_errno: Some(errno),
+                ..Self::new()
+            }
+        }
+        /// A descriptor that is a regular file of `size`, positioned at
+        /// `origin`, whose contents are `bytes`.
+        fn with_regular_file(origin: i64, size: i64, bytes: &[u8]) -> Self {
+            Self {
+                fd_offset: Ok(origin),
+                fd_regular_size: Ok(Some(size)),
+                fd_bytes: RefCell::new(Ok(bytes.to_vec())),
+                ..Self::new()
+            }
+        }
+
+        fn with_uid(uid: u32) -> Self {
+            Self { uid, ..Self::new() }
+        }
         fn with_hostname(bytes: &[u8]) -> Self {
             Self {
                 hostname: Ok(bytes.to_vec()),
@@ -1774,8 +3495,57 @@ mod tests {
         }
 
         fn if_nametoindex(&self, name: &CStr) -> Option<u32> {
-            *self.observed_name.borrow_mut() = Some(name.to_bytes_with_nul().to_vec());
+            *self.observed_name.borrow_mut() =
+                Some(name.to_bytes_with_nul().to_vec());
             self.index
+        }
+
+        fn fsetxattr(
+            &self,
+            _fd: BorrowedFd<'_>,
+            name: &CStr,
+            value: &[u8],
+        ) -> io::Result<()> {
+            *self.observed_xattr.borrow_mut() =
+                Some((name.to_bytes_with_nul().to_vec(), value.to_vec()));
+
+            match self.xattr_errno {
+                None => Ok(()),
+                Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            }
+        }
+
+        fn effective_uid(&self) -> u32 {
+            self.uid
+        }
+
+        fn fd_offset(&self, _fd: RawFd) -> io::Result<i64> {
+            self.fd_offset.map_err(io::Error::from_raw_os_error)
+        }
+
+        fn fd_regular_size(&self, _fd: RawFd) -> io::Result<Option<i64>> {
+            self.fd_regular_size.map_err(io::Error::from_raw_os_error)
+        }
+
+        fn read_fd(&self, _fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+            let mut held = self.fd_bytes.borrow_mut();
+            match &mut *held {
+                Ok(bytes) => {
+                    // Front of the queue, so a caller reading twice sees the
+                    // second half -- the property `read(2)` has and a plain
+                    // clone would not.
+                    let taken = bytes.len().min(buf.len());
+                    buf[..taken].copy_from_slice(&bytes[..taken]);
+                    bytes.drain(..taken);
+                    Ok(taken)
+                }
+                Err(errno) => Err(io::Error::from_raw_os_error(*errno)),
+            }
+        }
+
+        fn seek_fd(&self, _fd: RawFd, offset: i64) -> io::Result<()> {
+            self.observed_seeks.borrow_mut().push(offset);
+            self.fd_seek.map_err(io::Error::from_raw_os_error)
         }
     }
 
@@ -1874,7 +3644,8 @@ mod tests {
         let filled = vec![b'a'; HOSTNAME_MAX + 1];
         let sys = FakeSys::with_hostname(&filled);
 
-        let name = gethostname_with(&sys).expect("a filled buffer is not a failure");
+        let name =
+            gethostname_with(&sys).expect("a filled buffer is not a failure");
 
         assert_eq!(name.len(), HOSTNAME_MAX);
         assert!(name.bytes().all(|byte| byte == b'a'));
@@ -1905,7 +3676,8 @@ mod tests {
     fn a_non_utf8_hostname_does_not_panic() {
         let sys = FakeSys::with_hostname(&[0xff, 0xfe, b'.', b'x']);
 
-        let name = gethostname_with(&sys).expect("invalid UTF-8 is not a failure");
+        let name =
+            gethostname_with(&sys).expect("invalid UTF-8 is not a failure");
 
         assert!(!name.is_empty());
         assert!(name.contains('\u{fffd}'));
@@ -1961,7 +3733,7 @@ mod tests {
         let addrs = interface_addrs_with(&sys).expect("enumeration succeeds");
 
         assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0].name, "eth0");
+        assert_eq!(addrs[0].name, b"eth0");
         assert_eq!(addrs[0].addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)));
     }
 
@@ -1970,7 +3742,8 @@ mod tests {
     #[test]
     fn the_scope_id_is_surfaced_for_ipv6_and_zero_for_ipv4() {
         let link_local = [
-            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0x1a, 0x4a, 0xff, 0xfe, 0x00, 0x00, 0x01,
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0x1a, 0x4a, 0xff, 0xfe, 0x00,
+            0x00, 0x01,
         ];
         let sys = FakeSys::with_ifaddrs(vec![
             v4_node("eth0", [192, 168, 1, 5]),
@@ -2001,11 +3774,14 @@ mod tests {
     }
 
     /// `lib/if2ip.c:112` admits only the requested family, and this layer can
-    /// only represent the two internet ones, so an `AF_PACKET` or `AF_LINK`
+    /// only represent the two Internet ones, so an `AF_PACKET` or `AF_LINK`
     /// node contributes no address.
     #[test]
     fn an_unrepresentable_family_contributes_no_address() {
-        let sys = FakeSys::with_ifaddrs(vec![link_node("eth0"), v4_node("eth0", [10, 0, 0, 1])]);
+        let sys = FakeSys::with_ifaddrs(vec![
+            link_node("eth0"),
+            v4_node("eth0", [10, 0, 0, 1]),
+        ]);
 
         let addrs = interface_addrs_with(&sys).expect("enumeration succeeds");
 
@@ -2013,18 +3789,57 @@ mod tests {
         assert_eq!(addrs[0].addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
     }
 
+    /// A non-UTF-8 interface name survives enumeration **byte for byte**.
+    ///
+    /// Decoding it -- which [`String::from_utf8_lossy`] would do, substituting
+    /// U+FFFD -- destroys the only thing the name is for: `lib/if2ip.c:113`
+    /// compares it against the `--interface` value with `curl_strequal`, and a
+    /// replaced byte can never compare equal again. The two byte sequences
+    /// below are both invalid UTF-8 and would collapse onto the *same* decoded
+    /// string, so the assertion that they remain distinct is what actually
+    /// pins the property.
     #[test]
-    fn a_non_utf8_interface_name_does_not_panic() {
-        let node = IfNode {
+    fn a_non_utf8_interface_name_survives_byte_for_byte() {
+        let first = IfNode {
             name: vec![0xff, 0xfe],
             addr: Some(RawIfAddr::V4([127, 0, 0, 1])),
         };
-        let sys = FakeSys::with_ifaddrs(vec![node]);
+        let second = IfNode {
+            name: vec![0xfe, 0xff],
+            addr: Some(RawIfAddr::V4([127, 0, 0, 2])),
+        };
+        let sys = FakeSys::with_ifaddrs(vec![first, second]);
 
         let addrs = interface_addrs_with(&sys).expect("enumeration succeeds");
 
-        assert_eq!(addrs.len(), 1);
-        assert!(addrs[0].name.contains('\u{fffd}'));
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0].name, [0xff, 0xfe]);
+        assert_eq!(addrs[1].name, [0xfe, 0xff]);
+        assert_ne!(
+            addrs[0].name, addrs[1].name,
+            "a lossy decode would make these two names equal"
+        );
+
+        // The same property through the second projection.
+        assert_eq!(
+            interface_names_with(&sys),
+            Ok(vec![vec![0xff, 0xfe], vec![0xfe, 0xff]])
+        );
+    }
+
+    /// The bytes reach [`if_nametoindex`] unaltered, which is the other half of
+    /// the same property: a zone identifier that is not valid UTF-8 must still
+    /// be resolvable, because `lib/url.c:1615` passes it through untouched.
+    #[test]
+    fn a_non_utf8_zone_identifier_reaches_the_seam_unaltered() {
+        let sys = FakeSys::with_index(Some(4));
+
+        assert_eq!(if_nametoindex_with(&sys, &[b'e', 0xff, b'0']), Ok(4));
+        assert_eq!(
+            sys.observed_name.borrow().as_deref(),
+            Some(&[b'e', 0xff, b'0', 0][..]),
+            "the raw bytes must reach the seam, NUL-terminated and unchanged"
+        );
     }
 
     /// A failing `getifaddrs(3)` becomes [`CURLcode::InterfaceFailed`]. A
@@ -2061,7 +3876,7 @@ mod tests {
         let sys = FakeSys::with_ifaddrs(vec![link_node("eth9")]);
 
         assert_eq!(interface_addrs_with(&sys), Ok(Vec::new()));
-        assert_eq!(interface_names_with(&sys), Ok(vec![String::from("eth9")]));
+        assert_eq!(interface_names_with(&sys), Ok(vec![b"eth9".to_vec()]));
     }
 
     /// Order and duplicates are preserved, and NULL-address nodes are excluded
@@ -2077,11 +3892,7 @@ mod tests {
 
         assert_eq!(
             interface_names_with(&sys),
-            Ok(vec![
-                String::from("lo"),
-                String::from("lo"),
-                String::from("eth0"),
-            ])
+            Ok(vec![b"lo".to_vec(), b"lo".to_vec(), b"eth0".to_vec()])
         );
     }
 
@@ -2109,7 +3920,7 @@ mod tests {
         let names = interface_names().expect("enumeration succeeds");
         assert!(names.len() >= addrs.len());
         for entry in &addrs {
-            assert!(names.contains(&entry.name), "{} missing", entry.name);
+            assert!(names.contains(&entry.name), "{:?} missing", entry.name);
         }
     }
 
@@ -2123,7 +3934,7 @@ mod tests {
         let sys = FakeSys::with_index(None);
 
         assert_eq!(
-            if_nametoindex_with(&sys, "definitely-not-an-interface"),
+            if_nametoindex_with(&sys, b"definitely-not-an-interface"),
             Err(CURLcode::InterfaceFailed)
         );
     }
@@ -2132,14 +3943,14 @@ mod tests {
     fn a_known_interface_name_yields_its_index() {
         let sys = FakeSys::with_index(Some(7));
 
-        assert_eq!(if_nametoindex_with(&sys, "eth0"), Ok(7));
+        assert_eq!(if_nametoindex_with(&sys, b"eth0"), Ok(7));
     }
 
     /// The name reaches the seam NUL-terminated and otherwise unaltered.
     #[test]
     fn the_name_reaches_the_seam_nul_terminated() {
         let sys = FakeSys::with_index(Some(1));
-        let _ = if_nametoindex_with(&sys, "eth0");
+        let _ = if_nametoindex_with(&sys, b"eth0");
 
         assert_eq!(
             sys.observed_name.borrow().as_deref(),
@@ -2156,7 +3967,7 @@ mod tests {
         let sys = FakeSys::with_index(Some(1));
 
         assert_eq!(
-            if_nametoindex_with(&sys, "eth\0 0"),
+            if_nametoindex_with(&sys, b"eth\0 0"),
             Err(CURLcode::BadFunctionArgument)
         );
         assert!(
@@ -2170,7 +3981,7 @@ mod tests {
         let sys = FakeSys::with_index(None);
 
         assert_eq!(
-            if_nametoindex_with(&sys, ""),
+            if_nametoindex_with(&sys, b""),
             Err(CURLcode::InterfaceFailed)
         );
     }
@@ -2181,9 +3992,9 @@ mod tests {
     #[cfg_attr(miri, ignore = "if_nametoindex(3) is a foreign function")]
     fn the_real_loopback_interface_has_a_non_zero_index() {
         #[cfg(target_os = "linux")]
-        let loopback = "lo";
+        let loopback = b"lo".as_slice();
         #[cfg(target_os = "macos")]
-        let loopback = "lo0";
+        let loopback = b"lo0".as_slice();
 
         let index = if_nametoindex(loopback).expect("loopback always exists");
 
@@ -2194,8 +4005,1670 @@ mod tests {
     #[cfg_attr(miri, ignore = "if_nametoindex(3) is a foreign function")]
     fn a_real_unknown_interface_name_fails() {
         assert_eq!(
-            if_nametoindex("curl-rs-no-such-if"),
+            if_nametoindex(b"curl-rs-no-such-if"),
             Err(CURLcode::InterfaceFailed)
+        );
+    }
+
+    // -- Extended attributes ------------------------------------------------
+
+    /// Every target in the mandated matrix provides `fsetxattr(2)`, so the
+    /// `xattr: ` row of `src/curlinfo.c:176-181` reports `ON` on all four.
+    #[test]
+    fn the_xattr_primitive_is_available_on_every_supported_target() {
+        assert!(xattr_available());
+    }
+
+    /// Not a tautology: the assertion is that the answer is *derived* from the
+    /// operating system rather than asserted, which is precisely what
+    /// `src/tool_xattr.h:28-36` derives it from. A target outside the matrix
+    /// would report `OFF` rather than claim a primitive it does not have.
+    #[test]
+    fn the_xattr_predicate_tracks_the_operating_system() {
+        assert_eq!(
+            xattr_available(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+    }
+
+    /// The name reaches the seam NUL-terminated and the value reaches it
+    /// verbatim, with its own length rather than a terminator.
+    #[test]
+    fn the_name_is_terminated_and_the_value_is_passed_through() {
+        let sys = FakeSys::new();
+        // Any live descriptor; the fake never touches it. Standard input is
+        // guaranteed open for the duration of a test process.
+        let fd = std::io::stdin();
+
+        assert!(set_fd_xattr_with(&sys, fd.as_fd(), "user.creator", b"curl")
+            .is_ok());
+
+        let (name, value) = sys
+            .observed_xattr
+            .borrow_mut()
+            .take()
+            .expect("seam was called");
+        assert_eq!(name, b"user.creator\0");
+        assert_eq!(value, b"curl");
+    }
+
+    /// A value with an interior NUL and no terminator is legitimate: the length
+    /// is passed explicitly, so `value` is bytes, not a C string. Only `name` is
+    /// constrained.
+    #[test]
+    fn a_value_may_contain_an_interior_nul() {
+        let sys = FakeSys::new();
+        let fd = std::io::stdin();
+
+        assert!(set_fd_xattr_with(
+            &sys,
+            fd.as_fd(),
+            "user.xdg.origin.url",
+            b"a\0b"
+        )
+        .is_ok());
+
+        let (_, value) = sys
+            .observed_xattr
+            .borrow_mut()
+            .take()
+            .expect("seam was called");
+        assert_eq!(value, b"a\0b");
+    }
+
+    /// An empty value is written as an empty attribute rather than skipped. C's
+    /// `if(value)` guard at `src/tool_xattr.c:82` tests the *pointer*, not the
+    /// length, and it lives in the tool beside the table it protects.
+    #[test]
+    fn an_empty_value_still_reaches_the_seam() {
+        let sys = FakeSys::new();
+        let fd = std::io::stdin();
+
+        assert!(
+            set_fd_xattr_with(&sys, fd.as_fd(), "user.creator", b"").is_ok()
+        );
+
+        let (_, value) = sys
+            .observed_xattr
+            .borrow_mut()
+            .take()
+            .expect("seam was called");
+        assert!(value.is_empty());
+    }
+
+    /// An interior NUL in the *name* cannot be a C string, and is reported
+    /// rather than panicked on -- and the seam is never reached.
+    #[test]
+    fn an_interior_nul_in_the_name_is_rejected_before_the_call() {
+        let sys = FakeSys::new();
+        let fd = std::io::stdin();
+
+        let error = set_fd_xattr_with(&sys, fd.as_fd(), "user.a\0b", b"v")
+            .expect_err("an interior NUL cannot reach a C string");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            sys.observed_xattr.borrow().is_none(),
+            "the seam must not be reached once the name is rejected"
+        );
+    }
+
+    /// The operating system's errno is carried out unchanged, because
+    /// `src/tool_operate.c:637-638` renders it through `curlx_strerror`.
+    #[test]
+    fn the_errno_survives_the_wrapper() {
+        let sys = FakeSys::failing_xattr(libc::ENOTSUP);
+        let fd = std::io::stdin();
+
+        let error =
+            set_fd_xattr_with(&sys, fd.as_fd(), "user.creator", b"curl")
+                .expect_err("the fake reports a failure");
+
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTSUP));
+    }
+
+    // Terminal attributes -- the EchoGuard contract
+
+    /// A `termios` whose every field is zero.
+    ///
+    /// The "attributes were captured" state cannot be reached without a real
+    /// terminal, and `libc::termios` has no `Default`, so [`FakeTerminal`]
+    /// fabricates one. It never reaches the operating system: only the fake
+    /// ever holds it, and the only property any test reads back out of it is
+    /// whether [`SavedTerminal::is_restorable`] reports it.
+    fn zeroed_termios() -> libc::termios {
+        // SAFETY: `libc::termios` is a `#[repr(C)]` aggregate of integer
+        // scalars and arrays of integer scalars on both mandated operating
+        // systems -- no reference, no enum, no niche -- and every bit pattern
+        // of such a type is a valid value, the all-zero one included.
+        // `MaybeUninit::zeroed` writes exactly that pattern over storage of
+        // exactly that size, so the value is fully initialised.
+        unsafe { MaybeUninit::<libc::termios>::zeroed().assume_init() }
+    }
+
+    /// A pure-Rust [`TerminalCalls`] that counts what it was asked to do.
+    ///
+    /// `tcgetattr`, `tcsetattr` and `ioctl` are foreign functions that need a
+    /// real terminal, so the guard's whole contract -- disable once, restore
+    /// exactly once, restore on drop, restore on unwind -- is asserted through
+    /// this instead and is therefore covered under Miri.
+    struct FakeTerminal {
+        /// Whether `echo_disable` reports having captured attributes.
+        captures: bool,
+        /// The width `window_columns` reports, if any.
+        columns: Option<u32>,
+        /// How many times `echo_disable` was called.
+        disable_calls: Cell<usize>,
+        /// How many times `echo_restore` was called.
+        restore_calls: Cell<usize>,
+        /// Whether the last restore was handed restorable attributes.
+        restored_restorable: Cell<Option<bool>>,
+    }
+
+    impl FakeTerminal {
+        fn new(captures: bool) -> Self {
+            Self {
+                captures,
+                columns: None,
+                disable_calls: Cell::new(0),
+                restore_calls: Cell::new(0),
+                restored_restorable: Cell::new(None),
+            }
+        }
+
+        fn with_columns(columns: Option<u32>) -> Self {
+            Self {
+                columns,
+                ..Self::new(true)
+            }
+        }
+    }
+
+    impl TerminalCalls for FakeTerminal {
+        fn echo_disable(&self, _fd: BorrowedFd<'_>) -> SavedTerminal {
+            self.disable_calls.set(self.disable_calls.get() + 1);
+
+            if self.captures {
+                SavedTerminal {
+                    attrs: Some(zeroed_termios()),
+                }
+            } else {
+                SavedTerminal::unavailable()
+            }
+        }
+
+        fn echo_restore(&self, _fd: BorrowedFd<'_>, saved: &SavedTerminal) {
+            self.restore_calls.set(self.restore_calls.get() + 1);
+            self.restored_restorable.set(Some(saved.is_restorable()));
+        }
+
+        fn window_columns(&self, _fd: BorrowedFd<'_>) -> Option<u32> {
+            self.columns
+        }
+    }
+
+    /// The state a failed `tcgetattr` leaves. `RealSys::echo_restore` keys its
+    /// skip off exactly this predicate, which is why the predicate is asserted
+    /// rather than only the skip it drives.
+    #[test]
+    fn an_unavailable_saved_terminal_is_not_restorable() {
+        assert!(!SavedTerminal::unavailable().is_restorable());
+    }
+
+    #[test]
+    fn a_captured_saved_terminal_is_restorable() {
+        let saved = SavedTerminal {
+            attrs: Some(zeroed_termios()),
+        };
+
+        assert!(saved.is_restorable());
+    }
+
+    /// `src/tool_getpass.c:148` returns `TRUE` unconditionally once it has
+    /// taken the termios branch, having discarded both return values, so the
+    /// guard must report echo as disabled even when nothing could be captured
+    /// -- otherwise the extra newline at `:185` would go missing under the
+    /// redirected standard input `tests/runtests.pl` uses.
+    #[test]
+    fn echo_is_reported_disabled_even_when_nothing_was_captured() {
+        let stdin = io::stdin();
+        let fake = FakeTerminal::new(false);
+
+        let guard = disable_echo_with(&fake, stdin.as_fd());
+
+        assert!(guard.echo_disabled());
+    }
+
+    #[test]
+    fn echo_is_reported_disabled_when_attributes_were_captured() {
+        let stdin = io::stdin();
+        let fake = FakeTerminal::new(true);
+
+        let guard = disable_echo_with(&fake, stdin.as_fd());
+
+        assert!(guard.echo_disabled());
+    }
+
+    #[test]
+    fn creating_the_guard_disables_echo_once_and_restores_nothing() {
+        let stdin = io::stdin();
+        let fake = FakeTerminal::new(true);
+
+        let guard = disable_echo_with(&fake, stdin.as_fd());
+
+        assert_eq!(fake.disable_calls.get(), 1);
+        assert_eq!(
+            fake.restore_calls.get(),
+            0,
+            "nothing may be restored while the guard is alive"
+        );
+        drop(guard);
+    }
+
+    /// [`EchoGuard::restore`] exists so the caller can order the newline
+    /// before the restoration, as `src/tool_getpass.c:185-186` does. It must
+    /// restore, and the `Drop` that immediately follows it must not restore a
+    /// second time -- a second `tcsetattr(TCSAFLUSH)` would discard a second
+    /// helping of pending input.
+    #[test]
+    fn restore_puts_the_attributes_back_exactly_once() {
+        let stdin = io::stdin();
+        let fake = FakeTerminal::new(true);
+
+        let guard = disable_echo_with(&fake, stdin.as_fd());
+        guard.restore();
+
+        assert_eq!(fake.restore_calls.get(), 1);
+    }
+
+    #[test]
+    fn dropping_the_guard_restores_when_restore_was_not_called() {
+        let stdin = io::stdin();
+        let fake = FakeTerminal::new(true);
+
+        {
+            let _guard = disable_echo_with(&fake, stdin.as_fd());
+            assert_eq!(fake.restore_calls.get(), 0);
+        }
+
+        assert_eq!(fake.restore_calls.get(), 1);
+    }
+
+    /// The property the C cannot claim: a non-local jump between its two
+    /// `ttyecho` calls leaves the terminal with echo off for the rest of the
+    /// session.
+    #[test]
+    fn an_unwind_through_the_guard_still_restores() {
+        let stdin = io::stdin();
+        let fake = FakeTerminal::new(true);
+
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = disable_echo_with(&fake, stdin.as_fd());
+            panic!("the password prompt failed");
+        }));
+
+        assert!(outcome.is_err());
+        assert_eq!(
+            fake.restore_calls.get(),
+            1,
+            "an unwind must not leave echo disabled"
+        );
+    }
+
+    /// What was captured is what is put back, in both polarities -- including
+    /// the "nothing was captured" one, which is the only case
+    /// `RealSys::echo_restore` skips.
+    #[test]
+    fn the_guard_hands_back_exactly_what_it_captured() {
+        let stdin = io::stdin();
+
+        let captured = FakeTerminal::new(true);
+        disable_echo_with(&captured, stdin.as_fd()).restore();
+        assert_eq!(captured.restored_restorable.get(), Some(true));
+
+        let uncaptured = FakeTerminal::new(false);
+        disable_echo_with(&uncaptured, stdin.as_fd()).restore();
+        assert_eq!(uncaptured.restored_restorable.get(), Some(false));
+    }
+
+    // -- terminal width -----------------------------------------------------
+
+    #[test]
+    fn a_reported_window_width_is_returned_unchanged() {
+        let fake = FakeTerminal::with_columns(Some(132));
+
+        assert_eq!(terminal_columns_with(&fake), Some(132));
+    }
+
+    /// The `cols < 10000` test at `src/terminal.c:80` sits outside the `ioctl`
+    /// in C and belongs to the caller, so an implausible width must arrive
+    /// intact rather than being filtered by this layer.
+    #[test]
+    fn an_implausible_window_width_is_not_filtered_here() {
+        let fake = FakeTerminal::with_columns(Some(65535));
+
+        assert_eq!(terminal_columns_with(&fake), Some(65535));
+    }
+
+    /// A failed `ioctl` is C's `cols` staying `0`, which `src/terminal.c:80`
+    /// then rejects in favour of the `79` fallback.
+    #[test]
+    fn an_unavailable_window_width_is_none() {
+        let fake = FakeTerminal::with_columns(None);
+
+        assert_eq!(terminal_columns_with(&fake), None);
+    }
+
+    /// A zero width is reported as `Some(0)` rather than hidden: the `ioctl`
+    /// succeeded, and discarding the value is `src/terminal.c:80`'s decision.
+    #[test]
+    fn a_zero_window_width_is_reported_rather_than_hidden() {
+        let fake = FakeTerminal::with_columns(Some(0));
+
+        assert_eq!(terminal_columns_with(&fake), Some(0));
+    }
+
+    /// The real `ioctl`, whose answer depends on how the test binary was
+    /// invoked. Determinism is the property worth asserting: `src/terminal.c`
+    /// reads the width once per run and two reads must not disagree.
+    #[test]
+    #[cfg_attr(miri, ignore = "ioctl(2) is a foreign function")]
+    fn the_real_terminal_width_is_deterministic() {
+        assert_eq!(terminal_columns(), terminal_columns());
+    }
+
+    /// The real `tcgetattr`/`tcsetattr` pair against whatever standard input
+    /// is. Under `cargo test` it is usually not a terminal, which is the
+    /// failure path [`SavedTerminal::unavailable`] exists for; either way the
+    /// guard must report echo disabled and must restore without panicking.
+    #[test]
+    #[cfg_attr(miri, ignore = "tcgetattr(3) is a foreign function")]
+    fn the_real_echo_guard_completes_on_any_descriptor() {
+        let stdin = io::stdin();
+
+        let guard = disable_echo(stdin.as_fd());
+
+        assert!(guard.echo_disabled());
+        guard.restore();
+    }
+
+    // Extended attributes
+
+    /// A pure-Rust [`XattrCalls`] that records what it was handed.
+    ///
+    /// `fsetxattr` needs a file on a filesystem that supports extended
+    /// attributes, which no test can assume, so the wrapper's two decisions --
+    /// the `strlen` measurement of the value and the rejection of a name that
+    /// cannot be a C string -- are asserted through this instead.
+    struct FakeXattr {
+        /// What the seam reports: success, or the `errno` it fails with.
+        outcome: Result<(), i32>,
+        /// The name bytes, including the terminator, that the seam received.
+        observed_name: RefCell<Option<Vec<u8>>>,
+        /// The value bytes the seam received.
+        observed_value: RefCell<Option<Vec<u8>>>,
+        /// How many times the seam was called.
+        calls: Cell<usize>,
+    }
+
+    impl FakeXattr {
+        fn succeeding() -> Self {
+            Self {
+                outcome: Ok(()),
+                observed_name: RefCell::new(None),
+                observed_value: RefCell::new(None),
+                calls: Cell::new(0),
+            }
+        }
+
+        fn failing(errno: i32) -> Self {
+            Self {
+                outcome: Err(errno),
+                ..Self::succeeding()
+            }
+        }
+    }
+
+    impl XattrCalls for FakeXattr {
+        fn fsetxattr(
+            &self,
+            _fd: BorrowedFd<'_>,
+            name: &CStr,
+            value: &[u8],
+        ) -> io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            *self.observed_name.borrow_mut() =
+                Some(name.to_bytes_with_nul().to_vec());
+            *self.observed_value.borrow_mut() = Some(value.to_vec());
+
+            match self.outcome {
+                Ok(()) => Ok(()),
+                Err(errno) => Err(io::Error::from_raw_os_error(errno)),
+            }
+        }
+    }
+
+    /// The four names `src/tool_xattr.c:60-71` maps must reach the platform as
+    /// C strings, terminator included.
+    #[test]
+    fn an_xattr_name_reaches_the_seam_nul_terminated() {
+        let stdin = io::stdin();
+        let fake = FakeXattr::succeeding();
+
+        set_file_xattr_with(
+            &fake,
+            stdin.as_fd(),
+            b"user.xdg.origin.url",
+            b"https://example.com/",
+        )
+        .expect("the seam succeeds");
+
+        assert_eq!(
+            fake.observed_name.borrow().as_deref(),
+            Some(&b"user.xdg.origin.url\0"[..])
+        );
+        assert_eq!(
+            fake.observed_value.borrow().as_deref(),
+            Some(&b"https://example.com/"[..])
+        );
+    }
+
+    /// `src/tool_xattr.c:89` passes `strlen(value)`, so an interior NUL ends
+    /// the value and everything after it is never written.
+    #[test]
+    fn an_xattr_value_is_measured_with_strlen() {
+        let stdin = io::stdin();
+        let fake = FakeXattr::succeeding();
+
+        set_file_xattr_with(
+            &fake,
+            stdin.as_fd(),
+            b"user.mime_type",
+            b"text/html\0discarded",
+        )
+        .expect("the seam succeeds");
+
+        assert_eq!(
+            fake.observed_value.borrow().as_deref(),
+            Some(&b"text/html"[..])
+        );
+    }
+
+    /// `strlen` of a value that begins with NUL is zero, so the attribute is
+    /// set to an empty value rather than skipped.
+    #[test]
+    fn a_value_that_begins_with_nul_is_measured_as_empty() {
+        let stdin = io::stdin();
+        let fake = FakeXattr::succeeding();
+
+        set_file_xattr_with(&fake, stdin.as_fd(), b"user.creator", b"\0curl")
+            .expect("the seam succeeds");
+
+        assert_eq!(fake.observed_value.borrow().as_deref(), Some(&b""[..]));
+        assert_eq!(fake.calls.get(), 1, "an empty value still gets written");
+    }
+
+    /// An empty slice must reach the seam as a zero-length read, not as a
+    /// reason to skip the call. `value.as_ptr()` on an empty slice is
+    /// dangling-but-aligned and the length of `0` means no byte is read, which
+    /// is the SAFETY argument `RealSys::fsetxattr` relies on.
+    #[test]
+    fn an_empty_xattr_value_reaches_the_seam_as_a_zero_length_slice() {
+        let stdin = io::stdin();
+        let fake = FakeXattr::succeeding();
+
+        set_file_xattr_with(&fake, stdin.as_fd(), b"user.creator", b"")
+            .expect("the seam succeeds");
+
+        assert_eq!(fake.observed_value.borrow().as_deref(), Some(&b""[..]));
+        assert_eq!(fake.calls.get(), 1);
+    }
+
+    /// A name with an interior NUL cannot be a C string. `EINVAL`, and the
+    /// seam is never reached -- the same shape as the zone-identifier
+    /// rejection above.
+    #[test]
+    fn an_interior_nul_in_an_xattr_name_is_einval_without_a_call() {
+        let stdin = io::stdin();
+        let fake = FakeXattr::succeeding();
+
+        let error =
+            set_file_xattr_with(&fake, stdin.as_fd(), b"user.\0creator", b"x")
+                .expect_err("a name with an interior NUL cannot be passed");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(
+            fake.calls.get(),
+            0,
+            "the seam must not be called with a rejected name"
+        );
+    }
+
+    /// The number `src/tool_operate.c:637-639` renders with
+    /// `curlx_strerror(errno, ...)` must survive the trip back, because Rust
+    /// has no thread-global `errno` for the caller to consult afterwards.
+    #[test]
+    fn the_platform_errno_survives_inside_the_error() {
+        let stdin = io::stdin();
+        let fake = FakeXattr::failing(libc::ENOTSUP);
+
+        let error = set_file_xattr_with(
+            &fake,
+            stdin.as_fd(),
+            b"user.mime_type",
+            b"text/plain",
+        )
+        .expect_err("the seam fails");
+
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTSUP));
+    }
+
+    /// The real syscall, end to end, on a real file: write an attribute and
+    /// read it back through the same platform pair the wrapper uses.
+    #[test]
+    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
+    fn the_real_syscall_writes_an_attribute_that_reads_back() {
+        use std::io::Write as _;
+
+        // `user.` is the only namespace an unprivileged process may write on
+        // Linux (`xattr(7)`); Darwin has no namespace requirement and accepts
+        // the same name, so one name serves both targets.
+        const NAME: &str = "user.curl_rs_probe";
+        const VALUE: &[u8] = b"curl";
+
+        // A real file in a real directory, removed at the end. `/tmp` on this
+        // host is a normal filesystem, and a filesystem without extended
+        // attribute support reports ENOTSUP, which the assertion below reads as
+        // a skip rather than a failure.
+        let path = std::env::temp_dir()
+            .join(format!("curl_rs_xattr_{}", std::process::id()));
+        let mut file = std::fs::File::create(&path).expect("temporary file");
+        file.write_all(b"body").expect("write");
+
+        let outcome = set_fd_xattr(file.as_fd(), NAME, VALUE);
+
+        match outcome {
+            Ok(()) => {
+                // Read it back with the matching platform getter so the proof
+                // does not depend on an external tool being installed.
+                let cname =
+                    CString::new(NAME).expect("the name has no interior NUL");
+                let mut buf = [0u8; 32];
+
+                // SAFETY: both `fgetxattr` prototypes read `name` as a
+                // NUL-terminated C string and write at most `size` bytes into
+                // `value`; `cname` is live and terminated, and `buf` is a live,
+                // uniquely borrowed array of exactly `buf.len()` bytes, so the
+                // write cannot overrun. `file` is open for the whole call, so
+                // the descriptor is valid. The trailing zeros are Darwin's
+                // `position` and `options`, matching the write above.
+                let read = unsafe {
+                    #[cfg(target_os = "linux")]
+                    let n = libc::fgetxattr(
+                        file.as_raw_fd(),
+                        cname.as_ptr(),
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                    );
+                    #[cfg(target_os = "macos")]
+                    let n = libc::fgetxattr(
+                        file.as_raw_fd(),
+                        cname.as_ptr(),
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                        0,
+                        0,
+                    );
+                    n
+                };
+
+                assert!(
+                    read >= 0,
+                    "the attribute just written must be readable"
+                );
+                let read =
+                    usize::try_from(read).expect("a non-negative length");
+                assert_eq!(&buf[..read], VALUE);
+            }
+            Err(error) => {
+                // A filesystem that does not support extended attributes is a
+                // property of the host, not a defect in the wrapper. Any other
+                // errno is a real failure and is reported as one.
+                let errno = error.raw_os_error();
+                assert!(
+                    errno == Some(libc::ENOTSUP)
+                        || errno == Some(libc::EOPNOTSUPP)
+                        || errno == Some(libc::EPERM),
+                    "unexpected errno from fsetxattr: {error}"
+                );
+            }
+        }
+
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A different `errno` must not be flattened into the same value.
+    #[test]
+    fn distinct_platform_errnos_stay_distinct() {
+        let stdin = io::stdin();
+        let denied = FakeXattr::failing(libc::EACCES);
+        let missing = FakeXattr::failing(libc::ENOENT);
+
+        let first =
+            set_file_xattr_with(&denied, stdin.as_fd(), b"user.creator", b"c")
+                .expect_err("the seam fails");
+        let second =
+            set_file_xattr_with(&missing, stdin.as_fd(), b"user.creator", b"c")
+                .expect_err("the seam fails");
+
+        assert_ne!(first.raw_os_error(), second.raw_os_error());
+    }
+
+    // Broken-down time and the locale
+
+    /// A pure-Rust [`TimeCalls`] with scripted answers.
+    ///
+    /// `localtime_r`, `strftime` and `setlocale` all read process-wide state
+    /// that a test must not depend on -- the time zone database and the
+    /// current locale -- so the narrowing, the interior-NUL rejection and the
+    /// empty-buffer rejection are driven from here.
+    struct FakeTime {
+        /// The offset `utc_offset_secs` reports, if any.
+        offset: Option<i64>,
+        /// The bytes `strftime` produces, or [`None`] for "produced nothing".
+        rendered: Option<Vec<u8>>,
+        /// What `set_locale_from_environment` reports.
+        locale: bool,
+        /// The format bytes, terminator included, that the seam received.
+        observed_format: RefCell<Option<Vec<u8>>>,
+        /// The epoch the seam received.
+        observed_epoch: Cell<Option<i64>>,
+        /// How many times `strftime_gmt` was called.
+        strftime_calls: Cell<usize>,
+    }
+
+    impl FakeTime {
+        fn new() -> Self {
+            Self {
+                offset: None,
+                rendered: None,
+                locale: true,
+                observed_format: RefCell::new(None),
+                observed_epoch: Cell::new(None),
+                strftime_calls: Cell::new(0),
+            }
+        }
+
+        fn with_offset(offset: Option<i64>) -> Self {
+            Self {
+                offset,
+                ..Self::new()
+            }
+        }
+
+        fn rendering(bytes: &[u8]) -> Self {
+            Self {
+                rendered: Some(bytes.to_vec()),
+                ..Self::new()
+            }
+        }
+
+        fn rendering_nothing() -> Self {
+            Self::new()
+        }
+
+        fn with_locale(locale: bool) -> Self {
+            Self {
+                locale,
+                ..Self::new()
+            }
+        }
+    }
+
+    impl TimeCalls for FakeTime {
+        fn utc_offset_secs(&self, _epoch: i64) -> Option<i64> {
+            self.offset
+        }
+
+        fn strftime_gmt(
+            &self,
+            format: &CStr,
+            epoch: i64,
+            out: &mut [u8],
+        ) -> Option<usize> {
+            self.strftime_calls.set(self.strftime_calls.get() + 1);
+            *self.observed_format.borrow_mut() =
+                Some(format.to_bytes_with_nul().to_vec());
+            self.observed_epoch.set(Some(epoch));
+
+            let rendered = self.rendered.as_ref()?;
+
+            // `strftime` needs room for its terminator as well as the result,
+            // and returns `0` when the whole thing does not fit -- which
+            // `src/tool_writeout.c:588` reads as "write nothing".
+            if rendered.len() + 1 > out.len() {
+                return None;
+            }
+
+            out[..rendered.len()].copy_from_slice(rendered);
+            Some(rendered.len())
+        }
+
+        fn set_locale_from_environment(&self) -> bool {
+            self.locale
+        }
+    }
+
+    // -- the local UTC offset -----------------------------------------------
+
+    #[test]
+    fn a_local_offset_is_narrowed_to_i32() {
+        let fake = FakeTime::with_offset(Some(3600));
+
+        assert_eq!(local_utc_offset_secs_with(&fake, 0), Some(3600));
+    }
+
+    /// West of Greenwich the offset is negative, and the sign must survive the
+    /// narrowing -- a trace timestamp rendered with the wrong sign is off by
+    /// twice the offset.
+    #[test]
+    fn a_negative_local_offset_keeps_its_sign() {
+        let fake = FakeTime::with_offset(Some(-18000));
+
+        assert_eq!(local_utc_offset_secs_with(&fake, 0), Some(-18000));
+    }
+
+    /// `tm_gmtoff` is a `long`, which is 64 bits wide on every mandated
+    /// target, so a value no `i32` can hold is representable at the seam. The
+    /// narrowing is where it is rejected, rather than wrapping into a
+    /// plausible-looking wrong answer.
+    #[test]
+    fn an_offset_too_large_for_i32_is_rejected_rather_than_wrapped() {
+        let fake = FakeTime::with_offset(Some(i64::from(i32::MAX) + 1));
+
+        assert_eq!(local_utc_offset_secs_with(&fake, 0), None);
+    }
+
+    #[test]
+    fn an_offset_too_small_for_i32_is_rejected_rather_than_wrapped() {
+        let fake = FakeTime::with_offset(Some(i64::from(i32::MIN) - 1));
+
+        assert_eq!(local_utc_offset_secs_with(&fake, 0), None);
+    }
+
+    /// The extremes an `i32` can hold pass through, so the rejection above is
+    /// the range check it claims to be and not a narrower one.
+    #[test]
+    fn the_extremes_of_i32_pass_through_the_narrowing() {
+        let high = FakeTime::with_offset(Some(i64::from(i32::MAX)));
+        let low = FakeTime::with_offset(Some(i64::from(i32::MIN)));
+
+        assert_eq!(local_utc_offset_secs_with(&high, 0), Some(i32::MAX));
+        assert_eq!(local_utc_offset_secs_with(&low, 0), Some(i32::MIN));
+    }
+
+    #[test]
+    fn an_unavailable_local_offset_is_none() {
+        let fake = FakeTime::with_offset(None);
+
+        assert_eq!(local_utc_offset_secs_with(&fake, 0), None);
+    }
+
+    // -- strftime -----------------------------------------------------------
+
+    #[test]
+    fn strftime_writes_the_platform_result_and_reports_its_length() {
+        let fake = FakeTime::rendering(b"Thu");
+        let mut out = [0_u8; 16];
+
+        let written = strftime_gmt_with(&fake, b"%a", 0, &mut out);
+
+        assert_eq!(written, Some(3));
+        assert_eq!(&out[..3], b"Thu");
+    }
+
+    /// The format must arrive as a C string, because `strftime` reads it as
+    /// one.
+    #[test]
+    fn a_time_format_reaches_the_seam_nul_terminated() {
+        let fake = FakeTime::rendering(b"1970");
+        let mut out = [0_u8; 16];
+
+        strftime_gmt_with(&fake, b"%Y", 0, &mut out).expect("it fits");
+
+        assert_eq!(
+            fake.observed_format.borrow().as_deref(),
+            Some(&b"%Y\0"[..])
+        );
+    }
+
+    /// The epoch is passed through untouched, including a pre-epoch instant --
+    /// `curlx_gmtime` accepts a negative `time_t` and so must this.
+    #[test]
+    fn the_epoch_reaches_the_seam_unchanged() {
+        let fake = FakeTime::rendering(b"1969");
+        let mut out = [0_u8; 16];
+
+        strftime_gmt_with(&fake, b"%Y", -86_400, &mut out).expect("it fits");
+
+        assert_eq!(fake.observed_epoch.get(), Some(-86_400));
+    }
+
+    /// `src/tool_writeout.c:588` tests `strftime`'s return value and writes
+    /// nothing at all when it is `0`. The two outcomes -- produced nothing,
+    /// and did not fit -- collapse into [`None`] exactly as they do there.
+    #[test]
+    fn a_time_format_that_produces_nothing_is_none() {
+        let fake = FakeTime::rendering_nothing();
+        let mut out = [0_u8; 16];
+
+        assert_eq!(strftime_gmt_with(&fake, b"%%", 0, &mut out), None);
+    }
+
+    #[test]
+    fn a_result_that_does_not_fit_the_buffer_is_none() {
+        let fake = FakeTime::rendering(b"1970-01-01");
+        let mut out = [0_u8; 4];
+
+        assert_eq!(strftime_gmt_with(&fake, b"%F", 0, &mut out), None);
+    }
+
+    /// A `--write-out` format is user input, so an interior NUL must be an
+    /// error rather than a panic, and the seam must not be reached.
+    #[test]
+    fn an_interior_nul_in_a_time_format_is_rejected_without_a_call() {
+        let fake = FakeTime::rendering(b"1970");
+        let mut out = [0_u8; 16];
+
+        assert_eq!(strftime_gmt_with(&fake, b"%Y\0%m", 0, &mut out), None);
+        assert_eq!(
+            fake.strftime_calls.get(),
+            0,
+            "the seam must not be called with a rejected format"
+        );
+    }
+
+    /// An empty buffer has no valid `strftime` outcome, and it is rejected on
+    /// this side of the seam so the guarantee holds for every implementation
+    /// of [`TimeCalls`] rather than only for `RealSys`.
+    #[test]
+    fn an_empty_output_buffer_is_rejected_without_a_call() {
+        let fake = FakeTime::rendering(b"1970");
+        let mut out = [0_u8; 0];
+
+        assert_eq!(strftime_gmt_with(&fake, b"%Y", 0, &mut out), None);
+        assert_eq!(
+            fake.strftime_calls.get(),
+            0,
+            "the seam must not be handed a zero-length buffer"
+        );
+    }
+
+    /// A buffer of exactly the result plus its terminator is the boundary
+    /// case, and it must succeed.
+    #[test]
+    fn a_buffer_of_exactly_the_result_plus_terminator_succeeds() {
+        let fake = FakeTime::rendering(b"UTC");
+        let mut out = [0_u8; 4];
+
+        assert_eq!(strftime_gmt_with(&fake, b"%Z", 0, &mut out), Some(3));
+    }
+
+    // -- the locale ---------------------------------------------------------
+
+    /// Only the injected form is exercised. The real
+    /// [`set_locale_from_environment`] mutates process-wide state, and every
+    /// test in this crate shares one process, so calling it here would change
+    /// the locale under every other test -- which is precisely why the
+    /// function documents its owner as the command-line tool's start-up path.
+    #[test]
+    fn the_locale_result_is_reported_as_the_platform_gave_it() {
+        let accepted = FakeTime::with_locale(true);
+        let refused = FakeTime::with_locale(false);
+
+        assert!(set_locale_from_environment_with(&accepted));
+        assert!(!set_locale_from_environment_with(&refused));
+    }
+
+    // -- the real implementations -------------------------------------------
+
+    /// The buffer `src/tool_writeout.c:529` declares -- `char output[256]`.
+    /// Stated here rather than imported because the constant that mirrors it
+    /// belongs to the `--write-out` implementation in `curl-rs`, and this
+    /// module must not depend on the crate above it.
+    const C_TIME_BUFFER: usize = 256;
+
+    /// The real `localtime_r`. The container's zone is not known to the test,
+    /// so the assertion is the one that holds everywhere: an offset exists and
+    /// lies inside the range of real zones, which run from -12:00 to +14:00.
+    #[test]
+    #[cfg_attr(miri, ignore = "localtime_r(3) is a foreign function")]
+    fn the_real_local_offset_is_within_the_range_of_real_zones() {
+        let offset =
+            local_utc_offset_secs(0).expect("a zone is always available");
+
+        assert!(
+            (-12 * 3600..=14 * 3600).contains(&offset),
+            "{offset} is outside every real UTC offset"
+        );
+    }
+
+    /// The real `gmtime_r` plus `strftime` over a format whose every
+    /// conversion is numeric and therefore locale-independent, so the expected
+    /// bytes hold in any locale the process might be in.
+    #[test]
+    #[cfg_attr(miri, ignore = "strftime(3) is a foreign function")]
+    fn the_real_strftime_formats_the_epoch_in_utc() {
+        let mut out = [0_u8; C_TIME_BUFFER];
+
+        let written = strftime_gmt(b"%Y-%m-%dT%H:%M:%S", 0, &mut out)
+            .expect("the format fits");
+
+        assert_eq!(&out[..written], b"1970-01-01T00:00:00");
+    }
+
+    /// A second instant, so the previous test is exercising the conversion
+    /// rather than a constant. 2001-09-09T01:46:40Z.
+    #[test]
+    #[cfg_attr(miri, ignore = "strftime(3) is a foreign function")]
+    fn the_real_strftime_converts_a_later_instant() {
+        let mut out = [0_u8; C_TIME_BUFFER];
+
+        let written =
+            strftime_gmt(b"%Y-%m-%dT%H:%M:%S", 1_000_000_000, &mut out)
+                .expect("the format fits");
+
+        assert_eq!(&out[..written], b"2001-09-09T01:46:40");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "strftime(3) is a foreign function")]
+    fn the_real_strftime_reports_nothing_when_the_buffer_is_too_small() {
+        let mut out = [0_u8; 4];
+
+        assert_eq!(strftime_gmt(b"%Y-%m-%d", 0, &mut out), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "strftime(3) is a foreign function")]
+    fn the_real_strftime_rejects_an_empty_buffer() {
+        let mut out = [0_u8; 0];
+
+        assert_eq!(strftime_gmt(b"%Y", 0, &mut out), None);
+    }
+
+    // Terminal echo suppression
+
+    // The real `termios` path, against a pseudo-terminal.
+    //
+    // Everything above drives the injected [`SysCalls`], which proves the
+    // guard's *sequencing* -- restore exactly once, on every path including an
+    // unwind -- and nothing about whether `<RealSys as SysCalls>::echo_disable`
+    // actually clears `ECHO`. That is the half a fake cannot reach, and it is
+    // the half a password depends on, so it is measured here against a real
+    // terminal.
+    //
+    // A plain `File::open("/dev/ptmx")` allocates a pseudo-terminal pair and
+    // hands back the master, which `isatty` accepts and which `tcgetattr` and
+    // `tcsetattr` both serve -- verified on this platform before the test was
+    // written. No `unsafe` is needed to obtain it; the only `unsafe` is the
+    // observation below, which reads the attributes back.
+
+    /// Reads `ECHO` back from `fd`, for use as an independent observation.
+    ///
+    /// Deliberately does not go through [`SysCalls`]: a test that observed
+    /// through the same code path it is testing could not detect that path
+    /// doing nothing at all.
+    #[cfg(test)]
+    fn echo_bit_of(fd: RawFd) -> Option<bool> {
+        // SAFETY: `core::mem::zeroed::<libc::termios>()` is sound for the reason
+        // given at `<RealSys as SysCalls>::echo_disable` -- the type is a plain
+        // aggregate of integers and integer arrays on both mandated platforms,
+        // with no member for which an all-zero bit pattern would be invalid.
+        let mut attrs: libc::termios = unsafe { core::mem::zeroed() };
+
+        // SAFETY: `tcgetattr` writes one `struct termios` through its second
+        // argument and reads nothing else. The pointer is derived from a live,
+        // properly aligned local that outlives the call, and the borrow ends
+        // when the call returns. A non-terminal `fd` is reported through the
+        // return value.
+        let read = unsafe { libc::tcgetattr(fd, &mut attrs) };
+        if read != 0 {
+            return None;
+        }
+        Some((attrs.c_lflag & libc::ECHO) != 0)
+    }
+
+    /// Opens a pseudo-terminal master, or `None` where the platform has none.
+    #[cfg(test)]
+    fn open_pty_master() -> Option<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/ptmx")
+            .ok()
+    }
+
+    /// The guard really clears `ECHO`, and really puts it back.
+    ///
+    /// This is the assertion the whole echo-suppression path exists to
+    /// support: while the guard is held a typed password is not displayed, and
+    /// once the guard is gone the user's terminal is as it was found. Both
+    /// halves are read back with [`echo_bit_of`], which does not go through the
+    /// code under test -- the injected [`FakeTerminal`] records what
+    /// `echo_disable` *asked* for, which cannot tell a wrapper that issues
+    /// `tcsetattr` apart from one that quietly does not.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "tcgetattr(3) and tcsetattr(3) are foreign functions"
+    )]
+    fn a_real_terminal_has_echo_cleared_and_then_restored() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        let master = match open_pty_master() {
+            Some(file) => file,
+            // Not a skip that can hide a defect: the assertions below are
+            // about a pseudo-terminal, and without one there is nothing to
+            // assert. Every other property of the guard is covered through the
+            // fake.
+            None => return,
+        };
+        let fd = master.as_raw_fd();
+
+        assert_eq!(
+            echo_bit_of(fd),
+            Some(true),
+            "a fresh pseudo-terminal starts with ECHO set"
+        );
+
+        let guard = disable_echo(master.as_fd());
+        assert!(
+            guard.echo_disabled(),
+            "the guard reports echo disabled unconditionally, as C does"
+        );
+        assert_eq!(
+            echo_bit_of(fd),
+            Some(false),
+            "ECHO must be cleared while the guard is held"
+        );
+
+        drop(guard);
+        assert_eq!(
+            echo_bit_of(fd),
+            Some(true),
+            "the restore must put back the attributes tcgetattr reported"
+        );
+    }
+
+    /// A terminal that already had `ECHO` off is left off, not turned on.
+    ///
+    /// The restore reapplies the whole captured `struct termios`, exactly as
+    /// `ttyecho(TRUE, fd)` reapplies its `withecho` static
+    /// (`src/tool_getpass.c:154-155`), so a terminal the user had configured
+    /// with echo off has to come back that way. The inner guard below captures
+    /// while the outer one holds the bit clear, which is the only way to reach
+    /// that state without configuring the terminal by hand.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "tcgetattr(3) and tcsetattr(3) are foreign functions"
+    )]
+    fn a_terminal_that_already_had_echo_off_stays_off() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        let master = match open_pty_master() {
+            Some(file) => file,
+            None => return,
+        };
+        let fd = master.as_raw_fd();
+
+        let outer = disable_echo(master.as_fd());
+        assert_eq!(
+            echo_bit_of(fd),
+            Some(false),
+            "the outer guard clears the bit the inner one then captures"
+        );
+
+        let inner = disable_echo(master.as_fd());
+        drop(inner);
+        assert_eq!(
+            echo_bit_of(fd),
+            Some(false),
+            "the inner restore must not switch ECHO back on"
+        );
+
+        drop(outer);
+        assert_eq!(
+            echo_bit_of(fd),
+            Some(true),
+            "the outer restore returns the terminal to how it was found"
+        );
+    }
+
+    /// Reads one extended attribute back, for use as an independent observation.
+    ///
+    /// The counterpart of [`echo_bit_of`] for `fsetxattr`, and it exists for the
+    /// same reason: the injected fake records what `set_xattr` *asked* for, which
+    /// cannot distinguish a wrapper that issues the syscall from one that quietly
+    /// does not. `fgetxattr` is not part of [`SysCalls`] and is not used in
+    /// production; it is only ever an observer.
+    ///
+    /// [`None`] when the attribute is absent or the platform refuses the read,
+    /// which the caller must not confuse with an empty value -- hence the
+    /// `Option<Vec<u8>>` rather than a bare `Vec<u8>`.
+    #[cfg(test)]
+    fn xattr_value_of(fd: RawFd, name: &CStr) -> Option<Vec<u8>> {
+        // Sized generously: every name this crate writes carries a URL or a MIME
+        // type, and the assertions below use short literals.
+        let mut buffer = vec![0u8; 4096];
+        let capacity = buffer.len();
+        let ptr = buffer.as_mut_ptr().cast::<libc::c_void>();
+        // Bound separately so that each call below fits one line and its
+        // `// SAFETY:` comment stays adjacent to the `unsafe` it justifies.
+        let key = name.as_ptr();
+
+        #[cfg(target_os = "macos")]
+        // SAFETY: `fgetxattr` writes at most `capacity` bytes through `ptr` and
+        // reads the NUL-terminated name through `key`, writing nothing through
+        // it. `ptr` is derived from a live `Vec` of exactly `capacity` bytes
+        // that outlives the call, `key` is NUL-terminated by `CStr`'s invariant,
+        // and both borrows end when the call returns. The two trailing
+        // arguments are Darwin's `position` and `options`, both zero, matching
+        // the write at `<RealSys as SysCalls>::fsetxattr`.
+        let read = unsafe { libc::fgetxattr(fd, key, ptr, capacity, 0, 0) };
+
+        #[cfg(target_os = "linux")]
+        // SAFETY: as for the Darwin arm above; the Linux form takes no
+        // `position` or `options`.
+        let read = unsafe { libc::fgetxattr(fd, key, ptr, capacity) };
+
+        if read < 0 {
+            return None;
+        }
+        // `read` is non-negative and cannot exceed `capacity`, which the call
+        // enforces by returning ERANGE instead of overrunning.
+        let len = read as usize;
+        buffer.truncate(len);
+        Some(buffer)
+    }
+
+    /// A descriptor that cannot carry a `user.*` extended attribute.
+    ///
+    /// Linux permits those names on regular files and directories only, so a
+    /// socket is refused deterministically rather than by accident of the host's
+    /// filesystem. Used to prove the refusal is reported rather than swallowed.
+    #[cfg(test)]
+    fn open_non_file() -> Option<std::os::unix::net::UnixStream> {
+        std::os::unix::net::UnixStream::pair().ok().map(|(a, _b)| a)
+    }
+
+    // The extended-attribute wrapper, measured against a real file system
+    //
+    // The same division as the terminal tests above: the injected fake records
+    // the name and value `set_xattr` *asked* for, which cannot tell a wrapper
+    // that issues the syscall apart from one that quietly does not. These read
+    // the attribute back with `fgetxattr`, which is not part of `SysCalls`.
+
+    /// The bytes handed in are the bytes the file system holds afterwards.
+    #[test]
+    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
+    fn a_written_attribute_is_readable_back_byte_for_byte() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        let file = match tempfile::NamedTempFile::new() {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let fd = file.as_file().as_raw_fd();
+        // Not valid UTF-8: the value is a server-supplied header, so it is
+        // carried rather than interpreted. It holds no interior zero, which is
+        // the case C's `strlen` argument leaves whole; the other case is the
+        // test immediately below.
+        let value: &[u8] = &[0xff, b'a', 0xfe];
+
+        let written = set_file_xattr(
+            file.as_file().as_fd(),
+            b"user.xdg.origin.url",
+            value,
+        );
+        if written.is_err() {
+            // This file system does not support extended attributes at all, so
+            // there is nothing to read back and the assertion would be about the
+            // host. The refusal itself is asserted by the test below.
+            return;
+        }
+
+        let name =
+            CString::new("user.xdg.origin.url").expect("no interior NUL");
+        assert_eq!(
+            xattr_value_of(fd, &name).as_deref(),
+            Some(value),
+            "the value must survive the boundary unaltered"
+        );
+    }
+
+    /// An interior zero ends the value, exactly as C's `strlen` does.
+    ///
+    /// C hands `fsetxattr` a length of `strlen(value)` at
+    /// `src/tool_xattr.c:89` and `:91`, because what it holds is a `char *`.
+    /// A value carrying an interior zero is therefore written up to that zero
+    /// and no further, and reproducing the length computation is what keeps the
+    /// attribute this tool writes identical to the one curl writes. Carrying
+    /// the whole slice instead would be a behaviour change dressed as a fix,
+    /// which specification 0.8.1 puts outside this work's authority -- so the
+    /// truncation is asserted rather than left to be rediscovered.
+    #[test]
+    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
+    fn an_interior_zero_ends_the_value_exactly_as_strlen_does() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        let file = match tempfile::NamedTempFile::new() {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let fd = file.as_file().as_raw_fd();
+
+        let written = set_file_xattr(
+            file.as_file().as_fd(),
+            b"user.xdg.origin.url",
+            &[0xff, 0x00, b'a', 0xfe],
+        );
+        if written.is_err() {
+            // No extended-attribute support on this file system; the refusal
+            // itself is asserted by the test below.
+            return;
+        }
+
+        let name =
+            CString::new("user.xdg.origin.url").expect("no interior NUL");
+        assert_eq!(
+            xattr_value_of(fd, &name).as_deref(),
+            Some(&[0xff][..]),
+            "the value must end at the interior zero, as strlen would"
+        );
+    }
+
+    /// An empty value is written as an empty value, not skipped.
+    ///
+    /// `src/tool_xattr.c:90,92` passes `strlen(value)`, which is zero for an
+    /// empty string, and the syscall stores a zero-length attribute. The
+    /// distinction from an absent attribute is what `Option` preserves here.
+    #[test]
+    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
+    fn an_empty_value_is_stored_rather_than_dropped() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        let file = match tempfile::NamedTempFile::new() {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let fd = file.as_file().as_raw_fd();
+
+        if set_file_xattr(file.as_file().as_fd(), b"user.mime_type", b"")
+            .is_err()
+        {
+            return;
+        }
+
+        let name = CString::new("user.mime_type").expect("no interior NUL");
+        assert_eq!(
+            xattr_value_of(fd, &name),
+            Some(Vec::new()),
+            "present and empty, which is not the same as absent"
+        );
+    }
+
+    /// A platform refusal is reported, not swallowed.
+    ///
+    /// The defect this wrapper replaced returned success unconditionally, so a
+    /// descriptor that cannot carry the attribute is the sharpest available
+    /// probe. A socket is used because Linux permits `user.*` names on regular
+    /// files and directories only, making the refusal deterministic rather than
+    /// dependent on which file system the host mounted.
+    #[test]
+    #[cfg_attr(miri, ignore = "fsetxattr(2) is a foreign function")]
+    fn a_descriptor_that_cannot_hold_attributes_reports_the_refusal() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        let socket = match open_non_file() {
+            Some(socket) => socket,
+            None => return,
+        };
+        let fd = socket.as_raw_fd();
+
+        let refused = set_file_xattr(
+            socket.as_fd(),
+            b"user.xdg.origin.url",
+            b"https://example.com/",
+        )
+        .expect_err("a socket cannot carry a user.* attribute");
+        // The errno is carried rather than collapsed, which is what lets
+        // `curl-rs/src/output/xattr.rs` render the system's own text.
+        assert!(
+            refused.raw_os_error().is_some(),
+            "the platform's errno must survive the wrapper: {refused}"
+        );
+        let name =
+            CString::new("user.xdg.origin.url").expect("no interior NUL");
+        assert_eq!(
+            xattr_value_of(fd, &name),
+            None,
+            "and nothing may have been recorded"
+        );
+    }
+
+    // Descriptor extent, reads and seeks
+    //
+    // The fake covers the branch logic; these three measure the real calls
+    // against `std`'s own view of the same file, which is an independent
+    // observation for the same reason `echo_bit_of` and `xattr_value_of` are.
+
+    /// A regular file reports the offset and size `std` reports.
+    #[test]
+    #[cfg_attr(miri, ignore = "lseek(2) and fstat(2) are foreign functions")]
+    fn a_regular_file_reports_its_offset_and_size() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::fd::AsRawFd as _;
+
+        let mut file = match tempfile::NamedTempFile::new() {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let contents = b"0123456789";
+        if file.write_all(contents).is_err() {
+            return;
+        }
+        let fd = file.as_file().as_raw_fd();
+
+        // Positioned at the start, as a freshly opened stdin would be.
+        if file.as_file_mut().seek(SeekFrom::Start(0)).is_err() {
+            return;
+        }
+        assert_eq!(
+            regular_file_extent(fd),
+            Some((0, contents.len() as i64)),
+            "origin and size must match what std sees"
+        );
+
+        // And after a seek, the origin moves with it -- which is the whole
+        // reason C reads `ftell` rather than assuming zero (`:128`).
+        if file.as_file_mut().seek(SeekFrom::Start(4)).is_err() {
+            return;
+        }
+        assert_eq!(regular_file_extent(fd), Some((4, contents.len() as i64)));
+    }
+
+    /// A descriptor that is not a regular file is `None`, not an error.
+    ///
+    /// The three cases are not interchangeable, and only the last of them
+    /// reaches the file-type test. A socket, a terminal and a closed descriptor
+    /// are all refused by `lseek` before `fstat` is ever called, so they prove
+    /// the offset gate and nothing about `S_ISREG`. A character device is
+    /// seekable, so `lseek` succeeds and the file-type test is the only thing
+    /// that can reject it -- which is why `/dev/null` is here.
+    #[test]
+    #[cfg_attr(miri, ignore = "fstat(2) is a foreign function")]
+    fn a_descriptor_that_is_not_a_regular_file_selects_buffering() {
+        use std::os::fd::AsRawFd as _;
+
+        if let Some(socket) = open_non_file() {
+            assert_eq!(
+                regular_file_extent(socket.as_raw_fd()),
+                None,
+                "a socket must select the buffering branch"
+            );
+        }
+        if let Some(pty) = open_pty_master() {
+            assert_eq!(
+                regular_file_extent(pty.as_raw_fd()),
+                None,
+                "a terminal must select the buffering branch"
+            );
+        }
+        // A seekable descriptor that is still not a regular file: this is the
+        // case the `S_ISREG` test itself decides. A host without `/dev/null`
+        // would make the assertion a statement about the host, so it is
+        // conditional -- but this container has one, and the same observation is
+        // made independently through a redirected standard input by
+        // `curl-rs/src/output/formparse.rs`'s
+        // `a_character_device_standard_input_is_buffered_instead`.
+        if let Ok(null) = std::fs::File::open("/dev/null") {
+            let fd = null.as_raw_fd();
+            assert!(
+                RealSys.fd_offset(fd).is_ok(),
+                "/dev/null is seekable, which is what makes this case reach \
+                 the file-type test"
+            );
+            assert_eq!(
+                regular_file_extent(fd),
+                None,
+                "a character device must select the buffering branch"
+            );
+        }
+        // A closed descriptor is the same ordinary answer, not a panic.
+        assert_eq!(regular_file_extent(-1), None);
+    }
+
+    /// Reading and repositioning the descriptor agree with `std`.
+    #[test]
+    #[cfg_attr(miri, ignore = "read(2) and lseek(2) are foreign functions")]
+    fn a_descriptor_can_be_read_and_repositioned() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd as _;
+
+        let mut file = match tempfile::NamedTempFile::new() {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        if file.write_all(b"abcdefgh").is_err() {
+            return;
+        }
+        let fd = file.as_file().as_raw_fd();
+        if seek_fd(fd, 0).is_err() {
+            return;
+        }
+
+        let mut buffer = [0u8; 3];
+        assert_eq!(read_fd(fd, &mut buffer).ok(), Some(3));
+        assert_eq!(&buffer, b"abc");
+        // The descriptor advanced, so the next read continues rather than
+        // repeating -- the property `read(2)` has and a stateless helper
+        // would not.
+        assert_eq!(read_fd(fd, &mut buffer).ok(), Some(3));
+        assert_eq!(&buffer, b"def");
+
+        // Rewinding to an absolute offset is what a retry needs.
+        assert!(seek_fd(fd, 1).is_ok());
+        assert_eq!(read_fd(fd, &mut buffer).ok(), Some(3));
+        assert_eq!(&buffer, b"bcd");
+
+        // End of input is `Ok(0)`, not an error -- which is how the caller
+        // distinguishes it from `ferror`.
+        assert!(seek_fd(fd, 8).is_ok());
+        assert_eq!(read_fd(fd, &mut buffer).ok(), Some(0));
+
+        // And an unseekable descriptor reports the failure C turns into
+        // CURL_SEEKFUNC_CANTSEEK.
+        if let Some(socket) = open_non_file() {
+            assert!(seek_fd(socket.as_raw_fd(), 0).is_err());
+        }
+    }
+
+    /// The branch logic, over the fake, so Miri covers it.
+    #[test]
+    fn the_extent_branches_follow_the_c_condition() {
+        // A regular file with a non-zero origin: both values are carried.
+        let sys = FakeSys::with_regular_file(7, 99, b"payload");
+        assert_eq!(regular_file_extent_with(&sys, 0), Some((7, 99)));
+
+        // Not a regular file: `Ok(None)` is an answer, so the result is None
+        // without any error being invented.
+        let sys = FakeSys::new();
+        assert_eq!(regular_file_extent_with(&sys, 0), None);
+
+        // The offset call failing short-circuits before the size call, as C's
+        // `&&` chain does.
+        let sys = FakeSys {
+            fd_offset: Err(libc::ESPIPE),
+            fd_regular_size: Ok(Some(10)),
+            ..FakeSys::new()
+        };
+        assert_eq!(regular_file_extent_with(&sys, 0), None);
+
+        // And the size call failing is equally just None.
+        let sys = FakeSys {
+            fd_regular_size: Err(libc::EBADF),
+            ..FakeSys::new()
+        };
+        assert_eq!(regular_file_extent_with(&sys, 0), None);
+    }
+
+    /// Reads consume from the front and errors propagate, over the fake.
+    #[test]
+    fn the_read_and_seek_seams_carry_their_arguments() {
+        let sys = FakeSys::with_regular_file(0, 6, b"abcdef");
+        let mut buffer = [0u8; 4];
+
+        assert_eq!(read_fd_with(&sys, 3, &mut buffer).ok(), Some(4));
+        assert_eq!(&buffer, b"abcd");
+        assert_eq!(read_fd_with(&sys, 3, &mut buffer).ok(), Some(2));
+        assert_eq!(&buffer[..2], b"ef");
+        assert_eq!(read_fd_with(&sys, 3, &mut buffer).ok(), Some(0));
+
+        assert!(seek_fd_with(&sys, 3, 42).is_ok());
+        assert_eq!(sys.observed_seeks.borrow().as_slice(), &[42]);
+
+        let failing = FakeSys {
+            fd_bytes: RefCell::new(Err(libc::EIO)),
+            fd_seek: Err(libc::ESPIPE),
+            ..FakeSys::new()
+        };
+        assert!(read_fd_with(&failing, 3, &mut buffer).is_err());
+        assert!(seek_fd_with(&failing, 3, 0).is_err());
+    }
+
+    // Local time
+
+    // The broken-down-time probe that used to sit here is gone with the
+    // `localtime` wrapper it exercised: the facade this module publishes is
+    // `local_utc_offset_secs`, and its real-host measurement lives above in
+    // `the_real_local_offset_is_within_the_range_of_real_zones`, which bounds
+    // the offset more tightly than that probe did.
+
+    // Extended attributes
+
+    // Process identity
+
+    /// The uid crosses the seam unaltered.
+    #[test]
+    fn the_effective_uid_is_reported_verbatim() {
+        assert_eq!(effective_uid_with(&FakeSys::with_uid(1000)), 1000);
+        assert_eq!(effective_uid_with(&FakeSys::with_uid(0)), 0);
+    }
+
+    /// The real `geteuid` is callable and total.
+    #[test]
+    #[cfg_attr(miri, ignore = "geteuid(2) is a foreign function")]
+    fn the_real_effective_uid_answers() {
+        assert_eq!(
+            effective_uid(),
+            effective_uid(),
+            "geteuid cannot fail and cannot change under us"
+        );
+    }
+
+    // -- Assertions ported from the second termios implementation ------------
+    //
+    // A parallel unit implemented terminal echo suppression a second way, as
+    // `tcgetattr`/`tcsetattr` methods on [`SysCalls`] with a `TerminalEcho`
+    // guard. One implementation survives -- the [`TerminalCalls`] seam above,
+    // which keeps terminal handling out of [`SysCalls`] so that a fake for the
+    // hostname or interface primitives need not supply terminal behaviour it
+    // never exercises -- but three of that implementation's measurements were
+    // not covered here, so they are asserted below against the surviving API.
+    // Its remaining eight assertions are already covered: disable-exactly-once,
+    // restore-exactly-once, restore-on-drop, restore-on-unwind, the
+    // unconditional `echo_disabled()`, the skip when nothing was captured, and
+    // the two `SavedTerminal` predicates. Its `Debug`-rendering assertion has
+    // no counterpart because [`SavedTerminal`] deliberately implements no
+    // `Debug` and hands out no accessor, so nothing can render the attributes.
+
+    /// Clearing echo must change exactly one bit.
+    ///
+    /// `RealSys::echo_disable` copies the captured attributes and clears
+    /// `ECHO` alone (`src/tool_getpass.c:137-138`); the copy is what makes the
+    /// original restorable, and every other local flag has to survive it.
+    /// Clearing `ICANON` as well would turn the prompt into a raw read, and
+    /// clearing `ISIG` would stop Ctrl-C from interrupting it -- neither is
+    /// what C does. The bit arithmetic is asserted directly rather than through
+    /// the seam because `tcsetattr` is a foreign function while this one step
+    /// is pure.
+    #[test]
+    fn clearing_echo_leaves_every_other_local_flag_untouched() {
+        let mut attrs = zeroed_termios();
+        attrs.c_lflag = libc::ECHO | libc::ICANON | libc::ISIG | libc::IEXTEN;
+
+        let mut cleared = attrs;
+        cleared.c_lflag &= !libc::ECHO;
+
+        assert_eq!(cleared.c_lflag & libc::ECHO, 0, "ECHO must be cleared");
+        assert_eq!(
+            cleared.c_lflag | libc::ECHO,
+            attrs.c_lflag,
+            "no other local flag may change"
+        );
+    }
+
+    /// The disabling and restoring moments are two different POSIX constants,
+    /// and the difference is load-bearing rather than incidental.
+    ///
+    /// `src/tool_getpass.c:139` clears the bit with `TCSANOW` -- take effect
+    /// immediately, discard nothing -- and `:155` puts it back with
+    /// `TCSAFLUSH`, which additionally discards input that arrived while echo
+    /// was off. That is what stops the newline terminating the password from
+    /// being echoed after the fact. If the two ever collapsed to one value the
+    /// asymmetry `TerminalCalls` documents would become unobservable, so the
+    /// distinctness is asserted where it can be seen.
+    #[test]
+    fn the_two_set_moments_are_distinct_posix_constants() {
+        assert_ne!(
+            libc::TCSANOW,
+            libc::TCSAFLUSH,
+            "echo_disable uses TCSANOW and echo_restore TCSAFLUSH; \
+             they must remain two different requests"
+        );
+    }
+
+    /// Two guards over one terminal keep two independent snapshots.
+    ///
+    /// [`SavedTerminal`] is `Copy` and each [`EchoGuard`] owns its own, so a
+    /// nested guard cannot steal or share the outer one's attributes and each
+    /// restores exactly what it captured. Asserted because the alternative --
+    /// one shared snapshot -- would silently restore the inner guard's state
+    /// twice and the outer guard's never.
+    #[test]
+    fn two_guards_do_not_share_one_saved_snapshot() {
+        let stdin = io::stdin();
+        let fake = FakeTerminal::new(true);
+
+        {
+            let _first = disable_echo_with(&fake, stdin.as_fd());
+            let _second = disable_echo_with(&fake, stdin.as_fd());
+
+            assert_eq!(
+                fake.disable_calls.get(),
+                2,
+                "each guard captures for itself"
+            );
+            assert_eq!(fake.restore_calls.get(), 0);
+        }
+
+        assert_eq!(
+            fake.restore_calls.get(),
+            2,
+            "each guard restores its own snapshot"
         );
     }
 }

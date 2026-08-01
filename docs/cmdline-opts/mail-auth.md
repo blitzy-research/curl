@@ -20,7 +20,7 @@ Example:
 Specify a single address. This is used to specify the authentication address
 (identity) of a submitted message that is being relayed to another server.
 
-This build performs no `SMTP` or `SMTPS` transfers. curl still parses and
-accepts this option, yet a transfer using either scheme fails with
-`CURLE_UNSUPPORTED_PROTOCOL`, and neither scheme appears in the `Protocols:`
-line of the --version output.
+Transfers for `SMTP` and `SMTPS` are outside the specified scope of this
+rewrite, and neither scheme appears in the `Protocols:` line of the --version
+output. Parsing and accepting this option are still specified, with a transfer
+using either scheme then failing with `CURLE_UNSUPPORTED_PROTOCOL`.

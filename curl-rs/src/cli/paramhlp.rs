@@ -4,26 +4,16 @@
 
 //! The exact parameter acceptance rules of curl 8.19.0-DEV.
 //!
-//! Port of `src/tool_paramhlp.c` (733 lines) and `src/tool_paramhlp.h`. AAP
-//! section 0.4.1 assigns this module "numeric, protocol, and list parameter
-//! parsing with curl's exact acceptance rules".
+//! Port of `src/tool_paramhlp.c` (733 lines) and `src/tool_paramhlp.h`: the
+//! numeric, protocol and list parameter parsing, with curl's exact acceptance
+//! rules.
 //!
 //! This module is the arbiter of what curl accepts and what curl rejects, so
-//! its behaviour is frozen by AAP section 0.8.1: a value curl rejects must be
+//! its behaviour is frozen: a value curl rejects must be
 //! rejected, a value curl accepts must be accepted, and the reported error
 //! must be the same one. It also owns the two password prompts, which
 //! `curl-rs/src/terminal.rs` explicitly disclaims in the documentation of
 //! `getpass_r`.
-//!
-//! NO USER-SPECIFIED RULES EXIST FOR THIS PROJECT. `review_rules` returns the
-//! single line "No user rules provided." -- checked with the default window
-//! and again with an explicit full-document range, both returning that
-//! identical line, which corroborates AAP section 0.7. Nothing here is
-//! therefore attributed to a rule. Every constraint cited below is an AAP
-//! requirement drawn from the user's request (AAP section 0.8): binding, but a
-//! requirement rather than a rule. Where no requirement speaks,
-//! enterprise-standard best practice governs; the absence of rules is not
-//! permission to lower the bar.
 //!
 //! # The primitive that defines "exact"
 //!
@@ -43,14 +33,11 @@
 //! 1. **`outnum` becomes an owned counter.** `src/tool_paramhlp.c:40` declares
 //!    `static int outnum = 0;` inside `new_getout`, making it a process-global
 //!    monotonic counter shared across every configuration set rather than a
-//!    per-config index. The crate root's blanket safety `forbid` attribute on
-//!    `curl-rs/src/main.rs` covers this module, so a mutable `static` cannot
-//!    compile at all, and a `static` atomic would be a global singleton that
-//!    also destroys test isolation.
-//!    AAP section 0.1.2 replaces the C tree's shared mutable state with
-//!    "per-module structs and explicit ownership", so the counter is
-//!    [`GetOutSeq`], owned by whoever owns the URL list and threaded in by
-//!    `&mut`.
+//!    per-config index. A mutable `static` is not reproduced here, and neither
+//!    is a `static` atomic: both are process-global singletons, which makes the
+//!    numbering depend on what an earlier configuration set did and destroys
+//!    test isolation. The counter is instead [`GetOutSeq`], owned by whoever
+//!    owns the URL list and threaded in by `&mut`.
 //!
 //! 2. **`CURLE_TOO_LARGE` is reported as "out of memory", on purpose.**
 //!    `lib/curlx/dynbuf.c:82-84` returns `CURLE_TOO_LARGE` -- not
@@ -58,7 +45,7 @@
 //!    `toobig` cap. Every caller in this file maps any non-zero result to
 //!    `PARAM_NO_MEM`, so an over-large input file really does report "out of
 //!    memory" (`src/tool_helpers.c:57`). That is preserved exactly; a truer
-//!    error would be a behaviour change, which AAP section 0.8.2 rules out.
+//!    error would be a behaviour change, which is ruled out.
 //!
 //! 3. **`"-0"` is accepted by [`str2unum`].** `src/tool_paramhlp.c:252-260`
 //!    calls `str2num` and then rejects only `*val < 0`. A leading minus
@@ -94,47 +81,73 @@
 //! 7. **The login-option separator is hidden without mutation.**
 //!    `src/tool_paramhlp.c:578-588` overwrites the caller's string in place --
 //!    `*osep = '\0'` before prompting, `*osep = ';'` after -- so that the
-//!    prompt shows the user name alone while the composed result keeps the
+//!    prompt shows the username alone while the composed result keeps the
 //!    options. Here the prompt is built from a borrowed prefix and the result
 //!    from the untouched original, which is observably identical with no
 //!    mutation, no interior mutability and no escape from the safety rules.
 //!
-//! # Gaps, reported rather than worked around
+//! # Nothing here is deferred, and two things that look like it are not
 //!
-//! GAP #4: the URL list and the `OperationConfig` aggregate are owned by
-//! `curl-rs/src/config/mod.rs`; needed by `src/tool_paramhlp.c:35-55`.
-//! `new_getout` cannot append the node itself because AAP section 0.6.9
-//! replaces the intrusive `struct getout *next` chain with an owned `Vec`, and
-//! in Rust the push belongs to the owner of that `Vec`. [`new_getout`]
-//! therefore computes and returns exactly the two fields the C function
-//! assigns (`:51-52`) plus the sequence number, and the owner performs the
-//! push. Reported rather than worked around: reaching into another module's
-//! aggregate would rebuild the god-struct coupling AAP section 0.4.2 removes.
+//! Every behaviour of `src/tool_paramhlp.c` is implemented. Two of them cross
+//! a module boundary to get there, so the route is recorded rather than left to
+//! be rediscovered:
 //!
-//! GAP #5: `curl-rs/src/terminal.rs`'s `getpass_r` takes its prompt as `&str`;
-//! needed by `src/tool_paramhlp.c:575-586`. A user name that is not valid
-//! UTF-8 is therefore rendered with replacement characters in the prompt text.
-//! The divergence is confined to that one display string: the composed
-//! credential is assembled from the original bytes and is byte-exact, which is
-//! the part AAP section 0.8.1 freezes because Basic authentication encodes
-//! precisely those bytes. Reported rather than worked around: rendering the
-//! credential lossily to make the prompt lossless would corrupt what goes on
-//! the wire.
+//! * **The URL list.** `config->url_list` and `config->url_last`
+//!   (`src/tool_cfgable.h:102-103`) are owned by
+//!   `curl-rs/src/config/mod.rs`, and AAP section 0.6.9 replaces the intrusive
+//!   `struct getout *next` chain with an owned collection, so the push is that
+//!   owner's operation. [`new_getout`] nevertheless performs C's append and
+//!   tail update as one indivisible step, because the owner reaches it through
+//!   the [`UrlList`] port declared here: the aggregate implements three
+//!   methods, and nothing of it is named, owned or reached into here. That
+//!   keeps `src/tool_paramhlp.c:41-52` atomic -- list, tail and counter cannot
+//!   disagree -- without rebuilding the god-struct coupling AAP section 0.4.2
+//!   removes.
+//! * **The password prompt.** `curl-rs/src/terminal.rs`'s `getpass_r` takes
+//!   its prompt as `&[u8]`, so the username interpolated at
+//!   `src/tool_paramhlp.c:582` reaches the terminal as the bytes the command
+//!   line supplied. Nothing on the path decodes: both the prompt and the
+//!   composed credential are byte-exact, which is what AAP section 0.8.1
+//!   freezes, because Basic authentication encodes precisely those bytes.
 //!
-//! Gap 1 and Gap 2 are `curl-rs/src/terminal.rs`'s, and GAP #3 is
-//! `curl-rs/src/util.rs`'s. Nothing here attempts to compensate for Gap 2:
-//! no newline is added after the prompt, no re-prompt is issued and no
-//! terminal control is attempted.
+//! Terminal width, password echo suppression and local-time conversion are
+//! likewise complete: `curl-rs/src/terminal.rs` and `curl-rs/src/util.rs`
+//! reach all three through the engine's safe platform wrappers. Nothing here
+//! duplicates any of it -- no newline is added after the prompt, no re-prompt
+//! is issued and no terminal control is attempted, exactly as in C, where
+//! `src/tool_paramhlp.c:575-586` calls `getpass_r` and does nothing else.
+//!
+//! # C-string semantics at the password boundary
+//!
+//! Two of C's truncations here are consequences of its string handling rather
+//! than of any explicit rule, and both are reproduced exactly because both
+//! change bytes a user can observe:
+//!
+//! * The prompt is composed into a `char prompt[256]` (`:568`) by
+//!   `curl_msnprintf`, so it carries at most [`PROMPT_CONTENT_MAX`] bytes and a
+//!   longer username is cut short *in the prompt only*.
+//! * The credential is composed with `curlx_dyn_addf(&dyn, "%s:%s", ...)`
+//!   (`:590`), and the second `%s` reads the password as a C string, so it
+//!   **stops at the first NUL byte**. `getpass_r` can return a value containing
+//!   one, since it stores whatever `read(2)` delivered.
+//!
+//! Neither the prompt nor the credential is ever re-encoded. Both are composed
+//! from raw bytes, because `%s` on a `char *` copies bytes and a username taken
+//! from `argv` is an arbitrary byte string on the mandated targets. AAP section
+//! 0.8.1 freezes the credential in particular: Basic authentication encodes
+//! precisely those bytes.
+//!
 //!
 //! # What this module does not do
 //!
 //! It emits no error text. Every fallible entry point returns a
-//! [`ParameterError`] variant and `curl-rs/src/cli/args.rs` renders it through
-//! its port of `param2text` (`src/tool_helpers.c:35-75`). It writes nothing to
-//! standard error directly either: the three warnings it can raise go through
-//! `curl-rs/src/output/msgs.rs`, which owns the `Warning: ` prefix and the
-//! `--silent` gate. And it never logs, traces or `Debug`-prints a password;
-//! [`OperationArgs`] deliberately derives no `Debug` for that reason.
+//! [`ParameterError`] variant, which `curl-rs/src/cli/args.rs` is to render
+//! through its port of `param2text` (`src/tool_helpers.c:35-75`). It writes
+//! nothing to standard error directly either: the three warnings it can raise
+//! go through `curl-rs/src/output/msgs.rs`, which owns the `Warning: ` prefix
+//! and the `--silent` gate. And it never logs, traces or `Debug`-prints a
+//! password; [`OperationArgs`] deliberately derives no `Debug` for that
+//! reason.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -146,20 +159,19 @@ use crate::output::msgs::{warnf, warnf_bytes, MsgConfig};
 use crate::terminal::getpass_r;
 use crate::util::struplocompare4sort;
 
-// ===========================================================================
 // Constants -- every one measured in this tree, none invented
-// ===========================================================================
 
 /// `LONG_MAX`, the bound `str2num` and `secs2ms` apply.
 ///
-/// `long` is 64 bits on all four targets AAP section 0.1.1 goal G8 mandates
-/// (`x86_64`/`aarch64` on `unknown-linux-gnu` and `apple-darwin`, all LP64),
-/// so `i64` is the faithful width. AAP section 0.2.2 excludes 32-bit targets
-/// explicitly, calling the narrower `long` "a deliberate forfeit rather than
-/// an oversight".
+/// `long` is 64 bits on all four mandated targets (`x86_64`/`aarch64` on
+/// `unknown-linux-gnu` and `apple-darwin`, all LP64), so `i64` is the faithful
+/// width. 32-bit targets are excluded, and the narrower `long` there is a
+/// deliberate forfeit rather than an oversight.
+#[allow(dead_code)]
 const LONG_MAX: i64 = i64::MAX;
 
 /// `CURL_OFF_T_MAX`. `curl_off_t` is 64 bits on every mandated target.
+#[allow(dead_code)]
 const CURL_OFF_T_MAX: i64 = i64::MAX;
 
 /// `MAX_FILE2MEMORY` -- `src/tool_paramhlp.h:32-36`.
@@ -170,6 +182,7 @@ const CURL_OFF_T_MAX: i64 = i64::MAX;
 /// still compiles, with the cap the C code would have chosen, on a 32-bit host
 /// rather than overflowing its own constant.
 #[cfg(target_pointer_width = "64")]
+#[allow(dead_code)]
 const MAX_FILE2MEMORY: usize = 16 * 1024 * 1024 * 1024;
 
 /// `MAX_FILE2MEMORY` on a target whose `size_t` is at most 32 bits:
@@ -178,24 +191,48 @@ const MAX_FILE2MEMORY: usize = 16 * 1024 * 1024 * 1024;
 const MAX_FILE2MEMORY: usize = i32::MAX as usize;
 
 /// `MAX_FILE2STRING` -- `src/tool_paramhlp.c:84` aliases `MAX_FILE2MEMORY`.
+#[allow(dead_code)]
 const MAX_FILE2STRING: usize = MAX_FILE2MEMORY;
 
 /// `MAX_USERPWDLENGTH` -- `src/tool_paramhlp.c:547`, `100 * 1024`.
+#[allow(dead_code)]
 const MAX_USERPWDLENGTH: usize = 100 * 1024;
 
 /// `MAX_PROTOS` -- `src/tool_paramhlp.c:391`.
+#[allow(dead_code)]
 const MAX_PROTOS: usize = 34;
 
 /// `MAX_PROTOSTRING` -- `src/tool_paramhlp.c:392`, `MAX_PROTOS * 11`, with the
 /// C comment "Room for MAX_PROTOS number of 10-chars proto names."
+#[allow(dead_code)]
 const MAX_PROTOSTRING: usize = MAX_PROTOS * 11;
 
 /// `sizeof(passwd)` for the `char passwd[2048]` of
 /// `src/tool_paramhlp.c:567`, passed on to `getpass_r` at `:586`.
 ///
-/// AAP section 0.8.2 forbids widening it: the password is truncated at this
+/// Widening it is forbidden: the password is truncated at this
 /// bound exactly as C truncates it.
+#[allow(dead_code)]
 const PASSWORD_BUFFER_SIZE: usize = 2048;
+
+/// `sizeof(prompt)` for the `char prompt[256]` of `src/tool_paramhlp.c:568`.
+const PROMPT_BUFFER_SIZE: usize = 256;
+
+/// The longest prompt [`PROMPT_BUFFER_SIZE`] can carry: 255 bytes.
+///
+/// `curl_msnprintf(prompt, sizeof(prompt), ...)` at `:580` and `:584` streams
+/// through `addbyter` (`lib/mprintf.c:1065-1075`), which stops storing once
+/// `length == max`. `curl_mvsnprintf` then terminates the buffer, and when it
+/// was filled exactly it "scraps the last letter" to make room for the NUL
+/// (`lib/mprintf.c:1088-1094`). The content is therefore capped one byte below
+/// the buffer, and a longer username is truncated rather than growing the
+/// prompt.
+///
+/// The truncation is on **bytes**, not characters, because that is what
+/// `addbyter` counts: a multi-byte sequence straddling the bound is split
+/// exactly where C splits it. `fputs` at `src/tool_getpass.c:176` then writes
+/// whatever survived.
+const PROMPT_CONTENT_MAX: usize = PROMPT_BUFFER_SIZE - 1;
 
 /// `sizeof(buffer)` for the two `char buffer[4096]` read buffers of
 /// `src/tool_paramhlp.c:92` and `:143`.
@@ -204,6 +241,7 @@ const PASSWORD_BUFFER_SIZE: usize = 2048;
 /// stripping loop in [`file2string`] and the range arithmetic in
 /// [`file2memory_range`] both step chunk by chunk, so the reader below refills
 /// this many bytes per pass exactly as `fread` does.
+#[allow(dead_code)]
 const READ_CHUNK: usize = 4096;
 
 /// `sizeof(buffer) - 1` for the `char buffer[32]` of
@@ -213,15 +251,19 @@ const READ_CHUNK: usize = 4096;
 /// A longer protocol token is silently truncated to this length before
 /// `proto_token()` ever sees it, so the truncation is part of the acceptance
 /// rule rather than a buffer detail.
+#[allow(dead_code)]
 const PROTO_TOKEN_MAX: usize = 31;
 
 /// `CURLFTPMETHOD_MULTICWD` -- `include/curl/curl.h:1018`.
+#[allow(dead_code)]
 const CURLFTPMETHOD_MULTICWD: i64 = 1;
 
 /// `CURLFTPMETHOD_NOCWD` -- `include/curl/curl.h:1020`.
+#[allow(dead_code)]
 const CURLFTPMETHOD_NOCWD: i64 = 2;
 
 /// `CURLFTPMETHOD_SINGLECWD` -- `include/curl/curl.h:1021`.
+#[allow(dead_code)]
 const CURLFTPMETHOD_SINGLECWD: i64 = 3;
 
 /// `CURLFTPSSL_CCC_PASSIVE` -- `include/curl/curl.h:988`.
@@ -230,12 +272,15 @@ const CURLFTPMETHOD_SINGLECWD: i64 = 3;
 /// (`include/curl/curl.h:987`), which `ftpcccmethod` never selects because its
 /// fallback is the passive mode; it is recorded here rather than declared so
 /// that no constant in this file is unused.
+#[allow(dead_code)]
 const CURLFTPSSL_CCC_PASSIVE: i64 = 1;
 
 /// `CURLFTPSSL_CCC_ACTIVE` -- `include/curl/curl.h:989`.
+#[allow(dead_code)]
 const CURLFTPSSL_CCC_ACTIVE: i64 = 2;
 
 /// `CURLGSSAPI_DELEGATION_NONE` -- `include/curl/curl.h:861`.
+#[allow(dead_code)]
 const CURLGSSAPI_DELEGATION_NONE: i64 = 0;
 
 /// `CURLGSSAPI_DELEGATION_POLICY_FLAG` -- `include/curl/curl.h:862`.
@@ -243,14 +288,14 @@ const CURLGSSAPI_DELEGATION_NONE: i64 = 0;
 /// The C spelling is `(1L << 0)`; written as the literal `1` here because
 /// `clippy::identity_op` rejects a shift by zero and the value is what the ABI
 /// pins, not the expression.
+#[allow(dead_code)]
 const CURLGSSAPI_DELEGATION_POLICY_FLAG: i64 = 1;
 
 /// `CURLGSSAPI_DELEGATION_FLAG` -- `include/curl/curl.h:863`, `(1L << 1)`.
+#[allow(dead_code)]
 const CURLGSSAPI_DELEGATION_FLAG: i64 = 1 << 1;
 
-// ===========================================================================
 // The acceptance-rule primitive: lib/curlx/strparse.c, translated first
-// ===========================================================================
 
 /// The subset of `STRE_*` (`lib/curlx/strparse.h:28-36`) this module can
 /// observe.
@@ -262,6 +307,7 @@ const CURLGSSAPI_DELEGATION_FLAG: i64 = 1 << 1;
 /// (`src/tool_paramhlp.c:229-233`). Keeping the variants separate is what
 /// makes that difference expressible rather than accidental.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum StrError {
     /// `STRE_BYTE` (5) -- `curlx_str_single` found a different byte
     /// (`lib/curlx/strparse.c:126-133`).
@@ -286,6 +332,7 @@ enum StrError {
 /// [`hex_ascii_table`] bounds-checks rather than indexing blindly: C relies on
 /// `valid_digit`'s `byte <= m` test to stay inside the array, and `m` is never
 /// above `'f'`.
+#[allow(dead_code)]
 const HEX_ASCII_TABLE: [u8; 55] = [
     // 0x30: '0' - '9'
     16, 1, 2, 3, 4, 5, 6, 7, 8, 9, //
@@ -306,6 +353,7 @@ const HEX_ASCII_TABLE: [u8; 55] = [
 /// Returns 0 -- the table's "not a digit" value -- for any byte outside the
 /// table, which is the answer `valid_digit` needs and which keeps the lookup
 /// free of a panicking index.
+#[allow(dead_code)]
 fn hex_ascii_table(byte: u8) -> u8 {
     match byte.checked_sub(b'0') {
         Some(index) => match HEX_ASCII_TABLE.get(usize::from(index)) {
@@ -318,6 +366,7 @@ fn hex_ascii_table(byte: u8) -> u8 {
 
 /// `curlx_hexval(x)` -- `lib/curlx/strparse.h:111`, the table entry masked to
 /// its low nibble.
+#[allow(dead_code)]
 fn hexval(byte: u8) -> u8 {
     hex_ascii_table(byte) & 0x0f
 }
@@ -328,6 +377,7 @@ fn hexval(byte: u8) -> u8 {
 /// largest digit the base permits, and a non-zero table entry. The third is
 /// what excludes the seven punctuation bytes between `'9'` and `'A'` for
 /// base 16.
+#[allow(dead_code)]
 fn valid_digit(byte: u8, largest: u8) -> bool {
     byte >= b'0' && byte <= largest && hex_ascii_table(byte) != 0
 }
@@ -343,6 +393,7 @@ fn valid_digit(byte: u8, largest: u8) -> bool {
 /// A NUL byte embedded in the input therefore behaves exactly as it does in C,
 /// where it would have terminated the string: the digit scan stops there and
 /// the end-of-string test succeeds.
+#[allow(dead_code)]
 struct Cursor<'a> {
     /// The bytes being scanned.
     bytes: &'a [u8],
@@ -354,6 +405,7 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     /// Starts a scan at the first byte of `input`.
+    #[allow(dead_code)]
     fn new(input: &'a str) -> Self {
         Self {
             bytes: input.as_bytes(),
@@ -362,6 +414,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// C's `**linep`: the byte under the cursor, or 0 at or past the end.
+    #[allow(dead_code)]
     fn peek(&self) -> u8 {
         match self.bytes.get(self.pos) {
             Some(byte) => *byte,
@@ -373,6 +426,7 @@ impl<'a> Cursor<'a> {
     ///
     /// Saturating so the index cannot wrap; the value is only ever compared
     /// against the slice length, so saturation is unobservable.
+    #[allow(dead_code)]
     fn bump(&mut self) {
         self.pos = self.pos.saturating_add(1);
     }
@@ -382,6 +436,7 @@ impl<'a> Cursor<'a> {
     /// `secs2ms` needs this to count the digits of the fractional part, which
     /// C obtains as the pointer difference `str - s`
     /// (`src/tool_paramhlp.c:321`).
+    #[allow(dead_code)]
     fn offset(&self) -> usize {
         self.pos
     }
@@ -397,6 +452,7 @@ impl<'a> Cursor<'a> {
 /// The C function zeroes `*nump` before the digit test, so a failed parse
 /// leaves zero behind. That is unobservable here because failure yields
 /// `Err` and no value at all.
+#[allow(dead_code)]
 fn str_num_base(
     cursor: &mut Cursor<'_>,
     max: i64,
@@ -431,7 +487,7 @@ fn str_num_base(
             // Cannot overflow: on entry `num <= max < base <= 16`, so the
             // product is at most 256. Checked anyway so that no arithmetic
             // here can panic in a debug build, and reported as overflow --
-            // which is the outcome the very next line would produce.
+            // which is the outcome the following line would produce.
             num = match num.checked_mul(base).and_then(|v| v.checked_add(digit))
             {
                 Some(value) => value,
@@ -473,6 +529,7 @@ fn str_num_base(
 }
 
 /// `curlx_str_number` -- `lib/curlx/strparse.c:196-199`, base 10.
+#[allow(dead_code)]
 fn str_number(cursor: &mut Cursor<'_>, max: i64) -> Result<i64, StrError> {
     str_num_base(cursor, max, 10)
 }
@@ -482,6 +539,7 @@ fn str_number(cursor: &mut Cursor<'_>, max: i64) -> Result<i64, StrError> {
 /// Because the largest digit is `'7'`, `'8'` and `'9'` are not digits at all:
 /// `"08"` parses as 0, stops at the `'8'`, and is then rejected by the
 /// trailing-garbage test rather than by the number scan.
+#[allow(dead_code)]
 fn str_octal(cursor: &mut Cursor<'_>, max: i64) -> Result<i64, StrError> {
     str_num_base(cursor, max, 8)
 }
@@ -490,6 +548,7 @@ fn str_octal(cursor: &mut Cursor<'_>, max: i64) -> Result<i64, StrError> {
 ///
 /// Called with 0 it is the "must be exactly at the end of the string" test
 /// that rejects trailing garbage, trailing blanks included.
+#[allow(dead_code)]
 fn str_single(cursor: &mut Cursor<'_>, byte: u8) -> Result<(), StrError> {
     if cursor.peek() != byte {
         return Err(StrError::Byte);
@@ -498,9 +557,7 @@ fn str_single(cursor: &mut Cursor<'_>, byte: u8) -> Result<(), StrError> {
     Ok(())
 }
 
-// ===========================================================================
 // Numeric parameters
-// ===========================================================================
 
 /// `str2num` -- `src/tool_paramhlp.c:206-221`.
 ///
@@ -522,6 +579,7 @@ fn str_single(cursor: &mut Cursor<'_>, byte: u8) -> Result<(), StrError> {
 /// The C function's `DEBUGASSERT(str)` at `:210` is expressed in the type: the
 /// callers that can pass NULL are `secs2ms`, `str2tls_max` and
 /// `check_protocol`, and only those three take an `Option`.
+#[allow(dead_code)]
 pub(crate) fn str2num(text: &str) -> Result<i64, ParameterError> {
     let mut cursor = Cursor::new(text);
 
@@ -555,6 +613,7 @@ pub(crate) fn str2num(text: &str) -> Result<i64, ParameterError> {
 ///
 /// The sole caller passes `0777` (`src/tool_getparam.c:2415`, the
 /// `--create-file-mode` option).
+#[allow(dead_code)]
 pub(crate) fn oct2nummax(text: &str, max: i64) -> Result<i64, ParameterError> {
     let mut cursor = Cursor::new(text);
 
@@ -588,6 +647,7 @@ pub(crate) fn oct2nummax(text: &str, max: i64) -> Result<i64, ParameterError> {
 /// [`str2num`] followed by a single rejection of negative results, which is
 /// why `"-0"` is **accepted**: the minus yields zero and zero is not negative.
 /// Translation difference 3 in the module documentation records the anchor.
+#[allow(dead_code)]
 pub(crate) fn str2unum(text: &str) -> Result<i64, ParameterError> {
     // `:254-256`
     let value = str2num(text)?;
@@ -604,6 +664,7 @@ pub(crate) fn str2unum(text: &str) -> Result<i64, ParameterError> {
 ///
 /// [`str2unum`] plus an inclusive upper bound: `max` itself is accepted and
 /// anything above it is `PARAM_NUMBER_TOO_LARGE`.
+#[allow(dead_code)]
 pub(crate) fn str2unummax(text: &str, max: i64) -> Result<i64, ParameterError> {
     // `:275-277`
     let value = str2unum(text)?;
@@ -633,6 +694,7 @@ pub(crate) fn str2unummax(text: &str, max: i64) -> Result<i64, ParameterError> {
 ///    1, `"1.50"` by 10 and `"1.500"` by 100, so all three are 1500.
 /// 4. **The whole part is bounded by `LONG_MAX / 1000 - 1`**, which is what
 ///    makes the final `secs * 1000 + ms` unable to overflow.
+#[allow(dead_code)]
 pub(crate) fn secs2ms(text: Option<&str>) -> Result<i64, ParameterError> {
     /// `digs[]` -- `src/tool_paramhlp.c:301-311`, nine entries.
     ///
@@ -719,6 +781,7 @@ pub(crate) fn secs2ms(text: Option<&str>) -> Result<i64, ParameterError> {
 /// [`CURL_OFF_T_MAX`]. The C documentation at `:533` states the contract in
 /// capitals -- "The offset CANNOT be negative!" -- and the absence of a minus
 /// arm is what enforces it.
+#[allow(dead_code)]
 pub(crate) fn str2offset(text: &str) -> Result<i64, ParameterError> {
     let mut cursor = Cursor::new(text);
 
@@ -743,6 +806,7 @@ pub(crate) fn str2offset(text: &str) -> Result<i64, ParameterError> {
 ///
 /// An absent argument is `PARAM_REQUIRES_PARAMETER` (`:723-724`) and an
 /// unrecognised one is `PARAM_BAD_USE` (`:731`).
+#[allow(dead_code)]
 pub(crate) fn str2tls_max(text: Option<&str>) -> Result<u8, ParameterError> {
     /// `tls_max_array[]` -- `src/tool_paramhlp.c:715-721`. The comment on the
     /// first entry reads "lets the library decide".
@@ -772,9 +836,7 @@ pub(crate) fn str2tls_max(text: Option<&str>) -> Result<u8, ParameterError> {
     Err(ParameterError::BadUse)
 }
 
-// ===========================================================================
 // File readers
-// ===========================================================================
 
 /// The two capabilities `file2memory_range` asks of a `FILE *`.
 ///
@@ -786,9 +848,10 @@ pub(crate) fn str2tls_max(text: Option<&str>) -> Result<u8, ParameterError> {
 ///
 /// That branch is a property of the source, not of the algorithm, so it is
 /// expressed as a trait with two implementations rather than as a runtime
-/// comparison against a global. AAP section 0.3.3 pattern P12 injects such
-/// capabilities precisely so the behaviour can be exercised without the real
+/// comparison against a global. Such capabilities are injected precisely so
+/// the behaviour can be exercised without the real
 /// resource; both arms are covered by the tests below using in-memory sources.
+#[allow(dead_code)]
 pub(crate) trait ByteSource {
     /// One `fread` of up to `buffer.len()` bytes.
     ///
@@ -803,6 +866,7 @@ pub(crate) trait ByteSource {
 }
 
 /// A seekable source: the `file != stdin` arm.
+#[allow(dead_code)]
 pub(crate) struct SeekSource<T> {
     /// The underlying reader.
     inner: T,
@@ -810,6 +874,7 @@ pub(crate) struct SeekSource<T> {
 
 impl<T: Read + Seek> SeekSource<T> {
     /// Wraps a reader that supports seeking, such as a `std::fs::File`.
+    #[allow(dead_code)]
     pub(crate) fn new(inner: T) -> Self {
         Self { inner }
     }
@@ -826,6 +891,7 @@ impl<T: Read + Seek> ByteSource for SeekSource<T> {
 }
 
 /// A non-seekable source: the `file == stdin` arm.
+#[allow(dead_code)]
 pub(crate) struct StreamSource<R> {
     /// The underlying reader.
     inner: R,
@@ -833,6 +899,7 @@ pub(crate) struct StreamSource<R> {
 
 impl<R: Read> StreamSource<R> {
     /// Wraps a reader that cannot seek, such as standard input.
+    #[allow(dead_code)]
     pub(crate) fn new(inner: R) -> Self {
         Self { inner }
     }
@@ -862,6 +929,7 @@ impl<R: Read> ByteSource for StreamSource<R> {
 /// `PARAM_READ_ERROR` -- the C `ferror(file)` test at
 /// `src/tool_paramhlp.c:95` and `:147`, which likewise discards whatever had
 /// already been read.
+#[allow(dead_code)]
 fn fread(reader: &mut dyn Read, buffer: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0usize;
     while filled < buffer.len() {
@@ -884,6 +952,7 @@ fn fread(reader: &mut dyn Read, buffer: &mut [u8]) -> io::Result<usize> {
 ///
 /// A NUL byte counts as a line terminator alongside CR and LF, which matters
 /// because [`file2string`] uses it to end a piece.
+#[allow(dead_code)]
 fn is_crlf(byte: u8) -> bool {
     byte == b'\r' || byte == b'\n' || byte == 0
 }
@@ -899,6 +968,7 @@ fn is_crlf(byte: u8) -> bool {
 ///
 /// With no delimiter found it returns the whole length, which is C's
 /// `return total;` at `:81`.
+#[allow(dead_code)]
 fn memcrlf(mem: &[u8], countcrlf: bool) -> usize {
     for (index, byte) in mem.iter().enumerate() {
         // `:77-79`
@@ -920,6 +990,7 @@ fn memcrlf(mem: &[u8], countcrlf: bool) -> usize {
 ///
 /// The terminator is counted even though a `Vec<u8>` needs none, because the
 /// cap is an observable acceptance boundary rather than an allocation detail.
+#[allow(dead_code)]
 fn dyn_addn(
     out: &mut Vec<u8>,
     mem: &[u8],
@@ -938,6 +1009,7 @@ fn dyn_addn(
 /// Every length converted here is at most [`READ_CHUNK`], so the conversion is
 /// exact. The saturating fallback exists only so that no conversion in this
 /// module can panic.
+#[allow(dead_code)]
 fn as_off(len: usize) -> i64 {
     // `unwrap_or` is total -- it is the infallible combinator, not the
     // panicking accessor the prohibitions rule out.
@@ -957,7 +1029,8 @@ fn as_off(len: usize) -> i64 {
 /// The result is bytes rather than a string: the C function returns a
 /// `char *` that callers hand to libcurl unchanged, and the sources it reads --
 /// `--data`, `--header` and friends from a file -- are not required to be
-/// UTF-8. Re-encoding them would change bytes that AAP section 0.8.1 freezes.
+/// UTF-8. Re-encoding them would change bytes that are frozen.
+#[allow(dead_code)]
 pub(crate) fn file2string(
     file: Option<&mut dyn Read>,
 ) -> Result<Vec<u8>, ParameterError> {
@@ -1025,7 +1098,7 @@ pub(crate) fn file2string(
 /// cannot seek has `starto` bytes read and discarded instead (`:135-137`).
 /// An absent source yields an empty result and success (`:186-189`).
 ///
-/// This is the entry point `curl-rs/src/cli/vars.rs` needs for
+/// This is the entry point `curl-rs/src/cli/vars.rs` will need for
 /// `--variable @file[N-M]`; `src/var.c:455` is the C call site.
 ///
 /// An inverted range is `PARAM_NO_MEM`, which deserves its reasoning written
@@ -1040,6 +1113,7 @@ pub(crate) fn file2string(
 /// already buffered the C addition would wrap and copy about 2^64 bytes, which
 /// is undefined behaviour rather than behaviour to reproduce -- and it is
 /// unreachable.
+#[allow(dead_code)]
 pub(crate) fn file2memory_range(
     file: Option<&mut dyn ByteSource>,
     starto: i64,
@@ -1173,21 +1247,21 @@ pub(crate) fn file2memory_range(
 ///
 /// Exactly `file2memory_range(bufp, size, file, 0, CURL_OFF_T_MAX)`: the whole
 /// source, with no range restriction and no seek.
+#[allow(dead_code)]
 pub(crate) fn file2memory(
     file: Option<&mut dyn ByteSource>,
 ) -> Result<Vec<u8>, ParameterError> {
     file2memory_range(file, 0, CURL_OFF_T_MAX)
 }
 
-// ===========================================================================
 // Protocol sets
-// ===========================================================================
 
 /// `enum e_action` -- `src/tool_paramhlp.c:420`.
 ///
 /// The modifier a `--proto` token carries: `+` or nothing allows, `-` denies,
 /// `=` replaces the whole set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum Action {
     /// `allow` -- add to the set.
     Allow,
@@ -1211,6 +1285,7 @@ enum Action {
 ///
 /// The C entry point could also be called with NULL to obtain the cardinality
 /// (`:337-338`). That use disappears: a slice carries its own length.
+#[allow(dead_code)]
 fn protoset_index(
     info: &LibInfo,
     protoset: &[&'static str],
@@ -1240,6 +1315,7 @@ fn protoset_index(
 /// C's guard is `if(!protoset[n])`, meaning the index returned was the
 /// terminator's, i.e. not found. An index equal to the length says the same
 /// thing here.
+#[allow(dead_code)]
 fn protoset_set(
     info: &LibInfo,
     protoset: &mut Vec<&'static str>,
@@ -1263,6 +1339,7 @@ fn protoset_set(
 /// emitting, and it is reproduced rather than replaced by an order-preserving
 /// removal so that no intermediate ordering difference can hide a sorting
 /// mistake.
+#[allow(dead_code)]
 fn protoset_clear(
     info: &LibInfo,
     protoset: &mut Vec<&'static str>,
@@ -1314,6 +1391,7 @@ fn protoset_clear(
 ///
 /// An empty result is `PARAM_BAD_USE` (`:504-507`), which is what `"-all"` with
 /// nothing added produces.
+#[allow(dead_code)]
 pub(crate) fn proto2num(
     info: &LibInfo,
     preset: &[&str],
@@ -1510,6 +1588,7 @@ pub(crate) fn proto2num(
 /// `"ipfs"` is correctly unsupported: `src/tool_libinfo.c:47-50` declares
 /// `proto_ipfs` and `proto_ipns` as hard-coded literals that are never part of
 /// `built_in_protos`, so `proto_token()` cannot return them.
+#[allow(dead_code)]
 pub(crate) fn check_protocol(
     info: &LibInfo,
     text: Option<&str>,
@@ -1528,7 +1607,6 @@ pub(crate) fn check_protocol(
     }
 }
 
-// ===========================================================================
 // Keyword tables: src/tool_paramhlp.c:612-650
 //
 // All three share one shape. They match with `curl_strequal`, which
@@ -1537,7 +1615,6 @@ pub(crate) fn check_protocol(
 // fold, which would accept spellings curl rejects. All three
 // fall back to a default and emit a frozen warning; **none of them can fail**,
 // which is why they return a value rather than a `Result`.
-// ===========================================================================
 
 /// `ftpfilemethod` -- `src/tool_paramhlp.c:612-624`.
 ///
@@ -1545,6 +1622,7 @@ pub(crate) fn check_protocol(
 /// else warns and yields `CURLFTPMETHOD_MULTICWD`, matching `:622`.
 ///
 /// The `--ftp-method` call site is `src/tool_getparam.c:2495`.
+#[allow(dead_code)]
 pub(crate) fn ftpfilemethod(
     text: &str,
     sink: &mut dyn Write,
@@ -1578,6 +1656,7 @@ pub(crate) fn ftpfilemethod(
 /// yields `CURLFTPSSL_CCC_PASSIVE`, matching `:634`.
 ///
 /// The `--ftp-ssl-ccc-mode` call site is `src/tool_getparam.c:2799`.
+#[allow(dead_code)]
 pub(crate) fn ftpcccmethod(
     text: &str,
     sink: &mut dyn Write,
@@ -1607,6 +1686,7 @@ pub(crate) fn ftpcccmethod(
 /// warns and yields `CURLGSSAPI_DELEGATION_NONE`, matching `:648`.
 ///
 /// The `--delegation` call site is `src/tool_getparam.c:2549`.
+#[allow(dead_code)]
 pub(crate) fn delegation(
     text: &str,
     sink: &mut dyn Write,
@@ -1633,22 +1713,20 @@ pub(crate) fn delegation(
     CURLGSSAPI_DELEGATION_NONE
 }
 
-// ===========================================================================
 // String lists: src/tool_paramhlp.c:601-610, :652-671
-// ===========================================================================
 
 /// `add2list` -- `src/tool_paramhlp.c:601-610`.
 ///
 /// The C body is `curl_slist_append`, which returns `NULL` only when
 /// allocation fails; the caller maps that to `PARAM_NO_MEM` at `:607`.
 ///
-/// AAP section 0.6.9 replaces the intrusive `curl_slist` with an owned
-/// collection internally -- "`curl_slist` retains its C shape only at the ABI
-/// boundary" -- so `Vec::push` cannot report failure and the error arm is
-/// unreachable. The fallible signature is kept regardless, because thirteen C
-/// call sites across `src/tool_getparam.c` and `src/tool_operate.c` propagate
-/// the `ParameterError` and changing the shape would ripple into every one of
-/// them.
+/// The intrusive `curl_slist` becomes an owned collection internally -- it
+/// retains its C shape only at the ABI boundary -- so `Vec::push` cannot
+/// report failure and the error arm is unreachable. The fallible signature is
+/// kept regardless, because thirteen C call sites across `src/tool_getparam.c`
+/// and `src/tool_operate.c` propagate the `ParameterError` and changing the
+/// shape would ripple into every one of them.
+#[allow(dead_code)]
 pub(crate) fn add2list(
     list: &mut Vec<String>,
     ptr: &str,
@@ -1662,6 +1740,7 @@ pub(crate) fn add2list(
 /// The byte that must follow a header name for `inlist` to call it a match.
 /// `';'` counts because `-H` accepts `Name;` as the "send an empty header"
 /// form.
+#[allow(dead_code)]
 const fn is_header_sep(byte: u8) -> bool {
     byte == b':' || byte == b';'
 }
@@ -1683,6 +1762,7 @@ const fn is_header_sep(byte: u8) -> bool {
 ///
 /// The two `DEBUGASSERT`s at `:661-662` are preserved as `debug_assert!`:
 /// `checkfor` must be non-empty and must not already carry the `':'`.
+#[allow(dead_code)]
 fn inlist(head: &[String], checkfor: &str) -> bool {
     let needle = checkfor.as_bytes();
     // `:661-662`
@@ -1710,16 +1790,17 @@ fn inlist(head: &[String], checkfor: &str) -> bool {
     false
 }
 
-// ===========================================================================
 // Credentials: src/tool_paramhlp.c:547-599, :673-706
-// ===========================================================================
 
 /// The password prompt, injected so the frozen text can be asserted.
 ///
 /// [`get_args`] supplies [`crate::terminal::getpass_r`]; the tests supply a
 /// recorder. The two arguments are the prompt and the maximum password length,
 /// matching `getpass_r`'s own contract at `src/tool_getpass.h:35`.
-type PromptFn<'a> = &'a mut dyn FnMut(&str, usize) -> Vec<u8>;
+///
+/// The prompt crosses as bytes because it interpolates a username that need
+/// not be valid UTF-8; see [`checkpasswd`].
+type PromptFn<'a> = &'a mut dyn FnMut(&[u8], usize) -> Vec<u8>;
 
 /// `checkpasswd` -- `src/tool_paramhlp.c:548-599`.
 ///
@@ -1730,7 +1811,7 @@ type PromptFn<'a> = &'a mut dyn FnMut(&str, usize) -> Vec<u8>;
 /// # The two frozen prompts
 ///
 /// `:580-587` builds one of exactly two strings, and both are frozen ABI-level
-/// output under AAP section 0.8.1 -- no trailing space, no trailing newline,
+/// output -- no trailing space, no trailing newline,
 /// the colon inside the literal:
 ///
 /// * `Enter {kind} password for user '{user}':` when `i == 0` **and** `last`
@@ -1738,6 +1819,23 @@ type PromptFn<'a> = &'a mut dyn FnMut(&str, usize) -> Vec<u8>;
 ///
 /// The index is **one-based**: `:583` passes `i + 1` to `%zu`. `kind` is the
 /// literal `"host"` or `"proxy"` chosen by [`get_args`].
+///
+/// # The prompt is composed as bytes
+///
+/// `%s` at `:582` and `:585` renders the username from a `char *`, and a
+/// credential taken from a command line is a byte string that need not be valid
+/// UTF-8. Composing through `format!` would require decoding it first, and
+/// `String::from_utf8_lossy` would put U+FFFD on the terminal where C puts the
+/// user's own bytes -- a change to frozen CLI output, which AAP section 0.8.1
+/// rules out. The prompt is therefore built into a `Vec<u8>` and
+/// [`crate::terminal::getpass_r`] takes `&[u8]`, so no decoding happens
+/// anywhere on the path. Only `kind` and the URL number are text, and both are
+/// ASCII literals produced here.
+///
+/// The composed prompt is truncated to [`PROMPT_CONTENT_MAX`], which is
+/// `curl_msnprintf`'s bound on the `char prompt[256]` of `:568`. The bound is
+/// on bytes, so a multi-byte sequence straddling it is split exactly as
+/// `addbyter` splits it.
 ///
 /// # When no prompt happens
 ///
@@ -1749,7 +1847,7 @@ type PromptFn<'a> = &'a mut dyn FnMut(&str, usize) -> Vec<u8>;
 /// # Hiding the login options without mutating the caller's string
 ///
 /// Translation difference 7 in the module documentation: C truncates in place
-/// at `:578` (`*osep = '\0'`) so the prompt shows only the user name, then
+/// at `:578` (`*osep = '\0'`) so the prompt shows only the username, then
 /// restores the `';'` at `:588` **before** composing the result at `:590`. The
 /// login options are consequently absent from the prompt but present in the
 /// credential. This translation slices for the prompt and composes from the
@@ -1764,6 +1862,7 @@ type PromptFn<'a> = &'a mut dyn FnMut(&str, usize) -> Vec<u8>;
 /// `CURLE_OUT_OF_MEMORY`, because `:590-591` maps any `curlx_dyn_addf` failure
 /// to it -- the same `CURLE_TOO_LARGE` collapse recorded as translation
 /// difference 2.
+#[allow(dead_code)]
 fn checkpasswd(
     kind: &str,
     i: usize,
@@ -1787,28 +1886,45 @@ fn checkpasswd(
         return CURLcode::Ok;
     }
 
-    // `:578` -- the prompt shows the user name alone. Slicing replaces the
+    // `:578` -- the prompt shows the username alone. Slicing replaces the
     // in-place NUL; see the note above.
-    let shown_bytes = match osep {
+    let shown = match osep {
         Some(index) => match current.get(..index) {
             Some(head) => head,
             None => current,
         },
         None => current,
     };
-    // GAP #5: `getpass_r` takes `&str`, so a user name that is not UTF-8 is
-    // rendered lossily *in the prompt only*. The credential composed below is
-    // built from the original bytes and is never re-encoded.
-    let shown = String::from_utf8_lossy(shown_bytes);
 
-    // `:580-587` -- the two frozen prompts. `i + 1` is the one-based URL
-    // number that `%zu` receives at `:583`.
+    // `:580-587` -- the two frozen prompts, composed as **raw bytes**. `%s` on
+    // a `char *` copies the username byte for byte, so a name that is not
+    // valid UTF-8 must not be re-encoded on the way to the terminal; rendering
+    // it through `String::from_utf8_lossy` would put U+FFFD on the terminal in
+    // its place and change the emitted bytes, which AAP section 0.8.1 forbids.
+    // `i + 1` is the one-based URL number that `%zu` receives at `:583`.
     let urlnum = i.saturating_add(1);
-    let prompt_text = if i == 0 && last {
-        format!("Enter {kind} password for user '{shown}':")
+    let mut prompt_text: Vec<u8> = Vec::new();
+    prompt_text.extend_from_slice(b"Enter ");
+    prompt_text.extend_from_slice(kind.as_bytes());
+    prompt_text.extend_from_slice(b" password for user '");
+    prompt_text.extend_from_slice(shown);
+    prompt_text.push(b'\'');
+    if i == 0 && last {
+        prompt_text.push(b':');
     } else {
-        format!("Enter {kind} password for user '{shown}' on URL #{urlnum}:")
-    };
+        prompt_text.extend_from_slice(b" on URL #");
+        prompt_text.extend_from_slice(urlnum.to_string().as_bytes());
+        prompt_text.push(b':');
+    }
+    // `:580` and `:584` -- `curl_msnprintf(prompt, sizeof(prompt), ...)` over
+    // the `char prompt[256]` declared at `:570`. `curl_mvsnprintf`
+    // (`lib/mprintf.c:1077-1100`) stops storing at `max` and then, when it
+    // filled the buffer exactly, "scraps the last letter" to make room for the
+    // terminating NUL -- so the content a long username can reach is
+    // [`PROMPT_CONTENT_MAX`] bytes and no more. A username long enough to
+    // reach that bound is truncated *in the prompt*; the credential composed
+    // below is built from the untouched original.
+    prompt_text.truncate(PROMPT_CONTENT_MAX);
 
     // `:589` -- getpass_r(prompt, passwd, sizeof(passwd)).
     let passwd = prompt(&prompt_text, PASSWORD_BUFFER_SIZE);
@@ -1816,11 +1932,23 @@ fn checkpasswd(
     // `:590` -- curlx_dyn_addf(&dyn, "%s:%s", *userpwd, passwd), where
     // `*userpwd` has had its `';'` restored at `:588`, so the login options are
     // part of the credential.
+    //
+    // The second `%s` reads `passwd` as a C string, so it **stops at the first
+    // NUL byte**. `getpass_r` writes whatever `read(2)` delivered and can
+    // therefore return a value with an interior NUL -- a user pasting one, or a
+    // redirected file supplying one -- and C would compose the credential from
+    // the bytes before it only. Copying the whole buffer instead would send
+    // different credential bytes than the oracle sends, which is precisely the
+    // wire behaviour AAP section 0.8.1 freezes.
+    let passwd_cstr = match passwd.iter().position(|byte| *byte == 0) {
+        Some(nul) => passwd.get(..nul).unwrap_or(&passwd),
+        None => &passwd,
+    };
     let mut formatted =
-        Vec::with_capacity(current.len().saturating_add(1) + passwd.len());
+        Vec::with_capacity(current.len().saturating_add(1) + passwd_cstr.len());
     formatted.extend_from_slice(current);
     formatted.push(b':');
-    formatted.extend_from_slice(&passwd);
+    formatted.extend_from_slice(passwd_cstr);
 
     // One `dyn_nappend` of the whole formatted string into an empty buffer,
     // exactly as `curlx_dyn_addf` performs it; the cap is MAX_USERPWDLENGTH.
@@ -1837,7 +1965,7 @@ fn checkpasswd(
 
 /// The fields of `struct OperationConfig` that [`get_args`] reads.
 ///
-/// `OperationConfig` lives in `curl-rs/src/config/mod.rs` and is not among
+/// `OperationConfig` belongs to `curl-rs/src/config/mod.rs` and is not among
 /// this file's dependencies, so the borrow is explicit rather than reached for.
 /// The C field names are kept so the mapping needs no lookup:
 /// `src/tool_cfgable.h:274` (`jsoned`), `:149` (`headers`), `:85` (`userpwd`),
@@ -1846,6 +1974,7 @@ fn checkpasswd(
 /// This type deliberately derives **no** `Debug`: obligation O5 forbids any
 /// route by which a password could be logged, traced or printed, and
 /// `userpwd`/`proxyuserpwd` hold exactly that once [`checkpasswd`] has run.
+#[allow(dead_code)]
 pub(crate) struct OperationArgs<'a> {
     /// `config->jsoned` -- set by `--json`.
     pub(crate) jsoned: bool,
@@ -1859,8 +1988,8 @@ pub(crate) struct OperationArgs<'a> {
     /// for.
     pub(crate) oauth_bearer: Option<&'a str>,
     /// `config->next == NULL` at `src/tool_paramhlp.c:676`: true for the final
-    /// operation in the chain. The caller computes it because the chain lives
-    /// in `config/mod.rs`.
+    /// operation in the chain. The caller computes it because the chain
+    /// belongs to `config/mod.rs`.
     pub(crate) last: bool,
 }
 
@@ -1887,8 +2016,9 @@ pub(crate) struct OperationArgs<'a> {
 /// `:691-696`: the host password is skipped entirely when `oauth_bearer` is
 /// set, and the proxy password is attempted only if the host attempt
 /// succeeded.
+#[allow(dead_code)]
 pub(crate) fn get_args(args: OperationArgs<'_>, i: usize) -> CURLcode {
-    let mut prompt: fn(&str, usize) -> Vec<u8> = getpass_r;
+    let mut prompt: fn(&[u8], usize) -> Vec<u8> = getpass_r;
     get_args_with(args, i, &mut prompt)
 }
 
@@ -1896,6 +2026,7 @@ pub(crate) fn get_args(args: OperationArgs<'_>, i: usize) -> CURLcode {
 ///
 /// Exists so the two frozen prompt strings can be asserted without a terminal;
 /// `get_args` is the only production entry point.
+#[allow(dead_code)]
 fn get_args_with(
     args: OperationArgs<'_>,
     i: usize,
@@ -1939,9 +2070,7 @@ fn get_args_with(
     result
 }
 
-// ===========================================================================
 // URL list nodes: src/tool_paramhlp.c:35-55
-// ===========================================================================
 
 /// The counter behind `struct getout`'s `num` field.
 ///
@@ -1951,11 +2080,12 @@ fn get_args_with(
 /// per-config index. AAP section 0.1.2 replaces the C tree's shared mutable
 /// state with "per-module structs and explicit ownership", and a mutable
 /// `static` is forbidden outright, so the counter becomes a field owned by
-/// whichever
-/// aggregate owns the URL list -- `curl-rs/src/config/mod.rs` -- and is
-/// threaded in by `&mut`. A `static AtomicU32` would preserve the C shape but
-/// reintroduce a global singleton and destroy test isolation.
+/// whichever aggregate owns the URL list -- `curl-rs/src/config/mod.rs` -- and
+/// is reached through [`UrlList::sequence`]. A `static AtomicU32` would
+/// preserve the C shape but reintroduce a global singleton and destroy test
+/// isolation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct GetOutSeq {
     /// The value the next node will receive; `outnum` before the `++`.
     next: i32,
@@ -1963,17 +2093,44 @@ pub(crate) struct GetOutSeq {
 
 impl GetOutSeq {
     /// A counter positioned where `:40` starts, at zero.
+    #[allow(dead_code)]
     pub(crate) const fn new() -> Self {
         Self { next: 0 }
+    }
+
+    /// The number the next node will receive: `outnum` **before** `:52`'s
+    /// `++`.
+    ///
+    /// Split from [`GetOutSeq::advance`] so that the number can be put on the
+    /// node before the node is offered to the list, while the increment waits
+    /// until the list has really taken it. `:44`'s failure path leaves
+    /// `outnum` alone, and a single read-and-advance operation could not
+    /// reproduce that.
+    #[allow(dead_code)]
+    fn peek(&self) -> i64 {
+        // `curl_off_t num` (`src/tool_sdecls.h:90`) widens C's `int outnum`,
+        // so the widening is part of the original rather than added here.
+        i64::from(self.next)
+    }
+
+    /// `:52`'s `++`, performed only once the node is in the list.
+    #[allow(dead_code)]
+    fn advance(&mut self) {
+        // `int` overflow is undefined in C and unreachable in practice (it
+        // would need more than two billion URLs on one command line);
+        // saturating keeps this panic-free without pretending to a behaviour
+        // C does not define.
+        self.next = self.next.saturating_add(1);
     }
 }
 
 /// The two fields `new_getout` sets on a freshly appended node.
 ///
-/// `struct getout` is declared at `src/tool_sdecls.h:85-99` and owned by
+/// `struct getout` is declared at `src/tool_sdecls.h:85-99` and belongs to
 /// `curl-rs/src/config/mod.rs`; everything else on it is left at its default,
 /// exactly as `:47`'s `calloc` leaves it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct NewGetOut {
     /// `node->num` -- `:52`. `curl_off_t` in C even though `outnum` is `int`
     /// (`src/tool_sdecls.h:90`), so the widening is part of the original.
@@ -1982,40 +2139,118 @@ pub(crate) struct NewGetOut {
     pub(crate) useremote: bool,
 }
 
-/// `new_getout` -- `src/tool_paramhlp.c:35-55`.
+/// The owning configuration, as much of it as `new_getout` touches.
 ///
-/// GAP #4: the URL list itself (`config->url_list` / `config->url_last`,
-/// `src/tool_cfgable.h:102-103`) lives in `curl-rs/src/config/mod.rs`, which
-/// is not among this file's dependencies. This function therefore computes the
-/// node's contents and advances the sequence; the owner performs the push.
-/// AAP section 0.6.9 turns the intrusive `next` chain into an owned
-/// `Vec<GetOut>`, so appending is the owner's operation in any case. Reported
-/// rather than worked around: nothing here reaches into `config/mod.rs`.
+/// C's signature is `new_getout(struct OperationConfig *config)`: one
+/// parameter, and everything else is read out of it. This port is that
+/// parameter. `OperationConfig` and the list itself live in
+/// `curl-rs/src/config/mod.rs`, which AAP section 0.4.2 keeps out of this
+/// file's imports -- "one import per type actually used" replaces the C tree's
+/// blanket `#include "urldata.h"` -- so the *capabilities* are declared here
+/// and the aggregate implements them. Nothing here names, owns or reaches into
+/// that aggregate, and the three methods are exactly the three things `:35-55`
+/// does with `config`:
 ///
-/// The C function returns `NULL` when `calloc` fails and every caller treats
-/// that as out of memory (`:44-45`). `Vec::push` cannot fail that way, so the
-/// `NULL` branch disappears and this function is infallible.
-pub(crate) fn new_getout(
-    seq: &mut GetOutSeq,
-    remote_name_all: bool,
-) -> NewGetOut {
-    // `:52` -- `node->num = outnum++`, i.e. the pre-increment value.
-    let num = i64::from(seq.next);
-    // `int` overflow is undefined in C and unreachable in practice (it would
-    // need more than two billion URLs on one command line); saturating keeps
-    // this panic-free without pretending to a behaviour C does not define.
-    seq.next = seq.next.saturating_add(1);
-    NewGetOut {
-        num,
-        // `:51`
-        useremote: remote_name_all,
-    }
+/// * [`UrlList::append`] writes `config->url_list` and `config->url_last`
+///   (`src/tool_cfgable.h:102-103`) at `:43-49`.
+/// * [`UrlList::remote_name_all`] reads `config->remote_name_all`
+///   (`src/tool_cfgable.h:226`) at `:51`.
+/// * [`UrlList::sequence`] reads and advances the `static int outnum` of `:40`
+///   at `:52`.
+///
+/// The counter is reached *through* the port rather than passed alongside it
+/// because an owner that holds both the list and the counter cannot hand out
+/// two simultaneous `&mut` borrows of itself. Threading it separately would
+/// force the owner to move the counter out and back, and a window in which the
+/// list has grown but the counter has not is precisely what [`new_getout`]
+/// exists to prevent.
+#[allow(dead_code)]
+pub(crate) trait UrlList {
+    /// Appends `node` last in the list, makes it the tail, and reports the
+    /// position it took.
+    ///
+    /// This is `:42-49` in one operation, which is what makes it atomic:
+    /// `if(last) last->next = node; else config->url_list = node;` followed by
+    /// `config->url_last = node;`. AAP section 0.6.9 replaces the intrusive
+    /// `struct getout *next` chain with an owned collection, so "append last"
+    /// and "move the tail" stop being two writes that can disagree -- the tail
+    /// is wherever the last element is. An implementation that kept a separate
+    /// tail cursor would have to update it here, inside this one call, and not
+    /// afterwards.
+    ///
+    /// The returned position stands in for C's `struct getout *`: the callers
+    /// at `src/tool_getparam.c:1108`, `:1349`, `:1392` and `:1496` keep that
+    /// pointer in `config->url_get`, `url_out` or `url_ul` and then fill the
+    /// node in, so a stable handle to the appended node has to come back out.
+    /// AAP section 0.6.9 turns exactly this kind of retained pointer into a
+    /// key, "so a stale handle is detectably stale rather than a dangling
+    /// pointer".
+    ///
+    /// # Errors
+    ///
+    /// [`ParameterError::NoMem`] when the node cannot be stored. That is
+    /// `:37`'s `curlx_calloc` returning `NULL`, which `:44` turns into a
+    /// `NULL` return and every caller maps to `PARAM_NO_MEM`
+    /// (`src/tool_getparam.c:1110`, `:1352`, `:1395`, `:1499`). The mapping is
+    /// preserved rather than dropped: `Vec::push` aborts the process on an
+    /// allocation failure instead of reporting one, so an implementation that
+    /// wants C's behaviour reserves with `try_reserve` and converts the
+    /// failure. On failure the list must be left exactly as it was.
+    fn append(&mut self, node: NewGetOut) -> Result<usize, ParameterError>;
+
+    /// `config->remote_name_all` -- `--remote-name-all`, read at `:51`.
+    fn remote_name_all(&self) -> bool;
+
+    /// The counter behind `node->num`; see [`GetOutSeq`].
+    fn sequence(&mut self) -> &mut GetOutSeq;
 }
 
-// ===========================================================================
+/// `new_getout` -- `src/tool_paramhlp.c:35-55`.
+///
+/// Appends one node to the URL list and returns its position, which is C's
+/// `struct getout *`. The four callers keep that handle in `config->url_get`,
+/// `url_out` or `url_ul` and fill the node in afterwards
+/// (`src/tool_getparam.c:1102-1112`, `:1344-1353`, `:1388-1396`,
+/// `:1490-1500`).
+///
+/// # The append and the counter move together, or not at all
+///
+/// C does five things and does all of them inside `if(node)` at `:39`, so a
+/// failed `curlx_calloc` leaves the list unchanged **and** leaves `outnum`
+/// where it was. That is reproduced by ordering: the number is put on the node
+/// first, the node is offered to the list second, and the counter advances
+/// only after the list has taken it. A node therefore never carries a number
+/// the counter has not yet issued, and the counter never skips a number no
+/// node received.
+///
+/// # Errors
+///
+/// [`ParameterError::NoMem`], propagated from [`UrlList::append`]. See that
+/// method for why the allocation-error mapping is preserved rather than
+/// dropped on the grounds that Rust collections abort instead.
+#[allow(dead_code)]
+pub(crate) fn new_getout(
+    config: &mut dyn UrlList,
+) -> Result<usize, ParameterError> {
+    // `:51` -- `node->useremote = config->remote_name_all`.
+    let useremote = config.remote_name_all();
+    // `:52` -- `node->num = outnum++`, i.e. the pre-increment value.
+    let num = config.sequence().peek();
+
+    // `:42-49` -- append last in the list and move `config->url_last` to it.
+    // Everything else on the node stays at its default, exactly as `:37`'s
+    // `calloc` leaves it.
+    let position = config.append(NewGetOut { num, useremote })?;
+
+    // `:52`'s `++`, now that the node really is in the list.
+    config.sequence().advance();
+
+    Ok(position)
+}
+
 // Cross-checks
 //
-// AAP section 0.8.7 relocates the coverage of `tests/unit` into the crates,
+// The coverage of `tests/unit` moves into the crates,
 // because a Rust static library does not export `pub(crate)` items and the C
 // unit tests therefore cannot link whatever the quality of the translation.
 // These are that coverage for this module: every acceptance rule, every frozen
@@ -2031,7 +2266,6 @@ pub(crate) fn new_getout(
 // The second convention matters beyond style. `ParameterError` is owned by
 // `cli/args.rs`, which is deliberately not one of this file's dependencies, so
 // nothing here may assume which traits it derives.
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -2047,6 +2281,30 @@ mod tests {
     /// configuration would make every warning assertion below vacuously true.
     fn loud() -> MsgConfig {
         MsgConfig::new(false, true, false)
+    }
+
+    /// The nine schemes AAP 0.6.5 puts in scope, alphabetically ordered as the
+    /// engine orders them.
+    const IN_SCOPE_SCHEMES: &[&str] = &[
+        "file", "ftp", "ftps", "http", "https", "scp", "sftp", "ws", "wss",
+    ];
+
+    /// A library description that serves the nine in-scope schemes.
+    ///
+    /// The `--proto` and `--proto-redir` grammar of `:395-510` -- the
+    /// modifiers, the `all` keyword, the 31-byte truncation, the empty-token
+    /// skip, the alphabetic sort and the empty-result `PARAM_BAD_USE` -- is a
+    /// property of the parser rather than of the scheme list handed to it. It
+    /// therefore has to be exercised against a list that holds something:
+    /// `curl_rs_lib::version::ENGINE_PROTOCOLS` withholds every scheme until
+    /// the protocol engine exists, so the live list is empty today and every
+    /// grammar assertion below would collapse into the same `PARAM_BAD_USE`.
+    ///
+    /// Only the scheme list is synthetic -- see
+    /// `LibInfo::with_protocols`. Which schemes this build actually advertises
+    /// is asserted in `cli/libinfo.rs`, where it belongs.
+    fn served() -> Result<LibInfo, Error> {
+        LibInfo::with_protocols(IN_SCOPE_SCHEMES)
     }
 
     /// The message a warning carried, with `voutf`'s line wrapping undone.
@@ -2660,7 +2918,7 @@ mod tests {
 
     #[test]
     fn proto2num_selects_and_orders() -> Result<(), Error> {
-        let info = get_libcurl_info()?;
+        let info = served()?;
         let mut sink = Vec::new();
 
         // Named protocols with no modifier are allowed into an empty set.
@@ -2693,12 +2951,12 @@ mod tests {
 
     #[test]
     fn proto2num_denies_and_re_allows() -> Result<(), Error> {
-        let info = get_libcurl_info()?;
+        let info = served()?;
         let mut sink = Vec::new();
         let all = info.built_in_protos();
 
-        // `file` is advertised unconditionally by the engine, so it is the one
-        // token available whatever the Cargo feature selection.
+        // `file` is the scheme with no Cargo feature of its own, so it is the
+        // one token every selection carries once the engine lands.
         let mut without: Vec<&str> =
             all.iter().copied().filter(|name| *name != "file").collect();
         without.sort_by(struplocompare4sort);
@@ -2748,7 +3006,7 @@ mod tests {
 
     #[test]
     fn proto2num_handles_all_and_an_emptied_set() -> Result<(), Error> {
-        let info = get_libcurl_info()?;
+        let info = served()?;
         let mut sink = Vec::new();
         let mut everything: Vec<&str> = info.built_in_protos().to_vec();
         everything.sort_by(struplocompare4sort);
@@ -2795,7 +3053,7 @@ mod tests {
 
     #[test]
     fn proto2num_output_is_sorted_and_comma_joined() -> Result<(), Error> {
-        let info = get_libcurl_info()?;
+        let info = served()?;
         let mut sink = Vec::new();
 
         // The tokens come back from `proto_token` in the engine's own
@@ -2827,7 +3085,7 @@ mod tests {
 
     #[test]
     fn proto2num_skips_empty_tokens() -> Result<(), Error> {
-        let info = get_libcurl_info()?;
+        let info = served()?;
         let mut sink = Vec::new();
 
         // `:423-426` -- `if(str == next) { str++; continue; }`.
@@ -2855,7 +3113,7 @@ mod tests {
 
     #[test]
     fn proto2num_warns_about_an_unknown_protocol() -> Result<(), Error> {
-        let info = get_libcurl_info()?;
+        let info = served()?;
 
         // `:486` -- frozen text, and the set is otherwise untouched.
         let mut sink = Vec::new();
@@ -2889,7 +3147,7 @@ mod tests {
             b"unrecognized protocol 'bogus'".to_vec()
         );
 
-        // A stubbed scheme is legitimately unknown (AAP 0.6.5): the engine does
+        // A stubbed scheme is legitimately unknown: the engine does
         // not advertise it, so `--proto smtp` warns here while the 283 fixtures
         // that target it skip on the `Protocols:` line instead.
         let mut stub = Vec::new();
@@ -2907,7 +3165,7 @@ mod tests {
 
     #[test]
     fn proto2num_truncates_an_over_long_token() -> Result<(), Error> {
-        let info = get_libcurl_info()?;
+        let info = served()?;
         let mut sink = Vec::new();
 
         // `char buffer[32]` at `:463` holds 31 bytes and a NUL, so a longer
@@ -2939,18 +3197,23 @@ mod tests {
 
     #[test]
     fn proto2num_ignores_an_unknown_preset_entry() -> Result<(), Error> {
-        let info = get_libcurl_info()?;
+        let info = served()?;
         let mut sink = Vec::new();
 
         // `:410-415` skips a preset name the engine does not know, silently --
-        // there is no warning on that path. `--proto-redir`'s preset
+        // there is no warning on that path, unlike the token loop at `:486`.
+        // The path is live for real presets: `--proto-redir`'s
         // (`src/tool_getparam.c:2349-2355`) names ftp and ftps, which a build
-        // without the `ftp` feature does not advertise, so this path is live.
-        let preset = ["http", "https", "ftp", "ftps"];
-        let text = proto2num(&info, &preset, "", &mut sink, &loud());
-        let text = text.ok();
-        let text: &str = text.as_deref().unwrap_or_default();
-        assert!(text.contains("http"));
+        // without the `ftp` feature does not advertise, and the stubbed schemes
+        // of AAP 0.2.2 are never advertised by any build.
+        let preset = ["http", "https", "gopher", "smtp"];
+        assert_eq!(
+            proto2num(&info, &preset, "", &mut sink, &loud())
+                .ok()
+                .as_deref(),
+            Some("http,https"),
+            "the two unknown preset entries are dropped, not reported"
+        );
         assert!(sink.is_empty());
         Ok(())
     }
@@ -2960,7 +3223,7 @@ mod tests {
     #[test]
     fn check_protocol_reports_what_the_engine_advertises() -> Result<(), Error>
     {
-        let info = get_libcurl_info()?;
+        let info = served()?;
 
         assert!(check_protocol(&info, Some("http")).is_ok());
         assert!(check_protocol(&info, Some("HTTP")).is_ok());
@@ -2981,6 +3244,21 @@ mod tests {
         assert!(matches!(
             check_protocol(&info, None),
             Err(ParameterError::RequiresParameter)
+        ));
+
+        // And against the real engine, where the answer is whatever it
+        // advertises: the function reports, it does not decide. While
+        // `curl_rs_lib::version::ENGINE_PROTOCOLS` withholds every scheme this
+        // refuses `--proto http` too, which is the truthful refusal rather than
+        // a regression -- a scheme with no module cannot be transferred.
+        let live = get_libcurl_info()?;
+        assert_eq!(
+            check_protocol(&live, Some("http")).is_ok(),
+            live.proto_token(Some("http")).is_some()
+        );
+        assert!(matches!(
+            check_protocol(&live, Some("smtp")),
+            Err(ParameterError::LibcurlUnsupportedProtocol)
         ));
         Ok(())
     }
@@ -3032,12 +3310,12 @@ mod tests {
 
     #[test]
     fn checkpasswd_short_prompt_only_for_the_first_and_last_url() {
-        let mut asked: Vec<String> = Vec::new();
+        let mut asked: Vec<Vec<u8>> = Vec::new();
         let mut userpwd = Some(b"bob".to_vec());
         {
-            let mut prompt = |text: &str, max_len: usize| {
+            let mut prompt = |text: &[u8], max_len: usize| {
                 assert_eq!(max_len, PASSWORD_BUFFER_SIZE);
-                asked.push(text.to_owned());
+                asked.push(text.to_vec());
                 b"secret".to_vec()
             };
             assert_eq!(
@@ -3046,8 +3324,8 @@ mod tests {
             );
         }
         assert_eq!(
-            asked.first().map(String::as_str),
-            Some("Enter host password for user 'bob':")
+            asked.first().map(Vec::as_slice),
+            Some(&b"Enter host password for user 'bob':"[..])
         );
         assert_eq!(userpwd.as_deref(), Some(&b"bob:secret"[..]));
     }
@@ -3055,11 +3333,11 @@ mod tests {
     #[test]
     fn checkpasswd_long_prompt_carries_a_one_based_url_number() {
         // Not last, so the long form even at index 0 -- `:580-587`.
-        let mut asked: Vec<String> = Vec::new();
+        let mut asked: Vec<Vec<u8>> = Vec::new();
         let mut first = Some(b"bob".to_vec());
         {
-            let mut prompt = |text: &str, _max: usize| {
-                asked.push(text.to_owned());
+            let mut prompt = |text: &[u8], _max: usize| {
+                asked.push(text.to_vec());
                 b"pw".to_vec()
             };
             assert_eq!(
@@ -3068,16 +3346,16 @@ mod tests {
             );
         }
         assert_eq!(
-            asked.first().map(String::as_str),
-            Some("Enter host password for user 'bob' on URL #1:")
+            asked.first().map(Vec::as_slice),
+            Some(&b"Enter host password for user 'bob' on URL #1:"[..])
         );
 
         // Index 2 is URL #3: the `i + 1` of `:583`.
-        let mut later_asked: Vec<String> = Vec::new();
+        let mut later_asked: Vec<Vec<u8>> = Vec::new();
         let mut third = Some(b"bob".to_vec());
         {
-            let mut prompt = |text: &str, _max: usize| {
-                later_asked.push(text.to_owned());
+            let mut prompt = |text: &[u8], _max: usize| {
+                later_asked.push(text.to_vec());
                 b"pw".to_vec()
             };
             assert_eq!(
@@ -3086,18 +3364,18 @@ mod tests {
             );
         }
         assert_eq!(
-            later_asked.first().map(String::as_str),
-            Some("Enter host password for user 'bob' on URL #3:")
+            later_asked.first().map(Vec::as_slice),
+            Some(&b"Enter host password for user 'bob' on URL #3:"[..])
         );
     }
 
     #[test]
     fn checkpasswd_kind_is_the_literal_the_caller_passes() {
-        let mut asked: Vec<String> = Vec::new();
+        let mut asked: Vec<Vec<u8>> = Vec::new();
         let mut proxy = Some(b"joe".to_vec());
         {
-            let mut prompt = |text: &str, _max: usize| {
-                asked.push(text.to_owned());
+            let mut prompt = |text: &[u8], _max: usize| {
+                asked.push(text.to_vec());
                 b"pw".to_vec()
             };
             assert_eq!(
@@ -3106,8 +3384,8 @@ mod tests {
             );
         }
         assert_eq!(
-            asked.first().map(String::as_str),
-            Some("Enter proxy password for user 'joe' on URL #2:")
+            asked.first().map(Vec::as_slice),
+            Some(&b"Enter proxy password for user 'joe' on URL #2:"[..])
         );
     }
 
@@ -3117,7 +3395,7 @@ mod tests {
         let mut asked = 0_usize;
         let mut complete = Some(b"bob:hunter2".to_vec());
         {
-            let mut prompt = |_text: &str, _max: usize| {
+            let mut prompt = |_text: &[u8], _max: usize| {
                 asked += 1;
                 b"pw".to_vec()
             };
@@ -3132,7 +3410,7 @@ mod tests {
         // Even an empty password counts as present.
         let mut empty_pw = Some(b"bob:".to_vec());
         {
-            let mut prompt = |_text: &str, _max: usize| b"pw".to_vec();
+            let mut prompt = |_text: &[u8], _max: usize| b"pw".to_vec();
             assert_eq!(
                 checkpasswd("host", 0, true, &mut empty_pw, &mut prompt),
                 CURLcode::Ok
@@ -3143,7 +3421,7 @@ mod tests {
         // A value that opens with the login-options separator is left alone.
         let mut options_only = Some(b";auth=NTLM".to_vec());
         {
-            let mut prompt = |_text: &str, _max: usize| b"pw".to_vec();
+            let mut prompt = |_text: &[u8], _max: usize| b"pw".to_vec();
             assert_eq!(
                 checkpasswd("host", 0, true, &mut options_only, &mut prompt),
                 CURLcode::Ok
@@ -3154,7 +3432,7 @@ mod tests {
         // No option at all is nothing to do.
         let mut absent: Option<Vec<u8>> = None;
         {
-            let mut prompt = |_text: &str, _max: usize| b"pw".to_vec();
+            let mut prompt = |_text: &[u8], _max: usize| b"pw".to_vec();
             assert_eq!(
                 checkpasswd("host", 0, true, &mut absent, &mut prompt),
                 CURLcode::Ok
@@ -3165,11 +3443,11 @@ mod tests {
 
     #[test]
     fn checkpasswd_hides_login_options_from_the_prompt_but_keeps_them() {
-        let mut asked: Vec<String> = Vec::new();
+        let mut asked: Vec<Vec<u8>> = Vec::new();
         let mut userpwd = Some(b"bob;auth=NTLM".to_vec());
         {
-            let mut prompt = |text: &str, _max: usize| {
-                asked.push(text.to_owned());
+            let mut prompt = |text: &[u8], _max: usize| {
+                asked.push(text.to_vec());
                 b"pw".to_vec()
             };
             assert_eq!(
@@ -3179,8 +3457,8 @@ mod tests {
         }
         // `:578` truncates for the prompt...
         assert_eq!(
-            asked.first().map(String::as_str),
-            Some("Enter host password for user 'bob':")
+            asked.first().map(Vec::as_slice),
+            Some(&b"Enter host password for user 'bob':"[..])
         );
         // ...and `:588` restores before `:590` composes, so the options are in
         // the credential.
@@ -3189,12 +3467,52 @@ mod tests {
 
     #[test]
     fn checkpasswd_composes_bytes_without_re_encoding_them() {
-        // A user name that is not UTF-8 is rendered lossily in the prompt --
-        // GAP #5 -- but reaches the credential unchanged.
-        let mut asked: Vec<String> = Vec::new();
+        // A username that is not valid UTF-8 reaches BOTH the prompt and the
+        // credential unchanged. `%s` at `:582` renders it from a `char *`, so
+        // 0xFF 0xFE -- which is not a UTF-8 sequence -- must appear verbatim;
+        // `String::from_utf8_lossy` would have put two U+FFFD there instead,
+        // and U+FFFD is three bytes each, so the difference is observable in
+        // the emitted length as well as in the bytes.
+        let mut asked: Vec<Vec<u8>> = Vec::new();
         let mut userpwd = Some(vec![0xffu8, 0xfe, b'x']);
         {
-            let mut prompt = |text: &str, _max: usize| {
+            let mut prompt = |text: &[u8], _max: usize| {
+                asked.push(text.to_vec());
+                b"pw".to_vec()
+            };
+            assert_eq!(
+                checkpasswd("host", 0, true, &mut userpwd, &mut prompt),
+                CURLcode::Ok
+            );
+        }
+        let mut expected: Vec<u8> = b"Enter host password for user '".to_vec();
+        expected.extend_from_slice(&[0xff, 0xfe, b'x']);
+        expected.extend_from_slice(b"':");
+        assert_eq!(asked, vec![expected]);
+        assert_eq!(
+            userpwd.as_deref(),
+            Some(&[0xffu8, 0xfe, b'x', b':', b'p', b'w'][..])
+        );
+        // The prompt too: the three raw bytes appear between the quotes, and no
+        // U+FFFD replacement character was substituted for either of the two
+        // that cannot start a UTF-8 sequence.
+        let prompt = asked.first().map(Vec::as_slice).unwrap_or(b"");
+        assert!(prompt.windows(3).any(|w| w == [0xff, 0xfe, b'x']));
+        assert!(!prompt.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]));
+    }
+
+    // -------------------------- F24: C-string semantics at the prompt/passwd --
+
+    #[test]
+    fn checkpasswd_truncates_the_prompt_at_the_c_buffer_bound() {
+        // `char prompt[256]` at `:568` with `curl_msnprintf` at `:580`, so the
+        // content stops at 255 bytes. A username long enough to overflow it is
+        // cut short in the prompt, and the credential still carries every byte.
+        let long_user = vec![b'u'; 4096];
+        let mut asked: Vec<Vec<u8>> = Vec::new();
+        let mut userpwd = Some(long_user.clone());
+        {
+            let mut prompt = |text: &[u8], _max: usize| {
                 asked.push(text.to_owned());
                 b"pw".to_vec()
             };
@@ -3203,11 +3521,161 @@ mod tests {
                 CURLcode::Ok
             );
         }
-        assert_eq!(asked.len(), 1);
+        let prompt = asked.first().map(Vec::as_slice).unwrap_or(b"");
+        assert_eq!(
+            prompt.len(),
+            PROMPT_CONTENT_MAX,
+            "the prompt must stop at C's `char prompt[256]` content bound"
+        );
+        assert_eq!(PROMPT_CONTENT_MAX, 255);
+        // Truncation is at the tail, so the fixed prefix survives intact.
+        assert!(prompt.starts_with(b"Enter host password for user 'u"));
+        // ...and the closing "':" was pushed off the end, exactly as
+        // `curl_msnprintf` pushes it off.
+        assert!(!prompt.ends_with(b"':"));
+
+        // The credential is composed from the untouched original, so no byte of
+        // the username is lost there.
+        let mut expected = long_user;
+        expected.push(b':');
+        expected.extend_from_slice(b"pw");
+        assert_eq!(userpwd.as_deref(), Some(&expected[..]));
+    }
+
+    #[test]
+    fn checkpasswd_leaves_a_short_prompt_exactly_at_the_bound_intact() {
+        // One byte below the bound must not be touched; this is the control for
+        // the truncation above, so a cap applied unconditionally would fail here.
+        // "Enter host password for user '" is 30 bytes and "':" is 2, so a
+        // 223-byte name lands the prompt on exactly 255.
+        let name = vec![b'v'; PROMPT_CONTENT_MAX - 30 - 2];
+        let mut asked: Vec<Vec<u8>> = Vec::new();
+        let mut userpwd = Some(name);
+        {
+            let mut prompt = |text: &[u8], _max: usize| {
+                asked.push(text.to_owned());
+                b"pw".to_vec()
+            };
+            assert_eq!(
+                checkpasswd("host", 0, true, &mut userpwd, &mut prompt),
+                CURLcode::Ok
+            );
+        }
+        let prompt = asked.first().map(Vec::as_slice).unwrap_or(b"");
+        assert_eq!(prompt.len(), PROMPT_CONTENT_MAX);
+        assert!(
+            prompt.ends_with(b"':"),
+            "a prompt that exactly fits keeps its closing quote and colon"
+        );
+    }
+
+    #[test]
+    fn checkpasswd_stops_the_password_at_its_first_nul() {
+        // `curlx_dyn_addf(&dyn, "%s:%s", ...)` at `:590` reads the password as a
+        // C string. `getpass_r` stores whatever `read(2)` delivered, so an
+        // interior NUL is reachable, and C composes only the bytes before it.
+        // Sending the whole buffer instead would change the credential bytes,
+        // which is what Basic authentication encodes.
+        let mut userpwd = Some(b"bob".to_vec());
+        {
+            let mut prompt = |_text: &[u8], _max: usize| b"good\0evil".to_vec();
+            assert_eq!(
+                checkpasswd("host", 0, true, &mut userpwd, &mut prompt),
+                CURLcode::Ok
+            );
+        }
+        assert_eq!(userpwd.as_deref(), Some(&b"bob:good"[..]));
+    }
+
+    #[test]
+    fn checkpasswd_composes_nothing_when_the_password_opens_with_a_nul() {
+        // The degenerate case of the rule above: `%s` on a buffer whose first
+        // byte is NUL contributes no bytes at all, so the credential is the user
+        // name, a colon, and nothing.
+        let mut userpwd = Some(b"bob".to_vec());
+        {
+            let mut prompt = |_text: &[u8], _max: usize| b"\0hidden".to_vec();
+            assert_eq!(
+                checkpasswd("host", 0, true, &mut userpwd, &mut prompt),
+                CURLcode::Ok
+            );
+        }
+        assert_eq!(userpwd.as_deref(), Some(&b"bob:"[..]));
+    }
+
+    #[test]
+    fn checkpasswd_keeps_every_byte_of_a_nul_free_password() {
+        // The control for the two above: a password with no NUL, including bytes
+        // that are not valid UTF-8, is composed in full.
+        let mut userpwd = Some(b"bob".to_vec());
+        {
+            let mut prompt =
+                |_text: &[u8], _max: usize| vec![0x80u8, b'p', 0xff];
+            assert_eq!(
+                checkpasswd("host", 0, true, &mut userpwd, &mut prompt),
+                CURLcode::Ok
+            );
+        }
         assert_eq!(
             userpwd.as_deref(),
-            Some(&[0xffu8, 0xfe, b'x', b':', b'p', b'w'][..])
+            Some(&[b'b', b'o', b'b', b':', 0x80, b'p', 0xff][..])
         );
+    }
+
+    #[test]
+    fn checkpasswd_truncates_the_prompt_at_the_c_buffer_size() {
+        // `:568` declares `char prompt[256]` and `:580`/`:584` fill it with
+        // `curl_msnprintf`, which keeps at most 255 bytes
+        // (`lib/mprintf.c:1088-1095`). A username long enough to reach the
+        // bound is cut there, and the credential is composed from the full
+        // value regardless -- the cut belongs to the display string alone.
+        let mut asked: Vec<Vec<u8>> = Vec::new();
+        let long_user = vec![b'u'; 400];
+        let mut userpwd = Some(long_user.clone());
+        {
+            let mut prompt = |text: &[u8], _max: usize| {
+                asked.push(text.to_vec());
+                b"pw".to_vec()
+            };
+            assert_eq!(
+                checkpasswd("host", 0, true, &mut userpwd, &mut prompt),
+                CURLcode::Ok
+            );
+        }
+        let mut untruncated: Vec<u8> =
+            b"Enter host password for user '".to_vec();
+        untruncated.extend_from_slice(&long_user);
+        untruncated.extend_from_slice(b"':");
+        untruncated.truncate(PROMPT_CONTENT_MAX);
+        assert_eq!(asked.first().map(Vec::len), Some(PROMPT_CONTENT_MAX));
+        assert_eq!(asked, vec![untruncated]);
+
+        let mut whole: Vec<u8> = long_user;
+        whole.extend_from_slice(b":pw");
+        assert_eq!(userpwd.as_deref(), Some(whole.as_slice()));
+    }
+
+    #[test]
+    fn checkpasswd_leaves_a_prompt_one_byte_short_of_the_cap_intact() {
+        // The boundary from the other side: exactly 255 bytes is kept whole,
+        // because `curl_mvsnprintf` scraps a byte only when the buffer filled
+        // to `max` (`lib/mprintf.c:1090-1094`).
+        let fixed = b"Enter host password for user '".len() + 2;
+        let user = vec![b'u'; PROMPT_CONTENT_MAX - fixed];
+        let mut asked: Vec<Vec<u8>> = Vec::new();
+        let mut userpwd = Some(user);
+        {
+            let mut prompt = |text: &[u8], _max: usize| {
+                asked.push(text.to_vec());
+                b"pw".to_vec()
+            };
+            assert_eq!(
+                checkpasswd("host", 0, true, &mut userpwd, &mut prompt),
+                CURLcode::Ok
+            );
+        }
+        assert_eq!(asked.first().map(Vec::len), Some(PROMPT_CONTENT_MAX));
+        assert!(asked.first().is_some_and(|text| text.ends_with(b"':")));
     }
 
     #[test]
@@ -3219,7 +3687,7 @@ mod tests {
 
         let mut ok_value = Some(b"bob".to_vec());
         {
-            let mut prompt = |_text: &str, _max: usize| vec![b'p'; fits];
+            let mut prompt = |_text: &[u8], _max: usize| vec![b'p'; fits];
             assert_eq!(
                 checkpasswd("host", 0, true, &mut ok_value, &mut prompt),
                 CURLcode::Ok
@@ -3232,7 +3700,7 @@ mod tests {
 
         let mut too_big = Some(b"bob".to_vec());
         {
-            let mut prompt = |_text: &str, _max: usize| vec![b'p'; fits + 1];
+            let mut prompt = |_text: &[u8], _max: usize| vec![b'p'; fits + 1];
             assert_eq!(
                 checkpasswd("host", 0, true, &mut too_big, &mut prompt),
                 CURLcode::OutOfMemory
@@ -3256,17 +3724,17 @@ mod tests {
     ) -> (
         CURLcode,
         Vec<String>,
-        Vec<String>,
+        Vec<Vec<u8>>,
         Option<Vec<u8>>,
         Option<Vec<u8>>,
     ) {
         let mut headers = headers;
         let mut userpwd = userpwd;
         let mut proxyuserpwd = proxyuserpwd;
-        let mut asked: Vec<String> = Vec::new();
+        let mut asked: Vec<Vec<u8>> = Vec::new();
         let code = {
-            let mut prompt = |text: &str, _max: usize| {
-                asked.push(text.to_owned());
+            let mut prompt = |text: &[u8], _max: usize| {
+                asked.push(text.to_vec());
                 b"pw".to_vec()
             };
             let args = OperationArgs {
@@ -3390,8 +3858,8 @@ mod tests {
         assert_eq!(
             asked,
             vec![
-                "Enter host password for user 'bob':".to_owned(),
-                "Enter proxy password for user 'joe':".to_owned(),
+                b"Enter host password for user 'bob':".to_vec(),
+                b"Enter proxy password for user 'joe':".to_vec(),
             ]
         );
         assert_eq!(userpwd.as_deref(), Some(&b"bob:pw"[..]));
@@ -3414,7 +3882,7 @@ mod tests {
         // Only the proxy is asked about; the host value is untouched.
         assert_eq!(
             asked,
-            vec!["Enter proxy password for user 'joe':".to_owned()]
+            vec![b"Enter proxy password for user 'joe':".to_vec()]
         );
         assert_eq!(userpwd.as_deref(), Some(&b"bob"[..]));
         assert_eq!(proxyuserpwd.as_deref(), Some(&b"joe:pw"[..]));
@@ -3422,43 +3890,127 @@ mod tests {
 
     // -- new_getout, src/tool_paramhlp.c:35-55 -----------------------------
 
+    /// Stand-in for the `OperationConfig` that `curl-rs/src/config/mod.rs`
+    /// owns, holding exactly the three things [`UrlList`] exposes.
+    ///
+    /// `nodes` is the owned collection AAP section 0.6.9 puts in place of the
+    /// intrusive `next` chain, so its last element *is* `config->url_last` --
+    /// which is why an append that leaves the tail stale is not expressible
+    /// here, and why `refuse` exists to exercise `:37`'s failure instead.
+    struct FakeConfig {
+        nodes: Vec<NewGetOut>,
+        seq: GetOutSeq,
+        remote_name_all: bool,
+        /// When set, [`UrlList::append`] reports [`ParameterError::NoMem`]
+        /// without storing anything: C's `curlx_calloc` returning `NULL`.
+        refuse: bool,
+    }
+
+    impl FakeConfig {
+        fn new(remote_name_all: bool) -> Self {
+            Self {
+                nodes: Vec::new(),
+                seq: GetOutSeq::new(),
+                remote_name_all,
+                refuse: false,
+            }
+        }
+    }
+
+    impl UrlList for FakeConfig {
+        fn append(&mut self, node: NewGetOut) -> Result<usize, ParameterError> {
+            if self.refuse {
+                return Err(ParameterError::NoMem);
+            }
+            self.nodes.push(node);
+            Ok(self.nodes.len() - 1)
+        }
+
+        fn remote_name_all(&self) -> bool {
+            self.remote_name_all
+        }
+
+        fn sequence(&mut self) -> &mut GetOutSeq {
+            &mut self.seq
+        }
+    }
+
     #[test]
-    fn new_getout_numbers_nodes_and_carries_remote_name_all() {
-        let mut seq = GetOutSeq::new();
+    fn new_getout_appends_numbers_and_carries_remote_name_all() {
+        // `:42-52` in one step: the node lands in the list, the tail is the
+        // node just appended, `num` counts up from zero and `useremote` comes
+        // from `config->remote_name_all`.
+        let mut config = FakeConfig::new(true);
+        assert_eq!(new_getout(&mut config).ok(), Some(0));
+        assert_eq!(new_getout(&mut config).ok(), Some(1));
         assert_eq!(
-            new_getout(&mut seq, true),
-            NewGetOut {
+            config.nodes,
+            vec![
+                NewGetOut {
+                    num: 0,
+                    useremote: true
+                },
+                NewGetOut {
+                    num: 1,
+                    useremote: true
+                },
+            ]
+        );
+        // The returned handle addresses the node that was just appended, which
+        // is what `config->url_get` holds at `src/tool_getparam.c:1108`.
+        assert_eq!(config.nodes.len() - 1, 1);
+
+        // `--remote-name-all` is read per call, not captured once.
+        let mut plain = FakeConfig::new(false);
+        assert_eq!(new_getout(&mut plain).ok(), Some(0));
+        assert_eq!(
+            plain.nodes,
+            vec![NewGetOut {
                 num: 0,
-                useremote: true
-            }
-        );
-        assert_eq!(
-            new_getout(&mut seq, false),
-            NewGetOut {
-                num: 1,
                 useremote: false
-            }
-        );
-        assert_eq!(
-            new_getout(&mut seq, false),
-            NewGetOut {
-                num: 2,
-                useremote: false
-            }
+            }]
         );
 
-        // The counter is owned, not global: a fresh one restarts at zero.
+        // The counter is owned, not global: a fresh config restarts at zero.
         // Translation difference 1 -- C's `static int outnum` at `:40` could
         // not do this, and neither could a `static AtomicU32`.
-        let mut fresh = GetOutSeq::new();
-        assert_eq!(
-            new_getout(&mut fresh, false),
-            NewGetOut {
-                num: 0,
-                useremote: false
-            }
-        );
+        let mut fresh = FakeConfig::new(false);
+        assert_eq!(new_getout(&mut fresh).ok(), Some(0));
+        assert_eq!(fresh.nodes.first().map(|node| node.num), Some(0));
         assert_eq!(GetOutSeq::default(), GetOutSeq::new());
+    }
+
+    #[test]
+    fn new_getout_leaves_list_and_counter_untouched_when_it_cannot_append() {
+        // `:39` wraps everything in `if(node)`, so a failed `curlx_calloc` at
+        // `:37` appends nothing AND does not advance `outnum`. Both halves are
+        // asserted, because advancing the counter on a refused append would
+        // silently skip a URL number for every later node.
+        let mut config = FakeConfig::new(true);
+        assert_eq!(new_getout(&mut config).ok(), Some(0));
+
+        config.refuse = true;
+        assert!(matches!(
+            new_getout(&mut config),
+            Err(ParameterError::NoMem)
+        ));
+        assert_eq!(config.nodes.len(), 1);
+
+        // The next successful append still receives 1, not 2.
+        config.refuse = false;
+        assert_eq!(new_getout(&mut config).ok(), Some(1));
+        assert_eq!(config.nodes.last().map(|node| node.num), Some(1));
+    }
+
+    #[test]
+    fn getout_sequence_peeks_before_it_advances() {
+        // The split exists so `:52`'s `++` can wait for the append; peeking
+        // twice must yield the same number.
+        let mut seq = GetOutSeq::new();
+        assert_eq!(seq.peek(), 0);
+        assert_eq!(seq.peek(), 0);
+        seq.advance();
+        assert_eq!(seq.peek(), 1);
     }
 
     // -- the strparse primitive, lib/curlx/strparse.c ----------------------

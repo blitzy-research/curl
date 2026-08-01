@@ -24,8 +24,14 @@ one for one.
 - A terminating zero always follows the data, and it is not counted in the
   length that `curlx_dyn_len` reports.
 - `toobig` caps growth: an append that needs to grow the buffer past that cap
-  yields `CURLE_OUT_OF_MEMORY` instead of a larger allocation.
-- A failing append calls `curlx_dyn_free` on the buffer.
+  yields `CURLE_TOO_LARGE` instead of a larger allocation
+  (`lib/curlx/dynbuf.c:82-85`). `CURLE_OUT_OF_MEMORY` is a different
+  condition, reported only when an allocation itself fails
+  (`lib/curlx/dynbuf.c:105-109`). The two codes distinguish "the caller asked
+  for more than this buffer may hold" from "the allocator refused", and
+  callers can tell them apart.
+- A failing append calls `curlx_dyn_free` on the buffer. That holds for both
+  error paths above.
 - A pointer returned by `curlx_dyn_ptr` or `curlx_dyn_uptr` is invalidated by
   the next buffer manipulation call.
 - `curlx_dyn_reset` keeps the allocation and clears the length.
@@ -40,8 +46,8 @@ void curlx_dyn_init(struct dynbuf *s, size_t toobig);
 
 This initializes a struct to use for dynbuf and it cannot fail. The `toobig`
 value **must** be set to the maximum size we allow this buffer instance to
-grow to. The functions below return `CURLE_OUT_OF_MEMORY` when hitting this
-limit.
+grow to. The functions below return `CURLE_TOO_LARGE` when hitting this limit,
+and `CURLE_OUT_OF_MEMORY` only when an allocation fails.
 
 ## `curlx_dyn_free`
 
@@ -179,8 +185,10 @@ arithmetic to get wrong and no reallocation for a caller to miss.
 Each guarantee listed near the top of this page maps across as follows.
 
 - The `toobig` cap stays an explicit, checked maximum. Callers depend on
-  `CURLE_OUT_OF_MEMORY` at exactly that boundary, which makes the cap a
-  behavioral contract rather than an implementation detail.
+  `CURLE_TOO_LARGE` at exactly that boundary, which makes the cap a
+  behavioral contract rather than an implementation detail. Reporting
+  `CURLE_OUT_OF_MEMORY` there instead would be a behavior change, since that
+  code means the allocator refused rather than that the cap was reached.
 - The terminating zero stays observable wherever a caller reads the buffer as
   a C string. The specified design places the trailing zero at the boundary
   that produces a C string and keeps it out of the reported length.
@@ -200,12 +208,20 @@ Each guarantee listed near the top of this page maps across as follows.
   a public interface exposes the `printf` behavior itself, that behavior is
   reproduced in `curl-rs-ffi/src/ffi/printf.rs`.
 
-`#![forbid(unsafe_code)]` is specified at the root of `curl-rs-lib`, with a
+The safety invariant at the root of `curl-rs-lib` is `#![deny(unsafe_code)]`
+together with exactly one `#[allow(unsafe_code)]`, on `mod ffi`, which is the
 single narrowly allowed island under `curl-rs-lib/src/ffi/` for the operating
-system calls that have no safe expression, and a mandatory `// SAFETY:`
-comment on every `unsafe` block there. A buffer module has no business in that
-island: the design above reaches for nothing that `bytes::BytesMut` or
-`Vec<u8>` does not already provide safely.
+system calls that have no safe expression; every `unsafe` block there carries a
+mandatory `// SAFETY:` comment. It is `deny` rather than `forbid` because
+`forbid` cannot be locally overridden: `forbid` at the root plus an `allow` on
+the island is rejected with
+`error[E0453]: allow(unsafe_code) incompatible with previous forbid`, and
+Agent Action Plan goal G1 permits only three crates, so the island cannot be
+moved into a fourth.
+`deny` is not weaker in effect, since a stray `unsafe` block outside the island
+is a hard error rather than a warning. A buffer module has no business in that
+island in any case: the design above reaches for nothing that
+`bytes::BytesMut` or `Vec<u8>` does not already provide safely.
 
 For the sibling buffer modules, see [bufq](BUFQ.md), whose text notes that a
 `bufq` is initialized and freed similar to the `dynbuf` module, and

@@ -2,22 +2,25 @@
 #
 # SPDX-License-Identifier: curl
 
-# Validation gate 1 of the ten that guard the Rust workspace: BUILD.
+# The BUILD gate for the Rust workspace.
 #
 # This workflow runs `cargo build --locked --release --workspace` once per
 # mandated target triple, with warnings denied, and it confirms the minimum
 # supported Rust version still builds the workspace. It does nothing else.
-# The lint gate lives in rust-clippy.yml, the tests in rust-test.yml, coverage
-# in rust-coverage.yml, undefined behaviour in rust-miri.yml, the sanitizer in
-# rust-asan.yml, symbol and header parity in rust-abi.yml, the supply chain in
-# rust-audit.yml, and the curl fixture corpus in curl-testsuite.yml. One
-# workflow per validation gate, so that a failure names its own cause.
+# One workflow per validation gate, so that a failure names its own cause: lint
+# is rust-clippy.yml's, the tests rust-test.yml's, undefined behaviour
+# rust-miri.yml's, the sanitizer rust-asan.yml's, coverage rust-coverage.yml's,
+# the supply chain rust-audit.yml's, symbol and public-header parity
+# rust-abi.yml's, and the curl fixture corpus curl-testsuite.yml's. All nine are
+# on disk, this file among them, alongside hygiene.yml, which owns the spelling,
+# prohibited-wording and public-header style checks.
 #
 # That principle is why there is no clippy step, no `cargo fmt`, no
 # `cargo test`, no coverage instrumentation, no `cargo audit`, no symbol
 # comparison and no invocation of tests/runtests.pl anywhere below. Every one
-# of those has an owner, and a second owner would mean a red cross that does
-# not say what broke.
+# of those has a designated owner - rust-clippy.yml, rust-test.yml,
+# rust-coverage.yml, rust-audit.yml, rust-abi.yml and curl-testsuite.yml - and a
+# second owner would mean a red cross that does not say what broke.
 #
 # LINEAGE. This file is the successor to the compilation half of two C build
 # workflows, .github/workflows/linux.yml and .github/workflows/macos.yml, both
@@ -31,17 +34,15 @@
 # because the C build system offers no way to separate them. Cargo does, so
 # this file builds and stops.
 #
-# WHAT THIS GATE PROVES, AND WHAT IT DELIBERATELY DOES NOT
+# WHAT THIS GATE PROVES: the committed lockfile resolves; every workspace
+# member compiles for each of the four mandated triples in release
+# configuration; the compilation is free of rustc warnings; the four expected
+# artifacts appear; and the minimum supported Rust version accepts the same tree
+# and the same lockfile.
 #
-# Proves: the committed lockfile resolves; every workspace member compiles for
-# each of the four mandated triples in release configuration; the compilation
-# is free of rustc warnings; the four expected artifacts appear; and the
-# minimum supported Rust version accepts the same tree and the same lockfile.
-#
-# Does not prove: that the artifacts export the right symbols, that the
+# WHAT IT DOES NOT PROVE: that the artifacts export the right symbols, that the
 # generated public header is correct, that the code behaves correctly, or that
-# the dependency graph is free of advisories. Those are other gates, by
-# design.
+# the dependency graph is free of advisories. Those belong to other gates.
 
 name: 'Rust build'
 
@@ -51,26 +52,21 @@ name: 'Rust build'
       - master
       - '*/ci'
     # A deny-list, not an allow-list, and the same four entries the sibling
-    # Rust workflows and the two C build workflows use. An allow-list would
-    # have to enumerate Cargo.toml, Cargo.lock, rust-toolchain.toml,
+    # Rust workflows and the two C build workflows use. An allow-list would have
+    # to enumerate Cargo.toml, Cargo.lock, rust-toolchain.toml,
     # .cargo/config.toml, three member manifests, two build scripts and every
-    # source path in three crates, and the day one of them was left out is the
-    # day a change merged without ever having been compiled. `projects/**`
-    # holds the OS400, Windows and VMS project files, which are outside this
-    # migration entirely and cannot affect a Rust build.
+    # source path in three crates, and the day one was left out is the day a
+    # change merged without ever having been compiled. `projects/**` holds the
+    # OS400, Windows and VMS project files, outside this migration entirely.
     #
-    # ONE ENTRY IS DELIBERATELY ABSENT, and the omission is the considered
-    # choice rather than an oversight. macos.yml additionally ignores
-    # '**/*.md', which for a documentation-only commit is reasonable there.
-    # It would be wrong here, because in this workspace markdown is a BUILD
-    # INPUT: curl-rs/build.rs drives scripts/managen over docs/cmdline-opts to
-    # generate the embedded manual, and it names the directory plus every one
-    # of the 293 `*.md` pages inside it in `cargo:rerun-if-changed=`
-    # directives. It also asserts the page count, so a page added or removed
-    # without its companion table being updated is a BUILD FAILURE. Ignoring
-    # markdown would let exactly that class of change reach master without
-    # this gate ever running. The cost of keeping markdown in scope is some
-    # redundant builds; the cost of ignoring it is a hole in gate 1.
+    # ONE ENTRY IS DELIBERATELY ABSENT. macos.yml also ignores '**/*.md', which
+    # is reasonable there and wrong here, because in this workspace markdown is
+    # a BUILD INPUT: curl-rs/build.rs drives scripts/managen over
+    # docs/cmdline-opts to generate the embedded manual, naming the directory
+    # and all 293 `*.md` pages in `cargo:rerun-if-changed=` directives, and it
+    # asserts the page count - so a page added or removed without its companion
+    # table being updated is a BUILD FAILURE. Ignoring markdown would let
+    # exactly that class of change reach master without this gate running.
     paths-ignore:
       - '.circleci/**'
       - 'appveyor.*'
@@ -138,10 +134,82 @@ env:
   #                           named anyway so the requirement is visible
   CROSS_LINUX_PACKAGES: 'gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross'
 
+  # THE FOURTEEN IMPLEMENTABLE FEATURES, spelled out, and NEVER `--all-features`.
+  #
+  # The workspace declares fifteen optional features. Fourteen are
+  # implementable; the fifteenth, `hickory-dns`, is a reserved name that no
+  # crate can currently back - every hickory-resolver release satisfying the
+  # workspace floor requires a hickory-proto affected by RUSTSEC-2026-0119, and
+  # every release carrying the fix declares `rust-version 1.88` - so enabling
+  # it raises a deliberate `compile_error!` in curl-rs-lib/src/lib.rs. Cargo
+  # offers no "all except one" selector, so `--all-features` would fail this
+  # gate before a single line of the workspace was compiled, reporting a
+  # feature-set error wearing a build gate's name. Enumerating them is the only
+  # correct form, and rust-audit.yml and rust-miri.yml use the same list.
+  #
+  # The two names that matter most here are the two that are default-OFF and
+  # therefore reach no other step in this file: `negotiate`, which compiles
+  # curl-rs-lib/src/ffi/gss.rs and links a platform GSS-API provider, and
+  # `memdebug`, which installs a counting `#[global_allocator]`. Neither is
+  # exercised by a default build at all, so without this list they would be
+  # shipped never having been compiled for any target.
+  #
+  # Sorted alphabetically so that a name added to the manifests and forgotten
+  # here is visible in a diff rather than lost in an arbitrary ordering.
+  ALL_FEATURES: 'altsvc,brotli,cookies,doh,ftp,gzip,hsts,http2,http3,ssh,websockets,zstd,negotiate,memdebug'
+
+  # What `negotiate` needs at LINK time on a Linux runner.
+  #
+  # curl-rs-lib/src/ffi/gss.rs declares its GSS-API entry points under
+  # `#[cfg_attr(target_os = "linux", link(name = "gssapi_krb5"))]` and
+  # `#[cfg_attr(target_os = "macos", link(name = "GSS", kind = "framework"))]`.
+  # Linkage follows the platform and not the feature: the feature gates the
+  # capability, `target_os` decides which library provides it. On macOS the
+  # provider is Apple's GSS.framework, which every Xcode toolchain ships, so no
+  # installation step is needed there. On Linux it is MIT Kerberos, and
+  # `libgssapi_krb5.so` - the unversioned symlink a linker needs, as distinct
+  # from the `libgssapi_krb5.so.2` a runtime needs - arrives only with the
+  # development package. `krb5-config --libs gssapi` reports
+  # `-lgssapi_krb5 -lkrb5 -lk5crypto -lcom_err`; the transitive three arrive
+  # through the shared object's own DT_NEEDED entries, so only the first is
+  # named as a Rust `link` attribute and only this one package is needed.
+  NATIVE_LINK_PACKAGES: 'libkrb5-dev'
+
+  # THE RECORDED A4 DECISION, and the one thing in this file that is provisional.
+  #
+  # curl-rs-ffi/build.rs REFUSES to build aarch64-apple-darwin unless this
+  # variable is set to exactly `accept-unsupported-varargs`. That is not a
+  # nuisance check, it is the mechanism by which an open, escalated ambiguity
+  # cannot be crossed silently: measured against the compiled build script,
+  # the three other mandated triples build with the variable unset AND with it
+  # set, emitting zero warnings either way, while aarch64-apple-darwin exits
+  # non-zero with the full A4 explanation when it is unset or set to anything
+  # else, and exits zero with exactly ONE `cargo:warning=` naming A4 and the
+  # eleven affected exported symbols when it is set to the accepted value.
+  #
+  # WHY IT IS SET HERE RATHER THAN LEFT UNSET. Leaving it unset would make one
+  # of four mandated legs permanently red for a reason that is already known,
+  # already documented and not a property of the code being compiled, and gate
+  # 1 - "builds on all four targets" - could then never report anything at all.
+  # Setting it records the acceptance in ONE reviewable place instead, and the
+  # advisory it unlocks is not merely tolerated but ASSERTED by a step below:
+  # it must be present on aarch64-apple-darwin and absent on the other three.
+  # An advisory that is asserted cannot be lost, which is the property that
+  # makes recording the acceptance honest rather than a way of hiding it.
+  #
+  # WHAT IT DOES NOT DO. It does not resolve A4. Specification 0.8.6 itself
+  # records three options - raise the minimum supported Rust version, drop
+  # aarch64-apple-darwin, or accept that this target's varargs entry points are
+  # unsupported - and only whoever set the requirements can choose among them.
+  # This variable records the third as the present state of affairs because it
+  # is the only one that lets the mandated matrix run; it is a one-line change
+  # to this block on the day a different choice is made. There is still no
+  # `continue-on-error` on that leg, no `if:` that skips it, and the triple is
+  # not removed.
+  CURL_RS_A4_VARIADIC_DECISION: 'accept-unsupported-varargs'
+
 jobs:
-  # =========================================================================
-  # Gate 1 proper: the four-target release build, warnings denied
-  # =========================================================================
+  # The gate proper: the four-target release build, warnings denied
   build:
     name: ${{ matrix.build.target }}
 
@@ -182,6 +250,7 @@ jobs:
       MATRIX_TARGET: '${{ matrix.build.target }}'
       MATRIX_IMAGE: '${{ matrix.build.image }}'
       MATRIX_CROSS_TOOLCHAIN: '${{ matrix.build.cross_toolchain }}'
+      MATRIX_NATIVE_LINK: '${{ matrix.build.native_link }}'
 
     strategy:
       # Present on every matrix in this repository, and load-bearing for a
@@ -219,14 +288,12 @@ jobs:
         # absent from some of them. macos.yml solves the same problem the same
         # way, with the note "Set it once to silence actionlint."
         build:
-          # -----------------------------------------------------------------
           # The host triple, and the primary leg. Native compile, native link.
-          # -----------------------------------------------------------------
           - target: 'x86_64-unknown-linux-gnu'
             image: 'ubuntu-latest'
             cross_toolchain: ''
+            native_link: 'yes'
 
-          # -----------------------------------------------------------------
           # Cross-compiled from an Ubuntu runner.
           #
           # TWO ROUTES EXIST AND THIS ONE WAS CHOSEN BY MEASUREMENT. The
@@ -257,24 +324,33 @@ jobs:
           # to the requirements and are hostile to a cross build. The
           # assertions that hold the provider pinning in place live in
           # rust-audit.yml and are deliberately not duplicated here.
-          # -----------------------------------------------------------------
+          #
+          # `native_link` IS EMPTY ON THIS LEG AND ONLY ON THIS LEG, and it is
+          # what decides whether the fourteen-feature step below LINKS or only
+          # type-checks. The reason is specific: `negotiate` needs an aarch64
+          # `libgssapi_krb5.so` in the cross sysroot, which means enabling the
+          # arm64 dpkg architecture and pulling libkrb5-dev:arm64 from the
+          # ports archive - a second package source on one leg out of four,
+          # whose failure would be indistinguishable from a link failure in the
+          # code. `cargo check` type-checks src/ffi/gss.rs completely for this
+          # triple without needing it, and the two Apple legs plus the x86_64
+          # Linux leg prove the LINK. That is exactly the division the review
+          # finding asks for: four-target all-feature checks, plus Linux and
+          # macOS native-link builds.
           - target: 'aarch64-unknown-linux-gnu'
             image: 'ubuntu-latest'
             cross_toolchain: 'aarch64-linux'
+            native_link: ''
 
-          # -----------------------------------------------------------------
           # Cross-compiled on an arm64 macOS runner, which links Mach-O for
           # both architectures through one Xcode toolchain.
-          # -----------------------------------------------------------------
           - target: 'x86_64-apple-darwin'
             image: 'macos-latest'
             cross_toolchain: ''
+            native_link: 'yes'
 
-          # -----------------------------------------------------------------
-          # ###################################################################
-          # aarch64-apple-darwin -- THE HIGHEST-SEVERITY OPEN ITEM IN THE PLAN.
-          # Escalated ambiguity A4. READ THIS BEFORE DEBUGGING A FAILURE HERE.
-          # ###################################################################
+          # aarch64-apple-darwin -- AN UNRESOLVED ABI CONFLICT. READ THIS BEFORE
+          # DEBUGGING A FAILURE HERE.
           #
           # Apple's arm64 ABI passes variadic arguments ON THE STACK. Standard
           # AAPCS64, which Linux aarch64 follows, passes them in registers. The
@@ -289,15 +365,15 @@ jobs:
           # THE FAILURE IS SILENT, AND IT WOULD NOT SURFACE IN A LINUX-ONLY
           # ENVIRONMENT. It is not a compilation error, so this leg compiling
           # green is not evidence that the entry points work. Conversely, if
-          # this leg ever fails, check A4 before suspecting this workflow.
+          # this leg ever fails, suspect the argument-passing conflict before
+          # suspecting this workflow.
           #
-          # The remedy is the stabilised c_variadic feature, which was measured
-          # as stable on nightly 1.99 and therefore requires a toolchain NEWER
-          # than the mandated floor of 1.75. Two of the requirements - the MSRV
-          # floor and this four-target matrix - cannot both be met by any
-          # implementation. Resolving that is a decision for whoever set them:
-          # raise the MSRV, drop this target, or accept that this target's
-          # varargs entry points are unsupported.
+          # The remedy is the stabilised c_variadic feature, which is stable on
+          # nightly 1.99 and therefore requires a toolchain NEWER than the
+          # mandated floor of 1.75. The MSRV floor and this four-target matrix
+          # cannot both be met by any implementation. Resolving that is a
+          # decision for whoever set them: raise the MSRV, drop this target, or
+          # accept that this target's varargs entry points are unsupported.
           #
           # UNTIL THAT DECISION IS MADE, NOTHING HERE MAY PAPER OVER IT. There
           # is no `continue-on-error` on this entry, no `if:` that skips it, no
@@ -307,15 +383,15 @@ jobs:
           # assurance.
           #
           # Related and expected: curl-rs-ffi/build.rs deliberately emits a
-          # `cargo:warning=` advisory about A4 when it sees this target. That
-          # advisory MUST NOT fail this leg, and under the zero-warning
-          # mechanism chosen below it cannot - see the build step for why that
-          # is a property of the mechanism rather than an exception carved out
-          # for it.
-          # -----------------------------------------------------------------
+          # `cargo:warning=` advisory about this conflict when it sees this
+          # target. That advisory MUST NOT fail this leg, and under the
+          # zero-warning mechanism chosen below it cannot - see the build step
+          # for why that is a property of the mechanism rather than an exception
+          # carved out for it.
           - target: 'aarch64-apple-darwin'
             image: 'macos-latest'
             cross_toolchain: ''
+            native_link: 'yes'
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -366,13 +442,14 @@ jobs:
       - name: 'assert: the pinned stable toolchain, and a mandated target'
         run: |
           # Nightly is deliberately absent from rust-toolchain.toml, because
-          # only two gates need it and both install it for themselves and name
-          # it per invocation: rust-miri.yml and rust-asan.yml. THIS FILE MUST
-          # NOT INSTALL OR INVOKE NIGHTLY. The assertion below is what says so
-          # out loud rather than trusting that no `+nightly` crept into a step,
-          # and it matters beyond tidiness: an unstable flag or a nightly-only
-          # construct that compiled here would break every consumer building on
-          # the pinned stable channel.
+          # only two gates need it and each must install it for itself and name
+          # it per invocation. rust-miri.yml does; the AddressSanitizer leg is
+          # required but not yet added and must do the same when it lands. THIS
+          # FILE MUST NOT INSTALL OR INVOKE NIGHTLY. The assertion below is what
+          # says so out loud rather than trusting that no `+nightly` crept into
+          # a step, and it matters beyond tidiness: an unstable flag or a
+          # nightly-only construct that compiled here would break every consumer
+          # building on the pinned stable channel.
           pinned="$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)"
           if [ -z "${pinned}" ]; then
             echo 'FAIL: rust-toolchain.toml declares no [toolchain] channel'
@@ -381,7 +458,8 @@ jobs:
           case "${pinned}" in
             nightly*|beta*)
               echo "FAIL: rust-toolchain.toml pins ${pinned}."
-              echo 'Gate 1 builds on the pinned stable channel; nightly belongs to rust-miri.yml and rust-asan.yml.'
+              echo 'Gate 1 builds on the pinned stable channel. Nightly belongs to rust-miri.yml,'
+              echo 'and to rust-asan.yml, which AAP section 0.3.1 specifies but which is not yet on disk.'
               exit 1
               ;;
           esac
@@ -406,7 +484,7 @@ jobs:
               ;;
           esac
 
-          # The three-file target agreement, asserted rather than assumed. The
+          # The three-file target agreement. The
           # matrix above, rust-toolchain.toml `targets` and deny.toml
           # [graph] targets must describe one identical set of four triples: if
           # they drift, this gate builds a triple the toolchain does not
@@ -479,11 +557,10 @@ jobs:
           # That is the same attribution argument that put this gate in its own
           # workflow, applied one level down.
           #
-          # --locked because Cargo.lock is committed and reproducible builds
-          # are non-negotiable: it makes a lockfile that disagrees with the
-          # manifests fail loudly here rather than be silently regenerated
-          # underneath the gate. Every cargo invocation in this file that reads
-          # the lockfile carries it.
+          # --locked because Cargo.lock is committed: it makes a lockfile that
+          # disagrees with the manifests fail loudly here rather than be
+          # silently regenerated underneath the gate. Every cargo invocation in
+          # this file that reads the lockfile carries it.
           #
           # --target narrows the fetch to the graph this leg actually needs,
           # which also means a dependency that is unresolvable for this triple
@@ -500,36 +577,36 @@ jobs:
         # deny would force a full rebuild between this leg and the clippy leg
         # AND would destroy per-gate attribution by turning every other
         # workflow's warnings into errors too. Step scope is what keeps the
-        # deny inside gate 1.
+        # deny inside this gate.
         #
-        # WHAT IT COVERS, MEASURED RATHER THAN ASSUMED, by inspecting every
-        # rustc invocation of a build shaped like this workspace:
+        # WHAT IT COVERS, established by inspecting every rustc invocation of
+        # a build shaped like this workspace:
         #
         #   workspace member lib/bin   no cap-lints, receives the deny  DENIED
         #   registry dependency lib    receives the deny, but Cargo also
         #                              applies --cap-lints allow to it   capped
         #   build script (any)         host unit; does not receive it    exempt
         #
-        # So the deny effectively scopes to the workspace's own code. That is
-        # exactly what is wanted: a warning inside one of the 325 external
-        # crates is not ours to fix and must not be able to fail this gate,
-        # while a warning in our own code fails it immediately. Confirmed
-        # end-to-end: a single unused variable planted in a workspace crate
-        # turns this step red with `error: unused variable`, and the identical
-        # tree exits 0 with the deny removed.
+        # So the deny effectively scopes to the workspace's own code, which is
+        # what is wanted: a warning inside one of the 325 external crates is not
+        # ours to fix and must not be able to fail this gate, while a warning in
+        # our own code fails it immediately. Confirmed end-to-end - one unused
+        # variable planted in a workspace crate turns this step red with
+        # `error: unused variable`, and the identical tree exits 0 with the deny
+        # removed.
         #
         # WHY NOT THE LOG-GREP ALTERNATIVE. Capturing the build log and failing
-        # on the text `warning:` was measured and DISQUALIFIED, not merely
-        # ranked lower. On a clean, warning-free build that grep still matches,
-        # because cargo renders build-script advisories as
-        # `warning: <crate>@<version>: <text>`. curl-rs-ffi/build.rs emits
-        # exactly such an advisory, on purpose, for open ambiguity A4 whenever
-        # it sees aarch64-apple-darwin, and curl-rs/build.rs emits others when
-        # an optional input such as Perl is absent. A log grep would therefore
-        # fail the Apple arm64 leg on an INTENTIONAL advisory - a false
-        # negative on the one target whose real defect is silent, which is the
-        # worst possible failure mode here. The deny-flag mechanism is immune
-        # by construction: a build-script advisory is a cargo diagnostic, not a
+        # on the text `warning:` is DISQUALIFIED, not merely ranked lower: on a
+        # clean, warning-free build that grep still matches, because cargo
+        # renders build-script advisories as `warning: <crate>@<version>:
+        # <text>`. curl-rs-ffi/build.rs emits exactly such an advisory, on
+        # purpose, for the unresolved Apple arm64 variadic conflict whenever it
+        # sees aarch64-apple-darwin, and curl-rs/build.rs emits others when an
+        # optional input such as Perl is absent. A log grep would therefore fail
+        # the Apple arm64 leg on an INTENTIONAL advisory - a false negative on
+        # the one target whose real defect is silent, which is the worst
+        # possible failure mode here. The deny-flag mechanism is immune by
+        # construction: a build-script advisory is a cargo diagnostic, not a
         # rustc lint, so it is reported in the log and does not affect the exit
         # status. Verified: a build carrying that advisory and nothing else
         # exits 0.
@@ -546,7 +623,7 @@ jobs:
         env:
           RUSTFLAGS: '-D warnings'
         run: |
-          # Gate 1, verbatim, with --locked and the per-leg --target added.
+          # The gate command itself, with --locked and the per-leg --target.
           #
           # --workspace covers all three members in one invocation:
           #   curl-rs-lib   the engine, an rlib
@@ -554,7 +631,7 @@ jobs:
           #   curl-rs-ffi   a cdylib and a staticlib, named `curl` by its
           #                 [lib] table so the artifacts are libcurl.*
           #
-          # --release because that is what gate 1 names, and because the
+          # --release because that is what the gate names, and because the
           # release profile is where the workspace's own settings apply -
           # link-time optimisation off, unwinding preserved so a panic stays
           # contained at the FFI boundary, and overflow checks deliberately
@@ -567,14 +644,35 @@ jobs:
           # than failing, so its absence would be a quietly smaller manual and
           # not a red build - which is precisely why no step here asserts
           # anything about Perl that the build script does not.
-          cargo build --locked --release --workspace --target "${MATRIX_TARGET}"
+          #
+          # STREAMED THROUGH tee, AND THIS IS NOT THE LOG-GREP THAT WAS
+          # DISQUALIFIED ABOVE. Nothing here greps for the word `warning:` -
+          # that is still the deny flag's job and still the reason a
+          # build-script advisory cannot fail this step. The log is kept for
+          # ONE narrow purpose, in its own step below: asserting that the A4
+          # variadic advisory is PRESENT on aarch64-apple-darwin and ABSENT on
+          # the other three triples. That is the opposite of tolerating it. The
+          # real status is recovered from PIPESTATUS because tee always
+          # succeeds and the default shell is `bash -e` without `pipefail`.
+          log="${RUNNER_TEMP}/build-default.log"
+
+          status=0
+          cargo build --locked --release --workspace --target "${MATRIX_TARGET}" 2>&1 | tee "${log}"
+          status="${PIPESTATUS[0]}"
+
+          if [ "${status}" -ne 0 ]; then
+            echo "FAIL: the default-feature release build failed for ${MATRIX_TARGET}."
+            exit "${status}"
+          fi
+
+          echo "the default-feature release build succeeded for ${MATRIX_TARGET} with warnings denied"
 
       - name: 'artifacts'
         run: |
           # A build that exits 0 while producing nothing is not a build, and
           # cargo will happily do it if a [[bin]] or [lib] table is edited
           # wrongly. This step is what turns "the compiler was happy" into "the
-          # four artifacts gate 1 promises exist".
+          # four artifacts this gate promises exist".
           #
           # The names are not arbitrary. curl-rs/Cargo.toml declares two [[bin]]
           # targets, curl-rs and curlinfo. curl-rs-ffi/Cargo.toml declares
@@ -626,7 +724,8 @@ jobs:
           # Deliberately NOT done here: no nm, no objdump, no symbol counting
           # and no soname inspection. Exported-symbol parity against the
           # 100-name export list, and the generated public header, belong to
-          # rust-abi.yml. Gate 1 asks only whether the artifacts were built.
+          # the symbol-and-header parity gate, which is required but not yet
+          # added. This gate asks only whether the artifacts were built.
           echo '::group::artifact identity'
           for artifact in curl-rs curlinfo "${shared}" libcurl.a; do
             file -- "${out}/${artifact}"
@@ -634,12 +733,531 @@ jobs:
           echo '::endgroup::'
           echo "all four artifacts were produced for ${MATRIX_TARGET}"
 
+      - name: 'package: versioned shared library and consumer metadata'
+        run: |
+          set -eu
+          # WHY A PACKAGING STEP EXISTS IN GATE 1 AT ALL. The step above proves
+          # the four artifacts were produced. It does NOT prove they are
+          # installable, and two of the things a drop-in replacement needs are
+          # not Cargo outputs at all.
+          #
+          # First, the shared library's file name. curl-rs-ffi/build.rs stamps
+          # DT_SONAME=libcurl.so.4 (and -install_name @rpath/libcurl.4.dylib),
+          # derived from lib/Makefile.soname's -version-info 12:0:8, but Cargo
+          # emits one file and calls it libcurl.so. So the artifact DECLARES a
+          # runtime name that no file carries. That is not a load failure - it
+          # is worse. Measured on x86_64-unknown-linux-gnu: a consumer linked
+          # with -lcurl against the unversioned file records DT_NEEDED
+          # libcurl.so.4, the loader does not find it in our tree, searches on,
+          # and resolves to /lib/x86_64-linux-gnu/libcurl.so.4 - the SYSTEM C
+          # libcurl. The consumer then runs successfully against a completely
+          # different implementation, which no test of our artifact would
+          # notice. Review finding M-14.
+          #
+          # Second, curl-config and libcurl.pc. Both are target-specific and
+          # feature-specific, so a matrix of four builds cannot share one path;
+          # curl-rs-ffi/build.rs writes them into OUT_DIR and into an install
+          # staging tree beneath it. Collecting them here is what makes gate 1's
+          # output an installable set rather than four loose binaries. Review
+          # finding M-15.
+          out="target/${MATRIX_TARGET}/release"
+
+          # ONE authority for every derived name, shared with rust-abi.yml, so
+          # the packaging step and the assertion step cannot disagree.
+          echo '::group::derived names'
+          .github/scripts/materialize-soname.sh names "${MATRIX_TARGET}"
+          echo '::endgroup::'
+          eval "$(.github/scripts/materialize-soname.sh names "${MATRIX_TARGET}")"
+
+          .github/scripts/materialize-soname.sh materialize "${MATRIX_TARGET}" "${out}"
+
+          # Assert the chain rather than trusting the script that just built
+          # it: the real object must be a regular file and both other names
+          # must be symlinks, because that is the layout -lcurl and the loader
+          # each resolve through.
+          if [ ! -f "${out}/${LIBCURL_REAL}" ] || [ -L "${out}/${LIBCURL_REAL}" ]; then
+            echo "FAIL: ${out}/${LIBCURL_REAL} is not a regular file."
+            exit 1
+          fi
+          for link in "${LIBCURL_SONAME}" "${LIBCURL_DEV}"; do
+            if [ ! -L "${out}/${link}" ]; then
+              echo "FAIL: ${out}/${link} is not a symlink, so the versioned"
+              echo 'name and the development name are independent copies that'
+              echo 'will diverge on the next rebuild.'
+              exit 1
+            fi
+          done
+
+          # The consumer metadata, collected out of the build script's staging
+          # tree. Its location is derived from Cargo's own OUT_DIR rather than
+          # guessed, and there is exactly one because OUT_DIR is unique per
+          # target and per feature set.
+          staging="$(find "target/${MATRIX_TARGET}/release/build" \
+            -maxdepth 3 -type d -path '*curl-rs-ffi-*/out/staging' 2>/dev/null | head -1)"
+          if [ -z "${staging}" ]; then
+            echo 'FAIL: curl-rs-ffi produced no install staging tree. It must render'
+            echo 'curl-config and libcurl.pc into OUT_DIR/staging; see M-15.'
+            exit 1
+          fi
+          for rel in 'bin/curl-config' 'lib/pkgconfig/libcurl.pc'; do
+            if [ ! -f "${staging}/${rel}" ]; then
+              echo "FAIL: ${staging}/${rel} is missing, so consumers of this build"
+              echo 'have no way to discover its flags.'
+              exit 1
+            fi
+          done
+          if [ ! -x "${staging}/bin/curl-config" ]; then
+            echo 'FAIL: the generated curl-config is not executable.'
+            exit 1
+          fi
+
+          # Assemble the installable set. Copied, never moved, so nothing above
+          # is invalidated and a rerun of this step is idempotent.
+          dist="${out}/dist"
+          rm -rf "${dist}"
+          mkdir -p "${dist}/bin" "${dist}/lib/pkgconfig" "${dist}/include"
+          cp -R "${staging}/bin/." "${dist}/bin/"
+          cp -R "${staging}/lib/pkgconfig/." "${dist}/lib/pkgconfig/"
+          # Headers only. include/curl/ also holds Makefile.am, which belongs to
+          # the build system being replaced and has no place in an install set.
+          mkdir -p "${dist}/include/curl"
+          find include/curl -maxdepth 1 -name '*.h' -exec cp {} "${dist}/include/curl/" \;
+          cp "${out}/curl-rs" "${out}/curlinfo" "${dist}/bin/"
+          cp "${out}/libcurl.a" "${dist}/lib/"
+          # -P so the symlinks are copied AS symlinks; without it the chain
+          # would become three identical 4 MB regular files.
+          cp -P "${out}/${LIBCURL_REAL}" "${out}/${LIBCURL_SONAME}" \
+                "${out}/${LIBCURL_DEV}" "${dist}/lib/"
+
+          echo '::group::installable set'
+          find "${dist}" -mindepth 1 -maxdepth 3 \( -type f -o -type l \) \
+            -exec ls -ld {} +
+          echo '::endgroup::'
+          echo "packaged ${LIBCURL_REAL} and the consumer metadata for ${MATRIX_TARGET}"
+
+      - name: 'assert: a static C consumer links through both generated interfaces'
+        run: |
+          set -eu
+          # THE FOUR-TARGET CLAUSE OF M-21. A Rust staticlib carries no record of
+          # the native libraries the Rust standard library itself needs, so a C
+          # program linking libcurl.a must name them, and its only sources are
+          # `curl-config --static-libs` and `pkg-config --libs --static libcurl`.
+          # The required set is target-specific -- Linux needs -lgcc_s -lutil
+          # -lrt -lpthread -lm -ldl -lc, Apple needs -lSystem -lm plus the
+          # Security and CoreFoundation frameworks that rustls-native-certs
+          # reaches through security-framework -- which is exactly why this runs
+          # inside the matrix rather than once on the host.
+          #
+          # TWO FLAGS MAKE THE TEST NON-VACUOUS, and without either one it
+          # silently proves nothing. Measured on x86_64-unknown-linux-gnu:
+          #
+          #   plain link                     rc=0 with libs AND rc=0 without
+          #   -nodefaultlibs + whole-archive rc=0 with libs, rc=1 / 4368
+          #                                  undefined references without
+          #
+          # `-nodefaultlibs` stops the compiler driver from silently supplying
+          # -lc and -lgcc_s, which would mask anything the metadata omitted.
+          # Forcing every archive member in is equally necessary: a C program
+          # that references nothing from the archive pulls in no objects, so no
+          # undefined symbol can arise however incomplete the metadata is. The
+          # spelling of "force every member" differs by linker.
+          out="target/${MATRIX_TARGET}/release"
+          staging="$(find "${out}/build" -maxdepth 3 -type d \
+            -path '*curl-rs-ffi-*/out/staging' 2>/dev/null | head -1)"
+          if [ -z "${staging}" ]; then
+            echo 'FAIL: no install staging tree, so there is no generated metadata to test.'
+            exit 1
+          fi
+
+          case "${MATRIX_TARGET}" in
+            *-apple-darwin)
+              force_open="-Wl,-force_load,${out}/libcurl.a"
+              force_close=''
+              ;;
+            *-unknown-linux-gnu)
+              force_open="-Wl,--whole-archive ${out}/libcurl.a"
+              force_close='-Wl,--no-whole-archive'
+              ;;
+            *)
+              echo "FAIL: no force-load spelling known for ${MATRIX_TARGET}."
+              exit 1
+              ;;
+          esac
+
+          # Cross-compiled legs are built but not linked here: this runner has no
+          # linker for the foreign target, and a host link would silently test
+          # the wrong object. The metadata is still asserted below, so a
+          # cross leg is not skipped outright.
+          probe="${RUNNER_TEMP}/static_consumer.c"
+          printf 'int main(void) { return 0; }\n' > "${probe}"
+
+          cc_libs="$("${staging}/bin/curl-config" --static-libs | sed 's#[^ ]*libcurl\.a##')"
+          pc_libs="$(PKG_CONFIG_PATH="${PWD}/${staging}/lib/pkgconfig" \
+            pkg-config --libs --static libcurl | sed 's#-lcurl##; s#-L[^ ]*##g')"
+
+          echo "curl-config --static-libs :${cc_libs}"
+          echo "pkg-config  Libs.private :${pc_libs}"
+
+          # ONE AUTHORITY means the two must be identical, not merely similar.
+          # This is the property M-21 asks for and it is checked on every target,
+          # including the cross ones that cannot be linked here.
+          norm_cc="$(printf '%s\n' "${cc_libs}" | tr -s ' ' | sed 's/^ //; s/ $//')"
+          norm_pc="$(printf '%s\n' "${pc_libs}" | tr -s ' ' | sed 's/^ //; s/ $//')"
+          if [ "${norm_cc}" != "${norm_pc}" ]; then
+            echo 'FAIL: the two generated interfaces disagree about the native link set.'
+            echo "  curl-config: [${norm_cc}]"
+            echo "  pkg-config : [${norm_pc}]"
+            echo 'Both must be rendered from the single native-link authority in'
+            echo 'curl-rs-ffi/build.rs. See M-21.'
+            exit 1
+          fi
+          if [ -z "${norm_cc}" ]; then
+            echo 'FAIL: neither interface reports any native library. A Rust staticlib'
+            echo 'always needs some, so an empty set means the authority was not consulted.'
+            exit 1
+          fi
+          echo 'both interfaces report the same native link set'
+
+          # Read the host triple from the toolchain rather than inferring it from
+          # the runner image, so this stays correct if an image's architecture
+          # changes underneath the matrix.
+          host="$(rustc -vV | awk '/^host: / { print $2 }')"
+          if [ "${MATRIX_TARGET}" != "${host}" ]; then
+            echo "cross leg (host ${host}): metadata asserted, link skipped because"
+            echo "this runner has no ${MATRIX_TARGET} linker and a host link would"
+            echo 'silently test the wrong object.'
+          else
+
+          for interface in 'curl-config' 'pkg-config'; do
+            case "${interface}" in
+              curl-config) libs="${cc_libs}" ;;
+              pkg-config)  libs="${pc_libs}" ;;
+            esac
+            log="${RUNNER_TEMP}/static-${interface}.log"
+            # shellcheck disable=SC2086
+            if ! cc -nodefaultlibs "${probe}" ${force_open} ${force_close} ${libs} \
+                 -o "${RUNNER_TEMP}/static_consumer" > "${log}" 2>&1; then
+              echo "FAIL: a static consumer following ${interface} does not link on ${MATRIX_TARGET}."
+              echo "reported libraries:${libs}"
+              grep -E 'undefined (reference|symbol)' "${log}" | head -40
+              echo "total: $(grep -cE 'undefined (reference|symbol)' "${log}") undefined symbol(s)"
+              echo 'The native-link authority in curl-rs-ffi/build.rs is incomplete for'
+              echo 'this target. Re-measure it with:'
+              echo "  cargo rustc -p curl-rs-ffi --release --target ${MATRIX_TARGET} --crate-type staticlib -- --print native-static-libs"
+              exit 1
+            fi
+            echo "${interface}: a static consumer links on ${MATRIX_TARGET}"
+          done
+
+          # Vacuity check, in this run rather than on trust: omitting the
+          # reported libraries must fail. If it does not, -nodefaultlibs is not
+          # being honoured and both passes above are meaningless.
+          # shellcheck disable=SC2086
+          if cc -nodefaultlibs "${probe}" ${force_open} ${force_close} \
+               -o "${RUNNER_TEMP}/static_vacuity" > /dev/null 2>&1; then
+            echo 'FAIL: linking with NO reported libraries succeeded, so this gate cannot'
+            echo 'detect an under-reported native-link set.'
+            exit 1
+          fi
+          echo 'vacuity check: omitting the reported libraries fails, as required'
+
+          fi
+      - name: 'assert: the A4 advisory is present on aarch64-apple-darwin and absent elsewhere'
+        run: |
+          # The counterpart to CURL_RS_A4_VARIADIC_DECISION being set in this
+          # file's env block. Recording an acceptance is only honest if the
+          # advisory it unlocks cannot then be lost, so it is asserted in BOTH
+          # directions: it must appear on the one target whose variadic ABI is
+          # known-wrong, and it must NOT appear on any other.
+          #
+          # The reverse direction is the more valuable half. A change that made
+          # the advisory unconditional would look like a harmless widening and
+          # would in fact destroy the signal, because an advisory that is always
+          # printed tells a reader nothing about which target they are looking
+          # at.
+          log="${RUNNER_TEMP}/build-default.log"
+          if [ ! -s "${log}" ]; then
+            echo 'FAIL: the build step produced no log, so there is nothing to assert on.'
+            exit 1
+          fi
+
+          echo '::group::build-script advisories emitted for this target'
+          grep -F 'warning: curl-rs-ffi@' "${log}" || echo '(none)'
+          echo '::endgroup::'
+
+          # Anchored on the exact prefix curl-rs-ffi/build.rs emits, not on the
+          # bare token A4, so that the word appearing in a source comment that
+          # rustc happens to quote cannot satisfy this assertion.
+          seen='no'
+          if grep -q -F 'A4 decision on record (CURL_RS_A4_VARIADIC_DECISION=' "${log}"; then
+            seen='yes'
+          fi
+
+          case "${MATRIX_TARGET}" in
+            aarch64-apple-darwin)
+              if [ "${seen}" != 'yes' ]; then
+                echo 'FAIL: aarch64-apple-darwin built without the A4 variadic advisory.'
+                echo 'That advisory is the only thing announcing that eleven of the hundred exported symbols'
+                echo 'are not drop-in on this target. Losing it converts an open, escalated ambiguity into a'
+                echo 'silent one. curl-rs-ffi/build.rs owns the advisory; restore it there.'
+                exit 1
+              fi
+              echo 'aarch64-apple-darwin emitted the A4 advisory, as it must while A4 is open'
+              ;;
+            *)
+              if [ "${seen}" = 'yes' ]; then
+                echo "FAIL: ${MATRIX_TARGET} emitted the A4 variadic advisory, but A4 is specific to"
+                echo "aarch64-apple-darwin - Apple's arm64 ABI passes variadic arguments on the stack while"
+                echo 'standard AAPCS64 passes them in registers. An advisory printed on every target is a'
+                echo 'signal that has stopped carrying information. Narrow the condition in'
+                echo 'curl-rs-ffi/build.rs; do not relax this assertion.'
+                exit 1
+              fi
+              echo "${MATRIX_TARGET} emitted no A4 advisory, which is correct: A4 is specific to Apple arm64"
+              ;;
+          esac
+
+      - name: 'assert: the DEFAULT artifacts link no GSS-API'
+        run: |
+          # THE DEFAULT NO-GSS PROOF, retained as its own step precisely so that
+          # adding the feature legs below cannot dilute it.
+          #
+          # curl-rs-lib/src/ffi/gss.rs states the claim itself: with `negotiate`
+          # off the module is not compiled, so there is "no item, no `#[link]`
+          # directive, no linker input, no symbol", and `ldd` on a default build
+          # finds no libgssapi_krb5. This step is what turns that comment into a
+          # checked property of the shipped artifact.
+          #
+          # The direction matters. ABSENCE is assertable without qualification,
+          # because with the feature off nothing ever passes -lgssapi_krb5 to
+          # the linker, so the entry cannot appear for any reason. That is why
+          # the mirror-image assertion in the link step below is deliberately
+          # weaker - see the comment there.
+          #
+          # readelf, not ldd, for the ELF targets: this job may hold a
+          # cross-built aarch64 object that ldd on an x86_64 host refuses to
+          # examine, while readelf reads any architecture. otool for Mach-O.
+          #
+          # `anchor` is a string that EVERY genuine listing for the platform
+          # contains. It exists because of a measured weakness in the obvious
+          # vacuity guard; the assertion that uses it explains why.
+          case "${MATRIX_TARGET}" in
+            *-apple-darwin)
+              shared='libcurl.dylib'
+              lister='otool -L'
+              anchor='libSystem'
+              ;;
+            *-unknown-linux-gnu)
+              shared='libcurl.so'
+              lister='readelf -d'
+              anchor='libc.so'
+              ;;
+            *)
+              echo "FAIL: no dynamic-dependency lister is known for ${MATRIX_TARGET}."
+              exit 1
+              ;;
+          esac
+
+          out="target/${MATRIX_TARGET}/release"
+          deps="${RUNNER_TEMP}/default-deps.txt"
+          # shellcheck disable=SC2086 # ${lister} is a command plus one flag, and must split
+          ${lister} "${out}/${shared}" > "${deps}"
+
+          echo '::group::dynamic dependencies of the default-feature libcurl'
+          cat "${deps}"
+          echo '::endgroup::'
+
+          # NON-VACUITY, and deliberately NOT `[ ! -s "${deps}" ]`. That test was
+          # tried first and MEASURED to be too weak: it only catches a listing of
+          # zero bytes, so a lister that succeeds and emits nothing but a blank
+          # line - which is also what a changed output format or a wrong flag
+          # would look like - sails past it, both greps below find nothing, and
+          # the step passes for entirely the wrong reason. The two assertions
+          # here are ABSENCE assertions, and an absence assertion over an empty
+          # haystack is always satisfied, so the haystack has to be proved real
+          # before it is searched.
+          #
+          # The anchor is the C runtime, because every dynamically linked
+          # artifact on either platform records it: an ELF libcurl.so always
+          # carries a NEEDED entry for libc.so, and a Mach-O libcurl.dylib always
+          # carries /usr/lib/libSystem.B.dylib. A listing that does not even name
+          # the C library is not a dependency listing.
+          if ! grep -q -F "${anchor}" "${deps}"; then
+            echo "FAIL: ${lister} produced no recognisable dependency listing for ${out}/${shared}."
+            echo "Every genuine listing on this platform names ${anchor}; this one does not, so the"
+            echo 'absence assertions below would be vacuously true. Either the artifact is not a'
+            echo 'dynamically linked library, or the lister invocation has stopped working.'
+            exit 1
+          fi
+
+          if grep -q -i -E 'gssapi|GSS\.framework|libkrb5|Kerberos' "${deps}"; then
+            echo 'FAIL: a DEFAULT build of libcurl records a dependency on a GSS-API provider.'
+            echo 'The negotiate feature is default-off and gates the whole of curl-rs-lib/src/ffi/gss.rs,'
+            echo 'so a default artifact must contain no GSS item, no #[link] directive and no symbol.'
+            echo 'A dependency here means the cfg gate on that module has been weakened.'
+            exit 1
+          fi
+
+          # The same artifact, checked for the OTHER thing it must never link.
+          # rustls is the sole TLS implementation at every configuration, so a
+          # C TLS library appearing here would be a far larger regression than a
+          # GSS one. rust-audit.yml proves no such crate is in the dependency
+          # GRAPH; this proves none reached the LINKED artifact, which is a
+          # different statement and the one a consumer actually experiences.
+          if grep -q -i -E 'libssl|libcrypto|libgnutls|libmbedtls|libwolfssl|Security\.framework|libssh' "${deps}"; then
+            echo 'FAIL: libcurl links a C TLS or SSH library. rustls and russh are the only permitted'
+            echo 'implementations, at every configuration - not as a default, not behind a feature flag'
+            echo 'and not as a fallback.'
+            exit 1
+          fi
+
+          echo "the default ${shared} links no GSS-API provider and no C TLS or SSH library"
+
+      - name: 'install the native-link prerequisites for negotiate'
+        # Only on the legs that will LINK the feature build, and only on Linux:
+        # macOS needs nothing because GSS.framework ships with Xcode. A guard on
+        # a step that would be meaningless elsewhere, not a mask over failure.
+        if: ${{ matrix.build.native_link && startsWith(matrix.build.image, 'ubuntu') }}
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
+          sudo apt-get -o Dpkg::Use-Pty=0 update
+          sudo apt-get -o Dpkg::Use-Pty=0 install \
+            ${NATIVE_LINK_PACKAGES}
+
+          # Prove the linker input exists, and prove it by the name the Rust
+          # `#[link]` attribute actually asks for. `-lgssapi_krb5` resolves
+          # against the UNVERSIONED libgssapi_krb5.so symlink, which only the
+          # development package provides; the runtime libgssapi_krb5.so.2 is
+          # present on far more systems and is not sufficient. Checking the
+          # wrong one of the two would pass here and fail at link time.
+          echo '::group::the GSS-API provider this leg will link'
+          krb5-config --libs gssapi
+          ldconfig -p | grep -F 'libgssapi_krb5.so' || true
+          echo '::endgroup::'
+
+          if ! krb5-config --libs gssapi | grep -q -F '\-lgssapi_krb5'; then
+            echo 'NOTE: krb5-config does not name -lgssapi_krb5; the link step below is the real test.'
+          fi
+
+          echo 'the MIT Kerberos development package is installed'
+
+      - name: 'check: the fourteen implementable features, all four targets'
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: |
+          # THE FOUR-TARGET ALL-FEATURE CHECK.
+          #
+          # Two features are default-OFF and are therefore compiled by no other
+          # step in any workflow: `negotiate`, which is the whole of
+          # curl-rs-lib/src/ffi/gss.rs plus curl-rs-lib/src/auth/negotiate.rs
+          # and src/proxy/socks_gss.rs, and `memdebug`, which installs a
+          # counting `#[global_allocator]`. Shipping either having never been
+          # type-checked for any target is not acceptable, and type-checking
+          # them on ONE target is not acceptable either: gss.rs selects its
+          # provider with `#[cfg_attr(target_os = ...)]` and raises a
+          # `compile_error!` on any target that is neither Linux nor macOS, so
+          # the per-target arms are exactly the code most likely to rot.
+          #
+          # `cargo check` and not `cargo build`, deliberately. This step's
+          # question is "does every feature combination type-check for every
+          # mandated triple", and a check answers it for all four including the
+          # cross-compiled aarch64 Linux leg, which would otherwise need an
+          # aarch64 GSS-API provider in its sysroot. The LINK question is a
+          # different question and is asked by the next step, on the three legs
+          # that can answer it natively.
+          #
+          # ${ALL_FEATURES} rather than --all-features: the reason is in this
+          # file's env block, and it is that --all-features enables the reserved
+          # `hickory-dns` name and raises a deliberate compile_error!.
+          #
+          # RUSTFLAGS is step-scoped here for the same reason it is on the build
+          # step: a repo-wide deny would participate in Cargo's fingerprint and
+          # destroy per-gate attribution.
+          echo "checking ${MATRIX_TARGET} with: ${ALL_FEATURES}"
+          cargo check --locked --release --workspace \
+            --target "${MATRIX_TARGET}" \
+            --features "${ALL_FEATURES}"
+
+          echo "all fourteen implementable features type-check for ${MATRIX_TARGET} with warnings denied"
+
+      - name: 'build: the fourteen implementable features, natively linked'
+        # Every leg but the cross-compiled aarch64 Linux one; the matrix entry
+        # for that leg explains why it checks rather than links.
+        if: ${{ matrix.build.native_link }}
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: |
+          # THE NATIVE-LINK PROOF, and the reason it is a separate step from the
+          # check above: a type-check cannot discover that a library is missing.
+          # rustc emits `-lgssapi_krb5` for this feature set from the `#[link]`
+          # attribute on the extern block in curl-rs-lib/src/ffi/gss.rs, and a
+          # provider that is absent is a HARD LINK ERROR - `cannot find
+          # -lgssapi_krb5`. So this step succeeding IS the verification that the
+          # platform GSS-API provider was located and linked; there is no weaker
+          # reading of it.
+          #
+          # It rebuilds into the same target directory as the default build, so
+          # the artifacts it leaves behind are the feature-built ones. That is
+          # why the default no-GSS assertion runs BEFORE this step and not
+          # after: the order is load-bearing, not incidental.
+          echo "building ${MATRIX_TARGET} with: ${ALL_FEATURES}"
+          cargo build --locked --release --workspace \
+            --target "${MATRIX_TARGET}" \
+            --features "${ALL_FEATURES}"
+
+          # No `anchor` here, unlike the default no-GSS step above, and the
+          # difference is not an oversight: this step PRINTS the listing rather
+          # than asserting anything absent from it, so there is no absence
+          # assertion that an empty listing could satisfy vacuously.
+          case "${MATRIX_TARGET}" in
+            *-apple-darwin)
+              shared='libcurl.dylib'
+              lister='otool -L'
+              ;;
+            *-unknown-linux-gnu)
+              shared='libcurl.so'
+              lister='readelf -d'
+              ;;
+            *)
+              echo "FAIL: no dynamic-dependency lister is known for ${MATRIX_TARGET}."
+              exit 1
+              ;;
+          esac
+
+          out="target/${MATRIX_TARGET}/release"
+          missing=''
+          for artifact in curl-rs curlinfo "${shared}" libcurl.a; do
+            if [ ! -f "${out}/${artifact}" ]; then
+              missing="${missing} ${artifact}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "FAIL: the feature build reported success but these artifacts are absent:${missing}"
+            exit 1
+          fi
+
+          # PRINTED, NOT ASSERTED, and the asymmetry with the default step above
+          # is deliberate rather than a weaker standard applied twice. Ubuntu's
+          # toolchain links with --as-needed by default, so a NEEDED entry for a
+          # library whose symbols no reachable path references is legitimately
+          # pruned. Asserting the entry's PRESENCE would therefore be asserting
+          # a property of the linker's pruning rather than of this build, and it
+          # would turn a correct link into a red cross. The link having
+          # succeeded at all is the assertion; this listing is the evidence a
+          # reader needs to see beside it.
+          echo '::group::dynamic dependencies of the feature-built libcurl'
+          # shellcheck disable=SC2086 # ${lister} is a command plus one flag, and must split
+          ${lister} "${out}/${shared}"
+          echo '::endgroup::'
+
+          echo "the fourteen implementable features LINK natively for ${MATRIX_TARGET}, GSS-API provider included"
+
       - name: 'assert: this gate wrote nothing outside target/'
         run: |
           # The property that makes everything above trustworthy. Every cargo
           # invocation in this job either only reads the tree or was passed
           # --locked, so nothing should have been able to modify a tracked file
-          # or regenerate Cargo.lock. This says so out loud rather than
+          # or regenerate Cargo.lock. This asserts it rather than
           # assuming it.
           #
           # A finding means one of three things, all of them worth failing on:
@@ -658,9 +1276,7 @@ jobs:
           fi
           echo 'the working tree is byte-identical to the checkout: this gate builds, it does not rewrite'
 
-  # =========================================================================
   # The minimum supported Rust version floor
-  # =========================================================================
   #
   # WHY THIS IS A JOB IN THIS FILE, AND WHY IT IS NOT A MATRIX LEG ABOVE.
   #
@@ -706,8 +1322,8 @@ jobs:
           # download would fail this job for a reason unrelated to the MSRV.
           #
           # Explicitly NOT nightly. Nightly appears nowhere in this file; it
-          # belongs to rust-miri.yml and rust-asan.yml, which install it
-          # themselves.
+          # belongs to rust-miri.yml, which installs it itself, and to the
+          # AddressSanitizer leg once that is added.
           rustup toolchain install "${MSRV_TOOLCHAIN}" --profile minimal
 
       - name: 'toolchain versions'
@@ -770,27 +1386,52 @@ jobs:
         run: |
           # The floor, confirmed.
           #
-          # HOST ONLY, AND NO --release. The question this job answers is
-          # whether the floor toolchain accepts this source and this lockfile,
-          # and a host debug build answers it completely. Adding --target would
-          # re-ask gate 1's question on a toolchain gate 1 does not use, and
-          # adding --release would re-ask it again in a second configuration;
-          # both would blur what a failure here means. --locked stays, because
-          # the lockfile is half of what is being tested.
+          # HOST ONLY, AND NO --release. The question is whether the floor
+          # toolchain accepts this source and this lockfile, and a host debug
+          # build answers it completely. --target would re-ask the release
+          # gate's question on a toolchain it does not use, and --release would
+          # re-ask it in a second configuration; both blur what a failure here
+          # means. --locked stays, because the lockfile is half of what is being
+          # tested.
           #
           # HOW TO READ A FAILURE HERE. It almost certainly means a dependency
           # version in Cargo.toml declares a minimum newer than the floor, and
-          # THE DEFECT IS THAT VERSION PIN, NOT THE FLOOR. Raising the MSRV is
-          # a decision for whoever set it - it is escalated as ambiguity A4 -
-          # and it is not a change to be made to get a build green. The adopted
-          # version set was swept in full against the floor and produced zero
-          # violations, and it was chosen over the newest releases on purpose:
+          # THE DEFECT IS THAT VERSION PIN, NOT THE FLOOR. That tension is
+          # ambiguity A6 in specification 0.8.6 - "MSRV 1.75 versus the latest
+          # quinn, russh and clap" - and A6 is recorded there as RESOLVED, by
+          # adopting a version set that satisfies the floor. It is deliberately
+          # NOT A4: A4 is the aarch64-apple-darwin variadic ABI item, which is a
+          # property of one target rather than of any version pin, and it is
+          # escalated rather than resolved. Confusing the two sends a reader to
+          # the wrong file. Raising the MSRV is in any case a decision for
+          # whoever set it, and not a change to be made to get a build green.
+          #
+          # TWO CAUSES ARE FAR MORE LIKELY THAN A MANDATED CRATE, because both
+          # are transitive and both have already happened once. `cargo update`
+          # re-floats the two lockfile pins that hold this floor reachable:
+          # getrandom must stay at 0.3.3, because 0.3.4 reaches `wasip2` at
+          # rust-version 1.87; and wasi must stay at 0.14.0, because 0.14.7
+          # reaches `wit-bindgen 0.57.1`, which is EDITION 2024. The second is
+          # the nastier of the two - Cargo 1.75 cannot PARSE an edition-2024
+          # manifest, so `cargo metadata` fails for the entire graph and the
+          # error surfaces from cbindgen inside curl-rs-ffi's build script,
+          # nowhere near its cause. Both crates sit on a Windows-only,
+          # WebAssembly-only branch under cc's build dependency on jobserver;
+          # neither is compiled for any mandated target. Cargo.toml's
+          # rust-version comment records the chain and the remedy: restore the
+          # two pins with `cargo update -p <crate>@<new> --precise <pinned>`.
+          #
+          # The adopted version set was swept in full against the floor and
+          # produced zero violations, and it was chosen over the newest
+          # releases on purpose:
           # clap 4.6.4, quinn 0.11.11, russh 0.62.4, rand 0.10.2, sha2 0.11.0
           # and hmac 0.13.0 all declare a minimum of 1.85. Two independent
           # reasons make the adopted set preferable anyway, so a "fix" that
           # advanced those pins would lose both. First, every russh release
           # from 0.58.0 through 0.62.4 pulls release-candidate cryptography -
-          # a release-candidate RSA, ssh-key and pkcs1 - whereas the pinned
+          # a release-candidate RSA and pkcs1 throughout, a release-candidate
+          # ssh-key at 0.62.4, and seventeen such requirements at 0.60.3, the
+          # release that carries the fix - whereas the pinned
           # russh has a fully stable graph, and shipping release-candidate
           # cryptography would put the advisory gate in permanent jeopardy.
           # Second, the adopted set is coherent on one digest generation
@@ -801,12 +1442,12 @@ jobs:
           # ONE OTHER REGRESSION THIS JOB IS THE ONLY GATE TO CATCH. Both build
           # scripts must emit the legacy single-colon `cargo:` directive form
           # rather than the double-colon `cargo::` form, which postdates the
-          # floor. Measured on the floor toolchain, a double-colon directive is
-          # a HARD FAILURE - cargo reports `error: unsupported output in build
-          # script` and stops - so if this job fails with that message the
-          # remedy is to restore the single-colon spelling in the build script,
-          # nothing more. That matters because the soname of the shared library
-          # is emitted by exactly such a directive from curl-rs-ffi/build.rs.
+          # floor. On the floor toolchain a double-colon directive is a HARD
+          # FAILURE - `error: unsupported output in build script` - so if this
+          # job fails with that message the remedy is to restore the
+          # single-colon spelling, nothing more. It matters because the shared
+          # library's soname is emitted by exactly such a directive from
+          # curl-rs-ffi/build.rs.
           cargo "+${MSRV_TOOLCHAIN}" build --locked --workspace
 
       - name: 'assert: this gate wrote nothing outside target/'

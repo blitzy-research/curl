@@ -50,8 +50,9 @@ in the URL.
 When uploading to an SMTP server: the uploaded data is assumed to be RFC 5322
 formatted. It has to feature the necessary set of headers and mail body
 formatted correctly by the user as curl does not transcode nor encode it
-further in any way. This build performs no SMTP or SMTPS transfers, and the
-`Protocols:` line in the --version output names neither scheme. curl parses
-this option and reads the named file, yet the SMTP transfer itself fails with
-`CURLE_UNSUPPORTED_PROTOCOL`; that limit stops at those two mail schemes and
-leaves every other use of this option intact.
+further in any way. Transfers for SMTP and SMTPS are outside the specified
+scope of this rewrite, and the `Protocols:` line of the --version output names
+neither scheme. Parsing this option and reading the named file are still
+specified, with the SMTP transfer itself then failing with
+`CURLE_UNSUPPORTED_PROTOCOL`. That boundary stops at those two mail schemes
+and leaves every other use of this option intact.

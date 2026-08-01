@@ -1,0 +1,390 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Validation gate 8 of the ten that guard the Rust workspace: LINE COVERAGE OF
+# THE PROTOCOL AND TRANSFER MODULE TREES.
+#
+# The gate, verbatim: `cargo llvm-cov` at >=80% line coverage on
+# `curl-rs-lib/src/protocols/` and `curl-rs-lib/src/transfer/`. This file adds
+# `--locked`, `--all-targets`, a filesystem check that the two mandated trees
+# exist, a per-tree measurement, and assertions that the report is a real
+# coverage export rather than an empty or unrelated document. Nothing else.
+#
+# It does nothing further. The build lives in rust-build.yml, lint in
+# rust-clippy.yml, the tests in rust-test.yml, undefined behaviour in
+# rust-miri.yml, the sanitizer in rust-asan.yml, symbol and header parity in
+# rust-abi.yml, supply chain in rust-audit.yml, and the curl fixture corpus in
+# curl-testsuite.yml. One workflow per validation gate, so that a failure names
+# its own cause.
+#
+# WHY THIS GATE IS EXPECTED TO BE RED TODAY, AND WHY THAT IS CORRECT
+#
+# `curl-rs-lib/src/protocols/` and `curl-rs-lib/src/transfer/` do not exist in
+# this checkout yet. AAP 0.4.1 assigns them a large body of work -- http1,
+# http2, http3, the ftp trio, sftp, scp, file, ws and the stub registry on one
+# side, and the transfer loop, request state, sendf, writeout, progress,
+# ratelimit, content_encoding and chunked on the other -- and none of it has
+# landed.
+#
+# This gate therefore fails, naming both absent trees. That is deliberate. The
+# alternative implementations were considered and each is dishonest:
+#
+#   - Summing lines under a prefix that matches nothing yields 0/0. Reported as
+#     a percentage that is either a division by zero or a spurious 100%, it
+#     turns an unwritten module into a passing grade.
+#   - `cargo llvm-cov --fail-under-lines 80` gates the WORKSPACE TOTAL, not the
+#     two mandated trees. Measured on this checkout the workspace total is
+#     97.39% (18127/18613 lines), so a total-only gate passes comfortably while
+#     both mandated trees are absent. That is precisely the vacuous green this
+#     gate exists to prevent, which is why `--fail-under-lines` is not used
+#     here and the per-tree arithmetic is done explicitly.
+#   - Narrowing the mandate to the modules that happen to exist would edit the
+#     requirement instead of meeting it.
+#
+# A red gate that names the missing subject is the truthful state. It turns
+# green when the mandated modules land and are tested, and not before.
+#
+# LINEAGE
+#
+# The C tree had no coverage gate, so nothing is being replaced here. The
+# nearest ancestor is the fixture corpus under tests/data, which exercises the
+# protocol and transfer paths from the outside; that corpus is driven by
+# curl-testsuite.yml. This gate measures the inside, over the unit tests
+# compiled into the crates, and the two are complementary rather than
+# redundant: a fixture can march through a module without ever reaching its
+# error paths, and it is the error paths that the 80% floor is meant to force
+# into being exercised.
+
+name: 'Rust coverage'
+
+on:
+  push:
+    branches:
+      - master
+      - '*/ci'
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}'
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # Colour escapes corrupt the log scraping that the assertions below perform.
+  CARGO_TERM_COLOR: never
+  # A transient registry failure should not be read as a coverage regression.
+  CARGO_NET_RETRY: '3'
+  # Incremental artifacts are useless in a one-shot CI job and interact badly
+  # with coverage instrumentation, which needs a consistent set of objects.
+  CARGO_INCREMENTAL: '0'
+  # The exact stable pin from rust-toolchain.toml. Coverage instrumentation and
+  # the llvm-cov binary that reads the resulting profraw files must come from
+  # one toolchain: llvm-tools-preview ships a profdata/cov pair matched to its
+  # own LLVM, and mixing versions produces "unsupported instrumentation profile
+  # version" rather than a wrong number, but pinning states the intent.
+  STABLE_TOOLCHAIN: '1.97.1'
+  # AAP 0.8.4 gate 8. Expressed here so the number appears exactly once.
+  COVERAGE_MIN: '80'
+  # AAP 0.8.4 gate 8 names these two trees and no others. Space separated,
+  # repository relative, no trailing slash.
+  COVERAGE_TREES: 'curl-rs-lib/src/protocols curl-rs-lib/src/transfer'
+
+jobs:
+  coverage:
+    name: 'line coverage of protocols/ and transfer/'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'install the pinned stable toolchain, with llvm-tools-preview'
+        run: |
+          set -eu
+          if [ -z "${STABLE_TOOLCHAIN}" ]; then
+            echo "FAIL: STABLE_TOOLCHAIN is empty."
+            exit 1
+          fi
+          # llvm-tools-preview supplies llvm-profdata and llvm-cov. cargo-llvm-cov
+          # locates them inside the active toolchain's sysroot, so the component
+          # must be installed on the same toolchain that compiles the code.
+          rustup toolchain install "${STABLE_TOOLCHAIN}" \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --no-self-update
+          rustup default "${STABLE_TOOLCHAIN}"
+
+      - name: 'install cargo-llvm-cov at the pinned version'
+        run: |
+          set -eu
+          # AAP 0.5.1 pins cargo-llvm-cov to exactly 0.8.7. An unpinned install
+          # would let the coverage arithmetic change under an unchanged commit,
+          # which is the same class of defect that the dated nightly pin in
+          # rust-miri.yml exists to prevent.
+          cargo install cargo-llvm-cov --locked --version 0.8.7
+
+      - name: 'toolchain versions'
+        run: |
+          set -eu
+          rustc --version
+          cargo --version
+          cargo llvm-cov --version
+          echo "coverage floor: ${COVERAGE_MIN}%"
+          echo "mandated trees: ${COVERAGE_TREES}"
+
+      - name: 'assert: the pinned stable toolchain is the active one'
+        run: |
+          set -eu
+          have="$(rustc --version | awk '{print $2}')"
+          if [ "${have}" != "${STABLE_TOOLCHAIN}" ]; then
+            echo "FAIL: rustc reports ${have} but this gate is pinned to ${STABLE_TOOLCHAIN}."
+            echo "Coverage numbers are only comparable across runs when the"
+            echo "instrumenting compiler is held fixed."
+            exit 1
+          fi
+          # cargo-llvm-cov shells out to llvm-profdata and llvm-cov from the
+          # sysroot. If the component were missing the run would fail later with
+          # a confusing message, so prove it is present now.
+          sysroot="$(rustc --print sysroot)"
+          found=0
+          for tool in llvm-profdata llvm-cov; do
+            if [ -x "${sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/${tool}" ]; then
+              found=$((found + 1))
+            else
+              echo "FAIL: ${tool} is absent from ${sysroot}."
+              echo "llvm-tools-preview did not install, so no profile could be read."
+              exit 1
+            fi
+          done
+          echo "stable ${have} active, with ${found} llvm tool(s) present"
+
+      - name: 'assert: the mandated module trees exist'
+        run: |
+          set -eu
+          # This is the first of two independent guards. It reads the working
+          # tree, so it fails with a precise message when the mandated modules
+          # have not been written. The second guard reads the coverage report and
+          # catches the different case of a tree that exists but contributes no
+          # instrumented line.
+          missing=''
+          for tree in ${COVERAGE_TREES}; do
+            if [ ! -d "${tree}" ]; then
+              echo "  ${tree}: ABSENT"
+              missing="${missing} ${tree}"
+              continue
+            fi
+            n="$(find "${tree}" -type f -name '*.rs' | wc -l | tr -d ' ')"
+            if [ "${n}" -eq 0 ]; then
+              echo "  ${tree}: present but holds no .rs file"
+              missing="${missing} ${tree}"
+              continue
+            fi
+            echo "  ${tree}: ${n} .rs file(s)"
+          done
+          if [ -n "${missing}" ]; then
+            echo ''
+            echo "FAIL: AAP 0.8.4 gate 8 requires >=${COVERAGE_MIN}% line coverage on"
+            echo "the module trees named in COVERAGE_TREES, but the following are not"
+            echo "present in this checkout:${missing}"
+            echo ''
+            echo "This gate does not pass by measuring nothing. AAP 0.4.1 assigns the"
+            echo "protocol modules (http1, http2, http3, ftp, sftp, scp, file, ws and"
+            echo "the stub registry) and the transfer modules (the transfer loop,"
+            echo "request, sendf, writeout, progress, ratelimit, content_encoding and"
+            echo "chunked). Until they land, the honest verdict is failure that names"
+            echo "the missing subject rather than a green tick over an empty set."
+            exit 1
+          fi
+          echo 'every mandated module tree is present and holds Rust source'
+
+      - name: 'fetch the locked dependency graph'
+        run: |
+          set -eu
+          cargo fetch --locked
+
+      - name: 'the gate: cargo llvm-cov over the workspace'
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/coverage"
+          # --all-targets covers lib, bins, tests and benches but excludes
+          # doctests, matching rust-asan.yml. Doctest coverage needs the unstable
+          # -Z doctest-in-workspace path on nightly, and this gate is pinned to
+          # stable; the doctests themselves are still executed, by rust-test.yml,
+          # so nothing goes unrun.
+          #
+          # --locked keeps the measured graph identical to the committed
+          # Cargo.lock, so a coverage change can never be an unnoticed dependency
+          # change.
+          #
+          # stdin is closed because cargo-llvm-cov interposes on rustc as a
+          # wrapper, and a rustc target-information probe reads its source from
+          # standard input; leaving a live stdin attached lets unrelated bytes be
+          # lexed as Rust.
+          cargo llvm-cov \
+            --locked \
+            --workspace \
+            --all-targets \
+            --json \
+            --output-path "${RUNNER_TEMP}/coverage/coverage.json" \
+            < /dev/null
+          ls -l "${RUNNER_TEMP}/coverage/coverage.json"
+
+      - name: 'assert: each mandated tree meets the line-coverage floor'
+        run: |
+          set -eu
+          # python3 rather than jq: jq is not guaranteed on every runner image,
+          # python3 is, and the aggregation below sums per-file line counts across
+          # a multi-megabyte document, which is fragile in shell and direct here.
+          #
+          # The arithmetic is deliberately explicit rather than delegated to
+          # --fail-under-lines, because that flag gates the workspace total. On
+          # this checkout the total is 97.39% while both mandated trees are
+          # absent, so a total-only gate would pass and report nothing wrong.
+          python3 - \
+            "${RUNNER_TEMP}/coverage/coverage.json" \
+            "${GITHUB_WORKSPACE}" \
+            "${COVERAGE_MIN}" \
+            ${COVERAGE_TREES} <<'PYEOF'
+          import json, os, sys
+
+          REPORT = sys.argv[1]
+          ROOT = os.path.realpath(sys.argv[2])
+          THRESHOLD = float(sys.argv[3])
+          TREES = sys.argv[4:]
+
+          def die(msg):
+              print("FAIL: " + msg)
+              sys.exit(1)
+
+          if not TREES:
+              die("no module tree was named, so this gate would measure nothing. "
+                  "COVERAGE_TREES must list the trees from AAP 0.8.4 gate 8.")
+
+          try:
+              with open(REPORT, "r", encoding="utf-8") as fh:
+                  doc = json.load(fh)
+          except (OSError, ValueError) as exc:
+              die("the coverage report %s could not be read as JSON (%s). cargo "
+                  "llvm-cov must have produced a truncated or absent report."
+                  % (REPORT, exc))
+
+          if doc.get("type") != "llvm.coverage.json.export":
+              die("%s is not an llvm coverage export (type=%r). The gate would "
+                  "otherwise score an unrelated document."
+                  % (REPORT, doc.get("type")))
+
+          data = doc.get("data") or []
+          if not isinstance(data, list) or not data:
+              die("%s carries no 'data' element, so no file was measured at all."
+                  % REPORT)
+
+          files = data[0].get("files")
+          if not isinstance(files, list) or not files:
+              die("%s measured zero files. A report with no files would let every "
+                  "threshold pass vacuously." % REPORT)
+
+          def rel(path):
+              real = os.path.realpath(path)
+              if real.startswith(ROOT + os.sep):
+                  return real[len(ROOT) + 1:]
+              return real
+
+          buckets = {t: {"count": 0, "covered": 0, "files": 0} for t in TREES}
+          for entry in files:
+              name = rel(entry.get("filename", ""))
+              # Third-party and generated code is not the subject of the mandate.
+              if "/.cargo/registry/" in name or name.startswith("target/"):
+                  continue
+              lines = (entry.get("summary") or {}).get("lines") or {}
+              for tree in TREES:
+                  prefix = tree if tree.endswith("/") else tree + "/"
+                  if name.startswith(prefix):
+                      buckets[tree]["count"] += int(lines.get("count", 0))
+                      buckets[tree]["covered"] += int(lines.get("covered", 0))
+                      buckets[tree]["files"] += 1
+
+          totals = (data[0].get("totals") or {}).get("lines") or {}
+          print("workspace total (context only, NOT the gate): %d/%d lines = %.2f%%"
+                % (int(totals.get("covered", 0)), int(totals.get("count", 0)),
+                   float(totals.get("percent", 0.0))))
+          print("")
+          print("mandated module trees, each independently required to reach %.2f%%:"
+                % THRESHOLD)
+
+          failures = []
+          for tree in TREES:
+              b = buckets[tree]
+              if b["files"] == 0:
+                  print("  %-34s NO FILE MEASURED" % tree)
+                  failures.append(
+                      "%s contributed no measured file to the coverage report, so "
+                      "its line coverage is undefined rather than high. AAP 0.8.4 "
+                      "gate 8 requires >=%.0f%% line coverage on this tree; a tree "
+                      "that does not exist cannot satisfy it."
+                      % (tree, THRESHOLD))
+                  continue
+              if b["count"] == 0:
+                  print("  %-34s 0 INSTRUMENTED LINES (%d file(s))"
+                        % (tree, b["files"]))
+                  failures.append(
+                      "%s has %d file(s) in the report but zero instrumented lines, "
+                      "so a percentage cannot be computed. This is a vacuous pass "
+                      "and is rejected." % (tree, b["files"]))
+                  continue
+              pct = 100.0 * b["covered"] / b["count"]
+              verdict = "ok" if pct >= THRESHOLD else "BELOW THRESHOLD"
+              print("  %-34s %6d/%-6d lines = %6.2f%%  (%d file(s))  %s"
+                    % (tree, b["covered"], b["count"], pct, b["files"], verdict))
+              if pct < THRESHOLD:
+                  failures.append(
+                      "%s reaches only %.2f%% line coverage (%d/%d), below the "
+                      "%.0f%% required by AAP 0.8.4 gate 8."
+                      % (tree, pct, b["covered"], b["count"], THRESHOLD))
+
+          print("")
+          if failures:
+              for f in failures:
+                  print("FAIL: " + f)
+              sys.exit(1)
+          print("every mandated module tree meets the %.0f%% line-coverage floor."
+                % THRESHOLD)
+          PYEOF
+
+      - name: 'upload the coverage report'
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-json
+          path: '${{ runner.temp }}/coverage/coverage.json'
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 'assert: this gate wrote nothing outside target/'
+        run: |
+          set -eu
+          # curl-rs-ffi/build.rs generates the public headers into include/curl/.
+          # Those headers are tracked, so a generation change must arrive as a
+          # reviewed commit rather than as a side effect of measuring coverage.
+          changed="${RUNNER_TEMP}/worktree-status.txt"
+          git status --porcelain > "${changed}"
+          if [ -s "${changed}" ]; then
+            echo 'FAIL: the working tree changed while coverage was being measured:'
+            cat "${changed}"
+            exit 1
+          fi
+          echo 'the working tree is unchanged'

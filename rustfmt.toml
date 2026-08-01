@@ -6,41 +6,20 @@
 # curl-rs-ffi.
 #
 # This file and clippy.toml together replace scripts/checksrc.pl, curl's
-# hand-rolled C style enforcer. checksrc.pl declares 50 categories in
-# %warnings at L147-L201 and two more in %warnings_extended at L142-L145.
-# Exactly five of them describe layout rather than C syntax, and all five are
-# answered here:
+# hand-rolled C style enforcer. Five of checksrc.pl's 52 categories describe
+# layout rather than C syntax, and all five are answered here:
 #
-#   LONGLINE (L176)       "Line longer than $max_column", measured against
-#                         `my $max_column = 79;` at L29; the check at L588
-#                         exempts any line containing " https://"
-#                           -> max_width
-#   TABS (L197)           "TAB characters not allowed", enforced at L594
-#                           -> hard_tabs
-#   INDENTATION (L175)    "wrong start column for code", measured against
-#                         `my $indent = 2;` at L30, enforced at L1034 and
-#                         L1059
-#                           -> tab_spaces
-#   TRAILINGSPACE (L198)  "Trailing whitespace on the line", enforced at L599
-#                           -> no key needed: rustfmt strips it
-#                              unconditionally, measured
-#   MULTISPACE (L178)     "multiple spaces used when not suitable", enforced
-#                         at L1155
-#                           -> no key needed: rustfmt emits exactly one space
-#                              wherever one belongs, measured
+#   line length, against checksrc's max_column = 79   -> max_width
+#   TAB characters not allowed                        -> hard_tabs
+#   wrong start column, against checksrc's indent = 2 -> tab_spaces
+#   trailing whitespace                               -> no key needed;
+#                                                        rustfmt strips it
+#                                                        unconditionally
+#   multiple spaces where one belongs                 -> no key needed
 #
-# The other 45 categories in %warnings - BRACEPOS, ASTERISKSPACE,
-# EQUALSNOSPACE, SEMINOSPACE, TYPEDEFSTRUCT, CPPCOMMENTS and their kin - are C
-# syntax rules with no Rust meaning and are not reproduced. COPYRIGHT and
-# COPYRIGHTYEAR are answered by `reuse lint`, and the 89-entry BANNEDFUNC
-# table is addressed in clippy.toml, which records why it is deliberately left
-# unexpressed. The division of labour is written down in both files so that
-# neither can be read alone and misunderstood.
-#
-# No user-specified rules were supplied for this project: `review_rules`
-# returns "No user rules provided." Nothing below comes from a project rule.
-# Every value is either mandated by the specification or measured against this
-# repository, and the measurement is recorded beside the value it justifies.
+# The remaining categories are C syntax rules with no Rust meaning and are not
+# reproduced, except that copyright headers are answered by `reuse lint` and
+# the banned-C-function table is addressed in clippy.toml.
 #
 # Companion configuration, deliberately kept in separate files:
 #   Cargo.toml          edition, mirrored below; rust-version; dependencies
@@ -51,279 +30,163 @@
 #   .cargo/config.toml  per-target linkers
 #   deny.toml           supply-chain policy
 
-# ---------------------------------------------------------------------------
-# Stable options only, and how that was verified
-# ---------------------------------------------------------------------------
+# Stable options only
 #
-# rust-toolchain.toml pins `channel = "1.97.1"` - an exact stable release, not
-# a floating channel - and lists rustfmt among its components. A nightly-gated
-# key here would not take effect. Worse, it would print
+# rust-toolchain.toml pins an exact stable channel, so a nightly-gated key here
+# would not take effect - and worse, would print "can't set `<key>`, unstable
+# features are only available in nightly channel" on every `cargo fmt`, which
+# the zero-warning build gate does not tolerate. Every key below was verified by
+# writing it into this file on the pinned toolchain and confirming rustfmt's
+# stderr stayed empty. Verifying instead with `rustfmt --config key=value` does
+# NOT work: that path accepts nightly-only keys in silence.
 #
-#   Warning: can't set `wrap_comments = true`, unstable features are only
-#   available in nightly channel.
-#
-# on every `cargo fmt` invocation, and the first validation gate requires a
-# build with zero warnings. Every key below was therefore verified by writing
-# it into this file on the pinned toolchain and confirming that rustfmt's
-# stderr stayed empty.
-#
-# One trap is worth recording, because it is the obvious thing to try:
-# verifying with `rustfmt --config key=value` does NOT work. That path accepts
-# nightly-only keys in silence - every one of the unstable keys listed near the
-# end of this file was accepted that way without a word. Only the rustfmt.toml
-# path warns, so only the rustfmt.toml path proves anything.
-#
-# Every key below also predates the declared minimum supported Rust version, so
-# nobody building at the floor sees an "Unknown configuration option" either.
-# Measured across all three rustfmt builds installed for this project - 1.7.0
-# from the 1.75.0 MSRV-floor toolchain, 1.9.0 from the pinned 1.97.1, and
-# 1.10.0-nightly for the Miri and AddressSanitizer legs - each one reads this
-# file with an empty stderr and resolves all nine keys to the same values.
+# Every key below also predates the declared MSRV, so nobody building at the
+# floor sees "Unknown configuration option" either.
 
-# ---------------------------------------------------------------------------
 # edition - rustfmt's own default is "2015"
-# ---------------------------------------------------------------------------
 #
-# Held equal to Cargo.toml:115 `edition = "2021"`, which every member inherits
-# through `edition.workspace = true`, and mandated verbatim by the
-# specification: "Rust edition 2021, MSRV 1.75."
-#
-# It has to be stated here as well as there, because rustfmt invoked directly
-# - as `rustfmt path/to/file.rs`, which is how editor integrations and the
-# ad-hoc checks in this project reach it - defaults to edition 2015 and never
-# reads Cargo.toml. On 2015, `async`, `await` and `dyn` are not keywords, so an
-# `async fn` or a `Box<dyn Protocol>` is misparsed rather than merely
-# misformatted. This workspace is built on both: the connection-filter chain is
-# a `Box<dyn ConnFilter>` chain and the transfer core is async throughout, so
-# the mismatch would not be theoretical.
-#
-# `cargo fmt` passes the manifest edition on the command line, so the two
-# routes agree only for as long as this value tracks Cargo.toml. If Cargo.toml
-# raises its edition, raise this with it.
+# Held equal to Cargo.toml's `edition = "2021"`, which every member inherits.
+# It has to be stated here as well, because rustfmt invoked directly - as
+# `rustfmt path/to/file.rs`, which is how editor integrations reach it -
+# defaults to edition 2015 and never reads Cargo.toml. On 2015 `async`, `await`
+# and `dyn` are not keywords, so an `async fn` or a `Box<dyn Protocol>` is
+# misparsed rather than merely misformatted, and this workspace is built on
+# both. `cargo fmt` passes the manifest edition on the command line, so the two
+# routes agree only for as long as this value tracks Cargo.toml.
 edition = "2021"
 
-# ---------------------------------------------------------------------------
 # max_width - default 100
-# ---------------------------------------------------------------------------
 #
-# curl's measured convention is 79 columns, from two independent places:
-# `my $max_column = 79;` at scripts/checksrc.pl:29, surfaced as the LONGLINE
-# category at L176 and documented in the usage text at L389 as
-# "-m<n>  Maximum line length. Default: 79"; and `max_line_length = 79` in
-# .editorconfig.
+# curl's convention is 79 columns, from scripts/checksrc.pl's max_column and
+# from .editorconfig's max_line_length for `[*.{c,h}]`. 80 rather than 79
+# because rustfmt's max_width is inclusive, so 80 admits a line of exactly 80
+# columns where checksrc.pl admits 79; it is also the conventional Rust
+# expression of the same discipline. Nothing in the repository mandates a width
+# for Rust - .editorconfig has no `[*.rs]` section - so this is a deliberate
+# carry-over of the C tree's discipline, chosen so that a reviewer reading
+# lib/http.c beside its Rust counterpart has both fit one window.
 #
-# 80 rather than 79, and the one-column difference is deliberate rather than
-# sloppy: rustfmt's max_width is an inclusive limit, so 80 admits a line of
-# exactly 80 columns where checksrc.pl admits exactly 79. 80 is the
-# conventional Rust expression of the same discipline, it is the width this
-# file itself is written to, and buying back the last column would gain
-# nothing that a reviewer could see.
+# Two limits, so that nobody reads more into this key than it delivers:
 #
-# Note also what the two 79s actually govern: checksrc.pl only ever runs over
-# C sources, and .editorconfig scopes its 79 to `[*.{c,h}]`. There is no
-# `[*.rs]` section in .editorconfig at all, so nothing in the repository
-# mandates a width for Rust. This value is a deliberate carry-over of the C
-# tree's discipline, not an inherited constraint.
-#
-# Why not rustfmt's default of 100: because at 100 this key would be a no-op,
-# and the file would then contribute nothing at all with respect to the source
-# it derives from. The C tree beside it is 79 columns wide, and during a
-# 192,033-line migration a reviewer reading lib/http.c next to
-# curl-rs-lib/src/protocols/http1.rs is served by both fitting one window.
-#
-# Two measured limits, recorded so that nobody reads more into this key than it
-# delivers:
-#
-#   * It bounds CODE, not comments. wrap_comments is nightly-only, so rustfmt
-#     leaves comment interiors exactly as written - a 121-column comment line
-#     was left untouched at max_width = 80. Doc comments already in this
-#     workspace run to 100 columns, and no formatter run will narrow them.
-#   * It is a target, not an assertion. error_on_line_overflow, which would
-#     turn an unbreakable long line into an error, is nightly-only too, so
-#     rustfmt silently leaves a line it cannot break - a long string literal,
-#     a long path - over the limit. A 108-column line holding an HTTP request
-#     literal was measured staying put, which is exactly the outcome this
-#     project wants; see the format_strings note below.
+#   * It bounds CODE, not comments. wrap_comments is nightly-only, so comment
+#     interiors are left exactly as written and no formatter run will narrow a
+#     long doc comment.
+#   * It is a target, not an assertion. error_on_line_overflow is nightly-only
+#     too, so rustfmt silently leaves a line it cannot break - a long string
+#     literal, a long path - over the limit. That is the outcome this project
+#     wants; see the format_strings note below.
 max_width = 80
 
-# ---------------------------------------------------------------------------
 # hard_tabs - default false, restated as a declared contract
-# ---------------------------------------------------------------------------
 #
-# checksrc.pl:197 makes a TAB a violation outright, "TAB characters not
-# allowed", enforced at L594; .editorconfig sets `indent_style = space` for
-# `[*]`, so it already covers Rust; and scripts/spacecheck.pl - run over every
-# tracked file by .github/workflows/hygiene.yml:165 - reports "content: has
-# tab" for any file outside its narrow allow-list, which does not include
-# `*.rs` or `*.toml`.
-#
-# Three independent gates say the same thing, and rustfmt's default already
-# agrees with all three. It is restated because a formatter configuration that
-# leaves the project's oldest and least negotiable whitespace rule to a default
-# is trusting a default with a rule that predates it. Measured: a tab-indented
-# line is rewritten to spaces at this setting.
+# Three independent gates already say the same thing - checksrc.pl makes a TAB a
+# violation outright, .editorconfig sets `indent_style = space` for `[*]`, and
+# scripts/spacecheck.pl reports "content: has tab" for any file outside a narrow
+# allow-list that excludes `*.rs` and `*.toml`. It is restated because a
+# formatter configuration that leaves the project's oldest and least negotiable
+# whitespace rule to a default is trusting a default with a rule that predates
+# it.
 hard_tabs = false
 
-# ---------------------------------------------------------------------------
 # tab_spaces - default 4, restated as a declared contract
-# ---------------------------------------------------------------------------
 #
-# Four, which is Rust's universal convention and rustfmt's default.
-#
-# This deliberately differs from the C tree's two, and the difference is not a
-# conflict: `my $indent = 2;` at scripts/checksrc.pl:30 governs C files only,
-# and .editorconfig scopes `indent_size = 2` to `[*.{c,h}]` while giving
-# `[*.{pl,pm}]` four. The repository already carries per-language indentation,
-# and there is no `[*.rs]` section for this value to contradict.
-#
-# It is restated for the same reason as hard_tabs: INDENTATION
-# (scripts/checksrc.pl:175, enforced at L1034 and L1059) is one of the five
-# checksrc categories this file inherits, so the width it inherits should be
-# written down rather than assumed.
+# Four, which is Rust's universal convention. This deliberately differs from the
+# C tree's two, and the difference is not a conflict: checksrc.pl's indent
+# governs C files only, and .editorconfig scopes its 2 to `[*.{c,h}]` while
+# giving Perl four. The repository already carries per-language indentation and
+# has no `[*.rs]` section for this value to contradict.
 tab_spaces = 4
 
-# ---------------------------------------------------------------------------
 # newline_style - default "Auto"
-# ---------------------------------------------------------------------------
 #
-# "Auto" copies whatever line ending the file already begins with, so a file
-# that arrives with CRLF keeps it. "Unix" writes LF unconditionally, which is
-# what scripts/spacecheck.pl:125-128 requires of every tracked file that is not
-# a `.bat` or `.sln`: "content: must use LF EOL for this file type". This is
-# therefore not a taste setting - it is the formatter agreeing in advance with
-# a gate that would otherwise fail the build.
+# "Auto" copies whatever line ending a file already begins with, so a file that
+# arrives with CRLF keeps it. "Unix" writes LF unconditionally, which is what
+# scripts/spacecheck.pl requires of every tracked file that is not a `.bat` or
+# `.sln`. This is the formatter agreeing in advance with a gate that would
+# otherwise fail the build.
 #
 # One clarification, because this workspace is unusually sensitive to CRLF:
-# curl's test fixtures compare exact wire bytes, and HTTP framing on the wire
-# is CRLF-delimited. That CRLF lives inside string literals and in transfer
-# content - it is protocol data, not source formatting - and it is untouched by
-# this key. Measured: the literal
-# "GET /path HTTP/1.1\r\nHost: ...\r\n\r\n" is byte-identical before and after
-# a format run.
+# curl's fixtures compare exact wire bytes and HTTP framing is CRLF-delimited.
+# That CRLF lives inside string literals and in transfer content - it is
+# protocol data, not source formatting - and this key does not touch it.
 newline_style = "Unix"
 
-# ---------------------------------------------------------------------------
 # use_small_heuristics - default "Default", restated as a declared contract
-# ---------------------------------------------------------------------------
 #
-# The conservative choice, kept, and deliberately not tuned. It sets the family
-# of sub-widths that decide when a construct that would fit on one line is
-# nevertheless broken vertically: fn_call_width, attr_fn_like_width,
-# struct_lit_width, struct_variant_width, array_width, chain_width,
-# single_line_if_else_max_width and single_line_let_else_max_width.
+# The conservative choice, deliberately not tuned. It sets the sub-widths that
+# decide when a construct which would fit on one line is nevertheless broken
+# vertically: fn_call_width, attr_fn_like_width, struct_lit_width,
+# struct_variant_width, array_width, chain_width and the two single-line
+# if-else/let-else widths.
 #
-# One measured fact, recorded because the widely repeated version of it is
-# wrong: on the pinned rustfmt 1.9.0 these sub-widths do NOT rescale when
-# max_width is lowered. At max_width = 80 they stay at the values derived from
-# the default 100 - fn_call_width 60, attr_fn_like_width 70, struct_lit_width
-# 18, struct_variant_width 35, array_width 60, chain_width 60, and 50 for both
-# single-line if-else and let-else. This was checked behaviourally and not only
-# by printing the configuration: a 71-column line whose call-argument list is
-# 55 columns wide is left alone at max_width = 80, and the same line does break
-# once fn_call_width = 48 is set by hand.
-#
-# So max_width = 80 above is a hard-limit change, not a wholesale reflow
-# policy, and every one of these sub-widths remains at or below it. Tuning them
-# is a separate decision with a much larger diff, and no evidence asks for it.
+# One measured fact, because the widely repeated version of it is wrong: these
+# sub-widths do NOT rescale when max_width is lowered. At max_width = 80 they
+# stay at the values derived from the default 100. So max_width = 80 above is a
+# hard-limit change, not a wholesale reflow policy, and every sub-width remains
+# at or below it. Tuning them is a separate decision with a much larger diff,
+# and no evidence asks for it.
 use_small_heuristics = "Default"
 
-# ---------------------------------------------------------------------------
 # reorder_imports - default true, restated as a declared contract
-# ---------------------------------------------------------------------------
 #
-# Deterministic, alphabetical `use` ordering, and this workspace has a specific
-# reason to want it declared rather than assumed.
+# The migration replaces one blanket include with many narrow imports: the C
+# tree reaches shared state through `#include "urldata.h"` in nearly every
+# translation unit, and the transformation rule for it is one import per type
+# actually used. That trades one include for a block of imports in every file of
+# curl-rs-lib, and a block of imports is only reviewable if its order is
+# mechanical - an added dependency then appears as a one-line diff at its sorted
+# position instead of wherever the author happened to type it.
 #
-# The migration replaces one blanket include with many narrow imports. The C
-# tree reaches shared state through `#include "urldata.h"`, present in nearly
-# every translation unit, and the transformation rule for it is one import per
-# type actually used: `use crate::conn::Connection;` beside
-# `use crate::transfer::TransferState;` and so on, in place of a single line
-# that granted access to everything. That trades one include for a block of
-# imports in every file of curl-rs-lib, and a block of imports is only
-# reviewable if its order is mechanical. With this on, an added dependency
-# appears as a one-line diff at its sorted position instead of wherever the
-# author happened to type it.
-#
-# The mirror-image key, `imports_granularity`, would go further and merge those
-# lines into nested groups. It is nightly-only; see the list below.
+# The mirror-image key, `imports_granularity`, would merge those lines into
+# nested groups. It is nightly-only; see the list below.
 reorder_imports = true
 
-# ---------------------------------------------------------------------------
 # reorder_modules - default true, restated as a declared contract
-# ---------------------------------------------------------------------------
 #
-# Deterministic ordering of `mod` declarations, for the same reason at a larger
-# scale. curl-rs-lib alone declares module trees for protocols, conn, transfer,
-# tls, dns, auth, proxy, url, cookies, mime, headers, crypto and util, and the
-# crate root that lists them is the single file every one of those subtrees
-# touches when it grows. Sorted `mod` lines keep that file's history readable
-# and keep two agents adding two modules from colliding on one line.
-#
-# Note the deliberate limit of this key: it reorders sibling `mod`
-# declarations, it does not reorder items or move code between files.
+# The same reason at a larger scale. curl-rs-lib alone declares module trees for
+# protocols, conn, transfer, tls, dns, auth, proxy, url, cookies, mime, headers,
+# crypto and util, and the crate root that lists them is the one file every
+# subtree touches when it grows. Sorted `mod` lines keep that file's history
+# readable. Note the deliberate limit: this reorders sibling `mod` declarations,
+# it does not reorder items or move code between files.
 reorder_modules = true
 
-# ---------------------------------------------------------------------------
 # use_field_init_shorthand - default false
-# ---------------------------------------------------------------------------
 #
 # The one key here that changes tokens rather than whitespace: it rewrites
 # `Point { x: x, y: y }` as `Point { x, y }`. It is set because the alternative
-# is a formatter that produces code the lint gate then rejects.
+# is a formatter that produces code the lint gate then rejects -
+# clippy::redundant_field_names is warn-by-default and the gate is
+# `-D warnings`, so at rustfmt's default of false `cargo fmt` would report a
+# file clean that `cargo clippy` fails.
 #
-# Measured on the pinned toolchain: clippy reports `redundant_field_names` for
-# `Point { x: x, y: y }` and notes of it that
-# `#[warn(clippy::redundant_field_names)]` is on by default. The lint gate is
-# `cargo clippy --workspace -- -D warnings`, so on by default means build
-# failure. At rustfmt's default of false the formatter leaves that code exactly
-# as written, which puts the two tools in direct disagreement: `cargo fmt`
-# reports the file clean and `cargo clippy` fails it. At true, rustfmt performs
-# the rewrite clippy asks for, and the file passes both.
-#
-# The rewrite is a pure identity: the shorthand is defined to mean the
-# long form, so nothing observable changes. That matters here more than usual,
-# because this workspace's contract is its output bytes; a formatter key that
-# altered behaviour would be inadmissible no matter how tidy its output.
+# The rewrite is a pure identity: the shorthand is defined to mean the long
+# form, so nothing observable changes. That matters more than usual here,
+# because this workspace's contract is its output bytes.
 use_field_init_shorthand = true
 
-# ---------------------------------------------------------------------------
 # Nightly-only options: considered, and none set
-# ---------------------------------------------------------------------------
 #
-# Each of the following was written into this file on the pinned stable
-# toolchain and each produced "Warning: can't set `<key>`, unstable features
-# are only available in nightly channel." None is set. They are listed with
-# what they would have bought, so that the next maintainer knows they were
-# weighed rather than overlooked - and so that whoever eventually finds one of
-# them stabilised knows why it was wanted:
+# Each was written into this file on the pinned stable toolchain and rejected as
+# unstable. They are listed with what they would have bought, so that whoever
+# finds one stabilised knows why it was wanted:
 #
 #   wrap_comments, comment_width       would extend max_width to comment
-#                                      interiors. The one real gap in this
-#                                      configuration: doc comments in this
-#                                      workspace run to 100 columns and no
-#                                      stable key can narrow them. Note that
-#                                      comment_width already reads 80 by
-#                                      default and is inert without
-#                                      wrap_comments.
-#   imports_granularity, group_imports would merge and group the narrow
-#                                      imports described under
-#                                      reorder_imports. Attractive for exactly
-#                                      the same reason, and unavailable.
+#                                      interiors - the one real gap in this
+#                                      configuration, since no stable key can
+#                                      narrow a long doc comment.
+#   imports_granularity, group_imports would merge and group the narrow imports
+#                                      described under reorder_imports.
 #   error_on_line_overflow,            would promote an over-long or
 #   error_on_unformatted               unformattable line from silence to an
 #                                      error, turning max_width from a target
 #                                      into an assertion.
 #   format_code_in_doc_comments        would format the Rust inside doc
-#                                      examples. Harmless and wanted; also
-#                                      unavailable.
+#                                      examples.
 #   normalize_comments,                cosmetic normalisation of comment and
 #   normalize_doc_attributes           doc-attribute syntax.
-#   blank_lines_upper_bound            would cap consecutive blank lines.
-#                                      Partly covered already:
-#                                      scripts/spacecheck.pl rejects two
-#                                      consecutive blank lines in this file's
-#                                      own file type.
+#   blank_lines_upper_bound            would cap consecutive blank lines;
+#                                      partly covered by spacecheck.pl already.
 #   condense_wildcard_suffixes,        stylistic preferences with no gate
 #   hex_literal_case,                  behind them.
 #   struct_field_align_threshold,
@@ -337,92 +200,60 @@ use_field_init_shorthand = true
 #                                      rather than what it emits.
 #
 # format_strings is in that list too, and it is the one entry that must NOT be
-# revisited if it ever stabilises. It rewrites string literals to fit
-# max_width, breaking a long literal across lines. This workspace's
-# specification is its bytes: 1,476 of the 1,914 test fixtures carry an exact
-# `<protocol>` block, and the harness joins the expected and actual parts into
+# adopted if it ever stabilises. It rewrites string literals to fit max_width.
+# This workspace's specification is its bytes: 1,476 of the 1,914 fixtures carry
+# an exact `<protocol>` block, and the harness joins expected and actual into
 # one string and compares them whole - no per-line matching, no normalisation,
-# no reordering, and header order is significant. Header text, chunked
-# framing, FTP command sequences, Digest and NTLM messages, `--write-out`
-# formats and the progress-bar layout all live in string literals whose exact
-# content is the contract.
-#
-# curl-rs/src/libcurl_src.rs makes the same point from another direction: the
-# `--libcurl` flag emits a compilable C program, so string literals in that
-# module are C source text. A formatter reflowing them would emit C that no
-# longer compiles.
-#
-# Measured, and reassuring: at rustfmt's default the guard is already in place
-# - a 108-column line holding "GET /path HTTP/1.1\r\nHost: ...\r\n\r\n" came
-# back byte-identical from a real format run, verified by checksum rather than
-# by eye.
+# header order significant. Header text, chunked framing, FTP command sequences,
+# Digest and NTLM messages, `--write-out` formats and the progress-bar layout
+# all live in string literals whose exact content is the contract.
+# curl-rs/src/libcurl_src.rs makes the point from another direction: `--libcurl`
+# emits a compilable C program, so a formatter reflowing its literals would emit
+# C that no longer compiles.
 
-# ---------------------------------------------------------------------------
 # Stable options deliberately left at their defaults
-# ---------------------------------------------------------------------------
 #
-# Recorded because two of them are load-bearing for this workspace and a future
-# reader should know they were checked, not missed:
+# Recorded because two of them are load-bearing here and a future reader should
+# know they were checked, not missed:
 #
 #   force_explicit_abi (default true)   rewrites `extern {` as `extern "C" {`.
-#                                       rustc's own `missing_abi` lint is warn
-#                                       by default and would therefore fail
-#                                       `-D warnings`, so the default already
-#                                       does the right thing for the 100
-#                                       exported `extern "C"` symbols in
-#                                       curl-rs-ffi. Measured both ways.
-#   remove_nested_parens (default true) removes `((x))`. clippy's
+#                                       rustc's `missing_abi` lint is warn by
+#                                       default and would fail `-D warnings`, so
+#                                       the default already does the right thing
+#                                       for curl-rs-ffi's exported symbols.
+#   remove_nested_parens (default true) removes `((x))`; clippy's
 #                                       `double_parens` and rustc's
-#                                       `unused_parens` are both warn by
-#                                       default, so again the default already
-#                                       agrees with the gate. Measured.
-#   merge_derives (default true),       no gate behind them and no evidence
-#   fn_params_layout ("Tall"),          asks for a change. Left alone under the
-#   match_arm_leading_pipes ("Never"),  same minimal-change discipline that
-#   match_block_trailing_comma          governs the code.
-#   (false), short_array_element_
-#   width_threshold (10)
-#   use_try_shorthand                   inert: it rewrites `try!(...)` as `?`,
-#                                       and `try!` is deprecated to the point
-#                                       of erroring in edition 2021, measured.
-#                                       Nothing in this workspace can contain
-#                                       one.
+#                                       `unused_parens` are warn by default,
+#                                       so the default agrees with the gate.
+#   merge_derives, fn_params_layout,    no gate behind them and no evidence asks
+#   match_arm_leading_pipes,            for a change. Left alone under the same
+#   match_block_trailing_comma,         minimal-change discipline that governs
+#   short_array_element_width_threshold the code.
+#   use_try_shorthand                   inert: `try!` is an error in edition
+#                                       2021, so nothing here can contain one.
 #   style_edition                       reads "2015" by default even with
-#                                       edition = "2021", measured. Pinning it
-#                                       to 2021 was tried against all four
-#                                       existing Rust modules and changed
-#                                       nothing at all, so it stays unset:
-#                                       the exact toolchain pin in
-#                                       rust-toolchain.toml is what actually
-#                                       fixes the formatting rules, and an
-#                                       inert key would only add a second place
-#                                       to keep in step with the edition above.
+#                                       edition = "2021"; pinning it to 2021
+#                                       changed nothing measurable, so it stays
+#                                       unset rather than becoming a second
+#                                       place to keep in step with the edition.
 
-# ---------------------------------------------------------------------------
 # What belongs elsewhere, and how this file is enforced
-# ---------------------------------------------------------------------------
 #
-# Deliberately absent from this file, each with its real home:
-#
-#   * Lints, lint levels and thresholds - clippy.toml, which also carries
-#     `msrv = "1.75"` held equal to Cargo.toml's rust-version. rustfmt has no
-#     opinion on a lint and this file must not appear to have one.
-#   * The copyright and SPDX headers that checksrc.pl policed as COPYRIGHT and
-#     COPYRIGHTYEAR - `reuse lint`, run by .github/workflows/hygiene.yml:52.
-#     That is also why this file carries its own header above: REUSE.toml does
-#     not list rustfmt.toml, so it has to be annotated directly.
-#   * Tabs, trailing whitespace, EOL style, the newline at end of file,
-#     consecutive blank lines and non-ASCII bytes in every tracked file
-#     regardless of language - scripts/spacecheck.pl, run by
-#     .github/workflows/hygiene.yml:165. rustfmt enforces the first three for
-#     Rust sources; spacecheck.pl enforces all of them for everything,
-#     including this file.
+#   * Lints, lint levels and thresholds - clippy.toml, which also carries the
+#     msrv held equal to Cargo.toml's rust-version. rustfmt has no opinion on a
+#     lint and this file must not appear to have one.
+#   * Copyright and SPDX headers - `reuse lint`. That is also why this file
+#     carries its own header above: REUSE.toml does not list rustfmt.toml, so it
+#     has to be annotated directly.
+#   * Tabs, trailing whitespace, EOL style, final newline, consecutive blank
+#     lines and non-ASCII bytes in every tracked file regardless of language -
+#     scripts/spacecheck.pl. rustfmt enforces the first three for Rust sources;
+#     spacecheck.pl enforces all of them for everything, including this file.
 #   * Editor behaviour before a formatter ever runs - .editorconfig.
 #   * The toolchain that reads this file - rust-toolchain.toml.
 #
 # Enforcement: `cargo fmt --all -- --check` is a gate, not a fixer. It exits
-# non-zero and prints the diff it would have applied, so a formatting
-# divergence fails the build instead of being quietly rewritten under a
-# reviewer. `cargo fmt --all` is the developer-side counterpart and the only
-# supported way to satisfy it; nothing in continuous integration is permitted
-# to rewrite a tracked file.
+# non-zero and prints the diff it would have applied, so a formatting divergence
+# fails the build instead of being quietly rewritten under a reviewer.
+# `cargo fmt --all` is the developer-side counterpart, and nothing in continuous
+# integration is permitted to rewrite a tracked file.

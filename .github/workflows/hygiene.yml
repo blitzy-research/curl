@@ -122,6 +122,148 @@ jobs:
       - name: 'check'
         run: git grep -z -i -l -E '^<\?xml' | xargs -0 -r xmllint --output /dev/null
 
+  # The public C headers, graded by something OTHER than the generator.
+  #
+  # WHY THIS JOB EXISTS. .github/workflows/checksrc.yml used to carry a
+  # `checksrc` job on ubuntu-slim whose sole substantive step was
+  # `scripts/checksrc-all.pl`, and it was deleted together with the rest of
+  # that file when the C build workflows were replaced. Its other four jobs
+  # were relocated into this file; that one was not, and its loss took with it
+  # the ONLY independent style and correctness check over include/curl/*.h.
+  #
+  # That matters more now than it did before the migration, not less.
+  # include/curl/curl.h and seven of its siblings are no longer hand-written:
+  # curl-rs-ffi/build.rs generates them with cbindgen, and that same build
+  # script carries its own self-checks. A generator that grades its own output
+  # is not a gate, so the headers had no independent grader at all. This job is
+  # that grader, and it is deliberately scoped to the headers rather than to
+  # the whole C tree: the C sources are superseded and `clippy` plus `rustfmt`
+  # cover the Rust that replaces them, but the public headers are a SHIPPED
+  # artifact that C consumers compile, so they remain C and remain in scope.
+  #
+  # INDEPENDENT BY CONSTRUCTION. There is no cargo, no rustc and no cbindgen
+  # anywhere in this job. It runs perl over the committed headers on a plain
+  # checkout, so its verdict cannot be influenced by the thing it is judging.
+  # The complementary gate - that the committed headers are byte-identical to
+  # what the generator produces - is rust-build.yml's "wrote nothing outside
+  # target/" assertion, and that division is deliberate: this job says the
+  # headers are well-formed C, that one says they are the generator's output.
+  #
+  # NOT A DUPLICATE OF ANY OTHER GATE, AND MEASURED RATHER THAN ASSUMED.
+  # rust-clippy.yml lints Rust and states plainly that scripts/checksrc.pl must
+  # remain on disk; it cannot grade a C header and does not try.
+  #
+  # The gate that WOULD partly overlap this one is the header-parity gate
+  # specification 0.3.1 names rust-abi.yml, which compiles docs/examples
+  # against the generated headers. Two things must be said about it plainly,
+  # because a comment that leans on a sibling gate is worthless if the sibling
+  # is not there. First, it is NOT ON DISK: the workflows present in this
+  # directory are the four rust-*.yml files and this one, and rust-abi.yml,
+  # rust-test.yml, rust-asan.yml, rust-coverage.yml and curl-testsuite.yml are
+  # all specified and all still absent. Second, even once it exists it would
+  # not subsume this job, because compiling a header proves it is USABLE and
+  # says nothing about whether it is well-formed: a header can compile
+  # perfectly and still carry a `//` comment, a FIXME, a tab or an over-long
+  # line, none of which belongs in a header that ships to consumers on the
+  # older compilers curl still supports. So this job is not redundant today and
+  # would not become redundant later.
+  checksrc:
+    name: 'checksrc: the public C headers'
+    runs-on: ubuntu-slim
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'checksrc over include/curl'
+        run: |
+          # `git ls-files` rather than a shell glob, so that an untracked stray
+          # file cannot join the set and a tracked header cannot be missed. The
+          # set is what is being graded, so where it comes from matters.
+          headers="$(git ls-files 'include/curl/*.h')"
+          if [ -z "${headers}" ]; then
+            echo 'FAIL: git ls-files matched no header under include/curl/.'
+            echo 'The public headers are the C ABI contract; a checkout without them is not a checkout'
+            echo 'this gate can grade.'
+            exit 1
+          fi
+
+          # -v, and it is load-bearing rather than cosmetic. checksrc.pl prints
+          # its summary only `if($errors || $warnings || $verbose)`, so WITHOUT
+          # -v a clean run produces no output at all and there is nothing to
+          # distinguish "graded twelve headers and found nothing" from "graded
+          # nothing". With -v it prints one `Checking file:` line per file, and
+          # the count below is what turns that into a real assertion.
+          #
+          # THE VACUITY HAZARD THIS GUARDS AGAINST IS REAL AND SILENT: invoked
+          # with no file arguments at all, checksrc.pl prints its help text and
+          # EXITS 0. The exit status alone can therefore never prove this gate
+          # examined anything.
+          log="${RUNNER_TEMP}/checksrc-headers.log"
+          status=0
+          # shellcheck disable=SC2086 # deliberate word splitting: one argument per header
+          perl scripts/checksrc.pl -v ${headers} > "${log}" 2>&1 || status=$?
+
+          echo '::group::checksrc output'
+          cat "${log}"
+          echo '::endgroup::'
+
+          if [ "${status}" -ne 0 ]; then
+            echo 'FAIL: checksrc reported findings in the public C headers.'
+            echo 'Exit 5 means style or correctness warnings, listed above with a rule name in'
+            echo 'parentheses; docs/internals/CHECKSRC.md explains each rule. Exit 2 means perl could'
+            echo 'not open a file. For a generated header the remedy is in curl-rs-ffi/build.rs or'
+            echo 'curl-rs-ffi/cbindgen.toml, NOT an inline !checksrc! suppression in the header, because'
+            echo 'a suppression in generated output is erased the next time it is generated.'
+            exit "${status}"
+          fi
+
+          # Non-vacuity, asserted two ways rather than assumed.
+          #
+          # BOTH COUNTS COME FROM awk AND NOT FROM `grep -c`, and the reason is
+          # a real defect this step had until a probe found it. `grep -c`
+          # EXITS 1 when it counts zero, and a command substitution in an
+          # assignment carries that status, so under the `bash -e` that Actions
+          # runs `run:` bodies with, `examined="$(grep -c ...)"` aborted the
+          # step at that line with status 1 and printed nothing at all. The
+          # zero case is precisely the case this assertion exists to report, so
+          # the counting had to be total rather than merely usually-correct.
+          # `n + 0` prints 0 when the pattern never matched, which is the same
+          # idiom rust-miri.yml uses to sum its test counts.
+          examined="$(awk '/^Checking file: / { n++ } END { print n + 0 }' "${log}")"
+          expected="$(printf '%s\n' "${headers}" | awk 'NF { n++ } END { print n + 0 }')"
+          if [ "${examined}" -ne "${expected}" ]; then
+            echo "FAIL: ${expected} header(s) were passed to checksrc but only ${examined} were examined."
+            echo 'A file is dropped silently by a -W argument or by a checksrc.skip entry, so a shrinking'
+            echo 'count is a shrinking gate. include/curl/ carries no .checksrc and no checksrc.skip today,'
+            echo 'and this assertion is what keeps that true.'
+            exit 1
+          fi
+          if ! grep -q '^checksrc: 0 errors and 0 warnings$' "${log}"; then
+            echo 'FAIL: checksrc exited clean but never printed its zero-findings summary.'
+            echo 'That combination means the run did not complete normally, so its silence proves nothing.'
+            exit 1
+          fi
+
+          # THE PUBLIC HEADER SET IS PART OF THE ABI, so its size is asserted
+          # too. The C ABI contract is twelve headers under include/curl/, of
+          # which eight are generated by curl-rs-ffi/build.rs and four -
+          # curlver.h, stdcheaders.h, system.h and the 958-line
+          # typecheck-gcc.h that cbindgen cannot express - are hand-maintained
+          # and shipped verbatim beside them. A generator that stopped emitting
+          # one would otherwise leave this gate green while grading eleven
+          # files perfectly.
+          if [ "${expected}" -ne 12 ]; then
+            echo "FAIL: include/curl/ holds ${expected} tracked header(s); the public ABI contract is twelve."
+            echo 'Adding or removing a public header is an ABI change. If it is intended, update this'
+            echo 'assertion in the same commit so the two cannot drift; if it is not, a generated header'
+            echo 'is missing and curl-rs-ffi/build.rs is where to look.'
+            exit 1
+          fi
+
+          echo "checksrc graded all ${examined} public C headers independently of the generator, and found nothing"
+
   miscchecks:
     name: 'misc checks'
     runs-on: ubuntu-24.04-arm

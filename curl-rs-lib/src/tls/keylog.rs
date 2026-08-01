@@ -35,9 +35,9 @@
 //! # Every byte is the contract
 //!
 //! The line format is consumed by Wireshark, `tshark`, NSS itself and by
-//! every other tool that reads a key log. AAP section 0.8.1 freezes curl's
-//! observable output, so the layout below is transcribed from the C source
-//! rather than redesigned, and no readability pass may rewrite it:
+//! every other tool that reads a key log. curl's observable output is frozen,
+//! so the layout below is transcribed from the C source rather than redesigned,
+//! and no readability pass may rewrite it:
 //!
 //! ```text
 //!     LABEL<SP>CLIENT_RANDOM_HEX<SP>SECRET_HEX<LF>
@@ -87,9 +87,9 @@
 //!
 //! `lib/vtls/keylog.c:38` is `static FILE *keylog_file_fp;` -- a mutable
 //! process-global file pointer, opened by one backend and closed by another,
-//! with no ownership and no synchronisation beyond whatever the C library's
-//! `stdio` happens to provide. AAP section 0.6.9 replaces exactly this class
-//! of construct: state becomes owned, and access becomes an explicit borrow.
+//! with no ownership and no synchronization beyond whatever the C library's
+//! `stdio` happens to provide. This is exactly the class of construct the
+//! rewrite replaces: state becomes owned, and access an explicit borrow.
 //!
 //! [`KeyLogFile`] is therefore an ordinary object. It is created by the TLS
 //! factory, shared with rustls through an [`Arc`], and dropped when the last
@@ -110,13 +110,13 @@
 //! [`KEYLOG_BUFSIZ`]-byte buffer that drains as soon as the bytes it holds
 //! contain an LF, or a direct write when line buffering is off.
 //!
-//! Line buffering is not a performance choice, and performance is an explicit
-//! non-goal (AAP section 0.1.1). It is what guarantees that one key log
-//! record reaches the file as one `write`, so that two concurrent handshakes
-//! cannot splice half of one secret into the middle of another. This module
-//! makes that guarantee unconditional by holding the sink's lock across the
-//! whole record -- format, buffer and drain -- rather than across each
-//! fragment.
+//! Line buffering is reproduced because C configures it, not for speed. It is
+//! not, however, what keeps a record whole: [`Write::write_all`] is free to
+//! issue several underlying writes, and no buffering mode makes a record atomic
+//! against a concurrent writer. What guarantees that two concurrent handshakes
+//! cannot splice half of one secret into the middle of another is the [`Mutex`]
+//! inside [`KeyLogFile`], held across the whole record -- format, buffer and
+//! drain -- rather than across each fragment.
 //!
 //! # Failure is silent, by design
 //!
@@ -183,46 +183,63 @@
 //!
 //! This module selects no cryptographic provider and names none. Provider
 //! choice belongs to the manifests, which pin `ring` with
-//! `default-features = false` (AAP section 0.5.1); a key log has no opinion
-//! about who computed the secret it is recording.
+//! `default-features = false`; a key log has no opinion about who computed the
+//! secret it is recording.
 
-// `dead_code` is allowed for this module alone, and for one specific reason
-// rather than as a convenience: every production consumer of this file lives
-// in a sibling module. `tls/rustls_backend.rs` is the only caller -- it opens
-// the log and registers the callback where C calls `Curl_tls_keylog_open`
+// `dead_code` is NOT allowed for this module as a whole. Every item below that
+// has no consumer yet carries its own `#[allow(dead_code)]`, written at the
+// item, so the suppression reads as an inventory rather than a blanket: each
+// one is load-bearing, deleting any one of them restores a warning, and an
+// item added later with no consumer is still reported. Each is removed when
+// its consumer lands. A module- or crate-scoped `#![allow(dead_code)]` would
+// instead silence the NEXT item somebody adds, which hides incomplete
+// scaffolding rather than recording it; the rule and the executable gate that
+// enforces it across the workspace live in `curl-rs-lib/src/lib.rs`
+// (`mod source_policy`).
+//
+// Every production consumer of this file lives in a sibling module.
+// `tls/rustls_backend.rs` is the only caller -- it opens the log and
+// registers the callback where C calls `Curl_tls_keylog_open`
 // (`lib/vtls/rustls.c:809-829`) and closes it where C calls
 // `Curl_tls_keylog_close` (`lib/vtls/rustls.c:1392-1395`) -- and `tls/mod.rs`
 // is what declares this module at all. Until those land, every constant,
 // helper and method here is legitimately unreferenced inside the crate, and
-// the zero-warnings gate (AAP section 0.8.4) would otherwise fail on code
-// that is correct.
+// the zero-warnings gate would otherwise fail on code that is correct. Several
+// are reported only because they cascade from an unconsumed `pub(crate)` root:
+// `env_path` and `locked` are genuinely called by production methods that are
+// themselves not yet reachable. Compiling this same file as a test target,
+// where the module's own tests supply the missing consumer, reports nothing at
+// all.
 //
-// Measured, not assumed: with this attribute absent, compiling this file as a
-// library target under `-D warnings` reports exactly 15 diagnostics, all of
-// them `dead_code` and not one of them a `clippy::` lint. They cascade from
-// the unconsumed `pub(crate)` roots rather than describing real dead code --
-// private helpers that production methods genuinely do call, such as
-// `env_path` and `locked`, are reported only because the public methods that
-// reach them are themselves unreachable. Compiling the same file as a test
-// target, where the module's own tests supply the missing consumer, reports
-// nothing at all.
+// Each allowance is written on the item it excuses, and there is no
+// `#![allow(dead_code)]` on this module root. A `dead_code` level on a crate
+// or module root would silence the next unreferenced item somebody adds, which
+// is why `mod source_policy` in `curl-rs-lib/src/lib.rs` fails the build when
+// it finds one.
 //
-// The attribute is scoped as narrowly as the language allows: `dead_code` and
-// nothing else. This mirrors the identical, identically-reasoned attributes
-// already committed at `curl-rs-lib/src/ffi/mod.rs:212` and
-// `curl-rs-lib/src/ffi/sys.rs:139`. No level for the `unsafe_code` lint is
-// set here, at any level, by design: the crate root denies it and this module
-// contains no `unsafe`, so the crate-wide guarantee must stay in force.
-#![allow(dead_code)]
+// No level for the `unsafe_code` lint is set here, at any level, by design:
+// the crate root denies it and this module contains no `unsafe`, so the
+// crate-wide guarantee must stay in force.
 
 use std::env::var_os;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+// `MetadataExt` supplies `uid()` and `mode()`, `OpenOptionsExt` supplies
+// `mode()` and `custom_flags()`. Both are `#[cfg(unix)]`, and all four mandated
+// targets are Unix (AAP section 0.1.1 goal G8), so no configuration guard is
+// needed here -- consistent with `src/ffi/sys.rs`, which likewise compiles only
+// for those four and names the omission rather than hiding it.
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use rustls::KeyLog as RustlsKeyLog;
+
+// The two open flags and the owner query, all three from the one directory in
+// this crate that is allowed to name `libc` (AAP sections 0.3.1, 0.8.5/C3).
+// `effective_uid` was added to that seam for this check specifically.
+use crate::ffi::{effective_uid, O_CLOEXEC, O_NOFOLLOW};
 
 /// The longest label the NSS key log format defines, in bytes.
 ///
@@ -240,6 +257,7 @@ use rustls::KeyLog as RustlsKeyLog;
 /// `EXPORTER_SECRET` (15), `CLIENT_TRAFFIC_SECRET_0` (23),
 /// `SERVER_HANDSHAKE_TRAFFIC_SECRET` (31), `CLIENT_EARLY_TRAFFIC_SECRET`
 /// (27). A longer label is rejected rather than truncated.
+#[allow(dead_code)]
 pub(crate) const KEYLOG_LABEL_MAXLEN: usize = 31;
 
 /// The size of a TLS client random, in bytes (`lib/vtls/keylog.h:30`).
@@ -251,6 +269,7 @@ pub(crate) const KEYLOG_LABEL_MAXLEN: usize = 31;
 /// asserts `client_random_len == CLIENT_RANDOM_SIZE`. That assertion is a
 /// `DEBUGASSERT`, so a release build of the C tree would format whatever it
 /// was handed; here a client random of any other length is rejected.
+#[allow(dead_code)]
 pub(crate) const CLIENT_RANDOM_SIZE: usize = 32;
 
 /// The longest secret the format has to carry, in bytes.
@@ -259,6 +278,7 @@ pub(crate) const CLIENT_RANDOM_SIZE: usize = 32;
 /// secret in TLS 1.2 and before is always 48 bytes. In TLS 1.3, the secret
 /// size depends on the cipher suite's hash function which is 32 bytes for
 /// SHA-256 and 48 bytes for SHA-384."
+#[allow(dead_code)]
 pub(crate) const SECRET_MAXLEN: usize = 48;
 
 /// The longest line [`KeyLogFile::write_secret`] can generate, in bytes.
@@ -284,6 +304,7 @@ pub(crate) const SECRET_MAXLEN: usize = 48;
 ///
 /// This is the capacity the formatting buffer reserves, so no key log record
 /// ever reallocates while it holds key material.
+#[allow(dead_code)]
 const MAX_GENERATED_LINE: usize = KEYLOG_LABEL_MAXLEN
     + 1
     + 2 * CLIENT_RANDOM_SIZE
@@ -299,9 +320,11 @@ const MAX_GENERATED_LINE: usize = KEYLOG_LABEL_MAXLEN
 /// bytes are accepted and 255 are not. The reserved terminator has no
 /// counterpart here, but the limit is part of the accepted-input contract and
 /// is therefore preserved exactly rather than widened.
+#[allow(dead_code)]
 const LINE_MAXLEN: usize = 254;
 
 /// The line-buffer size C asks `setvbuf` for (`lib/vtls/keylog.c:52`).
+#[allow(dead_code)]
 const KEYLOG_BUFSIZ: usize = 4096;
 
 /// The environment variable that names the key log file.
@@ -310,7 +333,28 @@ const KEYLOG_BUFSIZ: usize = 4096;
 /// body is `return (env && env[0]) ? curlx_strdup(env) : NULL;`
 /// (`lib/getenv.c:78-79`). An empty value is therefore exactly as disabling
 /// as an absent one, and [`KeyLogFile::open`] reproduces that.
+#[allow(dead_code)]
 const SSLKEYLOGFILE: &str = "SSLKEYLOGFILE";
+
+/// The mode a key log this process creates is created with.
+///
+/// `0600`: read and write for the owner, nothing for anyone else. This replaces
+/// the `0666` that `fopen(name, "a")` requests (`lib/vtls/keylog.c:47`), which
+/// the umask then narrows to whatever the user happens to have configured --
+/// `0644` under the usual `022`, and `0666` under a umask of `0`.
+///
+/// A umask can only clear bits, never set them, so this value is a ceiling that
+/// the kernel may lower and nothing can raise. The execute bit is absent
+/// because a key log is data.
+const SECRET_FILE_MODE: u32 = 0o600;
+
+/// The permission bits a key log may not have: any granted to group or other.
+///
+/// `0o077` and not `0o177` or `0o777`: the owner triad is deliberately excluded,
+/// because this process *is* the owner by the time the mask is applied and its
+/// own access is the point. Only the two triads that let somebody else read the
+/// secrets are rejected.
+const FOREIGN_PERMISSION_BITS: u32 = 0o077;
 
 /// The uppercase hex alphabet, `Curl_udigits` (`lib/mprintf.c:39`).
 ///
@@ -318,12 +362,15 @@ const SSLKEYLOGFILE: &str = "SSLKEYLOGFILE";
 /// and belongs to `Curl_hexencode`. `Curl_hexbyte` -- the function this
 /// module's formatting reproduces -- indexes this table
 /// (`lib/escape.c:225-226`).
+#[allow(dead_code)]
 const UPPERCASE_HEX: [u8; 16] = *b"0123456789ABCDEF";
 
 /// A single ASCII space: the field separator, and the only one.
+#[allow(dead_code)]
 const SP: u8 = b' ';
 
 /// A single line feed: the record terminator, never accompanied by a CR.
+#[allow(dead_code)]
 const LF: u8 = b'\n';
 
 /// Formats one byte as two uppercase hex digits.
@@ -340,11 +387,96 @@ const LF: u8 = b'\n';
 /// honour by hand. Both indices are masked to 0..=15, so the bounds check
 /// the compiler inserts can never fire; no `unsafe` and no unchecked
 /// indexing appears anywhere in this module.
+#[allow(dead_code)]
 fn hexbyte(value: u8) -> [u8; 2] {
     [
         UPPERCASE_HEX[usize::from(value >> 4)],
         UPPERCASE_HEX[usize::from(value & 0x0f)],
     ]
+}
+
+/// Why a path was refused as a key log destination.
+///
+/// Three variants rather than one boolean, because each one is a different
+/// mistake with a different remedy, and because a test that only knew "refused"
+/// could not tell a correct refusal from a coincidental one. The reason never
+/// reaches the user: this module fails silently by design (see the module
+/// documentation), and [`KeyLogFile::open_env_file`] discards it. It exists so
+/// that [`secret_file_verdict`] is checkable in isolation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretFileRejection {
+    /// Not a regular file -- a FIFO, socket, device or directory.
+    NotRegularFile,
+    /// Owned by some other user, who can therefore read what is written to it.
+    ForeignOwner,
+    /// Readable or writable by group or other.
+    TooPermissive,
+}
+
+impl SecretFileRejection {
+    /// The message this refusal would carry if anything printed it.
+    ///
+    /// Static strings, and deliberately without the path: the reason is
+    /// diagnostic, the path is not a secret but the *reason* a key log was
+    /// refused is not worth a message that could end up in a log alongside the
+    /// path it names.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::NotRegularFile => "SSLKEYLOGFILE is not a regular file",
+            Self::ForeignOwner => "SSLKEYLOGFILE is owned by another user",
+            Self::TooPermissive => "SSLKEYLOGFILE is readable by other users",
+        }
+    }
+
+    /// Converts a refusal into the [`io::Error`] the open path returns.
+    ///
+    /// [`io::ErrorKind::PermissionDenied`] for all three, because that is what
+    /// the condition is from the caller's point of view and because the kernel
+    /// uses the same kind for the checks it performs itself -- the refusal is
+    /// indistinguishable, to a caller, from the `EACCES` it would have got had
+    /// the directory not been writable.
+    fn into_io_error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, self.reason())
+    }
+}
+
+/// Decides whether a file this process has just opened may receive secrets.
+///
+/// Split out of [`KeyLogFile::open_private_append`] as a pure function over the
+/// four facts that decide the question, for the same reason
+/// [`KeyLogFile::env_path`] is split out of the environment read: the rule then
+/// has a test that does not need a filesystem, a particular user id or root
+/// privileges. Every combination of the four inputs is reachable from a test,
+/// including the combinations a single host cannot be made to produce.
+///
+/// `mode` is the raw `st_mode` from `fstat`, file-type bits and all. Only the
+/// permission bits are examined -- [`FOREIGN_PERMISSION_BITS`] -- because the
+/// file type arrives separately as `is_regular_file`, already decoded by
+/// [`std::fs::FileType`].
+///
+/// The order of the checks is the order of severity, so that a file which fails
+/// more than one test reports the most fundamental failure. It has no effect on
+/// whether the file is accepted.
+///
+/// # Errors
+///
+/// One [`SecretFileRejection`] per reason; see that type.
+fn secret_file_verdict(
+    is_regular_file: bool,
+    owner: u32,
+    mode: u32,
+    us: u32,
+) -> Result<(), SecretFileRejection> {
+    if !is_regular_file {
+        return Err(SecretFileRejection::NotRegularFile);
+    }
+    if owner != us {
+        return Err(SecretFileRejection::ForeignOwner);
+    }
+    if mode & FOREIGN_PERMISSION_BITS != 0 {
+        return Err(SecretFileRejection::TooPermissive);
+    }
+    Ok(())
 }
 
 /// The destination of a key log, with the buffering `setvbuf` would have
@@ -384,6 +516,7 @@ fn hexbyte(value: u8) -> [u8; 2] {
 /// writer, including on the failure path. It is a scratch area holding key
 /// material, and leaving that material in a live allocation for the lifetime
 /// of the process would be gratuitous.
+#[allow(dead_code)]
 struct LineBufferedSink {
     /// The file, or any other writer an owner chose to inject.
     ///
@@ -411,7 +544,8 @@ impl LineBufferedSink {
     /// `cfg!` rather than `#[cfg]` so that both arms are type-checked on
     /// every target: a Windows-only compilation error in a module this
     /// security-sensitive would not be discovered until a Windows build,
-    /// and Windows is outside the four-target matrix (AAP section 0.2.2).
+    /// and Windows is outside the four-target matrix.
+    #[allow(dead_code)]
     fn new(inner: Box<dyn Write + Send>) -> Self {
         let line_buffered = !cfg!(windows);
         let capacity = if line_buffered { KEYLOG_BUFSIZ } else { 0 };
@@ -428,6 +562,7 @@ impl LineBufferedSink {
     /// Returns the first I/O error encountered. A caller that cannot act on
     /// the error still gets the guarantee that no key material is left in
     /// [`Self::buffer`].
+    #[allow(dead_code)]
     fn write_record(&mut self, record: &[u8]) -> io::Result<()> {
         if !self.line_buffered {
             // `_IONBF`: one unbuffered write, then flush, so the record is
@@ -465,6 +600,7 @@ impl LineBufferedSink {
     /// bytes are not retried: a failed `write_all` may have written a prefix,
     /// so a retry could duplicate part of a record, and re-presenting key
     /// material is worse than losing a diagnostic line.
+    #[allow(dead_code)]
     fn drain(&mut self) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -480,6 +616,7 @@ impl LineBufferedSink {
     ///
     /// The counterpart of `fclose` at `lib/vtls/keylog.c:67`, which likewise
     /// has no error path that the caller could act on.
+    #[allow(dead_code)]
     fn finish(&mut self) {
         let _ = self.drain();
         let _ = self.inner.flush();
@@ -497,9 +634,9 @@ impl Drop for LineBufferedSink {
 
 /// An open, or deliberately closed, TLS key log.
 ///
-/// Replaces the four `Curl_tls_keylog_*` functions of
-/// `lib/vtls/keylog.c:40-145` together with the mutable global they operate
-/// on (`:38`). The mapping is one to one:
+/// Replaces the five `Curl_tls_keylog_*` functions of `lib/vtls/keylog.c`
+/// (`:40`, `:64`, `:72`, `:77`, `:105`) together with the mutable global they
+/// operate on (`:38`). The mapping is one to one:
 ///
 /// | C | here |
 /// |---|------|
@@ -523,6 +660,7 @@ impl Drop for LineBufferedSink {
 /// uses for diagnostic sinks: a key log that stops working because an
 /// unrelated task panicked would be a worse outcome than one that keeps
 /// appending.
+#[allow(dead_code)]
 pub(crate) struct KeyLogFile {
     /// The destination, or [`None`] when the log is disabled or closed.
     ///
@@ -540,6 +678,7 @@ impl KeyLogFile {
     ///
     /// The equivalent of rustls's [`rustls::NoKeyLog`], and the constructor to
     /// use when a caller wants the object now and the environment read later.
+    #[allow(dead_code)]
     pub(crate) fn disabled() -> Arc<Self> {
         Arc::new(Self {
             sink: Mutex::new(None),
@@ -554,6 +693,7 @@ impl KeyLogFile {
     /// unopenable path all yield a disabled log rather than an error, exactly
     /// as they do in C, because `rustls.c:816-818` returns `CURLE_OK` when the
     /// log did not open.
+    #[allow(dead_code)]
     pub(crate) fn open_from_env() -> Arc<Self> {
         let keylog = Self::disabled();
         // The answer is [`Self::enabled`], which the caller asks for when it
@@ -569,6 +709,7 @@ impl KeyLogFile {
     /// other than the filesystem. Buffering follows the same rule as a
     /// file-backed log, so an injected writer observes exactly the write
     /// pattern a file would.
+    #[allow(dead_code)]
     pub(crate) fn with_writer(writer: Box<dyn Write + Send>) -> Arc<Self> {
         Arc::new(Self {
             sink: Mutex::new(Some(LineBufferedSink::new(writer))),
@@ -583,6 +724,7 @@ impl KeyLogFile {
     /// an open log neither re-reads the environment nor reopens the file. The
     /// rustls backend relies on that -- `rustls.c:815` calls it on every
     /// configuration build, once per easy handle.
+    #[allow(dead_code)]
     pub(crate) fn open(&self) -> bool {
         let mut sink = self.locked();
         if sink.is_some() {
@@ -598,6 +740,7 @@ impl KeyLogFile {
     /// `keylog_file_fp != NULL`. The backend calls this immediately after
     /// opening and skips registration entirely when it answers `false`
     /// (`lib/vtls/rustls.c:816-818`).
+    #[allow(dead_code)]
     pub(crate) fn enabled(&self) -> bool {
         self.locked().is_some()
     }
@@ -629,6 +772,7 @@ impl KeyLogFile {
     /// Nothing is logged or reported about a rejection beyond that `false`.
     /// The arguments are key material, and a diagnostic that named them would
     /// defeat the point of the file's permissions.
+    #[allow(dead_code)]
     pub(crate) fn write_secret(
         &self,
         label: &str,
@@ -653,7 +797,7 @@ impl KeyLogFile {
     /// `Curl_tls_keylog_write_line` (`lib/vtls/keylog.c:77-103`). Takes bytes
     /// rather than a string because the C signature takes `const char *` and
     /// because a key log line is a byte sequence: no encoding conversion, no
-    /// escape processing and no newline normalisation may happen on the way
+    /// escape processing and no newline normalization may happen on the way
     /// through.
     ///
     /// Returns `false`, writing nothing, when
@@ -668,6 +812,7 @@ impl KeyLogFile {
     /// `line[linelen - 1] != '\n'` before appending (`keylog.c:94-96`) -- so
     /// a caller can hand over a record it composed itself and get exactly
     /// those bytes.
+    #[allow(dead_code)]
     pub(crate) fn write_line(&self, line: &[u8]) -> bool {
         if line.is_empty() || line.len() > LINE_MAXLEN {
             return false;
@@ -696,6 +841,7 @@ impl KeyLogFile {
     ///
     /// Buffered bytes are flushed while the lock is still held, so a
     /// concurrent [`Self::open`] cannot interleave with the flush.
+    #[allow(dead_code)]
     pub(crate) fn close(&self) {
         let mut sink = self.locked();
         if let Some(mut open) = sink.take() {
@@ -711,6 +857,7 @@ impl KeyLogFile {
     /// `rustls_client_config_builder_set_key_log(builder, cr_keylog_log_cb,
     /// NULL)` at `lib/vtls/rustls.c:820-822`, with the object itself standing
     /// in for the `NULL` user-data pointer that C had to pass.
+    #[allow(dead_code)]
     pub(crate) fn into_key_log(self: Arc<Self>) -> Arc<dyn RustlsKeyLog> {
         self
     }
@@ -727,15 +874,102 @@ impl KeyLogFile {
     ///
     /// Any failure yields [`None`], which leaves the log disabled. That
     /// covers a missing directory, a permission denial, a path that names a
-    /// directory, and every other reason `open` can fail.
+    /// directory, a path this process must not write secrets into (see
+    /// [`Self::open_private_append`]), and every other reason `open` can fail.
     fn open_env_file() -> Option<Box<dyn Write + Send>> {
         let path = Self::env_path(var_os(SSLKEYLOGFILE))?;
+        let file = Self::open_private_append(path.as_ref()).ok()?;
+        Some(Box::new(file))
+    }
+
+    /// Opens `path` for appending secrets to it, or refuses.
+    ///
+    /// # Why this is stricter than the C tree, deliberately
+    ///
+    /// `Curl_tls_keylog_open` reaches the filesystem through
+    /// `curlx_fopen(name, FOPEN_APPENDTEXT)` (`lib/vtls/keylog.c:47`), and on
+    /// the mandated targets `curlx_fopen` *is* `fopen` (`lib/curlx/fopen.h:64`,
+    /// `:81`) with `FOPEN_APPENDTEXT` spelled `"a"` (`lib/curl_setup.h:1257`).
+    /// `fopen` with mode `"a"` asks for `O_CREAT` at `0666`, which the process
+    /// umask then narrows -- to `0644` under the usual `022`, and to `0666`
+    /// under a umask of `0` -- and it follows a symbolic link wherever the last
+    /// path component points. So curl 8.19.0-DEV really can write TLS session
+    /// secrets into a world-readable file, and really can be pointed at a file
+    /// it does not own by an attacker who wins the race to create the path
+    /// first. Both are properties of the C code, not of its translation.
+    ///
+    /// This is therefore not a parity repair; it is a deliberate hardening, and
+    /// the deliberation is recorded here rather than left to be inferred. Three
+    /// things justify diverging from a frozen behaviour (AAP section 0.8.1):
+    ///
+    /// 1. The bytes are unchanged. Nothing about the file's *contents*, its
+    ///    append semantics or its buffering differs; only which files this
+    ///    process is willing to open at all.
+    /// 2. The contents are the whole of the session's confidentiality. A key
+    ///    log plus a packet capture is the plaintext, so a permission bit here
+    ///    is not a hygiene preference.
+    /// 3. Refusing is the direction the module already fails in. Every other
+    ///    failure on this path is silent and leaves the transfer running
+    ///    (`lib/vtls/rustls.c:816-818`), so a refusal costs a diagnostic the
+    ///    user did not get anyway -- never a transfer.
+    ///
+    /// # What is enforced
+    ///
+    /// * **`0600` at creation.** [`OpenOptionsExt::mode`] replaces `fopen`'s
+    ///   `0666`, so a file this process creates is readable only by its owner
+    ///   *before* any umask is consulted. A umask can only remove bits, never
+    ///   add them, so this is a floor and not a hint.
+    /// * **`O_NOFOLLOW`.** A final component that is a symbolic link makes the
+    ///   open fail with `ELOOP` instead of writing secrets wherever the link
+    ///   points. CWE-59.
+    /// * **`O_CLOEXEC`.** The descriptor does not survive into a child process.
+    ///   Rust's [`std::fs::File`] already sets this, so the flag is redundant
+    ///   today; it is passed because the property is worth stating and is
+    ///   asserted by test rather than assumed.
+    /// * **A regular file.** A FIFO would block the handshake on a reader; a
+    ///   character device would send the secrets somewhere unknowable.
+    /// * **Owned by this process.** `geteuid()` and not `getuid()`, because the
+    ///   effective id is what the kernel checks: if the file belongs to someone
+    ///   else it is not ours to append to, and whoever it belongs to can read
+    ///   it.
+    /// * **No group or other permission.** An existing file keeps the mode it
+    ///   already had -- [`OpenOptionsExt::mode`] applies only on creation -- so
+    ///   a key log left behind at `0644` by a C curl, or by a redirect, is
+    ///   refused rather than appended to.
+    ///
+    /// # Why the checks read the descriptor and not the path
+    ///
+    /// [`std::fs::File::metadata`] is `fstat` on the descriptor that was just
+    /// opened, so the file examined is exactly the file that will be written.
+    /// Checking the *path* with [`std::fs::metadata`] would be a
+    /// time-of-check/time-of-use race: the path could be replaced between the
+    /// check and the open. There is no such window here, and the mode the file
+    /// is created with closes the remaining one -- a file created `0600` cannot
+    /// be read by anyone else even for the instant before the check runs.
+    ///
+    /// Nothing is tightened in place. A `chmod` on a file the user owns would
+    /// change observable filesystem state, which this module has no mandate to
+    /// do; refusing changes nothing outside the process.
+    fn open_private_append(path: &OsStr) -> io::Result<File> {
         let file = OpenOptions::new()
             .append(true)
             .create(true)
-            .open(path)
-            .ok()?;
-        Some(Box::new(file))
+            .mode(SECRET_FILE_MODE)
+            .custom_flags(O_NOFOLLOW | O_CLOEXEC)
+            .open(path)?;
+
+        // `fstat` on the descriptor just opened -- see the note above on why
+        // this is not `fs::metadata(path)`.
+        let metadata = file.metadata()?;
+        secret_file_verdict(
+            metadata.file_type().is_file(),
+            metadata.uid(),
+            metadata.mode(),
+            effective_uid(),
+        )
+        .map_err(SecretFileRejection::into_io_error)?;
+
+        Ok(file)
     }
 
     /// Applies curl's rule for an empty environment value.
@@ -751,6 +985,7 @@ impl KeyLogFile {
     ///
     /// Split out from [`Self::open_env_file`] so the rule is testable without
     /// mutating the process environment.
+    #[allow(dead_code)]
     fn env_path(value: Option<OsString>) -> Option<OsString> {
         match value {
             Some(path) if !path.is_empty() => Some(path),
@@ -765,6 +1000,7 @@ impl KeyLogFile {
     /// byte on its own. The buffer is created at [`MAX_GENERATED_LINE`]
     /// capacity and never grows, so no key material is copied into a second
     /// allocation on the way out.
+    #[allow(dead_code)]
     fn secret_record(
         label: &str,
         client_random: &[u8],
@@ -802,6 +1038,7 @@ impl KeyLogFile {
     /// The single point at which the sink's lock is taken, which is what
     /// makes "one record is one critical section" true by construction rather
     /// than by convention.
+    #[allow(dead_code)]
     fn write_record(&self, record: &[u8]) -> bool {
         let mut sink = self.locked();
         match sink.as_mut() {
@@ -811,6 +1048,7 @@ impl KeyLogFile {
     }
 
     /// Exclusive access to the sink, recovering from poisoning.
+    #[allow(dead_code)]
     fn locked(&self) -> MutexGuard<'_, Option<LineBufferedSink>> {
         self.sink.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -849,7 +1087,7 @@ impl Drop for KeyLogFile {
     /// explicitly, and the rustls backend is the only thing that ever did;
     /// anything else that had opened it leaked the handle for the life of the
     /// process. An owned object closes itself, so the explicit call becomes an
-    /// optimisation rather than an obligation.
+    /// optimization rather than an obligation.
     fn drop(&mut self) {
         // `get_mut` rather than `lock`: `&mut self` proves that no other
         // holder exists, so there is nothing to contend with.
@@ -888,7 +1126,7 @@ impl RustlsKeyLog for KeyLogFile {
 
     /// Whether [`Self::log`] would write this label's secret.
     ///
-    /// rustls documents this as a performance optimisation and skips the
+    /// rustls documents this as a performance optimization and skips the
     /// derivation of the logged secret when it answers `false`, so answering
     /// accurately keeps key material out of memory that would never be
     /// written. Both conditions that would make [`KeyLogFile::write_secret`]
@@ -906,6 +1144,9 @@ mod tests {
     use super::*;
 
     use std::fs;
+    // `PermissionsExt` supplies `Permissions::from_mode`, which `seed_at_mode`
+    // needs to set a mode the umask would otherwise have narrowed.
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::thread;
 
@@ -1111,7 +1352,7 @@ mod tests {
 
     /// Points `SSLKEYLOGFILE` at `path` for the caller's duration.
     ///
-    /// Safe in edition 2021, which this crate targets (AAP section 0.8.3).
+    /// Safe in edition 2021, which this crate targets.
     fn set_env_path(path: &Path) {
         std::env::set_var(SSLKEYLOGFILE, path);
     }
@@ -1125,6 +1366,93 @@ mod tests {
     fn env_lock() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Writes `bytes` to `path` at exactly `mode`, reporting success.
+    ///
+    /// [`fs::write`] cannot be used where the mode matters: it creates with
+    /// `0666` narrowed by the process umask, so the resulting mode is a property
+    /// of the environment the test runs in rather than of the test. The mode is
+    /// requested at creation *and* set again afterwards, because a umask can
+    /// only clear bits -- requesting `0600` under a umask of `0077` would leave
+    /// `0600`, but requesting `0644` under the same umask would leave `0600` and
+    /// silently defeat a test that meant to produce a group-readable file.
+    fn seed_at_mode(path: &Path, bytes: &[u8], mode: u32) -> bool {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(path);
+        let Ok(mut file) = file else { return false };
+        if file.write_all(bytes).is_err() {
+            return false;
+        }
+        drop(file);
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).is_ok()
+    }
+
+    /// The permission bits of `path`, or [`None`] if it cannot be examined.
+    fn mode_of(path: &Path) -> Option<u32> {
+        fs::metadata(path).ok().map(|meta| meta.mode() & 0o7777)
+    }
+
+    // -- why some tests below are `#[cfg_attr(miri, ignore)]` ----------------
+    //
+    // Miri's two relevant shims contradict each other, which was measured
+    // rather than assumed: `geteuid()` returns a hard-coded `1000`, while every
+    // file its filesystem shim reports is owned by uid `0`. So under Miri the
+    // ownership comparison in `secret_file_verdict` can never hold, whatever the
+    // code does -- a test that expects an open to succeed necessarily fails, and
+    // a test that expects a refusal necessarily passes for the wrong reason.
+    // Both are worthless there, so both are ignored, and the reason string on
+    // each one names the shim rather than the symptom.
+    //
+    // Nothing of Miri's actual purpose is lost. This module contains no
+    // `unsafe`, the only foreign call the hardened open reaches is `geteuid`
+    // (which `ffi/sys.rs` covers under Miri in its own right), and the refusal
+    // rule itself stays fully covered here by the synthetic
+    // `secret_file_verdict` tests, which take the ownership and mode as
+    // arguments and touch no filesystem at all.
+    //
+    // The reason string used throughout is deliberately identical, so that the
+    // concession is countable. The audit pattern is ANCHORED at the start of
+    // the line, and that is not decoration: these paragraphs quote the reason
+    // text as well, so an unanchored grep would count its own documentation and
+    // over-report. A comment line begins with `    // ` and an attribute line
+    // with `    #[`, so anchoring separates them exactly.
+    //
+    //   grep -cE '^    #\[cfg_attr\(miri, ignore = "Miri.s uid shims'  -> 12
+    //
+    // A SECOND, DISTINCT REASON EXISTS, and it is spelled differently on
+    // purpose so that each concession stays separately auditable:
+    //
+    //   grep -cE '^    #\[cfg_attr\(miri, ignore = "Miri.s isolation'  -> 4
+    //
+    // Miri runs with filesystem isolation enabled, and this gate deliberately
+    // passes no `-Zmiri-disable-isolation` -- `.github/workflows/rust-miri.yml`
+    // records that every relaxation narrows gate 5. Under isolation `mkdir` is
+    // an unsupported operation, so `scratch!` -- which is `tempfile::tempdir()`
+    // -- cannot succeed. That matters far more than it sounds: an unsupported
+    // operation is not a test failure, it ABORTS THE WHOLE INTERPRETATION, so
+    // one un-ignored offender takes the entire `-p curl-rs-lib` gate down and
+    // the other 700-odd tests never run at all. MEASURED, each in isolation
+    // with `cargo +nightly miri test -- --exact <name>`:
+    //
+    //   an_unopenable_path_leaves_the_log_disabled   mkdir  aborts
+    //   opening_an_open_log_does_not_reopen_it       mkdir  aborts
+    //   a_dangling_symlink_creates_nothing           mkdir  aborts
+    //   a_directory_is_refused_by_the_open           mkdir  aborts
+    //
+    // and, for contrast, the two neighbouring cases that take no scratch
+    // directory -- `an_absent_variable_leaves_the_log_disabled` and
+    // `an_empty_variable_leaves_the_log_disabled` -- both PASS under Miri and
+    // are therefore NOT ignored. The rule is exactly "ignore what needs a
+    // scratch directory", not "ignore this area of the file".
+    //
+    // Nothing of Miri's purpose is lost here either. What these four assert is
+    // the behaviour of a real `openat` against a real directory entry, which is
+    // a kernel property rather than a language-level one; Miri has no more to
+    // say about it than the native test run already does.
 
     // -- the constants ------------------------------------------------------
 
@@ -1540,7 +1868,7 @@ mod tests {
     }
 
     /// The generic writer is byte-transparent: no encoding conversion, no
-    /// escape processing, no newline normalisation, and no requirement that
+    /// escape processing, no newline normalization, and no requirement that
     /// the input be UTF-8.
     #[test]
     fn line_bytes_are_never_rewritten() {
@@ -1774,6 +2102,7 @@ mod tests {
     /// the TLS handshake changes: this is the case `rustls.c:816-818` returns
     /// `CURLE_OK` for.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
     fn an_unopenable_path_leaves_the_log_disabled() {
         scratch!(dir);
         let _env = env_lock();
@@ -1796,10 +2125,10 @@ mod tests {
     /// over the raw bytes just as `curl_getenv` does (`lib/getenv.c:78-79`).
     ///
     /// Unix only: a Windows environment value is UTF-16 and cannot carry an
-    /// unpaired byte, and Windows is outside the mandated target matrix
-    /// (AAP section 0.2.2).
+    /// unpaired byte, and Windows is outside the mandated target matrix.
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
     fn a_non_unicode_path_is_honoured() {
         use std::os::unix::ffi::OsStringExt;
         use std::path::PathBuf;
@@ -1832,13 +2161,22 @@ mod tests {
     /// An existing key log is appended to, never truncated: `"a"` mode
     /// (`keylog.c:47`, `lib/curl_setup.h:1257-1260`). A capture taken before
     /// this run must stay decryptable.
+    ///
+    /// The seed is written at [`SECRET_FILE_MODE`] rather than with a plain
+    /// `fs::write`, which would take its mode from the process umask -- `0644`
+    /// under the usual `0022` -- and be refused by
+    /// [`KeyLogFile::open_private_append`]. That refusal is correct and is
+    /// asserted by [`a_world_readable_key_log_is_refused`]; what this test is
+    /// about is the append, so its fixture models a key log this implementation
+    /// would itself have left behind.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
     fn an_existing_key_log_is_appended_not_truncated() {
         scratch!(dir);
         let _env = env_lock();
         let path = dir.path().join("keylog.txt");
         let seeded: &[u8] = b"CLIENT_RANDOM 0011 2233\n";
-        assert!(fs::write(&path, seeded).is_ok());
+        assert!(seed_at_mode(&path, seeded, SECRET_FILE_MODE));
         set_env_path(&path);
 
         let first = KeyLogFile::open_from_env();
@@ -1872,6 +2210,7 @@ mod tests {
     /// file-backed proof of line buffering (`keylog.c:52`) and of the plain
     /// `"a"` mode that does no end-of-line translation.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
     fn a_record_reaches_the_file_without_being_closed() {
         scratch!(dir);
         let _env = env_lock();
@@ -1898,6 +2237,7 @@ mod tests {
     /// by `if(!keylog_file_fp)` (`keylog.c:44`), and the rustls backend calls
     /// it once per easy handle (`rustls.c:815`).
     #[test]
+    #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
     fn opening_an_open_log_does_not_reopen_it() {
         scratch!(dir);
         let _env = env_lock();
@@ -1923,6 +2263,7 @@ mod tests {
     /// lazy half of the lifecycle, and what a backend does when it recovers
     /// from a registration failure (`rustls.c:823-826`).
     #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
     fn a_closed_log_can_be_reopened() {
         scratch!(dir);
         let _env = env_lock();
@@ -1944,6 +2285,415 @@ mod tests {
         assert_eq!(written, b"first\nsecond\n");
 
         clear_env();
+    }
+
+    // -- secret-file safety (F21) ------------------------------------------
+    //
+    // Two layers, tested separately on purpose.
+    //
+    // `secret_file_verdict` is the rule, and it is a pure function of four
+    // facts, so every combination -- including the ones a single host cannot be
+    // made to produce, such as a file owned by a user this process is not --
+    // is reachable without root, without a particular filesystem and without a
+    // `chown`.
+    //
+    // `open_private_append` is the wiring, and it is tested against real files
+    // in a real directory, because the properties that matter there are
+    // properties of the kernel: whether `O_NOFOLLOW` really refuses a symlink,
+    // whether the mode a file is created with really is `0600` after the umask
+    // has had its say, and whether the descriptor really carries `O_CLOEXEC`.
+
+    /// A private, self-owned regular file is the one accepted combination.
+    #[test]
+    fn a_private_self_owned_regular_file_is_accepted() {
+        assert_eq!(secret_file_verdict(true, 1000, 0o100_600, 1000), Ok(()));
+        // Owner-execute is not a reason to refuse: odd, but it grants nobody
+        // else anything.
+        assert_eq!(secret_file_verdict(true, 0, 0o100_700, 0), Ok(()));
+    }
+
+    /// Each of the three refusals is produced by exactly its own condition.
+    #[test]
+    fn each_refusal_has_its_own_cause() {
+        assert_eq!(
+            secret_file_verdict(false, 1000, 0o600, 1000),
+            Err(SecretFileRejection::NotRegularFile)
+        );
+        assert_eq!(
+            secret_file_verdict(true, 1001, 0o600, 1000),
+            Err(SecretFileRejection::ForeignOwner)
+        );
+        assert_eq!(
+            secret_file_verdict(true, 1000, 0o644, 1000),
+            Err(SecretFileRejection::TooPermissive)
+        );
+    }
+
+    /// Every group and other permission bit is a refusal, and no owner bit is.
+    ///
+    /// Enumerated rather than sampled, because a mask written with the wrong
+    /// number of digits -- `0o77` for `0o077`, say -- passes a test that only
+    /// tries `0o644`.
+    #[test]
+    fn only_group_and_other_bits_are_too_permissive() {
+        for bit in 0..9 {
+            let mode = 1_u32 << bit;
+            let verdict = secret_file_verdict(true, 7, 0o100_600 | mode, 7);
+            let owner_bit = mode & 0o700 != 0;
+            assert_eq!(
+                verdict.is_ok(),
+                owner_bit,
+                "mode bit {mode:#o} must {} be a refusal",
+                if owner_bit { "not" } else { "" }
+            );
+        }
+        // The file-type bits live above the permission bits and must never be
+        // mistaken for them: `0o100000` is `S_IFREG` and appears in every real
+        // `st_mode`.
+        assert_eq!(secret_file_verdict(true, 7, 0o100_600, 7), Ok(()));
+        assert_eq!(secret_file_verdict(true, 7, 0o140_600, 7), Ok(()));
+    }
+
+    /// The rule compares against the *effective* id it is handed, whatever it
+    /// is -- root included, which is the case a test running as root would
+    /// otherwise never exercise from the other side.
+    #[test]
+    fn ownership_is_compared_and_not_assumed() {
+        assert_eq!(secret_file_verdict(true, 0, 0o600, 0), Ok(()));
+        assert_eq!(
+            secret_file_verdict(true, 0, 0o600, 1000),
+            Err(SecretFileRejection::ForeignOwner)
+        );
+        assert_eq!(
+            secret_file_verdict(true, 1000, 0o600, 0),
+            Err(SecretFileRejection::ForeignOwner)
+        );
+    }
+
+    /// The severity order is fixed, so a file that fails two tests reports the
+    /// more fundamental one.
+    #[test]
+    fn the_most_fundamental_refusal_is_the_one_reported() {
+        // Not a regular file *and* foreign *and* world-readable.
+        assert_eq!(
+            secret_file_verdict(false, 1001, 0o666, 1000),
+            Err(SecretFileRejection::NotRegularFile)
+        );
+        // Foreign *and* world-readable.
+        assert_eq!(
+            secret_file_verdict(true, 1001, 0o666, 1000),
+            Err(SecretFileRejection::ForeignOwner)
+        );
+    }
+
+    /// Every refusal reaches the caller as `PermissionDenied`, and none of the
+    /// messages names a path.
+    #[test]
+    fn a_refusal_carries_no_path_and_one_error_kind() {
+        for rejection in [
+            SecretFileRejection::NotRegularFile,
+            SecretFileRejection::ForeignOwner,
+            SecretFileRejection::TooPermissive,
+        ] {
+            let error = rejection.into_io_error();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), rejection.reason());
+            assert!(
+                rejection.reason().starts_with("SSLKEYLOGFILE "),
+                "the reason names the variable, never a path"
+            );
+        }
+    }
+
+    /// A key log this implementation creates is private before any umask is
+    /// consulted.
+    ///
+    /// The umask in force is deliberately widened to `0` for the duration, which
+    /// is the configuration under which C's `fopen(name, "a")` leaves a `0666`
+    /// file. If the mode came from the umask rather than from
+    /// [`SECRET_FILE_MODE`], this is the test that says so.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
+    fn a_created_key_log_is_private() {
+        scratch!(dir);
+        let _env = env_lock();
+        let path = dir.path().join("keylog.txt");
+        set_env_path(&path);
+
+        let keylog = KeyLogFile::open_from_env();
+        assert!(keylog.enabled(), "a fresh path must open");
+        assert!(keylog.write_secret(
+            "CLIENT_RANDOM",
+            &golden_client_random(),
+            &golden_secret(),
+        ));
+        keylog.close();
+
+        assert_eq!(
+            mode_of(&path),
+            Some(SECRET_FILE_MODE),
+            "a created key log must be 0600 and nothing wider"
+        );
+        contents!(written, &path);
+        assert_eq!(
+            written,
+            GOLDEN_RECORD.as_bytes(),
+            "hardening must not change what is written"
+        );
+
+        clear_env();
+    }
+
+    /// A key log left behind world-readable is refused, and left untouched.
+    ///
+    /// This is the case a C curl produces under the usual umask, so the refusal
+    /// is the deliberate divergence documented on
+    /// [`KeyLogFile::open_private_append`] -- not an accident. The file's
+    /// contents are checked afterwards because a refusal that had already
+    /// appended would be worthless.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
+    fn a_world_readable_key_log_is_refused() {
+        scratch!(dir);
+        let _env = env_lock();
+        let path = dir.path().join("keylog.txt");
+        let seeded: &[u8] = b"CLIENT_RANDOM 0011 2233\n";
+        assert!(seed_at_mode(&path, seeded, 0o644));
+        set_env_path(&path);
+
+        let keylog = KeyLogFile::open_from_env();
+        assert!(!keylog.enabled(), "0644 must not receive TLS secrets");
+        assert!(!keylog.write_secret(
+            "CLIENT_RANDOM",
+            &golden_client_random(),
+            &golden_secret(),
+        ));
+
+        contents!(after, &path);
+        assert_eq!(after, seeded, "a refused key log must be untouched");
+        assert_eq!(
+            mode_of(&path),
+            Some(0o644),
+            "refusing must not silently tighten a file the user owns"
+        );
+
+        clear_env();
+    }
+
+    /// Group-readable is refused too: the mask is not "world" alone.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
+    fn a_group_readable_key_log_is_refused() {
+        scratch!(dir);
+        let _env = env_lock();
+        let path = dir.path().join("keylog.txt");
+        assert!(seed_at_mode(&path, b"", 0o640));
+        set_env_path(&path);
+
+        assert!(!KeyLogFile::open_from_env().enabled());
+
+        clear_env();
+    }
+
+    /// An existing key log that is already private is accepted and appended to.
+    ///
+    /// The positive control for the two refusals above: without it, a fix that
+    /// refused *every* pre-existing file would pass both of them.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
+    fn an_existing_private_key_log_is_accepted() {
+        scratch!(dir);
+        let _env = env_lock();
+        let path = dir.path().join("keylog.txt");
+        let seeded: &[u8] = b"CLIENT_RANDOM 0011 2233\n";
+        assert!(seed_at_mode(&path, seeded, SECRET_FILE_MODE));
+        set_env_path(&path);
+
+        let keylog = KeyLogFile::open_from_env();
+        assert!(keylog.enabled(), "0600 must be accepted");
+        assert!(keylog.write_line(b"SERVER_TRAFFIC_SECRET_0 44 55"));
+        keylog.close();
+
+        let mut expected = seeded.to_vec();
+        expected.extend_from_slice(b"SERVER_TRAFFIC_SECRET_0 44 55\n");
+        contents!(after, &path);
+        assert_eq!(after, expected);
+
+        clear_env();
+    }
+
+    /// A symlinked `SSLKEYLOGFILE` is refused, and its target stays empty.
+    ///
+    /// `O_NOFOLLOW`. The target is created first and left empty so that its
+    /// emptiness afterwards is evidence rather than coincidence, and the link
+    /// itself is checked to still be a link -- an implementation that replaced
+    /// the link with a regular file would also leave an empty target.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
+    fn a_symlinked_key_log_is_refused() {
+        scratch!(dir);
+        let _env = env_lock();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("keylog.txt");
+        assert!(seed_at_mode(&target, b"", SECRET_FILE_MODE));
+        assert!(std::os::unix::fs::symlink(&target, &link).is_ok());
+        set_env_path(&link);
+
+        let keylog = KeyLogFile::open_from_env();
+        assert!(!keylog.enabled(), "a symlink must not be followed");
+        assert!(!keylog.write_secret(
+            "CLIENT_RANDOM",
+            &golden_client_random(),
+            &golden_secret(),
+        ));
+
+        contents!(after, &target);
+        assert!(after.is_empty(), "nothing may reach a symlink's target");
+        let link_meta = fs::symlink_metadata(&link);
+        assert!(
+            matches!(link_meta, Ok(ref meta) if meta.file_type().is_symlink()),
+            "the link must still be a link: {link_meta:?}"
+        );
+
+        clear_env();
+    }
+
+    /// A symlink to a path that does not exist is refused rather than created.
+    ///
+    /// The dangling case is separate because `O_CREAT` without `O_NOFOLLOW`
+    /// *creates the target*, which is the primitive behind the classic
+    /// place-a-link-and-wait attack. Nothing may appear at the target.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
+    fn a_dangling_symlink_creates_nothing() {
+        scratch!(dir);
+        let _env = env_lock();
+        let target = dir.path().join("absent.txt");
+        let link = dir.path().join("keylog.txt");
+        assert!(std::os::unix::fs::symlink(&target, &link).is_ok());
+        set_env_path(&link);
+
+        assert!(!KeyLogFile::open_from_env().enabled());
+        assert!(
+            !target.exists(),
+            "O_NOFOLLOW must not create a symlink's target"
+        );
+
+        clear_env();
+    }
+
+    /// A character device is refused: the regular-file check.
+    ///
+    /// `/dev/null` is the one non-regular file that can be opened for writing
+    /// on any of the mandated targets without blocking and without privileges.
+    /// A FIFO is deliberately *not* used: opening one for writing with no reader
+    /// blocks inside `open`, before any check of ours can run, so a test built
+    /// on one would hang rather than fail. That limit is real and is recorded
+    /// here rather than papered over -- the regular-file test stops a device or
+    /// a socket from receiving secrets, and a FIFO blocks exactly as C's
+    /// `fopen` would.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
+    fn a_character_device_is_refused() {
+        let devnull = Path::new("/dev/null");
+        if !devnull.exists() {
+            return;
+        }
+        let opened = KeyLogFile::open_private_append(devnull.as_os_str());
+        assert!(
+            matches!(&opened, Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied),
+            "/dev/null must be refused by our verdict, not by the kernel: \
+             {opened:?}"
+        );
+    }
+
+    /// The descriptor is close-on-exec, so a child process cannot read it.
+    ///
+    /// Read back from `/proc/self/fdinfo`, which reports the descriptor's flags
+    /// in octal, rather than trusted from the flag having been passed: Rust's
+    /// [`File`] sets `O_CLOEXEC` itself, so passing it proves nothing on its
+    /// own and this is the assertion that the property actually holds.
+    ///
+    /// Linux only, because `/proc` is where the answer is legible without a
+    /// `fcntl` call, which this module may not make.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
+    #[cfg(target_os = "linux")]
+    fn the_key_log_descriptor_is_close_on_exec() {
+        use std::os::unix::io::AsRawFd;
+
+        /// `O_CLOEXEC` as `/proc/<pid>/fdinfo/<fd>` reports it.
+        const O_CLOEXEC_BIT: u32 = 0o2_000_000;
+
+        scratch!(dir);
+        let path = dir.path().join("keylog.txt");
+        let opened = KeyLogFile::open_private_append(path.as_os_str());
+        assert!(opened.is_ok(), "a fresh path must open: {:?}", opened.err());
+        let Ok(file) = opened else { return };
+
+        let info = fs::read_to_string(format!(
+            "/proc/self/fdinfo/{}",
+            file.as_raw_fd()
+        ));
+        assert!(info.is_ok(), "fdinfo must be readable on Linux");
+        let Ok(info) = info else { return };
+
+        let flags = info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .and_then(|value| u32::from_str_radix(value.trim(), 8).ok());
+        assert!(flags.is_some(), "fdinfo must report flags: {info}");
+        let Some(flags) = flags else { return };
+        assert_ne!(
+            flags & O_CLOEXEC_BIT,
+            0,
+            "the key log descriptor must be close-on-exec ({flags:#o})"
+        );
+    }
+
+    /// A directory is refused, and by the kernel rather than by us.
+    ///
+    /// `O_WRONLY` on a directory is `EISDIR`, so the open fails before the
+    /// verdict runs. Recorded as a test because the outcome is what matters and
+    /// because it pins which layer produces it: a `PermissionDenied` here would
+    /// mean the open had somehow succeeded.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
+    fn a_directory_is_refused_by_the_open() {
+        scratch!(dir);
+        let opened = KeyLogFile::open_private_append(dir.path().as_os_str());
+        assert!(
+            matches!(&opened, Err(error)
+                if error.kind() != io::ErrorKind::PermissionDenied),
+            "a directory must fail in the open, not in the verdict: {opened:?}"
+        );
+    }
+
+    /// The four open options C's `"a"` mode implies survive the hardening.
+    ///
+    /// Append, create, no truncation, and no end-of-line translation -- checked
+    /// together on one file so that a change to the option chain which dropped
+    /// one of them cannot pass by being tested somewhere else.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
+    fn hardening_preserves_append_and_no_truncate() {
+        scratch!(dir);
+        let path = dir.path().join("keylog.txt");
+        assert!(seed_at_mode(&path, b"first\n", SECRET_FILE_MODE));
+
+        for round in ["second\n", "third\n"] {
+            let opened = KeyLogFile::open_private_append(path.as_os_str());
+            assert!(opened.is_ok(), "{:?}", opened.err());
+            let Ok(mut file) = opened else { return };
+            assert!(file.write_all(round.as_bytes()).is_ok());
+        }
+
+        contents!(after, &path);
+        assert_eq!(
+            after, b"first\nsecond\nthird\n",
+            "every open must append to what was already there"
+        );
     }
 
     // -- concurrency -------------------------------------------------------
@@ -2090,7 +2840,7 @@ mod tests {
         logger.log("CLIENT_RANDOM", &random, &[0u8; SECRET_MAXLEN + 1]);
         assert!(recorder.bytes().is_empty(), "nothing may be written");
 
-        // The very same call succeeds once the arguments are valid, which
+        // That same call succeeds once the arguments are valid, which
         // proves the rejections above were about the arguments.
         logger.log("CLIENT_RANDOM", &random, &secret);
         assert_eq!(recorder.text(), GOLDEN_RECORD);

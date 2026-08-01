@@ -27,13 +27,25 @@ curl recognizes the environment variable named `CURL_CA_BUNDLE` if it is set,
 and uses the given path as a path to a CA cert bundle. This option overrides
 that variable.
 
-The certificates in the file become the trust anchors used to verify the
-server certificate. Without this option, curl verifies against the trust
+The certificates in the file become the trust anchors used to verify the server
+certificate. Without this option, curl is specified to verify against the trust
 anchors bundled through the `webpki-roots` crate, while --ca-native reads the
-platform trust store through the `rustls-native-certs` crate instead. The file
-named here is parsed with the `rustls-pemfile` crate.
+platform trust store through the `rustls-native-certs` crate instead. Those two
+crates are both declared and are not alternatives to one another: the bundled
+anchors back this embedded-bundle path and the platform store backs
+--ca-native, so choosing between them is a runtime decision driven by these
+options and never a build-time one. There is no unconditional fallback from one
+to the other. The file named here is read with the PEM parser in the
+`rustls-pki-types` crate, through its `PemObject` trait.
 
-Verification of the peer is on by default. --insecure is the only way to turn
-it off, and it prints a warning on stderr before the transfer proceeds. A
-revocation list given with --crlfile is applied to the trust anchors that this
-option installs.
+Verification of the peer is specified to be on by default, and --insecure is the
+only way to turn it off. The warning that --insecure prints on stderr before the
+transfer proceeds is delivered, and no verbosity option suppresses it, --silent
+included. A revocation list given with --crlfile is specified to apply to the
+trust anchors that this option installs.
+
+The trust-anchor, key-matching and revocation behavior described above is
+required target behavior rather than behavior a reader can exercise today: the
+`curl-rs-lib` TLS backend and its certificate-verification module are not yet
+on disk, and no
+revocation implementation has been delivered.

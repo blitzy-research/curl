@@ -32,9 +32,9 @@
 //!
 //! # The formats are the contract
 //!
-//! Every literal in this file is consumer-visible output. AAP section 0.8.1
-//! freezes protocol and terminal presentation, and AAP section 0.3.4 states
-//! that these surfaces are "reproduced byte-for-byte". Prefixes, bracket
+//! Every literal in this file is consumer-visible output, and protocol and
+//! terminal presentation are frozen: these surfaces are reproduced
+//! byte-for-byte rather than redesigned. Prefixes, bracket
 //! forms, separators, column alignment and dump geometry are therefore
 //! transcribed, never redesigned, and no formatting or readability pass may
 //! rewrite them. Where a literal is unusual, a comment records the C origin
@@ -50,10 +50,10 @@
 //! # Verified against the running C library, not only read
 //!
 //! The layouts below were confirmed by linking a probe against the C
-//! `libcurl.so.4` built from this tree (`curl 8.19.0-DEV`, the version AAP
-//! section 0.8.5/C6 binds every parity claim to) and calling
-//! `curl_global_trace()` with `CURLOPT_VERBOSE` and no debug callback, so the
-//! library's own writer was exercised:
+//! `libcurl.so.4` built from this tree (`curl 8.19.0-DEV`, the version every
+//! parity claim is against) and calling `curl_global_trace()` with
+//! `CURLOPT_VERBOSE` and no debug callback, so the library's own writer was
+//! exercised:
 //!
 //! ```text
 //! * [0-x] [MULTI] [INIT] added to multi, mid=1, running=1, total=2
@@ -86,22 +86,22 @@
 //!
 //! This module holds **no** multi-state strings. [`mstate_name`] delegates to
 //! [`crate::multi::state::CurlMstate`], which derives every name from one
-//! exhaustive `match`, so a state added without a name no longer compiles
-//! (AAP section 0.3.3 P3). [`TimerId`] applies the same discipline to
-//! `Curl_trc_timer_names[]` (`lib/curl_trc.c:281-297`): the enumeration and
-//! its names live together in one exhaustive `match` instead of an array
-//! indexed by a separately declared `expire_id` (`lib/urldata.h:887-904`).
+//! exhaustive `match`, so a state added without a name no longer compiles.
+//! [`TimerId`] applies the same discipline to `Curl_trc_timer_names[]`
+//! (`lib/curl_trc.c:281-297`): the enumeration and its names live together in
+//! one exhaustive `match` instead of an array indexed by a separately
+//! declared `expire_id` (`lib/urldata.h:887-904`).
 //!
 //! # Deliberate divergences, each with its reason
 //!
 //! * **The SMTP trace feature is omitted.** C registers `"SMTP"`
-//!   (`lib/curl_trc.c:426`), but SMTP is out of scope (AAP section 0.2.2) and
+//!   (`lib/curl_trc.c:426`), but SMTP is out of scope and
 //!   requests for it answer `CURLE_UNSUPPORTED_PROTOCOL`. The asymmetry that
-//!   governs the version banner governs this too (AAP section 0.6.5):
+//!   governs the version banner governs this too:
 //!   under-reporting a capability is safe, over-reporting is not.
 //! * **The `CURL_DEBUG` environment override is absent.** In C it exists only
 //!   under `DEBUGBUILD` (`lib/curl_trc.c:642-649`), and this build
-//!   deliberately does not advertise `Debug` (AAP section 0.6.6). It is
+//!   deliberately does not advertise `Debug`. It is
 //!   recorded here so its absence reads as a decision, not an oversight; were
 //!   the debug posture reversed it would belong in [`TraceConfig::init`].
 //! * **`Curl_trc_init()` is a no-op.** Outside a debug build the C function
@@ -155,14 +155,21 @@
 //! macros here but keep their own state. Presentation *policy* -- which
 //! stream a trace goes to, the terminal suppression of data blocks, the
 //! per-line prefixing that `--trace` performs across a multi-line payload,
-//! and the platform clock -- belongs to the command-line adapter in
-//! `curl-rs/src/callbacks/debug.rs`, because it needs process-wide state and
-//! a local-time conversion that cannot be written without `unsafe`. The
-//! geometry that policy arranges is here, in one place, rather than being
-//! re-derived there.
+//! and the platform clock -- is the command-line adapter's to own, in a
+//! `src/callbacks/debug.rs` under `curl-rs` that does not exist yet, because it
+//! needs process-wide state and a local-time conversion that cannot be written
+//! without `unsafe`. The geometry that policy arranges is here, in one place,
+//! rather than being re-derived there.
 //!
-//! There is no `unsafe` in this module, in keeping with the crate root's
-//! `forbid(unsafe_code)` (AAP section 0.1.1 G6).
+//! There is no `unsafe` in this module, and the crate root's
+//! `#![deny(unsafe_code)]` makes any that appeared here a hard error: the
+//! single exemption that root grants is on `mod ffi`, and this is not it.
+
+// Items whose only consumers are modules that have not landed yet carry
+// `#[allow(dead_code)]` individually. The allowance is never set on this
+// module's root, because that would also hide the next unreferenced item
+// somebody adds -- the crate's own policy test in `lib.rs` enforces the
+// distinction.
 
 use core::fmt;
 use std::borrow::Cow;
@@ -179,6 +186,7 @@ use crate::multi::state::CurlMstate;
 /// `maxlength - 1` bytes because it always writes a NUL
 /// (`lib/mprintf.c:1088-1098`); [`LineBuffer`] reproduces that budget rather
 /// than the nominal size.
+#[allow(dead_code)]
 pub(crate) const TRC_LINE_MAX: usize = 2048;
 
 /// Size of the caller-supplied `CURLOPT_ERRORBUFFER`, NUL included.
@@ -186,6 +194,7 @@ pub(crate) const TRC_LINE_MAX: usize = 2048;
 /// `CURL_ERROR_SIZE` (`include/curl/curl.h:865`). `Curl_failf()` formats with
 /// this as the bound (`lib/curl_trc.c:184`), so a failure message carries at
 /// most `CURL_ERROR_SIZE - 1` bytes before its newline.
+#[allow(dead_code)]
 pub(crate) const CURL_ERROR_SIZE: usize = 256;
 
 /// Longest `--trace-config` token, in bytes.
@@ -193,6 +202,7 @@ pub(crate) const CURL_ERROR_SIZE: usize = 256;
 /// The `max` argument of `curlx_str_until(&config, &out, 32, ',')`
 /// (`lib/curl_trc.c:607`). Exceeding it aborts the parse; see the module
 /// documentation and [`TraceConfig::apply`].
+#[allow(dead_code)]
 pub(crate) const TRACE_CONFIG_TOKEN_MAX: usize = 32;
 
 /// How much of a component's activity is logged.
@@ -204,6 +214,7 @@ pub(crate) const TRACE_CONFIG_TOKEN_MAX: usize = 32;
 /// value that never existed.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
 pub(crate) enum TraceLevel {
     /// `CURL_LOG_LVL_NONE` -- the component stays silent. Every feature and
     /// filter starts here (`lib/curl_trc.c:85`, `:207`, and so on for all
@@ -217,6 +228,7 @@ pub(crate) enum TraceLevel {
 impl TraceLevel {
     /// The C integer, for the FFI crate and for `curl_easy_getinfo`-style
     /// reporting.
+    #[allow(dead_code)]
     pub(crate) const fn as_i32(self) -> i32 {
         self as i32
     }
@@ -225,6 +237,7 @@ impl TraceLevel {
     ///
     /// Exactly `log_level >= CURL_LOG_LVL_INFO`, the comparison every C guard
     /// macro performs (`lib/curl_trc.h:314`, `:317`, `:320`).
+    #[allow(dead_code)]
     pub(crate) const fn is_info(self) -> bool {
         matches!(self, Self::Info)
     }
@@ -238,6 +251,7 @@ impl TraceLevel {
     ///
     /// [`Info`]: TraceLevel::Info
     /// [`None`]: TraceLevel::None
+    #[allow(dead_code)]
     pub(crate) const fn from_i32(raw: i32) -> Self {
         if raw >= Self::Info as i32 {
             Self::Info
@@ -256,6 +270,7 @@ impl TraceLevel {
 /// (`lib/curl_trc.c:595`, `:599`) -- a value here is a *set*, and the
 /// selector `all` passes the empty one.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct TraceCategory(u32);
 
 impl TraceCategory {
@@ -263,22 +278,29 @@ impl TraceCategory {
     /// belong to no group (`lib/curl_trc.c:511-512`), and passed as the
     /// selector by the `all` keyword (`lib/curl_trc.c:619`), where it means
     /// the opposite -- see [`matches_selector`](Self::matches_selector).
+    #[allow(dead_code)]
     pub(crate) const NONE: Self = Self(0);
     /// `TRC_CT_PROTOCOL (1 << 0)`.
+    #[allow(dead_code)]
     pub(crate) const PROTOCOL: Self = Self(1 << 0);
     /// `TRC_CT_NETWORK (1 << 1)`.
+    #[allow(dead_code)]
     pub(crate) const NETWORK: Self = Self(1 << 1);
     /// `TRC_CT_PROXY (1 << 2)`.
+    #[allow(dead_code)]
     pub(crate) const PROXY: Self = Self(1 << 2);
     /// `TRC_CT_INTERNALS (1 << 3)`.
+    #[allow(dead_code)]
     pub(crate) const INTERNALS: Self = Self(1 << 3);
 
     /// The raw mask, for the FFI crate and for tests that pin the bits.
+    #[allow(dead_code)]
     pub(crate) const fn bits(self) -> u32 {
         self.0
     }
 
     /// Whether this is the empty set, `TRC_CT_NONE`.
+    #[allow(dead_code)]
     pub(crate) const fn is_none(self) -> bool {
         self.0 == 0
     }
@@ -293,6 +315,7 @@ impl TraceCategory {
     /// as "matches nothing" would silently make `all` mean "only the
     /// uncategorised", so the two uses of the empty set are kept distinct here
     /// by naming: `self` is a membership, `selector` is a query.
+    #[allow(dead_code)]
     pub(crate) const fn matches_selector(self, selector: Self) -> bool {
         selector.is_none() || (self.0 & selector.0) != 0
     }
@@ -302,17 +325,26 @@ impl TraceCategory {
     /// The four case-insensitive keywords of `trc_opt()`
     /// (`lib/curl_trc.c:618-625`). `None` means the token was not a keyword
     /// and must be matched against component names instead.
-    pub(crate) fn from_keyword(token: &str) -> Option<Self> {
+    ///
+    /// Takes bytes, not `&str`, because C's token is a `struct Curl_str` --
+    /// a pointer and a length over the caller's buffer -- and
+    /// `curl_global_trace()` accepts any NUL-terminated bytes. Requiring UTF-8
+    /// here would push a decode onto the ABI boundary that has no counterpart
+    /// in C; see [`TraceConfig::apply`].
+    #[allow(dead_code)] // consumer module not landed
+    pub(crate) fn from_keyword(token: &[u8]) -> Option<Self> {
         // `eq_ignore_ascii_case` is `curlx_str_casecompare()`'s comparison:
         // that helper requires equal lengths and then defers to
         // `curl_strnequal()`, which is ASCII-only (`lib/curlx/strparse.c:239-243`).
-        if token.eq_ignore_ascii_case("all") {
+        // The slice form folds only A-Z/a-z, so a non-ASCII byte compares
+        // literally -- which is exactly what `Curl_raw_toupper()` does.
+        if token.eq_ignore_ascii_case(b"all") {
             Some(Self::NONE)
-        } else if token.eq_ignore_ascii_case("protocol") {
+        } else if token.eq_ignore_ascii_case(b"protocol") {
             Some(Self::PROTOCOL)
-        } else if token.eq_ignore_ascii_case("network") {
+        } else if token.eq_ignore_ascii_case(b"network") {
             Some(Self::NETWORK)
-        } else if token.eq_ignore_ascii_case("proxy") {
+        } else if token.eq_ignore_ascii_case(b"proxy") {
             Some(Self::PROXY)
         } else {
             None
@@ -326,7 +358,12 @@ impl TraceCategory {
 /// `struct Curl_str dns = { "dns", 3 }` (`lib/curl_trc.c:626-629`). Naming the
 /// target once means the alias cannot come to point at a feature that has been
 /// renamed: the constant is asserted against [`TraceFeature::Dns`] by test.
-const TRACE_CONFIG_DOH_ALIAS_TARGET: &str = "DNS";
+///
+/// Bytes rather than `&str`, to match the lookup it is fed to. C's literal is
+/// likewise a byte pointer with an explicit length rather than a decoded
+/// string.
+#[allow(dead_code)] // consumer module not landed
+const TRACE_CONFIG_DOH_ALIAS_TARGET: &[u8] = b"DNS";
 
 /// A traceable library component, other than a connection filter.
 ///
@@ -336,15 +373,14 @@ const TRACE_CONFIG_DOH_ALIAS_TARGET: &str = "DNS";
 /// diffed against the original entry by entry.
 ///
 /// Ten variants where C has eleven. `Curl_trc_feat_smtp` (`"SMTP"`,
-/// `lib/curl_trc.c:426`) has no counterpart because SMTP is out of scope (AAP
-/// section 0.2.2); the reasoning is in the module documentation.
+/// `lib/curl_trc.c:426`) has no counterpart because SMTP is out of scope; the
+/// reasoning is in the module documentation.
 ///
-/// The conditional variants mirror C's `#ifdef`s exactly, which is AAP section
-/// 0.4.2's transformation rule -- `#ifndef CURL_DISABLE_FTP` becomes
-/// `#[cfg(feature = "ftp")]`. `SSLS` is unconditional where C guards it with
-/// `#ifdef USE_SSL`, because rustls is the sole TLS implementation and is a
-/// non-optional dependency of this crate, so `USE_SSL` is always satisfied
-/// (AAP section 0.8.2).
+/// The conditional variants mirror C's `#ifdef`s exactly: `#ifndef
+/// CURL_DISABLE_FTP` becomes `#[cfg(feature = "ftp")]`. `SSLS` is unconditional
+/// where C guards it with `#ifdef USE_SSL`, because rustls is the sole TLS
+/// implementation and is a non-optional dependency of this crate, so `USE_SSL`
+/// is always satisfied.
 ///
 /// The discriminants are storage slots for [`TraceConfig`], not part of any
 /// ABI: they must be distinct and below [`SLOTS`](Self::SLOTS), and they stay
@@ -352,6 +388,7 @@ const TRACE_CONFIG_DOH_ALIAS_TARGET: &str = "DNS";
 /// cannot renumber the ones that remain. A test asserts both properties.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
 pub(crate) enum TraceFeature {
     /// `Curl_trc_feat_ids` (`lib/curl_trc.c:83`) -- prefixes records with the
     /// transfer and connection identifiers. Read through
@@ -396,6 +433,7 @@ impl TraceFeature {
     /// *could* exist so that a disabled Cargo feature leaves a hole rather
     /// than shifting its neighbours; the cost is a handful of bytes in
     /// [`TraceConfig`].
+    #[allow(dead_code)]
     pub(crate) const SLOTS: usize = 10;
 
     /// Every feature this build registers, in `trc_feats[]` order.
@@ -403,6 +441,7 @@ impl TraceFeature {
     /// The iteration order matters: `trc_apply_level_by_name()` stops at the
     /// first match (`lib/curl_trc.c:582-587`), so the order fixes which entry
     /// wins were two ever to share a name.
+    #[allow(dead_code)]
     pub(crate) const ALL: &'static [Self] = &[
         Self::Ids,
         Self::Multi,
@@ -429,6 +468,7 @@ impl TraceFeature {
     /// forwards (`src/tool_getparam.c:789`, `:803`).
     ///
     /// No `_` arm, so a variant added without a name is a compile error.
+    #[allow(dead_code)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Ids => "LIB-IDS",
@@ -452,6 +492,7 @@ impl TraceFeature {
     /// The `category` member of each `trc_feats[]` row
     /// (`lib/curl_trc.c:509-529`). `READ` and `WRITE` are genuinely
     /// uncategorised, so only the `all` keyword reaches them.
+    #[allow(dead_code)]
     pub(crate) const fn category(self) -> TraceCategory {
         match self {
             Self::Ids => TraceCategory::INTERNALS,
@@ -471,6 +512,7 @@ impl TraceFeature {
     }
 
     /// Index of this feature's level inside [`TraceConfig`].
+    #[allow(dead_code)]
     const fn slot(self) -> usize {
         self as usize
     }
@@ -480,11 +522,16 @@ impl TraceFeature {
     /// The second loop of `trc_apply_level_by_name()`
     /// (`lib/curl_trc.c:582-587`), which breaks at the first match. Unknown
     /// names simply do not match; C treats that as success, not as an error.
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|feature| feature.name().eq_ignore_ascii_case(name))
+    ///
+    /// The needle is bytes because the token it comes from is bytes; the
+    /// haystack is this table's own ASCII name. A needle that is not valid
+    /// UTF-8 cannot equal any entry, which is the same answer C's byte
+    /// comparison gives for the same input.
+    #[allow(dead_code)] // consumer module not landed
+    pub(crate) fn from_name(name: &[u8]) -> Option<Self> {
+        Self::ALL.iter().copied().find(|feature| {
+            feature.name().as_bytes().eq_ignore_ascii_case(name)
+        })
     }
 }
 
@@ -509,7 +556,7 @@ impl fmt::Display for TraceFeature {
 /// `struct curl_trc_feat`; it reaches into each through its own type rather
 /// than casting between them (`lib/curl_trc.c:572-588`). Two Rust enumerations
 /// reproduce that arrangement and make the conflation unrepresentable, which
-/// is the class of pattern AAP section 0.6.9 removes.
+/// is the class of pattern this rewrite exists to remove.
 ///
 /// Filters carry their own level rather than inheriting one, because
 /// `Curl_trc_cf_is_verbose()` tests `cf->cft->log_level` independently of the
@@ -522,6 +569,7 @@ impl fmt::Display for TraceFeature {
 /// every feature combination.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
 pub(crate) enum TraceFilter {
     /// `Curl_cft_tcp` -- the TCP socket filter.
     Tcp = 0,
@@ -538,7 +586,7 @@ pub(crate) enum TraceFilter {
     /// `Curl_cft_nghttp2` -- the HTTP/2 filter. C-guarded by
     /// `#if !defined(CURL_DISABLE_HTTP) && defined(USE_NGHTTP2)`. The Rust
     /// identifier drops the reference to the C library, which the `h2` crate
-    /// replaces (AAP section 0.4.1), but the emitted name is unchanged: the C
+    /// replaces, but the emitted name is unchanged: the C
     /// symbol's `name` member is the literal `"HTTP/2"`, so nothing in a trace
     /// log ever said `nghttp2` and nothing here will either.
     #[cfg(feature = "http2")]
@@ -563,8 +611,8 @@ pub(crate) enum TraceFilter {
     SocksProxy = 13,
     /// `Curl_cft_http3` -- the HTTP/3 filter. Already a filter in the C design
     /// (`lib/vquic/vquic.h:48`), which is why QUIC needs no parallel
-    /// abstraction here (AAP section 0.3.3 P2). C-guarded by
-    /// `#if !defined(CURL_DISABLE_HTTP) && defined(USE_HTTP3)`.
+    /// abstraction here. C-guarded by `#if !defined(CURL_DISABLE_HTTP) &&
+    /// defined(USE_HTTP3)`.
     #[cfg(feature = "http3")]
     Http3 = 14,
     /// `Curl_cft_http_connect` -- HTTPS version negotiation, the filter that
@@ -574,9 +622,11 @@ pub(crate) enum TraceFilter {
 
 impl TraceFilter {
     /// Number of storage slots reserved, counting the conditional variants.
+    #[allow(dead_code)]
     pub(crate) const SLOTS: usize = 16;
 
     /// Every filter this build registers, in `trc_cfts[]` order.
+    #[allow(dead_code)]
     pub(crate) const ALL: &'static [Self] = &[
         Self::Tcp,
         Self::Udp,
@@ -610,6 +660,7 @@ impl TraceFilter {
     /// `"HTTP/3"` contain a solidus.
     ///
     /// No `_` arm, so a variant added without a name is a compile error.
+    #[allow(dead_code)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Tcp => "TCP",
@@ -640,6 +691,7 @@ impl TraceFilter {
     /// (`lib/curl_trc.c:538-569`). Note that `SSL` is `NETWORK` while
     /// `SSL-PROXY` is `PROXY`: the same implementation is categorised by what
     /// it is protecting, not by what it is.
+    #[allow(dead_code)]
     pub(crate) const fn category(self) -> TraceCategory {
         match self {
             Self::Tcp => TraceCategory::NETWORK,
@@ -665,6 +717,7 @@ impl TraceFilter {
     }
 
     /// Index of this filter's level inside [`TraceConfig`].
+    #[allow(dead_code)]
     const fn slot(self) -> usize {
         self as usize
     }
@@ -673,11 +726,15 @@ impl TraceFilter {
     ///
     /// The first loop of `trc_apply_level_by_name()`
     /// (`lib/curl_trc.c:576-581`), which breaks at the first match.
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
+    ///
+    /// Bytes for the same reason as [`TraceFeature::from_name`]: the needle
+    /// originates in a `--trace-config` token, which C never decodes.
+    #[allow(dead_code)] // consumer module not landed
+    pub(crate) fn from_name(name: &[u8]) -> Option<Self> {
         Self::ALL
             .iter()
             .copied()
-            .find(|filter| filter.name().eq_ignore_ascii_case(name))
+            .find(|filter| filter.name().as_bytes().eq_ignore_ascii_case(name))
     }
 }
 
@@ -695,9 +752,9 @@ impl fmt::Display for TraceFilter {
 /// `trc_opt()` writes through (`lib/curl_trc.c:578`, `:584`, `:596`, `:600`).
 /// Here the levels are gathered into one owned value instead.
 ///
-/// That is not a stylistic preference. AAP section 0.3.3 P12 makes dependency
-/// injection an architectural requirement so the protocol and transfer modules
-/// can be tested to the mandated coverage without live network access, and a
+/// That is not a stylistic preference. Dependency injection is an architectural
+/// requirement here, so that the protocol and transfer modules can be tested to
+/// the mandated coverage without live network access, and a
 /// process-global trace level would make those tests order-dependent -- one
 /// test enabling `WRITE` would change what another observes. Keeping the levels
 /// in a value also removes the need for `static mut` or a `OnceLock`, neither
@@ -708,6 +765,7 @@ impl fmt::Display for TraceFilter {
 /// the exported `curl_global_trace()`, and lends it to each transfer, which is
 /// what C's globals amount to in the only configuration curl itself ships.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct TraceConfig {
     /// Levels indexed by [`TraceFeature::slot`].
     features: [TraceLevel; TraceFeature::SLOTS],
@@ -718,10 +776,11 @@ pub(crate) struct TraceConfig {
 impl TraceConfig {
     /// A configuration with every component silent.
     ///
-    /// The state C's statics are initialised to: every one of the eleven
-    /// features and every filter starts at `CURL_LOG_LVL_NONE`
+    /// The state C's static variables are initialised to: every one of
+    /// the eleven features and every filter starts at `CURL_LOG_LVL_NONE`
     /// (`lib/curl_trc.c:85`, `:207`, `:211`, `:215`, `:219`, `:223`, `:410`,
     /// `:446`, `:464`, `:482`).
+    #[allow(dead_code)]
     pub(crate) const fn new() -> Self {
         Self {
             features: [TraceLevel::None; TraceFeature::SLOTS],
@@ -740,29 +799,42 @@ impl TraceConfig {
     /// Under `DEBUGBUILD` the C function instead calls `Curl_trc_opt(NULL)`,
     /// which consults the `CURL_DEBUG` environment variable
     /// (`lib/curl_trc.c:642-649`). That path is deliberately absent: this
-    /// build does not advertise `Debug` (AAP section 0.6.6), and were that
+    /// build does not advertise `Debug`, and were that
     /// posture reversed, the override belongs here.
+    #[allow(dead_code)]
     pub(crate) fn init() -> CodeResult<Self> {
         Ok(Self::new())
     }
 
     /// The level a feature is logging at.
+    #[allow(dead_code)]
     pub(crate) fn feature_level(&self, feature: TraceFeature) -> TraceLevel {
         self.features[feature.slot()]
     }
 
     /// The level a filter type is logging at.
+    #[allow(dead_code)]
     pub(crate) fn filter_level(&self, filter: TraceFilter) -> TraceLevel {
         self.filters[filter.slot()]
     }
 
     /// Set one feature's level, as `trc_apply_level_by_name()` does.
-    pub(crate) fn set_feature_level(&mut self, feature: TraceFeature, level: TraceLevel) {
+    #[allow(dead_code)]
+    pub(crate) fn set_feature_level(
+        &mut self,
+        feature: TraceFeature,
+        level: TraceLevel,
+    ) {
         self.features[feature.slot()] = level;
     }
 
     /// Set one filter type's level.
-    pub(crate) fn set_filter_level(&mut self, filter: TraceFilter, level: TraceLevel) {
+    #[allow(dead_code)]
+    pub(crate) fn set_filter_level(
+        &mut self,
+        filter: TraceFilter,
+        level: TraceLevel,
+    ) {
         self.filters[filter.slot()] = level;
     }
 
@@ -772,6 +844,7 @@ impl TraceConfig {
     /// `Curl_trc_ft_is_verbose()` (`lib/curl_trc.h:318-320`). The transfer's
     /// own verbosity is the other half and lives on [`Tracer`], because it is
     /// per-transfer rather than per-configuration.
+    #[allow(dead_code)]
     pub(crate) fn feature_is_info(&self, feature: TraceFeature) -> bool {
         self.feature_level(feature).is_info()
     }
@@ -780,6 +853,7 @@ impl TraceConfig {
     ///
     /// The `cf->cft->log_level >= CURL_LOG_LVL_INFO` half of
     /// `Curl_trc_cf_is_verbose()` (`lib/curl_trc.h:315-317`).
+    #[allow(dead_code)]
     pub(crate) fn filter_is_info(&self, filter: TraceFilter) -> bool {
         self.filter_level(filter).is_info()
     }
@@ -790,7 +864,12 @@ impl TraceConfig {
     /// first and then features, with the empty selector meaning *everything*
     /// -- see [`TraceCategory::matches_selector`]. Unlike the by-name form this
     /// does not stop at the first match; it is a broadcast.
-    pub(crate) fn apply_level_by_category(&mut self, selector: TraceCategory, level: TraceLevel) {
+    #[allow(dead_code)]
+    pub(crate) fn apply_level_by_category(
+        &mut self,
+        selector: TraceCategory,
+        level: TraceLevel,
+    ) {
         for &filter in TraceFilter::ALL {
             if filter.category().matches_selector(selector) {
                 self.set_filter_level(filter, level);
@@ -814,7 +893,14 @@ impl TraceConfig {
     /// An unrecognised name matches nothing and is not an error. That leniency
     /// is documented behaviour: `Curl_trc_opt()`'s contract says "Unknown names
     /// are ignored" (`lib/curl_trc.h:40`).
-    pub(crate) fn apply_level_by_name(&mut self, name: &str, level: TraceLevel) {
+    ///
+    /// The name is bytes, matching C's `struct Curl_str *token`.
+    #[allow(dead_code)] // consumer module not landed
+    pub(crate) fn apply_level_by_name(
+        &mut self,
+        name: &[u8],
+        level: TraceLevel,
+    ) {
         if let Some(filter) = TraceFilter::from_name(name) {
             self.set_filter_level(filter, level);
         }
@@ -861,23 +947,40 @@ impl TraceConfig {
     /// 33-byte token followed by `multi` produced no `[MULTI]` records, a
     /// 32-byte one produced them all.
     ///
+    /// # Why the argument is bytes
+    ///
+    /// `curl_global_trace(const char *config)` accepts any NUL-terminated
+    /// byte string, and `trc_opt()` never decodes it: `curlx_str_until()`
+    /// hands `curlx_str_casecompare()` a pointer and a length, and that helper
+    /// folds only `A-Z`/`a-z` through `Curl_raw_toupper()`. Taking `&str` here
+    /// would move a decode that C does not perform onto the ABI boundary, and
+    /// the shim would then have to choose between two wrong answers: reject
+    /// the configuration outright, which C never does, or expand it lossily --
+    /// and a lossy expansion is worse than it looks, because each invalid byte
+    /// becomes a three-byte `U+FFFD`, which can push an otherwise legal token
+    /// past [`TRACE_CONFIG_TOKEN_MAX`] and, per the rules above, abandon the
+    /// rest of the string including later valid tokens.
+    ///
+    /// Bytes remove the choice. A token that is not valid UTF-8 matches no
+    /// keyword and no component name and is therefore ignored, which is
+    /// precisely what C's byte comparison already does with it.
+    ///
     /// # Errors
     ///
     /// Never. The signature is fallible because `Curl_trc_opt()`'s is, and
     /// because `curl_global_trace()` must return a `CURLcode`; C's own body
     /// can only produce `CURLE_OK`, and a caller that treated a malformed
     /// configuration as fatal would be a behaviour change.
-    pub(crate) fn apply(&mut self, config: Option<&str>) -> CodeResult<()> {
+    #[allow(dead_code)] // consumer module not landed
+    pub(crate) fn apply(&mut self, config: Option<&[u8]>) -> CodeResult<()> {
         let Some(config) = config else {
             return Ok(());
         };
 
-        // A byte cursor rather than `&str` slicing: token boundaries are byte
-        // offsets in C, and a multi-byte character straddling one would make
-        // `&config[a..b]` panic. Bytes cannot, and a non-ASCII token simply
-        // matches no name -- which is what C does too, since it compares raw
-        // bytes against ASCII literals.
-        let mut rest = config.as_bytes();
+        // A byte cursor, as C uses: token boundaries are byte offsets there,
+        // and `&str` slicing would panic on a multi-byte character straddling
+        // one.
+        let mut rest = config;
         while let Some(token) = next_config_token(&mut rest) {
             // `curlx_str_nudge(&out, 1)` after inspecting the first byte
             // (`lib/curl_trc.c:611-616`). A lone `"-"` or `"+"` leaves an empty
@@ -890,20 +993,18 @@ impl TraceConfig {
                 _ => (TraceLevel::Info, token),
             };
 
-            // Tokens are split on ASCII bytes and the sign stripped is ASCII, so
-            // a `&str` input yields valid UTF-8 here every time. The result is
-            // matched rather than unwrapped so that the invariant is not load
-            // bearing: were this ever fed raw bytes, an invalid sequence would
-            // become the same silent no-op an unrecognised name is, which is
-            // what C does when it compares raw bytes against ASCII literals.
-            if let Ok(name) = core::str::from_utf8(name) {
-                if let Some(selector) = TraceCategory::from_keyword(name) {
-                    self.apply_level_by_category(selector, level);
-                } else if name.eq_ignore_ascii_case("doh") {
-                    self.apply_level_by_name(TRACE_CONFIG_DOH_ALIAS_TARGET, level);
-                } else {
-                    self.apply_level_by_name(name, level);
-                }
+            // The four keywords, then the `doh` alias, then the component
+            // tables -- `trc_opt()`'s own if/else ladder
+            // (`lib/curl_trc.c:618-631`), matched on raw bytes throughout. No
+            // decode step exists, so no token can be lost to one: a sequence
+            // that is not valid UTF-8 falls through to the by-name lookup,
+            // matches nothing, and is ignored, which is C's outcome for it.
+            if let Some(selector) = TraceCategory::from_keyword(name) {
+                self.apply_level_by_category(selector, level);
+            } else if name.eq_ignore_ascii_case(b"doh") {
+                self.apply_level_by_name(TRACE_CONFIG_DOH_ALIAS_TARGET, level);
+            } else {
+                self.apply_level_by_name(name, level);
             }
 
             // `if(curlx_str_single(&config, ',')) break;`
@@ -924,7 +1025,12 @@ impl TraceConfig {
     /// symbols (`lib/libcurl.def:34`), so the ABI shim needs the code rather
     /// than a `Result`. Provided here so that the mapping is written once
     /// instead of in `curl-rs-ffi`.
-    pub(crate) fn apply_code(&mut self, config: Option<&str>) -> CURLcode {
+    ///
+    /// The argument is bytes for the reason [`apply`](Self::apply) gives: the
+    /// shim can pass `CStr::to_bytes()` straight through, with no decode and
+    /// therefore no way to reject or mangle a configuration C would accept.
+    #[allow(dead_code)] // consumer module not landed
+    pub(crate) fn apply_code(&mut self, config: Option<&[u8]>) -> CURLcode {
         match self.apply(config) {
             Ok(()) => CURLcode::Ok,
             Err(code) => code,
@@ -941,6 +1047,7 @@ impl TraceConfig {
 /// `None` covers both of C's failure codes, because `trc_opt()`'s
 /// `while(!curlx_str_until(...))` cannot distinguish them: `STRE_BIG` for a
 /// token over the cap and `STRE_SHORT` for an empty one.
+#[allow(dead_code)]
 fn next_config_token<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
     let len = rest
         .iter()
@@ -980,14 +1087,14 @@ fn next_config_token<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
 /// discriminants and [`name`](Self::name)'s exhaustive `match` cannot disagree,
 /// and a variant added without a name is a compile error.
 ///
-/// This is the one place where the target module differs from the plan sketched
-/// in [`crate::multi::state`], which anticipated the enumeration living in
-/// `crate::multi::events`. The scheduler will `use` this type rather than
-/// declare a second one; a parallel enumeration there would rebuild precisely
-/// the drift this arrangement removes, and the C original is a trace-module
-/// table in any case.
+/// This type lives here rather than in `crate::multi::events`, where
+/// [`crate::multi::state`]'s documentation still anticipates it. The scheduler
+/// is to `use` this type rather than declare a second one; a parallel
+/// enumeration there would rebuild precisely the drift this arrangement
+/// removes, and the C original is a trace-module table in any case.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
 pub(crate) enum TimerId {
     /// `EXPIRE_100_TIMEOUT`, `"100_TIMEOUT"` -- how long to wait for a
     /// `100 Continue` interim response before sending the body anyway.
@@ -1037,12 +1144,14 @@ impl TimerId {
     /// `EXPIRE_LAST` read as a count, which is what
     /// `CURL_ARRAYSIZE(Curl_trc_timer_names)` evaluates to
     /// (`lib/curl_trc.c:301`).
+    #[allow(dead_code)]
     pub(crate) const COUNT: usize = 15;
 
     /// Integer value of C's `EXPIRE_LAST` marker (`lib/urldata.h:903`).
     ///
     /// Published as a number rather than a variant, because the header says it
     /// is not a timer.
+    #[allow(dead_code)]
     pub(crate) const LAST: u8 = 15;
 
     /// Name answered when an integer does not denote a timer.
@@ -1054,9 +1163,11 @@ impl TimerId {
     /// (`lib/curl_trc.c:358`, reached through [`mstate_name`]). The two strings
     /// are different, both are frozen output, and unifying them would change
     /// what a trace log says.
+    #[allow(dead_code)]
     pub(crate) const UNKNOWN_NAME: &'static str = "UNKNOWN?";
 
     /// Every timer, in `Curl_trc_timer_names[]` order.
+    #[allow(dead_code)]
     pub(crate) const ALL: &'static [Self] = &[
         Self::Expect100Timeout,
         Self::AsyncName,
@@ -1087,6 +1198,7 @@ impl TimerId {
     /// `"100_TIMEOUT"` leads with a digit, `"CONNECTTIMEOUT"` and `"TOOFAST"`
     /// have no separator where `"MULTI_PENDING"` and `"FTP_ACCEPT"` do, and
     /// `"DNS_PER_NAME2"` ends in a bare digit. No `_` arm.
+    #[allow(dead_code)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Expect100Timeout => "100_TIMEOUT",
@@ -1114,6 +1226,7 @@ impl TimerId {
     /// construction; it exists because `Curl_trc_timer()` takes a plain `int`
     /// (`lib/curl_trc.h:96`) and because integers arrive unvalidated across the
     /// C ABI.
+    #[allow(dead_code)]
     pub(crate) const fn from_i32(tid: i32) -> Option<Self> {
         match tid {
             0 => Some(Self::Expect100Timeout),
@@ -1138,6 +1251,7 @@ impl TimerId {
     }
 
     /// The C integer, for the ABI shim.
+    #[allow(dead_code)]
     pub(crate) const fn as_i32(self) -> i32 {
         self as i32
     }
@@ -1147,6 +1261,7 @@ impl TimerId {
     /// `trc_timer_name()` verbatim (`lib/curl_trc.c:299-304`). Routed through
     /// [`name`](Self::name) so a timer's string is still written in exactly one
     /// place.
+    #[allow(dead_code)]
     pub(crate) const fn name_from_i32(tid: i32) -> &'static str {
         match Self::from_i32(tid) {
             Some(timer) => timer.name(),
@@ -1178,6 +1293,7 @@ impl fmt::Display for TimerId {
 /// This wrapper exists for the ABI shim, where a state arrives as a raw `int`
 /// and may be anything. Inside the crate, prefer [`CurlMstate::name`] on a
 /// typed value, which cannot fail.
+#[allow(dead_code)]
 pub(crate) fn mstate_name(state: i32) -> &'static str {
     CurlMstate::name_from_i32(state)
 }
@@ -1190,6 +1306,7 @@ pub(crate) fn mstate_name(state: i32) -> &'static str {
 /// variant; it survives as [`COUNT`](Self::COUNT).
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
 pub(crate) enum InfoType {
     /// `CURLINFO_TEXT` -- an informational line the library wrote itself.
     Text = 0,
@@ -1209,9 +1326,11 @@ pub(crate) enum InfoType {
 
 impl InfoType {
     /// Number of kinds, C's `CURLINFO_END`.
+    #[allow(dead_code)]
     pub(crate) const COUNT: usize = 7;
 
     /// Every kind, in declaration order.
+    #[allow(dead_code)]
     pub(crate) const ALL: &'static [Self] = &[
         Self::Text,
         Self::HeaderIn,
@@ -1227,6 +1346,7 @@ impl InfoType {
     /// C writes the prefix with an explicit length -- `fwrite(s_infotype[type],
     /// 2, 1, ...)` (`lib/curl_trc.c:65`, `:163`) -- so the two-byte width is
     /// part of the format, not an accident of the strings.
+    #[allow(dead_code)]
     pub(crate) const PREFIX_LEN: usize = 2;
 
     /// The two-byte marker a stream writer puts in front of the payload.
@@ -1244,6 +1364,7 @@ impl InfoType {
     /// The duplication *inside* the table is C's, not a transcription slip:
     /// `DataIn` and `SslDataIn` both give `"{ "`, and `DataOut` and
     /// `SslDataOut` both give `"} "`.
+    #[allow(dead_code)]
     pub(crate) const fn prefix(self) -> &'static str {
         match self {
             Self::Text => "* ",
@@ -1264,6 +1385,7 @@ impl InfoType {
     /// `:153-168`). Body and TLS payloads are dropped by the library's own
     /// writer; only a `CURLOPT_DEBUGFUNCTION` -- or the command-line tool's
     /// dump -- ever renders them.
+    #[allow(dead_code)]
     pub(crate) const fn is_written_plain(self) -> bool {
         matches!(self, Self::Text | Self::HeaderOut | Self::HeaderIn)
     }
@@ -1278,6 +1400,7 @@ impl InfoType {
     ///
     /// Directions are asymmetric in the original and stay that way: sends use
     /// `"=> "` and receives `"<= "`.
+    #[allow(dead_code)]
     pub(crate) const fn dump_label(self) -> Option<&'static str> {
         match self {
             Self::Text => None,
@@ -1291,6 +1414,7 @@ impl InfoType {
     }
 
     /// The C integer, for the ABI shim and for callback dispatch.
+    #[allow(dead_code)]
     pub(crate) const fn as_i32(self) -> i32 {
         self as i32
     }
@@ -1301,6 +1425,7 @@ impl InfoType {
     /// enumeration and C's own `switch` guards against unknown values with a
     /// `default` arm commented "in case a new one is introduced to shock us"
     /// (`src/tool_cb_dbg.c:247`).
+    #[allow(dead_code)]
     pub(crate) const fn from_i32(raw: i32) -> Option<Self> {
         match raw {
             0 => Some(Self::Text),
@@ -1320,12 +1445,13 @@ impl InfoType {
 /// `data->id` and either `data->conn->connection_id` or
 /// `data->state.recent_conn_id`, the two values `trc_print_ids()` renders
 /// (`lib/curl_trc.c:91-106`). Both are `curl_off_t` in C, which is 64-bit on
-/// every target in the mandated matrix (AAP section 0.1.1 G8), so `i64` is
+/// every target in the mandated matrix, so `i64` is
 /// exact rather than merely wide enough.
 ///
 /// A negative value means "not assigned", which is how C spells it: every test
 /// is `>= 0`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct TraceIds {
     /// `data->id`, the transfer identifier reported by `CURLINFO_XFER_ID`.
     pub(crate) xfer: i64,
@@ -1341,17 +1467,21 @@ impl TraceIds {
     ///
     /// The `x` of `"[x-x] "` (`lib/curl_trc.c:104`) and of the two mixed forms
     /// `CURL_TRC_FMT_IDSC` and `CURL_TRC_FMT_IDSD` (`lib/curl_trc.c:78-79`).
+    #[allow(dead_code)]
     pub(crate) const UNASSIGNED_PLACEHOLDER: &'static str = "x";
 
     /// Neither identifier assigned, which renders as `"[x-x] "`.
+    #[allow(dead_code)]
     pub(crate) const UNASSIGNED: Self = Self { xfer: -1, conn: -1 };
 
     /// Both identifiers known.
+    #[allow(dead_code)]
     pub(crate) const fn new(xfer: i64, conn: i64) -> Self {
         Self { xfer, conn }
     }
 
     /// A transfer that has not yet been attached to a connection.
+    #[allow(dead_code)]
     pub(crate) const fn xfer_only(xfer: i64) -> Self {
         Self { xfer, conn: -1 }
     }
@@ -1361,11 +1491,13 @@ impl TraceIds {
     /// Consulted outside rendering too: `Curl_trc_multi()` includes the
     /// multi-state name only for a transfer that has an id
     /// (`lib/curl_trc.c:364-365`).
+    #[allow(dead_code)]
     pub(crate) const fn has_xfer_id(&self) -> bool {
         self.xfer >= 0
     }
 
     /// Whether the connection identifier is assigned, C's `cid >= 0`.
+    #[allow(dead_code)]
     pub(crate) const fn has_conn_id(&self) -> bool {
         self.conn >= 0
     }
@@ -1437,6 +1569,7 @@ impl fmt::Display for TraceIds {
 ///
 /// [`with_content_max`]: Self::with_content_max
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct LineBuffer {
     buf: Vec<u8>,
     content_max: usize,
@@ -1447,15 +1580,18 @@ impl LineBuffer {
     ///
     /// `TRC_LINE_MAX - 1`; see the type documentation for why the nominal size
     /// is one larger.
+    #[allow(dead_code)]
     pub(crate) const CONTENT_MAX: usize = TRC_LINE_MAX - 1;
 
     /// The marker an overlong line ends with, newline included.
     ///
     /// The four bytes `trc_end_buf()` appends one at a time
     /// (`lib/curl_trc.c:114-117`).
+    #[allow(dead_code)]
     const TRUNCATION_MARKER: &'static [u8] = b"...\n";
 
     /// An empty trace line buffer, pre-sized so assembly never reallocates.
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::with_content_max(Self::CONTENT_MAX)
     }
@@ -1467,6 +1603,7 @@ impl LineBuffer {
     /// four leave no room for the truncation marker, so they are raised to
     /// four; C never uses one that small, and silently producing a shorter
     /// marker would be worse than declining to.
+    #[allow(dead_code)]
     pub(crate) fn with_content_max(content_max: usize) -> Self {
         let content_max = content_max.max(Self::TRUNCATION_MARKER.len());
         Self {
@@ -1476,6 +1613,7 @@ impl LineBuffer {
     }
 
     /// This buffer's content budget, C's `maxlen - 1`.
+    #[allow(dead_code)]
     pub(crate) fn content_max(&self) -> usize {
         self.content_max
     }
@@ -1488,26 +1626,31 @@ impl LineBuffer {
     /// `content_max + 1`.
     ///
     /// [`content_max`]: Self::content_max
+    #[allow(dead_code)]
     fn truncate_at(&self) -> usize {
         self.content_max - Self::TRUNCATION_MARKER.len()
     }
 
     /// Bytes assembled so far.
+    #[allow(dead_code)]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.buf
     }
 
     /// Number of bytes assembled so far, C's running `len`.
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.buf.len()
     }
 
     /// Whether nothing has been appended yet.
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
 
     /// Reset for reuse, keeping the allocation.
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.buf.clear();
     }
@@ -1517,6 +1660,7 @@ impl LineBuffer {
     /// One `curl_msnprintf()` call's worth of truncation: the excess is
     /// discarded silently, exactly as C's `addbyter()` discards it once
     /// `length == max` (`lib/mprintf.c:1067-1074`).
+    #[allow(dead_code)]
     pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
         let room = self.content_max.saturating_sub(self.buf.len());
         let take = room.min(bytes.len());
@@ -1524,6 +1668,7 @@ impl LineBuffer {
     }
 
     /// Append a string's bytes, dropping whatever does not fit.
+    #[allow(dead_code)]
     pub(crate) fn push_str(&mut self, text: &str) {
         self.push_bytes(text.as_bytes());
     }
@@ -1534,6 +1679,7 @@ impl LineBuffer {
     /// `trc_infof()` (`lib/curl_trc.c:253`). Formatting into this buffer cannot
     /// fail -- [`fmt::Write`] is implemented infallibly -- so the result is
     /// discarded deliberately rather than through oversight.
+    #[allow(dead_code)]
     pub(crate) fn push_fmt(&mut self, args: fmt::Arguments<'_>) {
         // `fmt::Write::write_fmt` only reports the sink's errors, and this
         // sink has none. A `Display` implementation could still panic, which
@@ -1551,6 +1697,7 @@ impl LineBuffer {
     ///
     /// The returned slice excludes the NUL that C writes at `buf[len]`, since
     /// the length is what C passes onward and the NUL is not part of it.
+    #[allow(dead_code)]
     pub(crate) fn finish(&mut self, add_newline: bool) -> &[u8] {
         // C's `maxlen`, one more than the content budget.
         let maxlen = self.content_max + 1;
@@ -1572,6 +1719,7 @@ impl LineBuffer {
     /// message therefore emits 256 bytes ending in a newline, where
     /// [`finish`](Self::finish) would have truncated it to `"...\n"`. The two
     /// paths differ in C and so they differ here.
+    #[allow(dead_code)]
     pub(crate) fn push_newline(&mut self) {
         self.buf.push(b'\n');
     }
@@ -1602,9 +1750,10 @@ impl fmt::Write for LineBuffer {
 /// `fwrite()` to `data->set.err` (`lib/curl_trc.c:50-71`, `:128-169`). This
 /// trait is that choice, made once at construction instead of per record.
 ///
-/// The sink is injected into [`Tracer`] rather than being reached for globally
-/// (AAP section 0.3.3 P12), so a test can capture output without touching
-/// process state and two tests cannot influence each other.
+/// The sink is injected into [`Tracer`] rather than being reached for globally,
+/// so a test can capture output without touching process state and two tests
+/// cannot influence each other.
+#[allow(dead_code)]
 pub(crate) trait TraceSink {
     /// Whether this sink is a caller-supplied `CURLOPT_DEBUGFUNCTION`.
     ///
@@ -1617,6 +1766,23 @@ pub(crate) trait TraceSink {
     /// The default is `false`, the stream case, because that is the shape a
     /// writer has and a callback adapter is the special one.
     fn is_user_callback(&self) -> bool {
+        false
+    }
+
+    /// Whether this sink's bytes are interpreted by a terminal.
+    ///
+    /// The single discriminator for control-byte neutralization: a record
+    /// reaching a screen has its display-affecting bytes replaced (see
+    /// [`escape_controls`]), a record reaching anything else does not.
+    ///
+    /// The default is `false` -- treat an unlabelled sink as a file -- and that
+    /// direction is deliberate. A file must stay byte-faithful so a redirected
+    /// trace can be diffed or replayed against the C tool, and a caller-supplied
+    /// `CURLOPT_DEBUGFUNCTION` is the embedding application's own code, which C
+    /// hands raw bytes and which must keep receiving them. Only the code that
+    /// wraps a real descriptor can know the answer, and that is where it is
+    /// stated: [`WriterSink::new_for_terminal`].
+    fn is_terminal(&self) -> bool {
         false
     }
 
@@ -1658,15 +1824,54 @@ pub(crate) trait TraceSink {
 /// application that sets only `CURLOPT_VERBOSE`, and it is what the capture used
 /// to verify this module's layouts exercised.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct WriterSink<W> {
     writer: W,
     errors: usize,
+    terminal: bool,
 }
 
 impl<W: io::Write> WriterSink<W> {
-    /// Wrap a stream.
+    /// Wrap a stream whose bytes are NOT interpreted by a terminal.
+    ///
+    /// The byte-faithful case: records reach the stream exactly as C would write
+    /// them, which is what a redirected `--trace` file must be so it can be
+    /// diffed or replayed. Use [`Self::new_for_terminal`] when the destination is
+    /// a screen.
+    #[allow(dead_code)]
     pub(crate) fn new(writer: W) -> Self {
-        Self { writer, errors: 0 }
+        Self {
+            writer,
+            errors: 0,
+            terminal: false,
+        }
+    }
+
+    /// Wrap a stream that a terminal will interpret.
+    ///
+    /// Identical to [`Self::new`] except that each record's payload passes
+    /// through [`escape_controls`] with
+    /// [`ControlEscaping::PreserveLineStructure`] first, so an ESC sequence or a
+    /// lone CR in server-supplied text cannot reposition the cursor or overwrite
+    /// what was already shown. Line structure is untouched, so well-formed
+    /// output is byte-identical to the unescaped form.
+    ///
+    /// A separate constructor rather than a parameter on [`Self::new`] so that
+    /// the choice is visible at the call site and so no existing caller silently
+    /// changes behaviour.
+    #[allow(dead_code)] // consumer module not landed
+    pub(crate) fn new_for_terminal(writer: W) -> Self {
+        Self {
+            writer,
+            errors: 0,
+            terminal: true,
+        }
+    }
+
+    /// Whether records written here are neutralized for a terminal.
+    #[allow(dead_code)] // consumer module not landed
+    pub(crate) fn is_terminal_destination(&self) -> bool {
+        self.terminal
     }
 
     /// How many records failed to write.
@@ -1675,17 +1880,25 @@ impl<W: io::Write> WriterSink<W> {
     /// strictly additional information and changes no output, which keeps it
     /// inside the preservation mandate while making a broken destination
     /// diagnosable.
+    #[allow(dead_code)]
     pub(crate) fn error_count(&self) -> usize {
         self.errors
     }
 
     /// The wrapped stream, for a caller that needs to flush or reclaim it.
+    #[allow(dead_code)]
     pub(crate) fn into_inner(self) -> W {
         self.writer
     }
 
     /// Write the three parts of a record, reporting the first failure.
-    fn write_record(&mut self, ids: &str, prefix: &str, payload: &[u8]) -> io::Result<()> {
+    #[allow(dead_code)]
+    fn write_record(
+        &mut self,
+        ids: &str,
+        prefix: &str,
+        payload: &[u8],
+    ) -> io::Result<()> {
         // Three writes in C's order. `write_all` rather than `write`, because
         // `fwrite()` of a single element either transfers it or fails.
         self.writer.write_all(ids.as_bytes())?;
@@ -1695,13 +1908,35 @@ impl<W: io::Write> WriterSink<W> {
 }
 
 impl<W: io::Write> TraceSink for WriterSink<W> {
+    fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     fn emit(&mut self, kind: InfoType, ids: &str, payload: &[u8]) {
         // C's `switch` drops every other kind through a `default` arm commented
         // "nada" (`lib/curl_trc.c:68-69`, `:166-167`).
         if !kind.is_written_plain() {
             return;
         }
-        if self.write_record(ids, kind.prefix(), payload).is_err() {
+
+        // The single choke point for every record that reaches a stream, which is
+        // why the neutralization lives here rather than in each of `Tracer`'s
+        // eight emitters: no caller can forget it, and one implementation decides
+        // for informational lines and raw protocol bytes alike.
+        //
+        // Only the payload. `ids` is rendered from the numeric `TraceIds` and
+        // `kind.prefix()` is a static two-character string, so neither can carry
+        // a byte from the network.
+        let payload = if self.terminal {
+            escape_controls(payload, ControlEscaping::PreserveLineStructure)
+        } else {
+            Cow::Borrowed(payload)
+        };
+
+        if self
+            .write_record(ids, kind.prefix(), payload.as_ref())
+            .is_err()
+        {
             self.errors += 1;
         }
     }
@@ -1714,11 +1949,12 @@ impl<W: io::Write> TraceSink for WriterSink<W> {
 ///
 /// Decomposed rather than an instant because the conversion is the part that
 /// cannot be written here: C uses `toolx_localtime()`, and reproducing *local*
-/// time needs a platform call that this crate may not make under
-/// `forbid(unsafe_code)`. Emitting UTC instead would be a behaviour change, so
-/// the split is deliberate -- whoever can perform the conversion supplies these
-/// fields, and this module owns only their rendering.
+/// time needs a platform call that no module outside `ffi` may make, the crate
+/// root denying `unsafe_code` everywhere else. Emitting UTC instead would be a
+/// behaviour change, so the split is deliberate -- whoever can perform the
+/// conversion supplies these fields, and this module owns only their rendering.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
 pub(crate) struct TraceTime {
     /// Hour, `0..=23`. C's `now.tm_hour`.
     pub(crate) hour: u8,
@@ -1739,6 +1975,7 @@ impl TraceTime {
     /// (`src/tool_cb_dbg.c:44-45`), so the hour, minute and second all read
     /// zero. A clock implementation that cannot convert returns this rather
     /// than inventing a plausible time or failing the trace.
+    #[allow(dead_code)]
     pub(crate) const CONVERSION_FAILED: Self = Self {
         hour: 0,
         minute: 0,
@@ -1768,12 +2005,13 @@ impl fmt::Display for TraceTime {
 
 /// Source of the time `--trace-time` prints.
 ///
-/// Injected rather than read from the process clock, because AAP section 0.3.3
-/// P12 requires it and because a trace containing an unpinnable timestamp cannot
-/// be compared byte for byte in a test. Nothing in this module calls
-/// `SystemTime::now()` or `Instant::now()`; the platform implementation belongs
-/// to `crate::ffi::sys`, which owns the local-time conversion and the `unsafe`
-/// it needs, or to the command-line adapter.
+/// Injected rather than read from the process clock, both because the clock is
+/// one of the dependencies this crate injects and because a trace containing an
+/// unpinnable timestamp cannot be compared byte for byte in a test. Nothing in
+/// this module calls `SystemTime::now()` or `Instant::now()`; the platform
+/// implementation belongs to `crate::ffi::sys`, which owns the local-time
+/// conversion and the `unsafe` it needs, or to the command-line adapter.
+#[allow(dead_code)]
 pub(crate) trait TraceClock {
     /// The current local time of day.
     ///
@@ -1795,6 +2033,7 @@ pub(crate) trait TraceClock {
 /// when a happy-eyeballs attempt that failed is superseded by one that
 /// succeeded (`lib/curl_trc.h:64-67`).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct ErrorBuffer {
     message: Vec<u8>,
     written: bool,
@@ -1802,6 +2041,7 @@ pub(crate) struct ErrorBuffer {
 
 impl ErrorBuffer {
     /// Size of the C buffer, its NUL included: `CURL_ERROR_SIZE`.
+    #[allow(dead_code)]
     pub(crate) const CAPACITY: usize = CURL_ERROR_SIZE;
 
     /// Most message bytes storable, `CURL_ERROR_SIZE - 1`.
@@ -1809,9 +2049,11 @@ impl ErrorBuffer {
     /// `Curl_failf()` formats with `curl_mvsnprintf(error, CURL_ERROR_SIZE,
     /// ...)` (`lib/curl_trc.c:184`), which reserves one byte for the
     /// terminator.
+    #[allow(dead_code)]
     pub(crate) const CONTENT_MAX: usize = CURL_ERROR_SIZE - 1;
 
     /// An empty, unfilled buffer.
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
             message: Vec::new(),
@@ -1820,6 +2062,7 @@ impl ErrorBuffer {
     }
 
     /// Whether a message has been stored, C's `data->state.errorbuf`.
+    #[allow(dead_code)]
     pub(crate) fn is_set(&self) -> bool {
         self.written
     }
@@ -1830,6 +2073,7 @@ impl ErrorBuffer {
     /// C stores the message *before* appending `'\n'`
     /// (`lib/curl_trc.c:187-190`), so the buffer an application reads has no
     /// line ending. That difference between the two copies is preserved.
+    #[allow(dead_code)]
     pub(crate) fn message_bytes(&self) -> &[u8] {
         &self.message
     }
@@ -1839,6 +2083,7 @@ impl ErrorBuffer {
     /// Lossy because the bytes come from format output that may have spliced in
     /// arbitrary protocol data, and because C makes no encoding promise about
     /// this buffer at all.
+    #[allow(dead_code)]
     pub(crate) fn message_lossy(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.message)
     }
@@ -1849,6 +2094,7 @@ impl ErrorBuffer {
     /// `Curl_failf()` (`lib/curl_trc.c:186-189`). Returns whether the message
     /// was taken. Input longer than [`CONTENT_MAX`](Self::CONTENT_MAX) is
     /// truncated, which is what C's bounded copy does.
+    #[allow(dead_code)]
     pub(crate) fn set_first(&mut self, message: &[u8]) -> bool {
         if self.written {
             return false;
@@ -1865,6 +2111,7 @@ impl ErrorBuffer {
     /// `Curl_reset_fail()` (`lib/curl_trc.c:197-202`). C only writes a NUL at
     /// offset zero rather than wiping the whole array, which for an owned
     /// buffer is emptying it.
+    #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         self.message.clear();
         self.written = false;
@@ -1887,6 +2134,7 @@ impl ErrorBuffer {
 /// feature label around a nested operation, which is what C does by assigning
 /// to `data->state.feat` directly.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct TraceState {
     /// `data->set.verbose`: whether tracing is on for this transfer at all.
     pub(crate) verbose: bool,
@@ -1900,6 +2148,7 @@ impl TraceState {
     /// Silent state: not verbose, no feature label, no identifiers.
     ///
     /// What a freshly initialised easy handle carries.
+    #[allow(dead_code)]
     pub(crate) const SILENT: Self = Self {
         verbose: false,
         feat: None,
@@ -1910,6 +2159,7 @@ impl TraceState {
     ///
     /// The state `CURLOPT_VERBOSE` alone produces, before a transfer has been
     /// given an id or a protocol has installed a label.
+    #[allow(dead_code)]
     pub(crate) fn verbose() -> Self {
         Self {
             verbose: true,
@@ -1930,8 +2180,8 @@ impl TraceState {
 /// | `data->set.errorbuffer`, `data->state.errorbuf` | [`ErrorBuffer`], borrowed |
 /// | `data->set.verbose`, `data->state.feat`, `data->id` | [`TraceState`], owned |
 ///
-/// Everything is borrowed rather than owned or reached for, which is AAP section
-/// 0.3.3 P12 applied to observability: two tests can each hold their own
+/// Everything is borrowed rather than owned or reached for -- dependency
+/// injection applied to observability: two tests can each hold their own
 /// `Tracer` over their own capture buffer and neither observes the other. No
 /// item in this module reads process state, and there is no `static mut` and no
 /// singleton anywhere in it.
@@ -1940,11 +2190,11 @@ impl TraceState {
 ///
 /// Every emitter re-tests its level before formatting, exactly as C does, and
 /// the [`infof!`] family of macros tests again at the call site. The duplication
-/// is deliberate and is *behavioural*, not an optimisation: C's macros exist so
+/// is deliberate and is *behavioural*, not an optimization: C's macros exist so
 /// that a suppressed trace never evaluates its arguments
 /// (`lib/curl_trc.h:138-208`), and an argument may have a side effect or be
 /// expensive enough that evaluating it changes observable timing. Performance is
-/// an explicit non-goal (AAP section 0.1.1); preserving the shape is not.
+/// an explicit non-goal; preserving the shape is not.
 ///
 /// # Example
 ///
@@ -1956,13 +2206,14 @@ impl TraceState {
 ///
 /// ```ignore
 /// let mut config = TraceConfig::new();
-/// config.apply(Some("multi,lib-ids"))?;
+/// config.apply(Some(b"multi,lib-ids"))?;
 /// let mut sink = WriterSink::new(std::io::stderr());
 /// let mut tracer = Tracer::new(&config, &mut sink);
 /// tracer.set_state(TraceState { verbose: true, feat: None, ids: TraceIds::new(0, 0) });
 /// trc_multi!(&mut tracer, CurlMstate::Connecting, "-> [{}]", CurlMstate::ProtoConnect);
 /// // writes: * [0-0] [MULTI] [CONNECTING] -> [PROTOCONNECT]
 /// ```
+#[allow(dead_code)]
 pub(crate) struct Tracer<'a> {
     config: &'a TraceConfig,
     sink: &'a mut dyn TraceSink,
@@ -1976,7 +2227,11 @@ impl<'a> Tracer<'a> {
     ///
     /// Silent because `data->set.verbose` defaults to false: a handle traces
     /// nothing until `CURLOPT_VERBOSE` is set.
-    pub(crate) fn new(config: &'a TraceConfig, sink: &'a mut dyn TraceSink) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        config: &'a TraceConfig,
+        sink: &'a mut dyn TraceSink,
+    ) -> Self {
         Self {
             config,
             sink,
@@ -1991,33 +2246,42 @@ impl<'a> Tracer<'a> {
     /// Without one, [`failf`](Self::failf) still writes to the trace log; with
     /// one, the first failure is also stored. That is C's arrangement, where the
     /// buffer is optional and its absence changes nothing else.
-    pub(crate) fn with_error_buffer(mut self, buffer: &'a mut ErrorBuffer) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn with_error_buffer(
+        mut self,
+        buffer: &'a mut ErrorBuffer,
+    ) -> Self {
         self.error_buffer = Some(buffer);
         self
     }
 
     /// Start from a known trace state.
+    #[allow(dead_code)]
     pub(crate) fn with_state(mut self, state: TraceState) -> Self {
         self.state = state;
         self
     }
 
     /// The trace configuration in force.
+    #[allow(dead_code)]
     pub(crate) fn config(&self) -> &TraceConfig {
         self.config
     }
 
     /// The current trace state.
+    #[allow(dead_code)]
     pub(crate) fn state(&self) -> TraceState {
         self.state
     }
 
     /// Replace the whole trace state.
+    #[allow(dead_code)]
     pub(crate) fn set_state(&mut self, state: TraceState) {
         self.state = state;
     }
 
     /// Set `data->set.verbose`.
+    #[allow(dead_code)]
     pub(crate) fn set_verbose(&mut self, verbose: bool) {
         self.state.verbose = verbose;
     }
@@ -2027,18 +2291,24 @@ impl<'a> Tracer<'a> {
     /// Returning the previous value is what makes save-and-restore around a
     /// nested operation possible without the caller keeping its own copy; C
     /// assigns through the pointer and remembers the old one by hand.
-    pub(crate) fn set_feature(&mut self, feat: Option<TraceFeature>) -> Option<TraceFeature> {
+    #[allow(dead_code)]
+    pub(crate) fn set_feature(
+        &mut self,
+        feat: Option<TraceFeature>,
+    ) -> Option<TraceFeature> {
         let previous = self.state.feat;
         self.state.feat = feat;
         previous
     }
 
     /// Set the transfer and connection identifiers.
+    #[allow(dead_code)]
     pub(crate) fn set_ids(&mut self, ids: TraceIds) {
         self.state.ids = ids;
     }
 
     /// The attached error buffer, if any.
+    #[allow(dead_code)]
     pub(crate) fn error_buffer(&self) -> Option<&ErrorBuffer> {
         self.error_buffer.as_deref()
     }
@@ -2049,6 +2319,7 @@ impl<'a> Tracer<'a> {
     /// (`lib/curl_trc.h:311-314`). The second clause is what lets
     /// `--trace-config -ftp` silence a whole protocol's ordinary `infof()`
     /// output, not merely the lines that name FTP explicitly.
+    #[allow(dead_code)]
     pub(crate) fn is_verbose(&self) -> bool {
         if !self.state.verbose {
             return false;
@@ -2065,6 +2336,7 @@ impl<'a> Tracer<'a> {
     /// `Curl_trc_is_verbose(data) && ft->log_level >= INFO`
     /// (`lib/curl_trc.h:318-320`). Note both feature levels are consulted: the
     /// label in force *and* the one being emitted for.
+    #[allow(dead_code)]
     pub(crate) fn is_feature_verbose(&self, feature: TraceFeature) -> bool {
         self.is_verbose() && self.config.feature_is_info(feature)
     }
@@ -2073,6 +2345,7 @@ impl<'a> Tracer<'a> {
     ///
     /// `Curl_trc_is_verbose(data) && cf->cft->log_level >= INFO`
     /// (`lib/curl_trc.h:315-317`).
+    #[allow(dead_code)]
     pub(crate) fn is_filter_verbose(&self, filter: TraceFilter) -> bool {
         self.is_verbose() && self.config.filter_is_info(filter)
     }
@@ -2086,6 +2359,7 @@ impl<'a> Tracer<'a> {
     /// appends `,-lib-ids` to whatever it forwards to `curl_global_trace()`
     /// (`src/tool_getparam.c:766-800`); an embedding application that asks for
     /// `lib-ids` directly does get it.
+    #[allow(dead_code)]
     pub(crate) fn is_ids_verbose(&self) -> bool {
         self.is_verbose() && self.config.feature_is_info(TraceFeature::Ids)
     }
@@ -2094,6 +2368,7 @@ impl<'a> Tracer<'a> {
     ///
     /// `lib/curl_trc.c:256-265`. Prefer the [`infof!`] macro, which also
     /// enforces the no-newline invariant at compile time.
+    #[allow(dead_code)]
     pub(crate) fn infof(&mut self, args: fmt::Arguments<'_>) {
         if self.is_verbose() {
             let feat = self.state.feat;
@@ -2114,6 +2389,7 @@ impl<'a> Tracer<'a> {
     ///   than a trace line's.
     /// * The copy stored in the buffer has no newline; the copy written to the
     ///   log has one, appended unconditionally.
+    #[allow(dead_code)]
     pub(crate) fn failf(&mut self, args: fmt::Arguments<'_>) {
         if !(self.state.verbose || self.error_buffer.is_some()) {
             return;
@@ -2123,7 +2399,8 @@ impl<'a> Tracer<'a> {
         // `curl_mvsnprintf(error, CURL_ERROR_SIZE, ...)`: the array is two
         // bytes larger than the cap so that the newline and terminator always
         // fit, which is why the newline is appended without a length test.
-        let mut message = LineBuffer::with_content_max(ErrorBuffer::CONTENT_MAX);
+        let mut message =
+            LineBuffer::with_content_max(ErrorBuffer::CONTENT_MAX);
         message.push_fmt(args);
 
         if let Some(buffer) = self.error_buffer.as_deref_mut() {
@@ -2146,6 +2423,7 @@ impl<'a> Tracer<'a> {
     /// `lib/curl_trc.c:197-202`. Called when an attempt that failed is
     /// superseded by one that succeeded, so the surviving path's error -- or no
     /// error at all -- is what the application reads.
+    #[allow(dead_code)]
     pub(crate) fn reset_fail(&mut self) {
         if let Some(buffer) = self.error_buffer.as_deref_mut() {
             buffer.reset();
@@ -2159,7 +2437,12 @@ impl<'a> Tracer<'a> {
     /// (`lib/curl_trc.c:373-489`), so they are one method here. Each passes no
     /// `opt_id`, which is why such lines read `* [READ] ...` with a single
     /// bracket group.
-    pub(crate) fn feature(&mut self, feature: TraceFeature, args: fmt::Arguments<'_>) {
+    #[allow(dead_code)]
+    pub(crate) fn feature(
+        &mut self,
+        feature: TraceFeature,
+        args: fmt::Arguments<'_>,
+    ) {
         if self.is_feature_verbose(feature) {
             self.assemble(Some(feature), None, 0, args);
         }
@@ -2174,13 +2457,18 @@ impl<'a> Tracer<'a> {
     /// not yet added to a multi handle has no meaningful state to report, so the
     /// group is omitted rather than filled with a placeholder.
     ///
-    /// **This is where AAP section 0.3.3 P3 pays off.** The name comes from
-    /// [`CurlMstate::name`], an exhaustive `match` in the module that owns the
-    /// enum. C instead keeps `Curl_trc_mstate_names[]` in this file and asks
+    /// **This is where the explicit state enumeration pays off.** The name comes
+    /// from [`CurlMstate::name`], an exhaustive `match` in the module that owns
+    /// the enum. C instead keeps `Curl_trc_mstate_names[]` in this file and asks
     /// maintainers to remember it (`lib/multihandle.h:48-49`) -- a note that has
     /// itself gone stale, since the array it names was renamed. Adding a state
     /// without naming it is a compile error here and cannot be one there.
-    pub(crate) fn multi(&mut self, mstate: CurlMstate, args: fmt::Arguments<'_>) {
+    #[allow(dead_code)]
+    pub(crate) fn multi(
+        &mut self,
+        mstate: CurlMstate,
+        args: fmt::Arguments<'_>,
+    ) {
         if self.is_feature_verbose(TraceFeature::Multi) {
             let name = if self.state.ids.has_xfer_id() {
                 Some(mstate.name())
@@ -2194,9 +2482,15 @@ impl<'a> Tracer<'a> {
     /// `Curl_trc_timer()`: a timer line naming `timer`.
     ///
     /// `lib/curl_trc.c:306-316`, giving `* [TIMER] [HAPPY_EYEBALLS] cleared`.
+    #[allow(dead_code)]
     pub(crate) fn timer(&mut self, timer: TimerId, args: fmt::Arguments<'_>) {
         if self.is_feature_verbose(TraceFeature::Timer) {
-            self.assemble(Some(TraceFeature::Timer), Some(timer.name()), 0, args);
+            self.assemble(
+                Some(TraceFeature::Timer),
+                Some(timer.name()),
+                0,
+                args,
+            );
         }
     }
 
@@ -2207,6 +2501,7 @@ impl<'a> Tracer<'a> {
     /// Rust callers use [`timer`](Self::timer) and cannot be out of range; this
     /// exists for the C ABI shim, where the value arrives from outside the
     /// crate and the fallback is genuinely reachable.
+    #[allow(dead_code)]
     pub(crate) fn timer_id(&mut self, timer: i32, args: fmt::Arguments<'_>) {
         if self.is_feature_verbose(TraceFeature::Timer) {
             let name = TimerId::name_from_i32(timer);
@@ -2228,11 +2523,12 @@ impl<'a> Tracer<'a> {
     ///
     /// C formats `curlx_ptimediff_us()` -- a value in **microseconds** -- under
     /// the literal suffix `ns` (`lib/curl_trc.c:327-328`). The suffix is wrong
-    /// and it is reproduced verbatim. AAP section 0.8.1 freezes observable
-    /// output and section 0.8.2 forbids a behaviour change justified as an
-    /// improvement, so `remaining_micros` is printed with `ns` after it. Callers
+    /// and it is reproduced verbatim: observable output is frozen and a
+    /// behaviour change justified as an improvement is not permitted, so
+    /// `remaining_micros` is printed with `ns` after it. Callers
     /// must pass microseconds; passing nanoseconds to make the label true would
     /// change the numbers curl prints.
+    #[allow(dead_code)]
     pub(crate) fn easy_timers<I>(&mut self, timers: I)
     where
         I: IntoIterator<Item = (TimerId, i64)>,
@@ -2256,7 +2552,13 @@ impl<'a> Tracer<'a> {
     /// The feature label passed on is `data->state.feat`, the *protocol's*
     /// label, not the filter's: a filter line is labelled by whichever protocol
     /// is driving it, while the gate is the filter's own level.
-    pub(crate) fn filter(&mut self, filter: TraceFilter, sockindex: i32, args: fmt::Arguments<'_>) {
+    #[allow(dead_code)]
+    pub(crate) fn filter(
+        &mut self,
+        filter: TraceFilter,
+        sockindex: i32,
+        args: fmt::Arguments<'_>,
+    ) {
         if self.is_filter_verbose(filter) {
             let feat = self.state.feat;
             self.assemble(feat, Some(filter.name()), sockindex, args);
@@ -2285,6 +2587,7 @@ impl<'a> Tracer<'a> {
     /// precision. A payload containing a NUL is therefore cut there. It is
     /// reachable only with `lib-ids` enabled, and it is C's behaviour, so it is
     /// reproduced rather than quietly corrected.
+    #[allow(dead_code)]
     pub(crate) fn debug(&mut self, kind: InfoType, payload: &[u8]) {
         // `Curl_debug()` gates on `data->set.verbose` alone: the kind prefix
         // path is not filtered by the feature label.
@@ -2314,7 +2617,8 @@ impl<'a> Tracer<'a> {
             let ids = self.state.ids;
             self.line.clear();
             self.line.push_fmt(format_args!("{ids}"));
-            let ids = String::from_utf8_lossy(self.line.as_bytes()).into_owned();
+            let ids =
+                String::from_utf8_lossy(self.line.as_bytes()).into_owned();
             self.sink.emit(kind, &ids, payload);
         } else {
             self.sink.emit(kind, "", payload);
@@ -2333,6 +2637,7 @@ impl<'a> Tracer<'a> {
     ///
     /// Every part shares one 2047-byte budget, so a long message is truncated to
     /// `"...\n"` rather than displacing the prefixes.
+    #[allow(dead_code)]
     fn assemble(
         &mut self,
         feat: Option<TraceFeature>,
@@ -2390,6 +2695,7 @@ impl fmt::Debug for Tracer<'_> {
 /// [`Tracer::debug`], so neither has a variant here: an enumerant that cannot
 /// occur is a state to be made unrepresentable, not carried.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
 pub(crate) enum DumpStyle {
     /// `TRACE_BIN`, `--trace`: hex columns then the character column.
     Hex,
@@ -2404,6 +2710,7 @@ impl DumpStyle {
     /// `0x10` for hex and `0x40` for ASCII, C's `width`
     /// (`src/tool_cb_dbg.c:75-79`); the wider setting exists because "without
     /// the hex output, we can fit more on screen".
+    #[allow(dead_code)]
     pub(crate) const fn width(self) -> usize {
         match self {
             Self::Hex => 0x10,
@@ -2412,6 +2719,7 @@ impl DumpStyle {
     }
 
     /// Whether this style shows the hex columns.
+    #[allow(dead_code)]
     const fn shows_hex(self) -> bool {
         matches!(self, Self::Hex)
     }
@@ -2420,6 +2728,7 @@ impl DumpStyle {
     ///
     /// Only `--trace-ascii` does; the hex layout keeps fixed 16-byte rows so its
     /// offsets stay aligned.
+    #[allow(dead_code)]
     const fn breaks_at_crlf(self) -> bool {
         matches!(self, Self::Ascii)
     }
@@ -2428,28 +2737,168 @@ impl DumpStyle {
 /// The character an unprintable byte is shown as.
 ///
 /// `UNPRINTABLE_CHAR` (`src/tool_setup.h:63`).
+#[allow(dead_code)]
 const UNPRINTABLE_CHAR: u8 = b'.';
 
 /// Lowest byte value shown as itself, C's `>= 0x20` test
 /// (`src/tool_cb_dbg.c:106-108`).
+#[allow(dead_code)]
 const PRINTABLE_LOW: u8 = 0x20;
 
 /// First byte value above the printable range, C's `< 0x7F` test.
+#[allow(dead_code)]
 const PRINTABLE_HIGH: u8 = 0x7F;
+
+// Control-byte neutralization for terminal destinations
+//
+// The crate-wide answer to CWE-117 (log forging) and CWE-150 (unneutralized
+// escape sequences) on diagnostic output. Defined here, beside the printable
+// range `dump()` already enforces, because a trace is where the largest volume
+// of attacker-influenced bytes reaches a screen; `src/output/msgs.rs` and
+// `src/tls/cipher_suite.rs` consume the same function rather than each
+// inventing its own idea of which bytes are dangerous.
+//
+// THE PARITY DECISION, RECORDED EXPLICITLY.
+//
+// C is not uniform here, and neither is this. `dump()` already replaces every
+// byte outside `0x20..0x7F` with `.` (`src/tool_cb_dbg.c:106-108`), so the
+// `--trace` and `--trace-ascii` bodies are control-safe in C and reproduced
+// byte for byte by [`dump`] -- they need nothing from this module. What C leaves
+// raw is the `TRACE_PLAIN` path: `CURLINFO_TEXT`, `CURLINFO_HEADER_IN` and
+// `CURLINFO_HEADER_OUT` go straight to `fwrite()` (`src/tool_cb_dbg.c:204`,
+// `:211`, `:220`), so a server-supplied header carrying `ESC[` really does
+// reach the user's terminal in curl 8.19.0-DEV.
+//
+// Escaping that path is therefore a deliberate STRENGTHENING, not a parity
+// repair, and it is taken only for destinations where the bytes are interpreted
+// -- a terminal. The risk of the strengthening was measured rather than assumed:
+// of the 1,914 fixtures, exactly 2 pass any `--trace*` flag, none compares a
+// hex-dump line, and of the 44 that compare `<stderr>` not one enables a trace
+// or verbose flag. No fixture in the corpus compares trace bytes, so this
+// cannot move the byte-exact oracle of AAP section 0.6.7.
+//
+// WHICH BYTES, AND WHY NOT SIMPLY "ALL CONTROLS".
+//
+// A blanket rule would be wrong in both directions:
+//
+//   * LF is the line structure of every multi-line payload. A whole header
+//     block arrives as one `CURLINFO_HEADER_IN` record, and C's own
+//     `CURLINFO_HEADER_OUT` handling walks the buffer for `\n` specifically so
+//     it can re-prefix each line (`src/tool_cb_dbg.c:196-211`). Replacing it
+//     would collapse `-v` output into one unreadable line -- a far worse
+//     regression than the risk, and a change to the terminal presentation that
+//     AAP sections 0.8.1 and 0.3.4 freeze.
+//   * A CR that precedes LF is equally structural: CRLF is the protocol line
+//     ending, so escaping it would put a `.` at the end of every single header
+//     line of every verbose transfer.
+//   * Bytes >= 0x80 cannot move a cursor or open an escape sequence. They are
+//     legitimate 8-bit or UTF-8 payload -- a header value in a non-ASCII
+//     charset, an internationalized hostname -- and mangling them would
+//     corrupt information without removing any hazard.
+//
+// What is left is exactly the hazard: ESC (0x1B) opens an ANSI sequence; a LONE
+// CR returns the cursor to column zero so following text overwrites what was
+// already shown, which is the classic log-overwrite trick; BEL, backspace,
+// vertical tab and form feed are all display-affecting; DEL (0x7F) is
+// terminal-dependent. None of them occurs in well-formed protocol text, so
+// neutralizing them leaves legitimate output byte-identical.
+
+/// How much line structure a payload is allowed to keep.
+///
+/// Two contexts with genuinely different needs, so the caller states which it
+/// is rather than the function guessing from the content.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ControlEscaping {
+    /// Multi-line payloads: keep LF, and keep CR only where it precedes LF.
+    ///
+    /// For trace records, whose payload legitimately spans lines. A lone CR is
+    /// still neutralized, so the overwrite trick does not survive.
+    PreserveLineStructure,
+
+    /// Single-line messages: neutralize every control byte, LF and CR included.
+    ///
+    /// For a warning, an error or an embedded diagnostic fragment. Such a
+    /// message is one line by construction, so any LF in it was injected and
+    /// would forge a second message -- precisely CWE-117.
+    SingleLine,
+}
+
+/// Replace display-affecting control bytes with [`UNPRINTABLE_CHAR`].
+///
+/// Returns [`Cow::Borrowed`] when there is nothing to replace, which is the
+/// overwhelmingly common case: no allocation, no copy, and the caller's bytes
+/// are passed through unchanged. A replacement is one byte for one byte, so the
+/// result is exactly as long as the input and this can never amplify output.
+///
+/// Never applied to a destination whose bytes are not interpreted. A file must
+/// stay byte-faithful so a redirected trace can be diffed or replayed, and a
+/// caller-supplied `CURLOPT_DEBUGFUNCTION` is the embedding application's own
+/// code, which C hands raw bytes and which must keep receiving them. See
+/// [`TraceSink::is_terminal`] for where that choice is made.
+///
+/// See the section comment above for which bytes are neutralized and why the
+/// set is not simply "every control byte".
+pub(crate) fn escape_controls(
+    bytes: &[u8],
+    mode: ControlEscaping,
+) -> Cow<'_, [u8]> {
+    /// Whether the byte at `index` must be replaced.
+    fn is_hazard(bytes: &[u8], index: usize, mode: ControlEscaping) -> bool {
+        let byte = bytes[index];
+        if byte == PRINTABLE_HIGH {
+            // DEL, whose effect is terminal-dependent.
+            return true;
+        }
+        if byte >= PRINTABLE_LOW {
+            // Printable ASCII and everything >= 0x80: never a hazard.
+            return false;
+        }
+        match mode {
+            ControlEscaping::SingleLine => true,
+            ControlEscaping::PreserveLineStructure => match byte {
+                b'\n' => false,
+                // A CR is structural only as the first half of a CRLF.
+                b'\r' => bytes.get(index + 1) != Some(&b'\n'),
+                _ => true,
+            },
+        }
+    }
+
+    let first = (0..bytes.len()).find(|index| is_hazard(bytes, *index, mode));
+    let Some(first) = first else {
+        return Cow::Borrowed(bytes);
+    };
+
+    // Copy the clean prefix wholesale, then decide byte by byte from the first
+    // hazard onward. `to_vec` is acceptable here and nowhere else in this
+    // function: the length is already known and bounded by the input, which the
+    // caller has itself already accepted into memory.
+    let mut escaped = bytes.to_vec();
+    // Iterated by slot rather than by index because `is_hazard` reads the byte
+    // AFTER the one being judged -- a CR is structural only when an LF follows --
+    // so the decision has to consult the pristine input while the copy is being
+    // written. `first + offset` is the absolute position in both.
+    for (offset, slot) in escaped[first..].iter_mut().enumerate() {
+        if is_hazard(bytes, first + offset, mode) {
+            *slot = UNPRINTABLE_CHAR;
+        }
+    }
+    Cow::Owned(escaped)
+}
 
 /// Render a hex/ASCII dump block, the body of `--trace` and `--trace-ascii`.
 ///
 /// `dump()` (`src/tool_cb_dbg.c:68-119`), reproduced geometry for geometry
-/// because AAP section 0.8.1 freezes it and fixtures compare it. A header line
+/// because the output is frozen and fixtures compare it. A header line
 /// then one line per row:
 ///
 /// ```text
 /// == Info: ...
 /// <= Recv data, 52 bytes (0x34)
 /// 0000: 48 65 6c 6c 6f 2c 20 63 75 72 6c 20 74 72 61 63 Hello, curl trac
-/// 0010: 65 20 6f 72 61 63 6c 65 21 0d 0a 53 65 63 6f 6e e oracle!..Secon
-/// 0020: 64 20 6c 69 6e 65 20 68 65 72 65 0d 0a 74 68 69 d line here..thi
-/// 0030: 72 64 0d 0a                                     rd..
+/// 0010: 65 20 6f 72 61 63 6c 65 21 0d 0a 4d 69 64 64 6c e oracle!..Middl
+/// 0020: 65 20 6c 69 6e 65 20 68 65 72 65 0d 0a 66 69 6e e line here..fin
+/// 0030: 61 6c 0d 0a                                     al..
 /// ```
 ///
 /// Exact details, each of them observable:
@@ -2479,6 +2928,7 @@ const PRINTABLE_HIGH: u8 = 0x7F;
 /// Errors are returned rather than ignored. C checks no `fprintf()` result on
 /// this path; propagating gives the caller the option, and no caller is obliged
 /// to act, so no output changes.
+#[allow(dead_code)]
 pub(crate) fn dump(
     out: &mut dyn io::Write,
     time_prefix: &str,
@@ -2577,6 +3027,7 @@ pub(crate) fn dump(
 /// comment asks for neither LF nor CR (`lib/curl_trc.c:174-175`), but the check
 /// C actually performs is LF alone, and a carriage return does appear in
 /// legitimate messages that quote protocol text.
+#[allow(dead_code)]
 pub(crate) const fn fmt_has_newline(fmt: &str) -> bool {
     let bytes = fmt.as_bytes();
     let mut index = 0;
@@ -2588,6 +3039,25 @@ pub(crate) const fn fmt_has_newline(fmt: &str) -> bool {
     }
     false
 }
+
+// THE SIX EMITTER MACROS
+//
+// Each is `#[allow(unused_macros)]` and each `pub(crate) use` re-export is
+// `#[allow(unused_imports)]`, for the same reason the module-level
+// `dead_code` allowance is granted above and no wider: the production
+// consumers of these macros are `crate::protocols`, `crate::conn`,
+// `crate::transfer` and `crate::multi`, none of which has landed yet, so in a
+// non-test build every macro and every re-export is legitimately
+// unreferenced. Compiling this file as a test target reports nothing at all,
+// because the module's own tests supply the missing consumers -- and they do
+// so deliberately: `every_macro_is_reachable_by_path_from_another_module`
+// invokes all six through their `crate::trace::` paths precisely to exercise
+// the re-exports rather than the textual `macro_rules!` scope.
+//
+// The attributes are attached per item, not as file-level inner attributes,
+// so that a genuinely unused macro or a stale `use` added later to this file
+// still warns. `#![allow(unused_imports)]` at the head of a 4,800-line module
+// would silence exactly the diagnostic that catches such a mistake.
 
 /// `infof()`: an informational line, guarded and newline-checked.
 ///
@@ -2606,6 +3076,7 @@ pub(crate) const fn fmt_has_newline(fmt: &str) -> bool {
 /// ```ignore
 /// infof!(tracer, "Connected to {host} port {port}");
 /// ```
+#[allow(unused_macros)]
 macro_rules! infof {
     ($tracer:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
         const _: () = ::core::assert!(
@@ -2618,6 +3089,7 @@ macro_rules! infof {
         }
     }};
 }
+#[allow(unused_imports)]
 pub(crate) use infof;
 
 /// `failf()`: state why the transfer failed.
@@ -2633,6 +3105,7 @@ pub(crate) use infof;
 /// ```ignore
 /// failf!(tracer, "Could not resolve host: {host}");
 /// ```
+#[allow(unused_macros)]
 macro_rules! failf {
     ($tracer:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
         const _: () = ::core::assert!(
@@ -2643,6 +3116,7 @@ macro_rules! failf {
         tracer.failf(::core::format_args!($fmt $(, $arg)*));
     }};
 }
+#[allow(unused_imports)]
 pub(crate) use failf;
 
 /// `CURL_TRC_READ()`, `CURL_TRC_WRITE()`, `CURL_TRC_DNS()`, `CURL_TRC_FTP()`,
@@ -2655,6 +3129,7 @@ pub(crate) use failf;
 /// ```ignore
 /// trc_feat!(tracer, TraceFeature::Read, "client read {} bytes", n);
 /// ```
+#[allow(unused_macros)]
 macro_rules! trc_feat {
     ($tracer:expr, $feature:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
         const _: () = ::core::assert!(
@@ -2668,6 +3143,7 @@ macro_rules! trc_feat {
         }
     }};
 }
+#[allow(unused_imports)]
 pub(crate) use trc_feat;
 
 /// `CURL_TRC_M()`: a multi-handle line carrying the transfer's state.
@@ -2679,6 +3155,7 @@ pub(crate) use trc_feat;
 /// ```ignore
 /// trc_multi!(tracer, mstate, "-> [{}]", next);
 /// ```
+#[allow(unused_macros)]
 macro_rules! trc_multi {
     ($tracer:expr, $mstate:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
         const _: () = ::core::assert!(
@@ -2692,6 +3169,7 @@ macro_rules! trc_multi {
         }
     }};
 }
+#[allow(unused_imports)]
 pub(crate) use trc_multi;
 
 /// `CURL_TRC_TIMER()`: a timer line naming the timer.
@@ -2701,6 +3179,7 @@ pub(crate) use trc_multi;
 /// ```ignore
 /// trc_timer!(tracer, TimerId::HappyEyeballs, "cleared");
 /// ```
+#[allow(unused_macros)]
 macro_rules! trc_timer {
     ($tracer:expr, $timer:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
         const _: () = ::core::assert!(
@@ -2714,6 +3193,7 @@ macro_rules! trc_timer {
         }
     }};
 }
+#[allow(unused_imports)]
 pub(crate) use trc_timer;
 
 /// `CURL_TRC_CF()`: a line attributed to a connection filter.
@@ -2727,6 +3207,7 @@ pub(crate) use trc_timer;
 /// ```ignore
 /// trc_cf!(tracer, TraceFilter::Tcp, sockindex, "connected to {peer}");
 /// ```
+#[allow(unused_macros)]
 macro_rules! trc_cf {
     ($tracer:expr, $filter:expr, $sockindex:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
         const _: () = ::core::assert!(
@@ -2740,6 +3221,7 @@ macro_rules! trc_cf {
         }
     }};
 }
+#[allow(unused_imports)]
 pub(crate) use trc_cf;
 
 #[cfg(test)]
@@ -2748,10 +3230,8 @@ mod tests {
     use crate::multi::state::CurlMstate;
     use std::cell::Cell;
 
-    // ---------------------------------------------------------------------
     // Test doubles. Everything this module needs is injected, so no test
     // touches process state and the order tests run in cannot matter.
-    // ---------------------------------------------------------------------
 
     /// Stands in for a `CURLOPT_DEBUGFUNCTION`, keeping every record whole.
     #[derive(Debug, Default)]
@@ -2782,7 +3262,11 @@ mod tests {
     }
 
     /// Run `body` against a stream-backed tracer and return what was written.
-    fn stream_output<F>(config: &TraceConfig, state: TraceState, body: F) -> String
+    fn stream_output<F>(
+        config: &TraceConfig,
+        state: TraceState,
+        body: F,
+    ) -> String
     where
         F: FnOnce(&mut Tracer<'_>),
     {
@@ -2796,7 +3280,31 @@ mod tests {
             0,
             "a Vec sink cannot fail to accept bytes"
         );
-        String::from_utf8(sink.into_inner()).expect("trace output is UTF-8 in these tests")
+        String::from_utf8(sink.into_inner())
+            .expect("trace output is UTF-8 in these tests")
+    }
+
+    /// As [`stream_output`], but the destination declares itself a terminal.
+    ///
+    /// Returns raw bytes rather than a `String`: a test that exercises escaping
+    /// must be able to assert on byte values that are not valid UTF-8 text.
+    fn terminal_output<F>(
+        config: &TraceConfig,
+        state: TraceState,
+        body: F,
+    ) -> Vec<u8>
+    where
+        F: FnOnce(&mut Tracer<'_>),
+    {
+        let mut sink = WriterSink::new_for_terminal(Vec::<u8>::new());
+        assert!(sink.is_terminal_destination());
+        assert!(TraceSink::is_terminal(&sink));
+        {
+            let mut tracer = Tracer::new(config, &mut sink).with_state(state);
+            body(&mut tracer);
+        }
+        assert_eq!(sink.error_count(), 0);
+        sink.into_inner()
     }
 
     /// Run `body` against a callback-backed tracer and return the records.
@@ -2822,7 +3330,7 @@ mod tests {
     fn traced_all() -> TraceConfig {
         let mut config = TraceConfig::new();
         config
-            .apply(Some("all"))
+            .apply(Some(b"all"))
             .expect("applying \"all\" cannot fail");
         config.set_feature_level(TraceFeature::Ids, TraceLevel::Info);
         config
@@ -2836,11 +3344,9 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------
     // Name and category tables. Every string below was transcribed from the C
     // source independently of the implementation, so a typo in one does not
     // hide a typo in the other.
-    // ---------------------------------------------------------------------
 
     /// `struct curl_trc_feat` initialisers in `lib/curl_trc.c`, in the order C
     /// declares them. `SMTP` is absent by design; see
@@ -2882,11 +3388,19 @@ mod tests {
         #[cfg(feature = "http2")]
         expected.push((TraceFilter::Http2, "HTTP/2", TraceCategory::PROTOCOL));
         expected.push((TraceFilter::Ssl, "SSL", TraceCategory::NETWORK));
-        expected.push((TraceFilter::SslProxy, "SSL-PROXY", TraceCategory::PROXY));
+        expected.push((
+            TraceFilter::SslProxy,
+            "SSL-PROXY",
+            TraceCategory::PROXY,
+        ));
         expected.push((TraceFilter::H1Proxy, "H1-PROXY", TraceCategory::PROXY));
         #[cfg(feature = "http2")]
         expected.push((TraceFilter::H2Proxy, "H2-PROXY", TraceCategory::PROXY));
-        expected.push((TraceFilter::HttpProxy, "HTTP-PROXY", TraceCategory::PROXY));
+        expected.push((
+            TraceFilter::HttpProxy,
+            "HTTP-PROXY",
+            TraceCategory::PROXY,
+        ));
         expected.push((TraceFilter::HaProxy, "HAPROXY", TraceCategory::PROXY));
         expected.push((TraceFilter::SocksProxy, "SOCKS", TraceCategory::PROXY));
         #[cfg(feature = "http3")]
@@ -2938,15 +3452,23 @@ mod tests {
         for (index, &(feature, name, category)) in expected.iter().enumerate() {
             assert_eq!(feature.name(), name, "name of {feature:?}");
             assert_eq!(feature.category(), category, "category of {feature:?}");
-            assert_eq!(TraceFeature::ALL[index], feature, "ALL order at {index}");
             assert_eq!(
-                TraceFeature::from_name(name),
+                TraceFeature::ALL[index],
+                feature,
+                "ALL order at {index}"
+            );
+            assert_eq!(
+                TraceFeature::from_name(name.as_bytes()),
                 Some(feature),
                 "{name} must resolve back to {feature:?}"
             );
             // C compares with `curlx_str_casecompare()`, which is
             // case-insensitive (`lib/curlx/strparse.c:239-243`).
-            assert_eq!(TraceFeature::from_name(&name.to_lowercase()), Some(feature));
+            let lower = name.to_lowercase();
+            assert_eq!(
+                TraceFeature::from_name(lower.as_bytes()),
+                Some(feature)
+            );
             assert_eq!(feature.to_string(), name, "Display must be the C name");
         }
     }
@@ -2968,11 +3490,11 @@ mod tests {
     #[test]
     fn smtp_feature_is_deliberately_absent() {
         // `Curl_trc_feat_smtp` exists in C (`lib/curl_trc.c:426`), but SMTP is
-        // out of scope (AAP section 0.2.2) and advertising a trace feature for a
+        // out of scope and advertising a trace feature for a
         // protocol that answers `CURLE_UNSUPPORTED_PROTOCOL` would be
         // over-reporting. Omission is safe; over-claiming is not.
-        assert_eq!(TraceFeature::from_name("SMTP"), None);
-        assert_eq!(TraceFeature::from_name("smtp"), None);
+        assert_eq!(TraceFeature::from_name(b"SMTP"), None);
+        assert_eq!(TraceFeature::from_name(b"smtp"), None);
         assert!(TraceFeature::ALL
             .iter()
             .all(|feature| feature.name() != "SMTP"));
@@ -2990,8 +3512,9 @@ mod tests {
             assert_eq!(filter.name(), name, "name of {filter:?}");
             assert_eq!(filter.category(), category, "category of {filter:?}");
             assert_eq!(TraceFilter::ALL[index], filter, "ALL order at {index}");
-            assert_eq!(TraceFilter::from_name(name), Some(filter));
-            assert_eq!(TraceFilter::from_name(&name.to_lowercase()), Some(filter));
+            assert_eq!(TraceFilter::from_name(name.as_bytes()), Some(filter));
+            let lower = name.to_lowercase();
+            assert_eq!(TraceFilter::from_name(lower.as_bytes()), Some(filter));
             assert_eq!(filter.to_string(), name, "Display must be the C name");
         }
     }
@@ -3017,8 +3540,8 @@ mod tests {
         // measured from `lib/http2.c`. The emitted string is the contract, so the
         // library it happens to be implemented with does not appear in output.
         assert_eq!(TraceFilter::Http2.name(), "HTTP/2");
-        assert_eq!(TraceFilter::from_name("nghttp2"), None);
-        assert_eq!(TraceFilter::from_name("http/2"), Some(TraceFilter::Http2));
+        assert_eq!(TraceFilter::from_name(b"nghttp2"), None);
+        assert_eq!(TraceFilter::from_name(b"http/2"), Some(TraceFilter::Http2));
     }
 
     #[test]
@@ -3027,7 +3550,7 @@ mod tests {
         // between them, so a shared name would silently set two levels.
         for &filter in TraceFilter::ALL {
             assert_eq!(
-                TraceFeature::from_name(filter.name()),
+                TraceFeature::from_name(filter.name().as_bytes()),
                 None,
                 "{} names both a filter and a feature",
                 filter.name()
@@ -3065,36 +3588,38 @@ mod tests {
         }
         assert!(!TraceCategory::NONE.matches_selector(TraceCategory::NETWORK));
         assert!(TraceCategory::NETWORK.matches_selector(TraceCategory::NETWORK));
-        assert!(!TraceCategory::PROTOCOL.matches_selector(TraceCategory::NETWORK));
+        assert!(
+            !TraceCategory::PROTOCOL.matches_selector(TraceCategory::NETWORK)
+        );
     }
 
     #[test]
     fn category_keywords_match_c() {
         // `lib/curl_trc.c:619-628`, matched case-insensitively.
         assert_eq!(
-            TraceCategory::from_keyword("all"),
+            TraceCategory::from_keyword(b"all"),
             Some(TraceCategory::NONE)
         );
         assert_eq!(
-            TraceCategory::from_keyword("ALL"),
+            TraceCategory::from_keyword(b"ALL"),
             Some(TraceCategory::NONE)
         );
         assert_eq!(
-            TraceCategory::from_keyword("protocol"),
+            TraceCategory::from_keyword(b"protocol"),
             Some(TraceCategory::PROTOCOL)
         );
         assert_eq!(
-            TraceCategory::from_keyword("Network"),
+            TraceCategory::from_keyword(b"Network"),
             Some(TraceCategory::NETWORK)
         );
         assert_eq!(
-            TraceCategory::from_keyword("PROXY"),
+            TraceCategory::from_keyword(b"PROXY"),
             Some(TraceCategory::PROXY)
         );
         // There is no `internals` keyword: the category exists but only
         // `lib-ids` carries it, and it is reachable by name alone.
-        assert_eq!(TraceCategory::from_keyword("internals"), None);
-        assert_eq!(TraceCategory::from_keyword("multi"), None);
+        assert_eq!(TraceCategory::from_keyword(b"internals"), None);
+        assert_eq!(TraceCategory::from_keyword(b"multi"), None);
     }
 
     #[test]
@@ -3170,7 +3695,11 @@ mod tests {
         // table.
         for index in 0..CurlMstate::COUNT {
             let state = CurlMstate::from_i32(index as i32).expect("in range");
-            assert_eq!(mstate_name(index as i32), state.name(), "state {index}");
+            assert_eq!(
+                mstate_name(index as i32),
+                state.name(),
+                "state {index}"
+            );
             assert_eq!(
                 mstate_name(index as i32),
                 state.to_string(),
@@ -3214,7 +3743,9 @@ mod tests {
         ];
         assert_eq!(InfoType::COUNT, expected.len());
         assert_eq!(InfoType::ALL.len(), expected.len());
-        for (index, &(kind, prefix, label, plain)) in expected.iter().enumerate() {
+        for (index, &(kind, prefix, label, plain)) in
+            expected.iter().enumerate()
+        {
             assert_eq!(InfoType::ALL[index], kind);
             assert_eq!(kind.as_i32(), index as i32, "{kind:?} discriminant");
             assert_eq!(InfoType::from_i32(index as i32), Some(kind));
@@ -3251,10 +3782,8 @@ mod tests {
         assert_eq!(TraceLevel::from_i32(i32::MIN), TraceLevel::None);
     }
 
-    // ---------------------------------------------------------------------
     // The --trace-config grammar. The abort cases were confirmed against the
     // C library built from this tree, not inferred.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn new_config_is_entirely_silent() {
@@ -3272,7 +3801,8 @@ mod tests {
     #[test]
     fn init_yields_a_silent_config_and_cannot_fail() {
         // `Curl_trc_init()` is `return CURLE_OK` outside a debug build.
-        let config = TraceConfig::init().expect("Curl_trc_init cannot fail here");
+        let config =
+            TraceConfig::init().expect("Curl_trc_init cannot fail here");
         assert_eq!(config, TraceConfig::new());
     }
 
@@ -3287,9 +3817,12 @@ mod tests {
     #[test]
     fn apply_all_enables_every_component() {
         let mut config = TraceConfig::new();
-        assert_eq!(config.apply_code(Some("all")), CURLcode::Ok);
+        assert_eq!(config.apply_code(Some(b"all")), CURLcode::Ok);
         for &feature in TraceFeature::ALL {
-            assert!(config.feature_is_info(feature), "{feature:?} should be on");
+            assert!(
+                config.feature_is_info(feature),
+                "{feature:?} should be on"
+            );
         }
         for &filter in TraceFilter::ALL {
             assert!(config.filter_is_info(filter), "{filter:?} should be on");
@@ -3303,17 +3836,17 @@ mod tests {
     #[test]
     fn apply_minus_all_disables_every_component() {
         let mut config = TraceConfig::new();
-        config.apply(Some("all")).unwrap();
-        config.apply(Some("-all")).unwrap();
+        config.apply(Some(b"all")).unwrap();
+        config.apply(Some(b"-all")).unwrap();
         assert_eq!(config, TraceConfig::new());
     }
 
     #[test]
     fn apply_plus_and_bare_name_are_the_same() {
         let mut plus = TraceConfig::new();
-        plus.apply(Some("+multi")).unwrap();
+        plus.apply(Some(b"+multi")).unwrap();
         let mut bare = TraceConfig::new();
-        bare.apply(Some("multi")).unwrap();
+        bare.apply(Some(b"multi")).unwrap();
         assert_eq!(plus, bare);
         assert!(plus.feature_is_info(TraceFeature::Multi));
         assert!(!plus.feature_is_info(TraceFeature::Dns));
@@ -3323,7 +3856,7 @@ mod tests {
     fn apply_is_case_insensitive() {
         for spelling in ["multi", "MULTI", "MuLtI"] {
             let mut config = TraceConfig::new();
-            config.apply(Some(spelling)).unwrap();
+            config.apply(Some(spelling.as_bytes())).unwrap();
             assert!(
                 config.feature_is_info(TraceFeature::Multi),
                 "{spelling} should match"
@@ -3334,7 +3867,7 @@ mod tests {
     #[test]
     fn apply_category_keywords_select_their_members() {
         let mut config = TraceConfig::new();
-        config.apply(Some("protocol,network")).unwrap();
+        config.apply(Some(b"protocol,network")).unwrap();
         for &filter in TraceFilter::ALL {
             let expected = matches!(
                 filter.category(),
@@ -3355,7 +3888,7 @@ mod tests {
     #[test]
     fn apply_proxy_category_selects_only_proxy_filters() {
         let mut config = TraceConfig::new();
-        config.apply(Some("proxy")).unwrap();
+        config.apply(Some(b"proxy")).unwrap();
         for &filter in TraceFilter::ALL {
             let expected = filter.category() == TraceCategory::PROXY;
             assert_eq!(config.filter_is_info(filter), expected, "{filter:?}");
@@ -3366,15 +3899,15 @@ mod tests {
     fn apply_doh_is_an_alias_for_dns() {
         // `lib/curl_trc.c:629-630`: `doh` is rewritten to `dns` before lookup.
         let mut alias = TraceConfig::new();
-        alias.apply(Some("doh")).unwrap();
+        alias.apply(Some(b"doh")).unwrap();
         let mut direct = TraceConfig::new();
-        direct.apply(Some("dns")).unwrap();
+        direct.apply(Some(b"dns")).unwrap();
         assert_eq!(alias, direct);
         assert!(alias.feature_is_info(TraceFeature::Dns));
 
         // And it works with a sign, as any name does.
         let mut off = TraceConfig::new();
-        off.apply(Some("all,-DOH")).unwrap();
+        off.apply(Some(b"all,-DOH")).unwrap();
         assert!(!off.feature_is_info(TraceFeature::Dns));
         assert!(off.feature_is_info(TraceFeature::Multi));
     }
@@ -3382,8 +3915,8 @@ mod tests {
     #[test]
     fn apply_minus_name_silences_only_that_name() {
         let mut config = TraceConfig::new();
-        config.apply(Some("all")).unwrap();
-        config.apply(Some("-ssls")).unwrap();
+        config.apply(Some(b"all")).unwrap();
+        config.apply(Some(b"-ssls")).unwrap();
         assert!(!config.feature_is_info(TraceFeature::Ssls));
         assert!(config.feature_is_info(TraceFeature::Multi));
         assert!(config.filter_is_info(TraceFilter::Ssl));
@@ -3392,12 +3925,12 @@ mod tests {
     #[test]
     fn apply_later_tokens_override_earlier_ones() {
         let mut config = TraceConfig::new();
-        config.apply(Some("all,-multi")).unwrap();
+        config.apply(Some(b"all,-multi")).unwrap();
         assert!(!config.feature_is_info(TraceFeature::Multi));
         assert!(config.feature_is_info(TraceFeature::Dns));
 
         let mut reverse = TraceConfig::new();
-        reverse.apply(Some("-multi,all")).unwrap();
+        reverse.apply(Some(b"-multi,all")).unwrap();
         assert!(reverse.feature_is_info(TraceFeature::Multi));
     }
 
@@ -3407,36 +3940,134 @@ mod tests {
         // continues -- confirmed against the C library, where "nosuch,multi"
         // still produced MULTI records.
         let mut config = TraceConfig::new();
-        assert!(config.apply(Some("nosuchname")).is_ok());
+        assert!(config.apply(Some(b"nosuchname")).is_ok());
         assert_eq!(config, TraceConfig::new());
 
         let mut carried_on = TraceConfig::new();
-        carried_on.apply(Some("nosuch,multi")).unwrap();
+        carried_on.apply(Some(b"nosuch,multi")).unwrap();
         assert!(carried_on.feature_is_info(TraceFeature::Multi));
     }
 
     #[test]
     fn apply_non_ascii_name_is_a_silent_no_op() {
+        // The literal below ends in `\xc3\xa9`, the UTF-8 encoding of a
+        // lower-case e with an acute accent: non-ASCII but valid UTF-8, so it
+        // is the easy half of the byte contract. The genuinely invalid half is
+        // covered by `apply_matches_invalid_utf8_as_bytes_without_decoding`.
         let mut config = TraceConfig::new();
-        assert!(config.apply(Some("caf\u{e9}")).is_ok());
+        assert!(config.apply(Some(b"tea\xc3\xa9")).is_ok());
         assert_eq!(config, TraceConfig::new());
         // And the parse continues past it, as it does past any unknown name.
         let mut carried_on = TraceConfig::new();
-        carried_on.apply(Some("caf\u{e9},multi")).unwrap();
+        carried_on.apply(Some(b"tea\xc3\xa9,multi")).unwrap();
         assert!(carried_on.feature_is_info(TraceFeature::Multi));
+    }
+
+    #[test]
+    fn apply_matches_invalid_utf8_as_bytes_without_decoding() {
+        // 0xFF can never appear in valid UTF-8, so this configuration is one
+        // that no decode step can carry: `core::str::from_utf8` rejects it
+        // outright and `String::from_utf8_lossy` rewrites it. C does neither,
+        // because `curlx_str_casecompare()` compares bytes
+        // (`lib/curlx/strparse.c:239-243`), so the token matches nothing.
+        //
+        // That premise is asserted here as prose rather than as code because
+        // rustc proves it at compile time: writing
+        // `core::str::from_utf8(b"\xff\xfe").is_err()` makes the
+        // `invalid_from_utf8` lint fire with "the literal was valid UTF-8 up to
+        // the 0 bytes". A test may not leave a warning behind, and a lint that
+        // fires is stronger evidence than a runtime check anyway.
+        let mut config = TraceConfig::new();
+        assert!(config.apply(Some(b"\xff\xfe")).is_ok());
+        assert_eq!(config, TraceConfig::new(), "it matches no name");
+
+        // THE POINT OF THE TEST: the parse continues past it. A decoding
+        // implementation would have had to reject the whole configuration or
+        // mangle it, and either way `multi` would never be reached.
+        let mut carried_on = TraceConfig::new();
+        carried_on.apply(Some(b"\xff\xfe,multi")).unwrap();
+        assert!(
+            carried_on.feature_is_info(TraceFeature::Multi),
+            "an undecodable token must be ignored, not fatal"
+        );
+
+        // An invalid byte inside or after a real name must not match it: the
+        // comparison is length-equal and byte-wise, never a prefix test.
+        let spoiled: [&[u8]; 3] = [b"mult\xffi", b"multi\xff", b"\xffmulti"];
+        for name in spoiled {
+            let mut near_miss = TraceConfig::new();
+            near_miss.apply(Some(name)).unwrap();
+            assert_eq!(
+                near_miss,
+                TraceConfig::new(),
+                "{:?} must not match `multi`",
+                String::from_utf8_lossy(name)
+            );
+        }
+
+        // The sign is still read off the first byte, so `-` plus undecodable
+        // bytes is an unknown name being silenced, which is also a no-op.
+        let mut signed = TraceConfig::new();
+        signed.apply(Some(b"all,-\xff\xfe")).unwrap();
+        let mut plain = TraceConfig::new();
+        plain.apply(Some(b"all")).unwrap();
+        assert_eq!(signed, plain);
+    }
+
+    #[test]
+    fn apply_measures_the_cap_in_raw_bytes_not_expanded_replacements() {
+        // This is the exact failure the byte contract removes. A lossy decode
+        // substitutes U+FFFD -- three bytes -- for each invalid byte, so a
+        // token of `n` bytes containing `k` invalid ones expands to `n + 2k`.
+        // One invalid byte in a token that is exactly at the cap is therefore
+        // enough to push the expansion over it, and an over-cap token does not
+        // get truncated: it ends the parse and discards every later token
+        // (`lib/curlx/strparse.c:48-53`).
+        let mut token = vec![b'x'; TRACE_CONFIG_TOKEN_MAX - 1];
+        token.push(0xff);
+        assert_eq!(token.len(), TRACE_CONFIG_TOKEN_MAX, "at the cap as bytes");
+        assert!(
+            String::from_utf8_lossy(&token).len() > TRACE_CONFIG_TOKEN_MAX,
+            "but over the cap once expanded -- the trap being avoided"
+        );
+
+        let mut config = token.clone();
+        config.extend_from_slice(b",multi");
+        let mut applied = TraceConfig::new();
+        applied.apply(Some(&config)).unwrap();
+        assert!(
+            applied.feature_is_info(TraceFeature::Multi),
+            "the raw token fits, so `multi` after it must still be applied"
+        );
+
+        // The cap itself is unchanged by the byte contract: one raw byte more
+        // still aborts, undecodable bytes or not.
+        let mut over = vec![b'x'; TRACE_CONFIG_TOKEN_MAX];
+        over.push(0xff);
+        assert_eq!(over.len(), TRACE_CONFIG_TOKEN_MAX + 1);
+        over.extend_from_slice(b",multi");
+        let mut aborted = TraceConfig::new();
+        aborted.apply(Some(&over)).unwrap();
+        assert_eq!(
+            aborted,
+            TraceConfig::new(),
+            "the cap is still measured, just in raw bytes"
+        );
     }
 
     #[test]
     fn apply_token_at_the_cap_is_accepted_and_one_over_aborts() {
         // THE CORRECTION: an overlong token does not get truncated, it ends the
         // parse. `curlx_str_until()` returns STRE_BIG and `trc_opt()`'s
-        // `while(!...)` stops. Both halves were measured against the C library:
-        // 32 bytes then ",multi" produced MULTI records; 33 bytes did not.
+        // `while(!...)` stops. Against the C library, 32 bytes then ",multi"
+        // produced MULTI records and 33 bytes did not.
         assert_eq!(TRACE_CONFIG_TOKEN_MAX, 32);
 
         let at_cap = "x".repeat(TRACE_CONFIG_TOKEN_MAX);
         let mut accepted = TraceConfig::new();
-        accepted.apply(Some(&format!("{at_cap},multi"))).unwrap();
+        accepted
+            .apply(Some(format!("{at_cap},multi").as_bytes()))
+            .unwrap();
         assert!(
             accepted.feature_is_info(TraceFeature::Multi),
             "a 32-byte token must be consumed and the parse continue"
@@ -3444,7 +4075,9 @@ mod tests {
 
         let over_cap = "x".repeat(TRACE_CONFIG_TOKEN_MAX + 1);
         let mut aborted = TraceConfig::new();
-        aborted.apply(Some(&format!("{over_cap},multi"))).unwrap();
+        aborted
+            .apply(Some(format!("{over_cap},multi").as_bytes()))
+            .unwrap();
         assert_eq!(
             aborted,
             TraceConfig::new(),
@@ -3454,7 +4087,7 @@ mod tests {
         // And an overlong token after a good one keeps the good one's effect.
         let mut partial = TraceConfig::new();
         partial
-            .apply(Some(&format!("multi,{over_cap},dns")))
+            .apply(Some(format!("multi,{over_cap},dns").as_bytes()))
             .unwrap();
         assert!(partial.feature_is_info(TraceFeature::Multi));
         assert!(!partial.feature_is_info(TraceFeature::Dns));
@@ -3466,7 +4099,9 @@ mod tests {
         // sign plus 32 bytes is 33 bytes and aborts.
         let name = "x".repeat(TRACE_CONFIG_TOKEN_MAX);
         let mut config = TraceConfig::new();
-        config.apply(Some(&format!("+{name},multi"))).unwrap();
+        config
+            .apply(Some(format!("+{name},multi").as_bytes()))
+            .unwrap();
         assert_eq!(
             config,
             TraceConfig::new(),
@@ -3477,20 +4112,20 @@ mod tests {
     #[test]
     fn apply_empty_token_aborts_but_a_trailing_comma_does_not() {
         // STRE_SHORT ends the parse too, which makes the leading and trailing
-        // comma cases asymmetric. Both were measured.
+        // comma cases asymmetric.
         let mut leading = TraceConfig::new();
-        leading.apply(Some(",multi")).unwrap();
+        leading.apply(Some(b",multi")).unwrap();
         assert_eq!(leading, TraceConfig::new(), "a leading comma aborts");
 
         let mut trailing = TraceConfig::new();
-        trailing.apply(Some("multi,")).unwrap();
+        trailing.apply(Some(b"multi,")).unwrap();
         assert!(
             trailing.feature_is_info(TraceFeature::Multi),
             "a trailing comma is harmless: the loop was ending anyway"
         );
 
         let mut doubled = TraceConfig::new();
-        doubled.apply(Some("multi,,dns")).unwrap();
+        doubled.apply(Some(b"multi,,dns")).unwrap();
         assert!(doubled.feature_is_info(TraceFeature::Multi));
         assert!(
             !doubled.feature_is_info(TraceFeature::Dns),
@@ -3498,7 +4133,7 @@ mod tests {
         );
 
         let mut empty = TraceConfig::new();
-        empty.apply(Some("")).unwrap();
+        empty.apply(Some(b"")).unwrap();
         assert_eq!(empty, TraceConfig::new());
     }
 
@@ -3508,18 +4143,18 @@ mod tests {
         // name, and `curlx_str_casecompare()` requires equal lengths, so nothing
         // matches. The separator is still consumed.
         let mut config = TraceConfig::new();
-        config.apply(Some("-,multi")).unwrap();
+        config.apply(Some(b"-,multi")).unwrap();
         assert!(config.feature_is_info(TraceFeature::Multi));
 
         let mut alone = TraceConfig::new();
-        alone.apply(Some("+")).unwrap();
+        alone.apply(Some(b"+")).unwrap();
         assert_eq!(alone, TraceConfig::new());
     }
 
     #[test]
     fn apply_matches_filter_names_too() {
         let mut config = TraceConfig::new();
-        config.apply(Some("tcp,socks,https-connect")).unwrap();
+        config.apply(Some(b"tcp,socks,https-connect")).unwrap();
         assert!(config.filter_is_info(TraceFilter::Tcp));
         assert!(config.filter_is_info(TraceFilter::SocksProxy));
         assert!(config.filter_is_info(TraceFilter::HttpConnect));
@@ -3533,7 +4168,7 @@ mod tests {
         // application calling `curl_global_trace()` -- which is exactly how the
         // capture that verified this module's layouts was taken.
         let mut config = TraceConfig::new();
-        config.apply(Some("lib-ids")).unwrap();
+        config.apply(Some(b"lib-ids")).unwrap();
         assert!(config.feature_is_info(TraceFeature::Ids));
         assert!(!config.feature_is_info(TraceFeature::Multi));
     }
@@ -3564,16 +4199,14 @@ mod tests {
         config.set_filter_level(TraceFilter::Ssl, TraceLevel::Info);
         assert_eq!(config.filter_level(TraceFilter::Ssl), TraceLevel::Info);
 
-        config.apply_level_by_name("udp", TraceLevel::Info);
+        config.apply_level_by_name(b"udp", TraceLevel::Info);
         assert!(config.filter_is_info(TraceFilter::Udp));
 
         config.apply_level_by_category(TraceCategory::PROXY, TraceLevel::Info);
         assert!(config.filter_is_info(TraceFilter::HaProxy));
     }
 
-    // ---------------------------------------------------------------------
     // LineBuffer: C's length budget and its "...\n" truncation.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn line_max_matches_c() {
@@ -3721,9 +4354,7 @@ mod tests {
         assert_eq!(buffer.as_bytes(), &[0xc3, 0xa9, 0xc3, 0xa9]);
     }
 
-    // ---------------------------------------------------------------------
     // TraceIds: the four bracket shapes.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn trace_ids_render_c_four_shapes() {
@@ -3757,9 +4388,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
     // TraceTime and the injected clock.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn trace_time_renders_the_c_prefix() {
@@ -3780,7 +4409,10 @@ mod tests {
     #[test]
     fn trace_time_conversion_failure_renders_zeroes() {
         // `hms_for_sec()` zeroes the whole `struct tm` when it cannot convert.
-        assert_eq!(TraceTime::CONVERSION_FAILED.to_string(), "00:00:00.000000 ");
+        assert_eq!(
+            TraceTime::CONVERSION_FAILED.to_string(),
+            "00:00:00.000000 "
+        );
         assert_eq!(TraceTime::default(), TraceTime::CONVERSION_FAILED);
     }
 
@@ -3810,9 +4442,7 @@ mod tests {
         assert_eq!(clock.now(), clock.now());
     }
 
-    // ---------------------------------------------------------------------
     // ErrorBuffer: first failure wins.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn error_buffer_keeps_the_first_message() {
@@ -3854,32 +4484,31 @@ mod tests {
         assert_eq!(buffer.message_bytes(), &[0xff, b'!']);
     }
 
-    // ---------------------------------------------------------------------
     // Tracer. The first five assertions are byte-for-byte against lines
     // captured from the libcurl built from this tree, driven through
     // curl_global_trace("all") with CURLOPT_VERBOSE and no debug callback.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn oracle_multi_state_transition_line() {
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.multi(
-                CurlMstate::Connecting,
-                format_args!("-> [{}]", mstate_name(6)),
-            );
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.multi(
+                    CurlMstate::Connecting,
+                    format_args!("-> [{}]", mstate_name(6)),
+                );
+            });
         assert_eq!(out, "* [0-0] [MULTI] [CONNECTING] -> [PROTOCONNECT]\n");
     }
 
     /// Reproduces the `ignore`d snippet on [`Tracer`], including its output.
     ///
     /// A rustdoc example cannot be compiled here: every item in this module is
-    /// `pub(crate)` per AAP 0.4.2, and a doctest is built as a separate crate,
-    /// so the snippet is necessarily `ignore`d and no compiler ever reads it.
-    /// That is a real drift hazard -- one such snippet was measured to name a
-    /// `CurlMstate` variant that does not exist -- so this test stands in for
-    /// the doctest and fails if the documentation stops being true.
+    /// `pub(crate)` and a doctest is built as a separate crate, so the snippet
+    /// is necessarily `ignore`d and no compiler ever reads it. That is a real
+    /// drift hazard -- such a snippet can name a `CurlMstate` variant that
+    /// does not exist and nothing will say so -- which is why this test stands
+    /// in for the doctest and fails if the documentation stops being true.
     ///
     /// The one necessary difference from the snippet is the macro receiver:
     /// `stream_output` hands the closure a `&mut Tracer`, so it passes `tracer`
@@ -3890,7 +4519,7 @@ mod tests {
     fn the_documented_example_writes_the_line_it_claims() {
         let mut config = TraceConfig::new();
         config
-            .apply(Some("multi,lib-ids"))
+            .apply(Some(b"multi,lib-ids"))
             .expect("the documented config string must parse");
         let state = TraceState {
             verbose: true,
@@ -3911,12 +4540,19 @@ mod tests {
     #[test]
     fn oracle_multi_init_line_with_unassigned_connection() {
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::xfer_only(0)), |tracer| {
-            tracer.multi(
-                CurlMstate::Init,
-                format_args!("added to multi, mid={}, running={}, total={}", 1, 1, 2),
-            );
-        });
+        let out = stream_output(
+            &config,
+            state_with(TraceIds::xfer_only(0)),
+            |tracer| {
+                tracer.multi(
+                    CurlMstate::Init,
+                    format_args!(
+                        "added to multi, mid={}, running={}, total={}",
+                        1, 1, 2
+                    ),
+                );
+            },
+        );
         assert_eq!(
             out,
             "* [0-x] [MULTI] [INIT] added to multi, mid=1, running=1, total=2\n"
@@ -3926,13 +4562,17 @@ mod tests {
     #[test]
     fn oracle_connection_filter_line_has_no_suffix_for_socket_zero() {
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.filter(
-                TraceFilter::Tcp,
-                0,
-                format_args!("adjust_pollset, !connected, POLLOUT fd={}", 4),
-            );
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.filter(
+                    TraceFilter::Tcp,
+                    0,
+                    format_args!(
+                        "adjust_pollset, !connected, POLLOUT fd={}",
+                        4
+                    ),
+                );
+            });
         assert_eq!(
             out,
             "* [0-0] [TCP] adjust_pollset, !connected, POLLOUT fd=4\n"
@@ -3942,9 +4582,10 @@ mod tests {
     #[test]
     fn oracle_timer_line() {
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.timer(TimerId::HappyEyeballs, format_args!("cleared"));
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.timer(TimerId::HappyEyeballs, format_args!("cleared"));
+            });
         assert_eq!(out, "* [0-0] [TIMER] [HAPPY_EYEBALLS] cleared\n");
     }
 
@@ -3954,18 +4595,21 @@ mod tests {
         // kind prefix, then the bytes -- whereas an informational line carries
         // its identifiers inside the payload and so shows them after "* ".
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.debug(InfoType::HeaderOut, b"GET /data.txt HTTP/1.1\r\n");
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer
+                    .debug(InfoType::HeaderOut, b"GET /data.txt HTTP/1.1\r\n");
+            });
         assert_eq!(out, "[0-0] > GET /data.txt HTTP/1.1\r\n");
     }
 
     #[test]
     fn filter_line_appends_a_non_zero_socket_index() {
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.filter(TraceFilter::Tcp, 1, format_args!("connected"));
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.filter(TraceFilter::Tcp, 1, format_args!("connected"));
+            });
         assert_eq!(out, "* [0-0] [TCP-1] connected\n");
     }
 
@@ -3990,10 +4634,14 @@ mod tests {
     #[test]
     fn infof_without_identifiers_has_no_bracket_group() {
         let mut config = TraceConfig::new();
-        config.apply(Some("all,-lib-ids")).unwrap();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.infof(format_args!("Connected to {} port {}", "localhost", 18049));
-        });
+        config.apply(Some(b"all,-lib-ids")).unwrap();
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.infof(format_args!(
+                    "Connected to {} port {}",
+                    "localhost", 18049
+                ));
+            });
         assert_eq!(out, "* Connected to localhost port 18049\n");
     }
 
@@ -4041,7 +4689,7 @@ mod tests {
     #[test]
     fn feature_lines_use_a_single_bracket_group() {
         let mut config = TraceConfig::new();
-        config.apply(Some("all,-lib-ids")).unwrap();
+        config.apply(Some(b"all,-lib-ids")).unwrap();
         let state = state_with(TraceIds::new(0, 0));
         for &(feature, name, _) in expected_features().iter() {
             if feature == TraceFeature::Ids {
@@ -4080,15 +4728,16 @@ mod tests {
     #[test]
     fn nothing_is_emitted_when_the_component_is_silent() {
         let config = TraceConfig::new();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            assert!(tracer.is_verbose(), "the transfer is verbose");
-            assert!(!tracer.is_feature_verbose(TraceFeature::Multi));
-            assert!(!tracer.is_filter_verbose(TraceFilter::Tcp));
-            tracer.multi(CurlMstate::Init, format_args!("suppressed"));
-            tracer.timer(TimerId::Timeout, format_args!("suppressed"));
-            tracer.filter(TraceFilter::Tcp, 0, format_args!("suppressed"));
-            tracer.feature(TraceFeature::Dns, format_args!("suppressed"));
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                assert!(tracer.is_verbose(), "the transfer is verbose");
+                assert!(!tracer.is_feature_verbose(TraceFeature::Multi));
+                assert!(!tracer.is_filter_verbose(TraceFilter::Tcp));
+                tracer.multi(CurlMstate::Init, format_args!("suppressed"));
+                tracer.timer(TimerId::Timeout, format_args!("suppressed"));
+                tracer.filter(TraceFilter::Tcp, 0, format_args!("suppressed"));
+                tracer.feature(TraceFeature::Dns, format_args!("suppressed"));
+            });
         assert_eq!(out, "");
     }
 
@@ -4157,9 +4806,13 @@ mod tests {
     #[test]
     fn a_long_message_is_truncated_with_the_marker_and_keeps_its_prefixes() {
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.multi(CurlMstate::Init, format_args!("{}", "z".repeat(4000)));
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.multi(
+                    CurlMstate::Init,
+                    format_args!("{}", "z".repeat(4000)),
+                );
+            });
         assert!(
             out.starts_with("* [0-0] [MULTI] [INIT] zzz"),
             "prefixes survive"
@@ -4169,9 +4822,7 @@ mod tests {
         assert_eq!(out.len(), InfoType::PREFIX_LEN + 2047);
     }
 
-    // ---------------------------------------------------------------------
     // failf: the error path, which is gated differently from everything else.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn failf_writes_the_log_and_fills_the_buffer() {
@@ -4182,7 +4833,10 @@ mod tests {
             let mut tracer = Tracer::new(&config, &mut sink)
                 .with_state(TraceState::verbose())
                 .with_error_buffer(&mut buffer);
-            tracer.failf(format_args!("Could not resolve host: {}", "nosuch.invalid"));
+            tracer.failf(format_args!(
+                "Could not resolve host: {}",
+                "nosuch.invalid"
+            ));
         }
         assert_eq!(
             String::from_utf8(sink.into_inner()).unwrap(),
@@ -4203,7 +4857,8 @@ mod tests {
         let mut buffer = ErrorBuffer::new();
         let mut sink = WriterSink::new(Vec::<u8>::new());
         {
-            let mut tracer = Tracer::new(&config, &mut sink).with_error_buffer(&mut buffer);
+            let mut tracer =
+                Tracer::new(&config, &mut sink).with_error_buffer(&mut buffer);
             assert!(!tracer.is_verbose());
             tracer.failf(format_args!("boom"));
         }
@@ -4243,7 +4898,10 @@ mod tests {
                 Some(&b"root cause"[..])
             );
             tracer.reset_fail();
-            assert_eq!(tracer.error_buffer().map(ErrorBuffer::is_set), Some(false));
+            assert_eq!(
+                tracer.error_buffer().map(ErrorBuffer::is_set),
+                Some(false)
+            );
             tracer.failf(format_args!("after reset"));
         }
         // Every call still reached the log, only the buffer is first-wins.
@@ -4258,7 +4916,8 @@ mod tests {
     fn reset_fail_without_a_buffer_is_harmless() {
         let config = TraceConfig::new();
         let mut sink = CallbackSink::default();
-        let mut tracer = Tracer::new(&config, &mut sink).with_state(TraceState::verbose());
+        let mut tracer =
+            Tracer::new(&config, &mut sink).with_state(TraceState::verbose());
         tracer.reset_fail();
         assert!(tracer.error_buffer().is_none());
     }
@@ -4283,9 +4942,7 @@ mod tests {
         assert_eq!(buffer.message_bytes().len(), 255);
     }
 
-    // ---------------------------------------------------------------------
     // debug(): the two destinations that differ in content, not just target.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn a_stream_sink_drops_body_and_tls_payloads() {
@@ -4299,9 +4956,13 @@ mod tests {
             InfoType::SslDataIn,
             InfoType::SslDataOut,
         ] {
-            let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-                tracer.debug(kind, b"body bytes");
-            });
+            let out = stream_output(
+                &config,
+                state_with(TraceIds::new(0, 0)),
+                |tracer| {
+                    tracer.debug(kind, b"body bytes");
+                },
+            );
             assert_eq!(out, "", "{kind:?} must not reach a plain writer");
         }
         for (kind, prefix) in [
@@ -4309,9 +4970,13 @@ mod tests {
             (InfoType::HeaderIn, "< "),
             (InfoType::HeaderOut, "> "),
         ] {
-            let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-                tracer.debug(kind, b"line\r\n");
-            });
+            let out = stream_output(
+                &config,
+                state_with(TraceIds::new(0, 0)),
+                |tracer| {
+                    tracer.debug(kind, b"line\r\n");
+                },
+            );
             assert_eq!(out, format!("{prefix}line\r\n"), "{kind:?}");
         }
     }
@@ -4320,11 +4985,15 @@ mod tests {
     fn a_callback_sink_receives_every_kind_untouched() {
         let mut config = traced_all();
         config.set_feature_level(TraceFeature::Ids, TraceLevel::None);
-        let records = callback_records(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            for &kind in InfoType::ALL {
-                tracer.debug(kind, b"\x00\x01raw");
-            }
-        });
+        let records = callback_records(
+            &config,
+            state_with(TraceIds::new(0, 0)),
+            |tracer| {
+                for &kind in InfoType::ALL {
+                    tracer.debug(kind, b"\x00\x01raw");
+                }
+            },
+        );
         assert_eq!(records.len(), InfoType::COUNT);
         for (index, (kind, payload)) in records.iter().enumerate() {
             assert_eq!(*kind, InfoType::ALL[index]);
@@ -4335,9 +5004,13 @@ mod tests {
     #[test]
     fn a_callback_sink_gets_identifiers_built_into_the_record() {
         let config = traced_all();
-        let records = callback_records(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.debug(InfoType::HeaderOut, b"GET / HTTP/1.1\r\n");
-        });
+        let records = callback_records(
+            &config,
+            state_with(TraceIds::new(0, 0)),
+            |tracer| {
+                tracer.debug(InfoType::HeaderOut, b"GET / HTTP/1.1\r\n");
+            },
+        );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, InfoType::HeaderOut);
         assert_eq!(
@@ -4353,9 +5026,13 @@ mod tests {
         // not be truncated to fit a trace buffer.
         let config = traced_all();
         let payload = vec![b'p'; TRC_LINE_MAX];
-        let records = callback_records(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.debug(InfoType::DataIn, &payload);
-        });
+        let records = callback_records(
+            &config,
+            state_with(TraceIds::new(0, 0)),
+            |tracer| {
+                tracer.debug(InfoType::DataIn, &payload);
+            },
+        );
         assert_eq!(
             records[0].1.len(),
             TRC_LINE_MAX,
@@ -4364,9 +5041,13 @@ mod tests {
         assert_eq!(records[0].1, payload);
 
         let just_under = vec![b'p'; TRC_LINE_MAX - 1];
-        let records = callback_records(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.debug(InfoType::DataIn, &just_under);
-        });
+        let records = callback_records(
+            &config,
+            state_with(TraceIds::new(0, 0)),
+            |tracer| {
+                tracer.debug(InfoType::DataIn, &just_under);
+            },
+        );
         assert!(
             records[0].1.starts_with(b"[0-0] "),
             "identifiers are prefixed below the cap"
@@ -4383,9 +5064,13 @@ mod tests {
         // (`lib/mprintf.c:879`), which halts at a NUL despite the precision.
         // Reachable only with `lib-ids` on; reproduced because it is C's output.
         let config = traced_all();
-        let records = callback_records(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.debug(InfoType::DataIn, b"visible\x00hidden");
-        });
+        let records = callback_records(
+            &config,
+            state_with(TraceIds::new(0, 0)),
+            |tracer| {
+                tracer.debug(InfoType::DataIn, b"visible\x00hidden");
+            },
+        );
         assert_eq!(records[0].1, b"[0-0] visible");
     }
 
@@ -4393,33 +5078,36 @@ mod tests {
     fn debug_without_identifiers_passes_the_payload_straight_through() {
         let mut config = traced_all();
         config.set_feature_level(TraceFeature::Ids, TraceLevel::None);
-        let records = callback_records(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.debug(InfoType::DataIn, b"visible\x00also visible");
-        });
+        let records = callback_records(
+            &config,
+            state_with(TraceIds::new(0, 0)),
+            |tracer| {
+                tracer.debug(InfoType::DataIn, b"visible\x00also visible");
+            },
+        );
         assert_eq!(
             records[0].1, b"visible\x00also visible",
             "no NUL truncation on this path"
         );
     }
 
-    // ---------------------------------------------------------------------
     // easy_timers: the preserved unit-label defect, and the skip.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn easy_timers_prints_microseconds_labelled_ns_exactly_as_c_does() {
         // `curlx_ptimediff_us()` under `"expires in %" FMT_TIMEDIFF_T "ns"`
         // (`lib/curl_trc.c:327-328`). The label is wrong in C and is frozen
-        // output, so it is wrong here too: AAP section 0.8.2 forbids a change
-        // justified as an improvement.
+        // output, so it is wrong here too: a change justified as an
+        // improvement is not permitted.
         let mut config = TraceConfig::new();
-        config.apply(Some("timer")).unwrap();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.easy_timers(vec![
-                (TimerId::Timeout, 1_500_000_i64),
-                (TimerId::ConnectTimeout, -25_i64),
-            ]);
-        });
+        config.apply(Some(b"timer")).unwrap();
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.easy_timers(vec![
+                    (TimerId::Timeout, 1_500_000_i64),
+                    (TimerId::ConnectTimeout, -25_i64),
+                ]);
+            });
         assert_eq!(
             out,
             "* [TIMER] [TIMEOUT] expires in 1500000ns\n\
@@ -4433,12 +5121,13 @@ mod tests {
         // iterator here counts, so the skip is observable rather than assumed.
         let visits = Cell::new(0_usize);
         let config = TraceConfig::new();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.easy_timers(TimerId::ALL.iter().map(|&timer| {
-                visits.set(visits.get() + 1);
-                (timer, 0_i64)
-            }));
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.easy_timers(TimerId::ALL.iter().map(|&timer| {
+                    visits.set(visits.get() + 1);
+                    (timer, 0_i64)
+                }));
+            });
         assert_eq!(out, "");
         assert_eq!(
             visits.get(),
@@ -4450,43 +5139,47 @@ mod tests {
     #[test]
     fn easy_timers_with_an_empty_list_emits_nothing() {
         let mut config = TraceConfig::new();
-        config.apply(Some("timer")).unwrap();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.easy_timers(Vec::new());
-        });
+        config.apply(Some(b"timer")).unwrap();
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.easy_timers(Vec::new());
+            });
         assert_eq!(out, "");
     }
 
     #[test]
     fn a_raw_timer_number_outside_the_range_renders_unknown() {
         let mut config = TraceConfig::new();
-        config.apply(Some("timer")).unwrap();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.timer_id(99, format_args!("armed"));
-            tracer.timer_id(TimerId::Shutdown.as_i32(), format_args!("armed"));
-        });
+        config.apply(Some(b"timer")).unwrap();
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.timer_id(99, format_args!("armed"));
+                tracer.timer_id(
+                    TimerId::Shutdown.as_i32(),
+                    format_args!("armed"),
+                );
+            });
         assert_eq!(
             out,
             "* [TIMER] [UNKNOWN?] armed\n* [TIMER] [SHUTDOWN] armed\n"
         );
     }
 
-    // ---------------------------------------------------------------------
     // The emitter macros.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn every_macro_produces_its_c_layout() {
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            infof!(tracer, "plain {} {}", "one", 2);
-            failf!(tracer, "failed with {}", 7);
-            trc_feat!(tracer, TraceFeature::Dns, "resolving {}", "host");
-            trc_multi!(tracer, CurlMstate::Performing, "sending");
-            trc_timer!(tracer, TimerId::Shutdown, "armed for {}ms", 250);
-            trc_cf!(tracer, TraceFilter::Ssl, 0, "handshake done");
-            trc_cf!(tracer, TraceFilter::Ssl, 2, "handshake done");
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                infof!(tracer, "plain {} {}", "one", 2);
+                failf!(tracer, "failed with {}", 7);
+                trc_feat!(tracer, TraceFeature::Dns, "resolving {}", "host");
+                trc_multi!(tracer, CurlMstate::Performing, "sending");
+                trc_timer!(tracer, TimerId::Shutdown, "armed for {}ms", 250);
+                trc_cf!(tracer, TraceFilter::Ssl, 0, "handshake done");
+                trc_cf!(tracer, TraceFilter::Ssl, 2, "handshake done");
+            });
         assert_eq!(
             out,
             "* [0-0] plain one 2\n\
@@ -4507,14 +5200,15 @@ mod tests {
         // through the path here is how those modules will, and it checks the
         // re-export rather than the textual scope.
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(1, 2)), |tracer| {
-            crate::trace::infof!(tracer, "by path");
-            crate::trace::failf!(tracer, "by path");
-            crate::trace::trc_feat!(tracer, TraceFeature::Write, "by path");
-            crate::trace::trc_multi!(tracer, CurlMstate::Setup, "by path");
-            crate::trace::trc_timer!(tracer, TimerId::TooFast, "by path");
-            crate::trace::trc_cf!(tracer, TraceFilter::Setup, 0, "by path");
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(1, 2)), |tracer| {
+                crate::trace::infof!(tracer, "by path");
+                crate::trace::failf!(tracer, "by path");
+                crate::trace::trc_feat!(tracer, TraceFeature::Write, "by path");
+                crate::trace::trc_multi!(tracer, CurlMstate::Setup, "by path");
+                crate::trace::trc_timer!(tracer, TimerId::TooFast, "by path");
+                crate::trace::trc_cf!(tracer, TraceFilter::Setup, 0, "by path");
+            });
         assert_eq!(
             out,
             "* [1-2] by path\n\
@@ -4546,14 +5240,29 @@ mod tests {
         let peer = "127.0.0.1:80";
 
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            crate::trace::infof!(tracer, "Connected to {host} port {port}");
-            crate::trace::failf!(tracer, "Could not resolve host: {host}");
-            crate::trace::trc_feat!(tracer, TraceFeature::Read, "client read {} bytes", n);
-            crate::trace::trc_multi!(tracer, mstate, "-> [{}]", next);
-            crate::trace::trc_timer!(tracer, TimerId::HappyEyeballs, "cleared");
-            crate::trace::trc_cf!(tracer, TraceFilter::Tcp, sockindex, "connected to {peer}");
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                crate::trace::infof!(tracer, "Connected to {host} port {port}");
+                crate::trace::failf!(tracer, "Could not resolve host: {host}");
+                crate::trace::trc_feat!(
+                    tracer,
+                    TraceFeature::Read,
+                    "client read {} bytes",
+                    n
+                );
+                crate::trace::trc_multi!(tracer, mstate, "-> [{}]", next);
+                crate::trace::trc_timer!(
+                    tracer,
+                    TimerId::HappyEyeballs,
+                    "cleared"
+                );
+                crate::trace::trc_cf!(
+                    tracer,
+                    TraceFilter::Tcp,
+                    sockindex,
+                    "connected to {peer}"
+                );
+            });
         assert_eq!(
             out,
             "* [0-0] Connected to example.com port 443\n\
@@ -4568,15 +5277,19 @@ mod tests {
     #[test]
     fn macros_accept_a_trailing_comma_and_no_arguments() {
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::UNASSIGNED), |tracer| {
-            infof!(tracer, "bare");
-            infof!(tracer, "trailing {}", 1,);
-            trc_feat!(tracer, TraceFeature::Read, "bare");
-            trc_multi!(tracer, CurlMstate::Done, "bare");
-            trc_timer!(tracer, TimerId::Quic, "bare");
-            trc_cf!(tracer, TraceFilter::Udp, 0, "bare");
-            failf!(tracer, "bare");
-        });
+        let out = stream_output(
+            &config,
+            state_with(TraceIds::UNASSIGNED),
+            |tracer| {
+                infof!(tracer, "bare");
+                infof!(tracer, "trailing {}", 1,);
+                trc_feat!(tracer, TraceFeature::Read, "bare");
+                trc_multi!(tracer, CurlMstate::Done, "bare");
+                trc_timer!(tracer, TimerId::Quic, "bare");
+                trc_cf!(tracer, TraceFilter::Udp, 0, "bare");
+                failf!(tracer, "bare");
+            },
+        );
         assert_eq!(out.lines().count(), 7);
     }
 
@@ -4591,12 +5304,13 @@ mod tests {
         };
 
         let silent = TraceConfig::new();
-        let out = stream_output(&silent, state_with(TraceIds::new(0, 0)), |tracer| {
-            trc_feat!(tracer, TraceFeature::Dns, "value {}", count());
-            trc_multi!(tracer, CurlMstate::Init, "value {}", count());
-            trc_timer!(tracer, TimerId::Timeout, "value {}", count());
-            trc_cf!(tracer, TraceFilter::Tcp, 0, "value {}", count());
-        });
+        let out =
+            stream_output(&silent, state_with(TraceIds::new(0, 0)), |tracer| {
+                trc_feat!(tracer, TraceFeature::Dns, "value {}", count());
+                trc_multi!(tracer, CurlMstate::Init, "value {}", count());
+                trc_timer!(tracer, TimerId::Timeout, "value {}", count());
+                trc_cf!(tracer, TraceFilter::Tcp, 0, "value {}", count());
+            });
         assert_eq!(out, "");
         assert_eq!(
             evaluations.get(),
@@ -4606,12 +5320,13 @@ mod tests {
 
         // And with everything enabled, each one is evaluated exactly once.
         let loud = traced_all();
-        let out = stream_output(&loud, state_with(TraceIds::new(0, 0)), |tracer| {
-            trc_feat!(tracer, TraceFeature::Dns, "value {}", count());
-            trc_multi!(tracer, CurlMstate::Init, "value {}", count());
-            trc_timer!(tracer, TimerId::Timeout, "value {}", count());
-            trc_cf!(tracer, TraceFilter::Tcp, 0, "value {}", count());
-        });
+        let out =
+            stream_output(&loud, state_with(TraceIds::new(0, 0)), |tracer| {
+                trc_feat!(tracer, TraceFeature::Dns, "value {}", count());
+                trc_multi!(tracer, CurlMstate::Init, "value {}", count());
+                trc_timer!(tracer, TimerId::Timeout, "value {}", count());
+                trc_cf!(tracer, TraceFilter::Tcp, 0, "value {}", count());
+            });
         assert_eq!(evaluations.get(), 4);
         assert!(out.contains("value 1"), "{out}");
         assert!(out.contains("value 4"), "{out}");
@@ -4645,7 +5360,8 @@ mod tests {
         let mut buffer = ErrorBuffer::new();
         let mut sink = WriterSink::new(Vec::<u8>::new());
         {
-            let mut tracer = Tracer::new(&config, &mut sink).with_error_buffer(&mut buffer);
+            let mut tracer =
+                Tracer::new(&config, &mut sink).with_error_buffer(&mut buffer);
             let tracer = &mut tracer;
             failf!(tracer, "value {}", {
                 evaluations.set(evaluations.get() + 1);
@@ -4661,9 +5377,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
     // The no-newline invariant.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn fmt_has_newline_detects_a_line_feed_anywhere() {
@@ -4676,8 +5390,8 @@ mod tests {
         assert!(fmt_has_newline("in the \n middle"));
         assert!(fmt_has_newline("two\nof\nthem"));
         // Multi-byte input is scanned by byte, as C's `strchr()` is.
-        assert!(!fmt_has_newline("caf\u{e9}"));
-        assert!(fmt_has_newline("caf\u{e9}\n"));
+        assert!(!fmt_has_newline("na\u{ef}ve"));
+        assert!(fmt_has_newline("na\u{ef}ve\n"));
     }
 
     #[test]
@@ -4692,7 +5406,8 @@ mod tests {
         assert_eq!([CLEAN, DIRTY], [false, true]);
         // The anonymous-constant form the macros use, which fails the build
         // rather than a test run.
-        const _: () = assert!(!fmt_has_newline("this is what every macro asserts"));
+        const _: () =
+            assert!(!fmt_has_newline("this is what every macro asserts"));
     }
 
     #[test]
@@ -4742,7 +5457,13 @@ mod tests {
             }
             .to_string(),
         );
-        fixed.push(TRACE_CONFIG_DOH_ALIAS_TARGET.to_string());
+        // The alias target is bytes, so it is decoded here rather than
+        // formatted. It is an ASCII literal owned by this module, so the
+        // conversion cannot fail; matching instead of unwrapping keeps that
+        // fact from becoming load-bearing.
+        if let Ok(alias) = core::str::from_utf8(TRACE_CONFIG_DOH_ALIAS_TARGET) {
+            fixed.push(alias.to_string());
+        }
 
         for candidate in &fixed {
             assert!(
@@ -4760,26 +5481,26 @@ mod tests {
     #[test]
     fn every_emitter_terminates_its_record_with_exactly_one_newline() {
         let config = traced_all();
-        let out = stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
-            tracer.infof(format_args!("a"));
-            tracer.failf(format_args!("b"));
-            tracer.feature(TraceFeature::Dns, format_args!("c"));
-            tracer.multi(CurlMstate::Init, format_args!("d"));
-            tracer.timer(TimerId::Timeout, format_args!("e"));
-            tracer.filter(TraceFilter::Tcp, 0, format_args!("f"));
-        });
+        let out =
+            stream_output(&config, state_with(TraceIds::new(0, 0)), |tracer| {
+                tracer.infof(format_args!("a"));
+                tracer.failf(format_args!("b"));
+                tracer.feature(TraceFeature::Dns, format_args!("c"));
+                tracer.multi(CurlMstate::Init, format_args!("d"));
+                tracer.timer(TimerId::Timeout, format_args!("e"));
+                tracer.filter(TraceFilter::Tcp, 0, format_args!("f"));
+            });
         assert_eq!(out.matches('\n').count(), 6);
         assert!(out.ends_with('\n'));
         assert!(!out.contains("\n\n"));
     }
 
-    // ---------------------------------------------------------------------
     // dump(): the --trace and --trace-ascii geometry, byte for byte against a
     // capture from the C command-line tool built from this tree.
-    // ---------------------------------------------------------------------
 
     /// The 52-byte payload the captures were taken over.
-    const ORACLE_PAYLOAD: &[u8] = b"Hello, curl trace oracle!\r\nSecond line here\r\nthird\r\n";
+    const ORACLE_PAYLOAD: &[u8] =
+        b"Hello, curl trace oracle!\r\nMiddle line here\r\nfinal\r\n";
 
     fn dumped(payload: &[u8], style: DumpStyle) -> String {
         let mut out = Vec::new();
@@ -4801,9 +5522,9 @@ mod tests {
         let expected = concat!(
             "<= Recv data, 52 bytes (0x34)\n",
             "0000: 48 65 6c 6c 6f 2c 20 63 75 72 6c 20 74 72 61 63 Hello, curl trac\n",
-            "0010: 65 20 6f 72 61 63 6c 65 21 0d 0a 53 65 63 6f 6e e oracle!..Secon\n",
-            "0020: 64 20 6c 69 6e 65 20 68 65 72 65 0d 0a 74 68 69 d line here..thi\n",
-            "0030: 72 64 0d 0a                                     rd..\n",
+            "0010: 65 20 6f 72 61 63 6c 65 21 0d 0a 4d 69 64 64 6c e oracle!..Middl\n",
+            "0020: 65 20 6c 69 6e 65 20 68 65 72 65 0d 0a 66 69 6e e line here..fin\n",
+            "0030: 61 6c 0d 0a                                     al..\n",
         );
         assert_eq!(dumped(ORACLE_PAYLOAD, DumpStyle::Hex), expected);
     }
@@ -4815,8 +5536,8 @@ mod tests {
         let expected = concat!(
             "<= Recv data, 52 bytes (0x34)\n",
             "0000: Hello, curl trace oracle!\n",
-            "001b: Second line here\n",
-            "002d: third\n",
+            "001b: Middle line here\n",
+            "002d: final\n",
         );
         assert_eq!(dumped(ORACLE_PAYLOAD, DumpStyle::Ascii), expected);
     }
@@ -4831,9 +5552,9 @@ mod tests {
     fn dump_pads_a_short_final_row_so_the_character_column_aligns() {
         let rendered = dumped(ORACLE_PAYLOAD, DumpStyle::Hex);
         let last = rendered.lines().last().expect("at least one row");
-        // "0030: " is 6, sixteen hex columns are 48, and "rd.." is 4.
+        // "0030: " is 6, sixteen hex columns are 48, and "al.." is 4.
         assert_eq!(last.len(), 6 + 48 + 4);
-        assert!(last.ends_with("rd.."), "{last}");
+        assert!(last.ends_with("al.."), "{last}");
         assert!(
             last.contains("0d 0a    "),
             "padding follows the last real byte"
@@ -4842,7 +5563,8 @@ mod tests {
 
     #[test]
     fn dump_renders_unprintable_bytes_as_dots() {
-        let payload: Vec<u8> = vec![0x00, 0x1f, 0x20, b'A', 0x7e, 0x7f, 0x80, 0xff];
+        let payload: Vec<u8> =
+            vec![0x00, 0x1f, 0x20, b'A', 0x7e, 0x7f, 0x80, 0xff];
         let rendered = dumped(&payload, DumpStyle::Hex);
         let row = rendered.lines().nth(1).expect("one row");
         // 0x20 is the space, and it is printable: the boundary is inclusive
@@ -4853,9 +5575,242 @@ mod tests {
         assert_eq!(PRINTABLE_HIGH, 0x7f);
     }
 
+    // escape_controls(): control-byte neutralization for terminal sinks (F25)
+
+    #[test]
+    fn clean_text_is_borrowed_unchanged_by_both_modes() {
+        for mode in [
+            ControlEscaping::PreserveLineStructure,
+            ControlEscaping::SingleLine,
+        ] {
+            let clean = b"GET / HTTP/1.1 Host: example.com \x80\xff~ ";
+            let escaped = escape_controls(clean, mode);
+            assert!(
+                matches!(escaped, Cow::Borrowed(_)),
+                "{mode:?} must not allocate for clean input"
+            );
+            assert_eq!(escaped.as_ref(), clean);
+        }
+    }
+
+    #[test]
+    fn high_bytes_are_never_escaped() {
+        // Legitimate 8-bit and UTF-8 payload: a non-ASCII header value, an IDN
+        // host. Mangling these removes no hazard and destroys information.
+        let payload: Vec<u8> = (0x80u8..=0xff).collect();
+        for mode in [
+            ControlEscaping::PreserveLineStructure,
+            ControlEscaping::SingleLine,
+        ] {
+            assert_eq!(escape_controls(&payload, mode).as_ref(), &payload[..]);
+        }
+    }
+
+    #[test]
+    fn every_display_affecting_control_is_neutralized() {
+        // ESC opens an ANSI sequence, BEL rings, BS and VT and FF move the
+        // cursor, DEL is terminal-dependent. None occurs in well-formed
+        // protocol text.
+        for byte in [0x00u8, 0x07, 0x08, 0x0b, 0x0c, 0x1b, 0x1f, 0x7f] {
+            let payload = [b'a', byte, b'b'];
+            for mode in [
+                ControlEscaping::PreserveLineStructure,
+                ControlEscaping::SingleLine,
+            ] {
+                assert_eq!(
+                    escape_controls(&payload, mode).as_ref(),
+                    b"a.b",
+                    "byte {byte:#04x} under {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preserve_line_structure_keeps_lf_and_crlf_but_not_a_lone_cr() {
+        let mode = ControlEscaping::PreserveLineStructure;
+
+        // A whole header block arrives as one record; it must survive intact.
+        let headers = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n";
+        assert!(matches!(escape_controls(headers, mode), Cow::Borrowed(_)));
+
+        // A bare LF is structural too: C's own HEADER_OUT handling splits on it.
+        assert_eq!(escape_controls(b"a\nb", mode).as_ref(), b"a\nb");
+
+        // A LONE CR is the overwrite trick, and is neutralized.
+        assert_eq!(
+            escape_controls(b"real\rforged", mode).as_ref(),
+            b"real.forged"
+        );
+
+        // A CR as the last byte has no following LF, so it is lone.
+        assert_eq!(escape_controls(b"tail\r", mode).as_ref(), b"tail.");
+
+        // CR CR LF: only the second CR is structural.
+        assert_eq!(escape_controls(b"x\r\r\n", mode).as_ref(), b"x.\r\n");
+    }
+
+    #[test]
+    fn single_line_mode_neutralizes_lf_and_cr_as_well() {
+        // A warning is one line by construction, so an LF in it was injected and
+        // would forge a second warning -- CWE-117.
+        let mode = ControlEscaping::SingleLine;
+        assert_eq!(
+            escape_controls(b"bad cert\ncurl: (0) all fine", mode).as_ref(),
+            b"bad cert.curl: (0) all fine"
+        );
+        assert_eq!(escape_controls(b"a\r\nb", mode).as_ref(), b"a..b");
+    }
+
+    #[test]
+    fn escaping_never_changes_the_length() {
+        // One byte in, one byte out: neutralization can never amplify output,
+        // which matters because these payloads are attacker-influenced.
+        for mode in [
+            ControlEscaping::PreserveLineStructure,
+            ControlEscaping::SingleLine,
+        ] {
+            for payload in [
+                &b""[..],
+                &b"\x1b[2J\x1b[H"[..],
+                &b"\r\n\r\n"[..],
+                &(0u8..=255).collect::<Vec<u8>>()[..],
+            ] {
+                assert_eq!(escape_controls(payload, mode).len(), payload.len());
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_payload_is_borrowed() {
+        for mode in [
+            ControlEscaping::PreserveLineStructure,
+            ControlEscaping::SingleLine,
+        ] {
+            assert!(matches!(escape_controls(b"", mode), Cow::Borrowed(_)));
+        }
+    }
+
+    // The sink wiring: escaping happens for a terminal and nowhere else.
+
+    /// The payload F25 describes: an ESC sequence in server-supplied header text.
+    const HOSTILE_HEADER: &[u8] =
+        b"Server: nginx\x1b[2J\x1b[1;31mCOMPROMISED\r\n";
+
+    #[test]
+    fn a_terminal_sink_neutralizes_a_hostile_header_but_keeps_its_crlf() {
+        let mut config = traced_all();
+        config.set_feature_level(TraceFeature::Ids, TraceLevel::None);
+        let out = terminal_output(
+            &config,
+            state_with(TraceIds::new(0, 0)),
+            |tracer| {
+                tracer.debug(InfoType::HeaderIn, HOSTILE_HEADER);
+            },
+        );
+        assert_eq!(
+            out,
+            b"< Server: nginx.[2J.[1;31mCOMPROMISED\r\n".to_vec(),
+            "ESC must be neutralized and the CRLF kept"
+        );
+        assert!(!out.contains(&0x1b), "no ESC may reach a terminal");
+    }
+
+    #[test]
+    fn a_file_sink_keeps_the_hostile_header_byte_for_byte() {
+        // The parity half of the decision: a redirected trace stays faithful so
+        // it can be diffed or replayed against the C tool.
+        let mut config = traced_all();
+        config.set_feature_level(TraceFeature::Ids, TraceLevel::None);
+        let mut sink = WriterSink::new(Vec::<u8>::new());
+        assert!(!TraceSink::is_terminal(&sink));
+        {
+            let mut tracer = Tracer::new(&config, &mut sink)
+                .with_state(state_with(TraceIds::new(0, 0)));
+            tracer.debug(InfoType::HeaderIn, HOSTILE_HEADER);
+        }
+        let mut expected = b"< ".to_vec();
+        expected.extend_from_slice(HOSTILE_HEADER);
+        assert_eq!(sink.into_inner(), expected);
+    }
+
+    #[test]
+    fn a_user_callback_keeps_raw_bytes_because_it_is_not_a_terminal() {
+        // C hands the application's CURLOPT_DEBUGFUNCTION raw bytes; the
+        // application, not this crate, owns how they are presented.
+        let mut config = traced_all();
+        config.set_feature_level(TraceFeature::Ids, TraceLevel::None);
+        let records = callback_records(
+            &config,
+            state_with(TraceIds::new(0, 0)),
+            |tracer| {
+                tracer.debug(InfoType::HeaderIn, HOSTILE_HEADER);
+            },
+        );
+        assert_eq!(
+            records,
+            vec![(InfoType::HeaderIn, HOSTILE_HEADER.to_vec())]
+        );
+    }
+
+    #[test]
+    fn informational_lines_are_neutralized_for_a_terminal_too() {
+        // `infof` interpolates values that can come from the network -- a host
+        // name, a server error string -- so the choke point in the sink has to
+        // cover this path as well as the raw one.
+        let mut config = traced_all();
+        config.set_feature_level(TraceFeature::Ids, TraceLevel::None);
+        let out = terminal_output(
+            &config,
+            state_with(TraceIds::new(0, 0)),
+            |tracer| {
+                tracer.infof(format_args!("Connected to \x1b[2Jevil\x07 host"));
+            },
+        );
+        assert_eq!(out, b"* Connected to .[2Jevil. host\n".to_vec());
+    }
+
+    #[test]
+    fn a_terminal_sink_leaves_ordinary_output_byte_identical() {
+        // The regression guard for the whole decision: escaping must be
+        // invisible on well-formed output, or it would be a presentation change
+        // and AAP 0.8.1 freezes presentation.
+        let mut config = traced_all();
+        config.set_feature_level(TraceFeature::Ids, TraceLevel::None);
+        let state = state_with(TraceIds::new(0, 0));
+        for kind in [InfoType::Text, InfoType::HeaderIn, InfoType::HeaderOut] {
+            let payload = b"GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+            let terminal = terminal_output(&config, state, |tracer| {
+                tracer.debug(kind, payload);
+            });
+            let file = stream_output(&config, state, |tracer| {
+                tracer.debug(kind, payload);
+            });
+            assert_eq!(
+                terminal,
+                file.into_bytes(),
+                "{kind:?} must be unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn dump_needs_no_escaping_because_c_already_neutralizes_it() {
+        // Stated as an assertion rather than a comment: the `--trace` and
+        // `--trace-ascii` bodies are control-safe in C itself
+        // (src/tool_cb_dbg.c:106-108), so they are outside F25's scope and must
+        // stay byte-for-byte as C renders them.
+        let rendered = dumped(HOSTILE_HEADER, DumpStyle::Ascii);
+        assert!(!rendered.as_bytes().contains(&0x1b));
+        assert!(rendered.contains("Server: nginx.[2J.[1;31mCOMPROMISED"));
+    }
+
     #[test]
     fn dump_of_an_empty_payload_is_the_header_alone() {
-        assert_eq!(dumped(b"", DumpStyle::Hex), "<= Recv data, 0 bytes (0x0)\n");
+        assert_eq!(
+            dumped(b"", DumpStyle::Hex),
+            "<= Recv data, 0 bytes (0x0)\n"
+        );
         assert_eq!(
             dumped(b"", DumpStyle::Ascii),
             "<= Recv data, 0 bytes (0x0)\n"
@@ -4900,7 +5855,9 @@ mod tests {
         .expect("a Vec cannot fail");
         let rendered = String::from_utf8(out).expect("ASCII");
         assert!(
-            rendered.starts_with("09:32:55.600049 [0-0] => Send header, 16 bytes (0x10)\n"),
+            rendered.starts_with(
+                "09:32:55.600049 [0-0] => Send header, 16 bytes (0x10)\n"
+            ),
             "{rendered}"
         );
         assert!(rendered.ends_with("0000: GET / HTTP/1.1\n"), "{rendered}");

@@ -105,6 +105,20 @@
 //! `unsafe_code` lint. (The root denies rather than forbids: `forbid` cannot be
 //! relaxed later, so it would reject the one exemption `mod ffi` requires.)
 
+// WHY A HANDFUL OF ITEMS BELOW CARRY `#[allow(dead_code)]`. Every production
+// consumer of this state machine lives in a module that has not landed yet --
+// the multi handle itself drives the transitions, `multi/mod.rs` re-exports
+// the type, and `crate::transfer` reads it -- so those accessors are
+// legitimately unreferenced in a non-test build even though this module's own
+// tests exercise every one of them.
+//
+// The allowance is per item and never on this module's root, which the crate's
+// own policy test enforces (`lib.rs`, `no_lint_level_for_dead_code_is_set_on_
+// a_crate_or_module_root`): a root-level level would also hide the next
+// unreferenced item somebody adds. No level for the `unsafe_code` lint is set
+// here at any level, by design -- the crate root's denial governs and this
+// module contains no `unsafe`, so the crate-wide guarantee stays in force.
+
 /// State of one transfer inside a multi handle.
 ///
 /// The C original is the `CURLMstate` typedef at `lib/multihandle.h:51-70`,
@@ -120,6 +134,7 @@
 /// this crate are required to match it exhaustively.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[allow(dead_code)]
 pub(crate) enum CurlMstate {
     /// `MSTATE_INIT` -- 0 - start in this state.
     Init = 0,
@@ -165,6 +180,7 @@ impl CurlMstate {
     /// (`lib/multi.c:138`) and what
     /// `CURL_ARRAYSIZE(Curl_trc_mstate_names)` evaluates to
     /// (`lib/curl_trc.c:356`).
+    #[allow(dead_code)]
     pub(crate) const COUNT: usize = 17;
 
     /// Integer value of the C sentinel `MSTATE_LAST`
@@ -172,6 +188,7 @@ impl CurlMstate {
     ///
     /// Published as an integer rather than as a variant precisely because the
     /// header forbids using it as a state.
+    #[allow(dead_code)]
     pub(crate) const LAST: u8 = 17;
 
     /// Name answered when an integer does not denote a state.
@@ -180,8 +197,9 @@ impl CurlMstate {
     /// check fails (`lib/curl_trc.c:356-358`) -- not `"UNKNOWN?"`, which is
     /// the unrelated timer fallback. `'static` is written out rather than
     /// elided because rustc 1.75, the declared minimum supported version,
-    /// warns `elided_lifetimes_in_associated_constant` otherwise, and AAP
-    /// section 0.8.4 gate 1 requires a build with zero warnings.
+    /// warns `elided_lifetimes_in_associated_constant` otherwise, and the build
+    /// gate requires zero warnings.
+    #[allow(dead_code)]
     const UNKNOWN_NAME: &'static str = "?";
 
     /// The state's trace name.
@@ -202,6 +220,7 @@ impl CurlMstate {
     /// literal `"-"` (`lib/curl_trc.h:333`). Whether to reproduce that is
     /// `crate::trace`'s decision, since it decides whether to ask for a name
     /// at all; this function only supplies one.
+    #[allow(dead_code)]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Init => "INIT",
@@ -233,6 +252,7 @@ impl CurlMstate {
     /// unvalidated across the C ABI in `curl-rs-ffi`, and because letting
     /// each caller re-derive the mapping would rebuild exactly the parallel
     /// table this module removes.
+    #[allow(dead_code)]
     pub(crate) fn from_i32(state: i32) -> Option<Self> {
         match state {
             0 => Some(Self::Init),
@@ -265,6 +285,7 @@ impl CurlMstate {
     /// (`lib/curl_trc.c:354-358`). The answer is routed through
     /// [`name`](Self::name) rather than through a table of its own, so a
     /// state's string is still written in exactly one place.
+    #[allow(dead_code)]
     pub(crate) fn name_from_i32(state: i32) -> &'static str {
         match Self::from_i32(state) {
             Some(state) => state.name(),
@@ -277,6 +298,7 @@ impl CurlMstate {
     /// `Curl_is_connecting()` verbatim -- `data->mstate < MSTATE_DO`
     /// (`lib/multi.c:359-361`). The C function accepts a `Curl_easy *` only
     /// to reach `data->mstate`, so the predicate belongs on the state.
+    #[allow(dead_code)]
     pub(crate) fn is_connecting(self) -> bool {
         self < Self::Do
     }
@@ -285,6 +307,7 @@ impl CurlMstate {
     ///
     /// The `premature` computation of `curl_multi_remove_handle()` --
     /// `data->mstate < MSTATE_COMPLETED` (`lib/multi.c:786`).
+    #[allow(dead_code)]
     pub(crate) fn is_premature(self) -> bool {
         self < Self::Completed
     }
@@ -297,6 +320,7 @@ impl CurlMstate {
     /// `curl_multi_remove_handle()` close the stream with "Removed with
     /// partial response" (`lib/multi.c:795`). The lower bound is strict, so
     /// `Do` itself is excluded.
+    #[allow(dead_code)]
     pub(crate) fn is_in_transfer(self) -> bool {
         Self::Do < self && self < Self::Completed
     }
@@ -334,7 +358,7 @@ mod tests {
     /// Transcribed from the C array independently of `CurlMstate::name`, so
     /// this is a genuine oracle rather than a restatement of the
     /// implementation. `rustfmt` is kept off the table because these are
-    /// frozen trace literals (AAP section 0.8.1).
+    /// frozen trace literals.
     #[rustfmt::skip]
     const NAMES: [&str; CurlMstate::COUNT] = [
         "INIT", "PENDING", "SETUP", "CONNECT", "RESOLVING", "CONNECTING",

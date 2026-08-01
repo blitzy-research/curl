@@ -4,10 +4,9 @@
 
 //! The parallel-transfer progress meter of the `curl-rs` command-line tool.
 //!
-//! AAP section 0.4.1 assigns this module one C translation unit:
-//! `curl-rs/src/output/progress.rs | CREATE | src/tool_progress.c | Progress
-//! bar layout preserved.` It owns exactly the five items that file exports,
-//! plus the run-level accumulators they share:
+//! This module supersedes one C translation unit, `src/tool_progress.c`, with
+//! its progress-bar layout preserved. It owns exactly the five items that file
+//! exports, plus the run-level accumulators they share:
 //!
 //! 1. [`max5data`] -- the five-column size formatter
 //!    (`src/tool_progress.c:32-62`, `UNITTEST`-exported at
@@ -24,12 +23,10 @@
 //!
 //! # Every byte emitted here is frozen
 //!
-//! AAP section 0.3.4 names this file directly, classifying "the progress bar
-//! layout from `src/tool_progress.c` and `src/tool_cb_prg.c`" as a "migration
-//! target, not a design decision", and AAP section 0.8.1 freezes it. Nothing
-//! in this module may reword the header, change a field width, add or remove a
-//! space, or alter the trailing bytes. AAP section 0.8.2 is explicit that "a
-//! refactor that produces different-but-arguably-better output has failed".
+//! The progress-bar layout is a migration target, not a design decision, and
+//! it is frozen. Nothing in this module may reword the header, change a field
+//! width, add or remove a space, or alter the trailing bytes: a refactor that
+//! produces different-but-arguably-better output has failed.
 //!
 //! The two frozen literals are [`HEADER`] (66 bytes) and the row assembled by
 //! `format_row` (72 bytes for the sample invocation). Both were verified
@@ -45,8 +42,8 @@
 //! `tool_progress_cb`, drives the *single-transfer* progress bar -- the one
 //! with `MAX_BARLENGTH 400` (`src/tool_cb_prg.c:31`), `MIN_BARLENGTH 20`
 //! (`:32`), the 200-value sine table (`:34-40`) and `update_width()`
-//! (`:110-119`) -- and belongs to `curl-rs/src/callbacks/progress.rs` per AAP
-//! section 0.4.1. Neither callback is duplicated or relocated here, even
+//! (`:110-119`) -- and belongs to `curl-rs/src/callbacks/progress.rs`.
+//! Neither callback is duplicated or relocated here, even
 //! though the two share a readbusy/un-pause block
 //! (`src/tool_progress.c:80-83` and `src/tool_cb_prg.c:216-219`).
 //!
@@ -55,28 +52,11 @@
 //! width detection belongs to `curl-rs/src/terminal.rs`. This meter needs no
 //! terminal width: only the single-transfer bar does.
 //!
-//! # Rules status and provenance
-//!
-//! No user-specified rules exist for this project. `review_rules` returns the
-//! single line "No user rules provided.", checked with the default window and
-//! again with an explicit full-document range that reads to end-of-document,
-//! both returning that identical line. This corroborates AAP section 0.7.
-//! Nothing in this file is therefore attributed to a rule, and none is
-//! invented. The constraints cited here are AAP *requirements* taken from the
-//! user's request (AAP section 0.8) -- fully binding, but requirements rather
-//! than rules; AAP section 0.7 warns that calling them rules "would
-//! misrepresent where they came from". Where no requirement speaks,
-//! enterprise-standard best practice governs: the absence of rules is not
-//! permission to lower the bar.
-//!
 //! # Injected dependencies
 //!
-//! C reaches for four things globally that this module receives as arguments,
-//! following AAP section 0.3.3 pattern P12 (dependency injection for "the
-//! resolver, the clock, and the TLS provider ... which is what makes the
-//! protocol modules testable"). Every one of them is what makes the frozen
-//! bytes assertable in a unit test with no clock, no network and no multi
-//! handle:
+//! C reaches for four things globally that this module receives as arguments.
+//! Injecting them is what makes the frozen bytes assertable in a unit test
+//! with no clock, no network and no multi handle:
 //!
 //! * **The sink.** C writes to the `FILE *tool_stderr` global
 //!   (`src/tool_stderr.c:29`). Here every emission goes to a
@@ -97,8 +77,8 @@
 //! * **The live transfers.** C walks the `transfers` global linked list at
 //!   `src/tool_progress.c:194`. Here the caller passes an iterator of
 //!   `&mut TransferProgress`, because the transfer records are owned by
-//!   `curl-rs/src/operate/`, matching AAP section 0.1.2's replacement of the
-//!   god-struct with "per-module structs with explicit ownership".
+//!   `curl-rs/src/operate/`: the C god-struct is replaced by per-module
+//!   structs with explicit ownership.
 //! * **The two multi-handle counters.** `src/tool_progress.c:272-273` calls
 //!   `curl_multi_get_offt(multi, CURLMINFO_XFERS_ADDED, ...)` and
 //!   `CURLMINFO_XFERS_RUNNING`. Those arrive through the `counters` closure,
@@ -117,18 +97,17 @@
 //! impossible or undefined, and none of them changes an emitted byte for any
 //! reachable input.
 //!
-//! 1. **The five C statics become owned state.** `src/tool_progress.c:124-127`
+//! 1. **The five C `static` variables become owned state.**
+//!    `src/tool_progress.c:124-127`
 //!    (`all_dltotal`, `all_ultotal`, `all_dlalready`, `all_ulalready`),
-//!    `:135-137` (`speedindex`, `indexwrapped`, `speedstore`), `:154`
-//!    (`stamp`) and `:155` (`header`) are process-global mutable state.
-//!    AAP section 0.7 obligation O1 has the crate root forbid the
-//!    memory-unchecked code that a mutable global would require, so no such
-//!    global can compile here, and no interior-mutable or lazily initialised
-//!    singleton stands in for one. All of it lives in [`ProgressMeter`],
-//!    owned by the
-//!    caller. This also repairs a genuine C limitation -- the statics make the
-//!    meter uninstantiable twice -- while staying behaviourally identical for
-//!    a single run.
+//!    `:135-137` (`speedindex`, `indexwrapped`, `speedstore`), `:154` (`stamp`)
+//!    and `:155` (`header`) are process-global mutable state. None of it is
+//!    reproduced: no mutable `static`, and no interior-mutable or lazily
+//!    initialised singleton standing in for one. All of it lives in
+//!    [`ProgressMeter`], owned by the caller. This also repairs a genuine C
+//!    limitation -- the `static` variables make the meter uninstantiable
+//!    twice -- while
+//!    staying behaviourally identical for a single run.
 //! 2. **The first call still prints.** C's `stamp` is a zero-initialised
 //!    `struct curltime`, so on the first call `curlx_timediff_ms(now, stamp)`
 //!    is the monotonic clock's own value in milliseconds -- seconds since boot
@@ -167,18 +146,15 @@
 //! # Imports
 //!
 //! This module imports [`std`] and nothing else -- no third-party crate, no
-//! sibling module, no `curl-rs-lib` item. AAP section 0.5.1 fixes the
-//! dependency inventory and this file adds nothing to it; the engine calls C
-//! makes at `src/tool_progress.c:82` and `:272-273` arrive through the
-//! injection points above, so the module compiles and its tests run in
-//! complete isolation.
+//! sibling module, no `curl-rs-lib` item. This file adds nothing to the
+//! dependency inventory; the engine calls C makes at `src/tool_progress.c:82`
+//! and `:272-273` arrive through the injection points above, so the module
+//! compiles and its tests run in complete isolation.
 
 use std::io::{self, Write};
 use std::time::Instant;
 
-// ===========================================================================
 // Frozen literals and dimensions
-// ===========================================================================
 
 /// The column header, byte for byte (`src/tool_progress.c:167-169`).
 ///
@@ -195,6 +171,7 @@ use std::time::Instant;
 /// `Speed` occupying bytes 60 to 64. Those two offsets are what the row's
 /// field widths -- and the single leading space at `src/tool_progress.c:282`
 /// -- exist to line up with.
+#[allow(dead_code)]
 pub(crate) const HEADER: &[u8] =
     b"DL% UL%  Dled  Uled  Xfers  Live Total     Current  Left    Speed\n";
 
@@ -202,6 +179,7 @@ pub(crate) const HEADER: &[u8] =
 ///
 /// The C test is `if(final || (diff > 500))` -- **strictly** greater, so an
 /// update at exactly 500 ms is suppressed and one at 501 ms is admitted.
+#[allow(dead_code)]
 const THROTTLE_MS: i64 = 500;
 
 /// The suffix ladder of [`max5data`] (`src/tool_progress.c:35`).
@@ -214,41 +192,50 @@ const THROTTLE_MS: i64 = 500;
 /// enters the loop, each iteration divides by 1024 and continues only while
 /// the quotient is at least 10,000, so [`i64::MAX`] reduces to `8191P` -- the
 /// value the oracle produced -- and the ladder stops at index 4.
+#[allow(dead_code)]
 const MAX5_UNITS: &[u8] = b"kMGTPE";
 
 /// The value below which [`max5data`] emits no suffix
 /// (`src/tool_progress.c:37`).
+#[allow(dead_code)]
 const MAX5_PLAIN_LIMIT: i64 = 100_000;
 
 /// Width of a [`max5data`] rendering: `char buffer[3][6]`
 /// (`src/tool_progress.c:175`) is five columns plus the NUL.
+#[allow(dead_code)]
 const MAX5_WIDTH: usize = 5;
 
 /// Width of a [`time2str`] rendering: `char time_left[9]` and its two
 /// siblings (`src/tool_progress.c:172-174`) are eight columns plus the NUL,
 /// as the comment at `:88` states -- "a time string that is 8 letters long
 /// (plus the zero byte)".
+#[allow(dead_code)]
 const TIME_WIDTH: usize = 8;
 
 /// `time2str(<= 0)` (`src/tool_progress.c:93`): eight spaces.
+#[allow(dead_code)]
 const TIME_BLANK: &str = "        ";
 
 /// `time2str` beyond 99,999 years (`src/tool_progress.c:118`). Eight bytes
 /// including the leading space.
+#[allow(dead_code)]
 const TIME_OVERFLOW: &str = " >99999y";
 
 /// Width of a percentage field: `char dlpercen[4]`
 /// (`src/tool_progress.c:177-178`) is three columns plus the NUL, rendered
 /// with `%3` and then left-justified by the row's `%-3s`.
+#[allow(dead_code)]
 const PERCENT_WIDTH: usize = 3;
 
 /// The initialiser of `dlpercen` and `ulpercen`
 /// (`src/tool_progress.c:177-178`), used whenever the corresponding total is
 /// unknown or zero. The row's `%-3s` renders it as `"-- "`.
+#[allow(dead_code)]
 const PERCENT_UNKNOWN: &str = "--";
 
 /// Slots in the speed ring buffer: `#define SPEEDCNT 10`
 /// (`src/tool_progress.c:134`).
+#[allow(dead_code)]
 const SPEEDCNT: usize = 10;
 
 /// Byte length of the sample row, used only as an allocation hint.
@@ -256,6 +243,7 @@ const SPEEDCNT: usize = 10;
 /// Measured from the oracle: 72 bytes including the leading carriage return.
 /// A row is longer only when a transfer counter needs more than five digits,
 /// which the C format string also allows.
+#[allow(dead_code)]
 const ROW_WIDTH: usize = 72;
 
 /// The row's trailing field when `final_row` is set: `%5s` applied to `"\n"`
@@ -264,23 +252,24 @@ const ROW_WIDTH: usize = 72;
 /// Four spaces and then the newline, because `%5s` right-justifies a
 /// one-character string in a five-column field. The C comment reading
 /// `/* final newline */` describes the intent, not the bytes.
+#[allow(dead_code)]
 const TRAILER_FINAL: &str = "\n";
 
 /// The row's trailing field otherwise: `%5s` applied to `""`, i.e. five
 /// spaces (`src/tool_progress.c:286`, `:298`).
+#[allow(dead_code)]
 const TRAILER_ONGOING: &str = "";
 
 /// Width of that trailing field (`src/tool_progress.c:286`).
+#[allow(dead_code)]
 const TRAILER_WIDTH: usize = 5;
 
-// ===========================================================================
 // `curl_msnprintf` and `printf` primitives
 //
 // C renders every field through `curl_msnprintf` into a fixed automatic
 // buffer, so two behaviours have to be reproduced together: the conversion's
 // padding, and the buffer's truncation. Both are byte-oriented in C, and both
 // are byte-oriented here.
-// ===========================================================================
 
 /// `curl_msnprintf` into a `char[limit + 1]`: keep the first `limit` bytes.
 ///
@@ -295,6 +284,7 @@ const TRAILER_WIDTH: usize = 5;
 /// `d h m y k M G T P E` -- so a byte index is always a character boundary and
 /// the `None` arm is unreachable; it returns the text unchanged rather than
 /// panicking if that ever stops being true.
+#[allow(dead_code)]
 fn truncate_to(text: &str, limit: usize) -> String {
     match text.get(..limit) {
         Some(head) => head.to_owned(),
@@ -308,6 +298,7 @@ fn truncate_to(text: &str, limit: usize) -> String {
 /// `printf` does -- a width is a minimum, never a maximum. Byte-oriented on
 /// purpose: `format!("{:<3}", ..)` pads on the *character* count, which would
 /// disagree with C for any non-ASCII input.
+#[allow(dead_code)]
 fn push_left(out: &mut String, text: &str, width: usize) {
     out.push_str(text);
     for _ in text.len()..width {
@@ -317,6 +308,7 @@ fn push_left(out: &mut String, text: &str, width: usize) {
 
 /// C's `%<width>s` and, applied to a rendered integer, `%<width>lld`: pad on
 /// the left to `width` bytes, then append `text`.
+#[allow(dead_code)]
 fn push_right(out: &mut String, text: &str, width: usize) {
     for _ in text.len()..width {
         out.push(' ');
@@ -330,6 +322,7 @@ fn push_right(out: &mut String, text: &str, width: usize) {
 /// zero-padded conversions only for `seconds > 0`. A negative value renders
 /// its sign first and is then already at least two bytes wide, which is what
 /// `printf` produces too.
+#[allow(dead_code)]
 fn push_zero_padded(out: &mut String, value: i64, width: usize) {
     let digits = value.to_string();
     for _ in digits.len()..width {
@@ -344,6 +337,7 @@ fn push_zero_padded(out: &mut String, value: i64, width: usize) {
 /// with the comment `/* maxed out! */`. See translation difference 3 in the
 /// module documentation for why this is [`i64::saturating_add`] rather than a
 /// literal transcription of the guard.
+#[allow(dead_code)]
 fn add_offt(val: &mut i64, add: i64) {
     *val = val.saturating_add(add);
 }
@@ -356,14 +350,13 @@ fn add_offt(val: &mut i64, add: i64) {
 /// `lib/curlx/timediff.h:30`). A reversed pair yields zero rather than a
 /// negative difference, which a monotonic clock cannot produce anyway. See
 /// translation difference 5.
+#[allow(dead_code)]
 fn ms_between(newer: Instant, older: Instant) -> i64 {
     let elapsed = newer.saturating_duration_since(older);
     i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
-// ===========================================================================
 // The two `UNITTEST`-exported formatters
-// ===========================================================================
 
 /// `max5data` (`src/tool_progress.c:32-62`).
 ///
@@ -387,6 +380,7 @@ fn ms_between(newer: Instant, older: Instant) -> i64 {
 /// A negative input takes the first branch, since it is below the limit, and
 /// is truncated to five bytes if its rendering is wider: the oracle returns
 /// `"-9999"` for -999,999.
+#[allow(dead_code)]
 pub(crate) fn max5data(bytes: i64) -> String {
     // `:37-40` -- the common case, no suffix.
     if bytes < MAX5_PLAIN_LIMIT {
@@ -460,6 +454,7 @@ pub(crate) fn max5data(bytes: i64) -> String {
 /// 360,000 seconds where `h` reaches 100. And `h` is **recomputed** inside
 /// the day branch as the hours within the day (`:105`), not reused from
 /// `:96`.
+#[allow(dead_code)]
 pub(crate) fn time2str(seconds: i64) -> String {
     // `:92-95` -- `curlx_strcopy(r, rlen, "        ", 8)`.
     if seconds <= 0 {
@@ -524,9 +519,7 @@ pub(crate) fn time2str(seconds: i64) -> String {
     TIME_OVERFLOW.to_owned()
 }
 
-// ===========================================================================
 // The per-transfer progress record
-// ===========================================================================
 
 /// The progress-relevant fields of `struct per_transfer`.
 ///
@@ -542,6 +535,7 @@ pub(crate) fn time2str(seconds: i64) -> String {
 /// accumulators **exactly once**, whether that happens while it is still live
 /// (`src/tool_progress.c:199-202`, `:206-209`) or as it finishes (`:309-316`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct TransferProgress {
     /// `per->dltotal` -- the download size libcurl last reported, or zero when
     /// it is not known.
@@ -576,17 +570,17 @@ impl TransferProgress {
     /// A freshly added transfer: nothing transferred, no total known, no total
     /// folded in, not aborting. C reaches the same state by allocating the
     /// record with `calloc`.
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
 }
 
-// ===========================================================================
 // `xferinfo_cb` -- the parallel-mode transfer-info callback
-// ===========================================================================
 
 /// The `xferinfo_cb` return value that lets a transfer proceed
 /// (`src/tool_progress.c:85`).
+#[allow(dead_code)]
 pub(crate) const XFERINFO_CONTINUE: i32 = 0;
 
 /// The `xferinfo_cb` return value that aborts a transfer
@@ -595,6 +589,7 @@ pub(crate) const XFERINFO_CONTINUE: i32 = 0;
 /// libcurl's contract for `CURLOPT_XFERINFOFUNCTION` is that any non-zero
 /// return aborts the transfer with `CURLE_ABORTED_BY_CALLBACK`; C returns
 /// exactly `1`, and so does this.
+#[allow(dead_code)]
 pub(crate) const XFERINFO_ABORT: i32 = 1;
 
 /// The four counters libcurl hands to `CURLOPT_XFERINFOFUNCTION`
@@ -603,6 +598,7 @@ pub(crate) const XFERINFO_ABORT: i32 = 1;
 /// Grouped into a struct so the four same-typed arguments cannot be
 /// transposed at a call site -- the C signature offers no such protection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct XferInfo {
     /// `dltotal`, zero when the download size is not known.
     pub(crate) dltotal: i64,
@@ -623,9 +619,10 @@ pub(crate) struct XferInfo {
 /// implementation instead. See the injection notes in the module
 /// documentation.
 ///
-/// `curl-rs/src/callbacks/read.rs` is what sets the flag this un-pauses:
+/// `curl-rs/src/callbacks/read.rs` is what will set the flag this un-pauses:
 /// `src/tool_cb_rea.c:119` and `:137` set `config->readbusy = TRUE` when a
 /// read returns `EAGAIN`.
+#[allow(dead_code)]
 pub(crate) trait TransferResume {
     /// Performs the un-pause. A failure is not reportable through libcurl's
     /// progress-callback contract -- C casts nothing away here only because
@@ -649,6 +646,7 @@ pub(crate) trait TransferResume {
 /// Not to be confused with `tool_progress_cb` (`src/tool_cb_prg.c:121`), the
 /// single-transfer bar's callback; see the boundary note in the module
 /// documentation.
+#[allow(dead_code)]
 pub(crate) fn xferinfo_cb(
     per: &mut TransferProgress,
     readbusy: &mut bool,
@@ -677,9 +675,7 @@ pub(crate) fn xferinfo_cb(
     XFERINFO_CONTINUE
 }
 
-// ===========================================================================
 // The meter
-// ===========================================================================
 
 /// The two multi-handle counters the row displays
 /// (`src/tool_progress.c:272-273`).
@@ -690,6 +686,7 @@ pub(crate) fn xferinfo_cb(
 /// [`Default`] reproduces that fallback, so a caller whose query fails passes
 /// `XferCounts::default()` and gets C's behaviour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct XferCounts {
     /// `CURLMINFO_XFERS_ADDED` -- the `Xfers` column.
     pub(crate) added: i64,
@@ -703,6 +700,7 @@ pub(crate) struct XferCounts {
 /// Grouping these keeps the call signature within the nine-argument budget
 /// `clippy.toml` sets and makes the injection points obvious at a call site.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub(crate) struct ProgressParams {
     /// `global->noprogress` (`src/tool_cfgable.h:364`, "do not show progress
     /// bar"), tested at `src/tool_progress.c:159`.
@@ -733,6 +731,7 @@ pub(crate) struct ProgressParams {
 /// written, so `None` is unobservable there -- and it is handled by falling
 /// back to the since-the-beginning branch rather than by unwrapping.
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
 struct SpeedSample {
     /// `speedstore[i].dl` -- the running download figure at this sample.
     dl: i64,
@@ -748,6 +747,7 @@ struct SpeedSample {
 /// the 72 frozen bytes without a clock, a multi handle or a transfer: the
 /// computation fills this in, and `format_row` is a pure function of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
 struct RowFields {
     /// `dlpercen` (`src/tool_progress.c:177`, `:213-216`).
     dlpercen: String,
@@ -794,6 +794,7 @@ struct RowFields {
 /// * The final field is `%5s` applied to `"\n"` or `""` (`:286`, `:298`), so a
 ///   final row ends with four spaces and a newline and an ongoing row ends
 ///   with five spaces.
+#[allow(dead_code)]
 fn format_row(fields: &RowFields, final_row: bool) -> String {
     let mut row = String::with_capacity(ROW_WIDTH);
 
@@ -855,6 +856,7 @@ fn format_row(fields: &RowFields, final_row: bool) -> String {
 /// denominator is scaled instead so that `now * 100` cannot overflow. See
 /// translation difference 4 for the divide-by-zero the second arm carries in
 /// C.
+#[allow(dead_code)]
 fn percent(known: bool, now: i64, total: i64) -> String {
     // `:177-178` -- the default, and the `dlknown && all_dltotal` gate at
     // `:212` / `:218`.
@@ -874,7 +876,7 @@ fn percent(known: bool, now: i64, total: i64) -> String {
     truncate_to(&out, PERCENT_WIDTH)
 }
 
-/// The run-level state of the meter: the five C statics, owned.
+/// The run-level state of the meter: the five C static variables, owned.
 ///
 /// `src/tool_progress.c` keeps `all_dltotal`, `all_ultotal`, `all_dlalready`
 /// and `all_ulalready` at `:124-127`, the speed ring at `:135-137`, the
@@ -885,6 +887,7 @@ fn percent(known: bool, now: i64, total: i64) -> String {
 /// One instance covers one run. Create it in `curl-rs/src/operate/` alongside
 /// the transfer list and thread it through.
 #[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
 pub(crate) struct ProgressMeter {
     /// `all_dltotal` (`src/tool_progress.c:124`) -- the sum of every download
     /// total folded in so far, live or finished.
@@ -926,7 +929,8 @@ impl ProgressMeter {
     /// A meter for a fresh run: no accumulated totals, an empty speed ring, no
     /// row emitted and no header written.
     ///
-    /// Equivalent to C's zero-initialised statics at process start.
+    /// Equivalent to C's zero-initialised static variables at process start.
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -955,6 +959,7 @@ impl ProgressMeter {
     ///
     /// `counters` is invoked at most once per call, and only for a row that is
     /// actually emitted -- the point C queries the multi handle (`:272-273`).
+    #[allow(dead_code)]
     pub(crate) fn progress_meter<'t, T>(
         &mut self,
         sink: &mut dyn Write,
@@ -1001,15 +1006,23 @@ impl ProgressMeter {
     ///
     /// Fallible so that the tests can assert propagation; the caller discards
     /// the result, as C discards `fputs`'s.
+    #[allow(dead_code)]
     fn emit_header(&self, sink: &mut dyn Write) -> io::Result<()> {
         sink.write_all(HEADER)
     }
 
     /// Writes one assembled row (`src/tool_progress.c:274-298`).
     ///
-    /// A single `write_all` for the whole row, matching C's single
-    /// `curl_mfprintf`, so that a row can never be interleaved with another
-    /// writer half-way through. No flush: see translation difference 6.
+    /// The row is assembled in full and handed to one [`Write::write_all`],
+    /// matching C's single `curl_mfprintf` so the byte sequence and the number
+    /// of calls both agree. That is not atomicity: `write_all` may issue
+    /// several underlying writes, and this type holds no lock, so a second
+    /// writer sharing the descriptor can still land between them. Keeping a
+    /// row whole is therefore the caller's obligation -- it must serialise
+    /// access to the sink, which the `&mut dyn Write` borrow secures only
+    /// against another user of *this* sink and not against a second handle
+    /// onto the same file. No flush: see translation difference 6.
+    #[allow(dead_code)]
     fn emit_row(
         &self,
         sink: &mut dyn Write,
@@ -1029,6 +1042,7 @@ impl ProgressMeter {
     /// speed computed (`:226-258`), the two time estimates follow
     /// (`:260-270`), and only then are the multi-handle counters queried
     /// (`:272-273`).
+    #[allow(dead_code)]
     fn collect<'t, T>(
         &mut self,
         params: &ProgressParams,
@@ -1149,6 +1163,7 @@ impl ProgressMeter {
     ///   `1152921504606846976` while `dl * 1000 / deltams` overflows. Measured
     ///   against the oracle.
     /// * `:257` -- the reported speed is the larger of the two rates.
+    #[allow(dead_code)]
     fn sample_speed(
         &mut self,
         params: &ProgressParams,
@@ -1224,8 +1239,9 @@ impl ProgressMeter {
     /// that was already counted while live is not counted again as it
     /// finishes. The `dlnow` and `ulnow` figures at `:307-308` carry no such
     /// flag in C and are added on every call, which is faithful because
-    /// `curl-rs/src/operate/` calls this exactly once per transfer, as
+    /// `curl-rs/src/operate/` is to call this exactly once per transfer, as
     /// `src/tool_operate.c` does.
+    #[allow(dead_code)]
     pub(crate) fn progress_finalize(&mut self, per: &mut TransferProgress) {
         // `:307-308`.
         add_offt(&mut self.all_dlalready, per.dlnow);
@@ -1251,7 +1267,7 @@ mod tests {
     use std::cell::Cell;
     use std::time::Duration;
 
-    // AAP section 0.8.7 relocates the coverage of `tests/unit` into the crate
+    // The coverage of `tests/unit` moves into the crate
     // as `#[cfg(test)]` modules, because a Rust static library does not export
     // `pub(crate)` items and the C unit tests therefore cannot link. Both
     // `max5data` and `time2str` are `UNITTEST`-exported in C
@@ -2218,7 +2234,7 @@ mod tests {
     fn progress_finalize_folds_a_total_exactly_once() {
         // `:304-317`. The totals are guarded by the two flags; the `dlnow` and
         // `ulnow` figures at `:307-308` are not, and C adds them on every
-        // call, which is faithful because `operate/` calls this once.
+        // call, which is faithful because `operate/` is to call this once.
         let mut meter = ProgressMeter::new();
         let mut done = transfer(1_000, 500, 2_000, 200);
 
@@ -2441,7 +2457,7 @@ mod tests {
 
     #[test]
     fn two_meters_are_independent() {
-        // Translation difference 1: the C statics make the meter
+        // Translation difference 1: the C static variables make the meter
         // uninstantiable twice. Owning the state removes that limitation
         // without changing single-run behaviour.
         let mut first = ProgressMeter::new();

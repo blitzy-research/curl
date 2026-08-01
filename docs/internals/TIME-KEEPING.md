@@ -83,10 +83,11 @@ detail, and any replacement has to keep all four:
 
 ## Specified `Rust` Successors
 
-Every path in this section names **specified target state**. No `Rust` source
-file exists in this tree, and nothing below describes code that has been
-written. The mapping is recorded so that the contract above survives the
-migration intact.
+Every path in this section names **specified target state**. The tree does
+already contain `Rust` source, in all three `crates`, but neither of the two
+files named below is among the delivered ones, and nothing below describes code
+that has been written. The mapping is recorded so that the contract above
+survives the migration intact.
 
 * `curl-rs-lib/src/util/timeval.rs` is the specified successor to
   `lib/curlx/timeval.c` and covers the clock reading.
@@ -142,8 +143,15 @@ claimed as nothing else.
 
 ### Where `unsafe` is allowed
 
-`#![forbid(unsafe_code)]` is specified at the root of `curl-rs-lib`, with one
-narrowly allowed island under `curl-rs-lib/src/ffi/` and a mandatory
-`// SAFETY:` comment on every `unsafe` block in it. Reading a clock is a
-standard-library operation and does not belong in that island. The residual
+The safety invariant at the root of `curl-rs-lib` is `#![deny(unsafe_code)]`
+plus exactly one `#[allow(unsafe_code)]`, on `mod ffi` -- the one narrowly
+allowed island under `curl-rs-lib/src/ffi/`, where every `unsafe` block carries
+a mandatory `// SAFETY:` comment. It is `deny` and not `forbid` because
+`forbid` cannot be locally overridden (`error[E0453]: allow(unsafe_code)
+incompatible with previous forbid`) and Agent Action Plan goal G1 permits only
+three crates, so the island cannot move into a fourth; `deny` is no weaker,
+since a stray `unsafe` block outside the island is a hard error rather than a
+warning.
+Reading a clock is a standard-library operation and does not belong in that
+island. The residual
 platform calls that do belong there are named in [`curlx`](CURLX.md).

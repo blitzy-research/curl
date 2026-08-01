@@ -23,6 +23,12 @@ Specify the list of DNS servers to use instead of the system default. The
 argument is a list of IP addresses separated with commas. Port numbers may
 also optionally be given, appended to the IP address separated with a colon.
 
-This build resolves names with the system resolver and does not use c-ares, so
-this option is accepted and has no effect. To send name resolution over
-DNS-over-HTTPS to a server of your choosing, consider the --doh-url option.
+Name resolution is specified to run through the system resolver rather than
+c-ares, so `curl_version_info` reports no c-ares. On a build that reports
+none, curl rejects this option while parsing the command line, with `the
+installed libcurl version does not support this`, and that rejection is the
+frozen behavior of the option rather than a new one. The resolver modules
+that would give the option meaning are not on disk.
+
+To send name resolution over DNS-over-HTTPS to a server of your choosing,
+consider the --doh-url option.

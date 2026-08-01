@@ -29,11 +29,12 @@ For an IMAP or SMTP MIME uploaded mail built with --form options, it is
 prepended to the resulting MIME document, effectively including it at the mail
 global level. It does not affect raw uploaded mails (Added in 7.56.0).
 
-This build performs no IMAP, IMAPS, SMTP or SMTPS transfers, and those schemes
-are absent from the `Protocols:` line in the --version output; curl still
-parses this option and prepends the header as described above, yet the IMAP or
-SMTP transfer itself then fails with `CURLE_UNSUPPORTED_PROTOCOL`. The HTTP
-and HTTPS header handling described on this page is fully supported.
+Transfers for IMAP, IMAPS, SMTP and SMTPS are outside the specified scope of
+this rewrite, and those four schemes are withheld from the `Protocols:` line
+of the --version output. Parsing this option and prepending the header as
+described above are still specified, with the IMAP or SMTP transfer then
+failing with `CURLE_UNSUPPORTED_PROTOCOL`. The HTTP and HTTPS header handling
+described on this page stays within the specified scope.
 
 You may specify any number of extra headers. Note that if you should add a
 custom header that has the same name as one of the internal ones curl would

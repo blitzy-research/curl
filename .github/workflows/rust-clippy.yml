@@ -2,61 +2,100 @@
 #
 # SPDX-License-Identifier: curl
 
-# Validation gate 2 of the ten that guard the Rust workspace: LINT.
+# The LINT gate for the Rust workspace.
 #
 # This workflow runs `cargo clippy` with warnings denied, and it runs
-# `cargo fmt --check`. It does nothing else. The build lives in
-# rust-build.yml, the tests in rust-test.yml, coverage in rust-coverage.yml,
-# undefined behaviour in rust-miri.yml, the sanitizer in rust-asan.yml, symbol
-# and header parity in rust-abi.yml, supply chain in rust-audit.yml, and the
-# curl fixture corpus in curl-testsuite.yml. One workflow per validation gate,
-# so that a failure names its own cause.
+# `cargo fmt --check`. It does nothing else. One workflow per validation gate,
+# so that a failure names its own cause: compilation is rust-build.yml's, the
+# tests rust-test.yml's, undefined behaviour rust-miri.yml's, the sanitizer
+# rust-asan.yml's, coverage rust-coverage.yml's, the supply chain
+# rust-audit.yml's, symbol and public-header parity rust-abi.yml's, and the curl
+# fixture corpus curl-testsuite.yml's. All nine are on disk, this file among
+# them, alongside hygiene.yml, which owns the spelling, prohibited-wording and
+# public-header style checks.
 #
-# That last sentence is the entire reason this file is separate rather than a
-# job inside rust-build.yml: lint cleanliness is a merge gate, and it runs as
-# its own workflow so that a lint failure names itself rather than hiding
-# inside a build log. Folding it into the build would put a clippy diagnostic
-# and a genuine compilation error behind the same red cross.
+# That is also why this is not a job inside rust-build.yml: folding it in would
+# put a clippy diagnostic and a genuine compilation error behind the same red
+# cross.
 #
-# LINEAGE. This file is the successor to exactly ONE job: the `checksrc` job
-# of the deleted .github/workflows/checksrc.yml, whose sole substantive step
-# ran scripts/checksrc-all.pl. That was the C style and correctness linter;
-# clippy and rustfmt are its Rust replacement. Two details of the inheritance
-# are worth writing down:
+# LINEAGE, AND THE ONE PART OF IT THIS FILE DOES NOT INHERIT. This file
+# succeeds the `checksrc` job of the deleted .github/workflows/checksrc.yml,
+# whose sole substantive step ran scripts/checksrc-all.pl. That job's coverage
+# did NOT all land here, and writing down where the rest went is the point of
+# this paragraph, because a workflow that claims a whole inheritance it only
+# partly received is how a gate goes missing without anyone noticing.
+#
+# checksrc-all.pl graded two different populations under one command: the C
+# implementation sources, and the public C headers. The two have opposite
+# fates under this migration. The C sources in lib/ and src/ are superseded
+# by Rust, so a C style linter over them has no target and clippy plus
+# rustfmt are its replacement - that half is this file's. The twelve headers
+# under include/curl/ are NOT superseded: specification 0.2.1 keeps every one
+# of them in scope as the shipped ABI contract, and eight of the twelve are
+# now *generated* by curl-rs-ffi/build.rs, which means their style is the
+# generator's output rather than anything a human edits. Nothing in this file
+# can grade them - clippy does not read C - so that half is owned by the
+# `checksrc` job of .github/workflows/hygiene.yml, which runs
+# scripts/checksrc.pl over `git ls-files 'include/curl/*.h'`. One gate per
+# cause, in two files, rather than one file claiming both.
+#
+# Two details of the half this file DID inherit are worth writing down:
 #
 #   scripts/checksrc.pl enforced a 79-column limit (`my $max_column = 79`)
-#   among many other C-specific rules. Its Rust successor is not a rule in
-#   this file but the `max_width` setting in rustfmt.toml, which the rustfmt
-#   step below enforces.
+#   among many other C-specific rules. Over Rust code its successor is not a
+#   rule in this file but the `max_width` setting in rustfmt.toml, which the
+#   rustfmt step below enforces. Over the public headers the original limit
+#   still applies literally, enforced by hygiene.yml.
 #
 #   scripts/checksrc.pl itself MUST REMAIN ON DISK even though
-#   scripts/checksrc-all.pl is superseded, because
-#   .github/scripts/verify-examples.pl hardcodes `./scripts/checksrc.pl` and
-#   checkdocs.yml still invokes verify-examples.pl. This workflow neither runs
-#   that script nor removes it.
+#   scripts/checksrc-all.pl is superseded, and there are now two independent
+#   reasons rather than one: .github/scripts/verify-examples.pl hardcodes
+#   `./scripts/checksrc.pl` and checkdocs.yml still invokes
+#   verify-examples.pl, and hygiene.yml's `checksrc` job invokes the script
+#   directly. This workflow neither runs that script nor removes it.
 #
 # checksrc.yml's other four jobs - `linters`, `complexity`, `xmllint` and
-# `miscchecks`, fifteen distinct checks including `reuse lint`, codespell,
-# typos, actionlint, zizmor, shellcheck, yamlcheck, spacecheck and badwords -
-# were relocated to .github/workflows/hygiene.yml, NOT here. Duplicating any
-# of them in this file would create two owners for one check and break the
-# one-gate-per-workflow property that the paragraph above depends on.
+# `miscchecks`, fifteen checks including `reuse lint`, codespell, typos,
+# actionlint, zizmor, shellcheck, yamlcheck, spacecheck and badwords - went to
+# hygiene.yml, NOT here. Duplicating one would give a single check two owners
+# and break the one-gate-per-workflow property above.
 #
-# WHAT THIS GATE CONTRIBUTES TO THE SAFETY INVARIANT. `#![forbid(unsafe_code)]`
-# at the root of curl-rs-lib and curl-rs is enforced by rustc itself, so a
-# violation of it is a compilation error and rust-build.yml is where it is
-# owned. Measured, so that the division of labour is stated accurately rather
+# WHAT THIS GATE CONTRIBUTES TO THE SAFETY INVARIANT. The invariant is enforced
+# by rustc itself, so a violation of it is a compilation error and
+# rust-build.yml is where it is owned. The exact mechanism, stated precisely
+# because the wording matters: curl-rs-lib/src/lib.rs and
+# curl-rs-ffi/src/lib.rs each carry `#![deny(unsafe_code)]` at the crate root
+# together with exactly ONE `#[allow(unsafe_code)]`, on `mod ffi`, which is the
+# sole sanctioned unsafe island. It is `deny` rather than `forbid` for a reason
+# that is not a matter of preference: `forbid` cannot be locally overridden, so
+# `forbid` at the root plus an `allow` on the island is rejected outright with
+# `error[E0453]: allow(unsafe_code) incompatible with previous forbid`, and AAP
+# goal G1 permits only three crates, ruling out moving the island into a fourth.
+# `deny` is therefore the strongest attribute that expresses the invariant AAP
+# goal G6 actually states. It is not weaker in effect: a stray `unsafe` block
+# anywhere outside the island is a hard error, not a warning. curl-rs needs no
+# exemption at all, so both of its roots - curl-rs/src/main.rs and
+# curl-rs/src/bin/curlinfo.rs - carry `#![forbid(unsafe_code)]` literally, as
+# does curl-rs/build.rs.
+#
+# Measured, so that the division of labour is stated accurately rather
 # than assumed: clippy stops on it too, because clippy-driver wraps rustc and
 # inherits its lints - a stray `unsafe` block in curl-rs-lib reports here as
 # `error: usage of an unsafe block`. That overlap is harmless and this gate
-# does not rely on it. Clippy's own contribution is the hygiene around the one
-# sanctioned unsafe island: `clippy::undocumented_unsafe_blocks` mechanises the
-# requirement that every `unsafe` block in curl-rs-lib/src/ffi/{mod,sys,gss}.rs
-# and in curl-rs-ffi carries a `// SAFETY:` comment. Whether that lint is
-# enabled is clippy.toml and crate-attribute territory and is owned elsewhere;
-# what this file must do is never weaken `-D warnings` in a way that would
-# demote it. Hence no `--cap-lints`, no `continue-on-error` and no `if:`
-# condition on any step below.
+# does not rely on it.
+#
+# The `// SAFETY:` comment on every unsafe block is NOT held by a clippy lint:
+# `clippy::undocumented_unsafe_blocks` is enabled nowhere in this workspace -
+# not in clippy.toml, not in a crate attribute, and not in a [lints] table,
+# because no member declares one. It is held by an executable test instead,
+# `mod source_policy`'s
+# `every_unsafe_block_in_this_crate_is_covered_by_a_safety_comment` in
+# curl-rs-lib/src/lib.rs, which walks the crate's own sources and runs under
+# rust-test.yml. Enabling the lint as well would be a change to a crate root or
+# a manifest, not to this file. What this file must do is never weaken
+# `-D warnings`, the only mechanism that turns a clippy finding into a failure
+# anywhere in the workspace. Hence no `--cap-lints`, no `continue-on-error` and
+# no `if:` condition on any step below.
 
 name: 'Rust lint'
 
@@ -65,16 +104,14 @@ name: 'Rust lint'
     branches:
       - master
       - '*/ci'
-    # A deny-list, deliberately, and never a `paths:` allow-list. checkdocs.yml
-    # uses an allow-list restricted to documentation paths, which is exactly
-    # why the hygiene jobs could not be folded into it: an allow-list here
-    # would have to name Cargo.toml, clippy.toml, rustfmt.toml,
-    # rust-toolchain.toml and every source path in three crates, and the day
-    # somebody forgot one is the day unlinted code merged without this gate
-    # ever firing. The four entries below are the ones the C build workflows
-    # ignore; `projects/**` holds the OS400, Windows and VMS project files,
-    # which are out of scope for this migration entirely and cannot affect a
-    # Rust lint.
+    # A deny-list, never a `paths:` allow-list. checkdocs.yml uses an allow-list
+    # restricted to documentation paths, which is why the hygiene jobs could not
+    # be folded into it: an allow-list here would have to name Cargo.toml,
+    # clippy.toml, rustfmt.toml, rust-toolchain.toml and every source path in
+    # three crates, and the day one was forgotten is the day unlinted code
+    # merged without this gate firing. The four entries below are the ones the C
+    # build workflows ignore; `projects/**` holds the OS400, Windows and VMS
+    # project files, out of scope for this migration entirely.
     paths-ignore:
       - '.circleci/**'
       - 'appveyor.*'
@@ -114,6 +151,32 @@ env:
   # below is ordered or configured for it.
   CARGO_INCREMENTAL: '0'
 
+  # THE FOURTEEN IMPLEMENTABLE FEATURES, and never `--all-features`.
+  #
+  # Identical to the list in rust-build.yml, rust-audit.yml and rust-miri.yml,
+  # in the same order, so the four can be diffed against one another. The
+  # fifteenth declared feature, `hickory-dns`, is a reserved name that no crate
+  # can currently back and enabling it raises a deliberate `compile_error!` in
+  # curl-rs-lib/src/lib.rs; Cargo has no "all except one" selector, so
+  # `--all-features` would fail this gate on a feature-set error wearing a lint
+  # gate's name. The full reasoning lives in rust-build.yml's env block.
+  #
+  # Two of the fourteen are default-OFF - `negotiate` and `memdebug` - and are
+  # therefore linted by no other step in this file. Their code is where a lint
+  # is most likely to go unnoticed, since `negotiate` is the crate's entire
+  # GSS-API binding and `memdebug` is a `#[global_allocator]`.
+  ALL_FEATURES: 'altsvc,brotli,cookies,doh,ftp,gzip,hsts,http2,http3,ssh,websockets,zstd,negotiate,memdebug'
+
+  # curl-rs-ffi's build script REFUSES to run unless this records an A4
+  # decision, and `cargo clippy --workspace` compiles curl-rs-ffi and therefore
+  # runs it. Measured: the value is entirely inert on this job's linux/x86_64
+  # host - zero warnings, identical behaviour set or unset - so it is here to
+  # keep the gate working if the runner ever changes, and to make the recorded
+  # acceptance visible in every workflow whose verdict depends on it.
+  # rust-build.yml's env block carries the full reasoning and is the one place
+  # to change when A4 is decided.
+  CURL_RS_A4_VARIADIC_DECISION: 'accept-unsupported-varargs'
+
 jobs:
   clippy:
     name: 'clippy + rustfmt'
@@ -124,14 +187,25 @@ jobs:
     # suited scripts/checksrc-all.pl because that was a Perl pass over text.
     runs-on: ubuntu-latest
 
-    # A single job, and no matrix. Clippy findings here are target-independent:
-    # the workspace has no `#[cfg(target_arch)]`-gated lint surface that a
-    # second triple would reach, and gate 2 names no matrix. The four-target
-    # compilation matrix belongs to rust-build.yml, which is where a
-    # target-specific defect must surface. One job, one gate, one cause. Were a
-    # matrix ever added here, `fail-fast: false` would be mandatory - every
-    # matrix in this repository carries it - because a lint gate that cancels
-    # its siblings on the first failure hides the rest of the findings.
+    # A single job, and no matrix, because the lint gate is specified without
+    # one. This carries a real and deliberate coverage limitation that must not
+    # be mistaken for target-independence: the workspace DOES have
+    # cfg-gated code that only one triple reaches. curl-rs-lib/src/version.rs
+    # selects its OS-and-architecture string from `#[cfg(target_arch)]` x
+    # `#[cfg(target_os)]` arms; curl-rs-lib/src/ffi/sys.rs and
+    # curl-rs/src/output/dirhie.rs both branch on `#[cfg(target_os)]`. Running
+    # on ubuntu-latest lints the x86_64-unknown-linux-gnu arms only, so a
+    # clippy finding inside an aarch64 or macOS arm is NOT caught here.
+    #
+    # The four-target compilation matrix in rust-build.yml is what compiles
+    # those arms, so a target-specific defect that rustc can see still
+    # surfaces. What no gate currently covers is a clippy-only finding confined
+    # to a non-host arm. Closing that would mean adding
+    # `--target <triple>` legs here; until it is, the limitation is recorded
+    # rather than implied away. Were a matrix ever added, `fail-fast: false`
+    # would be mandatory - every matrix in this repository carries it - because
+    # a lint gate that cancels its siblings on the first failure hides the rest
+    # of the findings.
     #
     # 20 minutes. The tree's common values are 5, 10 and 15, and this job is
     # heavier than any of them: it type-checks the whole workspace twice, once
@@ -147,9 +221,8 @@ jobs:
 
       - name: 'toolchain versions'
         run: |
-          # Evidence before use. Every claim this workflow makes downstream is
-          # a statement about which toolchain produced it, so the versions are
-          # printed before anything is judged by them.
+          # Every claim this workflow makes downstream is a statement about
+          # which toolchain produced it, so the versions are printed first.
           echo '::group::rust toolchain'
           command -v rustc
           command -v cargo
@@ -159,19 +232,19 @@ jobs:
           cargo fmt --version
           echo '::endgroup::'
 
-          # Nothing installs a toolchain or a component here, and that is
-          # deliberate. rust-toolchain.toml pins an exact stable channel and
-          # names rustfmt, clippy and llvm-tools-preview among its components;
-          # rustup honours all of it on the first `cargo` invocation. A
-          # `rustup component add clippy` in this file would only create a way
-          # for the two to disagree. The four `cargo` and `rustc` calls above
-          # having succeeded is itself the proof that the components resolved.
+          # Nothing installs a toolchain or a component here, deliberately.
+          # rust-toolchain.toml pins an exact stable channel and names rustfmt,
+          # clippy and llvm-tools-preview among its components; rustup honours
+          # all of it on the first `cargo` invocation. A `rustup component add
+          # clippy` here would only create a way for the two to disagree, and
+          # the four calls above having succeeded already proves the components
+          # resolved.
           echo '::group::rust-toolchain.toml (the pin this leg honours)'
           grep -v -E '^(#|$)' rust-toolchain.toml
           echo '::endgroup::'
 
           # The two configuration files this gate exists to enforce, printed
-          # so that a reader of the log can see what the verdict was passed on.
+          # so a reader of the log can see what the verdict was passed on.
           echo '::group::clippy.toml (validated by the clippy steps below)'
           grep -v -E '^(#|$)' clippy.toml
           echo '::endgroup::'
@@ -182,10 +255,12 @@ jobs:
       - name: 'assert: the pinned stable toolchain is the active one'
         run: |
           # Nightly is deliberately absent from rust-toolchain.toml: the Miri
-          # and AddressSanitizer gates need it and install it for themselves in
-          # rust-miri.yml and rust-asan.yml. This gate must run on the pinned
-          # stable channel, and the assertion below is what says so out loud
-          # rather than trusting that no `+nightly` crept into a step.
+          # and AddressSanitizer gates need it and install it for themselves.
+          # rust-miri.yml does so today; the AddressSanitizer leg is required
+          # but not yet added, and when it lands it must install nightly the
+          # same way. This gate must run on the pinned stable channel, and the
+          # assertion below enforces it rather than trusting that no `+nightly`
+          # crept into a step.
           #
           # It matters for correctness, not only for tidiness. rustfmt silently
           # ACCEPTS a nightly-only configuration key on nightly and only warns
@@ -199,7 +274,8 @@ jobs:
           case "${pinned}" in
             nightly*|beta*)
               echo "FAIL: rust-toolchain.toml pins ${pinned}."
-              echo 'This gate runs on the pinned stable channel; nightly belongs to rust-miri.yml and rust-asan.yml.'
+              echo 'This gate runs on the pinned stable channel. Nightly belongs to rust-miri.yml,'
+              echo 'and to rust-asan.yml, which AAP section 0.3.1 specifies but which is not yet on disk.'
               exit 1
               ;;
           esac
@@ -226,10 +302,9 @@ jobs:
 
       - name: 'fetch the locked dependency graph'
         run: |
-          # Its own step, so that a registry or network failure is reported as
-          # a fetch failure instead of arriving disguised as a clippy failure.
-          # That is the same attribution argument that put this gate in its own
-          # workflow, applied one level down.
+          # Its own step, so a registry or network failure is reported as a
+          # fetch failure rather than arriving disguised as a clippy failure -
+          # the same attribution argument that put this gate in its own file.
           #
           # --locked because Cargo.lock is committed and reproducible builds
           # are non-negotiable. It makes a lockfile that disagrees with the
@@ -242,7 +317,7 @@ jobs:
 
       - name: 'clippy: cargo clippy --workspace -- -D warnings'
         run: |
-          # Gate 2, verbatim, with --locked added.
+          # The gate command itself, with --locked added.
           #
           # -D warnings goes on the COMMAND LINE, after `--`, and nowhere else.
           # It must never be set in a repo-wide RUSTFLAGS or in
@@ -255,50 +330,68 @@ jobs:
           # that denies warnings anywhere in the workspace. Weakening it
           # weakens the whole invariant.
           #
-          # This is also the step that validates clippy.toml. An unknown key in
-          # clippy.toml is a HARD ERROR rather than a warning - clippy refuses
-          # to start, reporting `error reading Clippy's configuration file:
-          # unknown field ...` - so merely getting this far proves clippy.toml
-          # is well-formed and schema-valid against the pinned toolchain. That
-          # is why a clippy.toml typo surfaces as a failure of THIS workflow.
+          # This step also validates clippy.toml. An unknown key there is a
+          # HARD ERROR, not a warning - clippy refuses to start, reporting
+          # `error reading Clippy's configuration file: unknown field ...` - so
+          # getting this far proves clippy.toml is well-formed and schema-valid
+          # against the pinned toolchain, and a clippy.toml typo surfaces as a
+          # failure of THIS workflow.
           #
-          # This narrow form is run before the broad one below so that a
-          # finding in library and binary code is reported without test-code
-          # noise. It covers the lib and bin targets of all three members:
-          # curl-rs-lib, curl-rs and curl-rs-ffi.
+          # The narrow form runs before the broad one below so a finding in
+          # library and binary code is reported without test-code noise. It
+          # covers the lib and bin targets of all three members.
           cargo clippy --locked --workspace -- -D warnings
 
       - name: 'clippy: cargo clippy --workspace --all-targets -- -D warnings'
         run: |
-          # The broad form, and it is not redundant. Measured on the pinned
-          # toolchain with a deliberate `needless_return` planted in two
-          # places, the narrow form above reported NOTHING while this form
-          # reported both:
+          # The broad form, and it is not redundant. With a `needless_return`
+          # planted in two places, the narrow form above reported NOTHING while
+          # this form reported both: a `#[cfg(test)] mod tests` module inside a
+          # library, and a [[test]] target whose `path` lies outside its package
+          # directory.
           #
-          #   a `#[cfg(test)] mod tests` module inside a library, and
-          #   a [[test]] target whose `path` lies outside its package
-          #   directory.
+          # Both matter. The assertions from the C tree's tests/libtest and
+          # tests/unit programs - 235 and 59 files, which cannot link against a
+          # Rust static library because pub(crate) items are absent from its
+          # symbol table - are relocated into the crates as `#[cfg(test)]`
+          # modules or behind a `testing` feature, so that is a large body of
+          # code that must not escape the linter. And tests-rs/ sits at the
+          # repository root and is deliberately not a workspace member: it is
+          # reached only through [[test]] targets declared in the member
+          # manifests with `path = "../tests-rs/..."`. --all-targets is what
+          # puts both inside this gate.
           #
-          # Both matter here. The assertions from the C tree's tests/libtest
-          # and tests/unit programs - 235 and 59 files, which cannot link
-          # against a Rust static library because pub(crate) items are absent
-          # from its symbol table - are relocated into the crates as
-          # `#[cfg(test)]` modules or behind a `testing` feature, so that is a
-          # large body of code that must not escape the linter. And tests-rs/
-          # sits at the repository root and is deliberately not a workspace
-          # member: it is reached only through [[test]] targets declared in the
-          # member manifests with `path = "../tests-rs/..."`. --all-targets is
-          # what puts both inside this gate.
-          #
-          # One thing that was checked rather than assumed: on the pinned
-          # cargo, a [[test]] path outside the package directory produces no
-          # cargo warning at all, and it is still compiled and linted. So there
-          # is nothing here for -D warnings to surface on that account - and
-          # nothing for it to surface in principle either, since a cargo
-          # diagnostic is not a rustc lint. Were such a warning ever to appear,
-          # the remedy would be in the manifest, never a suppression in this
-          # workflow.
+          # A [[test]] path outside its package directory produces no cargo
+          # warning on the pinned cargo and is still compiled and linted, so
+          # there is nothing here for -D warnings to surface on that account -
+          # and nothing in principle either, since a cargo diagnostic is not a
+          # rustc lint. Were such a warning to appear, the remedy would be in
+          # the manifest, never a suppression in this workflow.
           cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: 'clippy: the fourteen implementable features -- -D warnings'
+        run: |
+          # THE FEATURE-GATED CODE, WHICH THE TWO STEPS ABOVE NEVER SEE.
+          #
+          # `negotiate` and `memdebug` are default-off, so under the default
+          # feature set the two steps above do not compile them and therefore
+          # cannot lint them. That is not a small gap: `negotiate` is the whole
+          # of curl-rs-lib/src/ffi/gss.rs - the crate's only foreign-function
+          # surface outside src/ffi/sys.rs, and the one place a `// SAFETY:`
+          # claim is most consequential - plus src/auth/negotiate.rs and
+          # src/proxy/socks_gss.rs, and `memdebug` installs a counting
+          # `#[global_allocator]`. Code that no linter ever reads is code whose
+          # style and correctness nobody has checked.
+          #
+          # --all-targets as well, so the `#[cfg(test)]` modules that exist only
+          # under these features are linted too. The narrow-then-broad ordering
+          # used above is not repeated here: it exists to keep library findings
+          # free of test noise on the DEFAULT set, and repeating it would double
+          # a type-check of the whole workspace for no new information.
+          #
+          # ${ALL_FEATURES} and never --all-features; see this file's env block.
+          cargo clippy --locked --workspace --all-targets \
+            --features "${ALL_FEATURES}" -- -D warnings
 
       - name: 'rustfmt: cargo fmt --all -- --check'
         run: |
@@ -353,7 +446,7 @@ jobs:
           # The property that makes the two steps above trustworthy. Every
           # cargo invocation here either only reads the tree or was passed
           # --locked, so nothing should have been able to modify a tracked file
-          # or write Cargo.lock. This says so out loud rather than assuming it.
+          # or write Cargo.lock. This asserts it rather than assuming it.
           #
           # A finding means one of three things, all of them defects worth
           # failing on: --check was dropped from the rustfmt step, --fix

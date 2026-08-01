@@ -49,9 +49,10 @@ output from the servers used in the test.
 
 The harness selects the binary under test through the `runtests.pl` `-c`
 option. Its own help output describes that option as
-`-c path  use this curl executable`. The specified `curl-rs` command-line
-binary substitutes for the C binary through this documented option, so no
-change to the harness is required in order to exercise it.
+`-c path  use this curl executable`. That documented option is what lets the
+specified `curl-rs` command-line binary stand in for the C binary with no
+change to the harness. The substitution is not available yet: `curl-rs` has no
+entry point on disk, so no run described on this page has taken place.
 
 Two companion options matter while bootstrapping a run. `-vc <path>` selects
 the curl used only to verify that the test servers are up, and `-ac <path>`
@@ -74,12 +75,20 @@ makes one asymmetry decisive. **Under-reporting a capability makes a fixture
 skip; over-reporting makes it run and fail.** Truthful advertisement is
 therefore the optimal strategy as well as the honest one.
 
-The specified target advertises only the protocols it implements. Those nine
+The feature and protocol tables that fill those two lines are delivered in
+`curl-rs-lib`, and their contents, including every name deliberately withheld,
+are asserted by its tests. The `--version` output that would carry them to the
+harness is not on disk yet, so each consequence described below follows from
+those tables rather than from an observed run.
+
+Only the protocols the specified target implements are advertised. Those nine
 schemes are `file`, `ftp`, `ftps`, `http`, `https`, `scp`, `sftp`, `ws` and
-`wss`. Every other registered scheme keeps its public protocol constant for
-ABI completeness and returns an unsupported-protocol error, and each is
-withheld from the `Protocols:` line so that the cases requiring it skip
-rather than fail.
+`wss`. The protocol table that names exactly those nine, and withholds the
+other 24 from the `Protocols:` line so that the cases requiring them skip
+rather than fail, is delivered and asserted by test. That every other
+registered scheme keeps its public protocol constant for ABI completeness and
+answers a transfer request with an unsupported-protocol error is specified
+target behavior, because the protocol modules are not on disk.
 
 The harness sets its own `rustls` feature from a `rustls-ffi` token in the
 libcurl version banner, at `tests/runtests.pl` lines 585-586, rather than
@@ -244,8 +253,14 @@ variable as well.
 
 The specified target does not use c-ares at all: c-ares is dropped, and
 `lib/asyn-ares.c` is not migrated. The specified target uses the system
-resolver by default, with the `hickory-dns` `crate` specified as an optional
-resolver behind a `Cargo` feature that is off by default. HTTPS
+resolver. A `hickory-dns` `Cargo` feature was specified as an optional
+in-process alternative, off by default; as built, that feature is a reserved
+name with no implementation and enabling it fails the build deliberately,
+because every release of the resolver crate that satisfies the project's
+minimum `Rust` version requires a `hickory-proto` affected by
+RUSTSEC-2026-0119, while every release carrying the fix raises that minimum.
+The system resolver is therefore the only resolver in every configuration.
+HTTPS
 resource-record handling and DNS-over-HTTPS are specified as the target
 modules `curl-rs-lib/src/dns/httpsrr.rs` and `curl-rs-lib/src/dns/doh.rs`,
 neither of which is a current file. The retained C build implements resolver
@@ -300,19 +315,36 @@ mode runs each test many times and makes each different memory allocation
 fail on each successive run. This tests the out of memory error handling code
 to ensure that memory leaks do not occur even in those situations.
 
-The specified default `Rust` target advertises no `Debug` token. The 28 cases
-that carry a `<limits>` allocation cap are therefore inert, the 98 cases that
-require `Debug` skip, and `make torture-test` is not applicable to the
-specified target. A default-off `memdebug` `Cargo` feature is specified,
-rather than present, as the mechanism that could restore this accounting by
-reproducing the log format the harness already parses. That format is fully
-specified by the retained C tree: records of the form
-`MEM <source>:<line> malloc(<size>) = <pointer>`, with parallel forms for
-`calloc`, `strdup`, `wcsdup`, `realloc` and `free`, plus `LIMIT`, `FD`,
-`FILE` and `ADDR` records. `tests/memanalyzer.pm` parses them, and
-`tests/runner.pm` sets the destination through the `CURL_MEMDEBUG`
-environment variable. An individual case can opt out with
-`<command option="no-memdebug">`.
+The `Rust` target advertises no `Debug` token in any configuration. The 28
+cases that carry a `<limits>` allocation cap are therefore inert, the 98 cases
+that require `Debug` skip, and `make torture-test` is not applicable. A
+default-off `memdebug` `Cargo` feature is present and implemented, and it
+reproduces the log format the harness already parses: enabling it installs a
+counting `GlobalAlloc` as the crate `#[global_allocator]`, which writes records
+of the form `MEM <source>:<line> malloc(<size>) = <pointer>` together with the
+`LIMIT` record, and a `CURL_MEMLIMIT` value supplies the allocation cap.
+`tests/memanalyzer.pm` parses those records, and `tests/runner.pm` sets the
+destination through the `CURL_MEMDEBUG` environment variable. An individual
+case can opt out with `<command option="no-memdebug">`.
+
+Three limits of that mechanism are recorded here rather than left to be
+rediscovered. The retained C tree writes `MEM`, `LIMIT`, `FD`, `FILE` and `BT`
+records, and an allocator can honestly produce only the first two, so file
+descriptor and stream tracking is absent; `tests/memanalyzer.pm` additionally
+parses an `ADDR` record that `lib/memdebug.c` never writes at all. Enabling
+`memdebug` does not by itself make the harness run these checks, because the
+harness keys them on the `Debug` token rather than on the presence of a log.
+Finally, the cap arms on the first allocation rather than partway through
+`main()`, so the two allocations the `Rust` runtime performs ahead of `main`
+count against it.
+
+Those five are the complete set of record prefixes, taken from the
+`curl_dbg_log()` call sites rather than inferred: `grep -c ADDR
+lib/memdebug.c` returns zero, and the fifth record is the back-trace line
+`BT <source>:<line> -- <function>` at `lib/memdebug.c:136`, gated on
+`USE_BACKTRACE` in the C tree and matched then discarded by
+`tests/memanalyzer.pm`. The analyzer retains a legacy `ADDR` branch that no
+emitter in the C tree feeds, so `ADDR` names a record that cannot occur.
 
 The `DEBUGBUILD` define, the `memanalyze.pl` script that analyzes the memory
 debugging output, and `CPPFLAGS=-DMEMDEBUG_LOG_SYNC`, which helps ensure that
@@ -466,7 +498,7 @@ static libcurl and call internal `Curl_*` symbols. In the specified `Rust`
 implementation those internal items are crate-private, and they are genuinely
 absent from the static library's symbol table rather than merely hidden, so
 these programs cannot link unmodified, and no quality of implementation
-changes that. Their assertions are relocated into the specified `Rust`
+changes that. Their assertions are to be relocated into the specified `Rust`
 `crates` as `#[cfg(test)]` modules, or behind a specified `testing` `Cargo`
 feature, which preserves the coverage without preserving the linkage.
 Exporting internal symbols solely to satisfy these programs is explicitly
@@ -495,11 +527,18 @@ certificate and key corpus, and the Perl harness modules are retained
 unmodified.
 
 The specified target uses rustls as its sole TLS implementation, at every
-configuration. Certificate validation is on by default, a self-signed
+configuration. Certificate validation has to be on by default, a self-signed
 certificate has to be rejected by default, and `--insecure` has to emit a
-warning on stderr before proceeding. Both of those behaviors are covered by
-dedicated integration tests specified under `tests-rs/integration/`, a
-specified location that is not part of this checkout.
+warning on stderr before proceeding. That warning is delivered in `curl-rs`,
+where it takes no verbosity argument at all, so no option suppresses it,
+`--silent` included, and the unit tests present in `curl-rs/src/output/msgs.rs`
+assert exactly that: the exact warning bytes, across every silent and
+show-error combination, for `--insecure`, `--proxy-insecure` and
+`--doh-insecure`. Rejection of a self-signed certificate has no coverage in this
+checkout at all, because `curl-rs-lib/src/tls/verify.rs` is not a current file
+and the backend it needs awaits its own unit of work. Both behaviors are also
+covered by dedicated integration tests specified under `tests-rs/integration/`,
+a specified location that is not part of this checkout.
 
 The items below are acceptance criteria that the specified target has to
 satisfy. They are criteria, never results, and `docs/CODE_REVIEW.md` owns

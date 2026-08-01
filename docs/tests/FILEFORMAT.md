@@ -762,11 +762,13 @@ a header and what is not in order to apply the CRLF line endings appropriately.
 When the binary under test advertises a `Debug` token in its `Features:` line,
 the harness enables memory tracking and runtests make sure that the set limits
 are not exceeded. The figures are upper bounds, so a run that allocates fewer
-times, or less memory, passes. On the specified default `Rust` target, which
-advertises no `Debug` token, these limits are inert and the cases that carry
-them run without a memory check; a default-off `memdebug` `Cargo` feature is
-specified, rather than present, as the mechanism that re-enables the existing
-memory log format. Supported limits:
+times, or less memory, passes. The `Rust` target advertises no `Debug` token in
+any configuration, so these limits are inert and the cases that carry them run
+without a memory check. A default-off `memdebug` `Cargo` feature is present and
+implemented, and it re-creates the memory log format that
+`tests/memanalyzer.pm` parses, but enabling it does not make the harness apply
+these limits, because the harness keys that on the `Debug` token rather than on
+the presence of a log. Supported limits:
 
     Allocations: [number of allocation calls]
     Maximum allocated: [maximum concurrent memory allocated]

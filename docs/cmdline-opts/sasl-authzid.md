@@ -20,12 +20,13 @@ Use this authorization identity (**authzid**), during SASL PLAIN
 authentication, in addition to the authentication identity (**authcid**) as
 specified by --user.
 
-This build implements no IMAP, IMAPS, POP3, POP3S, SMTP, SMTPS, LDAP or LDAPS
-transfers, the schemes that carry SASL PLAIN authentication. curl accepts this
-option and parses its argument, yet the transfer itself fails with
-`CURLE_UNSUPPORTED_PROTOCOL`, and the `Protocols:` line in the --version
-output omits those schemes. HTTP authentication is unaffected: Basic, Digest,
-Bearer and NTLM work as documented, and --user supplies their credentials.
+Transfers for IMAP, IMAPS, POP3, POP3S, SMTP, SMTPS, LDAP and LDAPS, the
+schemes that carry SASL PLAIN authentication, are outside the specified scope
+of this rewrite, and the `Protocols:` line of the --version output withholds
+all eight. Accepting this option and parsing its argument are still specified,
+with the transfer itself then failing with `CURLE_UNSUPPORTED_PROTOCOL`. HTTP
+authentication is untouched by that boundary: Basic, Digest, Bearer and NTLM
+are all within the specified scope, with --user supplying their credentials.
 
 If the option is not specified, the server derives the **authzid** from the
 **authcid**, but if specified, and depending on the server implementation, it

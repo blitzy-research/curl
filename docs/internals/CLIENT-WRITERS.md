@@ -25,8 +25,22 @@ maps one for one, rather than reinterprets.
   header, an informational header, a status line, a CONNECT response, a 1xx
   response or a trailer decides which application callback receives it, and
   whether it is written at all.
-- **`CLIENTWRITE_BODY` and `CLIENTWRITE_HEADER` are mutually exclusive**, and
-  the remaining bits only qualify `CLIENTWRITE_HEADER`.
+- **`CLIENTWRITE_BODY`, `CLIENTWRITE_INFO` and `CLIENTWRITE_HEADER` are three
+  mutually exclusive classes**, and at least one of them is always set.
+  `CLIENTWRITE_INFO` is a class in its own right -- meta information that is
+  not a header -- not a qualifier on `CLIENTWRITE_HEADER`. The three
+  `DEBUGASSERT`s at `lib/sendf.c:380-388` state the rule exactly: one of the
+  three is present; `BODY` may be accompanied only by `EOS`; and `INFO` may be
+  accompanied only by `EOS`. The qualifier bits `CLIENTWRITE_STATUS`,
+  `CLIENTWRITE_CONNECT`, `CLIENTWRITE_1XX` and `CLIENTWRITE_TRAILER` therefore
+  qualify `CLIENTWRITE_HEADER` alone.
+- **`CLIENTWRITE_EOS` and `CLIENTWRITE_0LEN` are orthogonal to the class
+  bits.** `EOS` marks the end of the download stream and is the one bit that
+  may accompany `BODY` or `INFO`; `0LEN` asks for the write to happen even
+  when the buffer is empty.
+- **None of these bits is part of the public ABI.** They are internal to
+  `lib/sendf.h`: `CLIENTWRITE` appears zero times anywhere under `include/`.
+  The application sees only the callback it registered, never a type bit.
 - **Phase ordering is behavioral.** The protocol length check happens before
   content decoding, which makes the compared length the length received and
   not the length after decoding. Moving that check produces different errors
@@ -73,12 +87,22 @@ The following bits are defined:
 #define CLIENTWRITE_CONNECT (1 << 4) /* a CONNECT related HEADER */
 #define CLIENTWRITE_1XX     (1 << 5) /* a 1xx response related HEADER */
 #define CLIENTWRITE_TRAILER (1 << 6) /* a trailer HEADER */
+#define CLIENTWRITE_EOS     (1 << 7) /* End Of transfer download Stream */
+#define CLIENTWRITE_0LEN    (1 << 8) /* write even 0-length buffers */
 ```
 
-The main types here are `CLIENTWRITE_BODY` and `CLIENTWRITE_HEADER`. They are
-mutually exclusive. The other bits are enhancements to `CLIENTWRITE_HEADER`
-to specify what the header is about. They are only used in HTTP and related
-protocols (RTSP and WebSocket).
+The class types here are `CLIENTWRITE_BODY`, `CLIENTWRITE_INFO` and
+`CLIENTWRITE_HEADER`, and they are mutually exclusive: `BODY` is non-meta
+information, `INFO` is meta information that is not a header, and `HEADER` is
+meta information that is. `CLIENTWRITE_STATUS`, `CLIENTWRITE_CONNECT`,
+`CLIENTWRITE_1XX` and `CLIENTWRITE_TRAILER` are enhancements to
+`CLIENTWRITE_HEADER` alone, specifying what the header is about, and they are
+only used in HTTP and related protocols (RTSP and WebSocket).
+
+`CLIENTWRITE_EOS` and `CLIENTWRITE_0LEN` are not header enhancements. `EOS`
+marks the end of the download stream and is the only bit permitted alongside
+`BODY` or `INFO`; `0LEN` requests that the write happen even for an empty
+buffer.
 
 The implementation of `Curl_client_write()` uses a chain of *client writer*
 instances to process the call and make sure that the bytes reach the proper
@@ -167,7 +191,17 @@ The HTTP protocol adds client writers in phase `CURL_CW_CONTENT_DECODE` on
 seeing such a header. For each encoding listed, it adds the corresponding
 writer. The response from the server is then passed through
 `Curl_client_write()` to the writers that decode it. If several encodings had
-been applied the writer chain decodes them in the proper order.
+been applied the writer chain decodes them in the proper order, and that order
+is the **reverse** of the order in which the writers were added. Each writer is
+inserted *first* in its phase (`lib/sendf.c:464-469`), so the one added last
+sits at the head of the chain and runs first.
+
+That is exactly what decoding requires. A `Content-Encoding: gzip, br` response
+was gzipped and then brotli-compressed, so the brotli layer has to come off
+before the gzip layer. `lib/content_encoding.c:768-780` leans on the same
+mechanism when it rejects a response whose `chunked` transfer coding is not
+last, observing that `chunked` "must be the last added to be the first in its
+phase".
 
 When the server provides a `Content-Length` header, that value applies to the
 *compressed* content. Length checks on the response bytes must happen *before*
@@ -200,9 +234,13 @@ writing the actual response data stays the same.
 ## The specified `Rust` successor
 
 The migration to the three-`crate` `Rust` `workspace` specifies successors to
-the four C files named at the top of this page. No `Rust` source file exists
-in the tree, so every path below is specified target state, while those C
-files remain the reference oracle at runtime.
+the four C files named at the top of this page. The tree does already contain
+`Rust` source, in all three `crates`, but no successor to any of those four
+files has been delivered, so each path in the list below is specified target
+state, while those C files remain the reference oracle at runtime. Two names
+mentioned further down are exceptions and are marked as such where they appear:
+`curl-rs/src/output/writeout.rs`, which is a different concern from this chain,
+and `curl-rs/src/bin/curlinfo.rs`, both of which do exist.
 
 - `curl-rs-lib/src/transfer/writeout.rs` succeeds `lib/cw-out.c` and
   `lib/cw-pause.c`: the client writer at the end of the chain, together with
@@ -218,10 +256,11 @@ files remain the reference oracle at runtime.
   installs, which puts them at the client end of everything described above.
 
 One name invites confusion and is worth separating out here.
-`curl-rs/src/output/writeout.rs` is the specified successor to
-`src/tool_writeout.c` and `src/tool_writeout_json.c`, which format the
-`--write-out` report once a transfer has finished. Despite the similar
-filename it is a **different** concern from the client writer chain:
+`curl-rs/src/output/writeout.rs` is the successor to `src/tool_writeout.c` and
+`src/tool_writeout_json.c`, which format the `--write-out` report once a
+transfer has finished; unlike the paths listed above, this one **is**
+delivered. Despite the similar filename it is a **different** concern from the
+client writer chain:
 `curl-rs-lib/src/transfer/writeout.rs` is the chain, and
 `curl-rs/src/output/writeout.rs` is the report.
 
@@ -273,8 +312,9 @@ follows.
   `zstd` `crate`, in place of the C libraries that `lib/content_encoding.c`
   calls. What stays fixed is the observable part: the coding names accepted,
   the `x-gzip` alias and the `identity` and `none` spellings among them; the
-  order the decoders are applied in, which follows the order of the header
-  value; the ceiling on how many of them may be stacked; and the errors
+  order the decoders are applied in, which is the **reverse** of the order the
+  header value lists them, because each writer is inserted first in its phase;
+  the ceiling on how many of them may be stacked; and the errors
   produced on malformed input, `CURLE_BAD_CONTENT_ENCODING` among them. The
   matching `Cargo` features are `gzip`, `brotli` and `zstd`.
 - **Progress accounting moves with the download writer.** The counters that
@@ -283,13 +323,21 @@ follows.
   those same counters at `curl-rs-lib/src/transfer/ratelimit.rs`. See
   [Rate Limiting Transfers](RATELIMITS.md).
 
-`#![forbid(unsafe_code)]` is specified at the root of `curl-rs-lib` and at the
-root of `curl-rs`, with a single narrowly allowed island under
-`curl-rs-lib/src/ffi/` for the operating system calls that have no safe
-expression, and a mandatory `// SAFETY:` comment on every `unsafe` block
-there. The writer chain has no business in that island: holding bytes and
-handing them to a callback asks for nothing that the safe subset does not
-already offer.
+The safety invariant at the root of `curl-rs-lib` is `#![deny(unsafe_code)]`
+plus exactly one `#[allow(unsafe_code)]`, on `mod ffi` -- the single narrowly
+allowed island under `curl-rs-lib/src/ffi/` for the operating system calls that
+have no safe expression, where every `unsafe` block carries a mandatory
+`// SAFETY:` comment. It is `deny` and not `forbid` because `forbid` cannot be
+locally overridden (`error[E0453]: allow(unsafe_code) incompatible with
+previous forbid`) and Agent Action Plan goal G1 permits only three crates, so
+the island cannot move into a fourth; `deny` is no weaker, since a stray
+`unsafe` block outside the island is a hard error rather than a warning. In
+`curl-rs` there is no island at all, so the delivered binary root
+`curl-rs/src/bin/curlinfo.rs` does carry `#![forbid(unsafe_code)]` literally;
+the crate root `curl-rs/src/main.rs` named in Agent Action Plan section 0.3.1
+is not yet on disk. The writer chain has no business in that island: holding
+bytes and handing them to a callback asks for nothing that the safe subset does
+not already offer.
 
 The application callbacks are reached across the public C ABI in
 `curl-rs-ffi`, and that is where the pointer and length contract with the

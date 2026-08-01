@@ -1,0 +1,622 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Validation gate 6 of the ten that guard the Rust workspace: ADDRESS
+# SANITIZER.
+#
+# The gate, verbatim: AddressSanitizer with zero errors across the FFI surface.
+# This file adds `--locked`, an explicit target triple, `-Zbuild-std`,
+# `--all-targets`, and assertions that the instrumentation was real and the run
+# was not vacuous. Nothing else.
+#
+# It does nothing further. The build lives in rust-build.yml, lint in
+# rust-clippy.yml, the tests in rust-test.yml, undefined behaviour in
+# rust-miri.yml, coverage in rust-coverage.yml, symbol and header parity in
+# rust-abi.yml, supply chain in rust-audit.yml, and the curl fixture corpus in
+# curl-testsuite.yml. One workflow per validation gate, so that a failure names
+# its own cause.
+#
+# WHY THIS IS SEPARATE FROM rust-miri.yml, since both install a nightly and
+# both look for memory errors. They disagree about what they can see, and the
+# disagreement is the reason both exist:
+#
+#   Miri INTERPRETS. It models the abstract machine, so it sees violations of
+#   the language's rules - an invalidated pointer, a data race in its model, an
+#   aliasing rule broken - including in code paths that a concrete execution
+#   would optimise away. What it cannot do is run code it has no shim for, and
+#   it cannot execute the FFI boundary against a real allocator.
+#
+#   ASan EXECUTES. It instruments real machine code and real allocations, so it
+#   sees what actually happens at the boundary this workspace exists to
+#   provide: an out-of-bounds access through a raw pointer handed in by a C
+#   caller, a use-after-free of a `Box::into_raw`'d handle, a leak of a handle
+#   the C side never freed. Those are exactly the failure modes of an FFI shim,
+#   and they are the ones Miri is worst placed to find.
+#
+# So the two gates have different subjects. Miri's is `curl-rs-lib`, the safe
+# engine. This one's is the FFI surface: `curl-rs-ffi`, the C ABI shim built as
+# a cdylib and staticlib, plus `curl-rs-lib/src/ffi/`, the one sanctioned
+# `unsafe` island in the engine.
+#
+# LINEAGE. This file succeeds the sanitizer legs of
+# .github/workflows/linux.yml, which built the C tree under
+# `-fsanitize=address` among others. The inheritance is partial by necessity:
+# those legs also ran MemorySanitizer, ThreadSanitizer and UndefinedBehaviour
+# sanitizer over C code, and the ten-gate framework this file belongs to names
+# only AddressSanitizer. Adding the other three here would be scope this file
+# does not have; Miri covers a large part of what UBSan covered, and safe Rust
+# plus a single-threaded engine covers most of what TSan did.
+#
+# WHY curl-rs IS NOT A SUBJECT. The command-line crate carries
+# `#![forbid(unsafe_code)]` at its root and has no `mod ffi`, so it contains no
+# `unsafe` block for ASan to find anything in - a claim the compiler enforces
+# rather than one this comment asserts. It is also not part of "the FFI
+# surface", which is what gate 6 names. Note that instrumentation is not
+# narrowed to the named packages anyway: RUSTFLAGS plus `-Zbuild-std` rebuilds
+# and instruments the ENTIRE dependency graph including the standard library,
+# so an error inside rustls, quinn or `core` reached from the FFI surface is
+# still caught here.
+
+name: 'Rust sanitizer'
+
+on:
+  push:
+    branches:
+      - master
+      - '*/ci'
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}'
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # Colour off. Two steps below parse tool output with `grep`, `sed` and `awk`
+  # to decide a verdict, and an ANSI escape sequence embedded in a diagnostic
+  # would make an anchored pattern silently stop matching. An assertion that
+  # silently stops matching is worse than no assertion.
+  CARGO_TERM_COLOR: never
+
+  # A nightly toolchain and the locked dependency graph are both downloaded
+  # here. A transient registry or CDN hiccup should retry rather than fail this
+  # gate and send somebody hunting for a memory error that is not there.
+  CARGO_NET_RETRY: '3'
+
+  # No cache is restored in this job, so incremental state is output that
+  # nothing ever reads. Not a speed tuning - performance is an explicit
+  # non-goal of this work and no step below is ordered or configured for it.
+  CARGO_INCREMENTAL: '0'
+
+  # THE NIGHTLY PIN. A DATED channel, never the moving `nightly` alias, for the
+  # same reason rust-miri.yml pins its own: with a moving channel an unchanged
+  # commit gains or loses findings over time, in both directions, and neither
+  # direction is detectable after the fact because the log of the earlier run
+  # names a nightly that no longer resolves to the same compiler. `-Zsanitizer`
+  # and `-Zbuild-std` are both unstable, so their behaviour is explicitly
+  # allowed to change between nightlies.
+  #
+  # This is a SEPARATE copy of the pin from the one in rust-miri.yml, and the
+  # duplication is deliberate: the two gates are independent, and being able to
+  # advance one nightly without disturbing the other is worth more than sharing
+  # a single value. Neither belongs in rust-toolchain.toml, which pins the
+  # stable channel every other leg builds on and records that the nightly
+  # belongs to "the Miri and AddressSanitizer gates" which "name it explicitly
+  # per invocation".
+  #
+  # MEASURED, because the naming is counter-intuitive: a dated nightly channel
+  # is the channel PUBLISHED on that date and carries a compiler BUILT THE
+  # PREVIOUS DAY. nightly-2026-07-31 resolves to
+  # `rustc 1.99.0-nightly (8ab9fdff5 2026-07-30)`, and it ships `rust-src`,
+  # which `-Zbuild-std` requires.
+  NIGHTLY_TOOLCHAIN: 'nightly-2026-07-31'
+
+  # -Zbuild-std demands an explicit --target: without one, cargo would apply
+  # RUSTFLAGS to build scripts and proc-macros as well, and a build script
+  # linked against the sanitizer runtime fails to run. Naming the triple splits
+  # host artifacts from target artifacts and is what makes the instrumented
+  # build work at all.
+  #
+  # x86_64-unknown-linux-gnu is one of the four mandated targets and the one
+  # ubuntu-latest runs natively. ASan requires executing the instrumented code,
+  # so the other three would need an emulator or a foreign runner; compilation
+  # for all four is gate 1 and is asserted in rust-build.yml.
+  ASAN_TARGET: 'x86_64-unknown-linux-gnu'
+
+  # The sanitizer itself. This is the whole gate expressed as a compiler flag.
+  #
+  # It is set as RUSTFLAGS rather than passed after `--` so that it applies to
+  # every crate in the graph rather than only to the top-level one. An
+  # uninstrumented dependency is a blind spot, and the interesting allocations
+  # in this workspace - rustls buffers, quinn packet buffers, the `Box`ed handles
+  # the C ABI hands out - live in dependencies.
+  RUSTFLAGS: '-Zsanitizer=address'
+
+  # ASan's own configuration, and each option earns its place:
+  #
+  #   detect_leaks=1                  a handle that C never frees is a leak,
+  #                                   and leak detection is the single most
+  #                                   relevant check for an ownership-transfer
+  #                                   boundary built on Box::into_raw.
+  #   abort_on_error=1                stop at the first error with a core-worthy
+  #                                   abort rather than unwinding through more
+  #                                   code and producing a second, derived
+  #                                   report that obscures the first.
+  #   strict_string_checks=1          C string functions are checked for reading
+  #                                   past a terminator, which is precisely what
+  #                                   a mis-sized CStr conversion does.
+  #   detect_stack_use_after_return=1 catches returning a pointer into a frame
+  #                                   that has gone, the classic way an FFI shim
+  #                                   leaks a dangling pointer to C.
+  #   check_initialization_order=1    and
+  #   strict_init_order=1             catch a static initialiser reading another
+  #                                   static that has not run yet - reachable
+  #                                   here because the C ABI is entered from a
+  #                                   foreign runtime whose init order is not
+  #                                   Rust's.
+  #
+  # Measured: with all six enabled, both subjects below pass with zero reports.
+  ASAN_OPTIONS: 'detect_leaks=1:abort_on_error=1:strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1'
+
+  # Deterministic execution, so that the log the assertion steps parse reads the
+  # same every time, and a full backtrace when something does fire - an ASan
+  # report without a Rust frame list is a great deal less useful.
+  RUST_TEST_THREADS: '1'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  asan:
+    name: 'AddressSanitizer over the FFI surface'
+
+    runs-on: ubuntu-latest
+
+    # -Zbuild-std recompiles core, alloc and std from source under
+    # instrumentation, twice over (once per subject, with different features),
+    # and there is no cache. The budget is generous for that reason; a gate that
+    # times out reports a timeout, which teaches a reader nothing about memory
+    # safety.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'install the pinned nightly toolchain, with rust-src'
+        # Its own step-level budget so that a slow or failing download is
+        # attributed to the download and cannot consume the sanitizing budget of
+        # the gate itself.
+        timeout-minutes: 10
+        run: |
+          # rust-toolchain.toml pins a STABLE channel and deliberately does not
+          # pin a nightly, naming this file and rust-miri.yml as the two gates
+          # that install one for themselves. So installing the nightly is this
+          # workflow's job.
+          #
+          # rust-src is the component `-Zbuild-std` needs: it is the standard
+          # library's SOURCE, and without it there is nothing to rebuild under
+          # instrumentation. miri is deliberately NOT requested - that component
+          # belongs to rust-miri.yml and downloading it here would be dead
+          # weight.
+          #
+          # --profile minimal because nothing in this job needs rustfmt, clippy
+          # or rust-docs. --no-self-update keeps rustup itself fixed. --override
+          # is deliberately NOT passed: it would write a directory override and
+          # mutate the state of the checkout, and every invocation below names
+          # +${NIGHTLY_TOOLCHAIN} instead.
+          command -v rustup
+          rustup --version
+
+          if [ -z "${NIGHTLY_TOOLCHAIN}" ]; then
+            echo 'FAIL: NIGHTLY_TOOLCHAIN is empty.'
+            echo 'An empty value would make every +NIGHTLY_TOOLCHAIN use below collapse to a bare'
+            echo 'invocation on the pinned STABLE channel, where -Zsanitizer and -Zbuild-std do not'
+            echo 'exist, and the failure would look like an unknown flag rather than a missing pin.'
+            exit 1
+          fi
+
+          # The pin must be a dated channel. `nightly` on its own is rejected
+          # here rather than half-working later: this is the one place that can
+          # tell a deliberate pin from a reintroduced moving channel.
+          case "${NIGHTLY_TOOLCHAIN}" in
+            nightly-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+            *)
+              echo "FAIL: NIGHTLY_TOOLCHAIN is '${NIGHTLY_TOOLCHAIN}', which is not a dated nightly."
+              echo 'It must be exactly nightly-YYYY-MM-DD. The moving nightly alias is what this'
+              echo 'pin exists to prevent: -Zsanitizer and -Zbuild-std are unstable, so with a'
+              echo 'moving channel an unchanged commit gains or loses findings over time and the'
+              echo 'gate stops being a statement about the commit.'
+              exit 1
+              ;;
+          esac
+
+          status=0
+          rustup toolchain install "${NIGHTLY_TOOLCHAIN}" \
+            --profile minimal \
+            --component rust-src \
+            --target "${ASAN_TARGET}" \
+            --no-self-update || status=$?
+
+          if [ "${status}" -ne 0 ]; then
+            echo "FAIL: could not install ${NIGHTLY_TOOLCHAIN} with rust-src for ${ASAN_TARGET}."
+            echo 'This is a TOOLCHAIN AVAILABILITY failure, not a memory-safety finding.'
+            echo 'Confirm against the nightly channel manifest for that date before changing'
+            echo 'anything here. Advancing the pin is the correct fix; relaxing the gate is not,'
+            echo 'and neither is reverting to the moving nightly channel.'
+            exit "${status}"
+          fi
+
+      - name: 'toolchain versions'
+        run: |
+          # Evidence before use. Every verdict this workflow reaches is a
+          # statement about which compiler and which sanitizer runtime produced
+          # it, so the versions are printed before anything is judged by them.
+          echo "::group::pinned nightly ${NIGHTLY_TOOLCHAIN} (the one this gate runs on)"
+          command -v rustup
+          rustc "+${NIGHTLY_TOOLCHAIN}" --version
+          cargo "+${NIGHTLY_TOOLCHAIN}" --version
+          echo '::endgroup::'
+
+          # Printed for contrast, not for use. Bare `cargo` in this directory
+          # resolves to the pinned stable channel, and seeing the two side by
+          # side in the log is what makes the assertion in the next step legible
+          # when it ever fires.
+          echo '::group::default toolchain in this checkout (NOT used by this gate)'
+          rustc --version
+          cargo --version
+          echo '::endgroup::'
+
+          echo '::group::sanitizer configuration actually in effect'
+          echo "RUSTFLAGS     = ${RUSTFLAGS}"
+          echo "ASAN_OPTIONS  = ${ASAN_OPTIONS}"
+          echo "ASAN_TARGET   = ${ASAN_TARGET}"
+          echo '::endgroup::'
+
+          echo '::group::rust-toolchain.toml (the pin this gate deliberately bypasses)'
+          grep -v -E '^(#|$)' rust-toolchain.toml
+          echo '::endgroup::'
+
+      - name: 'assert: the pinned nightly is the active one, and rust-src is present'
+        run: |
+          # A directory-scoped rust-toolchain.toml with an explicit `channel` is
+          # authoritative for a bare `cargo`, so in this checkout `rustc
+          # --version` reports the pinned stable release. An explicit
+          # `+toolchain` argument outranks that file, which is why every
+          # invocation in this job carries +${NIGHTLY_TOOLCHAIN}. A gate that
+          # merely assumed the override wins would be a gate that silently ran
+          # on stable - where `-Zsanitizer` is rejected outright - the day that
+          # ever changed.
+          nightly_rustc="$(rustc "+${NIGHTLY_TOOLCHAIN}" --version)"
+          nightly_cargo="$(cargo "+${NIGHTLY_TOOLCHAIN}" --version)"
+
+          case "${nightly_rustc}" in
+            *nightly*) ;;
+            *)
+              echo "FAIL: rustc +${NIGHTLY_TOOLCHAIN} reports '${nightly_rustc}', not a nightly."
+              echo '-Zsanitizer and -Zbuild-std are unstable, so this gate cannot run on stable.'
+              echo 'Add a step-scoped RUSTUP_TOOLCHAIN to the steps in this file; do not edit'
+              echo 'rust-toolchain.toml, which is owned elsewhere and correct as it stands.'
+              exit 1
+              ;;
+          esac
+
+          case "${nightly_cargo}" in
+            *nightly*) ;;
+            *)
+              echo "FAIL: cargo +${NIGHTLY_TOOLCHAIN} reports '${nightly_cargo}', not a nightly."
+              echo 'rustc and cargo have resolved to different channels. Investigate the rustup'
+              echo 'installation in the step above.'
+              exit 1
+              ;;
+          esac
+
+          # The pinned channel must exist under its own name. rustup does not
+          # silently substitute a different toolchain for an explicit `+name`, so
+          # this is what proves the install step materialised the pin rather than
+          # the job coasting on a nightly the runner image happened to ship.
+          if ! rustup toolchain list | grep -q -E "^${NIGHTLY_TOOLCHAIN}(-|\b)"; then
+            echo "FAIL: ${NIGHTLY_TOOLCHAIN} is not among the installed toolchains:"
+            rustup toolchain list | sed 's/^/  /'
+            exit 1
+          fi
+
+          # The build date. A dated channel published on D carries a compiler
+          # built on D-1 (measured; see the env block), so equality is the wrong
+          # test and would fail on every correct pin. The window is "at or before
+          # D, and no earlier than D-2": wide enough to absorb the off-by-one and
+          # a delayed publication, narrow enough that resolving to some other
+          # dated channel - the actual failure this guards - is caught at once.
+          pinned_date="$(printf '%s' "${NIGHTLY_TOOLCHAIN}" | sed -n 's/^nightly-//p')"
+          rustc_date="$(printf '%s\n' "${nightly_rustc}" | sed -n 's/.*[( ]\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]\)).*/\1/p')"
+
+          if [ -z "${rustc_date}" ]; then
+            echo "FAIL: could not read a build date out of '${nightly_rustc}'."
+            echo 'The version format changed. Fix the pattern rather than dropping the check:'
+            echo 'without it the pin is unverified and the gate is a moving target again.'
+            exit 1
+          fi
+
+          floor="$(date -u -d "${pinned_date} -2 days" +%Y-%m-%d 2>/dev/null || true)"
+          if [ -z "${floor}" ]; then
+            echo 'FAIL: date -u -d could not compute the window floor on this runner.'
+            exit 1
+          fi
+
+          if [ "${rustc_date}" \> "${pinned_date}" ] || [ "${rustc_date}" \< "${floor}" ]; then
+            echo "FAIL: rustc reports build date ${rustc_date}, outside [${floor}, ${pinned_date}]."
+            echo "  NIGHTLY_TOOLCHAIN : ${NIGHTLY_TOOLCHAIN}"
+            echo "  rustc             : ${nightly_rustc}"
+            echo 'The +toolchain argument resolved to a different dated channel than the pin names.'
+            echo 'A verdict from an unpinned sanitizer is not reproducible, so this gate refuses to'
+            echo 'report one. Fix the pin; do not widen this window to make it pass.'
+            exit 1
+          fi
+
+          # rust-src, checked directly rather than inferred from the install
+          # step's exit status. Without it `-Zbuild-std` fails with a message
+          # about a missing `std` source that reads like a broken toolchain
+          # rather than a missing component.
+          sysroot="$(rustc "+${NIGHTLY_TOOLCHAIN}" --print sysroot)"
+          if [ ! -f "${sysroot}/lib/rustlib/src/rust/library/std/Cargo.toml" ]; then
+            echo 'FAIL: the rust-src component is not present in the pinned nightly sysroot:'
+            echo "  ${sysroot}/lib/rustlib/src/rust/library/std/Cargo.toml"
+            echo '-Zbuild-std rebuilds the standard library from source under instrumentation, so'
+            echo 'without rust-src there is nothing to instrument and std stays a blind spot.'
+            exit 1
+          fi
+
+          echo "pinned nightly ${NIGHTLY_TOOLCHAIN} is active, dated ${rustc_date}, with rust-src present"
+
+      - name: 'fetch the locked dependency graph'
+        run: |
+          # Its own step, so that a registry or network failure is reported as a
+          # fetch failure instead of arriving disguised as a sanitizer failure.
+          #
+          # The pinned nightly's cargo does the fetching, because that is the
+          # cargo the instrumented builds below use, and a lockfile that one
+          # cargo accepts and another rejects should fail here rather than three
+          # steps later.
+          cargo "+${NIGHTLY_TOOLCHAIN}" fetch --locked --target "${ASAN_TARGET}"
+
+      - name: 'asan: curl-rs-ffi, the C ABI shim'
+        run: |
+          # SUBJECT ONE: the crate that is the FFI surface. Built as a cdylib and
+          # a staticlib, it is where `Box::into_raw` hands ownership to C and
+          # `Box::from_raw` takes it back, and where every raw pointer a C caller
+          # supplies is first touched.
+          #
+          # --all-targets, and this is not cosmetic. It selects lib, bins, tests
+          # and benches, and it EXCLUDES doctests. Measured: with doctests
+          # included the run fails with `error: linking with cc failed` during
+          # the doctest link step, because rustdoc's per-doctest link does not
+          # pick up the sanitizer runtime under -Zbuild-std. That is a limitation
+          # of the toolchain, not a finding about this workspace, and it would
+          # otherwise turn this gate permanently red for a reason unrelated to
+          # memory safety. Doctests are executed unsanitized by rust-test.yml,
+          # so nothing goes unrun.
+          #
+          # -Zbuild-std so that core, alloc and std are themselves instrumented.
+          # Without it, an out-of-bounds write that lands inside a `Vec`'s buffer
+          # is invisible, which is most of them.
+          log="${RUNNER_TEMP}/asan-ffi.log"
+          status=0
+          cargo "+${NIGHTLY_TOOLCHAIN}" test \
+            --locked \
+            -Zbuild-std \
+            --target "${ASAN_TARGET}" \
+            -p curl-rs-ffi \
+            --all-targets 2>&1 | tee "${log}" || status=$?
+
+          if [ "${status}" -ne 0 ]; then
+            echo "FAIL: AddressSanitizer run over curl-rs-ffi exited ${status}."
+            echo 'If the log above contains an "ERROR: AddressSanitizer" block, that block is the'
+            echo 'finding and its Rust frame list names the offending code. If it does not, the'
+            echo 'failure is a compilation or link failure of the instrumented build, which is'
+            echo 'still this gate: an FFI surface that cannot be instrumented cannot be cleared.'
+            exit "${status}"
+          fi
+
+          echo 'curl-rs-ffi under AddressSanitizer: exit 0'
+
+      - name: 'asan: curl-rs-lib --all-features, the sanctioned unsafe island'
+        run: |
+          # SUBJECT TWO: `curl-rs-lib/src/ffi/`, the only place in the engine
+          # where `unsafe` is permitted - `mod sys` for the socket and host calls
+          # that have no safe expression, and `mod gss` for the optional GSS-API
+          # binding.
+          #
+          # --all-features is load-bearing here rather than thoroughness for its
+          # own sake. `mod gss` sits behind the default-off `negotiate` feature,
+          # and it is the largest single body of `unsafe` in the crate. Without
+          # the flag this gate would clear an FFI surface while never compiling,
+          # let alone instrumenting, most of it.
+          #
+          # --all-targets for the same measured reason as the step above.
+          log="${RUNNER_TEMP}/asan-lib.log"
+          status=0
+          cargo "+${NIGHTLY_TOOLCHAIN}" test \
+            --locked \
+            -Zbuild-std \
+            --target "${ASAN_TARGET}" \
+            -p curl-rs-lib \
+            --all-features \
+            --all-targets 2>&1 | tee "${log}" || status=$?
+
+          if [ "${status}" -ne 0 ]; then
+            echo "FAIL: AddressSanitizer run over curl-rs-lib --all-features exited ${status}."
+            echo 'A failure here with curl-rs-ffi green points at curl-rs-lib/src/ffi/ - most'
+            echo 'likely mod gss, which only exists under the negotiate feature this step enables.'
+            exit "${status}"
+          fi
+
+          echo 'curl-rs-lib --all-features under AddressSanitizer: exit 0'
+
+      - name: 'assert: the instrumentation was real'
+        run: |
+          # The check that makes this gate more than a second copy of
+          # rust-test.yml.
+          #
+          # Everything above would pass, green and fast, if RUSTFLAGS were
+          # dropped, misspelled, or overridden by a `[build] rustflags` entry in
+          # .cargo/config.toml - cargo would simply build the tests without a
+          # sanitizer and they would pass, because they pass anyway. That is the
+          # most likely way for this gate to become a no-op, and no exit status
+          # anywhere reports it.
+          #
+          # So the binaries are inspected. An ASan-instrumented executable
+          # contains the runtime's initialiser, `__asan_init`; an uninstrumented
+          # one does not. Asking cargo which executables it produced, rather
+          # than guessing at paths under target/, keeps this correct when a
+          # crate gains or loses a test target.
+          exes="${RUNNER_TEMP}/asan-exes.txt"
+          : > "${exes}"
+
+          for spec in '-p curl-rs-ffi' '-p curl-rs-lib --all-features'; do
+            # shellcheck disable=SC2086
+            cargo "+${NIGHTLY_TOOLCHAIN}" test \
+              --locked \
+              -Zbuild-std \
+              --target "${ASAN_TARGET}" \
+              ${spec} \
+              --all-targets \
+              --no-run \
+              --message-format json 2>/dev/null \
+              | grep '"reason":"compiler-artifact"' \
+              | grep '"test":true' \
+              | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' >> "${exes}"
+          done
+
+          sort -u "${exes}" -o "${exes}"
+          count="$(wc -l < "${exes}" | tr -d ' ')"
+
+          if [ "${count}" -eq 0 ]; then
+            echo 'FAIL: cargo reported zero test executables for the two subjects.'
+            echo 'Nothing was instrumented and nothing ran, which a zero exit status above did'
+            echo 'not reveal. Check that both packages still declare test targets.'
+            exit 1
+          fi
+
+          if ! command -v nm > /dev/null 2>&1; then
+            echo 'FAIL: nm is not available, so the instrumentation cannot be verified.'
+            echo 'binutils is part of every ubuntu runner image; install it rather than skipping'
+            echo 'this check, which is the only thing standing between this gate and a silent no-op.'
+            exit 1
+          fi
+
+          uninstrumented=0
+          while IFS= read -r exe; do
+            [ -n "${exe}" ] || continue
+            if [ ! -f "${exe}" ]; then
+              echo "FAIL: cargo named '${exe}' as a test executable, but it does not exist."
+              uninstrumented=1
+              continue
+            fi
+            if nm "${exe}" 2>/dev/null | grep -q '__asan_init'; then
+              echo "  instrumented: $(basename "${exe}")"
+            else
+              echo "FAIL: $(basename "${exe}") contains no __asan_init symbol."
+              echo '  It was built WITHOUT AddressSanitizer, so its green result means nothing.'
+              uninstrumented=1
+            fi
+          done < "${exes}"
+
+          if [ "${uninstrumented}" -ne 0 ]; then
+            echo 'RUSTFLAGS did not reach the compiler. The usual causes are a [build] rustflags'
+            echo 'entry in .cargo/config.toml overriding the environment variable, a target-specific'
+            echo 'rustflags table for this target doing the same, or RUSTFLAGS being unset by a'
+            echo 'step-level env block. Fix the plumbing; a green uninstrumented run is worse than'
+            echo 'a red one because it looks like evidence.'
+            exit 1
+          fi
+
+          echo "all ${count} test executable(s) carry the AddressSanitizer runtime"
+
+      - name: 'assert: the run was not vacuous, and no report was swallowed'
+        run: |
+          # Two vacuity failures that a zero exit status does not cover.
+          ffi_log="${RUNNER_TEMP}/asan-ffi.log"
+          lib_log="${RUNNER_TEMP}/asan-lib.log"
+
+          for log in "${ffi_log}" "${lib_log}"; do
+            if [ ! -s "${log}" ]; then
+              echo "FAIL: ${log} is missing or empty; the sanitizer steps produced no output."
+              exit 1
+            fi
+
+            # (1) Something must have executed. `cargo test` over a package with
+            # no tests prints "0 passed; 0 failed" and exits 0, and an
+            # instrumented binary that is never run reports nothing at all.
+            if ! grep -q '^test result:' "${log}"; then
+              echo "FAIL: ${log} contains no 'test result:' summary line."
+              echo 'The instrumented binaries were built but never executed, so the sanitizer had'
+              echo 'nothing to observe. A run of nothing exits 0, which is why this is checked.'
+              exit 1
+            fi
+
+            passed="$(grep -oE '[0-9]+ passed' "${log}" | awk '{ s += $1 } END { print s + 0 }')"
+            failed="$(grep -oE '[0-9]+ failed' "${log}" | awk '{ s += $1 } END { print s + 0 }')"
+            echo "${log}: ${passed} passed, ${failed} failed"
+
+            if [ "${passed}" -le 0 ]; then
+              echo "FAIL: ${log} reports ${passed} passing tests under instrumentation."
+              exit 1
+            fi
+            if [ "${failed}" -ne 0 ]; then
+              echo "FAIL: ${failed} test(s) failed under instrumentation although cargo exited 0."
+              exit 1
+            fi
+
+            # (2) No ASan report may appear anywhere in the log. abort_on_error=1
+            # should make a report fatal, but a report emitted by a child process
+            # that the harness reaps, or one printed while unwinding, can leave
+            # the summary line green. The text is the authority, not the status.
+            if grep -q -E 'ERROR: (AddressSanitizer|LeakSanitizer)' "${log}"; then
+              echo "FAIL: ${log} contains a sanitizer report although the exit status was 0:"
+              grep -n -A 20 -E 'ERROR: (AddressSanitizer|LeakSanitizer)' "${log}" | head -60
+              echo 'Gate 6 requires ZERO errors. A report that did not propagate an exit status is'
+              echo 'still a report.'
+              exit 1
+            fi
+
+            if grep -q -E 'SUMMARY: AddressSanitizer' "${log}"; then
+              echo "FAIL: ${log} contains an AddressSanitizer SUMMARY line:"
+              grep -n -E 'SUMMARY: AddressSanitizer' "${log}"
+              exit 1
+            fi
+          done
+
+          echo 'both subjects executed real tests under a real sanitizer, and neither produced a report'
+
+      - name: 'assert: this gate wrote nothing outside target/'
+        run: |
+          # The property that makes everything above trustworthy. Every cargo
+          # invocation in this job was passed --locked, so nothing should have
+          # been able to modify a tracked file or regenerate Cargo.lock.
+          #
+          # A finding means one of three things, all worth failing on: --locked
+          # was dropped and cargo rewrote the lockfile, a build script wrote into
+          # the source tree instead of OUT_DIR, or the sanitizer left a report
+          # file next to the sources. The root .gitignore already covers /target,
+          # so a clean run leaves this empty.
+          changed="${RUNNER_TEMP}/worktree-status.txt"
+          git status --porcelain > "${changed}"
+          if [ -s "${changed}" ]; then
+            echo 'FAIL: the working tree changed while this gate ran:'
+            cat "${changed}"
+            exit 1
+          fi
+          echo 'the working tree is byte-identical to the checkout: this gate sanitizes, it does not rewrite'

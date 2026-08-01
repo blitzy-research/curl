@@ -2,14 +2,62 @@
 //
 // SPDX-License-Identifier: curl
 
+// THE CRATE-ROOT SAFETY GATE. Read before adding an `#[allow(unsafe_code)]`
+// anywhere in this crate.
+//
+// `deny`, not `forbid`, and the reason is measured rather than preferred.
+// `curl-rs-lib/src/lib.rs:34-48` records the experiment: `forbid` at the root
+// with `#[allow(unsafe_code)]` on a module is rejected outright with
+// `error[E0453]: allow(unsafe_code) incompatible with previous forbid`,
+// while `deny` plus a scoped `allow` compiles. This crate cannot do without
+// the scoped allows -- all 100 entry points receive raw pointers from C, so
+// `unsafe` is its subject matter and not an escape hatch -- so `forbid` is
+// unavailable and `deny` is the strongest level that can actually be set.
+//
+// What this changes. Before it, the three `#[allow(unsafe_code)]` attributes
+// below enforced NOTHING: the `unsafe_code` lint is `allow` by default, so
+// they were documentary. A new module could use `unsafe` freely and silently.
+// With the root at `deny`, `unsafe` anywhere in this crate is a compile error
+// unless that module carries an explicitly audited allow, which is the
+// property specification 0.1.1 goal G6 asks for and which review alone cannot
+// give.
+//
+// The three audited allowances, and why each is unavoidable:
+//
+//   `mod memory`  -- holds libcurl's five replaceable allocator hooks, whose
+//                    C typedefs (`include/curl/curl.h:469-473`) are
+//                    `unsafe extern "C" fn`. Calling one is inherently
+//                    unsafe: the pointer it returns is the application's.
+//   `mod ffi`     -- the 100 exported entry points. Every one is
+//                    `#[no_mangle] pub extern "C"` over raw C pointers.
+//   `mod tests`   -- must construct `unsafe extern "C" fn` hook
+//                    implementations to exercise `mod memory` against the
+//                    real typedefs. A safe stand-in would test a different
+//                    signature from the one the ABI publishes.
+//
+// `deny` is defeatable by an inner allow, exactly as it is in `curl-rs-lib`,
+// so the level is paired with an invariant a reviewer can check mechanically.
+// The pattern is ANCHORED to column zero, because an unanchored one also
+// matches the prose above and would report six:
+//
+//     grep -cE '^#\[allow\(unsafe_code\)\]$' curl-rs-ffi/src/lib.rs   ==  3
+//     grep -rnE '^ *#!?\[allow\(unsafe_code\)\]' curl-rs-ffi/src/ffi/ ==  nothing
+//
+// A fourth allowance in this file, or any allowance under `ffi/`, is a
+// finding and not a convenience. `the_audited_unsafe_allowances_are_exactly_
+// three` asserts the first of the two so that the count cannot drift silently,
+// and it reads this file from disk rather than trusting the comment. The other half of the discipline is
+// unchanged and is not replaceable by a lint: EVERY `unsafe` block carries a
+// `// SAFETY:` comment naming the precondition it relies on and why it holds.
+#![deny(unsafe_code)]
+
 //! libcurl's C ABI, expressed in Rust.
 //!
-//! This crate is the ABI facade -- pattern P10 of the migration plan --
-//! that presents curl 8.19.0-DEV's exported C surface over the safe engine
-//! in `curl-rs-lib`. It marshals; it does not decide. Every protocol,
-//! transport, TLS, DNS and authentication decision belongs to
-//! `curl-rs-lib`, which is what keeps the shim small enough to audit
-//! against the public header in isolation. There is deliberately no
+//! This crate is the ABI facade that presents curl 8.19.0-DEV's exported C
+//! surface over the safe engine in `curl-rs-lib`. It marshals; it does not
+//! decide. Every protocol, transport, TLS, DNS and authentication decision
+//! belongs to `curl-rs-lib`, which is what keeps the shim small enough to
+//! audit against the public header in isolation. There is deliberately no
 //! protocol logic anywhere in this crate.
 //!
 //! The build products are `libcurl.so` (a `cdylib`) and `libcurl.a` (a
@@ -42,7 +90,11 @@
 //! Each of the 100 names must have exactly **one**
 //! `#[no_mangle] pub extern "C"` definition; a duplicate is a link error
 //! and nothing builds. The partition below is therefore both disjoint and
-//! exhaustive, and it is the contract the `ffi/` modules satisfy.
+//! exhaustive, and it is the contract the `ffi/` modules must satisfy.
+//! None of those modules exists yet -- `curl-rs-ffi/src/` holds only this
+//! file at this commit -- so every `ffi/*.rs` named in this documentation,
+//! here and below, is a target rather than a description, and the crate
+//! exports nothing until they land.
 //!
 //! | Module | Count | Derivation |
 //! |---|---|---|
@@ -136,7 +188,7 @@
 //! mechanism is code, not a build setting: `panic = "abort"` is prohibited
 //! in the release profile -- the workspace root sets `panic = "unwind"`
 //! explicitly -- because aborting would terminate the host application,
-//! which is the very outcome the boundary exists to prevent. A member
+//! which is precisely the outcome the boundary exists to prevent. A member
 //! manifest could not change it in any case, since Cargo honours
 //! `[profile.*]` only at the workspace root and warns about it elsewhere,
 //! and a warning is itself a build failure here.
@@ -180,24 +232,71 @@
 //! far, so that a test can prove the net works and so that a clean run can
 //! be asserted to have absorbed none.
 //!
-//! No panic hook is installed here, and that is a decision rather than an
-//! omission. Two things are true at once, and only the first is under this
-//! crate's control. Nothing in `panic_boundary` writes to standard error.
-//! Rust's *default* hook, however, does print a `thread '<unnamed>'
-//! panicked at ...` line before unwinding begins -- measured, by driving
-//! these entry points from a C program and observing the stream, not
-//! assumed. Suppressing it with `std::panic::set_hook` was considered and
-//! rejected for two reasons. The hook is process-global, and this crate
-//! ships as a library loaded into an application that did not write it;
-//! replacing that application's own hook is a far more invasive side
-//! effect than a diagnostic line. And the diagnostic is wanted: since a
-//! panic here is by definition a defect, silencing it would hide the very
-//! thing that most needs to be seen. The residual risk is narrow and worth
-//! naming -- `tests/data` fixtures compare emitted bytes literally, so
-//! such a line could turn a passing fixture into a failing one -- but it
-//! can only arise when a defect is already present, and in that situation
-//! a loud failure is the correct outcome rather than something to be
-//! engineered away.
+//! ## The diagnostic the default hook would print, and why it is replaced
+//!
+//! Nothing in `panic_boundary` writes to standard error, but Rust's
+//! *default* hook does, before unwinding begins and therefore before
+//! `catch_unwind` can intervene -- measured by driving these entry points
+//! from a C program and observing the stream, not assumed. What it prints
+//! is `thread '<unnamed>' panicked at <file>:<line>:<col>:` followed by the
+//! payload, and, under `RUST_BACKTRACE`, a full backtrace with absolute
+//! paths and symbol names.
+//!
+//! Two things in that line are disclosures rather than diagnostics. **The
+//! payload is caller data.** A panic from `expect`, `unwrap` or an
+//! assertion routinely interpolates the value that failed, and at this
+//! boundary those values are URLs, credentials, headers and cookies. **The
+//! location and the backtrace are build-machine facts** -- paths of the
+//! machine that compiled the library, which the application it is loaded
+//! into never consented to publish.
+//!
+//! So a hook *is* installed, and the two objections that argued against
+//! one are both answered rather than overridden:
+//!
+//! * **It does not replace the application's hook.** The hook that was in
+//!   place is captured with `take_hook` and is called verbatim for every
+//!   panic that did not arise inside this boundary. An application that
+//!   installed its own hook keeps it for its own panics.
+//! * **The defect is not hidden.** A boundary panic emits one constant,
+//!   payload-free, path-free line naming it as a libcurl bug, and
+//!   `contained()` counts it so a test can assert both that the net works
+//!   and that a clean run absorbed nothing. `CURL_RS_PANIC_VERBOSE`
+//!   restores the unredacted default output for a debugging session, which
+//!   is the right way to make that output available: opt in, never by
+//!   default.
+//!
+//! Two consequences are stated rather than left to be discovered. A panic
+//! raised by an application's own callback while it is being driven from
+//! inside this boundary is indistinguishable from one raised by this
+//! crate, and is redacted with the rest; the failure is still returned to
+//! the application through the entry point's documented error value.
+//! And the constant line is bytes on standard error, so `tests/data`
+//! fixtures compare it -- but a fixture can only ever see it when a defect
+//! is already present, which is the situation in which a loud failure is
+//! the correct outcome.
+//!
+//! ## Containment is not a rollback, so handles are poisoned
+//!
+//! `catch_unwind` returns a documented failure value; it cannot undo what
+//! the body had already done. An entry point that panics halfway through
+//! mutating a handle would otherwise leave that handle observable in a
+//! state no code path constructs, and the application's next call would
+//! read it. Reverting arbitrary state generically is not possible, so the
+//! sound alternative is the one `std::sync::Mutex` takes: the handle is
+//! **poisoned** and is never observed again.
+//!
+//! `guard_tx` is the mechanism and the contract is binding on all 16
+//! modules under `ffi/`:
+//!
+//! * An entry point that **mutates** a handle routes through `guard_tx`
+//!   with that handle's [`panic_boundary::Poison`]. A panic poisons it.
+//! * An entry point that only **reads** may use `guard`.
+//! * Every call on a poisoned handle returns the family-correct error
+//!   **without running its body**, so half-mutated state is never read.
+//! * `curl_easy_cleanup`, `curl_multi_cleanup`, `curl_share_cleanup`,
+//!   `curl_mime_free`, `curl_formfree` and `curl_url_cleanup` are the
+//!   exception and must still free a poisoned handle. Refusing to free it
+//!   would convert a contained defect into a leak.
 //!
 //! # Argument validation at the boundary
 //!
@@ -304,7 +403,7 @@
 //!
 //! `curl-rs-lib/src/error.rs` owns `CURLcode`, `CURLMcode`, `CURLUcode`,
 //! `CURLSHcode` and `CURLHcode` for the engine, and `ffi/codes.rs`
-//! declares them again for the ABI. That is deliberate, not an oversight:
+//! declares them again for the ABI. That is deliberate:
 //! `cbindgen.toml` sets `parse_deps = false` and excludes `curl-rs-lib`,
 //! so cbindgen reads only this crate and the enumerations that must appear
 //! in the generated header have to be declared inside it. Drift is
@@ -316,32 +415,88 @@
 //! `CURLoption` are not error codes and are not in either place: they
 //! belong to `ffi/opts.rs`, which is their sole source of truth.
 //!
-//! # Open items, recorded rather than quietly accepted
+//! # Open items
 //!
-//! These are unresolved or resolved-with-a-cost, and the crate root is
-//! where a reader looks for crate-wide caveats. None may be discovered by
-//! surprise later.
+//! These are unresolved, or resolved at a cost, and the crate root is where
+//! a reader looks for crate-wide caveats. None may be discovered by surprise
+//! later.
 //!
-//! **A4: the minimum supported Rust version conflicts with one of the four
-//! required targets, and this needs a decision that is not the agent's to
-//! make.** Four exported functions -- `curl_easy_setopt`,
-//! `curl_easy_getinfo`, `curl_multi_setopt` and `curl_share_setopt` -- are
-//! C-variadic in the header, and the design reaches them with a
-//! non-variadic Rust function taking one trailing pointer, which works
-//! because the option identifier already encodes its argument's type class
-//! (integer division by 10,000 recovers the `CURLOPTTYPE_*` base). The
-//! generated aarch64 code reads that argument from register `x2`. Standard
-//! AAPCS64, which Linux aarch64 follows, passes variadic arguments in
-//! registers, so caller and callee agree. **Apple's arm64 ABI passes
-//! variadic arguments on the stack**, so on `aarch64-apple-darwin` the
-//! callee would read a register the caller never populated. The failure is
-//! silent and would not show up in a Linux test run. The remedy is
-//! `VaList` with `ap.next_arg`, whose `VaArgSafe` bound is sealed and is
-//! not implemented for raw pointers -- they must be read as `usize` and
-//! cast -- and which is stable only on a toolchain far newer than the
-//! declared minimum. Raising the minimum, dropping the target, or
-//! accepting that one target's variadic entry points are unsupported are
-//! the three options, and choosing between them is a user decision.
+//! **A4: RESOLVED, by a fourth option specification 0.8.6 did not have.**
+//! Four exported functions -- `curl_easy_setopt`, `curl_easy_getinfo`,
+//! `curl_multi_setopt` and `curl_share_setopt` -- are C-variadic in the
+//! header, and the design reaches them with a non-variadic Rust function
+//! taking one trailing pointer, which works because the option identifier
+//! already encodes its argument's type class (integer division by 10,000
+//! recovers the `CURLOPTTYPE_*` base).
+//!
+//! The hazard is real and was measured on both sides of the call, on all
+//! four targets. A C caller does not put the third argument in the same
+//! place everywhere:
+//!
+//! ```text
+//! x86_64-unknown-linux-gnu    mov  %rsi,%rdx     -> RDX
+//! x86_64-apple-darwin         movq %rsi,%rdx     -> RDX
+//! aarch64-unknown-linux-gnu   mov  x2, x1        -> X2
+//! aarch64-apple-darwin        str  x1, [sp]      -> THE STACK; x2 unwritten
+//! ```
+//!
+//! A plain non-variadic aarch64 callee compiles to `mov x0, x2; ret` -- it
+//! reads `x2`. Standard AAPCS64, which Linux aarch64 follows, passes
+//! variadic arguments in registers, so caller and callee agree there.
+//! **Apple's arm64 ABI passes them on the stack**, so on
+//! `aarch64-apple-darwin` the callee would read a register the caller never
+//! populated, silently and without a diagnostic.
+//!
+//! Specification 0.8.6 recorded three ways out -- raise the minimum
+//! supported Rust version, drop the target, or accept that one target's
+//! variadic entry points are unsupported -- because the only remedy known
+//! at the time was `VaList` with `ap.next_arg`, stable far above the
+//! declared minimum of 1.75. There is a fourth, and it costs none of those
+//! three. A `core::arch::global_asm!` trampoline exported under the public
+//! symbol name relocates the argument and tail-calls the implementation:
+//!
+//! ```text
+//! _curl_easy_setopt:
+//!     ldr  x2, [sp]                  ; the slot the Apple caller wrote
+//!     adrp x16, {impl}@PAGE
+//!     add  x16, x16, {impl}@PAGEOFF
+//!     br   x16
+//! ```
+//!
+//! `bl` does not modify `sp`, so `[sp]` on entry is exactly the slot the
+//! caller stored to. This was compiled and disassembled on stable 1.97.1
+//! **and on 1.75.0**: `llvm-nm` reports the trampoline as a global `T` and
+//! the implementation as a local `t`, so the private symbol does not join
+//! the export set, and `llvm-objdump` shows precisely the four instructions
+//! above. No newer toolchain, no C compiler, no dropped target.
+//!
+//! Because none of the four has a Rust body yet, there is nothing to
+//! trampoline to today and therefore no mismatch to be exposed to. That is
+//! a fact about the current state, not a reason to rely on remembering it:
+//! `curl-rs-ffi/build.rs`'s `check_variadic_strategy` fails the build, **on
+//! every target**, if any of the four ever gains a plain non-variadic
+//! definition without a `global_asm!` trampoline exporting its label. It
+//! checks for the assembly label rather than a marker comment, so it cannot
+//! be satisfied by prose, and it is target-independent so the failure cannot
+//! be confined to the one platform least likely to be building. This
+//! replaces a `cargo:warning=` that fired on every macOS arm64 build, which
+//! both broke specification 0.8.4 gate 1 -- zero warnings on all four
+//! targets -- and described a defect that was not present.
+//!
+//! **That decision is enforced, not merely recorded here.** A caveat in a
+//! doc comment is exactly the "silent acceptance" the specification calls
+//! the worst option, so `build.rs`'s `check_variadic_abi` makes it
+//! impossible: building for `aarch64-apple-darwin` **fails** unless
+//! `CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs` is set, and
+//! any target fails if `src/ffi/printf.rs` or `src/ffi/form.rs` appears
+//! while the decision is unrecorded. Setting that variable is an assertion
+//! that both consequences below are accepted; it fixes nothing, and where
+//! it actually suppresses a refusal the build says so. The two lists the
+//! gate reasons about are asserted against the verbatim header text this
+//! crate emits, and the eleven named in the next paragraph are asserted
+//! equal to the gate's own list by
+//! [`the_variadic_inventory_matches_the_build_gate`], so this
+//! documentation and that enforcement cannot drift apart.
 //!
 //! **Fifteen of the 100 symbols, not four, have an argument shape stable
 //! Rust cannot express at the declared minimum.** Searching for the
@@ -363,18 +518,49 @@
 //! System V, a pointer to a five-field record on AAPCS64, and a plain
 //! `char *` on Apple arm64 -- so walking one from Rust needs hand-written
 //! per-target `unsafe`, while the plain forms need `va_start`, which is
-//! unavailable at the declared minimum. Raising the minimum, or adding a
-//! small C shim that captures the `va_list` and delegates to a Rust
-//! function, are the only ABI-exact routes; a shim would add a build-time
-//! C compiler dependency the manifest does not currently permit. Dropping
-//! the symbols is not an option, because they are eleven of the 100.
+//! unavailable at the declared minimum.
+//!
+//! **The trampoline that resolves A4 does not resolve these eleven, and the
+//! difference is worth stating precisely so the resolution above is not
+//! over-read.** That trampoline relocates exactly one argument from a known
+//! stack slot into a known register, which is sufficient because those four
+//! functions take a fixed three arguments. A format-driven function takes an
+//! unknown number of arguments of unknown types, so reaching them needs the
+//! whole of what `va_start` does: spilling the general-purpose and
+//! floating-point argument registers into a target-specific record and
+//! synthesising the `va_list` that indexes it. That is expressible in
+//! `global_asm!` in principle, but it is a separate per-target
+//! implementation for each of the three `va_list` layouts above rather than
+//! a four-instruction thunk, and none of it is written. So these eleven
+//! remain **open**: raising the minimum, adding a C shim that captures the
+//! `va_list` and delegates -- which would add a build-time C compiler
+//! dependency the manifest does not currently permit -- and hand-writing the
+//! spill prologue are the ABI-exact routes. Dropping the symbols is not an
+//! option, because they are eleven of the 100.
+//!
+//! Ten of the eleven additionally need a formatter that does not exist yet:
+//! `lib/mprintf.c` is a complete `printf` implementation with curl's own
+//! conversion set, and specification 0.4.1 maps it to this crate's
+//! `ffi/printf.rs`. So for the `curl_m*printf` family the variadic question
+//! is not currently the binding constraint.
 //!
 //! **32-bit support is forfeited deliberately and must not be claimed.** A
 //! single register-width argument slot holds a `curl_off_t` only where
 //! `curl_off_t` fits a register. All four required targets are 64-bit, so
-//! the design is sound for the required matrix and for nothing wider.
+//! the width question is settled for the required matrix and for nothing
+//! wider.
 //!
-//! **A7, a disclosure rather than a defect.** Neither cryptographic
+//! Being 64-bit is necessary but **not** sufficient, and the distinction must
+//! not be collapsed: width decides whether a `curl_off_t` fits the slot, while
+//! the variadic conflict above decides whether the callee reads the slot the
+//! caller wrote. Width holds on all four targets; argument passing does not,
+//! because `aarch64-apple-darwin` passes variadic arguments on the stack. So
+//! the trailing-pointer design is sound on three of the four required targets
+//! and remains an open conflict on the fourth. A claim that 64-bit width alone
+//! makes it sound across the matrix would be wrong, and would hide that
+//! conflict rather than record it.
+//!
+//! **A disclosure rather than a defect.** Neither cryptographic
 //! provider available to rustls is pure Rust; both contain C and assembly.
 //! What the no-C-TLS requirement actually secures is satisfied: no C *TLS
 //! library* is linked, because rustls implements the protocol, the record
@@ -386,14 +572,14 @@
 //! `CURLSSLBACKEND_RUSTLS`, whose value 14 already exists in
 //! `curl_sslbackend`, so `curl_global_sslset` invents nothing.
 //!
-//! **A8, resolved in favour of accuracy.** `tests/runtests.pl:585-586`
-//! sets its `rustls` feature from a `rustls-ffi` token in the version
-//! banner, not from the word `rustls`. Emitting `rustls-ffi` would unlock
-//! the fixtures gated on that feature while misdescribing an
-//! implementation that uses rustls natively rather than through its C FFI,
-//! so the truthful token is emitted and the skips are accepted. The
-//! asymmetry makes this the safe direction as well as the honest one:
-//! under-reporting a capability makes a fixture skip, whereas
+//! **The version-banner token, resolved in favour of accuracy.**
+//! `tests/runtests.pl:585-586` sets its `rustls` feature from a `rustls-ffi`
+//! token in the version banner, not from the word `rustls`. Emitting
+//! `rustls-ffi` would unlock the fixtures gated on that feature while
+//! misdescribing an implementation that uses rustls natively rather than
+//! through its C FFI, so the truthful token is emitted and the skips are
+//! accepted. The asymmetry makes this the safe direction as well as the honest
+//! one: under-reporting a capability makes a fixture skip, whereas
 //! over-reporting makes it run and fail.
 //!
 //! **Versioned symbol names are not reproducible, and nothing here should
@@ -406,16 +592,22 @@
 //! configuration, so the artifact remains legitimate. Setting the
 //! `SONAME`, by contrast, does work, and `build.rs` owns it.
 //!
-//! **One re-export that `ffi/misc.rs` will need does not exist yet.**
-//! `curl_getdate` needs the date parser, which lives under
-//! `curl-rs-lib`'s `util` module; `util` is `pub(crate)` and the crate
-//! root re-exports nothing from it. `curl-rs-lib`'s public surface must
-//! grow that re-export. It is reported here rather than worked around:
-//! duplicating the parser in this crate would put engine logic in the
-//! facade, and reaching for a private path is not possible. The
-//! equivalent needs for the other two ABI obligations are already met --
-//! the TLS backend identity is public in `curl-rs-lib`'s `version` module,
-//! and every code enumeration exposes a message accessor.
+//! **Every re-export `ffi/misc.rs` needs now exists.** `curl_getdate`
+//! needs the date parser, which lives under `curl-rs-lib`'s `util`
+//! module; `util` is `pub(crate)`, so a private path could not be named
+//! from here. `curl-rs-lib`'s crate root now re-exports exactly one name
+//! from that tree -- `curl_rs_lib::getdate`, backed by
+//! `curl-rs-lib/src/util/parsedate.rs` -- which is review finding M-13's
+//! resolution. It was closed by widening the ENGINE rather than by
+//! duplicating the parser here, because a copy would put engine logic in
+//! a crate whose job is the C ABI and nothing else; this crate's
+//! `curl_getdate` is left with a `*const c_char` to `&str` conversion and
+//! an `Option` to `time_t` mapping. The internal `Curl_getdate_capped`
+//! stays `pub(crate)` in the engine, since it is not one of the 100
+//! exported symbols. The equivalent needs for the other two ABI
+//! obligations were already met -- the TLS backend identity is public in
+//! `curl-rs-lib`'s `version` module, and every code enumeration exposes a
+//! message accessor.
 //!
 //! # Provenance of the constraints above
 //!
@@ -429,763 +621,1084 @@
 //! so it can be rechecked. Neither is a rule, and neither should be
 //! described as one. Where a claim could not be settled by reading, it was
 //! settled by building and running the thing in question, and it says so.
-
-// Every consumer of the two helper modules below lives under `ffi/`, which
-// is a separate unit of work, so until those 16 files land each helper here
-// is legitimately unreferenced. `dead_code` is therefore allowed for these
-// modules specifically and with a stated reason rather than as a
-// convenience, which is the same situation and the same remedy as
-// `curl-rs-lib/src/ffi/sys.rs:131-135`. It is deliberately not allowed at
-// the crate root, so that genuinely dead code under `ffi/` still warns.
-
-/// Containment for panics that would otherwise unwind into C.
-///
-/// Every one of the 100 exported entry points routes its body through
-/// exactly one of the four functions here. See the crate-level
-/// documentation for the fallback each return type takes and for why
-/// containment is a safety net rather than an error-handling strategy.
-#[allow(dead_code)]
-pub(crate) mod panic_boundary {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use std::panic::{self, AssertUnwindSafe};
-
-    /// Panics absorbed since the library was loaded.
-    static CONTAINED: AtomicUsize = AtomicUsize::new(0);
-
-    /// How many panics this boundary has absorbed.
-    ///
-    /// A healthy process reports zero, and a non-zero result is a defect
-    /// report rather than a statistic. It exists so a test can prove the
-    /// net works without the crate having to write to a stream the test
-    /// fixtures compare byte for byte.
-    pub(crate) fn contained() -> usize {
-        CONTAINED.load(Ordering::Relaxed)
-    }
-
-    /// Runs `body`, returning `fallback` if it panics.
-    ///
-    /// `fallback` is evaluated by the caller, so it must be a plain value
-    /// and not itself able to fail. That is deliberate: the recovery path
-    /// has to be incapable of the fault it is recovering from.
-    pub(crate) fn guard<T, F>(fallback: T, body: F) -> T
-    where
-        F: FnOnce() -> T,
-    {
-        // `AssertUnwindSafe` is unavoidable and is sound here for a reason
-        // worth stating rather than waving through: the closures this
-        // wraps capture raw pointers handed over by C, and a raw pointer
-        // is never `UnwindSafe`. The lint exists to stop a caller
-        // observing a Rust value left half-updated by an unwind, but C
-        // owns the memory behind these pointers and inspects it after the
-        // call in either outcome. The boundary is itself where the
-        // invariant is restored, by returning a documented failure value.
-        match panic::catch_unwind(AssertUnwindSafe(body)) {
-            Ok(value) => value,
-            Err(payload) => {
-                CONTAINED.fetch_add(1, Ordering::Relaxed);
-                // Releasing the payload runs the caller's own `Drop` when
-                // the panic came from `panic_any` with a type of their
-                // choosing, so the release is contained too. A panic
-                // raised while already unwinding aborts by Rust's own
-                // rules, and that is the single case no library can
-                // intercept.
-                let _ = panic::catch_unwind(AssertUnwindSafe(move || {
-                    drop(payload);
-                }));
-                fallback
-            }
-        }
-    }
-
-    /// Runs `body`, returning a null pointer if it panics.
-    ///
-    /// Covers every entry point declared to return `char *`, `CURL *`,
-    /// `CURLM *`, `CURLSH *`, `CURLU *`, `CURL **`, `struct curl_slist *`,
-    /// `curl_mime *`, `curl_mimepart *` or `struct curl_header *`.
-    pub(crate) fn guard_ptr<T, F>(body: F) -> *mut T
-    where
-        F: FnOnce() -> *mut T,
-    {
-        guard(core::ptr::null_mut(), body)
-    }
-
-    /// Runs `body`, returning a null `const` pointer if it panics.
-    ///
-    /// Covers the entry points declared to return `const char *` or
-    /// `const struct curl_ws_frame *`.
-    pub(crate) fn guard_const_ptr<T, F>(body: F) -> *const T
-    where
-        F: FnOnce() -> *const T,
-    {
-        guard(core::ptr::null(), body)
-    }
-
-    /// Runs `body` and returns quietly if it panics.
-    ///
-    /// Covers the six entry points with no error channel at all:
-    /// `curl_global_cleanup`, `curl_free`, `curl_slist_free_all`,
-    /// `curl_mime_free`, `curl_formfree` and `curl_url_cleanup`.
-    pub(crate) fn guard_void<F>(body: F)
-    where
-        F: FnOnce(),
-    {
-        guard((), body);
-    }
-}
-
-/// libcurl's five replaceable allocator hooks.
-///
-/// This is the Rust counterpart of `Curl_cmalloc`, `Curl_cfree`,
-/// `Curl_crealloc`, `Curl_cstrdup` and `Curl_ccalloc`
-/// (`lib/easy.c:106-110`), and it backs `curl_global_init_mem`. Read the
-/// crate-level documentation for the scope of what these hooks observe:
-/// every buffer this crate hands to C passes through them, and the
-/// engine's internal Rust allocations do not, which is a deviation stated
-/// there in full along with the two measurements that force it.
-///
-/// The hook types below mirror the five typedefs at
-/// `include/curl/curl.h:469-473`. They are private and are given names
-/// distinct from the C typedefs on purpose: the ABI typedefs belong to the
-/// verbatim header text that `cbindgen.toml` and `ffi/handle.rs` own, and
-/// nothing here should be mistaken for them or collide with them. The
-/// `[export] include` allow-list in `cbindgen.toml` independently keeps
-/// them out of the generated header.
-#[allow(dead_code)]
-#[allow(unsafe_code)]
-pub(crate) mod memory {
-    use core::ffi::{c_char, c_void};
-    use core::ptr;
-    use std::ffi::CStr;
-    use std::sync::Mutex;
-
-    /// Mirrors `curl_malloc_callback` (`include/curl/curl.h:469`).
-    type MallocFn = unsafe extern "C" fn(usize) -> *mut c_void;
-    /// Mirrors `curl_free_callback` (`include/curl/curl.h:470`).
-    type FreeFn = unsafe extern "C" fn(*mut c_void);
-    /// Mirrors `curl_realloc_callback` (`include/curl/curl.h:471`).
-    type ReallocFn = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
-    /// Mirrors `curl_strdup_callback` (`include/curl/curl.h:472`).
-    type StrdupFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
-    /// Mirrors `curl_calloc_callback` (`include/curl/curl.h:473`).
-    type CallocFn = unsafe extern "C" fn(usize, usize) -> *mut c_void;
-
-    /// All five hooks, stored and replaced as a single value.
-    ///
-    /// Grouping them is not a convenience. `curl_global_init_mem` takes
-    /// all five together, and a set that were installed one at a time
-    /// could be observed half-replaced by another thread, which would
-    /// pair one allocator's `malloc` with another's `free`. A tuple is
-    /// used rather than a named struct so that this module declares no
-    /// type that could be confused with an ABI type.
-    type Hooks = (MallocFn, FreeFn, ReallocFn, StrdupFn, CallocFn);
-
-    /// `None` means the C library defaults are in force.
-    ///
-    /// A `Mutex` rather than a set of atomics, for two reasons. It makes
-    /// the five-at-once replacement above trivially correct, and it needs
-    /// no transmute between a function pointer and an integer, so this
-    /// module stores no address it has to reconstitute. `Mutex::new` is a
-    /// `const` constructor, so there is no lazy initialisation and no
-    /// start-up ordering problem. These paths run when a buffer crosses
-    /// the C boundary, not in any hot loop, so the lock is not on a
-    /// critical path.
-    static HOOKS: Mutex<Option<Hooks>> = Mutex::new(None);
-
-    /// Copies the installed hooks out, if any are installed.
-    ///
-    /// The copy is taken so that the lock is released before any hook
-    /// runs. A callback that re-entered libcurl while the lock was held
-    /// would deadlock, and function pointers are `Copy`, so avoiding it
-    /// costs nothing. Poisoning is absorbed rather than propagated: the
-    /// protected value is five function pointers with no invariant a
-    /// panic could break, and refusing to release memory because an
-    /// unrelated thread panicked would be strictly worse than proceeding.
-    fn snapshot() -> Option<Hooks> {
-        *HOOKS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Installs a complete hook set, as `curl_global_init_mem` does.
-    ///
-    /// Returns `false`, and installs nothing, when any hook is null. That
-    /// is exactly what `lib/easy.c:220-221` tests before returning
-    /// `CURLE_FAILED_INIT`. Choosing that `CURLcode` is the caller's job,
-    /// which is what keeps this module free of ABI enumerations.
-    ///
-    /// The replacement is legal only before any other libcurl call, per
-    /// `include/curl/curl.h:2743-2745`, because a block must be released
-    /// by the allocator that produced it. Nothing here can enforce that
-    /// ordering, and pretending otherwise would be worse than saying so.
-    pub(crate) fn install(
-        malloc: Option<MallocFn>,
-        free: Option<FreeFn>,
-        realloc: Option<ReallocFn>,
-        strdup: Option<StrdupFn>,
-        calloc: Option<CallocFn>,
-    ) -> bool {
-        let (Some(m), Some(f), Some(r), Some(s), Some(c)) =
-            (malloc, free, realloc, strdup, calloc)
-        else {
-            return false;
-        };
-        *HOOKS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some((m, f, r, s, c));
-        true
-    }
-
-    /// Restores the C library defaults, as `lib/easy.c:129-133` does.
-    pub(crate) fn reset() {
-        *HOOKS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-    }
-
-    /// Whether application-supplied hooks are currently in force.
-    pub(crate) fn is_installed() -> bool {
-        snapshot().is_some()
-    }
-
-    /// Allocates `size` bytes for the C caller to own.
-    ///
-    /// Returns null on failure, as C `malloc` does. A `size` of zero is
-    /// forwarded unchanged, so the result is whatever the active allocator
-    /// returns for it, which is the same latitude C libcurl allows.
-    pub(crate) fn malloc(size: usize) -> *mut c_void {
-        match snapshot() {
-            Some((hook, ..)) => {
-                // SAFETY: `hook` reached `install` as a
-                // `curl_malloc_callback`, whose contract at
-                // `include/curl/curl.h:2763-2768` is that it behaves as
-                // `malloc`; `install` rejected null. No value of `size`
-                // can make the call itself unsound.
-                unsafe { hook(size) }
-            }
-            None => {
-                // SAFETY: `libc::malloc` has no precondition beyond a
-                // valid `size_t`, and every `usize` is one on all four
-                // supported targets, which are all 64-bit Unix.
-                unsafe { libc::malloc(size) }
-            }
-        }
-    }
-
-    /// Allocates `nmemb * size` zeroed bytes for the C caller to own.
-    pub(crate) fn calloc(nmemb: usize, size: usize) -> *mut c_void {
-        match snapshot() {
-            Some((_, _, _, _, hook)) => {
-                // SAFETY: `hook` reached `install` as a
-                // `curl_calloc_callback` and is non-null. Overflow of
-                // `nmemb * size` is the allocator's to detect and report
-                // by returning null, exactly as C `calloc` must.
-                unsafe { hook(nmemb, size) }
-            }
-            None => {
-                // SAFETY: `libc::calloc` has no precondition beyond two
-                // valid `size_t` arguments and reports overflow by
-                // returning null.
-                unsafe { libc::calloc(nmemb, size) }
-            }
-        }
-    }
-
-    /// Resizes a block obtained from this module.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must be null, or a live block previously returned by this
-    /// module while the *same* hook set was in force. Passing null is
-    /// well defined and allocates, as C `realloc` requires.
-    pub(crate) unsafe fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
-        match snapshot() {
-            Some((_, _, hook, _, _)) => {
-                // SAFETY: `hook` reached `install` as a
-                // `curl_realloc_callback` and is non-null, and this
-                // function's own contract has already obliged the caller
-                // to pass a pointer that hook set produced.
-                unsafe { hook(ptr, size) }
-            }
-            None => {
-                // SAFETY: this function's contract obliges the caller to
-                // pass null or a live block from the same default path,
-                // which is `libc::realloc`'s only precondition.
-                unsafe { libc::realloc(ptr, size) }
-            }
-        }
-    }
-
-    /// Releases a block obtained from this module.
-    ///
-    /// Null is forwarded to the hook rather than filtered out, because C
-    /// `free` defines it as a no-op and libcurl does pass it -- the
-    /// `Curl_safefree` idiom releases unconditionally -- so filtering
-    /// would hide calls an accounting hook legitimately expects to see.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must be null, or a live block previously returned by this
-    /// module while the *same* hook set was in force, and must not have
-    /// been released already. Releasing across a hook replacement is the
-    /// mismatch the crate-level documentation describes, which is why
-    /// `curl_global_init_mem` may only be called before anything else.
-    pub(crate) unsafe fn free(ptr: *mut c_void) {
-        match snapshot() {
-            Some((_, hook, _, _, _)) => {
-                // SAFETY: `hook` reached `install` as a
-                // `curl_free_callback` and is non-null, and this
-                // function's contract has already obliged the caller to
-                // pass a pointer that hook set produced, or null.
-                unsafe { hook(ptr) }
-            }
-            None => {
-                // SAFETY: this function's contract obliges the caller to
-                // pass null or a live block from the same default path,
-                // which is `libc::free`'s only precondition.
-                unsafe { libc::free(ptr) }
-            }
-        }
-    }
-
-    /// Duplicates a C string into caller-owned memory.
-    ///
-    /// A null input yields null instead of undefined behaviour. That is a
-    /// deliberate and stated divergence: the default hook is the C
-    /// library's `strdup` (`lib/curl_setup.h:1450` defines
-    /// `CURLX_STRDUP_LOW` as `strdup`), which has no defined behaviour on
-    /// null, and libcurl simply never passes it one. Guarding costs a
-    /// branch, is indistinguishable to every conforming caller, and turns
-    /// a latent undefined behaviour into a null return.
-    ///
-    /// When no hook is installed the copy is made through this module's own
-    /// `malloc` rather than by calling the C library's `strdup`. The two
-    /// are indistinguishable to a caller -- curl's own default reaches
-    /// `malloc` through `strdup` anyway -- and routing through `malloc`
-    /// buys two things. The duplicate provably comes from the same
-    /// allocator as everything else here, so releasing it with `free` is
-    /// symmetric by construction rather than by coincidence; and it keeps
-    /// the module executable under Miri, which shims `malloc`, `calloc`,
-    /// `realloc`, `free` and `strlen` but rejects `strdup` outright with
-    /// "unsupported operation: can't call foreign function `strdup`". That
-    /// was measured, not assumed, and it would otherwise have made the
-    /// crate's own tests unrunnable under a required gate.
-    ///
-    /// # Safety
-    ///
-    /// `s` must be null, or a pointer to a NUL-terminated C string that
-    /// stays valid and unmodified for the duration of the call.
-    pub(crate) unsafe fn strdup(s: *const c_char) -> *mut c_char {
-        if s.is_null() {
-            return ptr::null_mut();
-        }
-        if let Some((_, _, _, hook, _)) = snapshot() {
-            // SAFETY: `hook` reached `install` as a
-            // `curl_strdup_callback` and is non-null; `s` is non-null and
-            // NUL-terminated by this function's own contract, which is
-            // all `strdup` requires.
-            return unsafe { hook(s) };
-        }
-        // SAFETY: `s` is non-null and points to a NUL-terminated string
-        // that stays valid for the call, by this function's contract, so
-        // the borrow ends before anything can invalidate it. The bytes it
-        // yields exclude the terminator, which `copy_to_c_string` adds
-        // back.
-        let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
-        copy_to_c_string(bytes)
-    }
-
-    /// Copies `bytes` into caller-owned C memory and appends a NUL.
-    ///
-    /// This is the primitive behind every entry point that returns a
-    /// string the application later releases with `curl_free`, such as
-    /// `curl_escape`, `curl_easy_escape`, `curl_maprintf` and
-    /// `curl_getenv`. Going through it rather than through
-    /// `CString::into_raw` is what makes those buffers the application's
-    /// own allocator's, so that `curl_free` -- and a plain `free`, which
-    /// applications do use -- behave exactly as against C libcurl.
-    ///
-    /// Returns null if the allocation fails or if the length plus its
-    /// terminator would overflow. `bytes` is copied verbatim, so an
-    /// interior NUL is preserved in the buffer and simply terminates the
-    /// string early as far as C is concerned; callers that must reject
-    /// that case check before calling, which is where the knowledge of
-    /// whether it matters lives.
-    pub(crate) fn copy_to_c_string(bytes: &[u8]) -> *mut c_char {
-        let Some(total) = bytes.len().checked_add(1) else {
-            return ptr::null_mut();
-        };
-        let block = malloc(total);
-        if block.is_null() {
-            return ptr::null_mut();
-        }
-        let out = block.cast::<u8>();
-        // SAFETY: `malloc` returned a non-null block of `total` bytes,
-        // and `total` is `bytes.len() + 1`, so the copy of `bytes.len()`
-        // bytes at offset 0 and the single terminator at offset
-        // `bytes.len()` both land inside it. `bytes` is a live borrowed
-        // slice, so it cannot overlap a block allocated after it, which
-        // is what `copy_nonoverlapping` requires. The destination is a
-        // fresh byte allocation, so it has no alignment requirement
-        // beyond one.
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
-            out.add(bytes.len()).write(0);
-        }
-        out.cast::<c_char>()
-    }
-}
-
-// The 100 exported entry points, and the ABI types the generated header is
-// built from. The module is private on purpose: a `cdylib` exports what is
-// declared `#[no_mangle] pub extern "C"` regardless of the privacy of the
-// module holding it, this crate has no `rlib` target and therefore no Rust
-// consumer, and so `pub` would widen the surface without widening what any
-// caller can reach. For the same reason there is no `pub use ffi::*`.
+// THE SAFETY INVARIANT for this crate, and the executable gate behind it.
 //
-// `#[allow(unsafe_code)]` sits here, on the declaration, rather than at the
-// crate root. That mirrors how `curl-rs-lib` and `curl-rs` are written, and
-// it keeps the sanctioned `unsafe` visibly scoped to the two places that
-// need it -- this module and `mod memory` above -- instead of blanketing
-// the crate.
+// `#![deny(unsafe_code)]` is at the head of this file, and exactly ONE
+// `#[allow(unsafe_code)]` exists in the whole crate: on the `mod ffi`
+// declaration at the foot of this file. Both spellings were compiled before
+// either was chosen.
+//
+// `#![forbid(unsafe_code)]` with `#[allow(unsafe_code)]` on `mod ffi` DOES NOT
+// COMPILE. Measured on the pinned toolchain, verbatim:
+//
+//     error[E0453]: allow(unsafe_code) incompatible with previous forbid
+//       |
+//     1 | #![forbid(unsafe_code)]
+//       |           ----------- `forbid` level set here
+//     2 |
+//     3 | #[allow(unsafe_code)]
+//       |         ^^^^^^^^^^^ overruled by previous forbid
+//
+// `forbid` is by definition un-overridable from an inner scope, so no placement
+// of the `allow` rescues it, and this crate cannot do without one: an
+// `extern "C"` entry point that dereferences a caller-supplied pointer is
+// `unsafe` by construction. `#![deny(unsafe_code)]` with the one `allow`
+// compiles, and the same `unsafe` block moved outside `src/ffi/` is a hard
+// error.
+//
+// One gap remains and is stated rather than glossed over: `deny`, unlike
+// `forbid`, CAN be overridden from an inner scope, so a second deliberate
+// `#[allow(unsafe_code)]` elsewhere in this crate would compile. That is what
+// `mod unsafe_boundary` at the foot of this file closes -- it walks `src/` at
+// test time and asserts that exactly one exemption exists, that it is on
+// `mod ffi`, and that the keyword appears nowhere outside `src/ffi/`. The check
+// is executable, so weakening the boundary fails `cargo test --workspace`
+// rather than merely contradicting a comment.
+//
+// NEVER add `#![allow(unsafe_code)]` at crate level, and NEVER add a second
+// `#[allow(unsafe_code)]` anywhere. Either one converts a checked invariant
+// back into a review obligation.
+// The 100 exported entry points, the two support modules every one of them
+// routes through, and the ABI types the generated header is built from.
+//
+// The module is private on purpose: a `cdylib` exports what is declared
+// `#[no_mangle] pub extern "C"` regardless of the privacy of the module holding
+// it, this crate has no `rlib` target and therefore no Rust consumer, and so
+// `pub` would widen the surface without widening what any caller can reach. For
+// the same reason there is no `pub use ffi::*`.
+//
+// This is the crate's ONLY `#[allow(unsafe_code)]`, and it is on the
+// declaration rather than at the crate root so that the exemption is visibly
+// scoped to one directory. `panic_boundary` and `memory` live *inside* that
+// directory for exactly this reason: two exemptions -- one for `mod memory` at
+// the root and one here -- would have meant two places to audit and would have
+// left the root able to grant a third.
 #[allow(unsafe_code)]
 mod ffi;
 
+// The executable half of the safety gate.
+
 #[cfg(test)]
-mod tests {
-    use super::{memory, panic_boundary};
-    use core::ffi::{c_char, c_void};
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use std::ffi::CStr;
-    use std::sync::{Mutex, MutexGuard};
+mod unsafe_boundary {
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
-    /// Serialises the tests that touch the process-wide hook registry.
-    ///
-    /// `memory`'s state is global by necessity, and the test harness runs
-    /// tests on concurrent threads, so anything that installs or resets
-    /// hooks has to take this first. Poisoning is absorbed for the same
-    /// reason the registry absorbs it: a failure in one test must not turn
-    /// every later test into a spurious failure.
-    static REGISTRY: Mutex<()> = Mutex::new(());
-
-    fn registry_lock() -> MutexGuard<'static, ()> {
-        REGISTRY
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Every `.rs` file under `src/`, relative to the crate directory.
+    fn sources() -> Vec<PathBuf> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        walk(&root, &mut found);
+        assert!(
+            !found.is_empty(),
+            "the walk must find this crate's own sources, or the gate is vacuous"
+        );
+        found.sort();
+        found
     }
 
-    /// Invocation counters for the test hooks below.
-    static MALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static REALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static STRDUP_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static CALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    // The five hooks an application would pass to `curl_global_init_mem`.
-    // Each records that it ran and then delegates to the C library, so a
-    // block they produce is releasable by the matching hook and the test
-    // observes routing without changing allocation behaviour.
-
-    unsafe extern "C" fn test_malloc(size: usize) -> *mut c_void {
-        MALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: `libc::malloc` requires only a valid `size_t`.
-        unsafe { libc::malloc(size) }
-    }
-
-    unsafe extern "C" fn test_free(ptr: *mut c_void) {
-        FREE_CALLS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: this hook is only ever reached through `memory::free`,
-        // whose contract obliges the caller to pass null or a live block
-        // that `test_malloc`, `test_calloc` or `test_realloc` produced,
-        // all of which allocate through `libc`.
-        unsafe { libc::free(ptr) }
-    }
-
-    unsafe extern "C" fn test_realloc(
-        ptr: *mut c_void,
-        size: usize,
-    ) -> *mut c_void {
-        REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: reached only through `memory::realloc`, whose contract
-        // obliges the caller to pass null or a live block from this same
-        // hook set, which allocates through `libc`.
-        unsafe { libc::realloc(ptr, size) }
-    }
-
-    /// Duplicates through `memory::copy_to_c_string`, which reaches
-    /// `memory::malloc` and therefore `test_malloc`. That is intentional:
-    /// it makes this test assert composition -- a hooked `strdup` whose
-    /// storage comes from the hooked `malloc` -- rather than merely
-    /// assert that one hook fired. It also keeps the test free of
-    /// `libc::strdup`, which Miri refuses to call.
-    unsafe extern "C" fn test_strdup(s: *const c_char) -> *mut c_char {
-        STRDUP_CALLS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: reached only through `memory::strdup`, which has already
-        // rejected null and whose contract obliges the caller to pass a
-        // NUL-terminated string valid for the call, so the borrow ends
-        // before anything can invalidate it.
-        let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
-        memory::copy_to_c_string(bytes)
-    }
-
-    unsafe extern "C" fn test_calloc(nmemb: usize, size: usize) -> *mut c_void {
-        CALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: `libc::calloc` requires only two valid `size_t` values.
-        unsafe { libc::calloc(nmemb, size) }
-    }
-
-    fn install_test_hooks() -> bool {
-        memory::install(
-            Some(test_malloc),
-            Some(test_free),
-            Some(test_realloc),
-            Some(test_strdup),
-            Some(test_calloc),
-        )
-    }
-
-    #[test]
-    fn guard_returns_the_body_value_when_nothing_panics() {
-        assert_eq!(panic_boundary::guard(-1_i32, || 42_i32), 42);
-        assert_eq!(panic_boundary::guard(0_usize, || 7_usize), 7);
-    }
-
-    #[test]
-    fn guard_returns_the_fallback_and_counts_a_contained_panic() {
-        let before = panic_boundary::contained();
-        // 2 stands in for `CURLE_FAILED_INIT`, the documented fallback for
-        // the `CURLcode` family. The enumeration itself belongs to
-        // `ffi/codes.rs`, so the assertion is on the integer.
-        let observed: i32 =
-            panic_boundary::guard(2, || panic!("contained on purpose"));
-        assert_eq!(observed, 2);
-        assert!(panic_boundary::contained() > before);
-    }
-
-    #[test]
-    fn guard_ptr_yields_null_on_panic_and_the_pointer_otherwise() {
-        let mut value = 5_u8;
-        let live: *mut u8 = &mut value;
-        assert_eq!(panic_boundary::guard_ptr(|| live), live);
-        let fallback: *mut u8 =
-            panic_boundary::guard_ptr(|| panic!("contained"));
-        assert!(fallback.is_null());
-    }
-
-    #[test]
-    fn guard_const_ptr_yields_null_on_panic() {
-        let fallback: *const c_char =
-            panic_boundary::guard_const_ptr(|| panic!("contained"));
-        assert!(fallback.is_null());
-    }
-
-    #[test]
-    fn guard_void_swallows_a_panic_and_returns_normally() {
-        let before = panic_boundary::contained();
-        panic_boundary::guard_void(|| panic!("no error channel exists"));
-        assert!(panic_boundary::contained() > before);
-    }
-
-    #[test]
-    fn guard_contains_a_panic_whose_payload_drop_also_panics() {
-        // The nastiest shape the boundary has to survive: releasing the
-        // payload runs the caller's `Drop`, and that `Drop` panics too.
-        // Both unwinds must stop inside `guard`.
-        struct Hostile;
-        impl Drop for Hostile {
-            fn drop(&mut self) {
-                panic!("the payload's own drop panicked too");
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(dir).unwrap_or_else(|error| {
+            panic!("cannot read {}: {error}", dir.display())
+        });
+        for entry in entries {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
             }
         }
-        let observed: i32 =
-            panic_boundary::guard(2, || std::panic::panic_any(Hostile));
-        assert_eq!(observed, 2);
     }
 
-    #[test]
-    fn install_rejects_an_incomplete_hook_set() {
-        let _guard = registry_lock();
-        // Each of the five positions is exercised as the missing one,
-        // because `lib/easy.c:220-221` rejects on any of them.
-        assert!(!memory::install(
-            None,
-            Some(test_free),
-            Some(test_realloc),
-            Some(test_strdup),
-            Some(test_calloc),
-        ));
-        assert!(!memory::install(
-            Some(test_malloc),
-            None,
-            Some(test_realloc),
-            Some(test_strdup),
-            Some(test_calloc),
-        ));
-        assert!(!memory::install(
-            Some(test_malloc),
-            Some(test_free),
-            None,
-            Some(test_strdup),
-            Some(test_calloc),
-        ));
-        assert!(!memory::install(
-            Some(test_malloc),
-            Some(test_free),
-            Some(test_realloc),
-            None,
-            Some(test_calloc),
-        ));
-        assert!(!memory::install(
-            Some(test_malloc),
-            Some(test_free),
-            Some(test_realloc),
-            Some(test_strdup),
-            None,
-        ));
-        // A rejected set must leave the previous state untouched.
-        assert!(!memory::is_installed());
+    /// True when `line` *is* an `allow(unsafe_code)` attribute rather than prose
+    /// mentioning one.
+    ///
+    /// The anchoring is what makes the check usable: this file legitimately
+    /// discusses the attribute many times over, and an unanchored search matches
+    /// the discussion and reports a false failure. Skipping leading whitespace
+    /// and then requiring `#[` or `#![` means a comment can never match, because
+    /// a comment begins with a slash.
+    fn is_allow_attribute(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("#[allow(unsafe_code)]")
+            || trimmed.starts_with("#![allow(unsafe_code)]")
     }
 
-    #[test]
-    fn the_default_path_round_trips_an_allocation() {
-        let _guard = registry_lock();
-        memory::reset();
-        let block = memory::malloc(32);
-        assert!(!block.is_null());
-        // SAFETY: `malloc` returned a live 32-byte block, so writing one
-        // byte at offset 0 is in bounds, and a fresh byte allocation has
-        // no alignment requirement beyond one.
-        unsafe { block.cast::<u8>().write(0xAB) };
-        // SAFETY: `block` came from `memory::malloc` under the same hook
-        // set, which is still the default one, and is released once.
-        unsafe { memory::free(block) };
-
-        let zeroed = memory::calloc(4, 8);
-        assert!(!zeroed.is_null());
-        let start = zeroed.cast::<u8>();
-        // SAFETY: `calloc` returned a live 32-byte block, so a 32-byte read
-        // from its start is in bounds, and `calloc` guarantees it is zeroed.
-        let bytes = unsafe { core::slice::from_raw_parts(start, 32) };
-        assert!(bytes.iter().all(|byte| *byte == 0));
-        // SAFETY: as above, released exactly once.
-        unsafe { memory::free(zeroed) };
-    }
-
-    #[test]
-    fn installed_hooks_receive_every_boundary_allocation() {
-        let _guard = registry_lock();
-        let malloc_before = MALLOC_CALLS.load(Ordering::Relaxed);
-        let free_before = FREE_CALLS.load(Ordering::Relaxed);
-        let calloc_before = CALLOC_CALLS.load(Ordering::Relaxed);
-        let realloc_before = REALLOC_CALLS.load(Ordering::Relaxed);
-        let strdup_before = STRDUP_CALLS.load(Ordering::Relaxed);
-
-        assert!(install_test_hooks());
-        assert!(memory::is_installed());
-
-        let block = memory::malloc(16);
-        assert!(!block.is_null());
-        // SAFETY: `block` is a live 16-byte block from the hook set that
-        // is still installed, and 32 bytes is a valid new size.
-        let grown = unsafe { memory::realloc(block, 32) };
-        assert!(!grown.is_null());
-        // SAFETY: `grown` is the live block that `realloc` returned under
-        // the still-installed hook set, released exactly once. `block` is
-        // not released: `realloc` already consumed it.
-        unsafe { memory::free(grown) };
-
-        let zeroed = memory::calloc(2, 8);
-        assert!(!zeroed.is_null());
-        // SAFETY: live block from the installed hooks, released once.
-        unsafe { memory::free(zeroed) };
-
-        let source = CStr::from_bytes_with_nul(b"curl\0").unwrap();
-        let malloc_pre_strdup = MALLOC_CALLS.load(Ordering::Relaxed);
-        // SAFETY: `CStr::as_ptr` yields a NUL-terminated string that
-        // outlives the call, which is `strdup`'s only precondition.
-        let copy = unsafe { memory::strdup(source.as_ptr()) };
-        assert!(!copy.is_null());
-        // SAFETY: `copy` is NUL-terminated because `strdup` copies through
-        // the terminator, and it stays valid until released below.
-        assert_eq!(unsafe { CStr::from_ptr(copy) }, source);
-        // Composition, not just dispatch: `test_strdup` obtains its
-        // storage from `memory::malloc`, so the hooked `malloc` must have
-        // fired again while servicing the hooked `strdup`. A hook set that
-        // dispatched `strdup` but bypassed `malloc` would pass every other
-        // assertion in this test and fail this one.
-        assert!(MALLOC_CALLS.load(Ordering::Relaxed) > malloc_pre_strdup);
-        // SAFETY: live block from the installed hooks, released once.
-        unsafe { memory::free(copy.cast::<c_void>()) };
-
-        assert!(MALLOC_CALLS.load(Ordering::Relaxed) > malloc_before);
-        assert!(REALLOC_CALLS.load(Ordering::Relaxed) > realloc_before);
-        assert!(CALLOC_CALLS.load(Ordering::Relaxed) > calloc_before);
-        assert!(STRDUP_CALLS.load(Ordering::Relaxed) > strdup_before);
-        assert!(FREE_CALLS.load(Ordering::Relaxed) > free_before);
-
-        memory::reset();
-        assert!(!memory::is_installed());
-    }
-
-    #[test]
-    fn strdup_maps_null_to_null_rather_than_to_undefined_behaviour() {
-        let _guard = registry_lock();
-        memory::reset();
-        // SAFETY: null is explicitly permitted by `strdup`'s contract and
-        // is the case under test.
-        let copy = unsafe { memory::strdup(core::ptr::null()) };
-        assert!(copy.is_null());
-    }
-
-    #[test]
-    fn copy_to_c_string_nul_terminates_and_is_caller_freeable() {
-        let _guard = registry_lock();
-        memory::reset();
-        let buffer = memory::copy_to_c_string(b"https://curl.se/");
-        assert!(!buffer.is_null());
-        // SAFETY: `copy_to_c_string` wrote a NUL after the payload, so the
-        // block is a valid C string that stays live until released.
-        let seen = unsafe { CStr::from_ptr(buffer) };
-        assert_eq!(seen.to_bytes(), b"https://curl.se/");
-        // SAFETY: the block came from `copy_to_c_string` under the default
-        // hook set, which is still in force, and is released once.
-        unsafe { memory::free(buffer.cast::<c_void>()) };
-
-        // The empty case must still produce a one-byte NUL-terminated
-        // buffer rather than null, because a caller cannot distinguish
-        // "empty" from "failed" otherwise.
-        let empty = memory::copy_to_c_string(b"");
-        assert!(!empty.is_null());
-        // SAFETY: as above; the single byte written is the terminator.
-        assert_eq!(unsafe { CStr::from_ptr(empty) }.to_bytes(), b"");
-        // SAFETY: as above, released exactly once.
-        unsafe { memory::free(empty.cast::<c_void>()) };
-    }
-
-    #[test]
-    fn the_registry_tolerates_concurrent_readers() {
-        let _guard = registry_lock();
-        memory::reset();
-        // `curl_global_init` and `curl_global_trace` are documented
-        // thread-safe at `include/curl/curl.h:2744-2745` and `:2788-2789`,
-        // so the state behind them must be too. Several threads allocate
-        // and release through the registry at once; the test passes if it
-        // neither deadlocks nor observes a torn hook set.
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                std::thread::spawn(|| {
-                    for _ in 0..64 {
-                        let block = memory::malloc(8);
-                        assert!(!block.is_null());
-                        // SAFETY: a live block from the hook set in force
-                        // for this iteration, released exactly once.
-                        unsafe { memory::free(block) };
-                    }
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().expect("registry access must not panic");
+    /// `line` with its comment tail and every string literal removed, leaving
+    /// only the code that the compiler would see as identifiers and punctuation.
+    ///
+    /// Both removals are necessary, and each was necessary in practice rather
+    /// than in theory. Dropping comments is obvious: this crate *discusses* the
+    /// keyword and the attribute at length, and an unfiltered scan reports the
+    /// prose as violations. Dropping string literals is the one that is easy to
+    /// miss -- the gate below compares against literals such as the block
+    /// opener, so a scan that kept string contents would flag its own
+    /// implementation. Removing both means the gate can live in the file it
+    /// checks, with no self-exemption and no allow-list to maintain.
+    ///
+    /// Escapes are honoured, so a literal containing an escaped quote does not
+    /// desynchronise the parse. Raw strings are not handled and are asserted
+    /// absent by [`the_gate_sees_no_raw_string_literals`], which is what keeps
+    /// this simplification safe rather than merely convenient.
+    fn code_only(line: &str) -> String {
+        let without_comment = line.split("//").next().unwrap_or("");
+        let mut out = String::with_capacity(without_comment.len());
+        let mut in_string = false;
+        let mut escaped = false;
+        for ch in without_comment.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if ch == '"' {
+                in_string = true;
+                // A space keeps the surrounding tokens apart, so a literal
+                // between two identifiers cannot fuse them into one word.
+                out.push(' ');
+                continue;
+            }
+            out.push(ch);
         }
+        out
+    }
+
+    /// True when `line` uses the `unsafe` keyword as code.
+    ///
+    /// Word-boundary matching over [`code_only`], so neither `unsafe_code`
+    /// inside an attribute name nor a function called `uses_unsafe_keyword`
+    /// counts. The remaining limitation is recorded honestly: a `//` sequence
+    /// inside a raw string would truncate the line early, which is exactly what
+    /// [`the_gate_sees_no_raw_string_literals`] rules out.
+    fn uses_unsafe_keyword(line: &str) -> bool {
+        code_only(line)
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|word| word == "unsafe")
+    }
+
+    /// Does `code` open a raw string literal?
+    ///
+    /// A raw string is `r"`, or `r` followed by one or more `#` and then `"`.
+    /// The `r` must NOT be preceded by an identifier character, or the last
+    /// letter of an ordinary word would match: a plain string literal ending
+    /// in the word "for" contains the bytes `r"` and is not a raw string at
+    /// all. That false positive was observed -- it failed
+    /// [`the_gate_sees_no_raw_string_literals`] on an unrelated assertion
+    /// message -- so the boundary check is required for the gate to mean what
+    /// it says rather than to fire on prose.
+    fn starts_a_raw_string(code: &str) -> bool {
+        let bytes = code.as_bytes();
+        for (i, _) in code.match_indices('r') {
+            if i > 0 {
+                let prev = bytes[i - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' {
+                    continue;
+                }
+            }
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] == b'#' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'"' {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn the_raw_string_detector_discriminates() {
+        // Real raw strings, which must be caught.
+        assert!(starts_a_raw_string("let a = r\"x\";"));
+        assert!(starts_a_raw_string("let a = r#\"x\"#;"));
+        assert!(starts_a_raw_string("let a = r###\"x\"###;"));
+        assert!(starts_a_raw_string("r\"at the start\""));
+        assert!(starts_a_raw_string("(r\"after a paren\")"));
+        // Not raw strings. The first is the case that actually fired: an
+        // ordinary literal whose last word ends in `r`.
+        assert!(!starts_a_raw_string("\"every callback accounted for\""));
+        assert!(!starts_a_raw_string("\"a user\", \"a doctor\""));
+        assert!(!starts_a_raw_string("let r = 1;"));
+        assert!(!starts_a_raw_string("foo(bar\")"));
+        assert!(!starts_a_raw_string("let x: r#type = 1;"));
+        assert!(!starts_a_raw_string(""));
+    }
+
+    #[test]
+    fn the_gate_sees_no_raw_string_literals() {
+        // [`code_only`] does not understand `r"..."` or `r#"..."#`. Rather than
+        // implement a lexer, the gate asserts the simplification holds: no
+        // source under `src/` uses a raw string. If one is ever introduced, this
+        // test fails and says so, instead of the two checks below silently
+        // losing coverage.
+        let mut offenders = Vec::new();
+        for path in sources() {
+            let text =
+                fs::read_to_string(&path).expect("a readable source file");
+            for (index, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if starts_a_raw_string(code) {
+                    offenders.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "code_only does not lex raw strings; found {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn exactly_one_exemption_exists_and_it_is_on_mod_ffi() {
+        let mut sites = Vec::new();
+        for path in sources() {
+            let text =
+                fs::read_to_string(&path).expect("a readable source file");
+            let lines: Vec<&str> = text.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if is_allow_attribute(line) {
+                    // The declaration the attribute applies to is the next line
+                    // that is neither blank nor another attribute.
+                    let target = lines[index + 1..]
+                        .iter()
+                        .find(|next| {
+                            let t = next.trim_start();
+                            !t.is_empty() && !t.starts_with('#')
+                        })
+                        .copied()
+                        .unwrap_or("");
+                    sites.push((
+                        path.clone(),
+                        index + 1,
+                        target.trim().to_string(),
+                    ));
+                }
+            }
+        }
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "exactly one allow(unsafe_code) may exist in this crate; found {sites:?}"
+        );
+        let (path, _line, target) = &sites[0];
+        assert!(
+            path.ends_with("src/lib.rs"),
+            "the one exemption must live in the crate root, not {}",
+            path.display()
+        );
+        assert_eq!(
+            target, "mod ffi;",
+            "the one exemption must apply to `mod ffi`, not to {target:?}"
+        );
+    }
+
+    #[test]
+    fn the_unsafe_keyword_appears_only_under_src_ffi() {
+        let mut outside = Vec::new();
+        let mut inside = 0usize;
+        for path in sources() {
+            let under_ffi = path
+                .components()
+                .any(|component| component.as_os_str() == "ffi");
+            let text =
+                fs::read_to_string(&path).expect("a readable source file");
+            for (index, line) in text.lines().enumerate() {
+                if uses_unsafe_keyword(line) {
+                    if under_ffi {
+                        inside += 1;
+                    } else {
+                        outside.push(format!(
+                            "{}:{}",
+                            path.display(),
+                            index + 1
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            outside.is_empty(),
+            "`unsafe` may appear only under src/ffi/; found {outside:?}"
+        );
+        // Discriminating rather than vacuous: the FFI tree really does use the
+        // keyword, so an expression that matched nothing would be caught here.
+        assert!(
+            inside > 0,
+            "the gate found no `unsafe` under src/ffi/, so it is not testing \
+             anything"
+        );
+    }
+
+    #[test]
+    fn every_unsafe_block_under_src_ffi_is_covered_by_a_safety_comment() {
+        // "Immediately preceded by a `// SAFETY:` line" is the natural phrasing
+        // and is measurably wrong: the justifications here run to several lines,
+        // so the line directly above an `unsafe` is the LAST line of the block,
+        // not its opener. The check walks back over blank lines and attributes,
+        // then over the contiguous run of `//` comment lines, and requires that
+        // run to contain a line beginning `// SAFETY:`.
+        //
+        // Only `unsafe` *blocks* and `unsafe` *impl*s need a justification. An
+        // `unsafe fn` declaration and an `unsafe extern "C" fn` definition state
+        // their contract in their doc comment instead, which is where a caller
+        // reads it.
+        let mut uncovered = Vec::new();
+        let mut covered = 0usize;
+        for path in sources() {
+            if !path.components().any(|c| c.as_os_str() == "ffi") {
+                continue;
+            }
+            let text =
+                fs::read_to_string(&path).expect("a readable source file");
+            let lines: Vec<&str> = text.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                let stripped = code_only(line);
+                let code = stripped.trim();
+                let is_block = code == "unsafe {"
+                    || code.ends_with(" unsafe {")
+                    || code.starts_with("unsafe impl ");
+                if !is_block {
+                    continue;
+                }
+                let mut cursor = index;
+                let mut found = false;
+                while cursor > 0 {
+                    cursor -= 1;
+                    let above = lines[cursor].trim_start();
+                    if above.is_empty() || above.starts_with('#') {
+                        continue;
+                    }
+                    if above.starts_with("//") {
+                        if above.starts_with("// SAFETY:") {
+                            found = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                if found {
+                    covered += 1;
+                } else {
+                    uncovered.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        }
+
+        assert!(
+            uncovered.is_empty(),
+            "every unsafe block under src/ffi/ needs a `// SAFETY:` comment; \
+             uncovered: {uncovered:?}"
+        );
+        assert!(covered > 0, "the gate found no unsafe blocks to check");
+    }
+}
+
+// The executable half of the capability-truthfulness contract.
+//
+// WHY THIS GATE EXISTS. Review finding M-22 recorded that the generated
+// consumer metadata and the runtime `--version` banner "describe different
+// products": the metadata added `asyn-rr` and `HTTPSRR`, omitted the truthful
+// `HTTPS-proxy`, and under `memdebug` emitted `Debug` plus a nonstandard
+// standalone `TrackMemory`, while the runtime did the opposite. The root cause
+// was structural -- a hand-mirrored capability table in `build.rs` sitting
+// beside the live table in `curl-rs-lib/src/version.rs`, with a comment
+// conceding the two "cannot be unified in code here" and a correspondence
+// check that was never written.
+//
+// The mirror is gone: `build.rs` now DERIVES both advertised sets from the
+// engine's own tables, which specification 0.4.1 makes the authority for the
+// banner. That removes the drift at its source. This gate is the independent
+// confirmation, and it is deliberately NOT a second copy of the derivation --
+// it reads the metadata artifact that consumers actually get and compares it
+// against the engine's live answer, so it would catch a defect in the
+// derivation itself and not merely a divergence between two lists.
+//
+// THE ASSERTION IS ASYMMETRIC, ON PURPOSE. Specification 0.6.5 measured that
+// `tests/runtests.pl` uses the advertised sets to decide fixture eligibility:
+// under-reporting a capability makes a fixture SKIP, while over-reporting makes
+// it RUN AND FAIL. So the contract is containment, not equality --
+// static must be a SUBSET of runtime. That is what lets the static metadata
+// legitimately withhold `GSS-API`, `Kerberos` and `SPNEGO`, whose availability
+// only a running process can establish.
+
+#[cfg(test)]
+mod capability_truthfulness {
+    /// The generated pkg-config metadata, baked in at compile time.
+    ///
+    /// `include_str!` rather than a runtime read: it guarantees the gate sees
+    /// exactly the artifact this build produced, and makes a missing file a
+    /// compile error instead of a silently skipped assertion.
+    const LIBCURL_PC: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/libcurl.pc"));
+
+    /// The value of one `key="value"` line of the generated metadata.
+    fn pc_variable(key: &str) -> Vec<String> {
+        let prefix = format!("{key}=");
+        let line = LIBCURL_PC
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the generated libcurl.pc declares no `{key}`; the gate \
+                     cannot confirm the advertised set without it"
+                )
+            });
+        line[prefix.len()..]
+            .trim()
+            .trim_matches('"')
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn static_metadata_never_advertises_a_feature_the_engine_withholds() {
+        let advertised = pc_variable("supported_features");
+        let runtime = curl_rs_lib::version::feature_names();
+
+        assert!(
+            !advertised.is_empty(),
+            "the generated metadata advertises no feature at all, which would \
+             make the derivation vacuous"
+        );
+
+        let over: Vec<&String> = advertised
+            .iter()
+            .filter(|token| !runtime.contains(&token.as_str()))
+            .collect();
+        assert!(
+            over.is_empty(),
+            "the generated metadata advertises {over:?}, which the engine's \
+             own banner does not. Over-reporting makes a gated fixture run and \
+             fail (specification 0.6.5), so the two surfaces must not diverge \
+             in this direction. Advertised: {advertised:?}; runtime: {runtime:?}"
+        );
+    }
+
+    #[test]
+    fn debug_and_trackmemory_never_appear_in_generated_metadata() {
+        // `Debug` gates ALL memory checking in the harness, and specification
+        // 0.6.6 records the deliberate decision to withhold it so the 28
+        // `<limits>` fixtures go inert rather than fail. `TrackMemory` is not a
+        // curl feature token at all -- the harness DERIVES it from /Debug/i --
+        // so emitting it standalone would advertise a vocabulary curl does not
+        // have. Both were emitted by the deleted mirror table.
+        let advertised = pc_variable("supported_features");
+        for forbidden in ["Debug", "TrackMemory"] {
+            assert!(
+                !advertised.iter().any(|token| token == forbidden),
+                "{forbidden} must never be advertised (specification 0.6.6); \
+                 found it in {advertised:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_protocol_surfaces_agree_under_the_documented_case_rule() {
+        // The engine spells schemes lower case, as `curl --version` does;
+        // `curl-config --protocols` and pkg-config spell them upper case, as
+        // configure.ac:5327 and CMakeLists.txt:1994 do. One list serves both,
+        // so the only permitted difference is that case change.
+        let advertised = pc_variable("supported_protocols");
+        let runtime: Vec<String> = curl_rs_lib::version::protocols()
+            .iter()
+            .map(|scheme| scheme.to_uppercase())
+            .collect();
+
+        // NOT asserted non-empty, and the reason is the same honesty rule the
+        // rest of this module turns on. Every row of the engine's protocol
+        // table is gated on its implementation module being present, and no
+        // protocol module has landed yet, so the truthful advertised set is
+        // empty and the generated metadata says so. Requiring a scheme here
+        // would demand that the metadata claim one -- over-reporting, which
+        // makes a gated fixture run and fail (specification 0.6.5), where
+        // under-reporting only makes it skip. What IS asserted is that the two
+        // surfaces agree, in either direction: one going non-empty while the
+        // other stays empty is exactly the divergence this test exists to
+        // catch, and it fails the comparison below.
+        let mut expected = runtime;
+        expected.sort_unstable();
+        let mut found = advertised;
+        found.sort_unstable();
+        assert_eq!(
+            found, expected,
+            "the generated protocol list and the engine's banner disagree. \
+             They are derived from one table, so a difference here means the \
+             derivation or the case rule is wrong."
+        );
+    }
+}
+
+// The executable half of the cross-crate seam.
+//
+// Review finding M-13: `curl_getdate` is one of the 100 exported symbols and
+// needs a date parser, which lives in `curl-rs-lib`'s `pub(crate) mod util`.
+// A private path cannot be named across a crate boundary, so before the fix
+// this crate had exactly two options -- reimplement `lib/parsedate.c` here, or
+// widen the engine. It was closed by widening the engine, because a copy would
+// put protocol-adjacent logic in a crate whose entire job is the C ABI.
+//
+// The test below asserts the SEAM, not the parser: that the one re-exported
+// name is reachable from here, that it answers correctly, and that the two
+// quirks of `curl_getdate`'s contract are already applied on the engine side so
+// the eventual `extern "C"` shim contains nothing but marshalling. The parser
+// itself is verified against the real `libcurl.so.4` in
+// `curl-rs-lib/src/util/parsedate.rs`, which is where that evidence belongs.
+
+#[cfg(test)]
+mod engine_seam {
+    // The boundary's own module, named rather than glob-imported so every use
+    // below reads `panic_boundary::...` and stays attributable to it. The
+    // process types are needed because the hook writes to the real standard
+    // error, which only a child process can observe -- see
+    // [`spawn_panic_child`].
+    use crate::ffi::panic_boundary;
+    use std::process::{Command, Output, Stdio};
+
+    /// The engine's date parser is reachable and correct from this crate.
+    #[test]
+    fn the_date_parser_is_reachable_through_the_crate_root() {
+        // Named through the ROOT re-export. `curl_rs_lib::util::parsedate::...`
+        // would not compile, and that is the point: the engine exposes one
+        // name, not a module.
+        assert_eq!(
+            curl_rs_lib::getdate("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        // Failure is out of band, so the shim maps `None` to `-1` and needs no
+        // knowledge of why the parse failed.
+        assert_eq!(curl_rs_lib::getdate("not a date"), None);
+    }
+
+    #[test]
+    fn the_minus_one_quirk_is_already_applied_on_the_engine_side() {
+        // `curl_getdate` cannot return -1 for a SUCCESSFUL parse, because -1
+        // is its failure sentinel; C increments that one instant to 0. If the
+        // engine did not do this, the shim would have to, and the finding
+        // would only have moved rather than been resolved.
+        assert_eq!(
+            curl_rs_lib::getdate("Wed, 31 Dec 1969 23:59:59 GMT"),
+            Some(0)
+        );
+        // Which means no successful parse ever yields the sentinel, so
+        // `unwrap_or(-1)` in the shim is unambiguous.
+        for input in [
+            "Wed, 31 Dec 1969 23:59:59 GMT",
+            "Thu, 01 Jan 1970 00:00:00 GMT",
+            "Wed, 31 Dec 1969 23:59:58 GMT",
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+        ] {
+            assert_ne!(
+                curl_rs_lib::getdate(input),
+                Some(-1),
+                "{input:?} must not collide with the failure sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn the_internal_capped_variant_is_not_reachable_from_here() {
+        // `Curl_getdate_capped` is NOT one of the 100 exported symbols, so the
+        // engine keeps it `pub(crate)`. This test documents that boundary; the
+        // compiler enforces it. Uncommenting the line below is a compile error
+        // (E0603, module `util` is private), which is the desired state:
+        //
+        //     curl_rs_lib::util::parsedate::getdate_capped("20011231");
+        //
+        // What IS reachable is the single exported name, and nothing else from
+        // that tree.
+        assert!(curl_rs_lib::getdate("20011231").is_some());
+    }
+
+    // -- The crate-root safety gate (finding 19) ---------------------------
+
+    #[test]
+    fn the_audited_unsafe_allowances_are_exactly_three() {
+        // The invariant the crate-root gate names, asserted rather than
+        // described. `#![deny(unsafe_code)]` is defeatable by an inner allow,
+        // so the count is the second half of the enforcement: a fourth
+        // allowance is a finding, and this is where it is caught.
+        //
+        // Read from disk so the assertion is about the files rather than
+        // about a copy of the list kept in the test, and read EVERY source in
+        // the crate rather than this one, because the gap the gate names is an
+        // allowance "elsewhere in this crate": `deny`, unlike `forbid`, can be
+        // overridden from an inner scope, so counting only this file would
+        // leave the one placement that defeats it unmeasured. The pattern is
+        // anchored to column zero, exactly as the comment on the gate
+        // specifies, because an unanchored one also matches the prose.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut sources = Vec::new();
+        let mut pending = vec![std::path::PathBuf::from(root)];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                // Reachable when this crate is compiled outside the workspace
+                // layout; the assertion would then be about the harness.
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    sources.push(path);
+                }
+            }
+        }
+        assert!(
+            sources.len() >= 2,
+            "the crate has more than one source file; found {sources:?}"
+        );
+
+        let mut carriers = Vec::new();
+        for path in &sources {
+            let text = std::fs::read_to_string(path).expect("a readable file");
+            let count = text
+                .lines()
+                .filter(|line| *line == "#[allow(unsafe_code)]")
+                .count();
+            for _ in 0..count {
+                carriers.push(path.clone());
+            }
+        }
+        assert_eq!(
+            carriers.len(),
+            1,
+            "exactly ONE `#[allow(unsafe_code)]` may exist in this crate -- on \
+             the `mod ffi` declaration at the foot of the crate root. A second \
+             one compiles, which is why it is counted here. Found: {carriers:?}"
+        );
+        assert!(
+            carriers[0].ends_with("lib.rs"),
+            "the single allowance must sit on the `mod ffi` declaration in the \
+             crate root, not in a module that the root cannot audit; found \
+             {carriers:?}"
+        );
+
+        // And the crate root really is at `deny`, not merely documented as
+        // such. Measured, because a lint level that is only in a comment
+        // enforces nothing -- which was the whole of the finding. This half
+        // reads the root through `include_str!`, which cannot fail, so the
+        // level is asserted even where the directory walk above bailed out.
+        let source = include_str!("lib.rs");
+        assert!(
+            source.lines().any(|line| line == "#![deny(unsafe_code)]"),
+            "the crate root must deny unsafe_code"
+        );
+        assert!(
+            !source.lines().any(|line| line == "#![allow(unsafe_code)]"),
+            "a crate-level allow would silently undo the gate"
+        );
+    }
+
+    // -- The variadic inventory, bound to the build gate (finding 20) ------
+
+    /// The eleven names in this test, read out of the build script.
+    ///
+    /// Parsing rather than duplicating, because a duplicate is a third place
+    /// to keep in step and the whole point of the assertion is that there are
+    /// only two.
+    fn build_script_inventory() -> Vec<String> {
+        let script = include_str!("../build.rs");
+        let start = script
+            .find("const VARIADIC_UNIMPLEMENTABLE:")
+            .expect("build.rs must declare VARIADIC_UNIMPLEMENTABLE");
+        let body = &script[start..];
+        let end = body.find("\n];").expect("the array must be terminated");
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_prefix('"')
+                    .and_then(|rest| rest.split('"').next())
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_variadic_inventory_matches_the_build_gate() {
+        // Finding 20 asked for three things: establish exactly which exports
+        // have no ABI-correct implementation, make that state impossible to
+        // ship silently, and document the decision it needs. The first and
+        // third live in the crate documentation above; the second lives in
+        // build.rs. This test is what stops the two from diverging, because a
+        // documented caveat that no longer matches the enforcement is worse
+        // than no caveat -- a reader would trust it.
+        let inventory = build_script_inventory();
+        assert_eq!(
+            inventory.len(),
+            11,
+            "the build gate must name exactly eleven exports, found {inventory:?}"
+        );
+
+        let doc = include_str!("lib.rs");
+        // The caveat section ALONE, not the whole crate documentation. Scoping
+        // this correctly is the difference between an assertion and a
+        // formality, and it was measured: with the whole documentation
+        // searched, deleting `curl_maprintf` from the caveat still passed,
+        // because the name also appears in the module table and in the memory
+        // section. Neither of those tells a reader the symbol is
+        // unimplemented, which is the only claim this test is about.
+        // Anchored with its surrounding newlines so the search cannot
+        // match this literal itself: in the documentation the heading is a
+        // line of its own, while here it sits inside a string on a line of
+        // code. Without the anchors `find` returns this offset instead,
+        // and the section then appears to have no following heading.
+        let heading = "\n//! # Open items\n";
+        let start = doc
+            .find(heading)
+            .expect("the crate documentation must carry an open-items section");
+        let body = &doc[start + heading.len()..];
+        let end = body.find("\n//! # ").expect(
+            "the open-items section must be followed by another heading",
+        );
+        let caveats = &body[..end];
+        assert!(
+            caveats.len() > 3_000,
+            "the open-items section did not parse out; got {} bytes",
+            caveats.len()
+        );
+        for name in &inventory {
+            assert!(
+                caveats.contains(name.as_str()),
+                "{name} is refused by the build gate but is not named among \
+                 the crate's open items, so a reader has no way to learn it \
+                 is unimplemented. Naming it elsewhere does not count: the \
+                 module table lists it as a symbol this crate exports, which \
+                 is the opposite claim."
+            );
+        }
+
+        // The spellings a user must type. A caveat that quotes the wrong
+        // variable or the wrong value is an instruction that does not work,
+        // and it would fail in the one direction that matters: the build would
+        // keep refusing and the reader would believe they had complied.
+        let script = include_str!("../build.rs");
+        for (constant, quoted) in [
+            ("A4_DECISION_ENV", "CURL_RS_A4_VARIADIC_DECISION"),
+            ("A4_ACCEPTED", "accept-unsupported-varargs"),
+        ] {
+            assert!(
+                script.contains(&format!(
+                    "const {constant}: &str = \"{quoted}\";"
+                )),
+                "build.rs must define {constant} as {quoted:?}"
+            );
+            assert!(
+                caveats.contains(quoted),
+                "the open-items section must quote {quoted:?} verbatim"
+            );
+        }
+
+        // And the gate must REFUSE rather than warn, which was the finding.
+        // Asserted on the shape of the code, because a gate that returns
+        // `Ok(Some(..))` on the Apple arm64 path is a warning wearing a
+        // refusal's name.
+        let arm = script
+            .find("if !accepted && os == \"macos\" && arch == \"aarch64\" {")
+            .expect("build.rs must guard the Apple arm64 configuration");
+        let tail = &script[arm..];
+        let body = &tail[..tail.find("\n    }").unwrap_or(tail.len())];
+        assert!(
+            body.contains("return Err("),
+            "the aarch64-apple-darwin arm must fail the build, not warn"
+        );
+    }
+
+    // -- Redaction and poisoning at the boundary (finding 26) --------------
+
+    #[test]
+    fn the_redacted_line_carries_no_payload_and_no_path() {
+        // What the hook is permitted to write, asserted byte by byte. The
+        // point of the constant is that nothing derived from the caller's data
+        // or from the build machine can reach standard error, so the assertion
+        // is that the line is free of every ingredient the default hook would
+        // have included.
+        let line = panic_boundary::REDACTED_PANIC_LINE;
+        assert!(line.ends_with('\n'), "one line, terminated");
+        assert_eq!(line.lines().count(), 1, "exactly one line");
+        assert!(line.contains("libcurl bug"), "it must name the fault class");
+
+        for leak in [
+            "panicked at", // the default hook's own wording
+            ".rs",         // any source filename
+            "/",           // any path separator, absolute or relative
+            "curl-rs",     // any crate directory
+            "src",         // the source directory
+        ] {
+            assert!(
+                !line.contains(leak),
+                "the redacted line must not contain {leak:?}"
+            );
+        }
+        assert!(
+            line.is_ascii() && !line.trim_end().contains('\n'),
+            "no embedded newline could forge a second line"
+        );
+    }
+
+    #[test]
+    fn redaction_applies_inside_the_boundary_and_nowhere_else() {
+        // The whole of the hook's decision, and the reason it is factored out
+        // of the hook: a `PanicHookInfo` cannot be constructed by a test.
+        //
+        // Outside any guard the answer must be false, which is what preserves
+        // the application's own hook for the application's own panics -- the
+        // objection that had previously argued against installing a hook at
+        // all.
+        assert!(
+            !panic_boundary::would_redact(),
+            "a panic outside the boundary belongs to the application"
+        );
+
+        let inside = panic_boundary::guard(false, panic_boundary::would_redact);
+        assert!(inside, "a panic raised inside the boundary is ours");
+
+        // And the depth is released again, unwind or not. Asserted after a
+        // guard that *did* panic, because that is the path where a plain
+        // decrement rather than a drop guard would leak the count and redact
+        // every later panic in the process.
+        let _: i32 =
+            panic_boundary::guard(0, || panic!("contained on purpose"));
+        assert!(
+            !panic_boundary::would_redact(),
+            "the depth must be released on the unwinding path too"
+        );
+    }
+
+    #[test]
+    fn a_healthy_handle_runs_its_body_and_stays_usable() {
+        let poison = panic_boundary::Poison::new();
+        assert!(!poison.is_poisoned());
+        let observed = panic_boundary::guard_tx(&poison, -1, || 41 + 1);
+        assert_eq!(observed, 42);
+        assert!(
+            !poison.is_poisoned(),
+            "a completed mutation must not poison"
+        );
+    }
+
+    #[test]
+    fn a_panic_before_a_mutation_poisons_the_handle() {
+        // Half one of what the finding asks to be tested. `catch_unwind`
+        // reports only that the body did not finish, so a panic that never
+        // reached the first write is treated exactly like one that did --
+        // conservative on purpose, and asserted so the conservatism is a
+        // property rather than an accident.
+        let poison = panic_boundary::Poison::new();
+        let mut mutated = false;
+        let observed = panic_boundary::guard_tx(&poison, -1, || {
+            panic!("contained on purpose");
+            #[allow(unreachable_code)]
+            {
+                mutated = true;
+                0
+            }
+        });
+        assert_eq!(observed, -1, "the caller sees the documented fallback");
+        assert!(!mutated, "nothing was written");
+        assert!(poison.is_poisoned(), "and the handle is still poisoned");
+    }
+
+    #[test]
+    fn a_panic_after_a_mutation_poisons_the_handle() {
+        // Half two. The mutation really happened, so the handle is observably
+        // half-updated -- which is exactly the state the poison flag exists to
+        // stop anyone reading.
+        let poison = panic_boundary::Poison::new();
+        let mut staged = 0u32;
+        let observed = panic_boundary::guard_tx(&poison, -1, || {
+            staged = 7;
+            panic!("contained on purpose")
+        });
+        assert_eq!(observed, -1);
+        assert_eq!(staged, 7, "the half-applied write is real");
+        assert!(poison.is_poisoned());
+    }
+
+    #[test]
+    fn a_poisoned_handle_never_runs_another_body() {
+        // The property that makes poisoning worth anything: the half-mutated
+        // state is not merely flagged, it is never read again. A short-circuit
+        // that still ran the body would leave the flag as decoration.
+        let poison = panic_boundary::Poison::new();
+        poison.poison();
+
+        let mut ran = false;
+        let observed = panic_boundary::guard_tx(&poison, -1, || {
+            ran = true;
+            0
+        });
+        assert_eq!(observed, -1);
+        assert!(!ran, "the body of a poisoned handle must not run");
+    }
+
+    #[test]
+    fn poisoning_is_idempotent_and_one_way() {
+        // There is deliberately no `unpoison`, so the only assertion available
+        // is that repetition changes nothing. Recorded as a test because the
+        // absence of an escape hatch is a design decision that a later edit
+        // could quietly reverse.
+        let poison = panic_boundary::Poison::new();
+        poison.poison();
+        poison.poison();
+        assert!(poison.is_poisoned());
+        // `Default` and `new` must agree: a handle built either way starts
+        // healthy, so neither constructor can become the one that forgets.
+        assert!(!panic_boundary::Poison::default().is_poisoned());
+    }
+
+    #[test]
+    fn a_contained_panic_in_a_transaction_is_still_counted() {
+        // `guard_tx` composes with `guard` rather than reimplementing it, so
+        // the panic must reach the same counter. If it stopped doing so, a
+        // whole family of entry points would become invisible to the only
+        // health signal this boundary publishes.
+        let before = panic_boundary::contained();
+        let poison = panic_boundary::Poison::new();
+        let _: i32 =
+            panic_boundary::guard_tx(&poison, -1, || panic!("on purpose"));
+        assert!(panic_boundary::contained() > before);
+    }
+
+    /// The libtest name of a test in this module, for re-execution.
+    ///
+    /// Derived from `module_path!()` with the crate segment dropped, so the
+    /// same code addresses the test whether this file is compiled as the
+    /// `curl` library or included by an out-of-tree type-check harness under a
+    /// different crate name.
+    fn child_test_path(function: &str) -> String {
+        let module = module_path!();
+        let inner = match module.find("::") {
+            Some(at) => &module[at + 2..],
+            None => "",
+        };
+        if inner.is_empty() {
+            function.to_string()
+        } else {
+            format!("{inner}::{function}")
+        }
+    }
+
+    /// The payload the redaction tests look for. Deliberately distinctive.
+    const SENSITIVE_PAYLOAD: &str = "blitzy-secret-payload-9f3c";
+
+    /// Set in the child to select the panic, so a plain run costs nothing.
+    const PANIC_CHILD_VAR: &str = "BLITZY_FFI_PANIC_CHILD";
+
+    /// Re-executes `function` in a child, returning its captured output.
+    ///
+    /// The hook writes to the process's real standard error, which cannot be
+    /// redirected in-process without `dup2`. A child is therefore the only way
+    /// to observe what a C application would actually see, and observing that
+    /// -- rather than the decision that leads to it -- is the whole point.
+    fn spawn_panic_child(function: &str, verbose: bool) -> Option<Output> {
+        let executable = std::env::current_exe().ok()?;
+        let mut command = Command::new(executable);
+        command
+            .arg("--exact")
+            .arg(child_test_path(function))
+            .arg("--nocapture")
+            .env(PANIC_CHILD_VAR, "1")
+            .stdin(Stdio::null());
+        if verbose {
+            command.env(panic_boundary::VERBOSE_ENV, "1");
+        } else {
+            command.env_remove(panic_boundary::VERBOSE_ENV);
+        }
+        command.output().ok()
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "re-executes the test binary; current_exe needs readlink, which \
+                  Miri's isolation refuses"
+    )]
+    fn a_boundary_panic_reaches_stderr_redacted() {
+        let Some(output) =
+            spawn_panic_child("panic_child_raises_in_guard", false)
+        else {
+            // A host that cannot spawn is not a host on which this property can
+            // be observed at all, so skipping is the honest answer rather than
+            // asserting something weaker.
+            return;
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            stderr.contains(panic_boundary::REDACTED_PANIC_LINE.trim_end()),
+            "the constant line must reach stderr, got: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains(SENSITIVE_PAYLOAD),
+            "the payload must never reach stderr, got: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "the default hook's wording must not appear, got: {stderr:?}"
+        );
+        assert!(
+            output.status.success(),
+            "the panic is contained, so the child still passes"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "re-executes the test binary; current_exe needs readlink, which \
+                  Miri's isolation refuses"
+    )]
+    fn the_verbose_opt_in_restores_the_unredacted_diagnostic() {
+        // The other side of the same mechanism, and the proof that the hook is
+        // what suppresses rather than something else swallowing the output. If
+        // this passed while the test above also passed for the wrong reason --
+        // stderr simply never receiving anything -- the payload could not
+        // appear here.
+        let Some(output) =
+            spawn_panic_child("panic_child_raises_in_guard", true)
+        else {
+            return;
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            stderr.contains(SENSITIVE_PAYLOAD),
+            "CURL_RS_PANIC_VERBOSE must restore the payload, got: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains(panic_boundary::REDACTED_PANIC_LINE.trim_end()),
+            "and must not also emit the redacted line, got: {stderr:?}"
+        );
+    }
+
+    #[test]
+    fn panic_child_raises_in_guard() {
+        // Returns immediately unless a parent selected it, so an ordinary run
+        // of the suite pays nothing for it.
+        if std::env::var_os(PANIC_CHILD_VAR).is_none() {
+            return;
+        }
+        let observed: i32 =
+            panic_boundary::guard(2, || panic!("{SENSITIVE_PAYLOAD}"));
+        assert_eq!(observed, 2, "the panic must be contained, not propagated");
+    }
+
+    #[test]
+    fn the_verbose_variable_is_named_as_documented() {
+        // The opt-in is part of the contract, so its spelling is pinned. A
+        // rename would silently remove the only route back to an unredacted
+        // diagnostic, and nothing else in the tree would notice.
+        assert_eq!(panic_boundary::VERBOSE_ENV, "CURL_RS_PANIC_VERBOSE");
     }
 }

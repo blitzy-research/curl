@@ -47,7 +47,7 @@
 //! preprocessor" (`cipher_suite.c:36-37`): each spelling becomes eight 6-bit
 //! indexes into a shared string pool `cs_txt`, packed into `uint8_t zip[6]`
 //! by `CS_ZIP_IDX`, and lookup compares packed forms with `memcmp`. That is a
-//! binary-size optimisation for a table of 200-odd mbedTLS rows, and it is
+//! binary-size optimization for a table of 200-odd mbedTLS rows, and it is
 //! not reproduced here, for two measured reasons.
 //!
 //! First, it would be optimising nothing: the `USE_RUSTLS` build compiles
@@ -64,7 +64,7 @@
 //! `docs/cmdline-opts/ciphers.md` by eye -- and the component structure is
 //! recovered by splitting when the algorithm needs it.
 //!
-//! Two consequences of the packed form are *behaviour*, not optimisation, and
+//! Two consequences of the packed form are *behaviour*, not optimization, and
 //! those are reproduced exactly: at most eight components per spelling
 //! (`cipher_suite.c:557`, `if(i == 8) return -1`), and no empty component
 //! (the pool scan at `cipher_suite.c:567` starts at index 1, skipping the
@@ -73,13 +73,20 @@
 //! # Why ordering is a frozen contract
 //!
 //! The selection returned by [`select_provider_suites`] becomes the cipher
-//! suite list of the TLS ClientHello, in order. The test corpus compares
-//! request bytes as a single joined string with no normalisation and no
-//! reordering, so every ordering decision here is observable on the wire.
-//! Nothing in this module may be reordered, sorted, deduplicated differently
-//! or "canonicalised" -- first-occurrence order is the specification. This is
-//! also why the provider's own suite order is honoured for the default
-//! prefix and suffix instead of being imposed by this module.
+//! suite list of the TLS ClientHello, in order, and the peer chooses from that
+//! list in the order it is offered. Reordering, sorting, deduplicating
+//! differently or "canonicalising" here therefore changes the handshake bytes,
+//! and can change which suite is negotiated: first-occurrence order is the
+//! specification. It is also why the provider's own suite order is honoured for
+//! the default prefix and suffix instead of being imposed by this module.
+//!
+//! The fixture corpus does not police that contract, and this file must not
+//! claim it does. The byte-exact `<protocol>` blocks record the application
+//! stream: `https` fixtures are served through stunnel, which terminates TLS
+//! and forwards plaintext to the same server the plain `http` fixtures use
+//! (`tests/servers.pm` starts the two as a piggybacked pair), so no fixture
+//! observes a ClientHello or names a cipher suite. Ordering here is held by
+//! review and by the tests at the foot of this file.
 //!
 //! # Provider neutrality
 //!
@@ -115,18 +122,26 @@
 //! no path panics on caller-supplied text: an unparsable spelling is `None`,
 //! never an abort.
 
-// `dead_code` is allowed for this module alone, and for one specific reason
-// rather than as a convenience: every consumer of this contract lives in
-// another module -- `tls/rustls_backend.rs` selects the suite list when it
-// builds the client configuration and renders suite names into `--trace`
-// output, and `tls/mod.rs` re-exports the pieces the backend trait needs --
-// so until those land each item here is legitimately unreferenced inside the
-// crate, and the zero-warnings gate would otherwise fail on code that is
-// correct. This mirrors the same allowance, granted for the same reason, in
-// `src/ffi/sys.rs`. No lint level for `unsafe_code` is set here, at any
-// level, by design: the crate root's `#![deny(unsafe_code)]` governs, and
-// this module has nothing to exempt.
-#![allow(dead_code)]
+// `dead_code` is NOT allowed for this module as a whole. Every item below that
+// has no consumer yet carries its own `#[allow(dead_code)]`, written at the
+// item, so the suppression reads as an inventory rather than a blanket: each
+// one is load-bearing, deleting any one of them restores a warning, and an
+// item added later with no consumer is still reported. Each is removed when
+// its consumer lands. A module- or crate-scoped `#![allow(dead_code)]` would
+// instead silence the NEXT item somebody adds, which hides incomplete
+// scaffolding rather than recording it; the rule and the executable gate that
+// enforces it across the workspace live in `curl-rs-lib/src/lib.rs`
+// (`mod source_policy`).
+//
+// Every consumer of this contract lives in another module --
+// `tls/rustls_backend.rs` selects the suite list when it builds the client
+// configuration and renders suite names into `--trace` output, and
+// `tls/mod.rs` re-exports the pieces the backend trait needs -- so until
+// those land each item here is legitimately unreferenced inside the crate,
+// and the zero-warnings gate would otherwise fail on code that is correct.
+// No lint level for `unsafe_code` is set here, at any level, by design: the
+// crate root's `#![deny(unsafe_code)]` governs, and this module has nothing
+// to exempt.
 
 use core::fmt;
 use std::borrow::Cow;
@@ -134,6 +149,11 @@ use std::borrow::Cow;
 use rustls::SupportedCipherSuite;
 
 use crate::error::{CURLcode, CurlResult, Error};
+// The shared control-byte neutralization, defined once in `trace.rs` and used
+// unchanged here so that one implementation decides what a hazardous byte is for
+// every diagnostic this crate emits. `SingleLine` is the mode for a message that
+// is one line by construction; see `SuiteDiagnostic`'s `Display`.
+use crate::trace::{escape_controls, ControlEscaping};
 
 /// The greatest number of components a cipher-suite spelling may have.
 ///
@@ -141,6 +161,7 @@ use crate::error::{CURLcode, CurlResult, Error};
 /// ninth component outright (`cipher_suite.c:544` declares `uint8_t
 /// indexes[8]`, `cipher_suite.c:557-558` returns `-1` once `i == 8`). Eight is
 /// not slack: `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` uses all eight.
+#[allow(dead_code)]
 pub(crate) const MAX_COMPONENTS: usize = 8;
 
 /// The destination size `cipher_suite.h:37-39` documents as sufficient.
@@ -150,6 +171,7 @@ pub(crate) const MAX_COMPONENTS: usize = 8;
 /// in the table is 45 bytes, so 64 leaves room; `tests/unit/unit3205.c:539`
 /// declares exactly `char buf[64]`. Passed to [`get_str_bounded`] this
 /// reproduces the C call the C unit test makes.
+#[allow(dead_code)]
 pub(crate) const NAME_BUFFER_SIZE: usize = 64;
 
 /// Every byte that separates one cipher suite from the next in a list.
@@ -158,7 +180,57 @@ pub(crate) const NAME_BUFFER_SIZE: usize = 64;
 /// nothing else. It is a closed set: adding a separator would accept lists
 /// curl 8.x rejects, and removing one would reject lists it accepts. Both are
 /// out of scope.
+#[allow(dead_code)]
 pub(crate) const SEPARATORS: [char; 5] = [' ', '\t', ':', ',', ';'];
+
+/// The greatest number of skipped spellings one selection will remember.
+///
+/// # There is no C counterpart, and that is the point
+///
+/// `cr_get_selected_ciphers` reports a skipped spelling by calling `infof` the
+/// instant it finds one (`lib/vtls/rustls.c:459-462`, `:468-473`) and keeps
+/// nothing. It has no diagnostic buffer to overflow. This module collects
+/// instead -- so that it depends on no handle, no log sink and no trace
+/// configuration (see [`SuiteDiagnostic`]) -- and a collection is a resource
+/// where a stream was not.
+///
+/// The exposure that creates is concrete. Every token of a cipher list that
+/// resolves to nothing appends one entry, the walk cannot stop early because a
+/// later token may still be selectable, and one entry is three machine words
+/// against an input token as short as two bytes (`x,`). An
+/// attacker-supplied `CURLOPT_SSL_CIPHER_LIST` therefore amplified roughly
+/// twelvefold: a 100 MB list of unknown spellings became more than a gigabyte
+/// of diagnostics, grown through an infallible [`Vec::push`] that aborts the
+/// process rather than returning [`CURLcode::OutOfMemory`]. CWE-400, CWE-789.
+///
+/// # Why 256
+///
+/// It has to be comfortably above every list a human writes and far below any
+/// figure that matters, and both bounds are measured rather than guessed:
+///
+/// | list                                                | tokens |
+/// |-----------------------------------------------------|--------|
+/// | the longest `--ciphers` anywhere in this repository  | 3      |
+/// | `tests/unit/unit3205.c:424-438`, curl's own longest  | 31     |
+/// | every spelling this build recognises ([`CS_LIST`])   | 17     |
+/// | a full OpenSSL `ALL` expansion                       | ~160   |
+///
+/// 256 is eight times curl's own longest fixture and still above a complete
+/// OpenSSL cipher vocabulary, so no legitimate list loses a diagnostic. At the
+/// same time it bounds the collection at roughly six kilobytes *whatever the
+/// input*, which turns an amplification into a constant.
+///
+/// # What the cap does not do
+///
+/// The walk still visits every token, because stopping early would change which
+/// suites are selected and that is frozen (AAP section 0.8.1). A caller can
+/// therefore still be made to spend time linear in the length of the list it was
+/// given -- exactly as curl 8.19.0-DEV can. What is removed is the memory that
+/// grew faster than the input, not the work.
+///
+/// Nothing is dropped silently: [`SuiteSelection::suppressed`] counts what did
+/// not fit and [`SuiteSelection::suppressed_note`] renders it.
+pub(crate) const MAX_DIAGNOSTICS: usize = 256;
 
 /// The first component that marks an IANA (RFC) spelling.
 ///
@@ -167,13 +239,16 @@ pub(crate) const SEPARATORS: [char; 5] = [' ', '\t', ':', ',', ';'];
 /// first three bytes, not a component-aware test, which is why
 /// `TLS-ECDHE-RSA-AES128-GCM-SHA256` is split on `_` and consequently
 /// recognised as nothing at all.
+#[allow(dead_code)]
 const RFC_PREFIX: &str = "TLS";
 
 /// The component separator of an IANA spelling: `TLS_AES_128_GCM_SHA256`.
+#[allow(dead_code)]
 const RFC_SEPARATOR: char = '_';
 
 /// The component separator of an OpenSSL spelling:
 /// `ECDHE-RSA-AES128-GCM-SHA256`.
+#[allow(dead_code)]
 const OPENSSL_SEPARATOR: char = '-';
 
 /// One row of the cipher-suite table: an IANA id and one spelling of it.
@@ -183,6 +258,7 @@ const OPENSSL_SEPARATOR: char = '-';
 /// this is the same row with the spelling held in readable form. Two rows may
 /// carry the same `id`, exactly as in C: one for the IANA spelling and one for
 /// the OpenSSL spelling.
+#[allow(dead_code)]
 struct CipherSuiteEntry {
     /// The IANA cipher suite identifier, as it appears on the wire.
     id: u16,
@@ -200,6 +276,7 @@ impl CipherSuiteEntry {
     /// pooled string `TLS`, so `TLSFOO_BAR` would not qualify even though it
     /// begins with those three bytes. Reproduced by splitting rather than by
     /// `starts_with`, so that distinction survives.
+    #[allow(dead_code)]
     fn is_rfc(&self) -> bool {
         let separator = separator_for(self.name);
         separator == RFC_SEPARATOR
@@ -209,6 +286,7 @@ impl CipherSuiteEntry {
 
 /// Builds one table row, mirroring the C `CS_ENTRY` macro
 /// (`cipher_suite.c:143-152`).
+#[allow(dead_code)]
 const fn cs(id: u16, name: &'static str) -> CipherSuiteEntry {
     CipherSuiteEntry { id, name }
 }
@@ -240,6 +318,7 @@ const fn cs(id: u16, name: &'static str) -> CipherSuiteEntry {
 /// section comments -- and keeps the spellings byte-exact, which is the whole
 /// contract of this module.
 #[rustfmt::skip]
+#[allow(dead_code)]
 static CS_LIST: &[CipherSuiteEntry] = &[
     /* TLS 1.3 ciphers */
     cs(0x1301, "TLS_AES_128_GCM_SHA256"),
@@ -267,6 +346,7 @@ static CS_LIST: &[CipherSuiteEntry] = &[
 /// Reproduces `cs_is_separator` (`cipher_suite.c:650-661`) through
 /// [`SEPARATORS`], so the set is stated once.
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn is_separator(c: char) -> bool {
     SEPARATORS.contains(&c)
 }
@@ -278,6 +358,7 @@ pub(crate) fn is_separator(c: char) -> bool {
 /// or one whose third byte lands inside a multi-byte character, takes `'-'`;
 /// neither can equal `TLS`, so this matches the C byte comparison.
 #[must_use]
+#[allow(dead_code)]
 fn separator_for(name: &str) -> char {
     match name.get(..RFC_PREFIX.len()) {
         Some(prefix) if prefix.eq_ignore_ascii_case(RFC_PREFIX) => {
@@ -297,6 +378,7 @@ fn separator_for(name: &str) -> char {
 /// unreachable through the FFI boundary, and it is reproduced anyway because
 /// "unreachable" is a property of today's callers, not of this function.
 #[must_use]
+#[allow(dead_code)]
 fn before_nul(text: &str) -> &str {
     match text.find('\0') {
         // `find` yields the byte index of an ASCII NUL, which is always a
@@ -313,6 +395,7 @@ fn before_nul(text: &str) -> &str {
 /// borrowed spelling costs nothing and cannot corrupt anything, which is the
 /// point of doing it this way instead of reproducing the buffer.
 #[must_use]
+#[allow(dead_code)]
 fn truncate_to(text: &str, limit: usize) -> &str {
     if text.len() <= limit {
         return text;
@@ -331,6 +414,7 @@ fn truncate_to(text: &str, limit: usize) -> &str {
 /// The Rust stand-in for `uint8_t zip[6]`: the same eight slots, holding the
 /// component text instead of a 6-bit pool index. Borrowed from the caller's
 /// string, so splitting a list allocates nothing.
+#[allow(dead_code)]
 struct NameComponents<'a> {
     /// The components, low index first; slots at or past `len` are `""`.
     parts: [&'a str; MAX_COMPONENTS],
@@ -357,6 +441,7 @@ impl<'a> NameComponents<'a> {
     /// scan; this returns the components and lets the table comparison fail.
     /// Both paths yield id 0 through the only public entry point, and the
     /// distinction is invisible to every caller.
+    #[allow(dead_code)]
     fn parse(name: &'a str) -> Option<Self> {
         if name.is_empty() {
             return None;
@@ -381,6 +466,7 @@ impl<'a> NameComponents<'a> {
 
     /// The components in use.
     #[must_use]
+    #[allow(dead_code)]
     fn as_slice(&self) -> &[&'a str] {
         // `len <= MAX_COMPONENTS == parts.len()`, upheld by `parse`, so this
         // range is always valid.
@@ -396,6 +482,7 @@ impl<'a> NameComponents<'a> {
     /// `cs_str_to_zip` rule before `memcmp` compared them
     /// (`cipher_suite.c:642`).
     #[must_use]
+    #[allow(dead_code)]
     fn matches(&self, name: &str) -> bool {
         let separator = separator_for(name);
         let mine = self.as_slice();
@@ -434,6 +521,7 @@ impl<'a> NameComponents<'a> {
 /// assert_eq!(lookup_id(""), None);
 /// ```
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn lookup_id(name: &str) -> Option<u16> {
     let name = before_nul(name);
     let components = NameComponents::parse(name)?;
@@ -453,6 +541,7 @@ pub(crate) fn lookup_id(name: &str) -> Option<u16> {
 /// a canonical one, so a diagnostic can only be faithful if the raw slice
 /// survives.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct CipherSuiteToken<'a> {
     /// Exactly the bytes between the separators, case and all.
     ///
@@ -491,6 +580,7 @@ pub(crate) struct CipherSuiteToken<'a> {
 /// - A NUL anywhere in the list ends the list, since NUL is not a separator
 ///   and terminates the token scan.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct Tokens<'a> {
     /// What is left of the list, always beginning at a separator or at the
     /// start of the next token.
@@ -501,6 +591,7 @@ pub(crate) struct Tokens<'a> {
 ///
 /// See [`Tokens`] for the tokenization rules, which are curl's exactly.
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn tokens(list: &str) -> Tokens<'_> {
     Tokens {
         rest: before_nul(list),
@@ -562,6 +653,7 @@ impl<'a> Iterator for Tokens<'a> {
 /// `None` is the C `-1` return. [`get_str`] turns it into the text C leaves in
 /// the caller's buffer.
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn name(id: u16, prefer_rfc: bool) -> Option<&'static str> {
     let mut fallback: Option<&'static str> = None;
 
@@ -597,6 +689,7 @@ pub(crate) fn name(id: u16, prefer_rfc: bool) -> Option<&'static str> {
 /// The C signature also returns `0` or `-1` to say which branch it took. A
 /// caller that needs to know asks [`name`], which is where that bit lives.
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn get_str(id: u16, prefer_rfc: bool) -> Cow<'static, str> {
     match name(id, prefer_rfc) {
         Some(spelling) => Cow::Borrowed(spelling),
@@ -626,6 +719,7 @@ pub(crate) fn get_str(id: u16, prefer_rfc: bool) -> Cow<'static, str> {
 /// `curl_msnprintf(buf, buf_size, "TLS_UNKNOWN_0x%04x", id)` is bounded by the
 /// same buffer.
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn get_str_bounded(
     id: u16,
     prefer_rfc: bool,
@@ -657,6 +751,7 @@ pub(crate) fn get_str_bounded(
 /// otherwise only observable in a ClientHello on the wire. It is also what
 /// keeps this module provider-neutral, so no cryptographic provider is ever
 /// constructed, installed or fetched here.
+#[allow(dead_code)]
 pub(crate) trait ProviderCipherSuite: Copy {
     /// The suite's IANA identifier, as it appears on the wire.
     fn iana_id(&self) -> u16;
@@ -689,6 +784,7 @@ impl ProviderCipherSuite for SupportedCipherSuite {
 /// and lets the caller emit them in the order they occurred. The borrowed
 /// spelling is the user's own, so a diagnostic can quote it exactly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum SuiteDiagnostic<'a> {
     /// The spelling resolved to no id, or to an id the provider does not
     /// offer.
@@ -709,25 +805,102 @@ pub(crate) enum SuiteDiagnostic<'a> {
 
 impl<'a> SuiteDiagnostic<'a> {
     /// The spelling this diagnostic is about, exactly as the user wrote it.
+    ///
+    /// **Raw**, control bytes and all -- unlike
+    /// [`Display`](fmt::Display::fmt), which neutralizes them. This is the
+    /// accessor to use to compare, match or store the spelling, and the wrong
+    /// one to use to print it: rendering this to a terminal is the injection
+    /// [`Display`](fmt::Display::fmt) exists to prevent.
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn spelling(&self) -> &'a str {
         match *self {
             Self::Unknown(text) | Self::Duplicate(text) => text,
         }
     }
+
+    /// The spelling with every control byte replaced, ready to interpolate.
+    ///
+    /// One byte in, one byte out, so the rendered message is exactly as long as
+    /// C's would have been; borrowed unchanged in the overwhelmingly common case
+    /// that a spelling contains no control byte at all.
+    ///
+    /// The [`String::from_utf8_lossy`] can never actually replace anything.
+    /// [`crate::trace::escape_controls`] substitutes only bytes below `0x20`
+    /// plus `0x7F`, all of which are ASCII, and only ever with `b'.'`, which is
+    /// also ASCII; every byte of a multi-byte UTF-8 sequence is `0x80` or above
+    /// and is left alone. So a valid `&str` in stays valid, and the conversion
+    /// is used because it is the checked one rather than because a replacement
+    /// is expected.
+    #[allow(dead_code)]
+    fn printable_spelling(&self) -> Cow<'_, str> {
+        match escape_controls(
+            self.spelling().as_bytes(),
+            ControlEscaping::SingleLine,
+        ) {
+            Cow::Borrowed(_) => Cow::Borrowed(self.spelling()),
+            Cow::Owned(escaped) => {
+                Cow::Owned(String::from_utf8_lossy(&escaped).into_owned())
+            }
+        }
+    }
 }
 
 impl fmt::Display for SuiteDiagnostic<'_> {
-    /// Renders the message `rustls.c` logs, byte for byte, so that a caller
-    /// only has to choose where it goes.
+    /// Renders the message `rustls.c` logs, with the user's spelling made
+    /// printable.
+    ///
+    /// # The message template is byte-exact; the interpolated spelling is not
+    ///
+    /// Everything around the quotes is transcribed from
+    /// `lib/vtls/rustls.c:460-461` and `:470-471` character for character. What
+    /// differs is the spelling between them: C interpolates it with `"%.*s"`
+    /// and therefore passes an `ESC`, a `CR` or an `LF` straight through to
+    /// wherever `infof` is pointed. Here every byte below `0x20`, and `0x7F`,
+    /// becomes `.` first.
+    ///
+    /// # Why that divergence is the right one, recorded rather than inferred
+    ///
+    /// F25's resolution allows escaping for terminal sinks, raw bytes for
+    /// non-terminal files, "or an explicit parity/security decision". This is
+    /// the third: the substitution happens here, for **every** destination, and
+    /// the reasons are specific to this message rather than general.
+    ///
+    /// 1. **The spelling is not protocol bytes.** `curl-rs-lib/src/trace.rs`
+    ///    keeps a trace file byte-faithful because a `--trace` dump is evidence
+    ///    about the wire. This string never went on the wire; it is a
+    ///    command-line option quoted back at its author, so there is no fidelity
+    ///    to preserve and nothing a capture would be compared against.
+    /// 2. **An `infof` record is one line by construction, and the crate already
+    ///    enforces it.** `trace.rs`'s `infof!` refuses a format string
+    ///    containing a newline *at compile time*, reproducing an assertion C
+    ///    makes at run time in a debug build. That invariant is enforced for the
+    ///    literal and unenforceable for an interpolated argument, so an `LF` in
+    ///    a cipher spelling forges a second log line -- against any
+    ///    destination, terminal or file. CWE-117. Neutralizing here is the
+    ///    runtime half of a rule the crate already states.
+    /// 3. **`trace.rs`'s terminal choke point is not enough on its own.** It
+    ///    escapes with `ControlEscaping::PreserveLineStructure`, which keeps
+    ///    `LF` -- necessarily, because a header block is one record with real
+    ///    line breaks in it. So the one byte that forges a log line survives
+    ///    that layer by design, and only the sender can know that this
+    ///    particular payload is a single line.
+    /// 4. **Safe by default beats safe if remembered.** The consumer of these
+    ///    diagnostics is `tls/rustls_backend.rs`, which does not exist yet. If
+    ///    the raw form were the one `{diagnostic}` produced, the natural call --
+    ///    the one this module's own example shows -- would be the unsafe one.
+    ///
+    /// The raw spelling stays reachable through
+    /// [`spelling`](Self::spelling) for a caller that needs the original bytes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = self.printable_spelling();
         match *self {
             // rustls.c:460-461
-            Self::Unknown(text) => {
+            Self::Unknown(_) => {
                 write!(f, "rustls: unknown cipher in list: \"{text}\"")
             }
             // rustls.c:470-471
-            Self::Duplicate(text) => {
+            Self::Duplicate(_) => {
                 write!(f, "rustls: duplicate cipher in list: \"{text}\"")
             }
         }
@@ -739,6 +912,7 @@ impl fmt::Display for SuiteDiagnostic<'_> {
 /// `suites` is the ClientHello cipher suite list, in the order it goes on the
 /// wire. Nothing may reorder it.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct SuiteSelection<'a, S> {
     /// The selected suites, in offer order, each one an entry of the injected
     /// provider list.
@@ -754,6 +928,17 @@ pub(crate) struct SuiteSelection<'a, S> {
     /// worth telling the user about, and a caller re-deriving it would have to
     /// re-derive the whole flow.
     pub(crate) default_tls13_prefix: usize,
+    /// How many skipped spellings did not fit in
+    /// [`diagnostics`](Self::diagnostics).
+    ///
+    /// Zero for every cipher list a person writes; see [`MAX_DIAGNOSTICS`] for
+    /// the measurements behind that claim. Non-zero only when a list carried
+    /// more than 256 unusable spellings, which is the case the cap exists for.
+    ///
+    /// Kept as a count rather than folded into `diagnostics` as a third variant,
+    /// so that [`SuiteDiagnostic::spelling`] stays total: every diagnostic is
+    /// about a spelling, and a suppression is not.
+    pub(crate) suppressed: usize,
 }
 
 impl<S> SuiteSelection<'_, S> {
@@ -767,6 +952,7 @@ impl<S> SuiteSelection<'_, S> {
     /// as curl 8.x. An empty selection is the *only* failure: a list of
     /// nothing but unusable spellings still succeeds when a default filled the
     /// selection, which is what C does and not an accident of it.
+    #[allow(dead_code)]
     pub(crate) fn require_supported(&self) -> CurlResult<()> {
         if self.suites.is_empty() {
             return Err(Error::with_context(
@@ -776,6 +962,30 @@ impl<S> SuiteSelection<'_, S> {
         }
         Ok(())
     }
+
+    /// A single line naming how many diagnostics the cap dropped, or [`None`].
+    ///
+    /// Composed here rather than left to the caller so that the wording lives
+    /// with the rule that produced it, and so that a truncation can never be
+    /// silent: a caller that logs [`diagnostics`](Self::diagnostics) and then
+    /// this is telling the whole truth about what it skipped.
+    ///
+    /// [`None`] whenever nothing was dropped, which is every ordinary run, so
+    /// the ordinary run allocates nothing and prints nothing extra. The phrasing
+    /// deliberately does not resemble any `rustls.c` message, because it
+    /// corresponds to none: there is no C line to be byte-exact with.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn suppressed_note(&self) -> Option<String> {
+        if self.suppressed == 0 {
+            return None;
+        }
+        Some(format!(
+            "rustls: {} further unusable cipher{} in list not reported",
+            self.suppressed,
+            if self.suppressed == 1 { "" } else { "s" },
+        ))
+    }
 }
 
 impl<S: ProviderCipherSuite> SuiteSelection<'_, S> {
@@ -784,6 +994,7 @@ impl<S: ProviderCipherSuite> SuiteSelection<'_, S> {
     /// The wire-visible summary of a selection: this is the sequence of
     /// `uint16` values that reaches the ClientHello.
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn ids(&self) -> Vec<u16> {
         self.suites
             .iter()
@@ -813,13 +1024,14 @@ impl<S: ProviderCipherSuite> SuiteSelection<'_, S> {
 ///
 /// [`CURLcode::SslCipher`], and only when the final selection is empty. See
 /// [`SuiteSelection::require_supported`].
+#[allow(dead_code)]
 pub(crate) fn select_provider_suites<'a, S: ProviderCipherSuite>(
     ciphers12: Option<&'a str>,
     ciphers13: Option<&'a str>,
     provider_suites: &[S],
 ) -> CurlResult<SuiteSelection<'a, S>> {
     let selection =
-        provider_suite_selection(ciphers12, ciphers13, provider_suites);
+        provider_suite_selection(ciphers12, ciphers13, provider_suites)?;
     selection.require_supported()?;
     Ok(selection)
 }
@@ -860,11 +1072,12 @@ pub(crate) fn select_provider_suites<'a, S: ProviderCipherSuite>(
 /// The 1.3 list is always parsed before the 1.2 list -- the `goto add_ciphers`
 /// at `rustls.c:478-481` -- and the defaults keep the provider's order rather
 /// than being sorted here.
+#[allow(dead_code)]
 pub(crate) fn provider_suite_selection<'a, S: ProviderCipherSuite>(
     ciphers12: Option<&'a str>,
     ciphers13: Option<&'a str>,
     provider_suites: &[S],
-) -> SuiteSelection<'a, S> {
+) -> CurlResult<SuiteSelection<'a, S>> {
     // `supported_len` (`rustls.c:416`). The C selection buffer is allocated
     // with exactly this many slots (`rustls.c:580`), and the loop bound below
     // is what keeps it from overflowing.
@@ -876,14 +1089,34 @@ pub(crate) fn provider_suite_selection<'a, S: ProviderCipherSuite>(
     // (`rustls.c:466`, `:492`), and since every one of them is fetched from
     // that same list by index, pointer identity and index identity are the
     // same relation.
+    //
+    // Reserved once, exactly, and fallibly. This is where C allocates too --
+    // `curlx_malloc(sizeof(*cipher_suites) * cipher_suites_len)` at
+    // `rustls.c:580`, whose failure arm two lines later is
+    // `result = CURLE_OUT_OF_MEMORY` -- so mapping a failed reservation to that
+    // code is exact parity rather than a choice. The capacity is the final
+    // capacity: the `break` below keeps `selected` from ever exceeding
+    // `supported_len`, so no push after this can reach the allocator.
     let mut selected: Vec<(usize, S)> = Vec::new();
+    reserve_exact_or_oom(&mut selected, supported_len)?;
+
+    // Capped at `MAX_DIAGNOSTICS` and grown fallibly; see that constant for the
+    // amplification this closes and the measurements behind the bound. Not
+    // pre-reserved, because the overwhelming majority of selections produce no
+    // diagnostic at all and 256 slots would then be six kilobytes reserved to
+    // hold nothing.
     let mut diagnostics: Vec<SuiteDiagnostic<'a>> = Vec::new();
+    let mut suppressed = 0_usize;
     let mut default_tls13_prefix = 0;
 
     // Which lists to parse, in order. The C code expresses this with a
     // mutable `ciphers` pointer and a `goto`; the two-element worst case is
-    // clearer as a list, and the cases it produces are identical.
-    let mut passes: Vec<&'a str> = Vec::new();
+    // clearer as an array, and the cases it produces are identical.
+    //
+    // A fixed array rather than a `Vec`: there are at most two passes and the
+    // number is known at compile time, so this removes an allocation instead of
+    // making one fallible.
+    let mut passes: [Option<&'a str>; 2] = [None, None];
 
     match ciphers13 {
         // "Add default TLSv1.3 ciphers to selection" (`rustls.c:425-440`).
@@ -900,7 +1133,7 @@ pub(crate) fn provider_suite_selection<'a, S: ProviderCipherSuite>(
 
             // `if(!ciphers) ciphers = "";` (`rustls.c:438-439`) -- the parse
             // still runs, over nothing.
-            passes.push(ciphers12.unwrap_or(""));
+            passes[0] = Some(ciphers12.unwrap_or(""));
         }
         // `else ciphers = ciphers13;` (`rustls.c:441-442`), then
         // `if(ciphers == ciphers13 && ciphers12)` (`rustls.c:478-481`) adds
@@ -908,14 +1141,12 @@ pub(crate) fn provider_suite_selection<'a, S: ProviderCipherSuite>(
         // case, so `default_tls13_prefix` stays 0 and every duplicate is
         // reportable.
         Some(explicit13) => {
-            passes.push(explicit13);
-            if let Some(explicit12) = ciphers12 {
-                passes.push(explicit12);
-            }
+            passes[0] = Some(explicit13);
+            passes[1] = ciphers12;
         }
     }
 
-    'passes: for list in passes {
+    'passes: for list in passes.into_iter().flatten() {
         for token in tokens(list) {
             // The `count < supported_len` half of the C loop condition
             // (`rustls.c:445`), checked before the token has any effect. It
@@ -941,7 +1172,11 @@ pub(crate) fn provider_suite_selection<'a, S: ProviderCipherSuite>(
                 // the empty token a trailing separator produces is skipped in
                 // silence rather than reported as an unknown cipher.
                 if !token.text.is_empty() {
-                    diagnostics.push(SuiteDiagnostic::Unknown(token.text));
+                    record_diagnostic(
+                        &mut diagnostics,
+                        &mut suppressed,
+                        SuiteDiagnostic::Unknown(token.text),
+                    )?;
                 }
                 continue;
             };
@@ -952,8 +1187,11 @@ pub(crate) fn provider_suite_selection<'a, S: ProviderCipherSuite>(
             match selected.iter().position(|&(taken, _)| taken == index) {
                 Some(hit) => {
                     if hit >= default_tls13_prefix {
-                        diagnostics
-                            .push(SuiteDiagnostic::Duplicate(token.text));
+                        record_diagnostic(
+                            &mut diagnostics,
+                            &mut suppressed,
+                            SuiteDiagnostic::Duplicate(token.text),
+                        )?;
                     }
                 }
                 None => match provider_suites.get(index) {
@@ -985,11 +1223,90 @@ pub(crate) fn provider_suite_selection<'a, S: ProviderCipherSuite>(
     // `*selected_size = count;` (`rustls.c:501`). The emptiness check the C
     // caller then performs lives in `SuiteSelection::require_supported`,
     // because that is where C performs it too.
-    SuiteSelection {
-        suites: selected.into_iter().map(|(_, suite)| suite).collect(),
+    //
+    // Built with an explicit fallible reservation rather than `collect`, which
+    // grows infallibly. `extend` cannot reach the allocator afterwards because
+    // the capacity is already exactly what the iterator will yield.
+    let mut suites: Vec<S> = Vec::new();
+    reserve_exact_or_oom(&mut suites, selected.len())?;
+    suites.extend(selected.into_iter().map(|(_, suite)| suite));
+
+    Ok(SuiteSelection {
+        suites,
         diagnostics,
         default_tls13_prefix,
+        suppressed,
+    })
+}
+
+/// Reserves exactly `additional` more slots, reporting refusal instead of
+/// aborting.
+///
+/// The single definition of "ask for capacity, and report
+/// [`CURLcode::OutOfMemory`] if it cannot be had", so that the two selection
+/// buffers cannot diverge on it. [`Vec::reserve_exact`], and every method that
+/// grows a vector implicitly, aborts the whole process when the allocator
+/// refuses; C's allocation on this same path returns a code instead
+/// (`lib/vtls/rustls.c:580-584` maps its failed `curlx_malloc` to
+/// `CURLE_OUT_OF_MEMORY`), so reporting is both the safer behaviour and the
+/// faithful one.
+///
+/// Exact rather than amortised because both callers know their final size:
+/// asking for slack would reserve capacity that is provably never used.
+///
+/// # Errors
+///
+/// [`CURLcode::OutOfMemory`] when the request overflows the address space or the
+/// allocator refuses it. Nothing is written and the vector is left untouched, so
+/// a caller may propagate the error immediately.
+fn reserve_exact_or_oom<T>(
+    vec: &mut Vec<T>,
+    additional: usize,
+) -> CurlResult<()> {
+    vec.try_reserve_exact(additional)
+        .map_err(|_| Error::new(CURLcode::OutOfMemory))
+}
+
+/// Appends one diagnostic, or counts it as suppressed once the cap is reached.
+///
+/// The single place a [`SuiteDiagnostic`] enters a selection, so that the cap and
+/// the fallible growth cannot be applied at one of the two call sites and
+/// forgotten at the other.
+///
+/// The reservation is the standard fallible-push idiom: [`Vec::push`] is
+/// infallible and aborts on allocation failure, so capacity is asked for
+/// explicitly first and only when the vector is actually full. Growth is
+/// amortised by [`Vec::try_reserve`] exactly as `push` would have amortised it,
+/// so a list with a hundred unknown spellings still performs a handful of
+/// reallocations rather than a hundred.
+///
+/// # Errors
+///
+/// [`CURLcode::OutOfMemory`] when the allocator refuses. The selection is
+/// abandoned rather than continued with a partial diagnostic list, because a
+/// caller that cannot allocate 256 pointers has a larger problem than a missing
+/// `infof` line, and because C's own allocation failure on this path is fatal to
+/// the connection too (`lib/vtls/rustls.c:580-584`).
+fn record_diagnostic<'a>(
+    diagnostics: &mut Vec<SuiteDiagnostic<'a>>,
+    suppressed: &mut usize,
+    diagnostic: SuiteDiagnostic<'a>,
+) -> CurlResult<()> {
+    if diagnostics.len() >= MAX_DIAGNOSTICS {
+        // Saturating, so that a list long enough to overflow a `usize` counter
+        // -- which no allocation could hold anyway -- cannot wrap the count back
+        // to zero and report "nothing was suppressed".
+        *suppressed = suppressed.saturating_add(1);
+        return Ok(());
     }
+
+    if diagnostics.len() == diagnostics.capacity() {
+        diagnostics
+            .try_reserve(1)
+            .map_err(|_| Error::new(CURLcode::OutOfMemory))?;
+    }
+    diagnostics.push(diagnostic);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1174,9 +1491,33 @@ mod tests {
     const DEFAULT_12: [u16; 6] =
         [0xC02C, 0xC02B, 0xCCA9, 0xC030, 0xC02F, 0xCCA8];
 
+    /// Binds `$name` to a selection, failing the test if it could not allocate.
+    ///
+    /// A macro rather than a function because the failure arm has to leave the
+    /// *test*: `unwrap`, `expect` and `panic!` are avoided throughout this file,
+    /// in the tests as much as in the code they exercise, so the pattern is an
+    /// assertion followed by a `let ... else` whose `return` arm is already
+    /// unreachable. The same shape as `scratch!` in `tls/keylog.rs`.
+    macro_rules! selection {
+        ($name:ident, $($arg:expr),+ $(,)?) => {
+            let $name = provider_suite_selection($($arg),+);
+            assert!(
+                $name.is_ok(),
+                "the selection must not fail: {:?}",
+                $name.as_ref().err().map(Error::code)
+            );
+            let Ok($name) = $name else { return };
+        };
+    }
+
     /// The selection [`RING_LIKE`] yields for the two options, as ids.
+    ///
+    /// An allocation failure yields an empty list rather than failing the test,
+    /// because every caller compares against an expected list and an empty one
+    /// can never match it.
     fn selected(ciphers12: Option<&str>, ciphers13: Option<&str>) -> Vec<u16> {
-        provider_suite_selection(ciphers12, ciphers13, RING_LIKE).ids()
+        provider_suite_selection(ciphers12, ciphers13, RING_LIKE)
+            .map_or_else(|_| Vec::new(), |selection| selection.ids())
     }
 
     /// The diagnostics [`RING_LIKE`] yields for the two options, rendered.
@@ -1184,11 +1525,16 @@ mod tests {
         ciphers12: Option<&str>,
         ciphers13: Option<&str>,
     ) -> Vec<String> {
-        provider_suite_selection(ciphers12, ciphers13, RING_LIKE)
-            .diagnostics
-            .iter()
-            .map(ToString::to_string)
-            .collect()
+        provider_suite_selection(ciphers12, ciphers13, RING_LIKE).map_or_else(
+            |_| Vec::new(),
+            |selection| {
+                selection
+                    .diagnostics
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            },
+        )
     }
 
     #[test]
@@ -1603,7 +1949,7 @@ mod tests {
     fn defaults_fill_both_ends_when_no_list_is_set() {
         // Neither option set: every provider suite, in provider order, TLS 1.3
         // defaults first (`rustls.c:425-440`, `:483-499`).
-        let selection = provider_suite_selection(None, None, RING_LIKE);
+        selection!(selection, None, None, RING_LIKE);
         let mut expected = DEFAULT_13.to_vec();
         expected.extend(DEFAULT_12);
         assert_eq!(selection.ids(), expected);
@@ -1619,7 +1965,7 @@ mod tests {
         // `ciphers12` was set.
         let list =
             Some("ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384");
-        let selection = provider_suite_selection(list, None, RING_LIKE);
+        selection!(selection, list, None, RING_LIKE);
         assert_eq!(selection.ids(), [0x1302, 0x1301, 0x1303, 0xC02F, 0xC02C]);
         assert_eq!(selection.default_tls13_prefix, 3);
         assert!(selection.diagnostics.is_empty());
@@ -1629,11 +1975,7 @@ mod tests {
     fn an_explicit_tls13_list_precedes_the_default_tls12_suffix() {
         // No prefix is inserted when `ciphers13` is set, and the TLS 1.2
         // defaults follow because `ciphers12` is not.
-        let selection = provider_suite_selection(
-            None,
-            Some("TLS_AES_128_GCM_SHA256"),
-            RING_LIKE,
-        );
+        selection!(selection, None, Some("TLS_AES_128_GCM_SHA256"), RING_LIKE,);
         let mut expected = vec![0x1301];
         expected.extend(DEFAULT_12);
         assert_eq!(selection.ids(), expected);
@@ -1645,7 +1987,8 @@ mod tests {
     fn both_lists_are_parsed_thirteen_then_twelve() {
         // `rustls.c:478-481`: the 1.3 list first, then the 1.2 list, and no
         // defaults at either end.
-        let selection = provider_suite_selection(
+        selection!(
+            selection,
             Some("ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256"),
             Some("TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384"),
             RING_LIKE,
@@ -1680,7 +2023,8 @@ mod tests {
     fn duplicates_keep_first_occurrence_order() {
         // A repeat never moves, promotes or re-adds a suite
         // (`rustls.c:465-473`).
-        let selection = provider_suite_selection(
+        selection!(
+            selection,
             Some(
                 "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:\
                  ECDHE-RSA-AES256-GCM-SHA384",
@@ -1691,7 +2035,8 @@ mod tests {
         assert_eq!(selection.ids(), [0x1302, 0x1301, 0x1303, 0xC030, 0xC02F]);
 
         // Both spellings of one suite are one suite.
-        let selection = provider_suite_selection(
+        selection!(
+            selection,
             Some(
                 "ECDHE-RSA-AES128-GCM-SHA256:\
                  TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
@@ -1707,7 +2052,8 @@ mod tests {
         // `rustls.c:469`: a repeat inside the automatically inserted TLS 1.3
         // prefix is not the user writing something twice, so it is skipped
         // without a word.
-        let selection = provider_suite_selection(
+        selection!(
+            selection,
             Some("TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256"),
             None,
             RING_LIKE,
@@ -1720,7 +2066,8 @@ mod tests {
     fn explicit_duplicates_are_reported() {
         // With an explicit TLS 1.3 list there is no prefix, so
         // `default_tls13_prefix` is 0 and every repeat is reportable.
-        let selection = provider_suite_selection(
+        selection!(
+            selection,
             None,
             Some("TLS_AES_128_GCM_SHA256:TLS_AES_128_GCM_SHA256"),
             RING_LIKE,
@@ -1735,7 +2082,8 @@ mod tests {
 
         // A repeat of a user-chosen TLS 1.2 suite is reported too, and the
         // report quotes the second spelling, not the first.
-        let selection = provider_suite_selection(
+        selection!(
+            selection,
             Some(
                 "ECDHE-RSA-AES128-GCM-SHA256:\
                  TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
@@ -1753,7 +2101,8 @@ mod tests {
 
     #[test]
     fn unknown_spellings_are_reported_with_their_text() {
-        let selection = provider_suite_selection(
+        selection!(
+            selection,
             Some("nope:ECDHE-RSA-AES128-GCM-SHA256:AES128-SHA:GIBBERISH"),
             None,
             RING_LIKE,
@@ -1782,7 +2131,8 @@ mod tests {
 
         // `rustls.c:455-456` overwrites the id with 0, so the message is the
         // same one an unrecognised spelling gets.
-        let selection = provider_suite_selection(
+        selection!(
+            selection,
             None,
             Some("TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256"),
             RING_LIKE,
@@ -1812,7 +2162,8 @@ mod tests {
     fn an_empty_selection_is_the_only_error() {
         // Both lists set and neither usable: nothing is left, and only then
         // does the C caller fail (`rustls.c:590-594`).
-        let selection = provider_suite_selection(
+        selection!(
+            selection,
             Some("GIBBERISH"),
             Some("TLS_AES_128_CCM_SHA256"),
             RING_LIKE,
@@ -1837,11 +2188,13 @@ mod tests {
             2
         );
 
-        // An empty provider list cannot select anything either.
+        // An empty provider list cannot select anything either. It still
+        // *builds* a selection -- reserving nothing succeeds -- and the failure
+        // is the emptiness check, which is where C puts it too.
         let empty: [FakeSuite; 0] = [];
-        assert!(provider_suite_selection(None, None, &empty)
-            .require_supported()
-            .is_err());
+        selection!(from_empty_provider, None, None, &empty);
+        assert!(from_empty_provider.suites.is_empty());
+        assert!(from_empty_provider.require_supported().is_err());
 
         // But a list of nothing but rubbish still succeeds when a default
         // filled the selection -- C does not fail for that, and neither may
@@ -1867,7 +2220,7 @@ mod tests {
                     ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES256-GCM-SHA384:\
                     ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:\
                     GIBBERISH";
-        let selection = provider_suite_selection(Some(list), None, RING_LIKE);
+        selection!(selection, Some(list), None, RING_LIKE);
         assert_eq!(selection.suites.len(), RING_LIKE.len());
         assert!(
             selection.diagnostics.is_empty(),
@@ -1891,6 +2244,373 @@ mod tests {
         assert_eq!(
             reported(Some("nope"), None),
             ["rustls: unknown cipher in list: \"nope\""]
+        );
+    }
+
+    // -- diagnostic bounds (F27) -------------------------------------------
+
+    /// Builds a cipher list of `count` distinct unusable spellings.
+    ///
+    /// Distinct, not repeated, so that every token produces a diagnostic:
+    /// repeating one spelling would still produce one diagnostic per token here
+    /// -- an unknown spelling is never deduplicated -- but distinct tokens keep
+    /// the fixture honest about what it is measuring.
+    fn unusable_list(count: usize) -> String {
+        let mut list = String::new();
+        for index in 0..count {
+            if index > 0 {
+                list.push(':');
+            }
+            list.push_str(&format!("NOSUCH-{index}"));
+        }
+        list
+    }
+
+    /// The collection stops growing at the cap and counts the rest.
+    #[test]
+    fn the_diagnostic_list_is_capped() {
+        const TOKENS: usize = MAX_DIAGNOSTICS * 4;
+
+        let list = unusable_list(TOKENS);
+        selection!(selection, Some(list.as_str()), None, RING_LIKE);
+
+        assert_eq!(
+            selection.diagnostics.len(),
+            MAX_DIAGNOSTICS,
+            "the collection must stop at the cap"
+        );
+        assert_eq!(
+            selection.suppressed,
+            TOKENS - MAX_DIAGNOSTICS,
+            "everything past the cap must be counted, not forgotten"
+        );
+        // The ones that were kept are the first ones, in order -- a cap must not
+        // reorder or sample.
+        assert_eq!(
+            selection.diagnostics.first().map(SuiteDiagnostic::spelling),
+            Some("NOSUCH-0")
+        );
+        assert_eq!(
+            selection.diagnostics.last().map(SuiteDiagnostic::spelling),
+            Some("NOSUCH-255")
+        );
+    }
+
+    /// Memory is bounded by the cap and not by the length of the input.
+    ///
+    /// The point of F27 stated as a property: quadrupling the input must not
+    /// change the size of the collection at all. Before the cap, this is the
+    /// assertion that failed -- the collection grew with the input, roughly
+    /// twelvefold by weight.
+    #[test]
+    fn the_collection_does_not_grow_with_the_input() {
+        let small = unusable_list(MAX_DIAGNOSTICS * 2);
+        let large = unusable_list(MAX_DIAGNOSTICS * 8);
+        assert!(
+            large.len() > small.len() * 3,
+            "the fixture must really grow"
+        );
+
+        selection!(from_small, Some(small.as_str()), None, RING_LIKE);
+        let small_len = from_small.diagnostics.len();
+        selection!(from_large, Some(large.as_str()), None, RING_LIKE);
+
+        assert_eq!(
+            small_len,
+            from_large.diagnostics.len(),
+            "a longer list must not produce a longer collection"
+        );
+        assert_eq!(small_len, MAX_DIAGNOSTICS);
+    }
+
+    /// The cap changes what is *reported*, never what is *selected*.
+    ///
+    /// The suite that matters is written after more unusable spellings than the
+    /// cap can hold, so an implementation that stopped walking once the
+    /// collection filled up would drop it. Selection is frozen behaviour
+    /// (AAP section 0.8.1) and the cap is not allowed to touch it.
+    #[test]
+    fn the_cap_does_not_change_which_suites_are_selected() {
+        let mut list = unusable_list(MAX_DIAGNOSTICS * 2);
+        list.push_str(":ECDHE-RSA-AES128-GCM-SHA256");
+        selection!(selection, Some(list.as_str()), None, RING_LIKE);
+
+        let mut expected = DEFAULT_13.to_vec();
+        expected.push(0xC02F);
+        assert_eq!(
+            selection.ids(),
+            expected,
+            "a suite named after the cap was reached must still be selected"
+        );
+        assert!(selection.suppressed > 0, "the cap must have been reached");
+    }
+
+    /// No list a person writes loses a diagnostic.
+    ///
+    /// The fixture is as long as [`WALK_LIST`], curl's own longest cipher list
+    /// (`unit3205.c:424-438`), and made entirely of unusable spellings -- the
+    /// worst case for a list of that size. Every one of them is still reported
+    /// individually and `suppressed` stays zero, which is the claim
+    /// [`MAX_DIAGNOSTICS`] makes about real inputs.
+    #[test]
+    fn a_realistic_list_loses_no_diagnostic() {
+        let list = unusable_list(WALK_FIXTURE.len());
+        selection!(selection, Some(list.as_str()), None, RING_LIKE);
+
+        assert_eq!(
+            selection.diagnostics.len(),
+            WALK_FIXTURE.len(),
+            "a list the size of curl's longest must be reported in full"
+        );
+        assert_eq!(selection.suppressed, 0);
+        assert_eq!(selection.suppressed_note(), None);
+
+        // The margin, restated as an assertion so that lowering the cap without
+        // re-reading the reasoning fails here. See `MAX_DIAGNOSTICS`.
+        assert!(
+            MAX_DIAGNOSTICS >= 8 * WALK_FIXTURE.len(),
+            "the cap must stay well clear of curl's own longest fixture"
+        );
+        assert!(
+            MAX_DIAGNOSTICS > CS_LIST.len() + MBEDTLS_ONLY.len(),
+            "the cap must exceed every spelling this build can be handed"
+        );
+    }
+
+    /// A truncation is never silent.
+    #[test]
+    fn suppression_is_reported_when_it_happens() {
+        selection!(quiet, Some("GIBBERISH"), None, RING_LIKE);
+        assert_eq!(quiet.suppressed, 0);
+        assert_eq!(quiet.suppressed_note(), None, "nothing to say");
+
+        let list = unusable_list(MAX_DIAGNOSTICS + 1);
+        selection!(one_over, Some(list.as_str()), None, RING_LIKE);
+        assert_eq!(one_over.suppressed, 1);
+        assert_eq!(
+            one_over.suppressed_note().as_deref(),
+            Some("rustls: 1 further unusable cipher in list not reported"),
+            "the singular form for exactly one"
+        );
+
+        let list = unusable_list(MAX_DIAGNOSTICS + 3);
+        selection!(three_over, Some(list.as_str()), None, RING_LIKE);
+        assert_eq!(
+            three_over.suppressed_note().as_deref(),
+            Some("rustls: 3 further unusable ciphers in list not reported"),
+            "the plural form for more than one"
+        );
+    }
+
+    /// Duplicates are capped by the same rule as unknown spellings.
+    ///
+    /// A separate test because they reach the collection through the other of
+    /// the two call sites, and a cap applied at only one of them would pass
+    /// every test above.
+    #[test]
+    fn repeated_duplicates_are_capped_too() {
+        // One explicit TLS 1.3 spelling, then the same spelling again far more
+        // times than the cap allows. The first occurrence selects; every later
+        // one is a reportable duplicate, because an explicit list sets
+        // `default_tls13_prefix` to zero.
+        let mut list = String::from("TLS_AES_128_GCM_SHA256");
+        for _ in 0..MAX_DIAGNOSTICS * 2 {
+            list.push_str(":TLS_AES_128_GCM_SHA256");
+        }
+        selection!(selection, None, Some(list.as_str()), RING_LIKE);
+
+        assert_eq!(selection.ids().first(), Some(&0x1301));
+        assert_eq!(selection.diagnostics.len(), MAX_DIAGNOSTICS);
+        assert_eq!(selection.suppressed, MAX_DIAGNOSTICS);
+        assert!(selection
+            .diagnostics
+            .iter()
+            .all(|entry| matches!(entry, SuiteDiagnostic::Duplicate(_))));
+    }
+
+    /// A reservation the address space cannot hold is reported, not aborted.
+    ///
+    /// `usize::MAX` slots of anything larger than a byte overflows the size
+    /// computation, so [`Vec::try_reserve_exact`] rejects it without ever
+    /// reaching the allocator -- which makes this deterministic on every target
+    /// rather than dependent on how much memory the machine happens to have.
+    /// What it proves is the contract: the refusal arrives as
+    /// [`CURLcode::OutOfMemory`], the code `rustls.c:580-584` uses, instead of
+    /// taking the process down the way [`Vec::reserve_exact`] would.
+    #[test]
+    fn a_refused_reservation_becomes_out_of_memory() {
+        let mut pairs: Vec<(usize, u64)> = Vec::new();
+        let refused = reserve_exact_or_oom(&mut pairs, usize::MAX);
+        assert_eq!(
+            refused.as_ref().err().map(Error::code),
+            Some(CURLcode::OutOfMemory)
+        );
+        assert_eq!(pairs.capacity(), 0, "a refusal must change nothing");
+        assert!(pairs.is_empty());
+
+        // And a reservation that can be had succeeds and is exact, since both
+        // callers pass their final size.
+        assert!(reserve_exact_or_oom(&mut pairs, 9).is_ok());
+        assert!(pairs.capacity() >= 9);
+    }
+
+    /// Every provider length a real selection uses is reservable.
+    ///
+    /// The companion to the test above: it says the fallible path is a guard
+    /// against an allocator refusal and not a size limit that a legitimate
+    /// provider could trip over. `rustls`' own list is nine suites and
+    /// [`CS_LIST`] knows seventeen.
+    #[test]
+    fn a_real_provider_length_is_always_reservable() {
+        let mut pairs: Vec<(usize, FakeSuite)> = Vec::new();
+        assert!(reserve_exact_or_oom(&mut pairs, RING_LIKE.len()).is_ok());
+        let mut suites: Vec<FakeSuite> = Vec::new();
+        assert!(reserve_exact_or_oom(&mut suites, CS_LIST.len()).is_ok());
+        // Zero is legal and allocates nothing: the empty-provider case.
+        let mut none: Vec<FakeSuite> = Vec::new();
+        assert!(reserve_exact_or_oom(&mut none, 0).is_ok());
+        assert_eq!(none.capacity(), 0);
+    }
+
+    // -- terminal and log safety (F25) -------------------------------------
+
+    /// An escape sequence in a spelling cannot reach a terminal.
+    ///
+    /// The message template stays byte-exact; only the bytes between the quotes
+    /// change, and each one becomes exactly one `.`. See
+    /// `SuiteDiagnostic`'s `Display` for why this happens for every destination
+    /// rather than only for a terminal.
+    #[test]
+    fn a_control_byte_in_a_spelling_is_neutralized() {
+        let hostile = "AES\x1b[2J\x1b[1;31mCOMPROMISED";
+        assert_eq!(
+            SuiteDiagnostic::Unknown(hostile).to_string(),
+            "rustls: unknown cipher in list: \"AES.[2J.[1;31mCOMPROMISED\""
+        );
+        assert_eq!(
+            SuiteDiagnostic::Duplicate(hostile).to_string(),
+            "rustls: duplicate cipher in list: \"AES.[2J.[1;31mCOMPROMISED\""
+        );
+    }
+
+    /// A newline in a spelling cannot forge a second log line.
+    ///
+    /// CWE-117, and the one hazard `trace.rs`'s terminal choke point cannot
+    /// close on this message's behalf: it escapes with
+    /// `ControlEscaping::PreserveLineStructure`, which keeps `LF` because a
+    /// header block legitimately contains line breaks. Only the sender knows
+    /// that an `infof` record is a single line.
+    #[test]
+    fn a_newline_in_a_spelling_cannot_forge_a_log_line() {
+        let forged = "AES\nrustls: unknown cipher in list: \"innocent\"";
+        let rendered = SuiteDiagnostic::Unknown(forged).to_string();
+        assert_eq!(rendered.lines().count(), 1, "one record is one line");
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\r'));
+
+        // A lone CR is the log-overwrite trick and goes the same way.
+        let overwrite = SuiteDiagnostic::Unknown("AES\rok").to_string();
+        assert_eq!(overwrite, "rustls: unknown cipher in list: \"AES.ok\"");
+    }
+
+    /// Neutralizing changes no length, so the rendered message is exactly as
+    /// long as C's would have been.
+    ///
+    /// The template length is measured from an empty spelling rather than
+    /// written out, so the property under test is the substitution and not the
+    /// transcription -- which
+    /// [`diagnostics_render_the_c_messages`](self::diagnostics_render_the_c_messages)
+    /// already owns.
+    #[test]
+    fn neutralizing_a_spelling_preserves_its_length() {
+        let template = SuiteDiagnostic::Unknown("").to_string().len();
+
+        for spelling in [
+            "AES\x1b[2J",
+            "\x00\x01\x02\x03\x04\x05\x06\x07",
+            "\x08\x09\x0a\x0b\x0c\x0d\x0e\x1f",
+            "\x7f",
+            "plain",
+        ] {
+            assert_eq!(
+                SuiteDiagnostic::Unknown(spelling).to_string().len(),
+                template + spelling.len(),
+                "one byte in, one byte out for {spelling:?}"
+            );
+        }
+    }
+
+    /// Bytes at or above `0x80` are payload, not hazards, and are left alone.
+    ///
+    /// A multi-byte UTF-8 sequence cannot move a cursor or open an escape
+    /// sequence, and mangling one would corrupt a spelling a user might
+    /// legitimately have typed. This is also the test that says the
+    /// `from_utf8_lossy` in `printable_spelling` never actually replaces
+    /// anything: a replacement would show up here as `U+FFFD`.
+    #[test]
+    fn multibyte_spellings_survive_unchanged() {
+        let rendered =
+            SuiteDiagnostic::Unknown("AES-\u{00e9}\u{4e2d}").to_string();
+        assert_eq!(
+            rendered,
+            "rustls: unknown cipher in list: \"AES-\u{00e9}\u{4e2d}\""
+        );
+        assert!(!rendered.contains('\u{fffd}'), "nothing may be replaced");
+
+        // And a control byte mixed in with them touches only itself.
+        assert_eq!(
+            SuiteDiagnostic::Unknown("\u{00e9}\x1b\u{4e2d}").to_string(),
+            "rustls: unknown cipher in list: \"\u{00e9}.\u{4e2d}\""
+        );
+    }
+
+    /// The raw spelling stays reachable, unescaped, for a caller that needs it.
+    ///
+    /// The escape hatch `Display`'s documentation promises. Comparing, matching
+    /// or storing a spelling must see what the user actually wrote.
+    #[test]
+    fn the_raw_spelling_is_never_escaped() {
+        let hostile = "AES\x1b[2J\nx";
+        assert_eq!(SuiteDiagnostic::Unknown(hostile).spelling(), hostile);
+        assert_eq!(SuiteDiagnostic::Duplicate(hostile).spelling(), hostile);
+    }
+
+    /// An ordinary spelling renders byte-for-byte as `rustls.c` renders it.
+    ///
+    /// The parity control for the four tests above: without it, an
+    /// implementation that escaped something it should not -- a hyphen, an
+    /// underscore, a digit -- would pass all of them.
+    #[test]
+    fn an_ordinary_spelling_is_rendered_byte_for_byte() {
+        for spelling in [
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+            "ECDHE-RSA-CHACHA20-POLY1305",
+            "GIBBERISH",
+            "a b",
+            "!\"#$%&'()*+,-./0123456789:;<=>?@[\\]^_`{|}~",
+        ] {
+            assert_eq!(
+                SuiteDiagnostic::Unknown(spelling).to_string(),
+                format!("rustls: unknown cipher in list: \"{spelling}\""),
+                "a printable spelling must pass through untouched"
+            );
+        }
+    }
+
+    /// A hostile spelling survives the walk and is reported once, neutralized.
+    ///
+    /// End to end rather than on a constructed diagnostic, so that the escaping
+    /// is proven to be on the path a real cipher list takes. `LF` is not one of
+    /// the five separators (`cipher_suite.c:650-661`), which is exactly why a
+    /// spelling can carry one.
+    #[test]
+    fn a_hostile_cipher_list_is_reported_safely() {
+        let list = "ECDHE-RSA-AES128-GCM-SHA256:AES\x1b[2Jx\nforged";
+        let notes = reported(Some(list), None);
+        assert_eq!(notes.len(), 1, "one token, one diagnostic");
+        assert_eq!(
+            notes.first().map(String::as_str),
+            Some("rustls: unknown cipher in list: \"AES.[2Jx.forged\"")
         );
     }
 
@@ -1958,7 +2678,7 @@ mod tests {
     #[test]
     fn the_real_provider_list_drives_the_token_loop() {
         // The same flow over `rustls::SupportedCipherSuite` rather than the
-        // fake, so the monomorphisation the backend will instantiate is the
+        // fake, so the monomorphization the backend will instantiate is the
         // one under test: the token loop, the provider lookup, the duplicate
         // check and the unknown-spelling path, all with the real type.
         let provider: &[SupportedCipherSuite] =

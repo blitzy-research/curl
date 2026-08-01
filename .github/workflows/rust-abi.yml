@@ -1,0 +1,729 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Validation gate 7 of the ten that guard the Rust workspace: C ABI PARITY --
+# the exported symbol set, and the public headers the C world compiles against.
+#
+# The gate, verbatim: `nm`/`objdump` symbol parity against curl 8.x's
+# libcurl.so -- 100 symbols. AAP 0.8.4 adds an eleventh gate to that list, "all
+# 129 docs/examples/*.c must compile against the generated header", and AAP
+# 0.4.1 assigns both to this one file. They are two legs of one question -- does
+# a program built against curl 8.19.0-DEV still build and link against this
+# artifact -- so they live together and are reported separately.
+#
+# It does nothing further. The build lives in rust-build.yml, lint in
+# rust-clippy.yml, the tests in rust-test.yml, undefined behaviour in
+# rust-miri.yml, the sanitizer in rust-asan.yml, coverage in
+# rust-coverage.yml, supply chain in rust-audit.yml, and the curl fixture
+# corpus in curl-testsuite.yml. One workflow per validation gate, so that a
+# failure names its own cause.
+#
+# WHY BOTH LEGS ARE EXPECTED TO BE RED TODAY, AND WHY THAT IS CORRECT
+#
+# Measured on this checkout:
+#
+#   Leg A, symbols.  lib/libcurl.def names 100 symbols. The release cdylib
+#   exports zero of them: `nm -D --defined-only target/release/libcurl.so`
+#   yields no curl_ name at all, and `readelf --dyn-syms` finds 43 global
+#   functions of which none matches curl_. So symbol parity is 100 missing, 0
+#   extra. The exports have not been written yet.
+#
+#   Leg B, headers.  The generated include/curl/curl.h is 717 lines where the
+#   committed header is 3344. Compiling the 129 example programs against it
+#   produces 122 regressions, with diagnostics of the form "unknown type name
+#   'curlfiletype'", "unknown type name 'curl_formget_callback'" and "unknown
+#   type name 'CURLSHcode'". Whole families of declarations are absent.
+#
+# Leg B is the precise failure AAP 0.6.4 attributes to the previous attempt at
+# this migration -- a cbindgen-generated header that broke C consumers -- and
+# the reason that section promotes the example corpus to a first-class gate.
+# This workflow exists so that the breakage is reported by CI rather than
+# discovered by a consumer.
+#
+# WHY LEG B IS A DIFFERENTIAL AND NOT A FIXED SKIP LIST
+#
+# Seven of the 129 examples do not compile against the COMMITTED upstream
+# header either, under the flag set this gate uses. Measured, they divide into
+# three unrelated causes:
+#
+#   crawler, ghiper, smooth-gtk-thread   missing optional third-party header
+#                                        (libxml, glib, gtk).
+#   evhiperfifo, hiperfifo, htmltidy     typecheck-gcc.h attribute-warnings,
+#                                        which -Werror promotes to errors.
+#                                        These pass without -Werror.
+#   ephiperfifo                          "'fifo' undeclared", a pre-existing
+#                                        defect in the example itself. Fails
+#                                        with and without -Werror.
+#
+# Upstream never compiles these files with -Werror -- docs/examples/Makefile.am
+# uses CFLAGS += @CURL_CFLAG_EXTRAS@, and .github/scripts/verify-examples.pl,
+# despite its name, compiles `# EXAMPLE` blocks extracted from markdown man
+# pages rather than docs/examples/*.c (checkdocs.yml invokes it as
+# `verify-examples.pl docs/libcurl/curl*.md docs/libcurl/opts/*.md`). So those
+# seven failures are properties of the corpus, not of this workspace.
+#
+# A hand-maintained skip list would therefore be wrong in both directions: it
+# would mis-attribute four of the seven, and -- fatally -- a list written today
+# would have to name 129 files to stay green, which would mask the 122 real
+# regressions completely. Instead the gate compiles every example TWICE, once
+# against the committed header and once against the generated one, and fails
+# only where the generated header does WORSE. That subtracts the upstream
+# baseline exactly, needs no maintenance, and cannot hide a regression.
+#
+# LINEAGE
+#
+# lib/libcurl.def is the authority for leg A and is read, never written. AAP
+# 0.2.1 records that docs/libcurl/symbols-in-versions is a historical superset
+# including removed symbols and is therefore NOT the export list. For leg B the
+# ancestor is docs/examples/Makefile.am, which compiles and links the corpus
+# against libcurl.la; this gate compiles but does not link, because linking
+# would conflate header conformance with export completeness and leg A already
+# measures the latter.
+
+name: 'Rust ABI parity'
+
+on:
+  push:
+    branches:
+      - master
+      - '*/ci'
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}'
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # Colour escapes corrupt the log scraping that the assertions below perform.
+  CARGO_TERM_COLOR: never
+  # A transient registry failure should not be read as an ABI regression.
+  CARGO_NET_RETRY: '3'
+  # Incremental artifacts are useless in a one-shot CI job.
+  CARGO_INCREMENTAL: '0'
+  # The exact stable pin from rust-toolchain.toml.
+  STABLE_TOOLCHAIN: '1.97.1'
+  # The authority for leg A. Read-only. AAP 0.1.1 derives the count of 100 from
+  # this file, and AAP 0.3.1 breaks it down per module: easy 21, multi 22,
+  # share 4, global 5, slist 2, mime 12, form 3, url 6, ws 4, printf 10,
+  # strerror 4, misc 13.
+  ABI_DEF: 'lib/libcurl.def'
+  # Derived in AAP 0.1.1 from lib/Makefile.soname (VERSIONCHANGE 12 minus
+  # VERSIONDEL 8). A drop-in replacement must satisfy the same dynamic-linker
+  # lookup, so this is part of the ABI and not a packaging detail.
+  ABI_SONAME: 'libcurl.so.4'
+  # The triple this gate builds for. Symbol parity and header conformance are
+  # target-independent properties, so one host leg establishes them; the
+  # four-target matrix belongs to gate 1 (rust-build.yml). Named explicitly
+  # because .github/scripts/materialize-soname.sh derives the Mach-O and ELF
+  # naming conventions from the triple, and it must be told which one applies.
+  ABI_TARGET: 'x86_64-unknown-linux-gnu'
+  # The flag set from .github/scripts/verify-examples.pl, reused verbatim so
+  # that leg B is judged by the same standard the C tree applies to the
+  # examples embedded in its manual pages.
+  EXAMPLE_CFLAGS: '-DCURL_ALLOW_OLD_MULTI_SOCKET -DCURL_DISABLE_DEPRECATION -Wunused -Werror -Wall -Wno-unused-but-set-variable'
+
+jobs:
+  abi:
+    name: 'symbol parity and public header conformance'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'install the pinned stable toolchain'
+        run: |
+          set -eu
+          if [ -z "${STABLE_TOOLCHAIN}" ]; then
+            echo "FAIL: STABLE_TOOLCHAIN is empty."
+            exit 1
+          fi
+          rustup toolchain install "${STABLE_TOOLCHAIN}" --profile minimal --no-self-update
+          rustup default "${STABLE_TOOLCHAIN}"
+
+      - name: 'toolchain versions'
+        run: |
+          set -eu
+          rustc --version
+          cargo --version
+          cc --version | head -1
+          nm --version | head -1
+          objdump --version | head -1
+
+      - name: 'assert: the pinned stable toolchain is the active one'
+        run: |
+          set -eu
+          have="$(rustc --version | awk '{print $2}')"
+          if [ "${have}" != "${STABLE_TOOLCHAIN}" ]; then
+            echo "FAIL: rustc reports ${have} but this gate is pinned to ${STABLE_TOOLCHAIN}."
+            exit 1
+          fi
+          echo "stable ${have} active"
+
+      - name: 'assert: the ABI authority is intact'
+        run: |
+          set -eu
+          # If lib/libcurl.def were truncated or reformatted, every comparison
+          # below would still "pass" against a shorter list. Prove the authority
+          # first, then trust it.
+          if [ ! -f "${ABI_DEF}" ]; then
+            echo "FAIL: ${ABI_DEF} is absent. It is the authority for the exported"
+            echo "symbol set and this gate cannot run without it."
+            exit 1
+          fi
+          if [ "$(head -1 "${ABI_DEF}")" != 'EXPORTS' ]; then
+            echo "FAIL: ${ABI_DEF} does not begin with the EXPORTS keyword, so its"
+            echo "format is not the one this gate parses."
+            exit 1
+          fi
+          # Every name sits on its own line with no leading whitespace.
+          if grep -qE '^[[:space:]]+' "${ABI_DEF}"; then
+            echo "FAIL: ${ABI_DEF} contains indented lines. The parser below assumes"
+            echo "one bare symbol per line."
+            grep -nE '^[[:space:]]+' "${ABI_DEF}" | head
+            exit 1
+          fi
+          grep -v '^EXPORTS' "${ABI_DEF}" | sed 's/[[:space:]]*$//' | grep . \
+            | sort -u > "${RUNNER_TEMP}/abi-expected.txt"
+          n="$(wc -l < "${RUNNER_TEMP}/abi-expected.txt" | tr -d ' ')"
+          if [ "${n}" -ne 100 ]; then
+            echo "FAIL: ${ABI_DEF} yields ${n} symbols, but AAP 0.1.1 fixes the"
+            echo "exported surface of curl 8.19.0-DEV at exactly 100. Either the"
+            echo "authority changed -- which is an ABI break needing a deliberate"
+            echo "decision -- or the parser no longer matches its format."
+            exit 1
+          fi
+          echo "${ABI_DEF}: ${n} symbols, first $(head -1 "${RUNNER_TEMP}/abi-expected.txt"), last $(tail -1 "${RUNNER_TEMP}/abi-expected.txt")"
+
+      - name: 'snapshot the committed public headers as the leg B baseline'
+        run: |
+          set -eu
+          # This MUST happen before any cargo build. curl-rs-ffi/build.rs writes
+          # the public headers into the source tree, so once the workspace has
+          # been built the committed version is no longer on disk to compare
+          # against.
+          if [ -n "$(git status --porcelain include/ 2>/dev/null)" ]; then
+            echo 'FAIL: include/ is already modified at checkout, so the committed'
+            echo 'headers cannot be used as a baseline. The differential in leg B'
+            echo 'depends on this snapshot being the reviewed, committed state.'
+            git status --porcelain include/
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/baseline"
+          cp -a include "${RUNNER_TEMP}/baseline/"
+          echo "baseline captured: $(find "${RUNNER_TEMP}/baseline/include" -name '*.h' | wc -l | tr -d ' ') header(s), curl.h is $(wc -l < "${RUNNER_TEMP}/baseline/include/curl/curl.h" | tr -d ' ') lines"
+
+      - name: 'leg B baseline: compile the example corpus against the committed headers'
+        run: |
+          set -eu
+          # Establish which examples the corpus itself cannot compile, under this
+          # exact flag set, independently of anything this workspace generates.
+          # Recorded as the baseline and subtracted later.
+          corpus="$(find docs/examples -maxdepth 1 -name '*.c' | wc -l | tr -d ' ')"
+          if [ "${corpus}" -eq 0 ]; then
+            echo 'FAIL: docs/examples/*.c matched no file. AAP 0.6.4 makes this corpus'
+            echo 'the ABI conformance suite; an empty corpus would let leg B pass'
+            echo 'without compiling anything.'
+            exit 1
+          fi
+          echo "corpus: ${corpus} example program(s)"
+          : > "${RUNNER_TEMP}/baseline-failures.txt"
+          for c in docs/examples/*.c; do
+            b="$(basename "${c}" .c)"
+            if ! cc -c "${c}" -o /dev/null ${EXAMPLE_CFLAGS} \
+                 -I "${RUNNER_TEMP}/baseline/include" \
+                 > "${RUNNER_TEMP}/baseline-${b}.log" 2>&1; then
+              echo "${b}" >> "${RUNNER_TEMP}/baseline-failures.txt"
+            fi
+          done
+          sort -u "${RUNNER_TEMP}/baseline-failures.txt" -o "${RUNNER_TEMP}/baseline-failures.txt"
+          nf="$(wc -l < "${RUNNER_TEMP}/baseline-failures.txt" | tr -d ' ')"
+          echo "baseline: $((corpus - nf)) compiled, ${nf} did not"
+          if [ "${nf}" -gt 0 ]; then
+            echo 'pre-existing corpus failures, excluded from this gate by subtraction:'
+            sed 's/^/  /' "${RUNNER_TEMP}/baseline-failures.txt"
+          fi
+          # A baseline in which nothing compiles would make every regression
+          # invisible, since a regression is defined as pass-then-fail.
+          if [ "$((corpus - nf))" -eq 0 ]; then
+            echo 'FAIL: not one example compiles against the COMMITTED headers, so the'
+            echo 'baseline is degenerate and leg B could not detect a regression.'
+            echo 'Investigate the toolchain or the checkout before trusting this gate.'
+            exit 1
+          fi
+          echo "${corpus}" > "${RUNNER_TEMP}/corpus-count.txt"
+
+      - name: 'fetch the locked dependency graph'
+        run: |
+          set -eu
+          cargo fetch --locked
+
+      - name: 'build the release cdylib and staticlib, regenerating the headers'
+        run: |
+          set -eu
+          # --release because the artifact under test is the one that ships.
+          # stdin is closed: a rustc target-information probe reads its source
+          # from standard input, and leaving a live stdin attached lets unrelated
+          # bytes be lexed as Rust.
+          cargo build --locked --release -p curl-rs-ffi < /dev/null
+          ls -l target/release/libcurl.so target/release/libcurl.a
+
+      - name: 'leg A: exported symbol parity against lib/libcurl.def'
+        run: |
+          set -eu
+          so='target/release/libcurl.so'
+          if [ ! -f "${so}" ]; then
+            echo "FAIL: ${so} was not produced, so there is no export set to compare."
+            exit 1
+          fi
+          # nm -D lists the dynamic symbol table, which is what a consumer links
+          # against. --defined-only drops the imports. The last field is the name,
+          # which survives both the "value type name" and "type name" layouts.
+          nm -D --defined-only "${so}" 2>/dev/null \
+            | awk 'NF >= 2 { print $NF }' \
+            | grep '^curl_' \
+            | sort -u > "${RUNNER_TEMP}/abi-actual.txt" || true
+          echo "exported curl_* symbols: $(wc -l < "${RUNNER_TEMP}/abi-actual.txt" | tr -d ' ')"
+          echo "expected (${ABI_DEF}):    $(wc -l < "${RUNNER_TEMP}/abi-expected.txt" | tr -d ' ')"
+          comm -23 "${RUNNER_TEMP}/abi-expected.txt" "${RUNNER_TEMP}/abi-actual.txt" \
+            > "${RUNNER_TEMP}/abi-missing.txt"
+          comm -13 "${RUNNER_TEMP}/abi-expected.txt" "${RUNNER_TEMP}/abi-actual.txt" \
+            > "${RUNNER_TEMP}/abi-extra.txt"
+          nmiss="$(wc -l < "${RUNNER_TEMP}/abi-missing.txt" | tr -d ' ')"
+          nextra="$(wc -l < "${RUNNER_TEMP}/abi-extra.txt" | tr -d ' ')"
+          echo ''
+          echo "missing (declared in ${ABI_DEF}, not exported): ${nmiss}"
+          sed 's/^/  /' "${RUNNER_TEMP}/abi-missing.txt"
+          echo "extra (exported, absent from ${ABI_DEF}): ${nextra}"
+          sed 's/^/  /' "${RUNNER_TEMP}/abi-extra.txt"
+          echo ''
+          if [ "${nmiss}" -ne 0 ] || [ "${nextra}" -ne 0 ]; then
+            echo 'FAIL: the exported symbol set is not identical to the authority.'
+            echo 'A missing symbol makes an existing consumer fail to link. An extra'
+            echo 'curl_-prefixed export enlarges the public surface beyond curl'
+            echo '8.19.0-DEV, which a drop-in replacement must not do. The comparison'
+            echo 'is deliberately symmetric so that neither direction can pass'
+            echo 'unnoticed.'
+            exit 1
+          fi
+          echo 'exported symbol set is identical to the authority'
+
+      - name: 'assert: the shared library carries the ABI identity a consumer looks up'
+        run: |
+          set -eu
+          so='target/release/libcurl.so'
+          # DT_SONAME is what the dynamic linker records in a consumer and then
+          # searches for at run time. A drop-in replacement that exports the
+          # right 100 symbols under the wrong soname still cannot be found.
+          soname="$(objdump -p "${so}" 2>/dev/null | awk '/SONAME/ { print $2; exit }')"
+          if [ -z "${soname}" ]; then
+            echo "FAIL: ${so} carries no DT_SONAME. AAP 0.1.1 derives ${ABI_SONAME}"
+            echo "from lib/Makefile.soname, and Cargo sets no soname by default, so"
+            echo "it must be configured explicitly."
+            exit 1
+          fi
+          if [ "${soname}" != "${ABI_SONAME}" ]; then
+            echo "FAIL: DT_SONAME is ${soname}, expected ${ABI_SONAME}."
+            exit 1
+          fi
+          echo "DT_SONAME: ${soname}"
+          # The soname must not leak onto the executables. Setting it through a
+          # blanket rustflags entry rather than a cdylib-only link argument gives
+          # curl-rs and curlinfo a DT_SONAME too, which would advertise that the
+          # binaries provide libcurl.so.4.
+          for exe in target/release/curl-rs target/release/curlinfo; do
+            if [ -f "${exe}" ]; then
+              leaked="$(objdump -p "${exe}" 2>/dev/null | awk '/SONAME/ { print $2; exit }')"
+              if [ -n "${leaked}" ]; then
+                echo "FAIL: ${exe} carries DT_SONAME ${leaked}. The soname must be a"
+                echo "cdylib-only link argument, never a blanket rustflag."
+                exit 1
+              fi
+              echo "$(basename "${exe}"): no soname, as required"
+            fi
+          done
+          # A correct DT_SONAME is necessary but not sufficient. The loader
+          # resolves that soname to a FILE of the same name, and a linker
+          # resolves -lcurl through the unversioned development symlink. Cargo
+          # emits only the unversioned libcurl.so, so the versioned name and the
+          # symlink chain that every distribution ships have to be produced
+          # deliberately:
+          #
+          #   libcurl.so    -> libcurl.so.4    development symlink, for -lcurl
+          #   libcurl.so.4                     the real object, matching DT_SONAME
+          #
+          # Without libcurl.so.4 on disk, an existing consumer that already
+          # records a dependency on libcurl.so.4 cannot load this build at all,
+          # so it is not a drop-in replacement no matter how correct its exports.
+          # NOT MERELY MISSING - SILENTLY WRONG. Measured on this exact artifact:
+          # with only the unversioned file present, a consumer linked with
+          # -Wl,--no-as-needed -lcurl records DT_NEEDED libcurl.so.4, the loader
+          # fails to find it here, searches on, and resolves to
+          # /lib/x86_64-linux-gnu/libcurl.so.4 - the system C libcurl. The
+          # consumer then runs against a different implementation entirely and
+          # reports success. So this cannot be a NOTE; it is a hard failure.
+          #
+          # Every name is derived by .github/scripts/materialize-soname.sh from
+          # lib/Makefile.soname, the same authority rust-build.yml packages
+          # with, so the two gates cannot disagree about what to expect.
+          eval "$(.github/scripts/materialize-soname.sh names "${ABI_TARGET}")"
+
+          # Cross-check the derivation against this workflow's own literal. If
+          # lib/Makefile.soname is ever bumped, this fails and names both
+          # values instead of asserting the stale one.
+          if [ "${LIBCURL_SONAME}" != "${ABI_SONAME}" ]; then
+            echo "FAIL: lib/Makefile.soname now derives ${LIBCURL_SONAME} but this"
+            echo "workflow pins ABI_SONAME=${ABI_SONAME}. Update the env value, and"
+            echo 'check SONAME_MAJOR in curl-rs-ffi/build.rs too.'
+            exit 1
+          fi
+
+          # Materialize, then assert the whole chain. Materializing here rather
+          # than only in rust-build.yml keeps this gate self-contained: it
+          # builds its own artifact, so it must version its own artifact.
+          .github/scripts/materialize-soname.sh materialize "${ABI_TARGET}" 'target/release'
+
+          if [ ! -f "target/release/${LIBCURL_REAL}" ] || [ -L "target/release/${LIBCURL_REAL}" ]; then
+            echo "FAIL: target/release/${LIBCURL_REAL} is not a regular file. libtool's"
+            echo 'rule for -version-info current:revision:age puts the real object at'
+            echo 'lib<name>.so.(current-age).(age).(revision).'
+            exit 1
+          fi
+          for link in "${LIBCURL_SONAME}" "${LIBCURL_DEV}"; do
+            if [ ! -L "target/release/${link}" ]; then
+              echo "FAIL: target/release/${link} is not a symlink to the versioned object."
+              echo 'AAP 0.1.1 requires this build to satisfy the same dynamic-linker'
+              echo 'lookup as the library it replaces, which means the same three-name'
+              echo 'chain every distribution ships:'
+              echo "  ${LIBCURL_DEV} -> ${LIBCURL_SONAME} -> ${LIBCURL_REAL}"
+              exit 1
+            fi
+            echo "${link} -> $(readlink "target/release/${link}")"
+          done
+
+          # The chain is only useful if DT_SONAME points INTO it. Assert that
+          # the versioned name a consumer will record is the one that now
+          # exists, rather than checking the two facts independently.
+          real_soname="$(objdump -p "target/release/${LIBCURL_REAL}" 2>/dev/null |
+            awk '/SONAME/ { print $2; exit }')"
+          if [ "${real_soname}" != "${LIBCURL_SONAME}" ]; then
+            echo "FAIL: ${LIBCURL_REAL} carries DT_SONAME ${real_soname:-<none>} but the"
+            echo "symlink chain provides ${LIBCURL_SONAME}. A consumer would record the"
+            echo 'former and the loader would look for a file that does not exist.'
+            exit 1
+          fi
+          echo "${LIBCURL_REAL}: DT_SONAME ${real_soname}, resolved by the chain above"
+
+          # The end-to-end property, verified rather than inferred: link a C
+          # consumer against the chain and confirm the loader resolves the
+          # recorded dependency to OUR file. --no-as-needed is REQUIRED: with
+          # the default --as-needed a consumer that calls nothing drops the
+          # DT_NEEDED entry and the check becomes vacuous (measured: only
+          # libc.so.6 was listed).
+          if [ "${ABI_TARGET}" != "${ABI_TARGET#*-linux-}" ]; then
+            printf 'int main(void) { return 0; }\n' > "${RUNNER_TEMP}/soname_consumer.c"
+            cc "${RUNNER_TEMP}/soname_consumer.c" -L 'target/release' -Wl,--no-as-needed \
+              -lcurl -o "${RUNNER_TEMP}/soname_consumer"
+            recorded="$(objdump -p "${RUNNER_TEMP}/soname_consumer" |
+              awk '/NEEDED/ && $2 ~ /curl/ { print $2; exit }')"
+            if [ "${recorded}" != "${LIBCURL_SONAME}" ]; then
+              echo "FAIL: a -lcurl consumer recorded ${recorded:-<nothing>} rather than"
+              echo "${LIBCURL_SONAME}."
+              exit 1
+            fi
+            resolved="$(LD_LIBRARY_PATH="${PWD}/target/release" \
+              ldd "${RUNNER_TEMP}/soname_consumer" | awk '/curl/ { print $3; exit }')"
+            case "${resolved}" in
+              "${PWD}/target/release/"*)
+                echo "a -lcurl consumer resolves ${recorded} to ${resolved}"
+                ;;
+              *)
+                echo "FAIL: a -lcurl consumer resolved ${recorded} to ${resolved:-<nothing>},"
+                echo 'which is not this build. That is the silent-substitution failure M-14'
+                echo 'describes: the consumer links and runs, against a different libcurl.'
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: 'leg A2: the consumer metadata describes a link that actually works'
+        run: |
+          set -eu
+          # WHAT THIS PROVES, AND WHY IT IS NOT COVERED BY ANYTHING ABOVE. A
+          # Rust staticlib is not self-contained: it carries no record of the
+          # native libraries the Rust standard library itself needs, so a C
+          # program linking libcurl.a must name them, and the only place a
+          # consumer can learn them is `curl-config --static-libs` or
+          # `pkg-config --libs --static libcurl`. Review finding M-21 recorded
+          # that both under-reported. Nothing else in this workflow would
+          # notice: symbol parity inspects the shared object, and the example
+          # corpus compiles but does not link.
+          #
+          # THE FORMULATION IS LOAD-BEARING, and the obvious one is vacuous.
+          # Measured on this artifact:
+          #
+          #   gcc c.c -Wl,--whole-archive libcurl.a -Wl,--no-whole-archive
+          #     WITH the reported libs .... rc=0
+          #     WITHOUT them .............. rc=0     <-- vacuous
+          #
+          # because the gcc driver supplies -lc and -lgcc_s implicitly, masking
+          # whatever the metadata failed to name. Adding -nodefaultlibs removes
+          # that safety net and the test discriminates sharply:
+          #
+          #   gcc -nodefaultlibs ... WITH libs -> rc=0, 0 undefined references
+          #                          WITHOUT    -> rc=1, 4368 undefined references
+          #
+          # --whole-archive is equally necessary: a C program that references
+          # nothing from the archive pulls in no objects at all, so no undefined
+          # symbol can arise and the link would succeed however incomplete the
+          # metadata was.
+          staging="$(find target/release/build -maxdepth 3 -type d \
+            -path '*curl-rs-ffi-*/out/staging' 2>/dev/null | head -1)"
+          if [ -z "${staging}" ]; then
+            echo 'FAIL: curl-rs-ffi produced no install staging tree, so there is no'
+            echo 'generated consumer metadata to test. See M-15.'
+            exit 1
+          fi
+          config="${staging}/bin/curl-config"
+          pc_dir="${staging}/lib/pkgconfig"
+          echo "::group::generated metadata under ${staging}"
+          "${config}" --static-libs
+          PKG_CONFIG_PATH="${PWD}/${pc_dir}" pkg-config --libs --static libcurl
+          echo '::endgroup::'
+
+          # The generated script names the install path of libcurl.a, which does
+          # not exist on a CI runner; substitute the built one and keep every
+          # other flag exactly as reported.
+          printf 'int main(void) { return 0; }\n' > "${RUNNER_TEMP}/static_consumer.c"
+
+          # Both interfaces, because M-21 names both and they are read by
+          # different consumers.
+          cc_libs="$("${config}" --static-libs | sed 's#[^ ]*libcurl\.a##')"
+          pc_libs="$(PKG_CONFIG_PATH="${PWD}/${pc_dir}" \
+            pkg-config --libs --static libcurl | sed 's#-lcurl##; s#-L[^ ]*##g')"
+
+          for interface in 'curl-config' 'pkg-config'; do
+            case "${interface}" in
+              curl-config) libs="${cc_libs}" ;;
+              pkg-config)  libs="${pc_libs}" ;;
+            esac
+            # shellcheck disable=SC2086
+            if ! cc -nodefaultlibs "${RUNNER_TEMP}/static_consumer.c" \
+                 -Wl,--whole-archive target/release/libcurl.a -Wl,--no-whole-archive \
+                 ${libs} -o "${RUNNER_TEMP}/static_consumer" \
+                 > "${RUNNER_TEMP}/static-${interface}.log" 2>&1; then
+              echo "FAIL: a static consumer following ${interface} does not link."
+              echo "reported libraries:${libs}"
+              echo 'undefined references, first 40:'
+              grep 'undefined reference' "${RUNNER_TEMP}/static-${interface}.log" |
+                head -40
+              echo "total: $(grep -c 'undefined reference' \
+                "${RUNNER_TEMP}/static-${interface}.log") undefined reference(s)"
+              echo 'The native-link authority in curl-rs-ffi/build.rs is incomplete for'
+              echo "${ABI_TARGET}. Re-measure with:"
+              echo '  cargo rustc -p curl-rs-ffi --release --crate-type staticlib -- --print native-static-libs'
+              exit 1
+            fi
+            echo "${interface}: a static consumer links against libcurl.a"
+          done
+
+          # Prove the gate is not vacuous IN THIS RUN rather than trusting the
+          # measurement recorded above. Omitting the reported libraries must
+          # fail; if it does not, the -nodefaultlibs safety net is gone on this
+          # runner and every result above is meaningless.
+          if cc -nodefaultlibs "${RUNNER_TEMP}/static_consumer.c" \
+               -Wl,--whole-archive target/release/libcurl.a -Wl,--no-whole-archive \
+               -o "${RUNNER_TEMP}/static_vacuity" > /dev/null 2>&1; then
+            echo 'FAIL: linking with NO reported libraries succeeded, so this gate'
+            echo 'cannot detect an under-reported native-link set and its passes above'
+            echo 'prove nothing. Check that -nodefaultlibs is still honoured.'
+            exit 1
+          fi
+          echo 'vacuity check: omitting the reported libraries fails, as required'
+
+      - name: 'leg B: compile the example corpus against the generated headers'
+        run: |
+          set -eu
+          # The build step above rewrote include/curl/. Prove that it did, because
+          # a differential against an unchanged tree compares a file with itself
+          # and reports success no matter how broken the generator is.
+          if [ -z "$(git status --porcelain include/ 2>/dev/null)" ]; then
+            echo 'FAIL: include/ is unchanged after building curl-rs-ffi, so the'
+            echo 'headers were not generated and leg B would compare the committed'
+            echo 'headers against themselves. AAP 0.4.1 makes include/curl/*.h an'
+            echo 'output of curl-rs-ffi/build.rs; if nothing was written, the'
+            echo 'generator did not run.'
+            exit 1
+          fi
+          echo 'headers regenerated:'
+          git status --porcelain include/ | sed 's/^/  /'
+          echo "generated curl.h: $(wc -l < include/curl/curl.h | tr -d ' ') lines, baseline $(wc -l < "${RUNNER_TEMP}/baseline/include/curl/curl.h" | tr -d ' ')"
+          echo ''
+          : > "${RUNNER_TEMP}/generated-failures.txt"
+          for c in docs/examples/*.c; do
+            b="$(basename "${c}" .c)"
+            if ! cc -c "${c}" -o /dev/null ${EXAMPLE_CFLAGS} -I include \
+                 > "${RUNNER_TEMP}/generated-${b}.log" 2>&1; then
+              echo "${b}" >> "${RUNNER_TEMP}/generated-failures.txt"
+            fi
+          done
+          sort -u "${RUNNER_TEMP}/generated-failures.txt" -o "${RUNNER_TEMP}/generated-failures.txt"
+          corpus="$(cat "${RUNNER_TEMP}/corpus-count.txt")"
+          nf="$(wc -l < "${RUNNER_TEMP}/generated-failures.txt" | tr -d ' ')"
+          echo "generated: $((corpus - nf)) compiled, ${nf} did not"
+
+      - name: 'assert: the generated headers compile everything the committed headers do'
+        run: |
+          set -eu
+          comm -13 "${RUNNER_TEMP}/baseline-failures.txt" \
+                   "${RUNNER_TEMP}/generated-failures.txt" \
+            > "${RUNNER_TEMP}/regressions.txt"
+          comm -23 "${RUNNER_TEMP}/baseline-failures.txt" \
+                   "${RUNNER_TEMP}/generated-failures.txt" \
+            > "${RUNNER_TEMP}/improvements.txt"
+          nreg="$(wc -l < "${RUNNER_TEMP}/regressions.txt" | tr -d ' ')"
+          nimp="$(wc -l < "${RUNNER_TEMP}/improvements.txt" | tr -d ' ')"
+          if [ "${nimp}" -gt 0 ]; then
+            echo "informational: ${nimp} example(s) that the committed headers cannot"
+            echo 'compile now do. Not a failure, but worth knowing:'
+            sed 's/^/  /' "${RUNNER_TEMP}/improvements.txt"
+            echo ''
+          fi
+          # The failure path is GUARDED rather than reached by falling through
+          # past an early `exit 0`. Both spellings behave identically here, but
+          # .github/scripts/shellcheck-ci.sh concatenates every run: block in
+          # this file into one script, so a block ending in an unconditional
+          # top-level `exit` makes shellcheck treat every following step as
+          # unreachable and report SC2317 against all of them. Guarding keeps
+          # the end of this block reachable and the whole file analysable.
+          if [ "${nreg}" -gt 0 ]; then
+            echo "FAIL: ${nreg} example(s) compile against the COMMITTED public headers"
+            echo 'but not against the GENERATED ones. Each is a C program that curl'
+            echo '8.19.0-DEV builds and this artifact does not, which is precisely the'
+            echo 'breakage AAP 0.6.4 records as the blocking failure of the previous'
+            echo 'attempt at this migration.'
+            echo ''
+            sed 's/^/  /' "${RUNNER_TEMP}/regressions.txt"
+            echo ''
+            first="$(head -1 "${RUNNER_TEMP}/regressions.txt")"
+            echo "first diagnostic, from ${first}:"
+            sed -n '1,20p' "${RUNNER_TEMP}/generated-${first}.log" | sed 's/^/  /'
+            exit 1
+          fi
+          echo 'no regression: every example that compiles against the committed'
+          echo 'headers also compiles against the generated ones.'
+
+      - name: 'assert: the type-checking macros were live during leg B'
+        if: always()
+        run: |
+          set -eu
+          # AAP 0.6.3 keeps include/curl/typecheck-gcc.h as a hand-maintained
+          # header of 258 curlcheck_ macros that cbindgen cannot express, and
+          # AAP 0.6.4 makes the example corpus valuable precisely because it
+          # exercises real call syntax THROUGH those macros. If the macros were
+          # inert -- because the header stopped being included, or because
+          # CURL_DISABLE_TYPECHECK crept into the flags -- leg B would degrade
+          # into a plain syntax check while still reporting success.
+          #
+          # This closes a hole that the differential alone cannot. The
+          # differential fails on examples that STOP compiling, so it detects a
+          # header that declares too little. It is blind to a header that CHECKS
+          # too little: dropping typecheck-gcc.h would make the corpus compile
+          # more easily, showing zero regressions and possibly "improvements",
+          # while every consumer silently lost its compile-time type safety.
+          #
+          # So probe negatively, against both headers, and require the SAME
+          # rejection from each. A call passing an integer where a string is
+          # required must be refused by the curl macros specifically.
+          probe="${RUNNER_TEMP}/typecheck-probe.c"
+          printf '#include <curl/curl.h>\nint main(void)\n{\n  CURL *c = curl_easy_init();\n  curl_easy_setopt(c, CURLOPT_URL, 42);\n  return 0;\n}\n' > "${probe}"
+
+          check_typecheck() {
+            label="$1"
+            incdir="$2"
+            log="${RUNNER_TEMP}/typecheck-${label}.log"
+            if cc -c "${probe}" -o /dev/null ${EXAMPLE_CFLAGS} -I "${incdir}" \
+                 > "${log}" 2>&1; then
+              echo "FAIL: against the ${label} headers, curl_easy_setopt(c, CURLOPT_URL, 42)"
+              echo 'compiled without complaint. The typecheck-gcc.h macros are not'
+              echo 'active there, so a consumer gets no compile-time type safety and'
+              echo 'leg B is not checking the declarations it appears to check.'
+              echo 'Confirm that curl.h still includes typecheck-gcc.h and that'
+              echo 'CURL_DISABLE_TYPECHECK is not defined.'
+              return 1
+            fi
+            if ! grep -q 'curl_easy_setopt expects' "${log}"; then
+              echo "FAIL: against the ${label} headers the probe was rejected, but not"
+              echo 'by the curl type-check macros. Something else refused it first,'
+              echo 'so this assertion cannot conclude that type checking works.'
+              echo 'The diagnostic was:'
+              sed -n '1,15p' "${log}" | sed 's/^/  /'
+              return 1
+            fi
+            echo "${label}: rejected by the curl macros, as required"
+            return 0
+          }
+
+          rc=0
+          # The baseline first: this establishes that the flag set itself
+          # activates the macros. If it failed, the premise of leg B would be
+          # broken and no conclusion about the generated headers would follow.
+          check_typecheck 'committed' "${RUNNER_TEMP}/baseline/include" || rc=1
+          # Then the generated headers, which is the case that matters.
+          check_typecheck 'generated' 'include' || rc=1
+          if [ "${rc}" -ne 0 ]; then
+            exit 1
+          fi
+          echo 'typecheck-gcc.h is live against both header sets'
+
+      - name: 'restore the committed public headers'
+        if: always()
+        run: |
+          set -eu
+          # The build regenerated include/curl/ in the working tree. Those files
+          # are tracked, so leaving them modified would make the assertion below
+          # fail for a reason this gate created itself. Restoring them keeps the
+          # final check meaningful: it then reports only writes this gate did NOT
+          # expect.
+          git checkout -- include/curl/
+          echo "include/ restored: $(git status --porcelain include/ | wc -l | tr -d ' ') modified file(s)"
+
+      - name: 'assert: this gate wrote nothing outside target/'
+        run: |
+          set -eu
+          # AAP 0.8.7 and finding M-15 both turn on this point: consumer metadata
+          # such as curl-config and libcurl.pc must be generated into a staging
+          # directory, never into the shared source root. If either appears here,
+          # a build step wrote into the checkout.
+          for stray in curl-config libcurl.pc; do
+            if [ -e "${stray}" ]; then
+              echo "FAIL: ${stray} was written into the source root. Consumer metadata"
+              echo 'belongs in an install-staging directory under target/, so that a'
+              echo 'build never mutates the checkout.'
+              exit 1
+            fi
+          done
+          changed="${RUNNER_TEMP}/worktree-status.txt"
+          git status --porcelain > "${changed}"
+          if [ -s "${changed}" ]; then
+            echo 'FAIL: the working tree changed while the ABI was being checked:'
+            cat "${changed}"
+            exit 1
+          fi
+          echo 'the working tree is unchanged'

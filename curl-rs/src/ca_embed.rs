@@ -14,8 +14,8 @@
 //!
 //! # What this supersedes, and why the source named for it does not exist
 //!
-//! AAP section 0.4.1 maps this module onto `src/tool_ca_embed.c` and marks
-//! that file "(build artifact)". It is genuinely absent from this repository:
+//! This module supersedes `src/tool_ca_embed.c`, which is a build artifact
+//! rather than committed source. It is genuinely absent from this repository:
 //! `ls src/tool_ca_embed.c` reports no such file, and `src/.gitignore:6`
 //! lists `tool_ca_embed.c` beside `tool_hugehelp.c` at `:7`. Perl writes it
 //! during the C build -- `src/Makefile.am:188` names it and `:190` adds it to
@@ -57,8 +57,8 @@
 //! artifact on every build, so this module can include it unconditionally and
 //! the no-bundle path costs no configuration anywhere. That symmetry is what
 //! makes the off arm ordinary rather than special-cased. The input is the
-//! environment variable `CURL_CA_EMBED` (`curl-rs/build.rs:185`), and an
-//! empty value counts as unset there (`:327-337`) to match the shell test in
+//! environment variable `CURL_CA_EMBED` (`curl-rs/build.rs`'s `ENV_CA_EMBED`),
+//! and an empty value counts as unset there to match the shell test in
 //! `configure.ac:2127`. Embedding is deliberately NOT a Cargo feature: it is
 //! a build input in C and it stays a build input here.
 //!
@@ -70,9 +70,9 @@
 //! prints the bundle with `curl_mprintf("%s", curl_ca_embed)`. Both stop at
 //! the NUL, so the bytes that reach a consumer are the payload alone.
 //!
-//! A Rust slice carries its own length, which makes the terminator
-//! redundant, and `curl-rs/build.rs:1036-1048` records the decision to drop
-//! it. Measured at this commit by compiling that script and running it: with
+//! A Rust slice carries its own length, which makes the terminator redundant,
+//! and `curl-rs/build.rs` records the decision to drop it. Measured at this
+//! commit by compiling that script and running it: with
 //! the input unset the payload is zero bytes, and with the input pointed at a
 //! 165-byte file the payload is byte-for-byte that file, with nothing
 //! appended. THE DECISION, STATED PLAINLY: the slice this module exposes is
@@ -96,14 +96,14 @@
 //! and no accessor collapses `Some` into `None` afterwards.
 //!
 //! One coordination limit is reported rather than hidden, because it belongs
-//! to the producer. `curl-rs/build.rs:1065-1068` states that "emptiness is
-//! the signal that embedding is off; there is no separate flag", and
-//! `:1564-1575` records the omission of a compile-time flag as a deliberate
-//! decision taken to keep the build warning-free at the declared minimum Rust
+//! to the producer. `curl-rs/build.rs` states that "emptiness is the signal
+//! that embedding is off; there is no separate flag", and also records the
+//! omission of a compile-time flag as a deliberate decision taken to keep the
+//! build warning-free at the declared minimum Rust
 //! version. Measured consequence: a configured file that is zero bytes long
 //! is normalised to the same empty artifact as an unset input, with the
 //! script emitting `CURL_CA_EMBED points at ..., which is empty; no CA bundle
-//! will be embedded` (`curl-rs/build.rs:1083-1090`). So within this workspace
+//! will be embedded` (`curl-rs/build.rs`). So within this workspace
 //! `CA_EMBED` is empty if and only if no bundle was embedded, which is what
 //! makes the single mapping below sound. It does diverge from C, where naming
 //! a zero-byte file still defines `CURL_CA_EMBED` and would therefore emit
@@ -118,26 +118,25 @@
 //!
 //! Four call sites in the C tool read `curl_ca_embed`. This module supplies
 //! the data for all of them and emits none of the output itself, because the
-//! wording of that output is frozen by AAP section 0.8.1 and belongs to the
-//! module that owns the channel.
+//! wording of that output is frozen and belongs to the module that owns the
+//! channel.
 //!
 //! `src/config2setopts.c:303-328` applies the bundle TWICE, once for the
 //! transfer and once for proxies, each behind its own test that the user
-//! configured nothing themselves: `:304` requires that neither `--cacert`
-//! nor `--capath` was given, and `:316` the same of `--proxy-cacert` and
+//! configured nothing themselves: `:304` requires that neither `--cacert` nor
+//! `--capath` was given, and `:316` the same of `--proxy-cacert` and
 //! `--proxy-capath`. Explicit configuration always wins, and that precedence
-//! is frozen. Each arm sets `blob.len` from `strlen` (`:307`, `:319`),
-//! sets `CURL_BLOB_NOCOPY` (`:308`), announces itself through the note
-//! channel with one of two distinct frozen strings -- `Using embedded CA
-//! bundle (%zu bytes)` at `:309` and `Using embedded CA bundle, for proxies
-//! (%zu bytes)` at `:321` -- and tolerates a `CURLE_NOT_BUILT_IN` answer by
-//! warning that the TLS backend does not support the option (`:311-313`,
-//! `:323-325`). `curl-rs/src/config/to_setopts.rs` owns all of that; it takes
-//! the byte count from [`byte_len`] so the two messages report the same
-//! number C reports, and reaches the note channel through
-//! `curl-rs/src/output/msgs.rs`. `CURL_BLOB_NOCOPY` asks the engine to borrow
-//! the bytes rather than copy them, which is precisely what a compiled-in
-//! `&'static [u8]` already is.
+//! is frozen. Each arm sets `blob.len` from `strlen` (`:307`, `:319`), sets
+//! `CURL_BLOB_NOCOPY` (`:308`), announces itself through the note channel with
+//! one of two distinct frozen strings -- `Using embedded CA bundle (%zu
+//! bytes)` at `:309` and `Using embedded CA bundle, for proxies (%zu bytes)`
+//! at `:321` -- and tolerates a `CURLE_NOT_BUILT_IN` answer by warning that
+//! the TLS backend does not support the option (`:311-313`, `:323-325`). All
+//! of that belongs to `curl-rs/src/config/to_setopts.rs`, which takes the byte
+//! count from [`byte_len`] so the two messages report the same number C
+//! reports, and reaches the note channel through `curl-rs/src/output/msgs.rs`.
+//! `CURL_BLOB_NOCOPY` asks the engine to borrow the bytes rather than copy
+//! them, which is precisely what a compiled-in `&'static [u8]` already is.
 //!
 //! `src/tool_operate.c:2319-2324` implements `--dump-ca-embed`: it prints the
 //! bundle with `%s` and adds no newline. When nothing is embedded the guarded
@@ -147,42 +146,59 @@
 //! `src/tool_getparam.c:3133-3138` excludes `PARAM_CA_EMBED_REQUESTED` from
 //! the path that would print a diagnostic. The option row at
 //! `src/tool_getparam.c:128` is unconditional, so the flag always parses,
-//! never warns and is never hidden. `curl-rs/src/operate/` owns the emission;
-//! [`bundle`] returning `None` is what makes "print nothing, succeed" the
-//! natural spelling rather than a special case.
+//! never warns and is never hidden. The emission belongs to
+//! `curl-rs/src/operate/`; [`bundle`] returning `None` is what makes "print
+//! nothing, succeed" the natural spelling rather than a special case.
 //!
 //! `src/tool_help.c:357-380` appends the literal token `CAcert` to the
 //! `Features:` line, and only when a bundle is embedded: `:361` reserves the
-//! extra slot, `:369` writes the token, and `:372-373` then re-sorts the
-//! whole list case-insensitively with `struplocompare4sort`, whose
-//! counterpart lives beside this file in `curl-rs/src/util.rs:470`. A
-//! case-sensitive sort would order the line differently, so that helper must
-//! be used rather than a plain sort. `curl-rs/src/cli/help.rs` owns the
-//! printer -- `curl-rs/src/cli/libinfo.rs:82-84` already records the hand-off
-//! -- and gates the token on [`is_embedded`], which is a `const fn` so the
-//! gate may even be evaluated at compile time. The token matters because the
-//! banner is machine-read: `tests/runtests.pl:640-730` parses `Features:` to
-//! decide which fixtures may run, and AAP section 0.6.5 records the asymmetry
-//! that under-reporting a capability makes a fixture skip while
-//! over-reporting makes it run and fail. `CAcert` is absent from the
-//! harness's 52-name vocabulary, so reporting it truthfully is harmless --
-//! and reporting it when no bundle exists would be over-reporting.
+//! extra slot, `:369` writes the token, and `:372-373` then re-sorts the whole
+//! list case-insensitively with `struplocompare4sort`, whose counterpart lives
+//! beside this file in `curl-rs/src/util.rs`. A case-sensitive sort would
+//! order the line differently, so that helper must be used rather than a plain
+//! sort. The printer belongs to `curl-rs/src/cli/help.rs` --
+//! `curl-rs/src/cli/libinfo.rs` already records the hand-off -- and is to gate
+//! the token on [`is_embedded`], which is a `const fn` so the gate may even be
+//! evaluated at compile time. The token matters because the banner is
+//! machine-read: `tests/runtests.pl:640-730` parses `Features:` to decide
+//! which fixtures may run, and the asymmetry is decisive: under-reporting a
+//! capability makes a fixture skip while over-reporting makes it run and fail.
+//! `CAcert` is absent from the harness's 52-name vocabulary, so reporting it
+//! truthfully is harmless -- and reporting it when no bundle exists would be
+//! over-reporting.
 //!
 //! # What this module deliberately does not do
 //!
-//! It chooses no fallback. When nothing is embedded the trust anchors come
-//! from the platform store, exactly as in C, and that decision executes in
-//! `curl-rs/src/config/to_setopts.rs` and ultimately in the engine's TLS
-//! layer, where AAP section 0.5.1 pins the crates for it. Nothing here names
-//! a source of trust anchors, parses a certificate, validates one or reads
-//! any file at run time: the bundle is compiled in, and the only thing this
-//! module reports about the absent case is that it is absent.
+//! It chooses no fallback, and it names no default. Which trust anchors are
+//! used when nothing is embedded is a **runtime** decision driven by curl's
+//! own options, never a build-time one: `webpki-roots` and
+//! `rustls-native-certs` are both pinned and are not alternatives -- the
+//! bundled anchors back the embedded CA bundle path, while the platform store
+//! backs `--ca-native`. That decision
+//! executes in `curl-rs/src/config/to_setopts.rs` and ultimately in the engine's
+//! TLS layer, where AAP section 0.5.1 pins the crates and deliberately omits
+//! `platform-verifier` so that `--cacert`, `--capath` and `--insecure` stay
+//! authoritative. The root `Cargo.toml` carries the canonical statement of that
+//! precedence.
+//!
+//! An earlier revision of this comment said the platform store is the fallback
+//! "exactly as in C". That is not what C does, and the oracle is explicit:
+//! `lib/vtls/vtls.c:296-323` sets `native_ca_store = TRUE` only
+//! `#if defined(USE_APPLE_SECTRUST) || defined(CURL_CA_NATIVE)`, and applies
+//! `CURL_CA_PATH` and `CURL_CA_BUNDLE` only `#ifdef` -- so each of the three is
+//! reached only when the *build* selected it, each is skipped when the user
+//! supplied `--cacert`, `--capath` or a blob, and the whole block is skipped for
+//! Schannel. There is no unconditional platform-store fallback in C to be
+//! "exactly as".
+//!
+//! Nothing here names a source of trust anchors, parses a certificate, validates
+//! one or reads any file at run time: the bundle is compiled in, and the only
+//! thing this module reports about the absent case is that it is absent.
 //!
 //! It generates nothing. Reproducing `src/mk-file-embed.pl` is
-//! `curl-rs/build.rs`'s job, and AAP section 0.3.3 pattern P11 keeps
-//! generated code generated. The artifact lives in the build script's output
-//! directory, which is inside `target/`, so it can never be committed by
-//! accident.
+//! `curl-rs/build.rs`'s job: generated code stays generated. The artifact
+//! lives in the build script's output directory, which is inside `target/`, so
+//! it can never be committed by accident.
 //!
 //! It exports nothing. The C declaration at `src/tool_setup.h:102` is a
 //! symbol the linker can see; the counterpart here is reachable only inside
@@ -192,12 +208,10 @@
 //! this module as written, and nothing here asks to be exempted from it: a
 //! compiled-in slice of bytes needs no escape hatch.
 
-// ===========================================================================
 // The generated artifact
-// ===========================================================================
 //
-// `curl-rs/build.rs:1057-1128` writes `ca_embed.rs` on every build, in both
-// configurations, and `:216-229` records the shape it promises:
+// `curl-rs/build.rs` writes `ca_embed.rs` on every build, in both
+// configurations, and records the shape it promises:
 //
 //     pub(crate) const CA_EMBED: &[u8]
 //
@@ -209,7 +223,7 @@
 // into this one, for three reasons. The generated tokens are then linted in
 // isolation, so a later change to their shape cannot quietly collide with a
 // name here. Callers cannot reach the constant, which is what keeps the
-// emptiness question interpreted in exactly one place. And this module's own
+// emptiness question interpreted in exactly one place. This module's own
 // surface stays the only thing the rest of the crate sees. No lint has to be
 // silenced to make that work, measured with `cargo clippy -- -D warnings` in
 // both configurations; the generated file carries no copyright header for the
@@ -219,9 +233,7 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/ca_embed.rs"));
 }
 
-// ===========================================================================
 // Interpretation -- the single place emptiness means anything
-// ===========================================================================
 
 /// Maps the generated artifact onto the two states a build can be in.
 ///
@@ -235,6 +247,7 @@ mod generated {
 ///
 /// A `const fn` so that the whole classification happens while compiling and
 /// every accessor below can be `const` too.
+#[allow(dead_code)]
 const fn classify(embedded: &'static [u8]) -> Option<&'static [u8]> {
     if embedded.is_empty() {
         None
@@ -244,6 +257,7 @@ const fn classify(embedded: &'static [u8]) -> Option<&'static [u8]> {
 }
 
 /// The bundle state of this build, resolved once, at compile time.
+#[allow(dead_code)]
 const BUNDLE: Option<&'static [u8]> = classify(generated::CA_EMBED);
 
 /// Reports the length of a bundle state without disturbing it.
@@ -253,6 +267,7 @@ const BUNDLE: Option<&'static [u8]> = classify(generated::CA_EMBED);
 /// `Some(0)` and an absent one answers `None`. Nothing downstream of
 /// [`classify`] may turn a present bundle into an absent one, and this is
 /// where that is pinned down.
+#[allow(dead_code)]
 const fn len_of(state: Option<&'static [u8]>) -> Option<usize> {
     match state {
         Some(bytes) => Some(bytes.len()),
@@ -260,9 +275,7 @@ const fn len_of(state: Option<&'static [u8]>) -> Option<usize> {
     }
 }
 
-// ===========================================================================
 // The surface -- three accessors, all crate-private
-// ===========================================================================
 
 /// The embedded bundle, or `None` when this build embedded none.
 ///
@@ -272,13 +285,14 @@ const fn len_of(state: Option<&'static [u8]>) -> Option<usize> {
 /// they stand: `src/config2setopts.c:308` asks for `CURL_BLOB_NOCOPY`, and a
 /// borrowed `'static` slice is already exactly that.
 ///
-/// Two consumers read this. `curl-rs/src/config/to_setopts.rs` applies it to
-/// the transfer and to proxies, each only when the user configured neither
-/// certificate file nor certificate directory for that half
-/// (`src/config2setopts.c:304`, `:316`). `curl-rs/src/operate/` writes it to
-/// standard output for `--dump-ca-embed` with no trailing newline
+/// Two consumers are owed this. `curl-rs/src/config/to_setopts.rs` is to
+/// apply it to the transfer and to proxies, each only when the user
+/// configured neither certificate file nor certificate directory for that
+/// half (`src/config2setopts.c:304`, `:316`). `curl-rs/src/operate/` is to
+/// write it to standard output for `--dump-ca-embed` with no trailing newline
 /// (`src/tool_operate.c:2322`), and prints nothing while still succeeding
 /// when the answer here is `None`.
+#[allow(dead_code)]
 pub(crate) const fn bundle() -> Option<&'static [u8]> {
     BUNDLE
 }
@@ -286,14 +300,15 @@ pub(crate) const fn bundle() -> Option<&'static [u8]> {
 /// Whether this build embedded a bundle at all.
 ///
 /// The predicate behind the `CAcert` token on the `Features:` line
-/// (`src/tool_help.c:361`, `:369`). `curl-rs/src/cli/help.rs` emits that
-/// token if and only if this is `true`, then re-sorts the list
+/// (`src/tool_help.c:361`, `:369`). `curl-rs/src/cli/help.rs` is to emit
+/// that token if and only if this is `true`, then re-sort the list
 /// case-insensitively through `curl-rs/src/util.rs`'s `struplocompare4sort`
 /// (`src/tool_help.c:372-373`).
 ///
 /// `const` so that the gate costs nothing at run time and may be evaluated in
 /// a `const` context, and equal to `bundle().is_some()` by construction
 /// rather than by convention.
+#[allow(dead_code)]
 pub(crate) const fn is_embedded() -> bool {
     BUNDLE.is_some()
 }
@@ -310,6 +325,7 @@ pub(crate) const fn is_embedded() -> bool {
 ///
 /// `Some(0)` and `None` are different answers: the first is an embedded
 /// bundle that is empty, the second is no embedded bundle.
+#[allow(dead_code)]
 pub(crate) const fn byte_len() -> Option<usize> {
     len_of(BUNDLE)
 }
@@ -333,7 +349,7 @@ mod tests {
     const PAYLOAD: &[u8] = b"-----BEGIN CERTIFICATE-----\n";
 
     /// The presence predicate is usable while compiling, which is what lets
-    /// `cli/help.rs` gate the `CAcert` token without a run-time cost.
+    /// `cli/help.rs` gate the `CAcert` token without a runtime cost.
     const IS_EMBEDDED_IN_CONST_CONTEXT: bool = is_embedded();
 
     /// So are the other two, and this is where that is checked.
@@ -372,7 +388,7 @@ mod tests {
         assert_eq!(byte_len().is_some(), is_embedded());
     }
 
-    /// The `const` evaluations above produced the same answers the run-time
+    /// The `const` evaluations above produced the same answers the runtime
     /// calls do.
     #[test]
     fn const_context_answers_match_the_accessors() {

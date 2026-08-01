@@ -5,9 +5,9 @@
 //! Local file timestamps: the `-R, --remote-time` writer and the
 //! `-z, --time-cond` reader.
 //!
-//! This module supersedes one C translation unit. AAP section 0.4.1 assigns
-//! it `src/tool_filetime.c` (152 lines) with the note "`-R` timestamp
-//! preservation", and it carries both of that file's functions:
+//! This module supersedes one C translation unit, `src/tool_filetime.c`
+//! (152 lines), which provides `-R` timestamp preservation. It carries both
+//! of that file's functions:
 //!
 //! | Item | C origin | Purpose |
 //! |---|---|---|
@@ -26,25 +26,21 @@
 //! `rustup run 1.75.0 rustc --edition 2021`. There is therefore no gap to
 //! bridge here, and consequently no `filetime`, `chrono`, `nix` or `libc`
 //! dependency and no hand-written `utimes`/`utimensat`/`futimens` call.
-//! `#![forbid(unsafe_code)]` on `curl-rs/src/main.rs` covers this module and
-//! nothing here asks for an exemption.
+//! Nothing here asks for an `unsafe` exemption, and nothing in this crate can
+//! grant one: `curl-rs` has no `mod ffi`, which is why the literal
+//! `#![forbid(unsafe_code)]` applies to both of its roots -- `src/main.rs` and
+//! `src/bin/curlinfo.rs` -- unlike `curl-rs-lib`, whose FFI island needs an
+//! inner `#[allow(unsafe_code)]` that `forbid` rejects as `error[E0453]`, so
+//! its root carries `#![deny(unsafe_code)]` with exactly one exemption
+//! instead.
 //!
-//! # Rules status and provenance
-//!
-//! No user-specified rules exist for this project. `review_rules` returns the
-//! single line "No user rules provided.", read both with the default window
-//! and with an explicit full-document range that reaches end-of-document;
-//! this corroborates AAP section 0.7. Nothing in this file is attributed to a
-//! rule and none was invented. Every constraint cited below is an AAP
-//! requirement taken from the user's request (AAP section 0.8) -- binding,
-//! but a requirement, not a rule; calling it a rule would, in AAP section
-//! 0.7's own words, "misrepresent where they came from". Where no requirement
-//! speaks, enterprise-standard best practice governs: the absence of rules is
-//! not permission to lower the bar.
+//! No user-specified rules exist for this project, so nothing here is
+//! attributed to one: every constraint cited below is a requirement taken from
+//! the user's request, which is binding but is not a rule.
 //!
 //! # The two frozen texts
 //!
-//! AAP section 0.8.1 freezes the observable bytes, so both warnings are
+//! The observable bytes are frozen, so both warnings are
 //! reproduced exactly, including the detail that they are *not* symmetrical:
 //!
 //! | Frozen text | C origin |
@@ -67,10 +63,10 @@
 //! The Windows arms -- `src/tool_filetime.c:42-69` (`curlx_CreateFile` plus
 //! `GetFileTime`) and `:91-126` (`SetFileTime`, the `910670515199` and
 //! `-6857222400` clamps, and the two `Capping set filetime ...` warnings) --
-//! are out of scope per AAP section 0.2.2, because the four mandated targets
-//! (AAP section 0.1.1 goal G8) are `x86_64-unknown-linux-gnu`,
-//! `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and
-//! `aarch64-apple-darwin`. No `#[cfg(windows)]` arm is added.
+//! are out of scope, because the four mandated targets are
+//! `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+//! `x86_64-apple-darwin` and `aarch64-apple-darwin`. No `#[cfg(windows)]` arm
+//! is added.
 //!
 //! One consequence is easy to miss and is load-bearing: **the clamps live only
 //! in the Windows arm**, so the live Unix path must not reject an out-of-range
@@ -124,7 +120,7 @@
 //! Closing the gap completely would need a safe path-based timestamp setter,
 //! which `std` does not offer. The only faithful alternative would be a
 //! `utimensat` wrapper added to `curl-rs-lib/src/ffi/sys.rs` -- the one
-//! sanctioned `unsafe` island in the engine (AAP section 0.8.5 conflict C3) --
+//! sanctioned `unsafe` island in the engine --
 //! exposed through a safe `pub` function. That is an engine change, outside
 //! this file's scope, and it is not required by any behaviour reachable from
 //! curl's command line; it is named here so the option is on record rather
@@ -137,13 +133,19 @@
 //! system text. Rust's `std::io::Error` `Display` appends the numeric code:
 //! measured, `No such file or directory (os error 2)` against C's
 //! `No such file or directory`. `std` exposes no `strerror`, and re-creating
-//! `curlx_strerror` is ruled out -- AAP section 0.4.2 retires the duplicate
+//! `curlx_strerror` is ruled out -- this migration retires the duplicate
 //! compilation of `../lib/curlx/*.c` into the tool that
 //! `src/Makefile.inc:33-51`
 //! arranges ("we reuse the code here to avoid duplication"), stating that it
-//! "disappears entirely; the CLI depends on the library crate instead". So
-//! [`strip_os_error_suffix`] removes the suffix as a plain, dependency-free
-//! string operation, applied to both frozen texts.
+//! "disappears entirely; the CLI depends on the library crate instead".
+//!
+//! The suffix is therefore removed by `curl_rs_lib::os_error_message`, the
+//! engine's single renderer, and **not** by anything in this file. That is the
+//! same conclusion AAP section 0.4.2 reaches for `curlx`: the CLI depends on
+//! the library crate. It also fixes a real divergence rather than merely
+//! tidying one up -- this file once carried its own fixed-point stripper while
+//! `output/formparse.rs` carried a single-pass one, so the same kind of error
+//! produced different frozen bytes in different diagnostics of the same tool.
 //!
 //! ## 3. `int rc = 1` becomes the value of the failing branch
 //!
@@ -168,6 +170,7 @@ use crate::output::msgs::{warnf, warnf_bytes, MsgConfig};
 ///
 /// `src/tool_filetime.c:74` reaches this by assigning `rc = 0`, and the
 /// contract at `:34` is "Returns 0 on success, non-zero on file problems".
+#[allow(dead_code)]
 pub(crate) const FILETIME_SUCCESS: i32 = 0;
 
 /// The `int` [`getfiletime`] returns when the file could not be inspected.
@@ -176,6 +179,7 @@ pub(crate) const FILETIME_SUCCESS: i32 = 0;
 /// `src/tool_getparam.c:1637` only tests it for truth (`if(!rc)`), so the
 /// exact magnitude is not observable, but 1 is the value C yields and there is
 /// no reason to pick another.
+#[allow(dead_code)]
 pub(crate) const FILETIME_FAILURE: i32 = 1;
 
 /// `EINVAL`, reported when the requested instant cannot be represented.
@@ -193,71 +197,24 @@ pub(crate) const FILETIME_FAILURE: i32 = 1;
 /// the `i64` seconds field, and both `i64::MIN` and `i64::MAX` were measured to
 /// yield `Some`. It exists so that [`filetime_to_times`] has no panicking path,
 /// as AAP section 0.7 requires of this crate.
+#[allow(dead_code)]
 const EINVAL: i32 = 22;
 
-/// The infix Rust's `std::io::Error` `Display` inserts before the raw errno.
-///
-/// See translation difference 2 in the module documentation.
-const OS_ERROR_INFIX: &str = " (os error ";
-
-/// Renders an I/O error the way `curlx_strerror` renders `errno`.
-///
-/// The bare system text, with Rust's ` (os error N)` suffix removed. Used for
-/// the `%s` of both frozen warnings (`src/tool_filetime.c:79` and `:136`).
-///
-/// Owns its result because `Display` has to be rendered into a buffer before
-/// the suffix can be found, and the borrow of that buffer cannot outlive it.
-/// C faces the same constraint and answers it the same way, with the
-/// `char errbuf[STRERROR_LEN]` of `:77` and `:133`.
-fn strerror(error: &io::Error) -> String {
-    strip_os_error_suffix(&error.to_string()).to_owned()
-}
-
-/// Removes every trailing ` (os error <digits>)` from a rendered error.
-///
-/// Stripping to a fixed point rather than exactly once is deliberate, and the
-/// reason was measured rather than guessed. On all four mandated targets
-/// `std` appends the suffix exactly once, so one pass and many passes produce
-/// the identical string and this choice is observationally neutral there. Under
-/// a hosted `std` whose `strerror_r` is emulated it is not: running these tests
-/// under Miri, `io::Error::from_raw_os_error(2).to_string()` yields
-/// `No such file or directory (os error 2) (os error 2)` -- the shim's own
-/// message already carries a suffix and `Display` then appends a second. A
-/// fixed-point strip is the only form that produces C's bare text in both
-/// environments while never yielding a *different* string on a real target.
-///
-/// Each pass is [`strip_one_os_error_suffix`], and each successful pass returns
-/// a strictly shorter slice, so the loop always terminates.
-fn strip_os_error_suffix(rendered: &str) -> &str {
-    let mut text = rendered;
-    while let Some(shorter) = strip_one_os_error_suffix(text) {
-        text = shorter;
-    }
-    text
-}
-
-/// One pass of [`strip_os_error_suffix`]: `Some` when a suffix was removed.
-///
-/// Conservative by construction. A suffix is recognised only when the string
-/// ends with `)`, contains [`OS_ERROR_INFIX`] before it, and every byte between
-/// the two is an ASCII digit. Anything else -- an error whose own message merely
-/// contains a parenthesis, a code that is not decimal, or a `Display`
-/// implementation that never appended one -- yields `None`, leaving the text
-/// untouched.
-///
-/// The last occurrence is taken, so the innermost real message is preserved
-/// when several suffixes are stacked.
-fn strip_one_os_error_suffix(rendered: &str) -> Option<&str> {
-    // `?` and `get` are used in place of indexing so that no input can produce
-    // a panicking path.
-    let tail = rendered.strip_suffix(')')?;
-    let start = tail.rfind(OS_ERROR_INFIX)?;
-    let digits = tail.get(start.saturating_add(OS_ERROR_INFIX.len())..)?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    tail.get(..start)
-}
+// `strerror` rendering: not implemented here.
+//
+// `src/tool_filetime.c:79` and `:136` render the errno with
+// `curlx_strerror(errno, errbuf, sizeof(errbuf))`, and both frozen texts take
+// their `%s` from `curl_rs_lib::os_error_message`, the workspace's single
+// renderer. See translation difference 2 in the module documentation for why
+// `std` needs a renderer at all, and `curl-rs-lib`'s own documentation for the
+// measured reason the annotation is stripped to a fixed point rather than once.
+//
+// A second, independent fixed-point implementation used to live here. It agreed
+// with the engine's by coincidence rather than by construction, and it did not
+// agree with `output/formparse.rs`'s single-pass one, so the same kind of error
+// rendered different bytes in different diagnostics of the same tool. Nothing
+// is defined in this section on purpose: a private copy here would restore that
+// drift.
 
 /// Reads a local file's modification time.
 ///
@@ -281,8 +238,9 @@ fn strip_one_os_error_suffix(rendered: &str) -> Option<&str> {
 /// [`setfiletime`] does include one, and the asymmetry is deliberate on C's
 /// part, so it is preserved.
 ///
-/// The Windows arm at `:42-69` is out of scope (AAP section 0.2.2); see the
+/// The Windows arm at `:42-69` is out of scope; see the
 /// module documentation.
+#[allow(dead_code)]
 pub(crate) fn getfiletime(
     sink: &mut dyn Write,
     config: &MsgConfig,
@@ -298,7 +256,7 @@ pub(crate) fn getfiletime(
         Err(error) => {
             // `:77-79`. The literal is the frozen text; it must not gain the
             // filename that `setfiletime`'s message carries.
-            let reason = strerror(&error);
+            let reason = curl_rs_lib::os_error_message(&error);
             warnf(
                 sink,
                 config,
@@ -335,10 +293,11 @@ pub(crate) fn getfiletime(
 /// The filename reaches the message as raw operating-system bytes, matching
 /// C's `%s` over a `char *`; see [`set_failure_message`].
 ///
-/// The Windows arm at `:91-126` is out of scope (AAP section 0.2.2), as is its
+/// The Windows arm at `:91-126` is out of scope, as is its
 /// pair of `Capping set filetime ...` warnings. See translation difference 1 in
 /// the module documentation for the path-versus-handle consequence of using
 /// `std`.
+#[allow(dead_code)]
 pub(crate) fn setfiletime(
     sink: &mut dyn Write,
     config: &MsgConfig,
@@ -360,6 +319,7 @@ pub(crate) fn setfiletime(
 /// independently testable, and so that the three ways it can fail -- an
 /// unrepresentable instant, a failed open, and a failed `set_times` -- all
 /// converge on the single frozen warning, exactly as C's one `if` does.
+#[allow(dead_code)]
 fn apply_filetime(filetime: i64, filename: &Path) -> io::Result<()> {
     let times = filetime_to_times(filetime)?;
 
@@ -384,6 +344,7 @@ fn apply_filetime(filetime: i64, filename: &Path) -> io::Result<()> {
 /// value is ever silently truncated or reinterpreted: it yields the magnitude
 /// as `u64`, and the sign selects the direction from the epoch. This is what
 /// makes a pre-1970 timestamp work.
+#[allow(dead_code)]
 fn filetime_to_times(filetime: i64) -> io::Result<FileTimes> {
     let magnitude = Duration::from_secs(filetime.unsigned_abs());
 
@@ -420,13 +381,14 @@ fn filetime_to_times(filetime: i64) -> io::Result<FileTimes> {
 /// mandated targets is the raw byte sequence the operating system gave us and
 /// therefore what C's `%s` would print. Going through `Path::display` or
 /// `to_string_lossy` instead would substitute U+FFFD for any non-UTF-8 byte and
-/// change the emitted bytes, which AAP section 0.8.1 does not permit. This is
-/// why the message is handed to
+/// change the emitted bytes, which the frozen-output rule does not permit. This
+/// is why the message is handed to
 /// [`warnf_bytes`](crate::output::msgs::warnf_bytes) rather than to
 /// [`warnf`](crate::output::msgs::warnf).
 ///
 /// The single quotes around the filename are part of the frozen text. So is
 /// the absence of a filename from [`getfiletime`]'s message.
+#[allow(dead_code)]
 fn set_failure_message(
     filetime: i64,
     filename: &Path,
@@ -445,7 +407,7 @@ fn set_failure_message(
 
     // `:135-136` -- "': %s", closing quote then the errno text.
     message.extend_from_slice(b"': ");
-    message.extend_from_slice(strerror(error).as_bytes());
+    message.extend_from_slice(curl_rs_lib::os_error_message(error).as_bytes());
 
     message
 }
@@ -553,90 +515,56 @@ mod tests {
 
     // -- The `strerror` replacement -----------------------------------------
 
-    #[test]
-    fn strip_os_error_suffix_removes_the_rust_only_tail() {
-        // The exact strings `std` produces, measured on this toolchain.
-        assert_eq!(
-            strip_os_error_suffix("No such file or directory (os error 2)"),
-            "No such file or directory"
-        );
-        assert_eq!(
-            strip_os_error_suffix("Permission denied (os error 13)"),
-            "Permission denied"
-        );
-        assert_eq!(
-            strip_os_error_suffix("Is a directory (os error 21)"),
-            "Is a directory"
-        );
-        assert_eq!(
-            strip_os_error_suffix("Invalid argument (os error 22)"),
-            "Invalid argument"
-        );
-    }
+    /// The annotation that `curl_rs_lib::os_error_message` removes and
+    /// `curlx_strerror` never produces.
+    ///
+    /// Kept only so the two assertions below can scan emitted diagnostics for
+    /// it. It is deliberately NOT used to render anything: the stripping policy
+    /// and its unit tests belong to `curl-rs-lib`, and a second copy of either
+    /// is what made the three implementations drift.
+    const OS_ERROR_INFIX: &str = " (os error ";
 
+    /// Both frozen texts take their `%s` from the shared renderer.
+    ///
+    /// The expected values are obtained from that renderer rather than written
+    /// out, because the message is the platform's and differs between Linux and
+    /// Darwin. What is asserted is the property the centralization exists for:
+    /// this file's bytes are the same bytes any other consumer would emit for
+    /// the same error. The stripping algorithm itself -- the fixed point, the
+    /// Miri double annotation, the near misses and the degenerate inputs -- is
+    /// unit-tested where it lives, in `curl-rs-lib`'s `util` module.
     #[test]
-    fn strip_os_error_suffix_leaves_everything_else_alone() {
-        // No suffix at all: the `io::ErrorKind` route never appends one.
-        assert_eq!(
-            strip_os_error_suffix("entity already exists"),
-            "entity already exists"
-        );
-        // A parenthesis that is not the suffix.
-        assert_eq!(strip_os_error_suffix("odd (thing)"), "odd (thing)");
-        // The infix present but the payload not decimal.
-        assert_eq!(
-            strip_os_error_suffix("weird (os error abc)"),
-            "weird (os error abc)"
-        );
-        // The infix present but the payload empty.
-        assert_eq!(
-            strip_os_error_suffix("weird (os error )"),
-            "weird (os error )"
-        );
-        // A negative code is not stripped: only ASCII digits qualify.
-        assert_eq!(
-            strip_os_error_suffix("weird (os error -1)"),
-            "weird (os error -1)"
-        );
-        // Not anchored at the end.
-        assert_eq!(
-            strip_os_error_suffix("x (os error 2) y"),
-            "x (os error 2) y"
-        );
-        // A single pass leaves a stacked suffix behind; the fixed-point loop
-        // does not. This is the shape Miri's emulated `strerror_r` produces --
-        // see [`strip_os_error_suffix`] -- so it is asserted rather than
-        // assumed.
-        assert_eq!(
-            strip_one_os_error_suffix(
-                "No such file or directory (os error 2) (os error 2)"
-            ),
-            Some("No such file or directory (os error 2)")
-        );
-        assert_eq!(
-            strip_os_error_suffix(
-                "No such file or directory (os error 2) (os error 2)"
-            ),
-            "No such file or directory"
-        );
-        // Degenerate inputs must not panic or mangle.
-        assert_eq!(strip_os_error_suffix(""), "");
-        assert_eq!(strip_os_error_suffix(")"), ")");
-        assert_eq!(strip_os_error_suffix("(os error 2)"), "(os error 2)");
-    }
+    fn the_frozen_texts_use_the_shared_renderer() {
+        // `:79` -- `Failed to get filetime: %s`. The error is not synthesised
+        // from an errno: the same call is made a second time so the expected
+        // text comes from the error the platform actually produced.
+        let missing = Path::new("/nonexistent-dir-for-filetime/absent");
+        let Err(same_error) = fs::metadata(missing) else {
+            panic!("{missing:?} must not exist");
+        };
+        let expected = curl_rs_lib::os_error_message(&same_error);
 
-    #[test]
-    fn strerror_yields_the_bare_system_text() {
-        // What `curlx_strerror(errno, ...)` yields at
-        // `src/tool_filetime.c:79` and `:136`.
-        assert_eq!(
-            strerror(&io::Error::from_raw_os_error(2)),
-            "No such file or directory"
+        let mut stamp = 0_i64;
+        let (rc, sink) = emit_get(missing, &mut stamp);
+        assert_eq!(rc, FILETIME_FAILURE);
+        let emitted = String::from_utf8_lossy(&sink).into_owned();
+        assert!(emitted.contains("Failed to get filetime: "), "{emitted}");
+        assert!(
+            emitted.contains(expected.as_str()),
+            "expected {expected:?} verbatim in {emitted:?}"
         );
-        assert_eq!(
-            strerror(&io::Error::from_raw_os_error(EINVAL)),
-            "Invalid argument"
+        assert!(!emitted.contains(OS_ERROR_INFIX), "{emitted}");
+
+        // `:136` -- the `setfiletime` message ends with the same rendering.
+        let invalid = io::Error::from_raw_os_error(EINVAL);
+        let invalid_text = curl_rs_lib::os_error_message(&invalid);
+        let message = set_failure_message(42, Path::new("/tmp/nope"), &invalid);
+        assert!(
+            message.ends_with(invalid_text.as_bytes()),
+            "{:?}",
+            String::from_utf8_lossy(&message)
         );
+        assert!(!invalid_text.contains(OS_ERROR_INFIX));
     }
 
     // -- `setfiletime`: the timestamps actually written --------------------

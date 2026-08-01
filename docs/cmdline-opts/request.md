@@ -23,12 +23,13 @@ Change the method to use when starting the transfer.
 curl passes on the verbatim string you give it in the request without any
 filter or other safe guards. That includes white space and control characters.
 
-This build does not implement POP3/POP3S, IMAP/IMAPS or SMTP/SMTPS transfers,
-so read the POP3, IMAP and SMTP sections below as descriptions of the command
-syntax curl accepts rather than as transfers it performs. curl still parses
-the option and its argument, yet a transfer using one of those schemes fails
-with `CURLE_UNSUPPORTED_PROTOCOL`, and the `Protocols:` line in the --version
-output omits those schemes.
+Transfers for POP3, POP3S, IMAP, IMAPS, SMTP and SMTPS are outside the
+specified scope of this rewrite, so read the POP3, IMAP and SMTP sections
+below as descriptions of the command syntax curl accepts rather than as
+transfers it carries out. Parsing the option and its argument is still
+specified, with a transfer using one of those schemes then failing with
+`CURLE_UNSUPPORTED_PROTOCOL`. The `Protocols:` line of the --version output
+withholds all six.
 
 ## HTTP
 Specifies a custom request method to use when communicating with the HTTP

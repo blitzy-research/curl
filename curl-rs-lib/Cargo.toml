@@ -2,39 +2,34 @@
 #
 # SPDX-License-Identifier: curl
 
-# ===========================================================================
 # curl-rs-lib -- the libcurl protocol engine.
 #
 # This crate supersedes the C protocol engine: 163,664 measured lines across
-# lib/*.c, lib/*.h and the five specialised subtrees (lib/curlx 18, lib/vtls
-# 15, lib/vauth 13, lib/vquic 4, lib/vssh 3 translation units). Per AAP 0.1.1
-# G1 it is "the only crate with protocol knowledge"; curl-rs (the
-# command-line binary) and curl-rs-ffi (the C ABI shim) are thin adapters
-# over it, so the dependency direction is
+# lib/*.c, lib/*.h and the five specialised subtrees (lib/curlx, lib/vtls,
+# lib/vauth, lib/vquic, lib/vssh). It is the only crate with protocol knowledge;
+# curl-rs (the command-line binary) and curl-rs-ffi (the C ABI shim) are thin
+# adapters over it, so the dependency direction is
 #
 #     curl-rs-ffi  ->  curl-rs-lib  <-  curl-rs
 #
 # with no cycles and no protocol logic in either leaf crate.
 #
-# NOTHING in this manifest pins a version. AAP 0.4.2: the workspace manifest
-# "is the single place versions are declared; member manifests inherit
-# through `workspace = true`, so a version can never disagree between
-# crates". Every dependency below is therefore `{ workspace = true }` plus,
-# only where genuinely required, an ADDITIVE crate-local `features` /
-# `optional` overlay.
+# NOTHING in this manifest pins a version. The workspace manifest is the single
+# place versions are declared, and member manifests inherit through `workspace =
+# true`, so a version can never disagree between crates. Every dependency below
+# is therefore `{ workspace = true }` plus, only where genuinely required, an
+# ADDITIVE crate-local `features` / `optional` overlay.
 #
 # CARGO MECHANIC that governs every overlay in this file: Cargo features are
-# additive and are UNIONED across the whole dependency graph. A member crate
-# can only ADD features, never subtract them. Consequently
+# additive and are UNIONED across the whole dependency graph. A member crate can
+# only ADD features, never subtract them. Consequently
 #   * `features = [...]` in a member is always honoured, and
 #   * `default-features = false` in a member is IGNORED (with a warning that
 #     Cargo says may become a hard error) whenever the inherited
 #     `[workspace.dependencies]` entry did not itself set it.
-# That warning would break AAP 0.8.4 gate 1 ("zero warnings"), so this file
-# never writes `default-features` at all. Where turning defaults off matters
-# -- the cryptographic provider -- the root manifest already does it; see the
-# TLS block below.
-# ===========================================================================
+# That warning would break the zero-warning build gate, so this file never
+# writes `default-features` at all. Where turning defaults off matters - the
+# cryptographic provider - the root manifest already does it; see the TLS block.
 
 [package]
 name = "curl-rs-lib"
@@ -44,28 +39,39 @@ name = "curl-rs-lib"
 # and `cargo metadata` and any future package registry entry should say which
 # is which. Every other shared field IS inherited, because duplicating it is
 # exactly the drift the root manifest exists to prevent (AAP 0.4.2).
-description = "The libcurl protocol engine in safe Rust: transfer core, connection filters, rustls TLS, DNS, authentication, and the HTTP/1.1, HTTP/2, HTTP/3, FTP, SFTP, SCP, file and WebSocket protocol implementations"
+#
+# It names the crate's ROLE and nothing more, deliberately. The full scope AAP
+# 0.3.1 assigns to this crate is SPECIFIED TARGET DESIGN and is only partly
+# delivered at this commit, so enumerating it here would read as an inventory
+# of working code:
+#   "transfer core, connection filters, rustls TLS, DNS, authentication, and
+#    the HTTP/1.1, HTTP/2, HTTP/3, FTP, SFTP, SCP, file and WebSocket protocol
+#    implementations"
+# Delivered so far, measured by listing the tree: 25 files -- src/lib.rs,
+# error.rs, version.rs, trace.rs; crypto/{mod,md5,md4,sha256,sha512_256,hmac,
+# rand}.rs; util/{mod,parsedate,strcase}.rs; url/{mod,escape,idn}.rs;
+# tls/{mod,cipher_suite,keylog}.rs; multi/{mod,state}.rs; and the ffi island
+# ffi/{mod,sys,gss}.rs. The protocols/, transfer/, conn/, dns/, auth/, proxy/,
+# cookies/, mime/, headers/, share/ and easy/ trees are specified and not yet
+# written. Restore the fuller wording only when they are, per AAP 0.8.1's rule
+# that current tense follows delivery.
+description = "The libcurl protocol engine in safe Rust"
 
 # Inherited from [workspace.package]. Never restated as literals here.
 #
 # The resolved values, and the authority for each:
-#   * package version  -- the semantic prefix of LIBCURL_VERSION. The reported
-#     libcurl version string is "8.19.0-DEV" (include/curl/curlver.h:35), with
-#     LIBCURL_VERSION_MAJOR 8, _MINOR 19, _PATCH 0 (curlver.h:39-41) and
-#     LIBCURL_VERSION_NUM 0x081300 (curlver.h:61). The existing build already
-#     treats curlver.h as the single version oracle: CMakeLists.txt:54-65
-#     greps LIBCURL_VERSION out of that header and feeds the semantic prefix
-#     to `project(CURL VERSION ...)`. Nothing here may bump it -- AAP 0.8.1
-#     freezes the contract, and AAP 0.8.5/C6 binds every parity claim in this
-#     work to curl/libcurl 8.19.0-DEV as checked out at commit 54cf587b9c.
-#   * edition = 2021 and rust-version = 1.75 -- AAP 0.8.3 preserves the user's
-#     directive verbatim: "Rust edition 2021, MSRV 1.75." The MSRV also has to
+#   * package version - the semantic prefix of LIBCURL_VERSION, which
+#     include/curl/curlver.h gives as 8.19.0-DEV. The existing build already
+#     treats that header as the single version oracle: CMake greps
+#     LIBCURL_VERSION out of it and feeds the semantic prefix to project(). No
+#     version is bumped here; the contract is frozen and every parity claim in
+#     this work is bound to curl/libcurl 8.19.0-DEV at commit 54cf587b9c.
+#   * edition = 2021 and rust-version = 1.75, as mandated. The MSRV also has to
 #     agree with clippy.toml's `msrv` and with the floor recorded in
-#     rust-toolchain.toml. AAP 0.7 obligation 1 requires that `rust-version`
-#     appear in EVERY member manifest, which the inherited key below satisfies
-#     (`cargo metadata` reports rust_version = "1.75" for this crate).
-#   * license = "curl" -- matches the SPDX identifier in the header above and
-#     the `curl` entry in deny.toml's licence allow-list.
+#     rust-toolchain.toml, and it must appear in every member manifest, which
+#     the inherited key below satisfies.
+#   * license = "curl" - matches the SPDX identifier in the header above and the
+#     `curl` entry in deny.toml's licence allow-list.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -74,51 +80,49 @@ authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
-# ---------------------------------------------------------------------------
 # Deliberately NO [lib] section.
 #
-# Cargo's defaults are exactly right: src/lib.rs, target name `curl_rs_lib`,
-# and a plain `rlib`. This crate must NOT declare an artifact-kind list.
-# AAP 0.3.1 gives `cdylib` and `staticlib` to curl-rs-ffi ALONE, and that
-# crate additionally renames its output to `curl` so the shared object is
-# `libcurl.so`. Emitting a second shared object here would destroy the
-# single-artifact identity `libcurl.so.4`, which the repository derives twice
-# and identically:
-#   * Autotools -- lib/Makefile.soname sets VERSIONCHANGE=12, VERSIONADD=0,
-#     VERSIONDEL=8, i.e. libtool `-version-info 12:0:8`, applied at
-#     lib/Makefile.am:97-99.
-#   * CMake -- lib/CMakeLists.txt:285-291 computes
-#     `_cmakesoname = VERSIONCHANGE - VERSIONDEL` = 12 - 8 = 4 and
-#     `_cmakeversion = 4.8.0`, then sets `VERSION "4.8.0" SOVERSION "4"`.
-# Both yield SONAME libcurl.so.4. The link argument that reproduces it lives
-# in curl-rs-ffi/build.rs, not here and not in .cargo/config.toml.
+# Cargo's defaults are exactly right: src/lib.rs, target name `curl_rs_lib`, and
+# a plain `rlib`. This crate must NOT declare an artifact-kind list. `cdylib`
+# and `staticlib` belong to curl-rs-ffi ALONE, and that crate additionally
+# renames its output to `curl` so the shared object is `libcurl.so`. Emitting a
+# second shared object here would destroy the single-artifact identity
+# libcurl.so.4, which the repository derives twice and identically - through
+# libtool's -version-info 12:0:8 under Autotools and through VERSIONCHANGE -
+# VERSIONDEL = 4 under CMake. The link argument that reproduces it lives in
+# curl-rs-ffi/build.rs, not here and not in .cargo/config.toml.
 #
 # No [[bin]], no [[bench]] and no [[example]] target either. This crate is a
 # library only, and there is no benchmark harness because performance is an
-# explicit non-goal -- AAP 0.1.1: "Explicitly NOT performance. No performance
-# objective, latency target, or throughput requirement appears anywhere in
-# the request [...] any change justified solely by speed is out of scope."
+# explicit non-goal: no performance objective appears anywhere in the
+# requirements, so no change may be justified on speed grounds.
 #
-# This crate also links no native library of its own, declares no build
-# script (AAP 0.3.1 assigns build scripts to curl-rs/build.rs and
-# curl-rs-ffi/build.rs only), and introduces no dependency override, no
-# vendored source replacement and no alternative registry -- AAP 0.5.1: the
-# workspace has "exactly three path dependencies among its own members and no
-# private registry, vendored crate, or internal package feed".
+# This crate also links no native library of its own, declares no build script
+# (build scripts belong to curl-rs and curl-rs-ffi only), and introduces no
+# dependency override, no vendored source replacement and no alternative
+# registry: the workspace has exactly three path dependencies among its own
+# members and no private registry, vendored crate or internal package feed.
 #
-# Unwind semantics are left at the Rust default so that curl-rs-ffi can
-# CONTAIN unwinding at the C ABI boundary instead of aborting the host
-# process. No build-profile table appears here in any case: profiles are
-# honoured only in the workspace root, and a member-level one emits a warning
-# that would break AAP 0.8.4 gate 1.
+# Unwind semantics are left at the Rust default so that curl-rs-ffi can CONTAIN
+# unwinding at the C ABI boundary instead of aborting the host process. No
+# build-profile table appears here in any case: profiles are honoured only in
+# the workspace root, and a member-level one emits a warning that would break
+# the zero-warning gate.
 #
 # Lint levels are not expressed in this manifest. The safety invariant is an
-# attribute pair in src/lib.rs -- AAP 0.1.1 G6: "`#![forbid(unsafe_code)]` at
-# the root of curl-rs-lib and curl-rs, with a single `#[allow(unsafe_code)]`
-# attribute on `mod ffi`" -- and `-D warnings` is applied on the command line
-# by .github/workflows/rust-clippy.yml (AAP 0.8.4 gate 2) so that, per AAP
-# 0.7, "a lint failure names itself rather than hiding inside a build log".
-# ---------------------------------------------------------------------------
+# attribute pair in src/lib.rs. AAP 0.1.1 G6 words it as "`#![forbid(unsafe_code)]`
+# at the root of curl-rs-lib and curl-rs, with a single `#[allow(unsafe_code)]`
+# attribute on `mod ffi`", and that literal pair DOES NOT COMPILE -- `forbid`
+# cannot be overridden from an inner scope, so it is `error[E0453]`. What
+# src/lib.rs therefore carries is `#![deny(unsafe_code)]` with exactly one
+# `#[allow(unsafe_code)]`, on `mod ffi`, which delivers the same property: an
+# `unsafe` block anywhere outside src/ffi/ is a hard error. The measurement,
+# the compiler transcript and the three source-policy tests that enforce it
+# are recorded in
+# src/lib.rs itself, as a documented deviation. Separately, `-D warnings` is
+# applied on the command line by .github/workflows/rust-clippy.yml
+# (AAP 0.8.4 gate 2) so that, per AAP 0.7, "a lint failure names itself rather
+# than hiding inside a build log".
 
 [dependencies]
 
@@ -135,9 +139,14 @@ repository.workspace = true
 # shared state behind curl-rs-lib/src/share/, `fs` for src/protocols/file.rs
 # and the cookie / HSTS / alt-svc jars, and `macros` for the `tokio::select!`
 # that implements Happy Eyeballs in src/conn/happy_eyeballs.rs (AAP 0.4.1).
-# The root entry currently requests `full`, so the graph-wide union is `full`;
-# this list is the set that would remain were the root narrowed, and it
-# documents the engine's actual requirement either way.
+#
+# This list is AUTHORITATIVE, not documentary. The root entry pins the version
+# only and declares no features, precisely so that this enumeration is the
+# engine's whole requirement: Cargo unions features across the graph, so a list
+# at the root would be a floor no member could narrow. What is absent is
+# therefore genuinely absent - `process`, `io-std` and `parking_lot` are not
+# enabled by this crate, and `signal` belongs to curl-rs, which is the crate
+# that ignores SIGPIPE.
 tokio = { workspace = true, features = [
   "fs",
   "io-util",
@@ -157,12 +166,13 @@ futures = { workspace = true }
 
 # Safe pin projection inside the `Box<dyn ConnFilter>` chain
 # (src/conn/filters.rs). This crate exists precisely so that pin projection
-# needs no `unsafe`, which is why it is load-bearing for AAP 0.1.1 G6.
+# needs no `unsafe`, which is why it is load-bearing for the zero-unsafe
+# invariant.
 pin-project-lite = { workspace = true }
 
 # `BytesMut` / `Vec<u8>` supersede the hand-rolled buffer arithmetic of
-# lib/curlx/dynbuf.c, lib/sendf.c and lib/bufq.c. AAP 0.6.9: this "make[s] the
-# invariant the type's responsibility" rather than the programmer's.
+# lib/curlx/dynbuf.c, lib/sendf.c and lib/bufq.c, making length and capacity the
+# type's responsibility rather than the programmer's.
 bytes = { workspace = true }
 
 # --- HTTP ------------------------------------------------------------------
@@ -172,10 +182,10 @@ bytes = { workspace = true }
 #
 # NOTE, and it is a design constraint rather than a preference: hyper is used
 # for connection management, keep-alive and framing ONLY. Request-line
-# composition and header emission stay ours, because AAP 0.6.7 establishes
-# that 1,476 of the 1,914 fixtures compare the request bytes as a single
-# joined string -- header order, casing and spacing are all significant -- and
-# hyper neither emits curl's default headers nor guarantees their order.
+# composition and header emission stay ours, because 1,476 of the 1,914 fixtures
+# compare the request bytes as a single joined string - header order, casing and
+# spacing are all significant - and hyper neither emits curl's default headers
+# nor guarantees their order.
 hyper = { workspace = true, features = ["http1", "http2", "client"] }
 hyper-util = { workspace = true, features = [
   "client",
@@ -185,18 +195,15 @@ hyper-util = { workspace = true, features = [
   "tokio",
 ] }
 
-# h2 is declared even though hyper already embeds it. AAP 0.8.5/C4 resolves
-# the apparent redundancy: "hyper is used with ["http1", "http2", "client"]
-# for connection management, and `h2` is declared explicitly because raw
-# SETTINGS and flow-control manipulation is observable in curl 8.x fixture
-# expectations and is not reachable through hyper's surface."
+# h2 is declared even though hyper already embeds it, because raw SETTINGS and
+# flow-control manipulation is observable in curl 8.x fixture expectations and
+# is not reachable through hyper's surface.
 #
 # Honest caveat about what the `http2` feature actually gates: hyper's own
-# `http2` feature is enabled by the root manifest unconditionally, so h2
-# remains in the resolved graph even under --no-default-features. The `http2`
-# feature below therefore gates THIS crate's direct use of h2's raw frame
-# surface and the src/protocols/http2.rs module -- not h2's presence in the
-# dependency tree.
+# `http2` feature is enabled by the root manifest unconditionally, so h2 remains
+# in the resolved graph even under --no-default-features. The `http2` feature
+# below therefore gates THIS crate's direct use of h2's raw frame surface and
+# the src/protocols/http2.rs module - not h2's presence in the dependency tree.
 h2 = { workspace = true, optional = true }
 
 http = { workspace = true }
@@ -208,13 +215,11 @@ httpdate = { workspace = true }
 
 # --- QUIC and HTTP/3 (feature `http3`) ------------------------------------
 #
-# Supersedes lib/vquic/vquic.c, lib/vquic/curl_ngtcp2.c and
-# lib/vquic/vquic-tls.c. AAP 0.8.3: "HTTP/3 via quinn and h3 using
-# `AsyncUdpSocket`" -- the named socket abstraction, not an ad-hoc UDP
-# wrapper. HTTP/3 is already a connection filter in the C design
-# (`extern struct Curl_cftype Curl_cft_http3`, lib/vquic/vquic.h:48), so it
-# slots into the same `ConnFilter` trait as TLS and raw sockets instead of
-# needing a parallel abstraction (AAP 0.3.3 P2).
+# Supersedes lib/vquic/. HTTP/3 is specified to go over quinn and h3 using the
+# named `AsyncUdpSocket` abstraction rather than an ad-hoc UDP wrapper. It is
+# already a connection filter in the C design (`extern struct Curl_cftype
+# Curl_cft_http3`), so it slots into the same `ConnFilter` trait as TLS and raw
+# sockets instead of needing a parallel abstraction.
 #
 # quinn carries NO feature overlay here -- see the TLS block for why.
 quinn = { workspace = true, optional = true }
@@ -223,51 +228,49 @@ h3-quinn = { workspace = true, optional = true }
 
 # --- TLS -- rustls only, and the provider is pinned by the ROOT ------------
 #
-# This is the highest-risk block in the file. AAP 0.5.1 calls the provider
-# declaration "the single most consequential manifest decision".
+# This is the highest-risk block in the file; the provider declaration is the
+# single most consequential manifest decision in the workspace.
 #
 # The root [workspace.dependencies] already declares all three entries with
 # `default-features = false` and an explicit `ring` provider. They are
-# referenced here BARE -- no `features`, no `default-features` -- and that is
+# referenced here BARE - no `features`, no `default-features` - and that is
 # deliberate, not an omission. Because Cargo unions features across the whole
 # graph (see the mechanic at the top of this file), naming the alternative
-# provider's feature -- or any feature that transitively enables it --
-# ANYWHERE in this manifest would silently re-link a second cryptographic
-# provider even though the root said `default-features = false`. There is no
-# local scope for feature selection: a member cannot opt out of what any other
-# member, or any transitive dependency, has opted in to. That is precisely why
-# the three entries below carry no overlay of any kind.
+# provider's feature - or any feature that transitively enables it - ANYWHERE in
+# this manifest would silently re-link a second cryptographic provider even
+# though the root said `default-features = false`. There is no local scope for
+# feature selection: a member cannot opt out of what any other member, or any
+# transitive dependency, has opted in to.
 #
-# The four defects that accepting the upstream defaults would cause, from
-# AAP 0.5.1 -- the default sets disagree with each other, which is what makes
-# this a trap rather than a preference:
-#   1. duplicated cryptographic code in one binary;
-#   2. a build-time requirement for CMake and NASM, introduced by the
-#      alternative provider's vendored C and assembly, "which is likely to
-#      break the `cross`-based aarch64 Linux leg" (also AAP 0.6.8);
+# The four defects accepting the upstream defaults would cause - the default
+# sets disagree with each other, which is what makes this a trap rather than a
+# preference:
+#   1. duplicated cryptographic code in one binary; 2. a build-time requirement
+#   for CMake and NASM, introduced by the alternative
+#      provider's vendored C and assembly, which is likely to break the
+#      cross-compiled aarch64 Linux leg;
 #   3. a large vendored-C surface sitting awkwardly against the no-C-TLS
-#      requirement of AAP 0.8.2;
+#      requirement;
 #   4. `prefer-post-quantum`, on by default upstream, offers a hybrid
-#      X25519MLKEM768 key exchange that CHANGES THE BYTES OF THE TLS
-#      ClientHello relative to curl 8.x. Under the byte-exact, order-
-#      significant fixture comparison of AAP 0.6.7 that puts every HTTPS
-#      fixture at risk.
+#      X25519MLKEM768 key exchange that CHANGES THE BYTES OF THE TLS ClientHello
+#      relative to curl 8.x. Under byte-exact, order-significant fixture
+#      comparison that puts every HTTPS fixture at risk.
 #
-# quinn's `rustls` feature already implies `rustls-ring`, so the provider
-# stays consistent across the graph without a second declaration.
+# quinn's `rustls` feature already implies `rustls-ring`, so the provider stays
+# consistent across the graph without a second declaration.
 #
-# `platform-verifier` is deliberately omitted from quinn: it would delegate
-# the trust DECISION to the operating-system store, which conflicts with
-# curl's --cacert, --capath and --insecure semantics remaining authoritative.
-# Those semantics are owned by src/tls/verify.rs.
+# `platform-verifier` is deliberately omitted from quinn: it would delegate the
+# trust DECISION to the operating-system store, which conflicts with curl's
+# --cacert, --capath and --insecure semantics remaining authoritative. Those
+# semantics are owned by src/tls/verify.rs.
 #
-# Honest disclosure, escalated as AAP 0.8.6/A7: neither `ring` nor the
-# alternative provider is pure Rust -- both contain C and assembly. The
-# user's constraint is satisfied in the sense that matters, which is that no C
-# TLS library is linked: rustls implements the TLS state machine, record layer
-# and certificate verification in Rust, and the provider supplies only
-# primitives. `ring` is chosen as the more portable and more readily
-# cross-compiled of the two.
+# Honest disclosure, escalated rather than resolved: neither `ring` nor the
+# alternative provider is pure Rust - both contain C and assembly. The user's
+# constraint is satisfied in the sense that matters, which is that no C TLS
+# library is linked: rustls implements the TLS state machine, record layer and
+# certificate verification in Rust, and the provider supplies only primitives.
+# `ring` is chosen as the more portable and more readily cross-compiled of the
+# two.
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 
@@ -276,7 +279,8 @@ tokio-rustls = { workspace = true }
 #
 # `std` is requested explicitly because the FILE-reading half of the PEM API --
 # `PemObject::from_pem_file`, `pem_file_iter` and `from_pem_reader` -- is gated
-# on that feature (verified in rustls-pki-types 1.15.1, src/pem.rs:37/50/59),
+# on that feature (verified in rustls-pki-types 1.15.1, src/pem.rs:37/50/60,
+# each declaration carrying its own `#[cfg(feature = "std")]`),
 # whereas this crate's own default set is only ["alloc"]. Reading PEM from a
 # path is precisely what --cacert, --capath, --cert and --key require, so the
 # overlay is load-bearing rather than cosmetic. It is additive, hence always
@@ -296,9 +300,15 @@ tokio-rustls = { workspace = true }
 # trust: the retired crate's ONLY dependency is pki-types, and pki-types at
 # 1.15.1 (>= 1.9.0) exports the `PemObject` trait it wraps. Dropping it removes
 # an advisory WITHOUT removing any capability, and without suppressing anything
-# in deny.toml -- which, being a sibling file, is not this file's to edit. The
-# root manifest's now-unused [workspace.dependencies] entry is reported upward
-# rather than changed from here, per AAP 0.4.2's single-source principle.
+# in deny.toml.
+#
+# LOOP NOW CLOSED. Earlier revisions of this comment reported the root
+# manifest's leftover [workspace.dependencies] entry upward rather than acting
+# on it. That entry has since been REMOVED, so the divergence is consistent in
+# both directions: no member forwards the retired crate and the root no longer
+# declares it. `cargo tree -i rustls-pemfile` reports nothing, and it appears
+# in neither Cargo.lock nor the `cargo audit` graph. rustls-pki-types is the
+# single authoritative PEM parser for the workspace.
 rustls-pki-types = { workspace = true, features = ["std"] }
 
 # Bundled trust anchors, superseding the CA bundle the C build embeds through
@@ -307,17 +317,21 @@ webpki-roots = { workspace = true }
 
 # Platform trust-store READING, for the cases where curl's own semantics call
 # for the system store. This is NOT the same thing as delegating the trust
-# decision to the platform: the decision stays in src/tls/verify.rs, which
-# remains authoritative for --cacert, --capath and --insecure. Keeping the
-# read path and the decision separate is exactly why `platform-verifier` is
-# omitted above while this crate is present.
+# decision to the platform: the decision belongs to src/tls/verify.rs, which is
+# to remain authoritative for --cacert, --capath and --insecure (that module is
+# specified target design and not yet delivered). Keeping the read path and the
+# decision separate is exactly why `platform-verifier` is omitted above while
+# this crate is present. Neither this crate nor webpki-roots above is "the
+# default": as the root manifest records, the two are not alternatives, and
+# selecting between them is a runtime decision driven by curl's own options,
+# never a build-time one.
 rustls-native-certs = { workspace = true }
 
 # --- SSH -- SFTP and SCP (feature `ssh`) ----------------------------------
 #
-# AAP 0.8.3: "russh for SFTP and SCP." Supersedes the C SSH transport under
-# lib/vssh/ (3 translation units, 7,552 lines with its headers); the alternate
-# SSH backend in that directory is out of scope entirely (AAP 0.2.2).
+# russh supersedes the C SSH transport under lib/vssh/ (3 translation units,
+# 7,552 lines with its headers); the alternate SSH backend in that directory is
+# out of scope entirely.
 #
 # Referenced bare on purpose. The root entry must carry
 # `default-features = false` together with an explicit feature list, because
@@ -329,30 +343,69 @@ rustls-native-certs = { workspace = true }
 # "has a fully stable dependency graph with no pre-release requirements at
 # all". Shipping release-candidate cryptography would put AAP 0.8.4 gate 9
 # (`cargo audit`, zero critical advisories) in permanent jeopardy.
+#
+# THE COST OF THAT TRADE, STATED HERE RATHER THAN ONLY IN deny.toml, so that
+# nobody enabling this feature has to go looking for it. The adopted release
+# carries two accepted RustSec advisories, both reached ONLY through this
+# feature and both availability-only:
+#
+#   RUSTSEC-2026-0154  russh, CVSS 7.5 HIGH, unbounded 32-bit allocation
+#   RUSTSEC-2026-0153  russh-cryptovec, CVSS 7.5 HIGH, same GHSA
+#
+# plus RUSTSEC-2023-0071 (rsa 0.9.10, CVSS 5.9 MEDIUM Marvin-Attack timing
+# side channel), for which RustSec records no safe upgrade in the whole 0.9
+# line. All three are documented with full reasoning in deny.toml's `ignore`
+# list; none is CRITICAL, so gate 9 is satisfied by the graph itself.
+#
+# Both blockers on the fix were re-measured rather than inherited, and either
+# alone would disqualify it: russh 0.60.3 - the first release carrying the fix
+# - has 17 pre-release version requirements spanning the entire SSH
+# cryptographic stack, AND declares rust-version 1.85 against this
+# workspace's measured, currently-satisfied floor of 1.75. A build that omits
+# this feature is advisory-free, which is what the minimal-feature scan in
+# .github/workflows/rust-audit.yml asserts.
 russh = { workspace = true, optional = true }
 
 # --- Sockets --------------------------------------------------------------
 #
 # Absorbs the raw setsockopt / getsockopt / fcntl calls of lib/cf-socket.c,
-# lib/socketpair.c and lib/curlx/nonblock.c into src/conn/socket.rs. This is
-# the crate that makes AAP 0.8.5/C3 work: "Route everything expressible
-# through `socket2`, and relocate the genuine residue into
-# curl-rs-lib/src/ffi/sys.rs." Without it the zero-`unsafe` invariant of
-# AAP 0.1.1 G6 is unachievable.
+# lib/socketpair.c and lib/curlx/nonblock.c into src/conn/socket.rs. This is the
+# crate that makes the zero-unsafe invariant achievable: everything expressible
+# is routed through socket2, and only the genuine residue is relocated into
+# src/ffi/sys.rs.
 socket2 = { workspace = true, features = ["all"] }
 
+# --- DNS ------------------------------------------------------------------
+#
+# NO resolver crate is declared. The system resolver is the mandated default,
+# and src/dns/resolver.rs is the module AAP 0.4.1 designates for it: it
+# supersedes lib/hostip.c, lib/hostip4.c, lib/hostip6.c, lib/curl_addrinfo.c,
+# lib/asyn-base.c, lib/asyn-thrdd.c and lib/curl_threads.c, and it is where
+# AAP 0.6.9's most valuable single deletion happens - lib/hostip.c's alarm()
+# plus sigsetjmp/siglongjmp DNS deadline becomes tokio::time::timeout with no
+# residual unsafe. That module is not part of this checkpoint's source set.
+# The c-ares path of lib/asyn-ares.c is dropped outright by AAP 0.5.2.
+#
+# The optional in-process resolver that AAP 0.5.2's `hickory-dns` feature
+# names has no admissible version: every hickory-resolver release that
+# clears the workspace MSRV requires a hickory-proto carrying
+# RUSTSEC-2026-0119, and every release that carries the fix declares
+# rust-version 1.88. The two sets are disjoint. The root manifest records
+# the full option space and the measurement; the feature below turns
+# enabling it into a build failure rather than a silent no-op.
+#
 # --- URL and encoding -----------------------------------------------------
 #
-# src/url/mod.rs backs the six exported curl_url_* symbols. curl's own
-# parsing quirks are preserved rather than delegated wholesale to the `url`
-# crate, which is used for the parts where the two genuinely agree.
+# src/url/mod.rs backs the six exported curl_url_* symbols. curl's own parsing
+# quirks are preserved rather than delegated wholesale to the `url` crate, which
+# is used for the parts where the two genuinely agree.
 url = { workspace = true }
 
 # Internationalised domain names, replacing libidn2 (src/url/idn.rs).
 idna = { workspace = true }
 
 # Percent-encoding tables behind curl_escape / curl_unescape
-# (src/url/escape.rs, from lib/escape.c).
+# (src/url/escape.rs).
 percent-encoding = { workspace = true }
 
 # Form encoding for application/x-www-form-urlencoded bodies.
@@ -361,22 +414,20 @@ form_urlencoded = { workspace = true }
 # --- Cryptographic primitives --------------------------------------------
 #
 # These replace the hand-rolled digests of lib/md5.c, lib/md4.c, lib/sha256.c,
-# lib/curl_sha512_256.c and lib/hmac.c with the RustCrypto equivalents, and
-# they back src/crypto/ and src/auth/.
+# lib/curl_sha512_256.c and lib/hmac.c with the RustCrypto equivalents, and they
+# back src/crypto/ and src/auth/.
 #
 # CRITICAL COHERENCE PROPERTY: every one of them must sit on the SAME `digest`
-# generation, or their traits do not unify. AAP 0.5.1 records that the
-# newest-release set "would have placed `digest 0.10` and `digest 0.11` in the
-# same graph, and `Hmac<Sha1>` would have failed to compile -- a build break
-# that would have surfaced only after the manifests were written". The adopted
-# set is coherent on `digest 0.10` throughout, and deny.toml enforces that
-# mechanically by denying `digest >= 0.11.0`.
+# generation, or their traits do not unify. The newest-release set would have
+# placed `digest 0.10` and `digest 0.11` in the same graph, and `Hmac<Sha1>`
+# would have failed to compile - a build break that would have surfaced only
+# after the manifests were written. The adopted set is coherent on `digest 0.10`
+# throughout, and deny.toml enforces that mechanically by denying `digest >=
+# 0.11.0`.
 #
-# Do not "upgrade" any of these. AAP 0.5.1 records that the newest releases of
-# sha2 (0.11.0), hmac (0.13.0) and rand (0.10.2) all declare MSRV 1.85 and so
-# violate the mandated 1.75 floor; the adopted set is the newest version of
-# each crate satisfying that floor and "was swept in full and produced zero
-# violations".
+# Do not "upgrade" any of these: the newest releases of sha2, hmac and rand all
+# declare MSRV 1.85 and so violate the mandated 1.75 floor. The adopted set is
+# the newest version of each crate satisfying that floor.
 
 # SHA-1: the WebSocket handshake accept key and Digest authentication.
 sha1 = { workspace = true }
@@ -394,97 +445,86 @@ md4 = { workspace = true }
 # HMAC: Digest-SESS and AWS SigV4.
 hmac = { workspace = true }
 
-# DES: the NTLM response (src/auth/ntlm.rs), keeping NTLM pure Rust as
-# AAP 0.8.3 requires.
+# DES: the NTLM response (src/auth/ntlm.rs), keeping NTLM pure Rust as required.
 des = { workspace = true }
 
-# Randomness for src/crypto/rand.rs (from lib/rand.c), nonces and boundary
-# strings. Pinned at the 0.8 series RATHER THAN ADVANCED, specifically because
-# the adopted russh release requires `rand ^0.8` (AAP 0.5.1) and unifying on
-# it keeps a single copy in the paths that share it. Note honestly that the
-# resolved graph still contains a second, newer `rand` reached through
-# quinn-proto; deny.toml lists `rand`, `rand_core`, `chacha20` and
-# `getrandom` in its `skip` set for exactly that reason, so the
-# `multiple-versions = "deny"` policy is satisfied.
+# Randomness for src/crypto/rand.rs, nonces and boundary strings. Pinned at the
+# 0.8 series RATHER THAN ADVANCED, specifically because the adopted russh
+# release requires `rand ^0.8` and unifying on it keeps a single copy in the
+# paths that share it. Note honestly that the resolved graph still contains a
+# second, newer `rand` reached through quinn-proto; deny.toml lists `rand`,
+# `rand_core`, `chacha20` and `getrandom` in its `skip` set for exactly that
+# reason, so the `multiple-versions = "deny"` policy is satisfied.
 rand = { workspace = true }
 
 # --- Encoding and content compression ------------------------------------
 #
-# base64 spans authentication (Basic, Digest, NTLM, Negotiate, Bearer) and
-# MIME, replacing lib/curlx/base64.c.
+# base64 spans authentication (Basic, Digest, NTLM, Negotiate, Bearer) and MIME,
+# replacing lib/curlx/base64.c.
 base64 = { workspace = true }
 
 # Hex encoding for Digest responses and public-key pinning.
 hex = { workspace = true }
 
-# Content-Encoding handling in src/transfer/content_encoding.rs, superseding
-# the zlib, brotli and zstd C calls of lib/content_encoding.c.
+# Content-Encoding handling in src/transfer/content_encoding.rs, superseding the
+# zlib, brotli and zstd C calls of lib/content_encoding.c.
 #
-# flate2 (feature `gzip`) MUST resolve to its PURE-RUST backend: AAP 0.8.2
-# forbids linking C libraries into this build, and the pure-Rust path is what
-# keeps the aarch64 cross leg free of a native toolchain requirement
-# (AAP 0.6.8). The backend is therefore selected EXPLICITLY BY NAME below.
-#
-# `default-features` is deliberately not written here, and the reason is
-# mechanical rather than stylistic: for a workspace-inherited dependency
-# Cargo IGNORES a member-level `default-features = false` when the root entry
-# did not set it, and emits a warning that would break AAP 0.8.4 gate 1.
-# `features` is additive and always honoured, so naming `rust_backend`
-# achieves the requirement safely. Measured corroboration: flate2's own
-# default set at the adopted release consists solely of `rust_backend`, none
-# of its C-backed backend features is enabled anywhere in the graph, and
-# `cargo tree -i libz-sys` reports that crate absent from the resolved tree.
+# flate2 (feature `gzip`) MUST resolve to its PURE-RUST backend, because linking
+# C libraries into this build is forbidden; the `rust_backend` feature is what
+# selects it, and it is additive so it is always honoured.
 flate2 = { workspace = true, optional = true, features = ["rust_backend"] }
 
-# Brotli decoding (feature `brotli`), replacing the C brotli library. This
-# crate is pure Rust.
+# Content-Encoding: br. The crate is pure Rust, so no backend overlay is needed.
 brotli = { workspace = true, optional = true }
 
-# Zstandard decoding (feature `zstd`).
+# Content-Encoding: zstd.
 #
-# FINDING, recorded rather than papered over: at the adopted release this
-# crate has NO pure-Rust backend. Its only dependency is zstd-safe, which in
-# turn requires zstd-sys, so a C binding (zstd-sys, vendoring zstd 1.5.7) is
-# unavoidable and does appear in the resolved graph. That binding is not
-# banned by deny.toml, and it is not a TLS library, so neither AAP 0.8.2's
-# no-C-TLS prohibition nor the committed supply-chain policy is violated. It
-# is nonetheless a genuine C dependency in a workspace whose stated intent is
-# to eliminate them, so it is surfaced here for the deny.toml owner to rule
-# on rather than hidden. The alternative -- dropping Content-Encoding: zstd --
-# would break fixture parity and is not this file's decision to take.
+# FINDING, recorded rather than papered over: at the adopted release this crate
+# has NO pure-Rust backend. Its only dependency is zstd-safe, which in turn
+# requires zstd-sys, so a C binding (zstd-sys, vendoring zstd 1.5.7) is
+# unavoidable and does appear in the resolved graph. That binding is not banned
+# by deny.toml and it is not a TLS library, so neither the no-C-TLS prohibition
+# nor the committed supply-chain policy is violated. It is nonetheless a genuine
+# C dependency in a workspace whose stated intent is to eliminate them, so it is
+# surfaced here for the deny.toml owner to rule on rather than hidden. The
+# alternative - dropping Content-Encoding: zstd - would break fixture parity and
+# is not this file's decision to take.
 zstd = { workspace = true, optional = true }
 
 # --- Cookie-domain policy (feature `cookies`) -----------------------------
 #
-# publicsuffix supplies the public-suffix rules that libpsl previously
-# supplied (src/cookies/psl.rs, from lib/psl.c).
+# publicsuffix supplies the public-suffix rules that libpsl previously supplied
+# (src/cookies/psl.rs).
 #
 # DELIBERATE OMISSION, from AAP 0.5.1: "No cookie-store crate is used. curl's
 # Netscape cookie-jar file must remain byte-compatible so that a jar written
 # by curl 8.x is readable by this implementation and vice versa, and no
 # general-purpose crate commits to that on-disk format. The jar is implemented
 # natively in curl-rs-lib/src/cookies/mod.rs; `publicsuffix` supplies only the
-# domain-matching rules that libpsl previously supplied." The same reasoning
-# applies to the HSTS and alt-svc caches, whose on-disk formats
-# src/cookies/hsts.rs and src/cookies/altsvc.rs reproduce natively.
+# domain-matching rules that libpsl previously supplied." That quotation is
+# reproduced in the specification's own tense; as delivery status it is
+# SPECIFIED TARGET DESIGN -- src/cookies/ is not written yet, which is why
+# publicsuffix is declared optional and unreached rather than consumed. The
+# same reasoning is to apply to the HSTS and alt-svc caches, whose on-disk
+# formats src/cookies/hsts.rs and src/cookies/altsvc.rs are to reproduce
+# natively for the same byte-compatibility reason.
 publicsuffix = { workspace = true, optional = true }
 
 # --- Errors, diagnostics, parsing and OS types ---------------------------
 #
 # thiserror is used BEHIND the pinned CURLcode mapping, never in place of it.
-# src/error.rs still writes every discriminant explicitly, because AAP 0.6.1
-# establishes that CURLcode declares only CURLE_OK = 0 and lets the other 102
-# tokens take their value from declaration order -- including 15 retired
-# CURLE_OBSOLETE* placeholders at exactly {20, 24, 29, 32, 34, 40, 41, 44, 46,
-# 50, 51, 57, 62, 75, 76}. Omitting one placeholder silently shifts every
-# later code, so ordinal inference is prohibited and derive macros may not be
-# trusted to assign values.
+# src/error.rs still writes every discriminant explicitly, because CURLcode
+# declares only CURLE_OK = 0 and lets the other 102 tokens take their value from
+# declaration order - including 15 retired CURLE_OBSOLETE* placeholders at
+# exactly {20, 24, 29, 32, 34, 40, 41, 44, 46, 50, 51, 57, 62, 75, 76}. Omitting
+# one placeholder silently shifts every later code, so ordinal inference is
+# prohibited and derive macros may not be trusted to assign values.
 thiserror = { workspace = true }
 
 # C types for the confined FFI island, src/ffi/sys.rs and src/ffi/gss.rs, and
 # for nothing else. Those two modules are the only place in this crate where
-# `unsafe` is permitted, under a single `#[allow(unsafe_code)]` on `mod ffi`
-# (AAP 0.1.1 G6), and every block there carries a `// SAFETY:` comment.
+# `unsafe` is permitted, under a single `#[allow(unsafe_code)]` on `mod ffi`,
+# and every block there carries a `// SAFETY:` comment.
 libc = { workspace = true }
 
 # Logging facade, kept because several dependencies emit through it and the
@@ -492,8 +532,8 @@ libc = { workspace = true }
 log = { workspace = true }
 
 # Structured diagnostics backing --trace, --trace-ascii and --trace-config in
-# src/trace.rs (from lib/curl_trc.c). The emitted trace FORMATS are frozen by
-# AAP 0.8.1, so tracing supplies the plumbing while the rendering stays ours.
+# src/trace.rs. The emitted trace FORMATS are frozen, so tracing supplies the
+# plumbing while the rendering stays ours.
 tracing = { workspace = true }
 
 # Byte scanning in header and chunked-framing parsing, replacing
@@ -501,95 +541,90 @@ tracing = { workspace = true }
 # lib/http_chunks.c.
 memchr = { workspace = true }
 
-# Content-type inference for multipart bodies (src/mime/).
+# NOT declared: a content-type inference crate for multipart bodies.
 #
-# JUDGEMENT CALL, evidenced: the inference lives in the LIBRARY, not the tool.
-# lib/mime.c:1611 `add_content_type()` walks a static table declared at
-# lib/mime.c:1629 (`static const struct ContentType ctts[]`) matching by
-# filename suffix at lib/mime.c:1647-1651, whereas src/tool_formparse.c only
-# handles the explicit `;type=` syntax of -F and performs no inference at all.
-# So this dependency belongs to curl-rs-lib rather than to curl-rs.
+# Where the inference lives is settled by measurement: lib/mime.c:1611
+# `add_content_type()` walks a static table declared at lib/mime.c:1629
+# (`static const struct ContentType ctts[]`) matching by filename suffix at
+# lib/mime.c:1647-1651, whereas src/tool_formparse.c only handles the explicit
+# `;type=` syntax of -F and performs no inference at all. So the behaviour
+# belongs to this crate (src/mime/mod.rs) rather than to curl-rs.
 #
-# CONSTRAINT ON ITS USE: curl's ctts[] table holds only a handful of entries
-# and falls back to application/octet-stream. This crate's database is far
-# larger, so letting it answer freely would emit Content-Type bytes that
-# curl 8.x never emits -- a violation of the wire freeze in AAP 0.8.1 and of
-# the byte-exact fixture comparison in AAP 0.6.7. src/mime/mod.rs must
-# therefore treat curl's ctts[] table as authoritative and must never widen
-# the answer set beyond it.
-mime_guess = { workspace = true }
+# It does not follow that a general-purpose MIME database belongs here, and on
+# the evidence it must not. curl's ctts[] table holds exactly ten entries --
+# .gif, .jpg, .jpeg, .png, .svg, .txt, .htm, .html, .pdf and .xml
+# (lib/mime.c:1629-1640) -- and falls back to application/octet-stream for
+# everything else; any crate whose database is larger would answer where curl
+# 8.x answers application/octet-stream, emitting Content-Type bytes curl never
+# emits. That violates the wire freeze of AAP 0.8.1 and fails the byte-exact,
+# order-significant fixture comparison of AAP 0.6.7. The only
+# behaviour-preserving implementation is a native transliteration of ctts[]
+# itself, which needs no dependency at all.
+#
+# `mime_guess = "=2.0.5"` therefore remains pinned in the root
+# [workspace.dependencies], because AAP 0.5.1's inventory is a specification
+# mandate and the root is where versions are recorded, but it is deliberately
+# NOT referenced here - exactly as rustls-pemfile is pinned at the root and left
+# unresolved. AAP 0.7 requires every dependency to have a named consumer, and
+# an unreferenced entry keeps the resolved graph, and therefore the surface
+# `cargo deny`'s multiple-versions policy must satisfy, honest.
 
 # --- Dependencies this crate deliberately does NOT declare ---------------
 #
-# * The command-line argument parser and its shell-completion generator
-#   belong to the curl-rs binary crate: AAP 0.3.1 places the whole argument
-#   surface in curl-rs/src/cli/. Declaring them here would put CLI knowledge
-#   in the engine, inverting AAP 0.1.1 G1's "no protocol logic in either leaf
-#   crate".
-# * The C-header generator is a BUILD dependency of curl-rs-ffi alone, which
-#   AAP 0.4.1 maps to curl-rs-ffi/build.rs together with the soname
-#   configuration. This crate has no build script at all.
-# * The coverage, advisory-scanning, licence-policy and cross-build tools of
-#   AAP 0.5.1 are CI tools installed by the workflows that need them. They are
-#   not manifest dependencies of any crate and appear in neither table here.
+# * The command-line argument parser and its shell-completion generator belong
+#   to the curl-rs binary crate, which owns the whole argument surface.
+#   Declaring them here would put CLI knowledge in the engine.
+# * The C-header generator is a BUILD dependency of curl-rs-ffi alone, together
+#   with the soname configuration. This crate has no build script at all.
+# * The coverage, advisory-scanning, licence-policy and cross-build tools are CI
+#   tools installed by the workflows that need them. They are not manifest
+#   dependencies of any crate and appear in neither table here.
 # * No C TLS, C QUIC, C SSH, C DNS, C compression or C internationalisation
-#   binding crate appears anywhere in this file. AAP 0.8.2: "No C TLS library
-#   at any configuration -- not as a default, not behind a feature flag, not
-#   as a fallback." The single exception surfaced honestly above is zstd-sys,
-#   reached transitively through zstd, which is a compression codec and not a
-#   security library.
+#   binding crate appears anywhere in this file - not as a default, not behind a
+#   feature flag, not as a fallback. The single exception surfaced honestly
+#   above is zstd-sys, reached transitively through zstd, which is a compression
+#   codec and not a security library.
 
-# ===========================================================================
 # [features] -- the functioning feature table for the workspace.
 #
 # Cargo has NO [workspace.features] table, so while the root manifest records
-# the vocabulary and the intended default state, the table that actually
-# governs compilation is THIS one.
-#
-# AAP 0.5.2 fixes the vocabulary at exactly fifteen names, "declared once at
-# the workspace level so that a capability cannot be enabled in one crate and
-# disabled in another". Those names are used verbatim below and none is added.
+# the vocabulary and the intended default state, the table that actually governs
+# compilation is THIS one. The vocabulary is exactly fifteen names, declared
+# once so that a capability cannot be enabled in one crate and disabled in
+# another; those names are used verbatim below and none is added.
 #
 # WHAT THIS TABLE REPLACES, measured in this repository rather than estimated:
 # configure.ac carries 101 configuration knobs (57 `AC_ARG_ENABLE` plus 44
-# `AC_ARG_WITH`), and the root CMakeLists.txt carries 98 `option(...)` calls
-# of which 47 are `option(CURL_DISABLE_*)`. That combined surface of 199
-# preprocessor-driven switches collapses to the fifteen features below. Per
-# AAP 0.4.2 the three jobs of `#include "curl_setup.h"` separate cleanly:
-# feature selection becomes Cargo [features], platform detection becomes
-# `#[cfg(target_os = ...)]` / `#[cfg(target_arch = ...)]`, and shared type
-# declarations become ordinary `use` statements.
+# `AC_ARG_WITH`), and the root CMakeLists.txt carries 98 `option(...)` calls of
+# which 47 are `option(CURL_DISABLE_*)`. That combined surface of 199
+# preprocessor-driven switches collapses to the fifteen features below.
 #
 # TWO NAMES THAT ARE DELIBERATELY ABSENT, recorded so that nobody adds them
 # later:
 #
-#   * There is NO `tls` feature. AAP 0.4.2 uses `#[cfg(feature = "tls")]` only
-#     as an illustrative example of the `#ifdef USE_SSL` transformation pattern;
-#     it is not among AAP 0.5.2's fifteen names, and an off-switchable `tls`
-#     feature would permit a build with no TLS at all -- contradicting both
-#     AAP 0.1.1 G4 ("rustls exclusively, validation on by default") and
-#     AAP 0.8.2. TLS is UNCONDITIONAL in this crate, which is why every rustls
-#     dependency above is non-optional. HTTP/1.1 is unconditional for the same
-#     structural reason: there is no `http1` name in the vocabulary either.
+#   * There is NO `tls` feature. An off-switchable one would permit a build with
+#     no TLS at all, contradicting the requirement of rustls exclusively with
+#     validation on by default. TLS is UNCONDITIONAL in this crate, which is why
+#     every rustls dependency above is non-optional. HTTP/1.1 is unconditional
+#     for the same structural reason: there is no `http1` name in the vocabulary
+#     either.
 #
-#   * There is NO `testing` feature. AAP 0.8.7 permits relocated unit-test
-#     coverage to live "as `#[cfg(test)]` modules or behind a `testing`
-#     feature"; `#[cfg(test)]` modules suffice here, they keep the relocated
-#     assertions out of every shipped artifact, and adding a published feature
-#     would invite exactly the re-export that AAP 0.8.7 forbids: "Re-exporting
-#     internals to satisfy them would defeat the encapsulation that makes the
-#     zero-`unsafe` guarantee possible."
+#   * There is NO `testing` feature. Relocated unit-test coverage may live
+#     either in `#[cfg(test)]` modules or behind such a feature; `#[cfg(test)]`
+#     modules suffice here, they keep the relocated assertions out of every
+#     shipped artifact, and adding a published feature would invite exactly the
+#     re-export of internals that would defeat the encapsulation the zero-unsafe
+#     guarantee rests on.
 #
 # `dep:` syntax is used throughout. It has been available since Cargo 1.60 and
-# is therefore safe at the declared MSRV, and it suppresses the implicit
-# feature that an optional dependency would otherwise create -- which is what
-# allows `brotli` and `zstd` to name features identical to their crate names.
-# ===========================================================================
+# is therefore safe at the declared MSRV, and it suppresses the implicit feature
+# that an optional dependency would otherwise create - which is what allows
+# `brotli` and `zstd` to name features identical to their crate names.
 
 [features]
 
-# The twelve capabilities curl 8.x provides out of the box, and which a
-# drop-in replacement must therefore provide out of the box as well.
+# The twelve capabilities curl 8.x provides out of the box, and which a drop-in
+# replacement must therefore provide out of the box as well.
 default = [
   "altsvc",
   "brotli",
@@ -607,8 +642,8 @@ default = [
 
 # HTTP/2 -- src/protocols/http2.rs, superseding lib/http2.c and its nghttp2
 # dependency. Gates this crate's direct use of h2's raw SETTINGS and
-# flow-control surface per AAP 0.8.5/C4; see the h2 entry above for the honest
-# caveat about hyper keeping h2 in the graph regardless.
+# flow-control surface; see the h2 entry above for the honest caveat about hyper
+# keeping h2 in the graph regardless.
 http2 = ["dep:h2"]
 
 # HTTP/3 over QUIC -- src/protocols/http3.rs, superseding lib/vquic/*.
@@ -624,26 +659,27 @@ ftp = []
 ssh = ["dep:russh"]
 
 # The WebSocket surface -- src/protocols/ws.rs, superseding lib/ws.c and
-# backing the four exported curl_ws_* symbols. Framing is implemented natively
-# because AAP 0.6.7's comparison is byte-exact; the handshake accept key uses
-# the unconditional sha1 and base64 dependencies.
+# backing the four curl_ws_* symbols AAP 0.3.1 assigns to the ABI shim.
+# Specified target design: framing is to be implemented natively because AAP
+# 0.6.7's comparison is byte-exact, and the handshake accept key is to use the
+# unconditional sha1 and base64 dependencies. Neither the module nor those
+# exports is delivered yet.
 websockets = []
 
-# Cookie engine -- src/cookies/mod.rs, superseding lib/cookie.c. The jar
-# format is native (see the publicsuffix entry); the optional dependency
-# supplies only the public-suffix domain-matching rules.
+# Cookie engine -- src/cookies/mod.rs, superseding lib/cookie.c. The jar format
+# is native (see the publicsuffix entry); the optional dependency supplies only
+# the public-suffix domain-matching rules.
 cookies = ["dep:publicsuffix"]
 
-# HSTS cache and its on-disk format -- src/cookies/hsts.rs, from lib/hsts.c.
+# HSTS cache and its on-disk format -- src/cookies/hsts.rs.
 hsts = []
 
-# Alt-Svc cache and its on-disk format -- src/cookies/altsvc.rs, from
-# lib/altsvc.c.
+# Alt-Svc cache and its on-disk format -- src/cookies/altsvc.rs.
 altsvc = []
 
-# DNS-over-HTTPS -- src/dns/doh.rs, from lib/doh.c. No external dependency:
-# AAP 0.4.1 specifies DoH "via the crate's own HTTP client", so it composes
-# out of the unconditional HTTP and TLS stacks.
+# DNS-over-HTTPS -- src/dns/doh.rs. No external dependency: DoH is specified to
+# go through the crate's own HTTP client, so it composes out of the
+# unconditional HTTP and TLS stacks.
 doh = []
 
 # Content-Encoding: br
@@ -652,58 +688,125 @@ brotli = ["dep:brotli"]
 # Content-Encoding: zstd
 zstd = ["dep:zstd"]
 
-# Content-Encoding: gzip and deflate. Named `gzip` rather than `flate2`
-# because AAP 0.5.2 fixes the vocabulary.
+# Content-Encoding: gzip and deflate. Named `gzip` rather than `flate2` because
+# the feature vocabulary is fixed.
 gzip = ["dep:flate2"]
 
 # --- The three capabilities that are DEFAULT-OFF, each with its reason ----
 
-# Negotiate / SPNEGO / Kerberos HTTP authentication (src/auth/negotiate.rs)
-# and GSS-API SOCKS5 (src/proxy/socks_gss.rs), superseding
-# lib/vauth/krb5_gssapi.c, lib/vauth/spnego_gssapi.c, lib/http_negotiate.c,
-# lib/curl_gssapi.c and lib/socks_gssapi.c.
+# Negotiate / SPNEGO / Kerberos HTTP authentication (src/auth/negotiate.rs) and
+# GSS-API SOCKS5 (src/proxy/socks_gss.rs), superseding lib/vauth/krb5_gssapi.c,
+# lib/vauth/spnego_gssapi.c, lib/http_negotiate.c, lib/curl_gssapi.c and
+# lib/socks_gssapi.c.
 #
-# Default-off resolves AAP 0.8.5/C2, the conflict between "no C TLS linkage at
-# any configuration" and "Negotiate where OS Kerberos is available":
-# "GSS-API is neither libcurl, nor libssl, nor a TLS library -- it is an
-# authentication mechanism. Negotiate sits behind a non-default `negotiate`
-# feature with the binding confined to curl-rs-lib/src/ffi/gss.rs, so the
-# default build links no C security library at all."
+# Default-off resolves the tension between "no C TLS linkage at any
+# configuration" and "Negotiate where OS Kerberos is available": GSS-API is an
+# authentication mechanism rather than a TLS library, and confining it to a
+# non-default feature with the binding in src/ffi/gss.rs means the default build
+# links no C security library at all.
 #
-# It wires to no optional crate because the binding is written directly
-# against the unconditional libc types in src/ffi/gss.rs; the feature gates
-# the modules and the link directive, not a dependency.
+# It wires to no optional crate because the binding is written directly against
+# the unconditional libc types in src/ffi/gss.rs; the feature gates the modules
+# and the link directive, not a dependency.
 negotiate = []
 
 # An in-process asynchronous DNS resolver as an alternative to the system
-# resolver. AAP 0.8.3 preserves the user's directive: "System resolver by
-# default, with hickory-dns as an optional feature that is disabled by
-# default."
+# resolver, replacing what lib/asyn-ares.c did with c-ares. AAP 0.8.3
+# preserves the user's directive: "System resolver by default, with
+# hickory-dns as an optional feature that is disabled by default."
 #
-# ESCALATION, stated plainly rather than papered over. This is the one feature
-# in AAP 0.5.2's vocabulary for which AAP 0.5.1 pins NO version, so it is
-# declared here as a pure cfg switch with no backing crate. A compliant
-# candidate does exist -- hickory-resolver 0.25.2 declares a minimum Rust
-# version of 1.71.1 and therefore satisfies the 1.75 floor, whereas
-# hickory-resolver 0.26.1 declares 1.88 and violates it (established from the
-# registry metadata sorted by parsed semantic version, because AAP 0.5.1
-# records that the registry returns versions in reverse-chronological
-# publication order and a naive read of the first element yields a stale
-# answer). Adding it, however, requires a `[workspace.dependencies]` entry in
-# the ROOT manifest, because AAP 0.4.2 makes the root the single place versions
-# are declared, and inventing a pin in a member manifest would violate the
-# discipline of AAP 0.5.1 that "No entry reads [a floating specifier] and none
-# is a placeholder". Enabling this feature is therefore a no-op until that
-# root entry exists; the requirement is reported upward rather than guessed at
-# here.
+# RESERVED BUT UNIMPLEMENTABLE, AND ENABLING IT IS A HARD BUILD FAILURE.
+#
+# The name is retained because AAP 0.5.2 fixes the feature vocabulary at
+# fifteen names, and deleting one would ripple into the `Features:` banner in
+# src/version.rs, the capability table in curl-rs-ffi/build.rs and curlinfo's
+# 29-entry table. But it is backed by NO dependency, and it must not be: an
+# earlier revision declared it as a bare `[]` cfg switch, which made enabling
+# it a SILENT NO-OP while the documentation promised an alternate resolver.
+# That is the worst of the available outcomes, because AAP 0.6.5 makes
+# over-reporting a capability the named failure mode. `compile_error!` in
+# src/lib.rs now converts that silence into an immediate, self-explaining
+# build failure.
+#
+# THE WIRING IS TRIVIAL, AND IT WAS BUILT AND TORN DOWN TO BE SURE OF THAT.
+# Adding `hickory-resolver = { version = "=0.25.2", default-features = false,
+# features = ["system-config", "tokio"] }` to the root's
+# [workspace.dependencies], `hickory-resolver = { workspace = true,
+# optional = true }` here, and `hickory-dns = ["dep:hickory-resolver"]` below
+# resolves cleanly offline, with no existing pin perturbed, and `cargo deny
+# check bans`, `licenses` and `sources` all still pass. So the blocker is not a
+# missing root entry and not a decision owed by some other file.
+#
+# The blocker is the ADVISORY gate, and the two records were read verbatim from
+# the local advisory database rather than summarised:
+#
+#   RUSTSEC-2026-0118  NSEC3 closest-encloser proof validation enters an
+#                      unbounded loop on cross-zone responses. `patched = []`
+#                      -- NO fixed version of hickory-proto exists -- with
+#                      `unaffected = ["< 0.25.0-alpha.3", ">= 0.26.0-beta.1"]`.
+#   RUSTSEC-2026-0119  O(n^2) name compression in BinEncoder; CPU exhaustion
+#                      while a message is ENCODED. `patched = [">= 0.26.1"]`.
+#
+# Both fixes live only in the 0.26 line, and hickory 0.26.x declares a minimum
+# Rust version of 1.88, which breaches the 1.75 floor AAP 0.8.3 preserves
+# verbatim. The version search, taken from the registry index sorted by PARSED
+# SEMANTIC VERSION (AAP 0.5.1 records that the index returns
+# reverse-chronological publication order, so reading the first element yields
+# a stale answer), is therefore exhaustive and the two sets are disjoint:
+#
+#   hickory-resolver 0.24.0-0.25.2  declare rust-version 1.67.0-1.71.1 and
+#     clear the 1.75 floor, but require hickory-proto ^0.24 / ^0.25, and no
+#     hickory-proto below 0.26.1 carries either fix.
+#   hickory-resolver 0.26.0-0.26.1  do carry them, and declare rust-version
+#     1.88, breaking the floor.
+#
+# Nor can the exposure be confined to the feature: cargo-deny and cargo-audit
+# read Cargo.lock rather than the active feature set, so an `optional = true`
+# entry is scanned even with the feature OFF. Measured, not assumed - wiring
+# 0.25.2 moved `cargo deny check advisories` from ok to FAILED on a DEFAULT
+# build.
+#
+# SO THREE AAP REQUIREMENTS CANNOT ALL HOLD, AND THAT IS ESCALATED RATHER THAN
+# DECIDED HERE:
+#   AAP 0.8.3    "Rust edition 2021, MSRV 1.75", frozen
+#   AAP 0.5.2    hickory-dns available as an optional, default-off feature
+#   AAP 0.8.4 g9 cargo audit with zero critical advisories
+# Any two are satisfiable; the three together are not. The options are all user
+# decisions: raise the MSRV so the 0.26 line becomes admissible, accept two
+# advisory ignores in deny.toml for a crate nothing yet consumes, or leave the
+# feature as vocabulary until the 0.25 line is patched. Until one is taken, the
+# third is what this manifest implements - and the `compile_error!` is what
+# keeps it from being mistaken for the second.
+#
+# Recorded precisely because the honest state is easy to overstate in either
+# direction: AAP 0.8.3 requires the "System resolver by default", which
+# src/dns/resolver.rs is the designated home for, "with hickory-dns as an
+# optional feature that is disabled by default" - and disabled it is. This
+# checkpoint carries no src/dns/ module at all, so even with the dependency
+# wired there would be no consumer of it here, and the crate would sit in the
+# lockfile unreferenced by any line of Rust while its advisories were scanned
+# on every build. Nothing in this file claims otherwise.
 hickory-dns = []
 
 # A counting `GlobalAlloc` reproducing the allocation log of lib/memdebug.c
 # (577 lines; the emitters at lib/memdebug.c:191-368 write
 # `MEM <src>:<line> malloc(<n>) = <ptr>` with parallel forms for
 # `calloc(n,size)`, `strdup(p)(n)`, `wcsdup(p)(n)`, `realloc(p,n)` and
-# `free(p)`, plus LIMIT, FD, FILE and ADDR records, to the destination named
+# `free(p)`, plus LIMIT, FD, FILE and BT records, to the destination named
 # by the CURL_MEMDEBUG environment variable).
+#
+# MEM, LIMIT, FD, FILE and BT are the complete set of record prefixes the C
+# tree emits, established by reading all 18 curl_dbg_log() call sites rather
+# than by inference: `grep -c ADDR lib/memdebug.c` returns 0, and the fifth
+# record is `BT %s:%d -- %s\n` at lib/memdebug.c:136, written by full_callback
+# under USE_BACKTRACE and matched-then-discarded by tests/memanalyzer.pm:116
+# with /^BT/. The analyzer's legacy ^ADDR branch at tests/memanalyzer.pm:349
+# has no producer anywhere in the C tree. The only other two call sites,
+# lib/memdebug.c:125 and :127, are free-form backtrace-error diagnostics that
+# the analyzer does not parse as records at all. src/ffi/sys.rs carries the
+# same measurement beside the allocator that has to emit these bytes, and
+# notes there that a `GlobalAlloc` can honestly produce only the MEM and LIMIT
+# forms.
 #
 # Default-off because of the analysis in AAP 0.6.6: the harness wraps its
 # entire memory check in `if($feature{"TrackMemory"})` and sets that feature
@@ -716,33 +819,29 @@ hickory-dns = []
 # trade can be reversed without redesign should it prove unacceptable.
 memdebug = []
 
-# ===========================================================================
 # [dev-dependencies] -- deliberately minimal.
 #
-# The >=80% line-coverage gate on src/protocols/ and src/transfer/
-# (AAP 0.8.4) is reached through the dependency injection of AAP 0.3.3 P12 --
-# "The resolver, the clock, and the TLS provider are injected rather than
-# reached for globally, which is what makes the protocol modules testable
-# [...] without live network access" -- and NOT through extra test crates.
+# The >=80% line-coverage gate on src/protocols/ and src/transfer/ is reached
+# through dependency injection - the resolver, the clock and the TLS provider
+# are injected rather than reached for globally, which is what makes the
+# protocol modules testable without live network access - and NOT through extra
+# test crates.
 #
-# No test target directories are declared either: AAP 0.3.1 places Rust
-# integration tests in the repository-root tests-rs/ tree, and AAP 0.8.7
-# places the relocated tests/unit and tests/libtest coverage in `#[cfg(test)]`
-# modules inside src/**.
-# ===========================================================================
+# No test target directories are declared either: Rust integration tests live in
+# the repository-root tests-rs/ tree, and the relocated tests/unit and
+# tests/libtest coverage lives in `#[cfg(test)]` modules inside src/**.
 
 [dev-dependencies]
 
 # Temporary files and directories for the `#[cfg(test)]` modules that exercise
-# the cookie jar, the HSTS and alt-svc caches, and src/protocols/file.rs
-# against real paths. AAP 0.5.1 lists this crate as a "Development dependency
-# for integration tests".
+# the cookie jar, the HSTS and alt-svc caches, and src/protocols/file.rs against
+# real paths.
 tempfile = { workspace = true }
 
-# Test-only runtime surface. `macros` supplies `#[tokio::test]`, and
-# `test-util` supplies the pausable, advanceable clock that lets the timeout
-# and rate-limit paths of src/transfer/ratelimit.rs and the DNS deadline be
-# tested deterministically -- the injected clock of AAP 0.3.3 P12. These
-# features are additive over the normal-dependency entry above and, under
-# resolver 2, are not enabled when building the library itself.
+# Test-only runtime surface. `macros` supplies `#[tokio::test]`, and `test-util`
+# supplies the pausable, advanceable clock that lets the timeout and rate-limit
+# paths of src/transfer/ratelimit.rs and the DNS deadline be tested
+# deterministically. These features are additive over the normal-dependency
+# entry above and, under resolver 2, are not enabled when building the library
+# itself.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

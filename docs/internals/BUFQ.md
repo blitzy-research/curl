@@ -20,13 +20,16 @@ for one, rather than reinterprets.
   the order they entered it.
 - **Byte counts are exact.** `Curl_bufq_len` reports the sum of the data held
   in all of the chunks, and a partial write reports the number of bytes
-  accepted rather than the number requested.
+  accepted rather than the number requested. That count arrives through a
+  `size_t *` out-parameter, not through the return value.
 - **Full and empty are signaled, not reported as failures.** The prototypes
-  below return -1 and set `CURLE_AGAIN` through the `err` out-parameter, which
-  is what a write to a full queue and a read from an empty queue do. Neither
-  is an ordinary error, and neither is a short transfer of zero bytes. The
-  transfer layer depends on that distinction as its pause and back-pressure
-  signal.
+  below return `CURLcode` directly, and `CURLE_AGAIN` is what a write to a
+  full queue and a read from an empty queue produce. The distinction is
+  precise: `CURLE_AGAIN` is returned only when **no** bytes moved at all
+  (`lib/bufq.c:414` for a read, `lib/bufq.c:391` for a write), so a partial
+  transfer of one or more bytes is `CURLE_OK` with a short count rather than
+  `CURLE_AGAIN`. Neither is an ordinary error. The transfer layer depends on
+  that distinction as its pause and back-pressure signal.
 - **Full and non-empty are loosely coupled**, exactly as the worked example in
   the section on empty, full and overflow shows.
 - `BUFQ_OPT_SOFT_LIMIT` permits a write beyond `max_chunks` while still
@@ -40,60 +43,102 @@ for one, rather than reinterprets.
 ## read/write
 
 Its basic read/write functions have a similar signature and return code
-handling as many internal curl read and write ones.
+handling as many internal curl read and write ones: the result is a `CURLcode`
+and the byte count is an out-parameter.
 
+```c
+CURLcode Curl_bufq_write(struct bufq *q,
+                         const uint8_t *buf, size_t len,
+                         size_t *pnwritten);
+
+CURLcode Curl_bufq_read(struct bufq *q, uint8_t *buf, size_t len,
+                        size_t *pnread);
 ```
-ssize_t Curl_bufq_write(struct bufq *q, const unsigned char *buf, size_t len, CURLcode *err);
 
-- returns the length written into `q` or -1 on error.
-- writing to a full `q` returns -1 and set *err to CURLE_AGAIN
+- Both set the out-parameter to 0 on entry and then report through it the
+  number of bytes actually moved, which may be fewer than `len`.
+- A write to a full `q` yields `CURLE_AGAIN`, but only when nothing at all was
+  accepted: the return is
+  `(!*pnwritten && len) ? CURLE_AGAIN : CURLE_OK` (`lib/bufq.c:391`).
+- A read from an empty `q` yields `CURLE_AGAIN` on the same condition:
+  `(!*pnread) ? CURLE_AGAIN : CURLE_OK` (`lib/bufq.c:414`).
+- A write can also yield `CURLE_OUT_OF_MEMORY`, when a non-full tail chunk
+  should have been available but could not be obtained (`lib/bufq.c:381`).
+  That is a genuine failure, unlike `CURLE_AGAIN`.
 
-ssize_t Curl_bufq_read(struct bufq *q, unsigned char *buf, size_t len, CURLcode *err);
+`Curl_bufq_cwrite` and `Curl_bufq_cread` are the `char *` spellings of the same
+two functions and simply delegate, so they share these semantics exactly.
 
-- returns the length read from `q` or -1 on error.
-- reading from an empty `q` returns -1 and set *err to CURLE_AGAIN
-
-```
+Note that the doc comments above these prototypes in `lib/bufq.h` still say
+"the amount of copied bytes is returned", which describes an older signature.
+The prototypes are authoritative; the surrounding comment has not kept pace.
 
 To pass data into a `bufq` without an extra copy, read callbacks can be used.
 
-```
-typedef ssize_t Curl_bufq_reader(void *reader_ctx, unsigned char *buf, size_t len,
-                                 CURLcode *err);
+```c
+typedef CURLcode Curl_bufq_reader(void *reader_ctx,
+                                  uint8_t *buf, size_t len,
+                                  size_t *pnread);
 
-ssize_t Curl_bufq_slurp(struct bufq *q, Curl_bufq_reader *reader, void *reader_ctx,
-                        CURLcode *err);
+CURLcode Curl_bufq_slurp(struct bufq *q, Curl_bufq_reader *reader,
+                         void *reader_ctx, size_t *pnread);
+
+CURLcode Curl_bufq_sipn(struct bufq *q, size_t max_len,
+                        Curl_bufq_reader *reader, void *reader_ctx,
+                        size_t *pnread);
 ```
 
 `Curl_bufq_slurp()` invokes the given `reader` callback, passing it its own
 internal buffer memory to write to. It may invoke the `reader` several times,
-as long as it has space and while the `reader` always returns the length that
-was requested. There are variations of `slurp` that call the `reader` at most
-once or only read in a maximum amount of bytes.
+as long as it has space and while the `reader` keeps reporting through `pnread`
+the full length that was requested. `Curl_bufq_sipn()` is the variation that
+calls the `reader` at most once, and it takes a `max_len` ceiling: when
+`max_len` is 0 the only limit is the available chunk space.
 
 The analog mechanism for write out buffer data is:
 
-```
-typedef ssize_t Curl_bufq_writer(void *writer_ctx, const unsigned char *buf, size_t len,
-                                 CURLcode *err);
+```c
+typedef CURLcode Curl_bufq_writer(void *writer_ctx,
+                                  const uint8_t *buf, size_t len,
+                                  size_t *pwritten);
 
-ssize_t Curl_bufq_pass(struct bufq *q, Curl_bufq_writer *writer, void *writer_ctx,
-                       CURLcode *err);
+CURLcode Curl_bufq_pass(struct bufq *q, Curl_bufq_writer *writer,
+                        void *writer_ctx, size_t *pwritten);
+
+CURLcode Curl_bufq_write_pass(struct bufq *q,
+                              const uint8_t *buf, size_t len,
+                              Curl_bufq_writer *writer, void *writer_ctx,
+                              size_t *pwritten);
 ```
 
-`Curl_bufq_pass()` invokes the `writer`, passing its internal memory and
-remove the amount that `writer` reports.
+`Curl_bufq_pass()` invokes the `writer`, passing its internal memory, and
+removes the amount that `writer` reports through `pwritten`.
+`Curl_bufq_write_pass()` is the combined form: it writes `buf` to the queue and
+passes queued content on through the same `writer`.
+
+The stale wording noted above is at its most visible here. The doc comments
+over these prototypes still describe a writer that "may return -1 and
+CURLE_AGAIN"
+and say "-1 is returned on any other errors", which no longer matches a
+`CURLcode` return with a `size_t *` out-parameter. Read the prototypes, not the
+comments.
 
 ## peek and skip
 
 It is possible to get access to the memory of data stored in a `bufq` with:
 
-```
-bool Curl_bufq_peek(const struct bufq *q, const unsigned char **pbuf, size_t *plen);
+```c
+bool Curl_bufq_peek(struct bufq *q, const uint8_t **pbuf, size_t *plen);
 ```
 
 On returning TRUE, `pbuf` points to internal memory with `plen` bytes that one
 may read. This is only valid until another operation on `bufq` is performed.
+On returning FALSE it sets `pbuf` to NULL and `plen` to 0.
+
+The `q` parameter is **not** `const`, and that is deliberate rather than an
+oversight: the call prunes an exhausted head chunk before looking
+(`lib/bufq.c:426-428`), so peeking can mutate the queue's chunk list even
+though it does not consume any bytes.
 
 Instead of reading `bufq` data, one may simply skip it:
 
@@ -254,13 +299,18 @@ follows.
   single-thread assumption therefore becomes a statement about which value
   owns the pool, rather than a comment asking each caller to be careful.
 
-`#![forbid(unsafe_code)]` is specified at the root of `curl-rs-lib`, with a
-single narrowly allowed island under `curl-rs-lib/src/ffi/` for the operating
-system calls that have no safe expression, and a mandatory `// SAFETY:`
-comment on every `unsafe` block there. A buffer queue has no business in that
-island. The manual chunk arithmetic of the C version, its read and write
-offsets and its spare list bookkeeping, is the class of code that the
-invariant removes.
+The safety invariant at the root of `curl-rs-lib` is `#![deny(unsafe_code)]`
+plus exactly one `#[allow(unsafe_code)]`, on `mod ffi` -- the single narrowly
+allowed island under `curl-rs-lib/src/ffi/` for the operating system calls that
+have no safe expression, where every `unsafe` block carries a mandatory
+`// SAFETY:` comment. It is `deny` and not `forbid` because `forbid` cannot be
+locally overridden (`error[E0453]: allow(unsafe_code) incompatible with
+previous forbid`) and Agent Action Plan goal G1 permits only three crates, so
+the island cannot move into a fourth; `deny` is no weaker, since a stray
+`unsafe` block outside the island is a hard error rather than a warning. A
+buffer queue has no business in that island. The manual chunk arithmetic of
+the C version, its read and write offsets and its spare list bookkeeping, is
+the class of code that the invariant removes.
 
 For the sibling buffer modules, see [dynbuf](DYNBUF.md), the module that a
 `bufq` follows for initialization and release, and [bufref](BUFREF.md).

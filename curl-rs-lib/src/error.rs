@@ -143,12 +143,13 @@
 //! # What this module deliberately does not contain
 //!
 //! - **`CURLoption` and `CURLINFO`.** Both are composed arithmetically from a
-//!   type base rather than ordinally (`CURLOPT(na, t, nu) = t + nu`), and
-//!   `curl-rs-ffi/src/ffi/opts.rs` is their sole source of truth, emitting
-//!   both the identifiers and the `curl_easyoption` metadata array that backs
-//!   `curl_easy_option_by_name`. Restating even one of them here would create
-//!   the second table that guarantees eventual drift. This module owns the
-//!   *result* codes and nothing else.
+//!   type base rather than ordinally (`CURLOPT(na, t, nu) = t + nu`), and their
+//!   sole source of truth is one module in the ABI crate --
+//!   `curl-rs-ffi/src/ffi/opts.rs` -- which emits both the identifiers and the
+//!   `curl_easyoption` metadata array that backs `curl_easy_option_by_name`.
+//!   Restating even one identifier here would create the second table that
+//!   guarantees eventual drift. This module owns the *result* codes and nothing
+//!   else.
 //! - **The legacy `#define` aliases.** `include/curl/curl.h:650-736` defines
 //!   40 backward-compatibility macros inside its `CURL_NO_OLDIES` block, among
 //!   them `CURLE_FUNCTION_NOT_FOUND` for `CURLE_OBSOLETE41` and
@@ -175,6 +176,7 @@
 //! `forbid` plus a relaxation errors, `deny` plus a relaxation builds clean.
 
 use std::borrow::Cow;
+use std::ffi::CStr;
 
 /// Which result family an integer was being interpreted as.
 ///
@@ -324,6 +326,19 @@ macro_rules! result_code {
             /// per-family constant rather than a shared one.
             pub const UNKNOWN_MESSAGE: &'static str = $unknown;
 
+            /// [`Self::UNKNOWN_MESSAGE`] as a NUL-terminated C string.
+            ///
+            /// The SAME literal, viewed twice: `concat!` appends the
+            /// terminator at compile time, so there is no second copy of the
+            /// text to keep in step and no allocation at run time. This is
+            /// what lets the C ABI shim hand a `const char *` straight out of
+            /// this table.
+            pub const UNKNOWN_MESSAGE_C: &'static CStr =
+                match CStr::from_bytes_with_nul(concat!($unknown, "\0").as_bytes()) {
+                    Ok(text) => text,
+                    Err(_) => panic!("an unknown-code message may not contain a NUL"),
+                };
+
             /// Every member of this enumeration, in declaration order, which
             /// for these families is also ascending numeric order.
             ///
@@ -381,6 +396,50 @@ macro_rules! result_code {
                 match Self::from_i32(raw) {
                     Some(code) => code.message(),
                     None => Self::UNKNOWN_MESSAGE,
+                }
+            }
+
+            /// [`Self::message`] as a NUL-terminated C string.
+            ///
+            /// The four exported `curl_*_strerror` functions return
+            /// `const char *`, and a Rust `&str` is not NUL-terminated, so
+            /// something has to supply the terminator. It is supplied HERE, by
+            /// `concat!` at compile time against the same `$message` literal
+            /// that [`Self::message`] returns, for two reasons:
+            ///
+            /// * A second table of NUL-terminated copies in the ABI shim would
+            ///   be a mirrored source of truth, and mirrored tables drift.
+            /// * Interning at run time would need an allocation and a cache
+            ///   behind a lock, for text that is already static.
+            ///
+            /// The result is a `&'static CStr` computed entirely at compile
+            /// time, so the shim's whole job is `.as_ptr()`.
+            #[must_use]
+            pub const fn message_c(self) -> &'static CStr {
+                match self {
+                    $(
+                        Self::$variant => match CStr::from_bytes_with_nul(
+                            concat!($message, "\0").as_bytes(),
+                        ) {
+                            Ok(text) => text,
+                            Err(_) => panic!("a code message may not contain a NUL"),
+                        },
+                    )+
+                }
+            }
+
+            /// [`Self::message_for`] as a NUL-terminated C string.
+            ///
+            /// The exact function the corresponding `curl_*_strerror` becomes:
+            /// known values resolve through [`Self::message_c`], everything
+            /// else -- values outside the enumeration, the retired
+            /// placeholders, and the family's `*_LAST` bound -- through
+            /// [`Self::UNKNOWN_MESSAGE_C`].
+            #[must_use]
+            pub const fn message_for_c(raw: i32) -> &'static CStr {
+                match Self::from_i32(raw) {
+                    Some(code) => code.message_c(),
+                    None => Self::UNKNOWN_MESSAGE_C,
                 }
             }
 
@@ -1267,6 +1326,17 @@ mod tests {
                     assert_eq!($name::try_from(raw), Ok(code));
                     assert_eq!(i32::from(code), raw);
                     assert_eq!($name::message_for(raw), code.message());
+                    // The NUL-terminated view is the SAME text: one literal,
+                    // two shapes. This is the assertion that makes the
+                    // "no mirrored table" claim on `message_c` executable.
+                    assert_eq!(
+                        code.message_c()
+                            .to_str()
+                            .expect("message must be UTF-8"),
+                        code.message(),
+                        "the C view of a message must equal the Rust view"
+                    );
+                    assert_eq!($name::message_for_c(raw), code.message_c());
                     // Display is defined in terms of message().
                     assert_eq!(code.to_string(), code.message());
                     // Non-empty, non-padded message text.
@@ -1279,6 +1349,12 @@ mod tests {
                 // Family identity and the per-family fallback.
                 assert_eq!($name::KIND, $kind);
                 assert_eq!($name::UNKNOWN_MESSAGE, $unknown);
+                assert_eq!(
+                    $name::UNKNOWN_MESSAGE_C
+                        .to_str()
+                        .expect("the unknown-code message must be UTF-8"),
+                    $unknown
+                );
 
                 // Integers outside the enumeration are refused inbound and
                 // resolve to the fallback for messaging.
@@ -1289,6 +1365,10 @@ mod tests {
                         Err(UnknownCode::new($kind, raw))
                     );
                     assert_eq!($name::message_for(raw), $unknown);
+                    assert_eq!(
+                        $name::message_for_c(raw),
+                        $name::UNKNOWN_MESSAGE_C
+                    );
                 }
 
                 // Exactly one success code, and into_result agrees with it.

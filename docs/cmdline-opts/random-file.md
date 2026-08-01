@@ -15,8 +15,9 @@ Example:
 
 # `--random-file`
 
-Deprecated option. This option is ignored (added in 7.84.0). The TLS
-implementation provides its own random data and consults no seed file.
+Deprecated option. This option is ignored (added in 7.84.0). The specified
+TLS implementation is required to provide its own random data and to consult
+no seed file.
 
 The argument is the path name to a file containing random data. The data was
 used to seed the random engine for SSL connections.

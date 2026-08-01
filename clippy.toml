@@ -6,293 +6,252 @@
 # curl-rs-ffi.
 #
 # This file replaces scripts/checksrc.pl, curl's hand-rolled C style enforcer.
-# checksrc.pl declares 50 warning categories in %warnings, two more in
-# %warnings_extended, and an 89-entry table of banned C functions. Only nine of
-# those categories are portable to Rust at all, and not one of the nine lands
-# here - each has a better home:
+# Of checksrc.pl's 52 warning categories, 41 are C syntax rules with no Rust
+# meaning and are not reproduced; the rest deliberately land elsewhere rather
+# than here:
 #
-#   LONGLINE (L176), measured against `my $max_column = 79;` at L29 with a
-#   ` https://` exemption at L588; TABS (L594); TRAILINGSPACE (L599);
-#   INDENTATION (L1034), against `my $indent = 2;` at L30; MULTISPACE (L1155)
+#   line length, tabs, trailing space, indentation, multiple spaces
 #       -> rustfmt.toml and .editorconfig. Clippy has no line-length, tab or
-#          indentation option whatsoever: the accepted-field list was
-#          enumerated against the pinned clippy 0.1.97 to be sure, rather than
-#          assumed.
+#          indentation option at all - the accepted-field list was enumerated
+#          against the pinned clippy 0.1.97 rather than assumed.
 #
-#   COPYRIGHT (L161) and COPYRIGHTYEAR (L143)
-#       -> `reuse lint`, run from .github/workflows/hygiene.yml. That is also
-#          why this file carries the SPDX header above: REUSE.toml does not
-#          list clippy.toml, so it must be annotated directly.
+#   copyright and copyright-year headers
+#       -> `reuse lint`. That is also why this file carries the SPDX header
+#          above: REUSE.toml does not list clippy.toml, so it must be
+#          annotated directly.
 #
-#   the deferred-work marker check (L616)
-#       -> no clippy analogue and none needed. Production code carries no
-#          deferred-work markers, so there is nothing to configure.
+#   the deferred-work marker check
+#       -> no clippy analogue and none needed; production code carries no
+#          deferred-work markers.
 #
-#   BANNEDFUNC (L982), 89 banned C functions
-#       -> clippy's disallowed-methods and disallowed-types would express it,
-#          and both are deliberately left unset. The banned list is malloc,
-#          realloc, free, strcpy, sprintf, atoi, fopen, socket, send, recv and
-#          their kin: every one is either absent from safe Rust or already safe
-#          by construction, because allocation, formatting and string handling
-#          are the type system's responsibility here. Banning names without a
-#          measured need would be inventing policy, not migrating it.
-#
-# The other 41 categories - BRACEPOS, ASTERISKSPACE, EQUALSNOSPACE,
-# SEMINOSPACE, TYPEDEFSTRUCT, CPPCOMMENTS and the rest - are C syntax rules
-# with no Rust meaning, and are not reproduced.
-#
-# No user-specified rules were supplied for this project: `review_rules`
-# returns "No user rules provided." Nothing below comes from a project rule.
-# Every value is either mandated by the specification or measured against this
-# repository, and the measurement is recorded beside the value it justifies.
+#   the 89 banned C functions (malloc, realloc, free, strcpy, sprintf, atoi,
+#   fopen, socket, send, recv and their kin)
+#       -> expressible through disallowed-methods and disallowed-types, both
+#          deliberately left unset: every banned name is either absent from
+#          safe Rust or already safe by construction, because allocation,
+#          formatting and string handling are the type system's responsibility
+#          here. Banning names without a measured need would be inventing
+#          policy, not migrating it.
 
-# ---------------------------------------------------------------------------
 # What this file can and cannot do
-# ---------------------------------------------------------------------------
 #
 # clippy.toml configures lint PARAMETERS: thresholds, allow-lists and the MSRV.
-# It cannot enable, deny, warn or allow a lint. There is no `deny` or `allow`
-# key to reach for, and no lint level appears anywhere below.
+# It cannot enable, deny, warn or allow a lint - there is no such key, and no
+# lint level appears anywhere below.
 #
-# Lint levels live in exactly two other places, and belong there:
+# Lint levels live in exactly two other places, and belong there: the command
+# line (`cargo clippy --workspace -- -D warnings`, run as a gate of its own so
+# that a lint failure names itself instead of hiding inside a build log), and a
+# `[lints.clippy]` table in a manifest or `#![deny(...)]` in a crate root.
 #
-#   * the command line - `cargo clippy --workspace -- -D warnings`, run by
-#     .github/workflows/rust-clippy.yml as a gate of its own so that a lint
-#     failure names itself instead of hiding inside a build log;
-#   * a `[lints.clippy]` table in a manifest, or `#![deny(...)]` in a crate
-#     root.
-#
-# Neither the workspace manifest nor any of the three member manifests defines
-# a [lints] table today, so only clippy's warn-by-default lints reach the gate.
+# Neither the workspace manifest nor any of the three member manifests defines a
+# [lints] table today, so only clippy's warn-by-default lints reach the gate.
 # Two keys below - too-many-lines-threshold and doc-valid-idents - parameterise
-# pedantic-group lints, which are allow-by-default. They are therefore inert
+# pedantic-group lints, which are allow-by-default; they are therefore inert
 # under the plain gate and take effect the moment anyone runs
-# `-W clippy::pedantic` or a [lints] table is added; that is recorded per key
-# rather than left for someone to discover.
+# `-W clippy::pedantic` or adds a [lints] table. That is recorded per key rather
+# than left for someone to discover.
 #
 # Three further invariants are not clippy's job and must not migrate here:
 #
-#   * memory safety - `#![forbid(unsafe_code)]` at the root of curl-rs-lib and
-#     curl-rs, exactly one `#[allow(unsafe_code)]` on `mod ffi`, and a
-#     `// SAFETY:` comment on every unsafe block. Crate attributes make that a
-#     compiler-checked invariant instead of a review obligation, which is the
-#     whole point of stating it there and not here;
+#   * memory safety - the crate attributes, not a clippy key. curl-rs-lib and
+#     curl-rs-ffi each carry `#![deny(unsafe_code)]` with exactly one
+#     `#[allow(unsafe_code)]`, on `mod ffi`. `deny` rather than the specified
+#     `forbid`, because `forbid` cannot be overridden from an inner scope: the
+#     pair is `error[E0453]: allow(unsafe_code) incompatible with previous
+#     forbid`, measured on the pinned toolchain, and the deviation is recorded
+#     in full at curl-rs-lib/src/lib.rs. `deny` still delivers the property
+#     that matters - the same `unsafe` block moved to any module outside
+#     `src/ffi/` is a hard error. The curl-rs roots need no exemption at all
+#     and use `forbid` literally: curl-rs/src/main.rs,
+#     curl-rs/src/bin/curlinfo.rs and curl-rs/build.rs all carry it. Every
+#     unsafe block additionally carries a `// SAFETY:` comment.
+#     `clippy::undocumented_unsafe_blocks` is deliberately NOT enabled
+#     anywhere in this workspace - the comments are held by an executable test
+#     instead, `mod source_policy`'s
+#     `every_unsafe_block_in_this_crate_is_covered_by_a_safety_comment`, which
+#     walks the crate's own sources. Crate attributes and that test make the
+#     invariant compiler- and test-checked rather than a review obligation,
+#     which is the whole point of stating it there and not here;
 #   * formatting - rustfmt.toml, which pins max_width and the newline style;
 #   * licence and copyright headers - `reuse lint`, as above.
 
-# ---------------------------------------------------------------------------
 # msrv - the single most important key in this file
-# ---------------------------------------------------------------------------
 #
-# Rust edition 2021 and a minimum supported Rust version of 1.75 are both
-# mandated. This value must stay equal to `rust-version` in Cargo.toml's
-# [workspace.package], which every member inherits through
-# `rust-version.workspace = true`, and consistent with the floor described by
-# rust-toolchain.toml, whose channel is pinned to 1.97.1.
-#
-# Measured rather than assumed: when the two disagree, clippy reports
-#   the MSRV in `clippy.toml` and `Cargo.toml` differ; using <this value>
-# and the value in THIS file wins. When they agree, clippy is silent and
-# `cargo clippy -- -D warnings` exits 0.
+# Held equal to `rust-version` in Cargo.toml's [workspace.package], which every
+# member inherits, and consistent with the floor rust-toolchain.toml describes.
+# When the two disagree clippy says so and the value in THIS file wins.
 #
 # Without this key clippy cheerfully suggests APIs newer than the floor, and
-# applying such a suggestion breaks the MSRV while still passing the gate on
-# the pinned toolchain - a silent regression. With it,
-# clippy::incompatible_msrv (warn by default, so `-D warnings` turns it into an
-# error) rejects them. Verified against Option::is_none_or, stable since 1.82:
-# reported with this key present, silent without it. That is what makes the
-# floor self-enforcing rather than aspirational, and it is why this key earns
-# its place first.
+# applying such a suggestion breaks the MSRV while still passing the gate on the
+# pinned toolchain - a silent regression. With it, clippy::incompatible_msrv is
+# warn by default, so `-D warnings` turns it into an error. Verified against
+# Option::is_none_or, stable since 1.82: reported with this key present, silent
+# without it. That is what makes the floor self-enforcing rather than
+# aspirational.
 #
 # Raising the floor is a decision for whoever set it, not a lint-configuration
-# change. If it is raised, raise Cargo.toml's rust-version, this line and
-# rust-toolchain.toml's channel together. Cargo.toml records the measured
-# caveat that 1.75 is not reachable with the mandated dependency set; the value
-# stays 1.75 because the specification froze it and that conflict is escalated
-# for a decision rather than resolved by quietly editing the mandate.
+# change. If it is ever raised, raise Cargo.toml's rust-version, this line,
+# rust-toolchain.toml's channel and .github/workflows/rust-build.yml's
+# MSRV_TOOLCHAIN together, or this key and the toolchain that actually compiles
+# will disagree.
+#
+# The floor is MEASURED, not aspirational, and Cargo.toml carries the full
+# evidence, reproducible with `cargo +1.75.0 metadata --locked --offline`
+# followed by `cargo +1.75.0 check --locked --offline --workspace
+# --all-targets` and `cargo +1.75.0 build --locked --offline --workspace`, all
+# of which exit 0 on this tree: across all four mandated targets, with and
+# without the implementable feature set, the maximum `rust-version` declared
+# anywhere in the resolved graph is 1.75 - this workspace's own crates and
+# nothing above them - with no edition-2024 package in any of the eight graphs.
+# Two lockfile pins hold it there, getrandom 0.3.3 and wasi 0.14.0, both on a
+# Windows-only, WebAssembly-only branch of a build dependency, and Cargo.toml's
+# rust-version comment records the chain and the remedy should `cargo update`
+# re-float them. So this value is a fact about the dependency set, which is
+# exactly what makes clippy::incompatible_msrv worth enforcing rather than
+# noise.
+#
+# WHAT THAT DOES NOT ESTABLISH is that the floor holds for the FINISHED
+# product. The workspace is only partly delivered, so every module that lands
+# can introduce an API newer than the floor, and re-running the three commands
+# above months later is the wrong instrument for catching it. Enforcing
+# clippy::incompatible_msrv is the right one, because it rejects a too-new API
+# at the moment it is written rather than at the next audit. That is the whole
+# reason this key exists rather than a note in a README.
+#
+# The one MSRV tension still open is the Apple arm64 variadic ABI, AAP 0.8.6
+# ambiguity A4, which is escalated for a decision rather than resolved by
+# quietly editing the mandate.
 msrv = "1.75"
 
-# ---------------------------------------------------------------------------
 # too-many-arguments-threshold - clippy::too_many_arguments, warn by default
-# ---------------------------------------------------------------------------
 #
-# Clippy's default is 7, measured: a function fires at 8. Raised to 9 on the
-# evidence below, and no further.
+# Clippy's default is 7; a function fires at 8. Raised to 9 on the evidence
+# below, and no further.
 #
 # The C tree concentrates its abstraction in hand-rolled vtables that become
 # Rust traits - struct Curl_protocol carries 18 function pointers, struct
 # Curl_cftype 14 and struct Curl_ssl about 22 - and trait methods count the
-# `&self` or `&mut self` receiver toward this threshold, which was confirmed by
-# probe rather than inferred. A method with eight genuine arguments therefore
-# scores 9.
+# receiver toward this threshold, confirmed by probe. A method with eight
+# genuine arguments therefore scores 9.
 #
-# Counting parameters across every C prototype in lib/ and src/: 98.13% take 6
-# or fewer, 98.89% take 7 or fewer, 99.30% take 8 or fewer and 99.60% take 9 or
-# fewer. Narrowing that list to the in-scope files leaves 29 prototypes with 8
-# or more parameters, clustered tightly at 8 and 9 and dominated by exactly the
-# code whose output bytes are frozen:
-#
-#   Curl_auth_create_digest_http_message (8) and its static helper
-#   auth_create_digest_http_message (10) - Digest message construction;
-#   make_headers in http_aws_sigv4.c (9) - the SigV4 canonical headers;
-#   Curl_http_req_make (9) - HTTP request composition;
-#   Curl_ssl_session_create2 (9); Curl_vquic_tls_init (9);
-#   Curl_auth_create_gssapi_user_message (9); proxy_h2_submit (9);
-#   ws_client_collect and ws_write_payload (8) - WebSocket framing; on_header
-#   and proxy_h2_on_header (8); cw_out_cb_write (8); altsvc_createid (8).
-#
-# Most of these narrow in Rust - the paired `_len` arguments vanish into
-# slices, and the `bool *done` and `size_t *pnwritten` out-parameters fold into
-# the return type - but the eight-argument residue plus a receiver lands
-# exactly on 9. That is the whole justification for the value: it prevents
-# gratuitous struct-wrapping of signatures the wire format dictates, while
-# still firing on anything wider, which is 0.4% of the C surface.
+# Counting parameters across every C prototype in lib/ and src/, 99.60% take 9
+# or fewer. The in-scope residue above 8 is dominated by exactly the code whose
+# output bytes are frozen: Digest message construction, the SigV4 canonical
+# headers, HTTP request composition, TLS session creation, the QUIC TLS
+# initialiser, the GSSAPI user message, HTTP/2 proxy submission, WebSocket
+# framing, header callbacks and the client-writer chain. Most of these narrow in
+# Rust - paired `_len` arguments vanish into slices, and `bool *done` and
+# `size_t *pnwritten` out-parameters fold into the return type - but the
+# eight-argument residue plus a receiver lands exactly on 9. The value prevents
+# gratuitous struct-wrapping of signatures the wire format dictates while still
+# firing on anything wider, which is 0.4% of the C surface.
 #
 # One measured fact that deliberately did NOT raise this value: clippy exempts
-# `extern "C"` functions and foreign declarations in `extern` blocks entirely.
-# A 10-parameter gss_init_sec_context declaration and an 8-parameter
-# `#[no_mangle] pub extern "C" fn` were both silent at threshold 7. The C ABI
-# shim in curl-rs-ffi and the GSS-API binding in curl-rs-lib/src/ffi/gss.rs
-# therefore need no headroom at all, so none was granted for them.
+# `extern "C"` functions and foreign declarations in `extern` blocks entirely,
+# so the C ABI shim in curl-rs-ffi and the GSS-API binding in
+# curl-rs-lib/src/ffi/gss.rs need no headroom, and none was granted for them.
 too-many-arguments-threshold = 9
 
-# ---------------------------------------------------------------------------
 # type-complexity-threshold - clippy::type_complexity, warn by default
-# ---------------------------------------------------------------------------
 #
-# Clippy's default is 250. Raised to 800, and the number is measured, not
-# picked: each type below was compiled against a sweep of thresholds to find
-# the exact point at which it stops being reported.
+# Clippy's default is 250. Raised to 800, and the number is measured by sweeping
+# thresholds until each unavoidable type stops being reported:
 #
-#   250 (the default) already reports the connection-filter chain's own
-#       signature, `Pin<Box<dyn Future<Output = Result<Box<dyn ConnFilter +
-#       Send + Sync>, io::Error>> + Send + 'static>>`; it clears at 300. Boxed
-#       futures are unavoidable there: the chain is composed as
-#       `Box<dyn ConnFilter>`, and an `async fn` in a trait is not
-#       dyn-compatible, so the future has to be boxed by hand.
-#   400 clears `Vec<Box<dyn Fn(u32) -> Option<Vec<u8>>>>`.
-#   500 clears a map of boxed callbacks.
-#   800 clears both remaining shapes that this codebase cannot avoid:
-#       the stored-callback field `Option<Box<dyn Fn(&[u8]) -> Result<usize,
-#       io::Error> + Send + Sync>>`, and the injected-dependency factory
-#       `Arc<dyn Fn(&str, u16) -> Pin<Box<dyn Future<..> + Send>> + Send +
-#       Sync>` used for the resolver, the clock and the TLS provider.
+#   250 already reports the connection-filter chain's own signature,
+#       `Pin<Box<dyn Future<Output = Result<Box<dyn ConnFilter + Send + Sync>,
+#       io::Error>> + Send + 'static>>`; it clears at 300. Boxed futures are
+#       unavoidable there: the chain is composed as `Box<dyn ConnFilter>`, and
+#       an `async fn` in a trait is not dyn-compatible.
+#   800 clears both remaining shapes this codebase cannot avoid: the
+#       stored-callback field `Option<Box<dyn Fn(&[u8]) -> Result<usize,
+#       io::Error> + Send + Sync>>`, and the injected-dependency factory used
+#       for the resolver, the clock and the TLS provider.
 #
-# The stored-callback shape is dictated by a frozen contract rather than by
-# taste: include/curl/curl.h declares 21 CURLOPTTYPE_FUNCTIONPOINT options and
-# 26 callback typedefs, and each one becomes a field of that form on the easy
-# handle. Forcing an alias for every one of them would be churn with no
-# behavioural benefit.
+# The stored-callback shape is dictated by a frozen contract rather than taste:
+# include/curl/curl.h declares 21 CURLOPTTYPE_FUNCTIONPOINT options and 26
+# callback typedefs, and each becomes a field of that form on the easy handle.
 #
-# 800 is not a way of switching the lint off. In the same probe, four deeper
-# nestings still fire at 800 and only clear at 1000, 1200, 1500 and 2000 - so
-# genuinely gnarly types are still reported. And because clippy does not lint
-# type ALIAS definitions at all, also measured, the idiomatic remedy the lint
-# recommends stays fully available: define `type BoxFuture<T> = ...` once and
-# the finding disappears without compromising the design.
+# 800 is not a way of switching the lint off - deeper nestings still fire at 800
+# and clear only at 1000 and beyond. And because clippy does not lint type ALIAS
+# definitions at all, the idiomatic remedy stays available: define
+# `type BoxFuture<T> = ...` once and the finding disappears.
 type-complexity-threshold = 800
 
-# ---------------------------------------------------------------------------
 # enum-variant-size-threshold - clippy::large_enum_variant, warn by default
-# ---------------------------------------------------------------------------
 #
-# Clippy's default is 200, and the lint compares the size DIFFERENCE between
-# the largest variant and the next largest - not the size of the enum.
-# Measured: `enum E { Small(u8), Large([u8; 256]) }` is reported at 200 and
-# silent at 256, while payloads of 300, 512 and 1024 bytes still fire at 256.
+# Clippy's default is 200, and the lint compares the size DIFFERENCE between the
+# largest variant and the next largest, not the size of the enum.
 #
-# 256 is chosen because it is not an arbitrary number: it is CURL_ERROR_SIZE
-# (include/curl/curl.h:865), the largest fixed-size buffer the public ABI
-# mandates, so a variant that carries one error buffer inline is exactly at the
-# limit and anything bigger genuinely deserves boxing. The same value covers
-# curl_version_info_data, measured with the real headers at 216 bytes, which
-# trips the default 200 for no useful reason. For scale, the neighbouring ABI
+# 256 is not arbitrary: it is CURL_ERROR_SIZE, the largest fixed-size buffer the
+# public ABI mandates, so a variant carrying one error buffer inline sits
+# exactly at the limit and anything bigger genuinely deserves boxing. The same
+# value covers curl_version_info_data, 216 bytes with the real headers, which
+# trips the default for no useful reason. For scale, the neighbouring ABI
 # structs are small - curl_fileinfo 128, curl_ws_frame 32, CURLMsg 24 - so this
 # is the one threshold the public surface actually forces.
 #
-# What this key is NOT for, stated because it is the intuitive but wrong
-# reading: the ABI enumerations are fieldless. CURLcode is `#[repr(i32)]` with
-# 103 explicitly written discriminants and CURLoption covers 308 identifiers,
-# and a fieldless enum cannot trip a size-difference lint at all - a
-# 103-variant `#[repr(i32)]` enum was compiled to confirm it stays silent even
-# at the default. The raise exists for the payload-carrying internal error and
-# protocol-state enums, where boxing a variant to satisfy the lint would add an
-# allocation on a transfer path in exchange for nothing. Performance is an
-# explicit non-goal here, but so is pointless indirection.
+# What this key is NOT for, because it is the intuitive but wrong reading: the
+# ABI enumerations are fieldless. CURLcode is `#[repr(i32)]` with 103 explicitly
+# written discriminants and CURLoption covers 308 identifiers, and a fieldless
+# enum cannot trip a size-difference lint at all. The raise exists for the
+# payload-carrying internal error and protocol-state enums, where boxing a
+# variant to satisfy the lint would add an allocation on a transfer path in
+# exchange for nothing.
 enum-variant-size-threshold = 256
 
-# ---------------------------------------------------------------------------
 # too-many-lines-threshold - clippy::too_many_lines, pedantic
-# ---------------------------------------------------------------------------
 #
-# Clippy's default is 100. Raised to 300.
+# Clippy's default is 100. Raised to 300. Note the group: too_many_lines is
+# pedantic, so it is allow-by-default and inert under the plain gate; it is
+# configured now so that enabling pedantic later does not produce a wall of
+# findings against functions that are long by data rather than by complexity.
 #
-# Note the group: too_many_lines is pedantic, so it is allow-by-default and no
-# [lints] table currently enables it. This key is inert under the plain
-# `-D warnings` gate and takes effect under `-W clippy::pedantic` or once a
-# [lints] table opts in. It is configured now so that enabling pedantic later
-# does not produce a wall of findings against functions that are long by data
-# rather than by complexity.
-#
-# Measured over 1,687 top-level function bodies in lib/ and src/: the median is
-# 11 lines, the 90th percentile 47, the 95th 75, the 99th 155 and the 99.5th
-# 187. 3.38% exceed clippy's default of 100, 1.13% exceed 150, 0.41% exceed 200
-# and only four exceed 300 - three of which (ldap_do at 392, telnet_do at 338,
-# rtsp_do at 317) belong to protocols that are out of scope and stubbed.
-#
-# The longest in-scope function is curl_easy_strerror at 290 lines: a flat
-# mapping from each of the 103 CURLcode values to its message string. Both the
-# arm count and the message text are frozen by the ABI, so splitting it would
-# buy nothing. Curl_output_aws_sigv4 (312), file_do (215) and parsedate (203)
-# are the other long in-scope bodies, and each is a single linear sequence.
-# The multi-handle state machine adds an exhaustive `match` over 18 states,
-# which is long for the same reason: one arm per state, checked for
-# exhaustiveness by the compiler.
+# Measured over 1,687 top-level function bodies in lib/ and src/: median 11
+# lines, 90th percentile 47, 95th 75, 99th 155, 99.5th 187. 3.38% exceed
+# clippy's default of 100, 1.13% exceed 150, 0.41% exceed 200, and only four
+# exceed 300: ldap_do at 392, telnet_do at 338 and rtsp_do at 317, which belong
+# to protocols that are out of scope and stubbed, and Curl_output_aws_sigv4 at
+# 312, which does not. That one and curl_easy_strerror at 290 are the longest
+# in-scope bodies - the latter a flat mapping from each of the 103 CURLcode
+# values to its message string, where both the arm count and the message text
+# are frozen by the ABI, so splitting it would buy nothing - with file_do at
+# 215 and parsedate at 203 behind them, each a single linear sequence. The
+# multi-handle state machine adds an exhaustive `match` over 18 states, long
+# for the same reason: one arm per state, checked for exhaustiveness by the
+# compiler.
 #
 # 300 therefore admits the data-driven bodies and still reports anything past
 # the measured 0.24% tail. One deliberate non-justification: the 282-row option
-# alias table and the 274-entry help table do not need headroom here, because
+# alias table and the 273-entry help table do not need headroom here, because
 # the clap surface is derived and the help table is generated at build time
 # rather than written as one long function - and curl 8.19 has already split
 # setopt.c into per-option helpers of at most 51 lines, so the 308-option
 # dispatch is not one long function either.
 too-many-lines-threshold = 300
 
-# ---------------------------------------------------------------------------
 # doc-valid-idents - clippy::doc_markdown, pedantic
-# ---------------------------------------------------------------------------
 #
 # The project's proper nouns, so that doc_markdown stops demanding backticks
 # around the vocabulary every doc comment in this workspace has to use.
 #
-# The leading ".." is load-bearing and must not be removed. Measured: with it,
-# clippy's own built-in list stays active and this list is added to it; without
-# it, the built-in list is REPLACED, and words clippy ships knowledge of -
-# OAuth, GitHub and TypeScript among them - immediately start being reported.
-# Position in the array does not matter; it is placed first here so that it is
-# impossible to miss.
+# The leading ".." is load-bearing and must not be removed: with it, clippy's
+# built-in list stays active and this list is added to it; without it the
+# built-in list is REPLACED, and words clippy ships knowledge of - OAuth, GitHub
+# and TypeScript among them - immediately start being reported.
 #
-# Measured on this exact vocabulary, so that nobody trims the list expecting
-# every entry to be doing work: HAProxy, WebSockets, SigV4 and DoH are reported
-# when they are absent from the list, while GSS-API, Alt-Svc, nghttp2, IPv6 and
-# MSRV were not reported either way - clippy's word-shape heuristic simply does
-# not flag them today. Every proper noun is listed regardless. An entry that
-# never matches costs nothing, it documents the vocabulary for a reader, and it
-# keeps this list correct if that heuristic changes. Entries containing "/" and
-# "-" were verified to be accepted and effective.
-#
-# Like too_many_lines above, doc_markdown is pedantic and therefore inert under
-# the plain `-D warnings` gate; this list is what makes enabling pedantic
-# painless rather than a wall of findings.
+# Not every entry is doing work today - HAProxy, WebSockets, SigV4 and DoH are
+# reported when absent from the list, while GSS-API, Alt-Svc, nghttp2, IPv6 and
+# MSRV are not flagged either way by clippy's word-shape heuristic. Every proper
+# noun is listed regardless: an entry that never matches costs nothing, it
+# documents the vocabulary for a reader, and it keeps this list correct if the
+# heuristic changes.
 #
 # What is deliberately NOT here: the ABI identifiers. CURLcode, CURLoption,
 # CURLINFO, CURLMsg, curl_slist, curl_off_t, curl_easy_setopt and their kin are
-# real items in these crates, so a doc comment that mentions one should put it
-# in backticks, and doc_markdown asking for that is correct rather than noise.
-# Verified: a comment reading "maps every libcurl CURLcode to its message" is
-# reported on CURLcode alone, and the rest of the sentence is clean. This list
-# is for proper nouns that are not code - products, protocols, conventions -
-# and adding code identifiers to it would suppress a suggestion worth taking.
+# real items in these crates, so a doc comment mentioning one should put it in
+# backticks and doc_markdown asking for that is correct rather than noise. This
+# list is for proper nouns that are not code - products, protocols, conventions.
 doc-valid-idents = [
   # Keep clippy's built-in list active - see the note above.
   "..",
@@ -315,76 +274,59 @@ doc-valid-idents = [
   "SysV",
 ]
 
-# ---------------------------------------------------------------------------
 # avoid-breaking-exported-api - applies to several warn-by-default lints
-# ---------------------------------------------------------------------------
 #
 # Default is true, which suppresses a family of lints on publicly reachable
 # items so that fixing them cannot break a downstream semantic-versioning
-# promise. Set to false here, which makes the gate STRICTER rather than
-# looser - and that direction matters, because a configuration key that only
-# ever silences findings would deserve much more suspicion than this one.
-#
-# Measured effect: clippy::vec_box, warn by default, reports a public
-# `fn takes_vec_box(v: Vec<Box<u32>>)` only when this is false. The same
-# reasoning extends to box_collection, redundant_allocation, option_option,
+# promise. Set to false here, which makes the gate STRICTER rather than looser -
+# a configuration key that only ever silenced findings would deserve much more
+# suspicion than this one. Measured effect: clippy::vec_box reports a public
+# `fn takes_vec_box(v: Vec<Box<u32>>)` only when this is false, and the same
+# extends to box_collection, redundant_allocation, option_option,
 # wrong_self_convention and their siblings.
 #
 # The justification is that these crates make no semantic-versioning promise
-# about a *Rust* API. curl-rs and curl-rs-ffi declare `publish = false`
-# outright, and no downstream Rust consumer exists to break. The contract that
-# is genuinely frozen is the C ABI - the 100 exported symbols, the 103 CURLcode
+# about a *Rust* API: curl-rs and curl-rs-ffi declare `publish = false`, and no
+# downstream Rust consumer exists to break. The contract that is genuinely
+# frozen is the C ABI - the 100 exported symbols, the 103 CURLcode
 # discriminants, the 308 CURLoption identifiers - and clippy has no view of any
-# of it. It is asserted where it can actually be asserted: by the symbol
-# parity check against lib/libcurl.def and by compiling all 129 programs in
-# docs/examples/ against the generated header. Leaving this key at true would
-# ask clippy to protect a stability guarantee that does not exist, at the cost
-# of not linting the crates' own public surfaces.
+# of it; it is asserted where it can be, by symbol parity against
+# lib/libcurl.def and by compiling all 129 programs in docs/examples/ against
+# the generated header.
 avoid-breaking-exported-api = false
 
-# ---------------------------------------------------------------------------
 # disallowed-names - clippy::disallowed_names, warn by default
-# ---------------------------------------------------------------------------
 #
-# Measured: clippy's built-in list is exactly foo, baz and quux - "bar" is not
-# in it. ".." keeps those three and adds to them, so this restores the complete
-# classic placeholder trio rather than replacing the defaults with a shorter
-# list. Under `-D warnings` a placeholder binding name becomes a build failure,
-# which is the intent.
+# Clippy's built-in list is exactly foo, baz and quux - "bar" is not in it. ".."
+# keeps those three and adds to them, restoring the complete classic placeholder
+# trio rather than replacing the defaults with a shorter list. Under
+# `-D warnings` a placeholder binding name becomes a build failure, which is the
+# intent.
 #
 # One candidate was considered and rejected: "tmp". It is pervasive in the C
-# originals being ported, banning it would create mechanical friction across
-# the whole migration, and it carries none of the "this code was never
-# finished" signal that foo, bar, baz and quux carry. Adding it would be
-# inventing a convention curl never had.
+# originals being ported, banning it would create mechanical friction across the
+# whole migration, and it carries none of the "this code was never finished"
+# signal that foo, bar, baz and quux carry.
 disallowed-names = ["..", "bar"]
 
-# ---------------------------------------------------------------------------
 # Considered and deliberately not set
-# ---------------------------------------------------------------------------
 #
-# Recorded so the next maintainer knows these were weighed rather than
-# overlooked, and does not add them without a measured need. Configuration is
+# Recorded so that these are not added without a measured need. Configuration is
 # held to the same minimal-change discipline as code.
 #
-#   max-fn-params-bools, max-struct-bools - default 3 for both, measured. The
-#     command-line configuration model does carry many boolean flags, but both
-#     lints are pedantic and therefore inert today, and the defaults are
-#     defensible. Revisit only if a [lints] table enables pedantic and the
-#     findings prove to be noise rather than signal.
-#   single-char-binding-names-threshold - default 4, measured, also pedantic.
-#     Nothing in this migration needs more than four single-character bindings
-#     in one scope; a protocol implementation that does is worth reading twice.
+#   max-fn-params-bools, max-struct-bools - the command-line configuration model
+#     does carry many boolean flags, but both lints are pedantic and therefore
+#     inert today, and the defaults of 3 are defensible.
+#   single-char-binding-names-threshold - default 4, also pedantic. Nothing in
+#     this migration needs more than four single-character bindings in one
+#     scope.
 #   cognitive-complexity-threshold, excessive-nesting-threshold - nursery and
 #     restriction lints that are not enabled, so a value here would express an
 #     opinion without having any effect.
 #   disallowed-methods, disallowed-types, disallowed-macros - the honest
-#     analogue of checksrc.pl's BANNEDFUNC, and unset for the reason given at
-#     the top of this file: the 89 banned C functions have no unsafe Rust
-#     counterpart to ban.
+#     analogue of checksrc.pl's BANNEDFUNC, unset for the reason given at the
+#     top of this file.
 #   allow-unwrap-in-tests, allow-panic-in-tests and friends - these loosen
 #     restriction lints that are not enabled, so they would be inert.
 #
-# Anything not listed above is left at clippy's default deliberately. The
-# defaults were measured for every key that is set here, and none of the rest
-# was found wanting.
+# Anything not listed above is left at clippy's default deliberately.

@@ -5,19 +5,19 @@
 // THE SAFETY INVARIANT, ASSERTED LOCALLY.
 //
 // `src/bin/curlinfo.rs` is its OWN crate root: Cargo compiles it as a
-// separate crate from `src/main.rs` (both are declared explicitly in
-// curl-rs/Cargo.toml, at :168-170 and :179-181). An attribute written in
+// separate crate from `src/main.rs` (both are declared as explicit
+// `[[bin]]` targets in curl-rs/Cargo.toml). An attribute written in
 // `src/main.rs` therefore does not reach this file, so the invariant is
 // restated here rather than inherited.
 //
 // `forbid` is used, not `deny`. The engine crate settles for
 // `#![deny(unsafe_code)]` because it must grant exactly one exemption --
 // `#[allow(unsafe_code)]` on `pub(crate) mod ffi`, and `forbid` cannot be
-// overridden from an inner scope at all (curl-rs-lib/src/lib.rs:126 records
-// the measured `error[E0453]`). This crate has no `mod ffi` and needs no
-// exemption, so it takes the strictly stronger form: with `forbid`, not even
-// a deliberate inner `#[allow(unsafe_code)]` can re-enable the keyword.
-// AAP 0.1.1 goal G6 and AAP 0.6.9 require exactly this.
+// overridden from an inner scope at all -- the engine crate root records the
+// measured `error[E0453]` beside its own attribute. This crate has no
+// `mod ffi` and needs no exemption, so it takes the strictly stronger form:
+// with `forbid`, not even a deliberate inner `#[allow(unsafe_code)]` can
+// re-enable the keyword.
 #![forbid(unsafe_code)]
 
 //! `curlinfo` -- the build-capability diagnostic.
@@ -32,10 +32,9 @@
 //! The C build treats it as a development diagnostic rather than a shipped
 //! artifact -- `src/Makefile.am:51-52` declares `curlinfo_SOURCES =
 //! curlinfo.c` under `noinst_PROGRAMS`, and `src/CMakeLists.txt:111` uses
-//! `add_executable(curlinfo EXCLUDE_FROM_ALL "curlinfo.c")`. AAP 0.3.1
-//! nevertheless lists it explicitly ("`curl-rs/src/bin/curlinfo.rs`
-//! separate diagnostic binary"), and AAP 0.4.1 maps it CREATE from
-//! `src/curlinfo.c`, so it is in scope and is reproduced here.
+//! `add_executable(curlinfo EXCLUDE_FROM_ALL "curlinfo.c")`. It is
+//! nevertheless in scope as a separate diagnostic binary derived from
+//! `src/curlinfo.c`, and is reproduced here.
 //!
 //! # The output contract
 //!
@@ -59,11 +58,48 @@
 //! Labels are copied byte-for-byte, including the non-uniform casing of
 //! `DoH: `, `HTTP-auth: ` and `Mime: `, the leading `--` of `--libcurl: `,
 //! and the single space after every colon. Normalising any of them for
-//! "consistency" would silently change program output, which AAP 0.8.2
-//! forbids: "a refactor that produces different-but-arguably-better output
-//! has failed."
+//! "consistency" would silently change program output: a refactor that
+//! produces different-but-arguably-better output has failed.
 //!
-//! # Why the values cannot be transliterated
+//! # These 29 lines are machine-read, and they gate 492 fixtures
+//!
+//! The C's own purpose comment presents this as a human diagnostic, and its
+//! build classification agrees. That framing is incomplete, and the omission
+//! matters more than anything else in this file: the test harness parses this
+//! output and uses it to decide which fixtures to run.
+//! `tests/runtests.pl:537-546` executes the binary named by
+//! `tests/globalconfig.pm:122-123` and folds every line into its feature map:
+//!
+//! ```text
+//! open(my $disabledh, "-|", exerunner() . shell_quote($CURLINFO));
+//! while(<$disabledh>) {
+//!   if($_ =~ /([^:]*): ([ONF]*)/) {
+//!     my ($val, $toggle) = ($1, $2);
+//!     push @disabled, $val if($toggle eq "OFF");
+//!     $feature{$val} = 1   if($toggle eq "ON");
+//!   }
+//! }
+//! ```
+//!
+//! So each label is a *feature name* in exactly the sense
+//! `tests/data/test*`'s `<features>` blocks mean it, and each `ON` grants
+//! eligibility while each `OFF` withdraws it. Measured over the corpus, 492
+//! fixtures gate positively on a label here and one gates negatively;
+//! `proxy` alone accounts for 225, then `digest` 76, `cookies` 51, `Mime`
+//! 48, `aws` 22, `headers-api` 14, `--libcurl` 11, `verbose-strings` 10,
+//! `form-api` 9. `tests/http/testenv/env.py:162-167` reads the same output
+//! for `verbose-strings: ON` and `cert-status: ON`, and raises if the exit
+//! status is non-zero -- which is why the unconditional `return 0` below is a
+//! contract and not a stylistic choice.
+//!
+//! AAP 0.6.5's asymmetry therefore applies here with full force, identically
+//! to the `Features:` line of `curl --version`: "under-reporting a
+//! capability makes a fixture skip; over-reporting makes it run and fail."
+//! A row that claims `ON` for an implementation this workspace does not carry
+//! does not merely mislead a reader -- it converts a clean skip into a hard
+//! failure, hundreds of times over.
+//!
+//! # Where the values come from
 //!
 //! The C reads its answers straight out of the preprocessor. `:32-38`
 //! includes five *internal* library headers purely to observe build macros
@@ -73,27 +109,47 @@
 //! `fake_addrinfo.h` for `USE_FAKE_GETADDRINFO`), plus
 //! `<openssl/opensslconf.h>` at `:42-44` for `OPENSSL_NO_OCSP`.
 //!
-//! None of that is reachable from Rust, by design. AAP 0.4.2 converts the C
-//! tree's `Curl_`-prefixed "private by convention" linkage into `pub(crate)`
+//! None of that is reachable from Rust, by design. The C tree's
+//! `Curl_`-prefixed "private by convention" linkage becomes `pub(crate)`
 //! "private by enforcement", and `curl-rs-lib` exposes exactly eight public
 //! modules -- `error`, `version`, `url`, `headers`, `mime`, `share`, `easy`
 //! and `multi`. The twelve that would carry these answers (`trace`, `util`,
 //! `ffi`, `crypto`, `dns`, `conn`, `tls`, `proxy`, `auth`, `cookies`,
 //! `transfer`, `protocols`) are `pub(crate)` and invisible here.
 //!
-//! Every value below therefore comes from exactly one of two legitimate
-//! sources:
+//! The substitute is not a guess, and it is not a table of literals. It is
+//! the engine capability registry -- `curl_rs_lib::version::Engine` and the
+//! `ENGINE_*` constants -- which records, for every module AAP 0.4.1 assigns
+//! a capability, whether this build carries a working implementation of it.
+//! That registry is the same one the `--version` banner consults, so the two
+//! self-description surfaces cannot disagree, which is the transformation
+//! rule AAP 0.1.2 states as "a single Rust module is the sole source of
+//! truth". Every value below comes from exactly one of these sources:
 //!
-//! 1. `curl_rs_lib::version`, the public module that also backs
-//!    `curl_version_info` and the `--version` banner. Preferring it keeps
-//!    `curl-rs-lib` the single owner of the truth, which is the
-//!    transformation rule AAP 0.1.2 states as "a single Rust module is the
-//!    sole source of truth".
-//! 2. `cfg!(feature = "...")` over this crate's own compiled feature set.
+//! 1. An `ENGINE_*` entry, on its own or conjoined with a Cargo feature. A
+//!    capability claim has two independent preconditions -- was it *selected*
+//!    for this build, and does the module that *honours* it exist -- and C
+//!    never had to separate them because its `#if` decided both at once.
+//!    Twenty-two rows are answered this way.
+//! 2. `cfg!(feature = "...")` over this crate's own compiled feature set,
+//!    always as one conjunct of an engine test rather than alone.
 //!    `curl-rs/Cargo.toml` declares exactly fifteen features and forwards
 //!    each to `curl-rs-lib/<name>` while holding `default-features = false`
 //!    on the path dependency, so the tool's feature set cannot diverge from
 //!    the engine's. There is no `tls` feature and none is invented here.
+//! 3. A genuine build-intrinsic fact: the width of a machine word (rows 21
+//!    and 22), or the absence of a platform or a TLS backend that AAP 0.1.1
+//!    and 0.2.2 exclude outright (rows 24, 25, 29). These are properties of
+//!    the build, not of an unwritten module, so no engine gates them.
+//! 4. Named analogues of C macros the transformation removed, for the one
+//!    compound condition that needs them (row 27).
+//!
+//! Nothing here reports a capability it cannot substantiate, and nothing
+//! reports a third token. Exactly four rows read `ON`: `verbose-strings` and
+//! `xattr`, each naming a module that exists and an item it exports which the
+//! registry pins at compile time, and `large-time` and `large-size`, which
+//! measure a machine word. The other twenty-five read `OFF`, and each says
+//! which named module or excluded platform makes it so.
 //!
 //! # The polarity is not uniform
 //!
@@ -107,26 +163,38 @@
 //!
 //! # Honesty over completeness
 //!
-//! AAP 0.6.5 records the asymmetry that governs every uncertain row:
-//! "under-reporting a capability makes a fixture skip; over-reporting makes
-//! it run and fail." Five rows describe capabilities whose status no public
-//! predicate can currently establish. Each reports `OFF`, never a third
-//! token, and each carries the exact predicate `curl-rs-lib` would need to
-//! expose in order to answer properly. Guessing `ON` would be the one
-//! failure mode the AAP names by hand.
+//! One asymmetry governs every uncertain row: under-reporting a capability
+//! makes a fixture skip, while over-reporting makes it run and fail. Four
+//! rows -- `bindlocal`, `shuffle-dns`, `wakeup` and `sha512-256` -- once had
+//! no public predicate that could establish them at all, and were reported
+//! `OFF` on that basis. They are still `OFF`, but no longer on that basis:
+//! each now reads a named engine in `curl_rs_lib::version`, so the row says
+//! "this module is measurably absent" rather than "this file cannot see far
+//! enough to tell", and each will turn `ON` by itself on the day its module
+//! lands. The Derivation classes note below records the change in full.
+//!
+//! Two tokens only, never a third. An `UNKNOWN` would be a new spelling in
+//! frozen output (`src/curlinfo.c` emits `ON` or `OFF`), and a reader who
+//! saw it could not act on it, whereas `OFF` is both truthful and
+//! actionable while the module is missing.
+//!
+//! `xattr` is the row where that asymmetry resolved the other way. The
+//! wrapper it needed now exists in `curl-rs-lib/src/ffi/sys.rs` and
+//! `curl-rs/src/output/xattr.rs` really writes the attribute, so the row
+//! reports `ON` on the strength of the implementation rather than of a
+//! guess -- see [`use_xattr`], which conjoins the wrapper's engine with the
+//! two operating systems whose arm it compiles.
 
 use std::io::{self, Write};
 
 use curl_rs_lib::version;
 
-// ===========================================================================
 // The two output tokens
 //
 // The vocabulary is closed: `ON` and `OFF`, nothing else. There is
 // deliberately no `UNKNOWN`, no `N/A` and no empty string -- the C emits one
 // of these two for all 29 rows, and a consumer parsing the table would break
 // on a third value.
-// ===========================================================================
 
 /// The token a compiled-in capability renders as.
 const ON: &str = "ON";
@@ -134,59 +202,64 @@ const ON: &str = "ON";
 /// The token an absent capability renders as.
 const OFF: &str = "OFF";
 
-// ===========================================================================
 // Derivation classes
 //
 // Named rather than written as bare `true`/`false` literals so that each row
-// of the table declares WHY it holds its value, not merely what the value
-// is. The three names below are all the classes the table needs beyond the
-// rows that are computed.
-// ===========================================================================
+// declares WHY it holds its value, not merely what the value is. One name is
+// left, for the one class of row that no engine gates. Everything else in the
+// table derives from `curl_rs_lib::version`'s engine registry, from a machine
+// word width, or from a named macro analogue, so there is nothing left for a
+// `true` literal to stand for.
+//
+// Two names that used to live here are gone, and their removal is the whole of
+// this file's compliance story:
+//
+// * `ALWAYS_COMPILED_IN: bool = true` forced fourteen rows ON -- the five auth
+//   mechanisms, MIME, the form API, netrc, parsedate, proxy, typecheck,
+//   verbose-strings, the header API and `--libcurl` -- on the reasoning that no
+//   Cargo feature could switch them off. That reasoning confused CONFIGURATION
+//   with IMPLEMENTATION: the absence of a switch says nothing about whether the
+//   module behind the switch was ever written, and eleven of those fourteen
+//   modules do not exist. Between them those rows over-advertised 462 fixtures
+//   into running against nothing.
+// * `NOT_DETERMINABLE: bool = false` marked four rows as unanswerable and
+//   listed, at each use site, the public predicate `curl-rs-lib` would have to
+//   grow. Those predicates now exist, so the name has nothing left to mark.
+//   `bindlocal` reads `ENGINE_CONN`, `shuffle-dns` reads `ENGINE_DNS`, `wakeup`
+//   reads `ENGINE_MULTI` and `sha512-256` reads `ENGINE_SHA512_256`. All four
+//   still render OFF -- but now because a named module is measurably absent,
+//   not because this file could not see far enough to tell.
 
-/// A capability this implementation always compiles in.
+/// A capability this build definitively does not provide, for reasons no
+/// engine can change.
 ///
-/// The C reports these from `#ifdef CURL_DISABLE_<X>`, a macro the
-/// Autotools and CMake builds define only when a `--disable-<x>` switch is
-/// passed. This workspace has no equivalent switch for them: they are not
-/// among the fifteen Cargo features, so no build configuration can turn them
-/// off, exactly as a C build that never defines the macro reports `ON`.
-const ALWAYS_COMPILED_IN: bool = true;
-
-/// A capability whose status no public predicate can currently establish.
-///
-/// Used by the five rows enumerated in this module's documentation. Rendering
-/// `OFF` is the honest choice under AAP 0.6.5's asymmetry, and it is paired
-/// with a named required predicate at each use site so the gap is actionable
-/// rather than merely recorded.
-const NOT_DETERMINABLE: bool = false;
-
-/// A capability this build definitively does not provide.
-///
-/// Distinct from [`NOT_DETERMINABLE`]: here the answer is known, and it is
-/// negative. Kept separate so a future reader can tell "we cannot tell" from
-/// "we can tell, and it is absent".
+/// Used by exactly three rows, and only where the answer is *known* rather
+/// than merely unwritten: the two `win32-*` rows, which need a platform
+/// AAP 0.1.1 goal G8 excludes from the target matrix, and `cert-status`,
+/// which needs a TLS backend AAP 0.1.1 goal G4 excludes from every
+/// configuration. Writing a module cannot flip any of the three, which is
+/// what distinguishes them from the twenty-two engine-gated rows: those will
+/// turn ON when their implementation lands, and these will not.
 const NOT_PRESENT: bool = false;
 
-// ===========================================================================
 // Macro analogues that are permanently false in this implementation
 //
 // These mirror C macros the transformation removed outright. They are named
 // after the macro they replace so the compound conditions further down can be
 // read against the C source line by line.
-// ===========================================================================
 
 /// `CURLRES_ARES` -- the c-ares resolver backend.
 ///
-/// AAP 0.5.2 drops c-ares entirely ("Replaced by the system resolver;
-/// `hickory-dns` remains an optional, default-off feature"), and
-/// `lib/asyn-ares.c` is listed among the excluded sources in AAP 0.4.1. No
-/// Cargo feature can define this, so it is permanently false.
+/// c-ares is dropped entirely, replaced by the system resolver, with
+/// `hickory-dns` an optional default-off alternative; `lib/asyn-ares.c` is
+/// among the excluded sources. No Cargo feature can define this, so it is
+/// permanently false.
 const CURLRES_ARES: bool = false;
 
 /// `USE_FAKE_GETADDRINFO` -- the test-only resolver interception hook.
 ///
-/// `lib/fake_addrinfo.c` has no target in the AAP 0.4.1 transformation map,
-/// so the capability does not exist here in any configuration.
+/// `lib/fake_addrinfo.c` has no counterpart in this workspace, so the
+/// capability does not exist here in any configuration.
 const USE_FAKE_GETADDRINFO: bool = false;
 
 /// The `curl_version_info` feature name that reports TLS session export.
@@ -231,13 +304,59 @@ impl Capability {
     }
 }
 
-// ===========================================================================
 // The computed rows
 //
-// Four rows are not a single constant or a single feature flag. Each is given
+// These rows are not a single constant or a single feature flag. Each is given
 // a named function so its derivation sits next to the C condition it
 // reproduces, and so the `#[cfg(test)]` module can assert it by name.
-// ===========================================================================
+
+/// Row 16, `verbose-strings`. C: `#ifdef CURL_DISABLE_VERBOSE_STRINGS` yields
+/// `OFF` (`src/curlinfo.c:155-160`).
+///
+/// One of the two rows that reads `ON`, and the claim is narrow: that this
+/// build carries human-readable diagnostic *text*, not that it can describe a
+/// transfer. C's macro shrinks the binary by emptying `failf()` and `infof()`
+/// of their message strings; here `curl-rs-lib/src/error.rs` carries the
+/// complete `CURLcode` message set behind the public `CURLcode::message`, and
+/// `curl-rs-lib/src/trace.rs` carries the `infof!`/`failf!` macros with the
+/// `--trace` formats frozen. No Cargo feature strips either, and
+/// [`version::ENGINE_DIAGNOSTIC_STRINGS`] pins that pairing at compile time.
+///
+/// `tests/data/test1538` is the corroboration: it gates on `verbose-strings`
+/// and is titled "libcurl strerror API call tests", which is exactly what
+/// `CURLcode::message` answers. The value is read from the registry rather
+/// than probed locally so that this row and the `--version` banner cannot
+/// drift; the registry's own
+/// `every_present_engine_has_a_compile_time_link` test is what proves the
+/// message table is really there.
+const fn verbose_strings() -> bool {
+    version::ENGINE_DIAGNOSTIC_STRINGS.is_present()
+}
+
+/// Row 19, `xattr`. C: `#ifndef USE_XATTR` yields `OFF`
+/// (`src/curlinfo.c:176-181`), so the C test is INVERTED and this function
+/// answers its positive form.
+///
+/// C defines `USE_XATTR` when the build detects an `fsetxattr` with either the
+/// five-argument Linux signature or the six-argument macOS one
+/// (`HAVE_FSETXATTR_5` and `HAVE_FSETXATTR_6`, selected at
+/// `src/tool_xattr.c:88-92`). `curl-rs/src/output/xattr.rs` issues that call
+/// through `curl_rs_lib::set_file_xattr`, which selects between the two forms
+/// itself, so the capability is present wherever either spelling is.
+///
+/// Both conjuncts are load-bearing and neither implies the other.
+/// [`version::ENGINE_XATTR`] says the wrapper exists -- a fact this crate root
+/// could not otherwise establish, since `bin/curlinfo.rs` is compiled
+/// separately from `src/main.rs` and so does not fail to build when the
+/// wrapper disappears from under `curl-rs/src/output/xattr.rs`. The `cfg`
+/// says this is one of the two operating systems whose arm the wrapper
+/// compiles; AAP 0.2.2 puts every other platform out of scope, so a build for
+/// one would correctly report `OFF` rather than advertise a syscall it cannot
+/// issue.
+const fn use_xattr() -> bool {
+    version::ENGINE_XATTR.is_present()
+        && cfg!(any(target_os = "linux", target_os = "macos"))
+}
 
 /// Row 21, `large-time`. C: `#if (SIZEOF_TIME_T < 5)` yields `OFF`
 /// (`src/curlinfo.c:190-195`).
@@ -255,8 +374,8 @@ const fn large_time() -> bool {
 /// (`src/curlinfo.c:197-202`).
 ///
 /// `usize` is Rust's spelling of C's `size_t`, so this is an exact analogue
-/// rather than an approximation. All four targets in the AAP 0.1.1 goal G8
-/// matrix are 64-bit, giving 8 bytes and therefore `ON`.
+/// rather than an approximation. All four mandated targets are 64-bit, giving
+/// 8 bytes and therefore `ON`.
 const fn large_size() -> bool {
     core::mem::size_of::<usize>() >= 5
 }
@@ -296,7 +415,6 @@ fn ssl_sessions() -> bool {
     version::has_feature(SSLS_EXPORT_FEATURE)
 }
 
-// ===========================================================================
 // The table
 //
 // Order is table order, matching `src/curlinfo.c:46-258` element for element.
@@ -309,214 +427,229 @@ fn ssl_sessions() -> bool {
 // is a fixed-length array rather than a slice or a `Vec` so that the row
 // count is enforced by the type system. No mutable global state is involved:
 // there is no `static mut` and no `thread_local!` anywhere in this file.
-// ===========================================================================
 
 /// The 29 diagnostic rows, in the order `src/curlinfo.c:46-258` declares them.
 fn capabilities() -> [Capability; CAPABILITY_COUNT] {
     [
         // 1. C `:47-52`: `#ifdef CURL_DISABLE_BINDLOCAL` -> OFF.
         //
-        // GAP 1 of 5. Binding a transfer to a local interface, address or
-        // port. The engine plainly has the machinery -- AAP 0.4.1 maps
-        // `curl-rs-lib/src/dns/if2ip.rs` from `lib/if2ip.c` for
-        // "`--interface` resolution", and `curl-rs-lib/src/ffi/sys.rs`
-        // discusses `bindlocal` at :661, :673, :732 and :2058 -- but both
-        // `dns` and `ffi` are `pub(crate)`, so no predicate is reachable
-        // from this crate.
-        //
-        // REQUIRED PREDICATE: `curl_rs_lib::version::has_feature("...")`
-        // gains no row for this (it is not a `--version` token, and adding
-        // one would breach the disjoint vocabularies this file keeps), so the
-        // right shape is a dedicated public capability predicate on the
-        // engine, e.g. `pub fn curl_rs_lib::version::supports_bindlocal()
-        // -> bool` backed by `crate::dns::if2ip`.
-        Capability::new("bindlocal: ", NOT_DETERMINABLE),
+        // Binding a transfer to a local interface, address or port -- C's
+        // `bindlocal()` in `lib/cf-socket.c`, behind `--interface`,
+        // `--local-port` and `CURLOPT_INTERFACE`. AAP 0.4.1 maps that file
+        // to `curl-rs-lib/src/conn/socket.rs` and `lib/if2ip.c` to
+        // `curl-rs-lib/src/dns/if2ip.rs`; neither exists, so there is no
+        // socket to bind. No fixture gates on the label.
+        Capability::new("bindlocal: ", version::ENGINE_CONN.is_present()),
         // 2. C `:55-60`: `#ifdef CURL_DISABLE_COOKIES` -> OFF.
         //
-        // A genuine Cargo feature, default ON (`curl-rs/Cargo.toml`
-        // `default` list), forwarding to `curl-rs-lib/cookies`.
-        Capability::new("cookies: ", cfg!(feature = "cookies")),
+        // Both preconditions, and the second is what changed: the `cookies`
+        // Cargo feature is default ON (`curl-rs/Cargo.toml` `default` list)
+        // and forwards to `curl-rs-lib/cookies`, but `cookies/mod.rs` -- the
+        // jar itself -- is unwritten, so the feature selects nothing. 51
+        // fixtures gate on the label and skip.
+        Capability::new(
+            "cookies: ",
+            cfg!(feature = "cookies")
+                && version::ENGINE_STATE_STORES.is_present(),
+        ),
         // 3. C `:63-68`: `#ifdef CURL_DISABLE_BASIC_AUTH` -> OFF.
         //
         // AAP 0.4.1: `curl-rs-lib/src/auth/basic.rs` CREATE from
-        // `lib/vauth/cleartext.c`. Not a Cargo feature, so unconditional.
-        Capability::new("basic-auth: ", ALWAYS_COMPILED_IN),
+        // `lib/vauth/cleartext.c`. Unwritten, so no `Authorization: Basic`
+        // header can be composed. That no Cargo feature switches it off is
+        // beside the point: the C macro's absence means "not disabled", not
+        // "implemented".
+        Capability::new(
+            "basic-auth: ",
+            version::ENGINE_AUTH_BASIC.is_present(),
+        ),
         // 4. C `:70-75`: `#ifdef CURL_DISABLE_BEARER_AUTH` -> OFF.
         //
         // AAP 0.4.1: `curl-rs-lib/src/auth/bearer.rs` from
-        // `lib/vauth/oauth2.c`.
-        Capability::new("bearer-auth: ", ALWAYS_COMPILED_IN),
+        // `lib/vauth/oauth2.c`. Unwritten, so `--oauth2-bearer` has nothing
+        // to serve it.
+        Capability::new(
+            "bearer-auth: ",
+            version::ENGINE_AUTH_BEARER.is_present(),
+        ),
         // 5. C `:77-82`: `#ifdef CURL_DISABLE_DIGEST_AUTH` -> OFF.
         //
-        // AAP 0.4.1: `curl-rs-lib/src/auth/digest.rs` from
+        // Backed by `curl-rs-lib/src/auth/digest.rs`, from
         // `lib/vauth/digest.c` and `lib/http_digest.c`, with message
-        // construction byte-exact.
-        Capability::new("digest: ", ALWAYS_COMPILED_IN),
+        // construction byte-exact. Unwritten -- and none of that byte-exact
+        // construction exists to be exact about. 76 fixtures gate on the
+        // label and skip, the second-largest withholding in the table.
+        Capability::new("digest: ", version::ENGINE_AUTH_DIGEST.is_present()),
         // 6. C `:84-89`: `#ifdef CURL_DISABLE_NEGOTIATE_AUTH` -> OFF.
         //
         // A Cargo feature, default OFF. AAP 0.8.5 conflict C2 keeps
         // Negotiate behind a non-default `negotiate` feature so that the
         // default build links no C security library at all, which is what
         // reconciles "no C TLS linkage at any configuration" with
-        // "Negotiate where OS Kerberos is available".
-        Capability::new("negotiate-auth: ", cfg!(feature = "negotiate")),
+        // "Negotiate where OS Kerberos is available". The engine conjunct is
+        // the same one the `SPNEGO` banner token uses: `curl-rs-lib/src/
+        // ffi/gss.rs` exists, but `auth/negotiate.rs` -- the module that
+        // would drive it through an HTTP exchange -- does not.
+        Capability::new(
+            "negotiate-auth: ",
+            cfg!(feature = "negotiate") && version::ENGINE_GSS.is_present(),
+        ),
         // 7. C `:91-96`: `#ifdef CURL_DISABLE_AWS` -> OFF.
         //
         // AAP 0.4.1: `curl-rs-lib/src/auth/aws_sigv4.rs` from
-        // `lib/http_aws_sigv4.c`.
-        Capability::new("aws: ", ALWAYS_COMPILED_IN),
+        // `lib/http_aws_sigv4.c`. Unwritten, so `--aws-sigv4` cannot sign
+        // anything even though `sha2` and `hmac` are linked. 22 fixtures
+        // gate on the label and skip.
+        Capability::new("aws: ", version::ENGINE_AUTH_AWS_SIGV4.is_present()),
         // 8. C `:98-103`: `#ifdef CURL_DISABLE_DOH` -> OFF.
         //
         // A Cargo feature, default ON, forwarding to `curl-rs-lib/doh`
         // (AAP 0.4.1: `curl-rs-lib/src/dns/doh.rs` from `lib/doh.c`).
-        Capability::new("DoH: ", cfg!(feature = "doh")),
+        // Doubly unreachable: the module is unwritten and so are the
+        // resolver and TLS layers it would issue its query over. 5 fixtures
+        // gate on the label and skip.
+        Capability::new(
+            "DoH: ",
+            cfg!(feature = "doh") && version::ENGINE_DOH.is_present(),
+        ),
         // 9. C `:105-110`: `#ifdef CURL_DISABLE_HTTP_AUTH` -> OFF.
         //
         // The HTTP authentication dispatcher, AAP 0.4.1
         // `curl-rs-lib/src/auth/mod.rs` from `lib/vauth/vauth.c`. Not a
-        // Cargo feature; the individual mechanisms above are what vary.
-        Capability::new("HTTP-auth: ", ALWAYS_COMPILED_IN),
+        // Cargo feature; the individual mechanisms above are what vary in a
+        // C build. Unwritten, so there is nothing to select between.
+        Capability::new(
+            "HTTP-auth: ",
+            version::ENGINE_AUTH_DISPATCH.is_present(),
+        ),
         // 10. C `:112-117`: `#ifdef CURL_DISABLE_MIME` -> OFF.
         //
         // AAP 0.4.1: `curl-rs-lib/src/mime/mod.rs` from `lib/mime.c`,
-        // backing the 12 exported `curl_mime_*` symbols. `mime` is one of
-        // the engine's eight PUBLIC modules, so the capability is not merely
-        // planned, it is reachable.
-        Capability::new("Mime: ", ALWAYS_COMPILED_IN),
+        // backing the 12 exported `curl_mime_*` symbols. `lib.rs:787`
+        // declares `pub mod mime;` -- but a declaration is not an
+        // implementation, and the file does not exist. Reading reachability
+        // off the `pub` keyword was the specific mistake this row used to
+        // make. 48 fixtures gate on the label and skip.
+        Capability::new("Mime: ", version::ENGINE_MIME.is_present()),
         // 11. C `:120-125`: `#ifdef CURL_DISABLE_NETRC` -> OFF.
         //
         // AAP 0.4.1: `curl-rs-lib/src/cookies/netrc.rs` from `lib/netrc.c`.
-        Capability::new("netrc: ", ALWAYS_COMPILED_IN),
+        // Unwritten, so `--netrc`, `--netrc-file` and `--netrc-optional`
+        // have no file parser. Gated on its own engine rather than on the
+        // cookie jar's, even though the two files are siblings, so that
+        // landing one cannot silently advertise the other.
+        Capability::new("netrc: ", version::ENGINE_NETRC.is_present()),
         // 12. C `:127-132`: `#ifdef CURL_DISABLE_PARSEDATE` -> OFF.
         //
         // AAP 0.4.1: `curl-rs-lib/src/util/parsedate.rs` from
-        // `lib/parsedate.c`. Cannot be optional here even in principle --
-        // `curl_getdate` is one of the 100 exported symbols, so the parser
-        // is part of the ABI.
-        Capability::new("parsedate: ", ALWAYS_COMPILED_IN),
+        // `lib/parsedate.c`. `util/mod.rs:334` declares the module and the
+        // file does not exist, so `curl_getdate` -- one of the 100 exported
+        // symbols -- has no parser behind it and `--time-cond` cannot
+        // interpret its argument. Being part of the ABI makes the row
+        // mandatory, not true.
+        Capability::new("parsedate: ", version::ENGINE_PARSEDATE.is_present()),
         // 13. C `:134-139`: `#ifdef CURL_DISABLE_PROXY` -> OFF.
         //
-        // AAP 0.4.1 maps the whole `curl-rs-lib/src/proxy/` tree; 228
-        // fixtures gate on the `proxy` feature name (AAP 0.6.5), the single
-        // most demanded capability in the corpus.
-        Capability::new("proxy: ", ALWAYS_COMPILED_IN),
+        // AAP 0.4.1 maps the whole `curl-rs-lib/src/proxy/` tree and none of
+        // it exists. This is the costliest row in the table: 225 fixtures
+        // gate on the `proxy` label and skip. One gates on `!proxy` and
+        // becomes eligible -- `tests/data/test375`, which requires `-x` to
+        // fail with `curl: proxy support is disabled in this libcurl` and
+        // `<errorcode> 4`. That is the right pairing rather than a
+        // regression: reporting OFF is what makes that obligation visible.
+        Capability::new("proxy: ", version::ENGINE_PROXY.is_present()),
         // 14. C `:141-146`: `#ifdef CURL_DISABLE_SHUFFLE_DNS` -> OFF.
         //
-        // GAP 2 of 5. Randomising the order of resolved addresses, the
-        // capability behind `CURLOPT_DNS_SHUFFLE_ADDRESSES`. Searched the
-        // whole of `curl-rs-lib/src` for `shuffle` (case-insensitive): zero
-        // occurrences, in code or in comments. The owning module would be
-        // `crate::dns`, which is `pub(crate)`.
-        //
-        // REQUIRED PREDICATE: a public capability predicate on the engine,
-        // e.g. `pub fn curl_rs_lib::version::supports_dns_shuffle() -> bool`
-        // -- or, more generally, for `curl-rs-lib` to expose whether a given
-        // `CURLoption` is honoured, which would answer this row and row 1
-        // together.
-        Capability::new("shuffle-dns: ", NOT_DETERMINABLE),
+        // Randomising the order of resolved addresses, the capability behind
+        // `CURLOPT_DNS_SHUFFLE_ADDRESSES`. A property of the resolver, so it
+        // reads the resolver's engine: `dns/mod.rs` and `dns/resolver.rs`
+        // are unwritten, and a case-insensitive search of
+        // `curl-rs-lib/src` for `shuffle` still finds nothing. 1 fixture
+        // gates on the label and skips.
+        Capability::new("shuffle-dns: ", version::ENGINE_DNS.is_present()),
         // 15. C `:148-153`: `#ifdef CURL_DISABLE_TYPECHECK` -> OFF.
         //
         // Compile-time type checking of `curl_easy_setopt`'s variadic
-        // argument. AAP 0.6.3 records that
-        // `include/curl/typecheck-gcc.h` -- 958 lines of 258 `curlcheck_`
-        // macros that cbindgen cannot express -- "is carried as a
-        // hand-maintained header shipped verbatim beside the generated one",
-        // and that "it must remain correct because the 129 example programs
-        // compile with it active". The facility is therefore present.
-        Capability::new("typecheck: ", ALWAYS_COMPILED_IN),
+        // argument. AAP 0.6.3 records that `include/curl/typecheck-gcc.h` --
+        // 958 lines of 258 `curlcheck_` macros that cbindgen cannot express
+        // -- "is carried as a hand-maintained header shipped verbatim beside
+        // the generated one". That header does exist; what does not is the
+        // generated one beside it. The macros take effect only when a C
+        // consumer includes `curl/curl.h`, which `curl-rs-ffi/build.rs` must
+        // produce with cbindgen from `curl-rs-ffi/src/ffi/` -- and
+        // `curl-rs-ffi/src/lib.rs:852` declares `mod ffi` with no source, so
+        // `ffi/easy.rs`, holding the very `curl_easy_setopt` those macros
+        // wrap, is absent. A facility with nothing to check is not present.
+        Capability::new(
+            "typecheck: ",
+            version::ENGINE_PUBLIC_HEADER.is_present(),
+        ),
         // 16. C `:155-160`: `#ifdef CURL_DISABLE_VERBOSE_STRINGS` -> OFF.
         //
-        // Human-readable diagnostic text. AAP 0.4.1 maps
-        // `curl-rs-lib/src/trace.rs` from `lib/curl_trc.c` with the
-        // `--trace` formats frozen, and `curl-rs-lib/src/error.rs` carries
-        // the full `CURLcode` message set rather than bare numbers. Nothing
-        // in this workspace strips those strings.
-        Capability::new("verbose-strings: ", ALWAYS_COMPILED_IN),
+        // ON. See [`verbose_strings`]: the claim is about diagnostic TEXT,
+        // and `error.rs` and `trace.rs` both exist and carry it.
+        Capability::new("verbose-strings: ", verbose_strings()),
         // 17. C `:162-167`: `#ifndef ENABLE_WAKEUP` -> OFF. INVERTED.
         //
-        // GAP 3 of 5. Whether `curl_multi_wakeup` can interrupt a blocking
-        // `curl_multi_poll`. The C learns this by including the internal
-        // `multihandle.h`. Here `curl_rs_lib::multi` IS public, but it
-        // exposes no wakeup predicate: the only related symbol anywhere in
-        // the engine is `CURLMcode::WakeupFailure`
-        // (`curl-rs-lib/src/error.rs:784-785`, "Wakeup is unavailable or
-        // failed"), and an error code cannot serve as a capability
-        // predicate -- it is precisely the value returned when wakeup is
-        // unavailable, so its existence proves nothing either way.
-        //
-        // REQUIRED PREDICATE: `pub fn curl_rs_lib::multi::wakeup_available()
-        // -> bool`, sited on the public `multi` module that owns the
-        // socketpair the capability depends on.
-        Capability::new("wakeup: ", NOT_DETERMINABLE),
+        // Whether `curl_multi_wakeup` can interrupt a blocking
+        // `curl_multi_poll`. The C learns this from the internal
+        // `multihandle.h`; here it reads the multi handle's own engine.
+        // `lib.rs:897` declares `pub mod multi;` and `multi/state.rs`
+        // exists, but `multi/mod.rs` does not, so there is no handle to own
+        // the socketpair the capability depends on.
+        // `CURLMcode::WakeupFailure` (`error.rs:784-785`) remains no
+        // evidence either way -- it is precisely the value returned when
+        // wakeup is unavailable. 2 fixtures gate on the label and skip.
+        Capability::new("wakeup: ", version::ENGINE_MULTI.is_present()),
         // 18. C `:169-174`: `#ifdef CURL_DISABLE_HEADERS_API` -> OFF.
         //
-        // AAP 0.4.1: `curl-rs-lib/src/headers/mod.rs` from `lib/headers.c`
+        // Backed by `curl-rs-lib/src/headers/mod.rs`, from `lib/headers.c`
         // and `lib/dynhds.c`, backing `curl_easy_header` and
-        // `curl_easy_nextheader`. `headers` is one of the eight PUBLIC
-        // modules, so this is reachable rather than merely planned.
-        Capability::new("headers-api: ", ALWAYS_COMPILED_IN),
+        // `curl_easy_nextheader`. `lib.rs:653` declares `pub mod headers;`
+        // and, as with `Mime`, the declaration is all there is. 14 fixtures
+        // gate on the label and skip.
+        Capability::new("headers-api: ", version::ENGINE_HEADERS.is_present()),
         // 19. C `:176-181`: `#ifndef USE_XATTR` -> OFF. INVERTED.
         //
-        // GAP 4 of 5, and the one row whose answer is settled by an
-        // explicit cross-file mandate rather than by inference.
-        // `curl-rs/src/output/xattr.rs:165-169` -- the module that owns
-        // `--xattr` -- states: "`src/curlinfo.c:176-181` prints `xattr: `
-        // followed by `ON` or `OFF` from `#ifndef USE_XATTR`, so while this
-        // gap stands the diagnostic binary must report `xattr: OFF`".
-        //
-        // The reason it stands: `std` has no extended-attribute API, no
-        // `xattr` crate is among the workspace pins, and
-        // `curl-rs-lib/src/ffi/sys.rs` -- the only sanctioned home for such
-        // a call -- re-exports five things, none of them `fsetxattr`. That
-        // module documents at :141-154 that it adopts upstream's own
-        // unavailable-arm, `src/tool_xattr.h:46`'s
-        // `#define fwrite_xattr(a, b, c) 0`, so `--xattr` is the same
-        // silent no-op a real curl built without `USE_XATTR` performs.
-        // Reporting `OFF` here is therefore CONSISTENT with what the tool
-        // actually does, which is the requirement -- not a guess.
-        //
-        // REQUIRED PREDICATE: `fsetxattr`/`extattr_set_fd` wrappers added to
-        // `curl-rs-lib/src/ffi/sys.rs` and surfaced as
-        // `pub fn curl_rs_lib::version::supports_xattr() -> bool`. Closing
-        // it means changing `set_file_xattr` and this row, and nothing else.
-        Capability::new("xattr: ", NOT_DETERMINABLE),
+        // ON. Derived, not asserted: [`use_xattr`] answers the positive form
+        // of C's test from two conjuncts -- that the engine's `fsetxattr`
+        // wrapper exists, and that this is one of the operating systems
+        // whose arm it compiles. `curl-rs/src/output/xattr.rs` issues that
+        // call, so the row reports what `--xattr` actually does.
+        Capability::new("xattr: ", use_xattr()),
         // 20. C `:183-188`: `#ifdef CURL_DISABLE_FORM_API` -> OFF.
         //
-        // AAP 0.4.1: `curl-rs-lib/src/mime/formdata.rs` from
+        // Backed by `curl-rs-lib/src/mime/formdata.rs`, from
         // `lib/formdata.c`, backing the three legacy `curl_form*` symbols
-        // that AAP 0.8.2 forbids removing.
-        Capability::new("form-api: ", ALWAYS_COMPILED_IN),
+        // that AAP 0.8.2 forbids removing. Unwritten. Gated separately from
+        // `Mime` because C guards the two separately and either can be
+        // disabled alone. 9 fixtures gate on the label and skip.
+        Capability::new("form-api: ", version::ENGINE_FORM.is_present()),
         // 21. C `:190-195`: `#if (SIZEOF_TIME_T < 5)` -> OFF. NUMERIC.
         Capability::new("large-time: ", large_time()),
         // 22. C `:197-202`: `#if (SIZEOF_SIZE_T < 5)` -> OFF. NUMERIC.
         Capability::new("large-size: ", large_size()),
         // 23. C `:204-209`: `#ifndef CURL_HAVE_SHA512_256` -> OFF. INVERTED.
         //
-        // GAP 5 of 5. SHA-512/256, used by HTTP Digest. AAP 0.4.1 does map
-        // `curl-rs-lib/src/crypto/sha512_256.rs` from
-        // `lib/curl_sha512_256.c`, and the dependency inventory in AAP
-        // 0.5.1 pins `sha2 0.10.9` which provides the primitive -- but
-        // `crate::crypto` is `pub(crate)` (the only trace of it reachable
-        // from outside is a prose mention at
-        // `curl-rs-lib/src/lib.rs:620`), so this crate cannot confirm the
-        // primitive is wired in. AAP 0.6.5's asymmetry decides the tie:
-        // claiming `ON` for a digest this binary cannot see would be the
-        // over-report that makes fixtures run and fail.
-        //
-        // REQUIRED PREDICATE: `pub fn curl_rs_lib::version::has_sha512_256()
-        // -> bool` (or a public `crypto` digest-capability enumeration)
-        // backed by `crate::crypto::sha512_256`.
-        Capability::new("sha512-256: ", NOT_DETERMINABLE),
+        // SHA-512/256, which HTTP Digest consults for `SHA-512-256`
+        // challenges. AAP 0.4.1 maps `curl-rs-lib/src/crypto/sha512_256.rs`
+        // from `lib/curl_sha512_256.c` and AAP 0.5.1 pins `sha2 0.10.9`,
+        // which provides the primitive; `crypto/mod.rs:369` declares the
+        // module and the file does not exist, so nothing wires the primitive
+        // to a digest. 5 fixtures gate on the label and skip.
+        Capability::new(
+            "sha512-256: ",
+            version::ENGINE_SHA512_256.is_present(),
+        ),
         // 24. C `:212-219`: `#if !defined(_WIN32) ||
         // (defined(CURL_WINDOWS_UWP) || defined(CURL_DISABLE_CA_SEARCH) ||
         // defined(CURL_CA_SEARCH_SAFE))` -> OFF.
         //
-        // The FIRST disjunct settles it. AAP 0.1.1 goal G8 fixes the target
-        // matrix at `x86_64-unknown-linux-gnu`,
-        // `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and
-        // `aarch64-apple-darwin`; AAP 0.2.2 puts every Windows source out of
-        // scope. `_WIN32` is therefore never defined, `!defined(_WIN32)` is
-        // always true, and the row is always `OFF`.
+        // The FIRST disjunct settles it. The target matrix is
+        // `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+        // `x86_64-apple-darwin` and `aarch64-apple-darwin`, and every Windows
+        // source is out of scope. `_WIN32` is therefore never defined,
+        // `!defined(_WIN32)` is always true, and the row is always `OFF`.
         //
         // Deliberately NOT written as `!cfg!(windows)`: there is no Windows
         // arm in this file, and a `cfg` would falsely suggest the value
@@ -532,8 +665,16 @@ fn capabilities() -> [Capability; CAPABILITY_COUNT] {
         // reproducing the current invocation. AAP 0.3.1 and 0.4.1 both list
         // `curl-rs/src/libcurl_src.rs` (from `src/tool_easysrc.c`), and AAP
         // 0.3.1 notes the obligation that its output "must remain valid C
-        // against the generated header". Not a Cargo feature.
-        Capability::new("--libcurl: ", ALWAYS_COMPILED_IN),
+        // against the generated header". Not a Cargo feature, and not
+        // written: the file does not exist. The engine entry names a path in
+        // THIS crate rather than in the engine, which the registry already
+        // supports -- `ENGINE_GLOBAL_INIT` names a `curl-rs-ffi` path -- and
+        // which is what lets one table answer both self-description
+        // surfaces. 11 fixtures gate on the label and skip.
+        Capability::new(
+            "--libcurl: ",
+            version::ENGINE_LIBCURL_SOURCE.is_present(),
+        ),
         // 27. C `:236-242`: POSITIVE test -> ON. See `override_dns`.
         Capability::new("override-dns: ", override_dns()),
         // 28. C `:244-249`: POSITIVE test -> ON. See `ssl_sessions`.
@@ -542,19 +683,21 @@ fn capabilities() -> [Capability; CAPABILITY_COUNT] {
         // ((defined(USE_QUICHE) || defined(USE_OPENSSL)) &&
         // !defined(OPENSSL_NO_OCSP))` -> ON.
         //
-        // Every macro in that condition names a backend this workspace does
-        // not link. AAP 0.1.1 goal G4 makes rustls the sole TLS
-        // implementation "not as a default, not behind a feature flag, not
-        // as a fallback"; AAP 0.2.2 drops `lib/vtls/gtls.c`,
-        // `lib/vtls/openssl.c` and `lib/vquic/curl_quiche.c` outright. With
-        // neither GnuTLS nor OpenSSL nor the third QUIC backend present,
-        // no disjunct can hold, so OCSP-based certificate status stapling
-        // is definitively absent -- known, not merely undeterminable.
+        // Every macro in that condition names a backend this workspace does not
+        // link. rustls is the sole TLS implementation -- not as a default, not
+        // behind a feature flag, not as a fallback -- and this workspace drops
+        // `lib/vtls/gtls.c`, `lib/vtls/openssl.c` and `lib/vquic/curl_quiche.c`
+        // outright. With neither GnuTLS nor OpenSSL nor the third QUIC backend
+        // present, no disjunct can hold, so OCSP-based certificate status
+        // stapling is definitively absent -- known, not merely undeterminable.
+        // Unlike the engine-gated rows above, this one will not turn ON when a
+        // module lands: no rustls configuration satisfies the C condition, so
+        // it is [`NOT_PRESENT`] rather than a capability awaiting an
+        // implementation.
         Capability::new("cert-status: ", NOT_PRESENT),
     ]
 }
 
-// ===========================================================================
 // Rendering
 //
 // The sink is a parameter rather than `println!` for two reasons. It lets the
@@ -562,7 +705,6 @@ fn capabilities() -> [Capability; CAPABILITY_COUNT] {
 // and it avoids the panic `println!` raises when stdout is a closed pipe --
 // `puts` in the C returns EOF and is ignored (`src/curlinfo.c:267-268`
 // discards the return value), so aborting would be a behaviour change.
-// ===========================================================================
 
 /// Writes the 29 rows, one newline-terminated line each, and nothing else.
 ///
@@ -596,10 +738,10 @@ fn render<W: Write>(sink: &mut W) -> io::Result<()> {
 ///   `env!("CARGO_BIN_NAME")` and `env!("CARGO_PKG_VERSION")` are absent by
 ///   design: the Cargo package is `curl-rs` while every self-reported name in
 ///   this project stays `curl` (`src/tool_version.h:28`), and the version
-///   anchors in `include/curl/curlver.h` are frozen by AAP 0.8.5 conflict C6.
+///   anchors in `include/curl/curlver.h` are frozen.
 ///   Printing nothing but the table, as the C does, sidesteps the question
 ///   entirely and keeps the output a pure function of the compiled feature
-///   set and the target (AAP 0.7's reproducibility obligation).
+///   set and the target, which reproducibility requires.
 fn main() {
     let stdout = io::stdout();
     let mut sink = stdout.lock();
@@ -608,20 +750,18 @@ fn main() {
     let _ = sink.flush();
 }
 
-// ===========================================================================
 // Tests
 //
 // Kept inside this file because `src/bin/` is a Cargo convention directory for
 // binary auto-discovery, not a Rust module: there is no `mod.rs` here and a
 // sibling file could not be reached from this crate root. Integration tests
-// live in the top-level `tests-rs/` tree (AAP 0.3.1), so no
-// `curl-rs/tests/` directory is created either.
+// belong in the top-level `tests-rs/` tree, so no `curl-rs/tests/`
+// directory is created either.
 //
 // `assert!`/`assert_eq!` are the test vocabulary and are used freely; the
 // production code above contains no `unwrap`, `expect` or `panic!`, and these
 // helpers deliberately return `Option` rather than panicking so that a
 // missing label is reported by an assertion instead of a unwinding helper.
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -844,20 +984,75 @@ mod tests {
     // -- Polarity, asserted by name so a mechanical edit cannot flip it ----
 
     #[test]
-    fn the_three_ifndef_inverted_rows_are_off() {
-        // `#ifndef ENABLE_WAKEUP` (:163), `#ifndef USE_XATTR` (:177) and
-        // `#ifndef CURL_HAVE_SHA512_256` (:205). A naive `#ifdef` to `OFF`
-        // transliteration would render these ON; they are OFF here because
-        // no public predicate can establish them (rows 17, 19 and 23), and
-        // for `xattr` because `curl-rs/src/output/xattr.rs:165-169`
-        // explicitly requires it.
-        assert_eq!(value_of("wakeup: "), Some(false), "wakeup is inverted");
-        assert_eq!(value_of("xattr: "), Some(false), "xattr is inverted");
+    fn the_two_inverted_rows_with_absent_engines_are_off() {
+        // `#ifndef ENABLE_WAKEUP` (:163) and `#ifndef CURL_HAVE_SHA512_256`
+        // (:205). A naive `#ifdef` to `OFF` transliteration would render
+        // these ON. They are OFF here for a stated, checkable reason --
+        // `multi/mod.rs` and `crypto/sha512_256.rs` are absent -- so the
+        // assertion tracks those engines rather than a literal, and it will
+        // start demanding ON the moment either module lands.
+        assert_eq!(
+            value_of("wakeup: "),
+            Some(version::ENGINE_MULTI.is_present()),
+            "row 17 tracks the multi handle"
+        );
         assert_eq!(
             value_of("sha512-256: "),
-            Some(false),
-            "sha512-256 is inverted"
+            Some(version::ENGINE_SHA512_256.is_present()),
+            "row 23 tracks the SHA-512/256 module"
         );
+    }
+
+    #[test]
+    fn the_xattr_row_follows_the_engine_wrapper() {
+        // `#ifndef USE_XATTR` (:177), also inverted -- and derived from two
+        // conjuncts, so both are asserted. On every target in the AAP 0.1.1
+        // goal G8 matrix the engine's `fsetxattr` wrapper exists AND the
+        // platform is one of the two its arms compile, so the row is ON, and
+        // `curl-rs/src/output/xattr.rs` issues that call.
+        assert_eq!(value_of("xattr: "), Some(use_xattr()));
+        assert_eq!(
+            use_xattr(),
+            version::ENGINE_XATTR.is_present()
+                && cfg!(any(target_os = "linux", target_os = "macos")),
+            "neither conjunct may be dropped"
+        );
+        assert!(use_xattr(), "all four mandated targets are Linux or macOS");
+        assert!(
+            version::ENGINE_XATTR.is_present(),
+            "curl_rs_lib::set_file_xattr is what this row reports on"
+        );
+    }
+
+    #[test]
+    fn the_verbose_strings_row_follows_the_diagnostic_text_engine() {
+        // `#ifdef CURL_DISABLE_VERBOSE_STRINGS` (:156). ON, and the claim is
+        // substantiated at its point of use rather than trusted: the engine
+        // entry says `error.rs` carries the message set, and the message set
+        // answers.
+        assert_eq!(value_of("verbose-strings: "), Some(verbose_strings()));
+        assert_eq!(
+            verbose_strings(),
+            version::ENGINE_DIAGNOSTIC_STRINGS.is_present(),
+            "row 16 is the registry's answer, not a second opinion"
+        );
+        assert!(
+            !curl_rs_lib::CURLcode::UnsupportedProtocol
+                .message()
+                .is_empty(),
+            "the text this row advertises must really be present"
+        );
+    }
+
+    #[test]
+    fn the_xattr_row_reports_the_capability_that_is_implemented() {
+        // `#ifndef USE_XATTR` (:177), the third inverted row, and the one whose
+        // answer changed when the write became real. `curl-rs/src/output/xattr.rs`
+        // calls `curl_rs_lib::set_file_xattr` for every attribute, so `ON` is
+        // what the tool actually does; its
+        // `the_diagnostic_binary_agrees_that_xattr_is_on` asserts the same fact
+        // from the other side so the pair cannot drift.
+        assert_eq!(value_of("xattr: "), Some(true), "xattr is implemented");
     }
 
     #[test]
@@ -882,14 +1077,189 @@ mod tests {
         );
     }
 
+    // -- Every row traces to a typed predicate ------------------------------
+
+    /// The engine each of the 22 engine-gated rows derives from.
+    ///
+    /// Transcribed from the table above so that the two cannot drift: if a row
+    /// is rewired to a different engine, or a new bare literal is introduced,
+    /// [`no_row_outlives_the_engine_that_would_implement_it`] stops agreeing.
+    /// The seven rows deliberately absent from this list are the two machine
+    /// word widths (21, 22), the two `win32-*` rows and `cert-status` (24, 25,
+    /// 29), `override-dns` (27) and `ssl-sessions` (28) -- each covered by its
+    /// own test below or above.
+    const ROW_ENGINES: [(&str, version::Engine); 22] = [
+        ("bindlocal: ", version::ENGINE_CONN),
+        ("cookies: ", version::ENGINE_STATE_STORES),
+        ("basic-auth: ", version::ENGINE_AUTH_BASIC),
+        ("bearer-auth: ", version::ENGINE_AUTH_BEARER),
+        ("digest: ", version::ENGINE_AUTH_DIGEST),
+        ("negotiate-auth: ", version::ENGINE_GSS),
+        ("aws: ", version::ENGINE_AUTH_AWS_SIGV4),
+        ("DoH: ", version::ENGINE_DOH),
+        ("HTTP-auth: ", version::ENGINE_AUTH_DISPATCH),
+        ("Mime: ", version::ENGINE_MIME),
+        ("netrc: ", version::ENGINE_NETRC),
+        ("parsedate: ", version::ENGINE_PARSEDATE),
+        ("proxy: ", version::ENGINE_PROXY),
+        ("shuffle-dns: ", version::ENGINE_DNS),
+        ("typecheck: ", version::ENGINE_PUBLIC_HEADER),
+        ("verbose-strings: ", version::ENGINE_DIAGNOSTIC_STRINGS),
+        ("wakeup: ", version::ENGINE_MULTI),
+        ("headers-api: ", version::ENGINE_HEADERS),
+        ("xattr: ", version::ENGINE_XATTR),
+        ("form-api: ", version::ENGINE_FORM),
+        ("sha512-256: ", version::ENGINE_SHA512_256),
+        ("--libcurl: ", version::ENGINE_LIBCURL_SOURCE),
+    ];
+
+    /// The only rows that this build may legitimately report `ON`.
+    ///
+    /// Two are engine-backed by a module that exists (`verbose-strings` from
+    /// `error.rs`, `xattr` from `ffi/sys.rs`) and two are build-intrinsic
+    /// machine word widths. Every other row describes a module AAP 0.4.1
+    /// mandates and this workspace has not written, or a platform or backend
+    /// excluded outright.
+    ///
+    /// This list is the deliberate-edit point: a checkpoint that lands, say,
+    /// `mime/mod.rs` flips `ENGINE_MIME` and adds `"Mime: "` here in the same
+    /// change, and until it does the claim is refused by
+    /// [`no_row_outside_the_substantiated_ones_is_on`].
+    const ROWS_THAT_MAY_BE_ON: [&str; 4] = [
+        "verbose-strings: ",
+        "xattr: ",
+        "large-time: ",
+        "large-size: ",
+    ];
+
+    #[test]
+    fn no_row_outlives_the_engine_that_would_implement_it() {
+        // The invariant the whole rewiring exists to hold, and the direction
+        // that matters: an absent engine must force its row OFF. Stated as an
+        // implication rather than as 22 literals so that the test keeps
+        // working -- and keeps being meaningful -- as engines land one by one.
+        for (label, engine) in ROW_ENGINES {
+            assert!(
+                version::ENGINES.contains(&engine),
+                "{label:?} names an unregistered engine"
+            );
+
+            if !engine.is_present() {
+                assert_eq!(
+                    value_of(label),
+                    Some(false),
+                    "{label:?} claims a capability {} cannot provide",
+                    engine.owner()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_engine_gated_row_exists_and_names_a_module() {
+        // Guards the transcription itself: a typo in a label above would make
+        // `value_of` return `None`, and an engine with no owning module would
+        // make the pairing unauditable.
+        for (label, engine) in ROW_ENGINES {
+            assert!(
+                value_of(label).is_some(),
+                "{label:?} is not a row of the table"
+            );
+            assert!(
+                engine.owner().ends_with(".rs"),
+                "{label:?} must name a Rust source file, got {}",
+                engine.owner()
+            );
+        }
+
+        assert_eq!(
+            ROW_ENGINES.len() + 7,
+            CAPABILITY_COUNT,
+            "22 engine-gated rows plus 7 accounted for individually"
+        );
+    }
+
+    #[test]
+    fn no_row_outside_the_substantiated_ones_is_on() {
+        // AAP 0.6.5, enforced rather than documented: over-reporting makes
+        // fixtures run and fail, and `tests/runtests.pl:537-546` turns every
+        // ON row here into a `<features>` gate. 492 fixtures gate on these
+        // labels, so a single wrong ON is worth hundreds of spurious
+        // failures.
+        for capability in &capabilities() {
+            if !ROWS_THAT_MAY_BE_ON.contains(&capability.label) {
+                assert!(
+                    !capability.enabled,
+                    "{:?} is ON with nothing behind it",
+                    capability.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_substantiated_rows_are_on_and_each_for_its_own_reason() {
+        // The other direction: under-reporting is safe but it is not
+        // truthful, and a row whose capability really is present must say so.
+        assert_eq!(value_of("verbose-strings: "), Some(true));
+        assert_eq!(value_of("xattr: "), Some(true));
+        assert_eq!(value_of("large-time: "), Some(true));
+        assert_eq!(value_of("large-size: "), Some(true));
+
+        for label in ROWS_THAT_MAY_BE_ON {
+            assert!(
+                value_of(label).is_some(),
+                "{label:?} is not a row of the table"
+            );
+        }
+    }
+
+    #[test]
+    fn the_labels_the_harness_would_disable_are_the_off_rows() {
+        // `tests/runtests.pl:539-543` splits the output in two: `ON` rows
+        // become `$feature{<label>}`, `OFF` rows are pushed onto `@disabled`.
+        // Reproducing that split here proves the two sets partition the table
+        // exactly -- no row can land in both, and none in neither, which is
+        // what the closed ON/OFF vocabulary guarantees.
+        let table = capabilities();
+        let enabled: Vec<&str> = table
+            .iter()
+            .filter(|capability| capability.enabled)
+            .map(|capability| capability.label)
+            .collect();
+        let disabled: Vec<&str> = table
+            .iter()
+            .filter(|capability| !capability.enabled)
+            .map(|capability| capability.label)
+            .collect();
+
+        assert_eq!(
+            enabled.len() + disabled.len(),
+            CAPABILITY_COUNT,
+            "every row is in exactly one of the harness's two sets"
+        );
+        assert_eq!(
+            enabled.len(),
+            ROWS_THAT_MAY_BE_ON.len(),
+            "only substantiated rows may reach the feature map"
+        );
+
+        for label in &enabled {
+            assert!(
+                !disabled.contains(label),
+                "{label:?} cannot be both a feature and disabled"
+            );
+        }
+    }
+
     // -- Numeric width rows -------------------------------------------------
 
     #[test]
     fn large_time_and_large_size_are_on_because_the_word_is_wide() {
         // The C tests `SIZEOF_TIME_T < 5` and `SIZEOF_SIZE_T < 5`. Asserting
         // against the measured widths documents WHY the answer is ON rather
-        // than hard-coding it: all four targets in the AAP 0.1.1 G8 matrix
-        // are 64-bit, so both widths are 8.
+        // than hard-coding it: all four mandated targets are 64-bit, so both
+        // widths are 8.
         let pointer_width = core::mem::size_of::<usize>();
         let time_width = core::mem::size_of::<i64>();
 
@@ -907,8 +1277,8 @@ mod tests {
     #[test]
     fn the_two_win32_rows_are_off_on_every_mandated_target() {
         // `!defined(_WIN32)` is the first disjunct of both conditions and is
-        // always true here: AAP 0.1.1 G8 lists only Linux and macOS targets
-        // and AAP 0.2.2 excludes every Windows source. The rows must still
+        // always true here: the mandated targets are Linux and macOS only,
+        // and every Windows source is excluded. The rows must still
         // be present so the output stays 29 lines.
         assert_eq!(
             value_of("win32-ca-searchpath: "),
@@ -937,30 +1307,42 @@ mod tests {
 
     // -- Feature-driven rows, asserted under both settings ------------------
 
+    #[test]
+    fn the_three_feature_gated_rows_need_the_feature_and_the_engine() {
+        // Written as conjunctions rather than as literals, so the test tracks
+        // the registry instead of restating a snapshot of it. Each row is ON
+        // only when BOTH preconditions hold, which is the distinction the C
+        // never had to draw because its `#if` decided selection and
+        // compilation together.
+        assert_eq!(
+            value_of("cookies: "),
+            Some(
+                cfg!(feature = "cookies")
+                    && version::ENGINE_STATE_STORES.is_present()
+            ),
+            "row 2 needs the cookies feature and the cookie jar"
+        );
+        assert_eq!(
+            value_of("negotiate-auth: "),
+            Some(
+                cfg!(feature = "negotiate") && version::ENGINE_GSS.is_present()
+            ),
+            "row 6 needs the negotiate feature and auth/negotiate.rs"
+        );
+        assert_eq!(
+            value_of("DoH: "),
+            Some(cfg!(feature = "doh") && version::ENGINE_DOH.is_present()),
+            "row 8 needs the doh feature and dns/doh.rs"
+        );
+    }
+
     #[cfg(not(feature = "negotiate"))]
     #[test]
     fn negotiate_auth_is_off_without_the_negotiate_feature() {
-        assert_eq!(
-            value_of("negotiate-auth: "),
-            Some(false),
-            "negotiate is a default-OFF feature (AAP 0.8.5 conflict C2)"
-        );
-    }
-
-    #[cfg(feature = "negotiate")]
-    #[test]
-    fn negotiate_auth_is_on_with_the_negotiate_feature() {
-        assert_eq!(
-            value_of("negotiate-auth: "),
-            Some(true),
-            "--features negotiate must turn the row ON"
-        );
-    }
-
-    #[cfg(feature = "cookies")]
-    #[test]
-    fn cookies_is_on_with_default_features() {
-        assert_eq!(value_of("cookies: "), Some(true), "cookies defaults ON");
+        // The feature half of the conjunction, asserted absolutely: with the
+        // default-OFF feature absent (AAP 0.8.5 conflict C2), no engine
+        // landing can turn the row ON.
+        assert_eq!(value_of("negotiate-auth: "), Some(false));
     }
 
     #[cfg(not(feature = "cookies"))]
@@ -971,12 +1353,6 @@ mod tests {
             Some(false),
             "--no-default-features must turn the row OFF"
         );
-    }
-
-    #[cfg(feature = "doh")]
-    #[test]
-    fn doh_is_on_with_default_features() {
-        assert_eq!(value_of("DoH: "), Some(true), "doh defaults ON");
     }
 
     #[cfg(not(feature = "doh"))]
@@ -1079,8 +1455,8 @@ mod tests {
     fn rendering_is_deterministic_and_cannot_depend_on_arguments() {
         // `render` and `capabilities` take no argument source: the only
         // parameter is the sink. The table is therefore a pure function of
-        // the compiled feature set and the target, which is both AAP 0.7's
-        // reproducibility obligation and the reason `--help`, `--version`
+        // the compiled feature set and the target, which is both what
+        // reproducibility requires and the reason `--help`, `--version`
         // and stray positional arguments cannot change the output.
         //
         // `main` returns `()`, so there is no path that yields a non-zero

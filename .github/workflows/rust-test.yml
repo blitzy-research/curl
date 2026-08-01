@@ -1,0 +1,420 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Validation gate 3 of the ten that guard the Rust workspace: TESTS.
+#
+# The gate, verbatim: `cargo test --workspace` passing in full. This file adds
+# `--locked`, a second run with every feature enabled, and an assertion that
+# the run was not vacuous. Nothing else.
+#
+# It does nothing further. The build lives in rust-build.yml, lint in
+# rust-clippy.yml, undefined behaviour in rust-miri.yml, the sanitizer in
+# rust-asan.yml, coverage in rust-coverage.yml, symbol and header parity in
+# rust-abi.yml, supply chain in rust-audit.yml, and the curl fixture corpus in
+# curl-testsuite.yml. One workflow per validation gate, so that a failure names
+# its own cause. Nothing below builds a release artifact, lints, formats,
+# measures coverage, audits a dependency, inspects a symbol table, compiles an
+# example program or runs tests/runtests.pl.
+#
+# WHY THIS IS SEPARATE FROM rust-build.yml, which already compiles the
+# workspace. A build failure and a failing assertion are different findings
+# with different owners, and folding them together puts both behind one red
+# cross. There is also a concrete difference in what gets compiled: this gate
+# builds the `--cfg test` configuration of every crate, which is a genuinely
+# different compilation. Several hundred items in this workspace are reachable
+# only from `#[cfg(test)]` code, and two of the workspace's structural
+# invariants - the single-`allow(unsafe_code)` boundary and the
+# no-blanket-lint-allowance rule - are enforced by `#[cfg(test)]` modules that
+# read the crate's own source. Those checks exist nowhere else in the gate
+# family, so a workspace that builds but does not test is a workspace whose
+# safety boundary is unverified.
+#
+# LINEAGE. This file succeeds the `test` phase of the Autotools and CMake legs
+# of .github/workflows/linux.yml and macos.yml, which ran the C unit tests
+# through `make test-ci`. Two parts of that inheritance are deliberately NOT
+# here:
+#
+#   The 1,914 fixtures under tests/data are driven by tests/runtests.pl against
+#   the command-line binary, not by `cargo test`, and they belong to
+#   curl-testsuite.yml. That split follows the artifacts: `cargo test` exercises
+#   Rust items through Rust, the fixture corpus exercises bytes on the wire
+#   through a process.
+#
+#   tests/libtest and tests/unit are C programs that link a debug static
+#   libcurl and call internal `Curl_*` symbols. A Rust static library does not
+#   export `pub(crate)` items - they are absent from the symbol table, not
+#   merely hidden - so those cannot link against this workspace at any quality
+#   of implementation. Their coverage is relocated into the Rust crates as
+#   `#[cfg(test)]` modules, which means it is this gate that now owns it. That
+#   relocation is a recorded, deliberate deviation, and this comment is here so
+#   that a reader who goes looking for those suites finds out where their
+#   assertions went instead of concluding they were dropped.
+#
+# NO CROSS-TARGET MATRIX, unlike rust-build.yml. Gate 3 is stated as
+# `cargo test --workspace`, with no target list, and running it for
+# aarch64 or Apple triples would require an emulator or a foreign runner to
+# execute the test binaries. Compilation for all four targets is gate 1 and is
+# asserted in rust-build.yml; execution is asserted here, on the host.
+
+name: 'Rust tests'
+
+# The trigger shape is identical to the rest of the Rust gate family, so that
+# one edit to what counts as a source change does not have to be made in nine
+# places with nine chances to diverge. Markdown is deliberately NOT in
+# paths-ignore: docs/cmdline-opts/ and docs/libcurl/ are inputs to generated
+# code and are asserted against by tests, so a documentation-only change can
+# genuinely break this gate.
+on:
+  push:
+    branches:
+      - master
+      - '*/ci'
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}'
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # Colour off. The assertion step below parses `cargo test` output with `grep`,
+  # `sed` and `awk` to decide whether the run was vacuous, and an ANSI escape
+  # sequence embedded in a summary line would make an anchored pattern silently
+  # stop matching. An assertion that silently stops matching is worse than no
+  # assertion.
+  CARGO_TERM_COLOR: never
+
+  # The locked dependency graph is downloaded here. A transient registry hiccup
+  # should retry rather than fail this gate and send somebody looking for a
+  # broken test that is not broken.
+  CARGO_NET_RETRY: '3'
+
+  # No cache is restored in this job, so incremental state is output that
+  # nothing ever reads. Not a speed tuning - performance is an explicit
+  # non-goal of this work and no step below is ordered or configured for it.
+  CARGO_INCREMENTAL: '0'
+
+  # Deterministic test execution. The default is one thread per core, which
+  # makes the interleaving of output depend on the runner's core count; the
+  # assertion step reads that output. Tests in this workspace are independent
+  # and none of them shares mutable process state, so serialising costs
+  # correctness nothing and buys a log that reads the same every time.
+  RUST_TEST_THREADS: '1'
+
+  # A panic backtrace in the log is the difference between a diagnosable
+  # failure and a line saying a test failed.
+  RUST_BACKTRACE: '1'
+
+jobs:
+  test:
+    name: 'cargo test --workspace'
+
+    runs-on: ubuntu-latest
+
+    # Two full `--cfg test` compilations of the workspace plus their execution.
+    # The measured wall clock is a small fraction of this on a warm runner and
+    # a few minutes cold; the budget is deliberately generous because a gate
+    # that times out reports a timeout, which teaches a reader nothing about
+    # the tests.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'toolchain versions'
+        run: |
+          # Evidence before use. Every verdict below is a statement about which
+          # compiler produced it, so the versions are printed before anything is
+          # judged by them.
+          echo '::group::active toolchain'
+          rustc --version
+          cargo --version
+          echo '::endgroup::'
+
+          echo '::group::rust-toolchain.toml (the pin this gate honours)'
+          grep -v -E '^(#|$)' rust-toolchain.toml
+          echo '::endgroup::'
+
+          # Which features are on decides which code the test binaries even
+          # contain, so the default list is printed next to the versions.
+          echo '::group::curl-rs-lib default features'
+          sed -n '/^default = \[/,/^\]/p' curl-rs-lib/Cargo.toml
+          echo '::endgroup::'
+
+      - name: 'assert: the pinned stable toolchain is the active one'
+        run: |
+          # Nightly is deliberately absent from rust-toolchain.toml: the Miri
+          # and AddressSanitizer gates need it and install it for themselves in
+          # rust-miri.yml and rust-asan.yml. This gate must run on the pinned
+          # stable channel, and the assertion below is what says so out loud
+          # rather than trusting that no `+nightly` crept into a step.
+          #
+          # It matters for correctness here, not only for tidiness. `cargo test`
+          # on a newer channel can pass on code the pinned compiler rejects, and
+          # a green result from the wrong compiler is not a result about this
+          # workspace at all.
+          pinned="$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          if [ -z "${pinned}" ]; then
+            echo 'FAIL: rust-toolchain.toml declares no [toolchain] channel'
+            exit 1
+          fi
+          case "${pinned}" in
+            nightly*|beta*)
+              echo "FAIL: rust-toolchain.toml pins ${pinned}."
+              echo 'This gate runs on the pinned stable channel; nightly belongs to rust-miri.yml and rust-asan.yml.'
+              exit 1
+              ;;
+          esac
+          if rustc --version | grep -q -E 'nightly|beta'; then
+            echo 'FAIL: the active rustc is a nightly or beta build, but this gate requires the pinned stable channel'
+            rustc --version
+            exit 1
+          fi
+          active="$(rustc --version | awk '{ print $2 }')"
+          case "${pinned}" in
+            [0-9]*)
+              if [ "${active}" != "${pinned}" ]; then
+                echo "FAIL: rustc reports ${active}, but rust-toolchain.toml pins the exact version ${pinned}."
+                echo 'An exact pin is honoured by rustup on the first cargo invocation, so a mismatch means'
+                echo 'something in this job overrode the toolchain. Find and remove the override.'
+                exit 1
+              fi
+              echo "rustc ${active} matches the exact pin in rust-toolchain.toml"
+              ;;
+            *)
+              echo "rust-toolchain.toml pins the ${pinned} channel; the active rustc is ${active}"
+              ;;
+          esac
+
+      - name: 'fetch the locked dependency graph'
+        run: |
+          # Its own step, so that a registry or network failure is reported as a
+          # fetch failure instead of arriving disguised as a test failure. That
+          # is the same attribution argument that put this gate in its own
+          # workflow, applied one level down.
+          #
+          # --locked because Cargo.lock is committed and reproducible builds are
+          # non-negotiable. It makes a lockfile that disagrees with the
+          # manifests fail loudly here rather than be silently regenerated under
+          # the gate, and every cargo invocation in this file carries it for the
+          # same reason.
+          cargo fetch --locked
+
+      - name: 'enumerate the test executables cargo will run'
+        run: |
+          # The measurement that makes the verdict step non-vacuous, taken
+          # BEFORE anything runs.
+          #
+          # `cargo test` exits 0 on a workspace containing no tests at all. So
+          # does a `cargo test` whose filters happen to select nothing. Either
+          # would be reported as a green gate, which is precisely the shape of
+          # vacuity this workflow family exists to avoid. Counting the test
+          # binaries cargo intends to execute, from cargo's own JSON rather than
+          # from a hardcoded list, gives the verdict step something to compare
+          # the run against - and it stays correct when a crate gains or loses a
+          # test target, which a hardcoded list would not.
+          plan="${RUNNER_TEMP}/test-plan.json"
+          cargo test --locked --workspace --no-run --message-format json > "${plan}"
+
+          # One line per compiler artifact; the test executables are the ones
+          # with `"test":true` and a non-empty `executable`.
+          exes="${RUNNER_TEMP}/test-exes.txt"
+          grep '"reason":"compiler-artifact"' "${plan}" \
+            | grep '"test":true' \
+            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' \
+            | sed 's:.*/::' \
+            | sort -u > "${exes}"
+
+          count="$(wc -l < "${exes}" | tr -d ' ')"
+          if [ "${count}" -eq 0 ]; then
+            echo 'FAIL: cargo intends to run zero test executables.'
+            echo 'Every crate in this workspace has test code, so a count of zero means the'
+            echo 'harness targets were lost - a missing [lib] or [[bin]] target, or a manifest'
+            echo 'that no longer declares one. A cargo test over nothing exits 0, so without'
+            echo 'this check the gate would report success for an empty run.'
+            exit 1
+          fi
+
+          echo "cargo will run ${count} test executable(s):"
+          sed 's/^/  /' "${exes}"
+
+      - name: 'test: cargo test --locked --workspace'
+        run: |
+          # THE GATE, verbatim apart from --locked. No --no-fail-fast: a gate
+          # reports the first failure and stops, and a reader who wants the full
+          # list can add the flag locally. No filter argument, no --exclude, no
+          # `--` separator passing anything to the harness: every test in the
+          # workspace runs, which is what "passing in full" means.
+          log="${RUNNER_TEMP}/cargo-test-default.log"
+          status=0
+          cargo test --locked --workspace 2>&1 | tee "${log}" || status=$?
+
+          # `tee` in a pipeline hides the exit status of cargo behind its own on
+          # some shells; the pipeline status is what matters here, so it is read
+          # explicitly rather than trusted.
+          if [ "${status}" -ne 0 ]; then
+            echo "FAIL: cargo test --workspace exited ${status}."
+            echo 'This is the gate itself. The failing test names are above, in the suite output.'
+            exit "${status}"
+          fi
+
+          echo 'cargo test --workspace: exit 0'
+
+      - name: 'test: cargo test --locked --workspace --all-features'
+        run: |
+          # The default run above cannot reach the code behind the three
+          # default-off features, and "passing in full" has to mean the whole
+          # workspace rather than the default slice of it. The three are
+          # `negotiate` (the GSS-API binding, the largest single body of
+          # `unsafe` in curl-rs-lib), `hickory-dns` (an optional resolver
+          # dependency and the banner token that reports it) and `memdebug`
+          # (allocation accounting). Each carries tests that exist only when the
+          # feature is on, and each is a place where a compilation error can
+          # hide indefinitely behind a cfg.
+          #
+          # It is a SECOND run rather than a replacement for the first, because
+          # the two configurations are not comparable: `--all-features` also
+          # cfg's OUT the assertions that check the default-off features really
+          # are off. Neither run subsumes the other, so both must be green.
+          log="${RUNNER_TEMP}/cargo-test-all-features.log"
+          status=0
+          cargo test --locked --workspace --all-features 2>&1 | tee "${log}" || status=$?
+
+          if [ "${status}" -ne 0 ]; then
+            echo "FAIL: cargo test --workspace --all-features exited ${status}."
+            echo 'A failure here and a pass above means the defect is behind a feature gate:'
+            echo 'negotiate, hickory-dns or memdebug. The failing test names are above.'
+            exit "${status}"
+          fi
+
+          echo 'cargo test --workspace --all-features: exit 0'
+
+      - name: 'assert: the run was not vacuous, and name every ignored test'
+        run: |
+          # A green `cargo test` is only evidence if something ran. Three
+          # distinct vacuity failures are checked here, and none of them makes
+          # cargo exit non-zero on its own.
+          default_log="${RUNNER_TEMP}/cargo-test-default.log"
+          allfeat_log="${RUNNER_TEMP}/cargo-test-all-features.log"
+          exes="${RUNNER_TEMP}/test-exes.txt"
+
+          for log in "${default_log}" "${allfeat_log}"; do
+            if [ ! -s "${log}" ]; then
+              echo "FAIL: ${log} is missing or empty; the test steps above produced no output."
+              exit 1
+            fi
+          done
+
+          # (1) Every executable cargo planned to run must appear in the default
+          # run's log. This is the check that catches a suite silently vanishing
+          # - a `#[cfg]` that excluded a whole test module, or a target that
+          # stopped being built - which no exit status reports.
+          missing=0
+          while IFS= read -r exe; do
+            [ -n "${exe}" ] || continue
+            if ! grep -q -- "${exe}" "${default_log}"; then
+              echo "FAIL: planned test executable '${exe}' never appears in the run log."
+              missing=1
+            fi
+          done < "${exes}"
+          if [ "${missing}" -ne 0 ]; then
+            echo 'cargo listed these binaries as test targets but did not report running them.'
+            exit 1
+          fi
+
+          # (2) A positive number of assertions must have executed, and none may
+          # have failed. `cargo test` on an empty suite prints
+          # "0 passed; 0 failed" and exits 0, so the exit status above does not
+          # cover this.
+          for log in "${default_log}" "${allfeat_log}"; do
+            if ! grep -q '^test result:' "${log}"; then
+              echo "FAIL: ${log} contains no 'test result:' summary line at all."
+              echo 'Nothing ran. A run of nothing exits 0, which is why this is checked.'
+              exit 1
+            fi
+
+            passed="$(grep -oE '[0-9]+ passed' "${log}" | awk '{ s += $1 } END { print s + 0 }')"
+            failed="$(grep -oE '[0-9]+ failed' "${log}" | awk '{ s += $1 } END { print s + 0 }')"
+            suites="$(grep -c '^test result:' "${log}")"
+
+            echo "${log}: ${suites} suite(s), ${passed} passed, ${failed} failed"
+
+            if [ "${failed}" -ne 0 ]; then
+              echo "FAIL: ${failed} test(s) failed in ${log} although cargo exited 0."
+              grep -E '^(failures:|    [a-zA-Z_].*)$' "${log}" | head -50
+              exit 1
+            fi
+
+            if [ "${passed}" -le 0 ]; then
+              echo "FAIL: ${log} reports ${passed} passing tests."
+              echo 'A suite that asserts nothing is indistinguishable from a suite that passes,'
+              echo 'so this gate refuses to call an empty run a success.'
+              exit 1
+            fi
+          done
+
+          # (3) Every ignored test is named. An ignored test is not a failure,
+          # but an ignore that nobody reads is how a permanently disabled
+          # assertion survives review. Naming them in the log makes the set
+          # reviewable at a glance and makes growth in it visible.
+          #
+          # `#[ignore]`d unit tests and doctests both print the same suffix, so
+          # one pattern catches both.
+          echo '::group::ignored tests (not failures - listed so the set stays reviewable)'
+          ignored_names="${RUNNER_TEMP}/ignored.txt"
+          grep -E '^test .* \.\.\. ignored' "${default_log}" > "${ignored_names}" || true
+          if [ -s "${ignored_names}" ]; then
+            sed 's/^/  /' "${ignored_names}"
+          else
+            echo '  (none)'
+          fi
+          echo '::endgroup::'
+
+          ignored_count="$(grep -oE '[0-9]+ ignored' "${default_log}" | awk '{ s += $1 } END { print s + 0 }')"
+          named_count="$(wc -l < "${ignored_names}" | tr -d ' ')"
+          if [ "${ignored_count}" -ne "${named_count}" ]; then
+            echo "FAIL: the summaries report ${ignored_count} ignored test(s) but only ${named_count} were named."
+            echo 'The pattern that lists them has stopped matching the harness output format. Fix the'
+            echo 'pattern rather than dropping the check: an unnamed ignore is an invisible one.'
+            exit 1
+          fi
+
+          echo "tests ran, nothing failed, and all ${ignored_count} ignored test(s) are named above"
+
+      - name: 'assert: this gate wrote nothing outside target/'
+        run: |
+          # The property that makes everything above trustworthy. Every cargo
+          # invocation in this job was passed --locked, so nothing should have
+          # been able to modify a tracked file or regenerate Cargo.lock. This
+          # says so out loud rather than assuming it.
+          #
+          # A finding means one of three things, all of them worth failing on:
+          # --locked was dropped somewhere and cargo rewrote the lockfile, a
+          # build script wrote into the source tree instead of OUT_DIR, or a
+          # test wrote a fixture next to the sources instead of into a temporary
+          # directory. The root .gitignore already covers /target, so a clean
+          # run leaves this empty.
+          changed="${RUNNER_TEMP}/worktree-status.txt"
+          git status --porcelain > "${changed}"
+          if [ -s "${changed}" ]; then
+            echo 'FAIL: the working tree changed while this gate ran:'
+            cat "${changed}"
+            exit 1
+          fi
+          echo 'the working tree is byte-identical to the checkout: this gate tests, it does not rewrite'

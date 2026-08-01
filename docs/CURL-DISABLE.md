@@ -18,9 +18,24 @@ configuration knobs, and `CMakeLists.txt` mirrors them.
 
 The `Rust` `workspace` moves that configuration out of the preprocessor and
 into the build graph. A capability that the C build selects by defining a
-macro is selected by a `cargo` feature instead. The features are declared once
-for the whole `workspace`, in the root `Cargo.toml`, so a capability cannot be
-enabled in one `crate` and disabled in another.
+macro is selected by a `cargo` feature instead. One mechanical detail is worth
+stating precisely, because the obvious reading of it is wrong: a virtual
+`workspace` manifest has no `[features]` table, so the declarations cannot live
+in the root `Cargo.toml` at all. They are defined once in
+`curl-rs-lib/Cargo.toml`, which is where a feature name turns into an optional
+dependency, and `curl-rs` and `curl-rs-ffi` each forward all fifteen to
+`curl-rs-lib/<name>`. That pass-through, not a root declaration, is what keeps
+the setting coherent: enabling a name on either leaf crate enables the same name
+in the engine, so a capability cannot be enabled in one `crate` and disabled in
+another. A plain `--features <list>` therefore reaches every member, and all
+three manifests declare the same twelve features by default. The root manifest
+does carry the same set once more, as `[workspace.metadata.curl-rs.features]`,
+but that is an inventory for tooling to read rather than a `cargo` feature
+table.
+
+All fifteen names below are declared today. How much each one gates is bounded
+by how much of the module behind it is on disk, and this page says which is
+which rather than leaving the declaration to imply a capability.
 
 ## `Cargo` features
 
@@ -43,17 +58,46 @@ enabled in one `crate` and disabled in another.
 | `memdebug` | off | `MEMDEBUG` and `DEBUGBUILD` allocation tracking |
 
 Twelve of the fifteen are on by default, because curl 8.x provides those
-twelve capabilities out of the box and a drop-in replacement provides them out
-of the box as well. The other three are off by default, each for a reason
-worth stating:
+twelve capabilities out of the box and a drop-in replacement is required to
+provide them out of the box as well. The other three are off by default, each
+for a reason worth stating:
 
 - `negotiate` needs an operating system GSS-API library for Negotiate, SPNEGO
   and Kerberos authentication. Leaving the feature off keeps the default build
   free of any C security library.
-- `hickory-dns` selects an in-process resolver as an alternative to the system
-  resolver, which is what resolves names by default.
+- `hickory-dns` is a **reserved name with no implementation**, and enabling it
+  is a deliberate build failure rather than a silent no-op. It was intended to
+  select an in-process resolver as an alternative to the system resolver, which
+  is what resolves names by default. No version of `hickory-resolver` can
+  currently back it: every release that satisfies the workspace minimum Rust
+  version (0.24.0 through 0.25.2) requires a `hickory-proto` affected by
+  RUSTSEC-2026-0119, and every release carrying that fix (0.26.0, 0.26.1)
+  declares `rust-version 1.88` and breaks the minimum. The two sets are
+  disjoint. Declaring the crate as an optional dependency would not have
+  confined the advisory either, because `cargo deny` and `cargo audit` read
+  `Cargo.lock` rather than the active feature set, so it would be reported for
+  every build including default ones. The name is kept because three
+  self-description surfaces are written against the fifteen feature names --
+  the `Features:` line of `curl --version`, the capability table the FFI build
+  script emits, and `curlinfo`'s table -- and the root `Cargo.toml` records the
+  full measurement. Because Cargo has no "all features except one" selector,
+  feature-matrix builds enumerate the fourteen implementable features rather
+  than passing `--all-features`.
 - `memdebug` selects allocation tracking, and it carries a cost that the
   section below states in full.
+
+Which of the fifteen pull in a dependency is a separate question from which are
+declared, and the answer divides them cleanly. Seven gate an optional
+dependency today: `http2`, `http3`, `ssh`, `cookies`, `brotli`, `zstd` and
+`gzip`. The other eight are declared with an empty definition, because the
+modules they are specified to gate are not yet on disk: `ftp`, `websockets`,
+`hsts`, `altsvc`, `doh`, `negotiate`, `hickory-dns` and `memdebug`. An empty
+definition is not an inert name, and reading it that way would be the second
+obvious-but-wrong reading on this page: every one of the fifteen is consulted by
+`cfg` in the sources today. `negotiate` gates the build half of the `GSS-API`,
+`Kerberos` and `SPNEGO` rows of the version banner, and `hickory-dns` gates the
+`compile_error!` described above. What an empty definition does mean is that
+enabling one adds no crate to the dependency graph.
 
 ## The mapping is not one to one
 
@@ -82,11 +126,17 @@ which follows the C tree: `lib/curl_setup.h` gates `USE_SPNEGO` and
 `CURL_DISABLE_SMTP`, `CURL_DISABLE_TELNET` and `CURL_DISABLE_TFTP` all name
 schemes drawn from the 24 registered schemes for which no transfer is
 implemented. Those schemes stay part of the public ABI. Their `CURLPROTO_*`
-constants remain in `include/curl/curl.h`, a URL naming one of them still
-parses, and a transfer request for one of them fails with
-`CURLE_UNSUPPORTED_PROTOCOL`. The `Protocols:` line of the version output
-names only the nine schemes that do perform transfers, which is what lets the
-test suite skip the cases needing the others rather than fail them.
+constants remain in `include/curl/curl.h`, which is retained here at
+8.19.0-DEV and is unmodified. Beyond the constants, the paragraph splits into a
+part that is specified and a part that is delivered, and the two are worth
+keeping apart. A URL naming one of these schemes is specified to still parse,
+and a transfer request for one to fail with `CURLE_UNSUPPORTED_PROTOCOL` from
+the stub registration; both await `curl-rs-lib/src/protocols/`, which is not
+yet on disk, so neither is observable today. The `Protocols:` line is the part
+that is delivered: `curl-rs-lib/src/version.rs` names only the nine schemes
+that do perform transfers, and asserts by test that the other 24 are withheld
+from the banner, which is what lets the test suite skip the cases needing them
+rather than fail them.
 
 **Its subject is unconditional, so no switch exists.** `CURL_DISABLE_AWS`,
 `CURL_DISABLE_BASIC_AUTH`, `CURL_DISABLE_BEARER_AUTH`,
@@ -132,19 +182,36 @@ cases under `tests/data`, 98 name `Debug` among their required features and
 skip while it is absent, and `make torture-test` requires the feature
 outright, so it does not apply.
 
-Should that trade prove unacceptable, the remedy is the reason the feature
-name exists: a counting `GlobalAlloc` behind `memdebug`, reproducing the log
-format of `lib/memdebug.c`. That format is fully specified by the C
-implementation, which writes records of the form
+That trade is reversible, and the machinery for reversing it is implemented
+rather than merely planned. Enabling `memdebug` installs a counting
+`GlobalAlloc` as the crate `#[global_allocator]`, reproducing the log format of
+`lib/memdebug.c`: records of the form
 `MEM <source>:<line> malloc(<n>) = <pointer>`, with parallel forms for
-`calloc`, `strdup`, `wcsdup`, `realloc` and `free`, to the destination named
-by the `CURL_MEMDEBUG` environment variable.
+`calloc`, `strdup`, `wcsdup`, `realloc` and `free`, written to the destination
+named by the `CURL_MEMDEBUG` environment variable, which is what
+`tests/memanalyzer.pm` parses. A `CURL_MEMLIMIT` value caps the number of
+allocations, mirroring `curl_dbg_memlimit()` and its one-shot guard, and a
+denied allocation writes the `LIMIT ... reached memlimit` record to both the
+log and standard error before the allocation fails.
+
+Two properties of that implementation are disclosed rather than smoothed over.
+First, the cap arms on the first allocation rather than partway through
+`main()` where the C arms it, so the allocations the `Rust` runtime performs
+ahead of `main` are counted too. That offset measures as a constant two on this
+platform, which makes `CURL_MEMLIMIT=1` and `CURL_MEMLIMIT=2` fail during
+start-up, and a value of three or more behave as expected. Second, enabling
+`memdebug` does not make the binary advertise `Debug`, and that is deliberate:
+the feature supplies the allocation log alone, while the `Debug` token also
+promises internal behavior changes this build does not make. The harness checks
+described above therefore stay skipped even with `memdebug` on, because only
+the `Debug` token governs them.
 
 ## The `CURL_DISABLE_*` defines
 
 Each define below is described exactly as it behaves in the retained C
-reference tree, where it remains in force. The `Rust` `workspace` reaches the
-equivalent decisions through the feature map above instead.
+reference tree, where it remains in force. The `Rust` `workspace` is specified
+to reach the equivalent decisions through the feature map above instead, to the
+extent recorded there.
 
 ## `CURL_DISABLE_ALTSVC`
 
@@ -331,12 +398,25 @@ Useful to improve build performance for the `tests/libtest` test tool.
 This define keeps its meaning after the migration. The type checking it turns
 off lives in `include/curl/typecheck-gcc.h`, and that header is maintained by
 hand rather than generated, because `cbindgen` has no way to express its 958
-lines and 258 `curlcheck_` references. It ships verbatim beside the generated
-`include/curl/curl.h`. The two header checks under `.github/scripts` treat the
-define differently on purpose: `verify-synopsis.pl` compiles with
-`-DCURL_DISABLE_TYPECHECK`, while `verify-examples.pl` does not, so the 129
-example programs under `docs/examples` are compiled with the type checking
-active and hold the declarations to it.
+lines, across which `curlcheck_` is referenced 260 times on 258 distinct
+lines. The two counts differ because two lines carry the token twice, and both
+of those are comments rather than macro definitions, so neither count is the
+number of macros. It ships verbatim beside the generated `include/curl/curl.h`.
+
+The two header checks under `.github/scripts` treat the define differently on
+purpose, and their scopes are easy to confuse.
+`verify-synopsis.pl docs/libcurl/curl*.md` compiles the synopses in those
+pages with `-DCURL_DISABLE_TYPECHECK`, so the type checking is off there.
+`verify-examples.pl docs/libcurl/curl*.md docs/libcurl/opts/*.md` compiles
+the examples embedded in those Markdown pages and does not pass the define,
+so those embedded examples are compiled with the type checking active and
+hold the declarations to it.
+
+Neither script reads the 129 standalone programs under `docs/examples`. Both
+take Markdown pages as their arguments. The standalone programs are compiled
+separately by the build system and remain untouched, and in the target design
+that separate compilation is the additional ABI gate recorded in
+`docs/tests/TEST-SUITE.md`, which states the same distinction.
 
 ## `CURL_DISABLE_VERBOSE_STRINGS`
 

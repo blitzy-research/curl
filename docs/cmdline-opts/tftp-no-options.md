@@ -19,7 +19,7 @@ Do not send TFTP options requests. This improves interop with some legacy
 servers that do not acknowledge or properly implement TFTP options. When this
 option is used --tftp-blksize is ignored.
 
-This build performs no TFTP transfers, so a transfer request for a TFTP URL
-fails with `CURLE_UNSUPPORTED_PROTOCOL` even though curl accepts and parses
-this option. The `Protocols:` line in the --version output does not name the
-scheme.
+Transfers for TFTP are outside the specified scope of this rewrite, so a
+transfer request for a TFTP URL is specified to fail with
+`CURLE_UNSUPPORTED_PROTOCOL` even though the option itself is still accepted
+and parsed. The `Protocols:` line of the --version output withholds the scheme.
