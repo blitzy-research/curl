@@ -47,3 +47,9 @@ interpretation use --data-raw instead.
 The data for this option is passed on to the server exactly as provided on the
 command line. curl does not convert, change or improve it. It is up to the
 user to provide the data in the correct form.
+
+Transfers for `MQTT` and `MQTTS` are not implemented in this build, so neither
+scheme appears in the `Protocols:` line of the --version output; this option,
+its data argument and any @ file it names are still parsed and read, and it is
+the `MQTT` transfer that then fails with `CURLE_UNSUPPORTED_PROTOCOL`. POST
+over HTTP and HTTPS remains fully supported, exactly as described above.

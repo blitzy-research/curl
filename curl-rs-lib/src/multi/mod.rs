@@ -70,6 +70,27 @@
 //! module that owns the feature, rather than being re-derived by the
 //! diagnostic binary, so the report and the behaviour cannot disagree.
 
+/// The completion-message queue and the notification subsystem.
+///
+/// `pub`, unlike [`state`] beside it, and the difference is the ABI. Four
+/// exported symbols rest on this module -- `curl_multi_info_read`,
+/// `curl_multi_get_offt`, `curl_multi_notify_enable` and
+/// `curl_multi_notify_disable` -- and the vocabulary their signatures name
+/// travels with them: `CURLMSG`, `CURLMinfo_offt` and the two
+/// `CURLMNOTIFY_*` macros all appear in `include/curl/multi.h`. Their pinned
+/// engine-side counterparts are therefore reachable from `curl-rs-ffi`, which
+/// bridges each to its C-shaped declaration. A `CURLMstate`, by contrast,
+/// crosses no boundary at all.
+///
+/// Only that vocabulary is public. The queue, the notification store, the
+/// chunk ring and the enabled bitset are `pub(crate)`: the shim reaches them
+/// through this crate's multi handle, never directly, so a static library that
+/// does not export `pub(crate)` items costs nothing here.
+///
+/// Declared before [`state`] because `rustfmt.toml` sets
+/// `reorder_modules = true` and would otherwise move it.
+pub mod notify;
+
 /// The transfer state machine: the seventeen reachable `CURLMstate` values.
 ///
 /// `pub(crate)`: no exported symbol takes or returns a state. The multi

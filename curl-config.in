@@ -23,6 +23,43 @@
 #
 ###########################################################################
 
+# HOW THIS FILE IS RENDERED, NOW THAT THERE IS NO C BUILD
+#
+# This is the curl-config template. Autotools substituted it through
+# AC_SUBST and config.status -- configure.ac:5476 is
+# AC_CONFIG_FILES([curl-config], [chmod +x curl-config]) -- and CMake
+# substitutes it with configure_file() in @ONLY mode at
+# CMakeLists.txt:2295-2297, installing the result with executable
+# permissions. A Cargo build runs neither, so the renderer is now
+# curl-rs-ffi/build.rs: it reads this file, fills in the eighteen
+# substitution tokens and writes bin/curl-config, mode 0755, into an
+# install-staging directory under target/ -- or wherever
+# CURL_RS_STAGING_DIR names, and never into the checkout.
+#
+# The token spelling is deliberately unchanged. Both CMake's
+# configure_file() and the new renderer understand it, so a packager
+# diffing this template against curl 8.x sees added comments and nothing
+# else. Those comments therefore name each token WITHOUT its surrounding
+# at-signs. Substitution is a plain global replacement in both renderers,
+# so a real token written inside a comment would be replaced there too,
+# and the new renderer additionally scans this file to assert the shell
+# quoting of every token it substitutes -- a token sitting in a comment
+# reads as an unquoted occurrence and fails the build rather than the
+# review.
+#
+# The command-line contract is frozen, not merely preserved. The fifteen
+# options usage() lists below, their spellings, the shape of what each one
+# prints and the exit status each one leaves are the ones curl 8.x
+# published, because third-party build systems shell out to curl-config
+# and parse the answer. Nothing is added either: a --rust or a --crates
+# switch would be a new flag, and there are none.
+#
+# Both lists this script prints -- the features and the protocols -- are
+# projections of the one capability table in curl-rs-lib/src/version.rs,
+# which also renders the `curl --version` banner. Neither is maintained
+# here and neither is maintained in the renderer, so this script,
+# libcurl.pc and that banner cannot describe three different products.
+
 # shellcheck disable=SC2006
 
 prefix='@prefix@'
@@ -65,14 +102,39 @@ fi
 
 while test "$#" -gt 0; do
   case "$1" in
+  # ENABLE_SHARED expands to yes. curl-rs-ffi/Cargo.toml declares
+  # crate-type = ["cdylib", "staticlib"] under [lib] name = "curl", so both
+  # artifacts are built and both really are called libcurl: libcurl.so and
+  # libcurl.a. The shared object carries DT_SONAME = libcurl.so.4, whose 4
+  # is derived rather than chosen -- lib/Makefile.soname sets
+  # VERSIONCHANGE=12, VERSIONADD=0 and VERSIONDEL=8, giving libtool
+  # -version-info 12:0:8, and a libtool soname major is current - age.
   --built-shared)
     echo '@ENABLE_SHARED@'
     ;;
 
+  # CURL_CA_BUNDLE is still the runtime CA bundle path, and empty is a
+  # legitimate answer here rather than an oversight: this build reads trust
+  # anchors through rustls unless a path is configured. It is NOT the
+  # bundle curl-rs/build.rs embeds into the command-line tool -- that one
+  # replaces src/mk-file-embed.pl and is compiled in, so it has no
+  # filesystem path a consumer could be told about.
   --ca)
     echo '@CURL_CA_BUNDLE@'
     ;;
 
+  # CC no longer describes how libcurl was built: rustc and cargo build
+  # it, and neither is something a consumer could be handed. What a
+  # consumer actually wants from this option is a compiler that can build
+  # a program against the artifact, and since the artifact exposes a C ABI
+  # whose consumers are C programs, a C compiler remains the useful
+  # answer. So the value names the compiler for the target that was built,
+  # resolved the way cc-rs resolves it -- CC_<target>, then the underscored
+  # spelling of that, then TARGET_CC, then CC, then a name derived from the
+  # triple. Getting the precedence right matters when cross-compiling,
+  # where a bare CC would name the host compiler and misdirect every
+  # consumer. It is never empty: a consumer substituting an empty value
+  # into a command line would run its next argument as a program.
   --cc)
     echo '@CC@'
     ;;
@@ -81,12 +143,69 @@ while test "$#" -gt 0; do
     echo "$prefix"
     ;;
 
+  # SUPPORT_FEATURES expands to the truthful subset of curl's own feature
+  # vocabulary, each name spelled as configure.ac spells it from :5143
+  # onward and the whole list sorted case-insensitively as
+  # CMakeLists.txt:2040-2045 sorts it, so two builds of one configuration
+  # print the same lines in the same order.
+  #
+  # Truthfulness here is the optimal strategy and not merely the decent
+  # one. tests/runtests.pl parses the Features: line of `curl --version`
+  # into a 52-name map, and 874 of the 1,914 fixtures gate on it, so
+  # under-reporting a capability only makes a fixture skip while
+  # over-reporting makes it run and fail. Withheld on purpose:
+  #
+  #   Debug, and with it TrackMemory -- advertising Debug arms the
+  #   harness's allocation-cap and leak accounting against a Rust
+  #   allocator whose allocation pattern cannot match a C one. The cost is
+  #   stated rather than hidden: 98 fixtures skip and torture-test does
+  #   not apply.
+  #
+  #   Every name belonging to a dropped backend, since rustls, quinn and
+  #   russh are the sole implementations: MultiSSL, OpenSSL, GnuTLS,
+  #   mbedtls, wolfssl, Schannel, SSPI, TLS-SRP, NTLM_WB, WinIDN,
+  #   AppleIDN, libssh, libssh2, c-ares and gsasl.
+  #
+  #   GSS-API, SPNEGO and Kerberos, which are compiled in only behind the
+  #   non-default `negotiate` Cargo feature -- and even then stay out of
+  #   this script, because whether a usable mechanism exists on the host
+  #   is a runtime property that a file written at build time cannot know.
+  #   That question is left to `curl --version`, which can ask.
+  #
+  # The list is not written down here. It is read from the capability
+  # table in curl-rs-lib/src/version.rs, the same table libcurl.pc's
+  # supported_features and the runtime banner are read from, so the three
+  # agree by construction rather than by inspection. A capability appears
+  # only once the engine module that provides it is present, so the list
+  # is never ahead of the code.
   --feature|--features)
     for feature in @SUPPORT_FEATURES@ ''; do
       test -n "$feature" && echo "$feature"
     done
     ;;
 
+  # SUPPORT_PROTOCOLS expands to the schemes this implementation really
+  # serves, space separated so the loop below word-splits it into one
+  # scheme per line: FILE FTP FTPS HTTP HTTPS SCP SFTP WS WSS. Those nine
+  # are the whole of it.
+  #
+  # The twenty-four schemes that stay registered for ABI completeness but
+  # are not implemented -- DICT, GOPHER, GOPHERS, IMAP, IMAPS, LDAP, LDAPS,
+  # MQTT, POP3, POP3S, RTMP and its variants, RTSP, SMB, SMBS, SMTP, SMTPS,
+  # TELNET and TFTP -- are deliberately absent, and the absence is the
+  # point rather than an oversight. They are out of scope for
+  # implementation but not for the ABI, so their CURLPROTO_ constants
+  # remain in the public header, a request for one of them returns
+  # CURLE_UNSUPPORTED_PROTOCOL, and 283 fixtures -- 14.8% of the corpus --
+  # depend on this omission to skip cleanly instead of running and failing.
+  #
+  # The upper case is curl's own, not a choice made here:
+  # configure.ac:5326 onward appends HTTP, FTP, FILE and the rest
+  # upper-cased, and CMakeLists.txt:1994 builds the same variable from
+  # upper-case items, deriving a separate lower-case one at :1995 purely
+  # for a status message. The engine stores these schemes in lower case
+  # for the Protocols: line of `curl --version`, so one list serves both
+  # surfaces and the renderer applies that documented transformation.
   --protocols)
     # shellcheck disable=SC2043
     for protocol in @SUPPORT_PROTOCOLS@; do
@@ -94,11 +213,22 @@ while test "$#" -gt 0; do
     done
     ;;
 
+  # CURLVERSION expands to 8.19.0-DEV, read from include/curl/curlver.h:35
+  # exactly as configure.ac:129 read it with sed. It is NOT bumped: the
+  # version is part of the frozen contract, and every parity claim made
+  # about this artifact -- 100 exported symbols, 103 CURLcode discriminants,
+  # 308 CURLoption identifiers -- is a claim against curl 8.19.0-DEV.
   --version)
     echo 'libcurl @CURLVERSION@'
     exit 0
     ;;
 
+  # The arithmetic below is reproduced rather than rewritten, and it
+  # already tolerates a development version: the cut -d- -f1 on the patch
+  # field turns 8.19.0-DEV into 0, which is what lets the comparison run at
+  # all. A requested version equal to or older than this one still exits 0
+  # and prints nothing; a newer one still prints the same sentence on
+  # stdout and exits 1.
   --checkfor)
     checkfor="$2"
     cmajor=`echo "$checkfor" | cut -d. -f1`
@@ -131,6 +261,11 @@ while test "$#" -gt 0; do
     exit 1
     ;;
 
+  # VERSIONNUM expands to 081300: the hexadecimal digits of
+  # LIBCURL_VERSION_NUM 0x081300 at include/curl/curlver.h:61 with the 0x
+  # dropped. The drop is a convention rather than a loss -- the sed at
+  # configure.ac:141 captures only the digits -- so a consumer parsing this
+  # output has always received them bare, and it keeps receiving them bare.
   --vernum)
     echo '@VERSIONNUM@'
     exit 0
@@ -140,6 +275,18 @@ while test "$#" -gt 0; do
     usage 0
     ;;
 
+  # LIBCURL_PC_CFLAGS expands to empty and the -I is appended below, so
+  # this arm's output shape is exactly what it was. What changed is what
+  # the -I points at, because the public header found there is now
+  # GENERATED: cbindgen, run from curl-rs-ffi/build.rs, produces
+  # include/curl/curl.h from the ABI crate, inverting the direction the C
+  # build used, where the header was the source of truth and the internal
+  # option table was derived from it. include/curl/typecheck-gcc.h ships
+  # verbatim beside it as a hand-maintained file, because its 258
+  # curlcheck_ macros give curl_easy_setopt compile-time type checking that
+  # cbindgen cannot express. Note that the directory reported is the one
+  # HOLDING curl/, not curl/ itself, since the headers are included as
+  # <curl/curl.h>.
   --cflags)
     if test "@includedir@" = '/usr/include'; then
       echo '@LIBCURL_PC_CFLAGS@'
@@ -148,6 +295,29 @@ while test "$#" -gt 0; do
     fi
     ;;
 
+  # -lcurl is the one literal in this file that must never change, and
+  # curl-rs-ffi/Cargo.toml earns it by declaring [lib] name = "curl", so
+  # the artifacts really are libcurl.so and libcurl.a rather than
+  # libcurl_rs_ffi.so and libcurl_rs_ffi.a.
+  #
+  # LIBCURL_PC_LIBS_PRIVATE, printed only when the shared library was not
+  # built, is now no more than the platform C runtime: on the two
+  # unknown-linux-gnu triples -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc,
+  # and on the two apple-darwin ones -lSystem -lm with the Security and
+  # CoreFoundation frameworks, plus -lgssapi_krb5 or the GSS framework when
+  # the negotiate feature is on.
+  #
+  # Nothing else appears, because every C library curl used to name became
+  # a statically linked Rust crate. OpenSSL, GnuTLS, mbedTLS and wolfSSL
+  # became rustls; nghttp2 became h2; ngtcp2, nghttp3 and quiche became
+  # quinn, h3 and h3-quinn; libssh2 and libssh became russh; the C brotli
+  # and zstd libraries became the brotli and zstd crates; c-ares became the
+  # system resolver; libidn2 became idna; libpsl became publicsuffix; libuv
+  # became tokio; and zlib became flate2.  spellchecker:disable-line
+  #
+  # ring, the pinned cryptographic provider, contributes nothing here
+  # either: its C and assembly are compiled into the archive, so there is
+  # no external library left to name.
   --libs)
     if test "@libdir@" != '/usr/lib' && test "@libdir@" != '/usr/lib64'; then
       curllibdir="-L@libdir@ "
@@ -161,10 +331,40 @@ while test "$#" -gt 0; do
     fi
     ;;
 
+  # SSL_BACKENDS expands to rustls and to nothing else, because there is no
+  # C TLS library at any configuration -- not as a default, not behind a
+  # feature flag and not as a fallback. No value had to be invented for it:
+  # the public enumerant CURLSSLBACKEND_RUSTLS = 14 already exists in
+  # curl_sslbackend, so curl_global_sslset reports a backend the header has
+  # always declared.
+  #
+  # The spelling is the truthful one. tests/runtests.pl sets its rustls
+  # feature from a rustls-ffi token in the libcurl banner, so emitting
+  # rustls-ffi here would unlock the rustls-gated fixtures -- and would
+  # misdescribe an implementation that uses rustls natively rather than
+  # through its C FFI. Accuracy wins, consistently with under-reporting
+  # being safe and over-reporting not, and the skips are accepted.
+  #
+  # The case is deliberate too: CMakeLists.txt:2055-2062 capitalises its
+  # backend names, but the honest token is the crate's own, lower-case.
   --ssl-backends)
     echo '@SSL_BACKENDS@'
     ;;
 
+  # ENABLE_STATIC expands to yes and libext to a, because the staticlib
+  # crate type produces libcurl.a. The disabled branch is kept exactly as
+  # it was rather than removed as unreachable: reporting the refusal on
+  # stderr and exiting 1 is part of this option's contract, and a
+  # consumer's configure script may well test for that pair.
+  #
+  # LIBCURL_PC_LDFLAGS_PRIVATE expands to empty -- a Rust cdylib needs no
+  # extra link-time flags of its own -- and LIBCURL_PC_LIBS_PRIVATE is the
+  # same native-link set described at the --libs arm above, read from the
+  # same authority so that the two options cannot disagree. Its order is
+  # the one a left-to-right static linker needs, which is why -lc is last.
+  # A Rust staticlib is not self-contained: it carries no reference to the
+  # Rust standard library's own dependencies, so a consumer that omits
+  # these gets undefined symbols rather than a diagnosis.
   --static-libs)
     if test '@ENABLE_STATIC@' != 'no'; then
       echo "@libdir@/libcurl.@libext@ @LIBCURL_PC_LDFLAGS_PRIVATE@ @LIBCURL_PC_LIBS_PRIVATE@"
@@ -174,6 +374,14 @@ while test "$#" -gt 0; do
     fi
     ;;
 
+  # CONFIGURE_OPTIONS used to hold the arguments given to configure. There
+  # is no configure left to give arguments to, so it holds the equivalent
+  # Cargo invocation instead: the target triple and the enabled feature
+  # list, as --target=<triple> --features=<a,b,c>. That is strictly more
+  # informative than what CMakeLists.txt:2077 left here, which was nothing,
+  # and it still answers the question the option is really asked -- how was
+  # this built. The option itself stays: the command-line surface is
+  # frozen, and only the value behind it moved with the build system.
   --configure)
     echo @CONFIGURE_OPTIONS@
     ;;

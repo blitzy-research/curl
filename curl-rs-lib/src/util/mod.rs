@@ -346,7 +346,21 @@
 //   lives in the file.
 // Atomic file creation and seeking -- supersedes `lib/curl_fopen.c` (158)
 // and the cross-platform residue of `lib/curlx/fopen.c` (`curlx_fseek`).
+//   LANDED, and declared below rather than only listed here. The second child
+//   whose contents are conditional, and the first whose gate is written PER
+//   ITEM rather than as an inner attribute: the two C files it supersedes
+//   carry different guards, and an inner `#![cfg]` would hide the seek helper
+//   from `crate::mime`. It is also the second place the layering rule above
+//   is honoured by parameterization -- the random component of the temporary
+//   name is injected, because `Curl_rand_alnum` is now in `crate::crypto`.
 // Line reading from a stream -- supersedes `lib/curl_get_line.c` (67).
+//   LANDED, and declared below rather than only listed here. It carries no
+//   `pub` item: nothing in it is reachable from `curl-rs-ffi`, and its four
+//   consumers -- the cookie jar, the Alt-Svc cache, `.netrc` and the HSTS
+//   cache -- are all inside this crate. Declared unconditionally even though
+//   the C guards the whole file on four `CURL_DISABLE_*` names, because one of
+//   the four has no feature counterpart and the disjunction is therefore
+//   always true.
 // The string-keyed hash table -- supersedes `lib/hash.c` (388).
 //   LANDED, and declared below. It differs from the other two that have
 //   arrived in carrying no `pub` item at all: `lib/hash.h` is an internal
@@ -391,6 +405,14 @@
 //   reason from the first two: it backs no exported symbol, but `timeval` and
 //   `splay` cannot be written before the type every timeout is carried in.
 // The monotonic clock -- supersedes `lib/curlx/timeval.c` (272).
+//   LANDED, and declared below. It backs no exported symbol, so it carries
+//   no `pub` item, and it arrives directly after `timediff` because it is
+//   written in terms of the type that file defines. It is also the one child
+//   with an architectural obligation of its own: it owns the crate's CLOCK
+//   SEAM, so no other module -- here or anywhere in `curl-rs-lib` -- may
+//   read a monotonic or a wall clock directly. AAP 0.3.3's P12 requires the
+//   injection, and the coverage gate of AAP 0.8.4 over the time-driven
+//   `protocols/` and `transfer/` modules is unreachable without it.
 // Integer-keyed bitsets -- supersedes `lib/uint-bset.c` (231) and
 // `lib/uint-spbset.c` (251).
 //   LANDED, and declared below. The third to exist, and the first that backs
@@ -507,6 +529,76 @@ pub(crate) mod dynbuf;
 /// of a condition that would have to be repeated at every future FTP child.
 pub(crate) mod fnmatch;
 
+/// Atomic-replace file creation and stream seeking -- supersedes
+/// `lib/curl_fopen.c` (159 lines) with `lib/curl_fopen.h` (32), and the
+/// cross-platform residue of `lib/curlx/fopen.c` (`curlx_fseek`, `:28-39`)
+/// with the non-Windows half of `lib/curlx/fopen.h` (88).
+///
+/// Declared here rather than only listed above because the file now exists,
+/// which is the rule stated in the twenty-two-children note: a declaration
+/// arrives WITH its file, in the unit of work that creates it.
+///
+/// `pub(crate)` with no `pub` item, like every child except [`parsedate`],
+/// [`strcase`] and [`slist`]: `grep -i fopen lib/libcurl.def` finds nothing,
+/// so no exported symbol is backed from here and nothing in `curl-rs-ffi`
+/// reaches it. Its consumers are the three state-file savers --
+/// `lib/cookie.c:1483`, `lib/altsvc.c:371` and `lib/hsts.c:349` -- all of
+/// which are inside this crate.
+///
+/// It is the SECOND child whose contents are conditional, and unlike
+/// [`fnmatch`] it does NOT carry an inner `#![cfg]`, because the two C
+/// translation units it supersedes carry DIFFERENT guards:
+/// `lib/curl_fopen.c:26-27` is wrapped in
+/// `#if !defined(CURL_DISABLE_COOKIES) || !defined(CURL_DISABLE_ALTSVC) ||
+/// !defined(CURL_DISABLE_HSTS)`, all three of which map onto real names in
+/// the fifteen-name vocabulary, while `lib/curlx/fopen.c` is guarded by
+/// nothing at all. An inner attribute would delete `curlx_fseek`'s successor
+/// along with everything else and hide it from `crate::mime`, which is
+/// unconditional. So the gate is written per item, on exactly the items that
+/// came from the guarded file. The declaration itself stays unconditional
+/// either way, as the policy above requires.
+///
+/// The one thing a reader of THIS file should carry away is the layering
+/// consequence recorded in the preamble: the C reaches `Curl_rand_alnum` in
+/// what is now the sibling `crate::crypto`, so the random component of the
+/// temporary name is INJECTED as a provider argument and the C's
+/// `struct Curl_easy *data` parameter -- which existed only for that one call
+/// -- is dropped entirely. The child also records a measured correction to
+/// `dirslash`: for a path at the filesystem root the directory component
+/// comes back EMPTY, not `"/"`, so the temporary file lands in the current
+/// working directory.
+pub(crate) mod fopen;
+
+/// Whole-line reading from a stream -- supersedes `lib/curl_get_line.c` and
+/// `lib/curl_get_line.h`.
+///
+/// `pub(crate)` with no `pub` item at all, unlike [`parsedate`], [`strcase`]
+/// and [`slist`]: `grep -i get_line lib/libcurl.def` finds nothing, so no
+/// exported symbol is backed from here and no `curl-rs-ffi` consumer can
+/// reach it. Its four consumers -- the Netscape cookie jar, the Alt-Svc
+/// cache, `.netrc` and the HSTS cache -- are all inside this crate, under
+/// `src/cookies/`.
+///
+/// Declared unconditionally, and that is a measured decision rather than an
+/// oversight. The C wraps the whole file in
+/// `#if !defined(CURL_DISABLE_COOKIES) || !defined(CURL_DISABLE_ALTSVC) ||
+/// !defined(CURL_DISABLE_HSTS) || !defined(CURL_DISABLE_NETRC)`
+/// (`lib/curl_get_line.c:26-27`). Three of those four names map to features in
+/// the fifteen-name vocabulary and the fourth does not -- there is no `netrc`
+/// feature, because `.netrc` support is unconditional -- so the disjunction is
+/// always true and the guard has nothing to express. Neither this line nor the
+/// file carries a `cfg`, because a condition naming a feature that does not
+/// exist compiles the code away in silence.
+///
+/// The one thing a reader of THIS file should carry away: **every successful
+/// return ends in a newline, and at end of input the function synthesises a
+/// line consisting solely of one.** `lib/hsts.c:517-520` documents its
+/// reliance on that, so it is a contract rather than an artefact, and the
+/// child records the two further places where the C's behaviour is surprising
+/// -- a chunk truncated at an embedded zero byte, and a carriage return that
+/// is never stripped.
+pub(crate) mod get_line;
+
 /// The string-keyed hash table -- supersedes `lib/hash.c` and `lib/hash.h`.
 ///
 /// Declared here rather than only listed above because the file now exists,
@@ -581,6 +673,26 @@ pub(crate) mod slist;
 /// `u8::to_ascii_uppercase` is the same function as `Curl_raw_toupper`.
 pub(crate) mod strcase;
 
+/// The bounded cursor parser -- supersedes `lib/curlx/strparse.c` and
+/// `lib/curlx/strparse.h`, and additionally owns `lib/curl_ctype.h`.
+///
+/// `pub(crate)` with no `pub` item inside it, unlike [`parsedate`] and
+/// [`strcase`]: `grep curlx_str lib/libcurl.def` finds nothing, so no
+/// exported symbol is backed from here and nothing in `curl-rs-ffi` reaches
+/// it. The `tests/unit` coverage that would have called these functions
+/// through a debug static library relocates into the file's own
+/// `#[cfg(test)]` module, per the policy at the head of this file.
+///
+/// It carries a third C translation unit that the inventory above does not
+/// list, and the reason is recorded here so that its absence from the list
+/// is not read as an oversight. `lib/curl_ctype.h` has no module of its own
+/// anywhere in this layer, yet [`fnmatch`], [`parsedate`], `range` and
+/// [`base64`] all classify bytes curl's way rather than the C library's.
+/// The twenty ASCII-only predicates live here, once, because the
+/// classification decides which byte ends a header value and that decision
+/// is visible in the request bytes the fixture corpus compares.
+pub(crate) mod strparse;
+
 /// Time differences and the millisecond conversions -- supersedes
 /// `lib/curlx/timediff.c` and `lib/curlx/timediff.h`.
 ///
@@ -596,6 +708,30 @@ pub(crate) mod strcase;
 /// has yet to land, never on a module, so that an item added later with no
 /// consumer is still reported.
 pub(crate) mod timediff;
+
+/// The monotonic clock, the instant type and the UTC calendar conversion --
+/// supersedes `lib/curlx/timeval.c` and `lib/curlx/timeval.h`.
+///
+/// `pub(crate)` with no `pub` item, for the same reason as [`timediff`]:
+/// nothing in it backs an exported symbol, so none of it is reachable from
+/// `curl-rs-ffi` and none is re-exported by the crate root. It follows
+/// [`timediff`] immediately because every difference it returns is carried in
+/// that module's `TimeDiff`.
+///
+/// It is the one child of this directory with an obligation beyond its own
+/// correctness: **it owns the clock seam.** No other module in this crate may
+/// call a monotonic or a wall-clock primitive; each one receives a `Clock`
+/// and asks it. That is AAP 0.3.3's P12 applied to time, and it is what makes
+/// the AAP 0.8.4 coverage gate over the time-driven `protocols/` and
+/// `transfer/` modules reachable at all, since every timeout, retry, expiry
+/// and rate limit in them is driven by a clock that a test has to be able to
+/// move. The `TestClock` it exports is deliberately NOT `#[cfg(test)]`, so
+/// that those modules' own tests can inject it.
+///
+/// No `#[allow(dead_code)]` on this declaration, for the reason recorded on
+/// [`timediff`]: the allowances belong on the items, so that an item added
+/// later with no consumer is still reported.
+pub(crate) mod timeval;
 
 /// Integer-keyed bitsets -- supersedes `lib/uint-bset.c` and
 /// `lib/uint-spbset.c`, the pair the inventory above lists together.
@@ -1616,7 +1752,9 @@ mod tests {
         // marker for one of its timezone abbreviations. Naming the string
         // once keeps the suppression to a single line, and spelling the
         // reason out without repeating either flagged token keeps this
-        // explanation from tripping the very gates it describes.
+        // explanation from tripping the gates it describes. The word that
+        // stood between "the" and "gates" was itself one of those gates'
+        // findings, which is why it is no longer here.
         let name = "na\u{ef}ve-caf\u{e9}.txt"; // spellchecker:disable-line
         let path = String::from("directory/") + name;
         let base = basename(&path);

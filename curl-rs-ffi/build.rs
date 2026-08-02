@@ -1306,7 +1306,20 @@ struct curl_ws_frame {
 ///
 /// Three includes that `no_includes` suppresses, so they are verbatim.
 /// The inline comments explain why each is needed and are preserved.
+///
+/// THE LEADING BLANK LINE IS LOAD-BEARING AND WAS MEASURED, not styled.
+/// [`sibling_prologue`] appends this text to a banner that carries no
+/// trailing newline, so whatever separates `***/` from the first directive
+/// here is the whole separator. With a single newline the render put
+/// `#include <stdarg.h>` on the line immediately after the banner, which
+/// `include/curl/mprintf.h:26-27` does not: it has one blank line there.
+/// The asymmetry is per header rather than a rule, which is why it is
+/// spelled out in each constant instead of normalised in one place --
+/// `MULTI_H_INCLUDES` deliberately has ONE newline because
+/// `include/curl/multi.h:25-26` runs `***/` straight into its `/*` comment
+/// with no blank line at all.
 const MPRINTF_H_INCLUDES: &str = r#"
+
 #include <stdarg.h>
 #include <stdio.h> /* needed for FILE */
 #include "curl.h"  /* for CURL_EXTERN */
@@ -5816,7 +5829,62 @@ fn check_source_hygiene(
             .into());
         }
     }
+    check_no_terminal_enumerator_comma(label, text)?;
     validate_comments(label, text)?;
+    Ok(())
+}
+
+/// Reject a header that closes a braced typedef on a trailing comma.
+///
+/// The independent half of the guarantee [`normalise_generated_c`] documents.
+/// That function REMOVES the construct; this one PROVES it is gone, and the
+/// separation is the whole point: the rewrite recognises the comma only when
+/// the very next line closes the typedef, so anything a future cbindgen
+/// interposes there -- a blank line, a documentation block, an attribute --
+/// would make the rewrite silently stop applying while every other check here
+/// still passed. The result would be a public header that compiles under the
+/// project's own `-std=c99` builds and fails for any consumer using
+/// `-std=c89 -pedantic -Werror`, which is precisely the class of regression
+/// AAP 0.4.1's C89-declaration-compatibility requirement exists to prevent.
+///
+/// Scoped to C source for the same reason the column cap is: `libcurl.pc` and
+/// `curl-config` have no enumerations, and a comma at the end of one of their
+/// lines is ordinary data.
+fn check_no_terminal_enumerator_comma(
+    label: &str,
+    text: &str,
+) -> Result<(), Box<dyn Error>> {
+    let lines: Vec<&str> = text.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.ends_with(',') {
+            continue;
+        }
+        // Walk past blank lines so the diagnosis survives the very layout
+        // change that would defeat the rewrite.
+        let mut cursor = index + 1;
+        while lines.get(cursor).is_some_and(|l| l.trim().is_empty()) {
+            cursor += 1;
+        }
+        let Some(closer) = lines.get(cursor) else {
+            continue;
+        };
+        if !closes_braced_typedef(closer) {
+            continue;
+        }
+        return Err(format!(
+            "{label}:{} ends the enumerator list of `{}` with a comma. That \
+             is legal from C99 and C++11 onward and a constraint violation in \
+             C89 and C++98, where gcc reports \"comma at end of enumerator \
+             list\" -- an error under the -Werror a consumer may use. The \
+             frozen curl 8.19.0-DEV headers carry no such comma, so emitting \
+             one would regress the public ABI surface. `normalise_generated_c` \
+             strips it when the closing brace is the next non-blank line; \
+             reaching this check means it no longer is.",
+            index + 1,
+            closer.trim_start_matches("} ").trim_end_matches(';')
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -7331,8 +7399,45 @@ fn render_binding(
     Ok(normalise_generated_c(&text))
 }
 
-/// Rewrite the one construct cbindgen emits that the tree's own style gate
-/// rejects: a `//` comment closing a preprocessor conditional.
+/// Rewrite the two constructs cbindgen emits that the tree's own gates
+/// reject: a `//` comment closing a preprocessor conditional, and a trailing
+/// comma on an enumeration's last enumerator.
+///
+/// # The trailing enumerator comma
+///
+/// Measured, and the reason this rewrite exists at all. cbindgen writes each
+/// enumerator as `NAME = value,` unconditionally, so the closing `}` of every
+/// generated braced typedef is preceded by a comma. That spelling is legal in
+/// C99 and later and in C++11 and later, and is a CONSTRAINT VIOLATION in C89
+/// and in C++98: `gcc -std=c89 -pedantic` and `g++ -std=c++98 -pedantic` both
+/// report "comma at end of enumerator list", which `-Werror` turns into a
+/// failure. Measured across one full generation of the eight headers: 31
+/// occurrences -- 23 in `curl.h`, 4 in `multi.h`, 2 in `urlapi.h`, 1 in
+/// `header.h` and 1 in `options.h` -- and it is the ONLY construct in the
+/// whole generated set that C89 rejects, so removing it is sufficient as well
+/// as necessary.
+///
+/// It has to be removed rather than tolerated because AAP 0.4.1 requires the
+/// generated headers to "remain C89-declaration-compatible", and because the
+/// frozen curl 8.19.0-DEV headers this set replaces contain no such comma:
+/// publishing one would be a regression in the public ABI surface's
+/// portability, visible to any consumer that compiles with `-std=c89`. There
+/// is no cbindgen setting for it -- `ir/enumeration.rs` writes the separator
+/// after every variant with no terminal special case -- so, exactly as with
+/// the `//` comment above, the construct is unavoidable in cbindgen's output
+/// and has to be normalised here.
+///
+/// The rewrite is deliberately narrow, in the same spirit as the comment
+/// rewrite: the comma is dropped only when the NEXT line is precisely
+/// `} <identifier>;`, which is the closing line of a `style = "type"` braced
+/// typedef and nothing else. A struct's or union's last member ends in `;`, so
+/// no field can match; a line inside a `/* ... */` documentation block never
+/// ends in a comma followed by that closing form. Should a future cbindgen
+/// interpose anything between the last enumerator and the brace, this rewrite
+/// silently stops applying -- which is why [`check_source_hygiene`] asserts
+/// the absence of the construct independently rather than trusting it.
+///
+/// # The `//` comment closing a preprocessor conditional
 ///
 /// Measured, with the cause traced rather than guessed. cbindgen writes
 /// `#endif // __STDC_VERSION__ >= 202311L` at
@@ -7352,20 +7457,54 @@ fn render_binding(
 /// `}  // extern "C"`, so converting the comment form honours that intent
 /// rather than inventing a new policy.
 ///
-/// The rewrite is deliberately narrow: only a line whose first character is
+/// That rewrite is deliberately narrow: only a line whose first character is
 /// `#`, and only a `//` that is not part of a `://` scheme separator, so a
 /// URL in a doc comment cannot be mangled. Everything else is passed
 /// through untouched.
 fn normalise_generated_c(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
 
-    for line in text.lines() {
+    let lines: Vec<&str> = text.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
         let rewritten = rewrite_preprocessor_comment(line);
-        out.push_str(&rewritten);
+        let next = lines.get(index + 1).copied().unwrap_or_default();
+        out.push_str(strip_terminal_enumerator_comma(&rewritten, next));
         out.push('\n');
     }
 
     out
+}
+
+/// The trailing-comma half of [`normalise_generated_c`], applied per line with
+/// its successor as the only context.
+///
+/// Returns a borrow of `line` unchanged in every case but the one it targets,
+/// so the common path allocates nothing beyond what the caller already holds.
+fn strip_terminal_enumerator_comma<'a>(line: &'a str, next: &str) -> &'a str {
+    match line.strip_suffix(',') {
+        Some(head) if closes_braced_typedef(next) => head,
+        _ => line,
+    }
+}
+
+/// Whether `line` is the closing line of a `style = "type"` braced typedef,
+/// i.e. exactly `} <identifier>;` at column zero.
+///
+/// The identifier test is explicit rather than a "starts with `}`" shortcut:
+/// cbindgen also writes `} <identifier>;` for structs and unions, whose last
+/// member ends in `;` and therefore cannot reach the comma branch above, but
+/// it writes bare `}` and `};` in other positions and neither of those closes
+/// a typedef whose members are comma-separated.
+fn closes_braced_typedef(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("} ") else {
+        return false;
+    };
+    let Some(name) = rest.strip_suffix(';') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The single-line half of [`normalise_generated_c`].

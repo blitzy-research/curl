@@ -741,10 +741,44 @@ pub(crate) mod tls;
 /// lands.
 pub mod multi;
 
-// THE ELEVEN REMAINING SUBSYSTEMS -- SPECIFIED TARGET DESIGN, NOT DECLARED
+/// The easy interface: one handle, one transfer.
+///
+/// Supersedes `lib/easy.c`, `lib/setopt.c` (308 options), `lib/getinfo.c`
+/// (70 `CURLINFO` accessors) and the generated `lib/easyoptions.c` with
+/// `lib/easygetopt.c`.
+///
+/// The god-struct is decomposed here. `lib/urldata.h` is included nearly
+/// universally in C and concentrates connection, transfer and TLS state in one
+/// declaration; those fields migrate to the module that owns their lifecycle,
+/// and cross-module access becomes an explicit borrow rather than an implicit
+/// reach into shared mutable state.
+///
+/// The option table is NOT declared here. `curl-rs-ffi` is the sole source of
+/// truth for the 308 `CURLoption` identifiers, their backward-compatibility
+/// aliases and the `curl_easyoption` metadata array behind
+/// `curl_easy_option_by_name`, `_by_id` and `_next`; this module CONSUMES that
+/// table. Two tables would drift, and the drift would stay invisible until a
+/// consumer queried an option by name and received the wrong identifier. The
+/// consumption happens in `easy::options`, which owns the lookup algorithm and
+/// the option-identity vocabulary and owns no rows -- and which takes the table
+/// as an argument, because the crate that holds it depends on this one and this
+/// one may never name it.
+///
+/// `pub` because it backs the 21 exported `curl_easy_*` symbols, and because
+/// the "peer verification disabled" state that obliges `curl-rs` to warn on
+/// standard error before proceeding is readable through this surface.
+/// **Partially delivered.** Of this module's planned children, only `options`
+/// exists yet; the easy handle itself, the option setters and the `CURLINFO`
+/// accessors arrive with their files. `easy/mod.rs` is the module root and
+/// declares exactly that one.
+pub mod easy;
+
+// THE TEN REMAINING SUBSYSTEMS -- SPECIFIED TARGET DESIGN, NOT DECLARED
 //
-// The AAP's module graph gives this crate eleven further subsystems. None of
-// their files exists yet, and a `mod` line without its file is E0583 -- a
+// The AAP's module graph gives this crate ten further subsystems; the
+// eleventh, `easy`, is declared above now that the first of its children
+// exists. None of the ten has a file yet, and a `mod` line without its file is
+// E0583 -- a
 // hard error that no `#[allow]` can reach, because module resolution never
 // gets far enough to produce a lint. They are therefore DESCRIBED here, in
 // the same dependency order the declarations above follow, and each
@@ -891,28 +925,6 @@ pub mod multi;
 // `curl_share_init`, `curl_share_setopt`, `curl_share_cleanup` and
 // `curl_share_strerror`.
 //
-// --- easy (pub) ----------------------------------------------------------
-// Supersedes lib/easy.c, setopt.c (308 options), getinfo.c (70 `CURLINFO`
-// accessors) and the generated easyoptions.c with easygetopt.c.
-//
-// The god-struct is decomposed here. lib/urldata.h is included nearly
-// universally in C and concentrates connection, transfer and TLS state in
-// one declaration; those fields migrate to the module that owns their
-// lifecycle, and cross-module access becomes an explicit borrow rather than
-// an implicit reach into shared mutable state.
-//
-// The option table is NOT declared here. `curl-rs-ffi` is the sole source of
-// truth for the 308 `CURLoption` identifiers, their 17 backward-
-// compatibility aliases and the `curl_easyoption` metadata array behind
-// `curl_easy_option_by_name`, `_by_id` and `_next`; this module CONSUMES
-// that table. Two tables would drift, and the drift would stay invisible
-// until a consumer queried an option by name and received the wrong
-// identifier.
-//
-// `pub` because it backs the 21 exported `curl_easy_*` symbols, and because
-// the "peer verification disabled" state that obliges `curl-rs` to warn on
-// standard error before proceeding is readable through this surface.
-
 // MODULE MAP -- the remaining subsystems of the target design.
 //
 // The entries below name the rest of this crate's module graph and the C
@@ -1097,30 +1109,6 @@ pub mod multi;
 // `curl_share_init`, `curl_share_setopt`, `curl_share_cleanup` and
 // `curl_share_strerror`.
 //
-// The easy interface: one handle, one transfer.
-//
-// Supersedes `lib/easy.c`, `lib/setopt.c` (308 options), `lib/getinfo.c`
-// (70 `CURLINFO` accessors) and the generated `lib/easyoptions.c` with
-// `lib/easygetopt.c`.
-//
-// The god-struct is decomposed here. `lib/urldata.h` is included nearly
-// universally in C and concentrates connection, transfer and TLS state in
-// one declaration; those fields migrate to the module that owns their
-// lifecycle, and cross-module access becomes an explicit borrow rather than
-// an implicit reach into shared mutable state.
-//
-// The option table is NOT declared here. `curl-rs-ffi` is the sole source
-// of truth for the 308 `CURLoption` identifiers, their 17
-// backward-compatibility aliases and the `curl_easyoption` metadata array
-// behind `curl_easy_option_by_name`, `_by_id` and `_next`; this module
-// CONSUMES that table. Two tables would drift, and the drift would stay
-// invisible until a consumer queried an option by name and received the
-// wrong identifier.
-//
-// `pub` because it backs the 21 exported `curl_easy_*` symbols, and because
-// the "peer verification disabled" state that obliges `curl-rs` to warn on
-// standard error before proceeding is readable through this surface.
-
 // THE OPTIONAL ALLOCATION LOG -- `memdebug`, default OFF.
 //
 // This is the ONLY wiring this file performs, and it is wiring only: the
