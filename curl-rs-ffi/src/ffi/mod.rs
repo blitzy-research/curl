@@ -94,11 +94,29 @@ pub(crate) mod types;
 // target partition names. Each owns a disjoint slice of the 100 names in
 // `lib/libcurl.def`, and `build.rs`'s `check_export_coverage` asserts that the
 // partition stays disjoint and exhaustive as families land. The six below
-// carry 24 definitions between them; `multi`, `share`, `mime`, `form`, `url`,
-// `ws` and `printf` are not yet declared because they are not yet written.
+// carry 24 definitions between them; `multi`, `share`, `mime`, `form`, `url`
+// and `ws` are not yet declared because they are not yet written.
 pub(crate) mod easy;
 pub(crate) mod escape;
 pub(crate) mod global;
 pub(crate) mod misc;
 pub(crate) mod slist;
 pub(crate) mod strerror;
+
+// The `curl_m*printf` family, declared apart from the six above because it is
+// unlike every other family in this crate in two ways.
+//
+// It needs nothing from `curl-rs-lib`. Specification 0.4.1 maps it from
+// `include/curl/mprintf.h` and `lib/mprintf.c` alone and assigns it no library
+// module, so curl's formatter lives inside it rather than being adapted from
+// somewhere else. That is not a breach of the facade discipline the other
+// families follow: a `printf` implementation is not protocol logic, and there is
+// no protocol logic here to move.
+//
+// And five of its ten symbols are not Rust functions at all. `extern "C" fn
+// f(x: T, ...)` is `error[E0658]` on stable, so the plain-variadic forms are
+// emitted by `global_asm!` -- one prologue per ABI, performing exactly what a C
+// compiler's `va_start` performs -- and only the five `va_list` forms behind
+// them are ordinary `#[no_mangle]` definitions. `build.rs`'s
+// `check_printf_trampolines` enforces that arrangement per symbol.
+pub(crate) mod printf;

@@ -33,8 +33,11 @@
 //!   behind the banner described above.
 //! - `paramhlp` -- `src/tool_paramhlp.c`: the exact numeric, protocol and
 //!   list acceptance rules of curl 8.19.0-DEV.
+//! - `vars` -- `src/var.c` with `src/var.h`: the `--variable` definition
+//!   grammar and the `{{name:func}}` expansion that the `--expand-` option
+//!   prefix drives (`src/tool_getparam.c:2921-2925`, applied at `:2955-2972`).
 //!
-//! # The remaining three -- SPECIFIED TARGET DESIGN, NOT DECLARED
+//! # The remaining two -- SPECIFIED TARGET DESIGN, NOT DECLARED
 //!
 //! Their files do not exist in this checkout, and a `mod` line without its file
 //! is `E0583` -- a hard error no `#[allow]` can reach, because module resolution
@@ -50,7 +53,6 @@
 //!   274 initialiser rows, of which `{ NULL, NULL, 0 }` at `:863` is the
 //!   terminator.
 //! - `ipfs` -- `src/tool_ipfs.c`: IPFS gateway URL translation.
-//! - `vars` -- `src/var.c`: `--variable` expansion.
 
 /// The option surface and the parameter-outcome vocabulary --
 /// `src/tool_getparam.c` with `src/tool_helpers.c`.
@@ -71,3 +73,7 @@ pub(crate) mod libinfo;
 /// The exact numeric, protocol and list acceptance rules of
 /// curl 8.19.0-DEV -- `src/tool_paramhlp.c`.
 pub(crate) mod paramhlp;
+
+/// `--variable` definitions and `{{name:func}}` expansion -- `src/var.c`
+/// with `src/var.h`.
+pub(crate) mod vars;

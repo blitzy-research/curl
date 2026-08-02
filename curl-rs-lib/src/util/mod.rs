@@ -257,15 +257,24 @@
 // private by CONVENTION and visible to the linker, whereas
 // `pub(crate) fn xyz(...) -> Result<..>` is private by ENFORCEMENT.
 //
-// Four of the children nevertheless declare some `pub` items, because a
+// Three of the children nevertheless declare some `pub` items, because a
 // `pub` item inside a `pub(crate)` module becomes reachable once the crate
 // root re-exports it -- the standard private-module / public-re-export idiom
-// -- and four exported C symbols are backed from this layer:
+// -- and the exported C symbols behind them are backed from this layer:
 //
 //   `parsedate`  ->  curl_getdate
 //   `strcase`    ->  curl_strequal, curl_strnequal
-//   `base64`     ->  the encode/decode the auth and MIME paths need
 //   `slist`      ->  curl_slist_append, curl_slist_free_all
+//
+// `base64` was listed here as a fourth while it was still prose, on the
+// reasoning that the authentication and MIME paths need its output. It is
+// NOT one, and the correction is recorded rather than quietly applied:
+// `grep -i base64 lib/libcurl.def` finds nothing, so no exported symbol is
+// backed from that file and every consumer of it -- `auth/`,
+// `protocols/ws`, `mime`, `tls/session_cache`, `cookies/{altsvc,hsts}` --
+// is inside this crate. "The auth path needs it" is a reason to make an
+// item `pub(crate)`, which is already the default here; only an exported
+// symbol or a crate-root re-export justifies `pub`.
 //
 // Those `pub` markers live in the four files themselves, next to the items
 // they widen, where the justification can name the consumer. THIS file adds
@@ -284,40 +293,80 @@
 // zero-`unsafe` guarantee possible. Their coverage relocates into
 // `#[cfg(test)]` modules inside these files.
 
-// THE TWENTY-TWO CHILD MODULES -- TWO LANDED, TWENTY DESCRIBED
+// THE TWENTY-TWO CHILD MODULES -- THOSE DECLARED, AND THOSE DESCRIBED
 //
-// The AAP's transformation map gives this layer twenty-two children. Two exist
-// and are declared further down, `parsedate` and `strcase`; the other twenty
-// are each a separate unit of work and are DESCRIBED here rather than declared.
+// The AAP's transformation map gives this layer twenty-two children. The ones
+// that exist are declared further down, each arriving in the unit of work
+// that creates it; the rest are each a separate unit of work and are
+// DESCRIBED here rather than declared. The declarations below are the
+// authoritative inventory of what has landed, and this paragraph
+// deliberately states the rule instead of a tally: a running count here
+// would be wrong again the moment the next child arrives, and it would put
+// every unit of work that adds one in conflict with every other over the
+// same line.
 //
 // That distinction is load-bearing rather than stylistic.
 // `pub(crate) mod base64;` without `util/base64.rs` on disk is E0583, "file not
 // found for module" -- a hard error, not a warning. One such line stops the
-// whole crate compiling, and twenty of them stop it twenty times over. No
-// `#[allow]` reaches an E0583 either, because module resolution never gets far
-// enough to raise a lint. So each declaration arrives WITH its file, in the
-// unit of work that creates it, and until then the provenance lives in prose
-// where it costs nothing.
+// whole crate compiling, and one for every child still absent stops it that
+// many times over. No `#[allow]` reaches an E0583 either, because module
+// resolution never gets far enough to raise a lint. So each declaration
+// arrives WITH its file, in the unit of work that creates it, and until then
+// the provenance lives in prose where it costs nothing.
 //
 // Each entry is the module and the C translation unit it supersedes, with that
 // unit's line count, so this list stands in for the LIB_CURLX_CFILES and
 // LIB_CFILES groups of `lib/Makefile.inc` for the utility half of the tree.
 // Order is alphabetical, matching `reorder_modules = true` in `rustfmt.toml`.
 //
-// Base64 and base32hex codecs -- supersedes `lib/curlx/base64.c` (267).
+// The base64 and base64url codecs -- supersedes `lib/curlx/base64.c` (267).
+//   LANDED, and declared below. "base32hex" appeared in an earlier draft of
+//   this line and is struck from it: `grep -rni base32 lib/ include/ src/`
+//   finds nothing anywhere in the C tree, so there is no such codec to
+//   supersede. The file carries base64 and base64url and nothing else.
 // The chunked buffer queue -- supersedes `lib/bufq.c` (619).
-// The reference-counted buffer -- supersedes `lib/bufref.c` (138).
+//   LANDED, and declared below. It is the largest single module in this
+//   directory and the substrate the whole connection-filter chain buffers on,
+//   so the layers that consume it cannot be written against a placeholder.
+// The borrowed-or-owned buffer reference -- supersedes `lib/bufref.c` (138).
+//   LANDED, and declared below. Named "reference-counted" in an earlier
+//   reading of this list, which the measurement corrects: `struct bufref`
+//   holds no count. Its `dtor` field is a single owned-versus-borrowed
+//   discriminator, which is `std::borrow::Cow<'_, [u8]>`.
 // The growable dynamic buffer -- supersedes `lib/curlx/dynbuf.c` (292).
+//   LANDED, and declared below. It is the third of the 22 to exist because
+//   its nineteen size limits gate `CURLE_TOO_LARGE` across the DoH, HTTP,
+//   chunked, FTP, IMAP, MQTT, RTSP, HAProxy, proxy-CONNECT, paused-writer,
+//   `aprintf` and TLS file-loading paths, so the modules that supersede any
+//   of those cannot be written without it.
 // Wildcard pattern matching -- supersedes `lib/curl_fnmatch.c` (385).
+//   LANDED, and declared below rather than only listed here. Its contents are
+//   gated on the `ftp` feature, because the whole of the C sits inside
+//   `#ifndef CURL_DISABLE_FTP`; the declaration is unconditional and the gate
+//   lives in the file.
 // Atomic file creation and seeking -- supersedes `lib/curl_fopen.c` (158)
 // and the cross-platform residue of `lib/curlx/fopen.c` (`curlx_fseek`).
 // Line reading from a stream -- supersedes `lib/curl_get_line.c` (67).
 // The string-keyed hash table -- supersedes `lib/hash.c` (388).
+//   LANDED, and declared below. It differs from the other two that have
+//   arrived in carrying no `pub` item at all: `lib/hash.h` is an internal
+//   header, and the two helpers it does export, `Curl_hash_str` and
+//   `curlx_str_key_compare`, are `Curl_`- and `curlx_`-prefixed rather than
+//   members of the 100-symbol export set, so nothing there is reachable from
+//   `curl-rs-ffi` and nothing there needs widening.
 // Address presentation and parsing -- supersedes `lib/curlx/inet_ntop.c`
 // (222) and `lib/curlx/inet_pton.c` (221). ISC-licensed, NOT curl-licensed --
 // a distinction that must survive into the file superseding them.
-// The doubly-linked list -- supersedes `lib/llist.c` (268).
+// The general-purpose ordered collection -- supersedes `lib/llist.c` (268).
+//   LANDED, and declared below. It holds no list type: `VecDeque<T>` is the
+//   successor, per AAP 0.6.9, and the module holds the three helpers that
+//   container lacks plus the documentation of the substitution. It is the
+//   first of the 22 with no `pub` item, because no exported C symbol is
+//   backed from it.
 // Reverse byte search -- supersedes `lib/curl_memrchr.c` (53).
+//   LANDED, and declared below. The only one of the three that backs no
+//   exported symbol: it is declared because the transformation map names it,
+//   and it carries no `pub` item at all.
 // Date parsing -- supersedes `lib/parsedate.c` (585). Backs `curl_getdate`.
 //   LANDED, and declared below rather than only listed here. It is the first
 //   of the 22 to exist because `curl_getdate` is an exported symbol and
@@ -325,23 +374,40 @@
 // Byte-range parsing -- supersedes `lib/curl_range.c` (91).
 // The `curl_slist` chain -- supersedes `lib/slist.c` (139). Backs the exported
 // `curl_slist_append` and `curl_slist_free_all`.
+//   LANDED, and declared below rather than only listed here, for the same
+//   reason as `parsedate` and `strcase`: both of the symbols it backs are
+//   exported, so `curl-rs-ffi` reaches it. The chain itself does not come with
+//   it -- the C-shaped struct stays at the ABI boundary and this module holds
+//   an owned, ordered sequence instead.
 // The splay tree behind expiry timers -- supersedes `lib/splay.c` (291).
 // Case-insensitive comparison -- supersedes `lib/strcase.c` (146) and
 // `lib/strequal.c` (95). Backs `curl_strequal` and `curl_strnequal`.
 //   LANDED, and declared below, for the same reason as `parsedate`: both
 //   comparators are reached from `curl-rs-ffi`.
 // The bounded string parser -- supersedes `lib/curlx/strparse.c` (304).
-// Monotonic time differences -- supersedes `lib/curlx/timediff.c` (85).
+// Time differences and the millisecond conversions -- supersedes
+// `lib/curlx/timediff.c` (85).
+//   LANDED, and declared below. Third of the 22 to exist, and for a different
+//   reason from the first two: it backs no exported symbol, but `timeval` and
+//   `splay` cannot be written before the type every timeout is carried in.
 // The monotonic clock -- supersedes `lib/curlx/timeval.c` (272).
 // Integer-keyed bitsets -- supersedes `lib/uint-bset.c` (231) and
 // `lib/uint-spbset.c` (251).
+//   LANDED, and declared below. The third to exist, and the first that backs
+//   no exported symbol: it is here because `struct Curl_multi` holds four of
+//   the dense sets beside its transfer table, so the multi handle cannot be
+//   written until they do. Two types in the one file, because the AAP maps
+//   both C translation units onto it.
 // The integer-keyed hash -- supersedes `lib/uint-hash.c` (240).
+//   LANDED, and declared below. It is the transfer-identifier to
+//   per-stream-state map for the multiplexed protocols: all three C call
+//   sites construct it with 63 slots and key it on `data->mid`.
 // The integer-keyed table -- supersedes `lib/uint-table.c` (200).
 //
-// The four `pub`-item consumers named in the preamble above -- `parsedate`,
-// `strcase`, `base64` and `slist` -- all appear in that list, and the
-// preamble's rule still governs the two that have yet to arrive: the `pub`
-// marker lives in the child file next to the item it widens, and THIS file adds
+// The three `pub`-item consumers named in the preamble above -- `parsedate`,
+// `strcase` and `slist` -- all appear in that list, and all three have now
+// landed. The preamble's rule governed each of them: the `pub` marker
+// lives in the child file next to the item it widens, and THIS file adds
 // no `pub` item and no `pub use` of any kind.
 
 // ABSORBED SHIM 1 of 6 -- byte order.  `lib/curl_endian.c:24-83`
@@ -375,6 +441,115 @@
 // are kept because NTLM uses all three shapes of read across its type-2
 // message parsing.
 
+/// The base64 codec -- supersedes `lib/curlx/base64.c`.
+///
+/// `pub(crate)` with no `pub` item inside it, which is a departure from what
+/// the preamble above anticipated for this child and is recorded here rather
+/// than left as a silent difference. The preamble grouped `base64` with
+/// `parsedate`, `strcase` and `slist` as a candidate for widening; on
+/// measurement it is not one. `grep -i base64 lib/libcurl.def` finds
+/// nothing, so no exported symbol is backed from that file and no
+/// `curl-rs-ffi` consumer can reach for it. The entry belongs where it now
+/// is: the codec is needed by `auth/`, `protocols/ws`, `mime`,
+/// `tls/session_cache` and `cookies/{altsvc,hsts}`, and every one of those
+/// is inside this crate.
+///
+/// AAP 0.8.7 settles the remaining temptation. `tests/unit/unit1302.c` is
+/// the C unit test for this codec and it calls the internal functions
+/// directly, so widening the surface would make it link -- and that is
+/// exactly the re-export the specification forbids. Its coverage is
+/// relocated into the file's own `#[cfg(test)]` module instead.
+pub(crate) mod base64;
+
+/// The chunked byte queue -- supersedes `lib/bufq.c` and `lib/bufq.h`.
+///
+/// `pub(crate)` with no `pub` item at all, and unlike [`parsedate`] and
+/// [`strcase`] there is no reason for one: no `curl_bufq_*` name appears among
+/// the 100 exported symbols of `lib/libcurl.def`, so nothing in
+/// `curl-rs-ffi` reaches it. It is the buffering substrate the
+/// connection-filter chain sits on, and `CURLE_AGAIN` out of it is how "would
+/// block" travels up that chain.
+pub(crate) mod bufq;
+
+/// The generic buffer reference -- supersedes `lib/bufref.c` and
+/// `lib/bufref.h`.
+///
+/// `pub(crate)` throughout, and unlike [`parsedate`] and [`strcase`] it
+/// carries no `pub` item at all: `lib/libcurl.def` exports no
+/// `curl_bufref_*` symbol, so nothing here is reachable from `curl-rs-ffi`
+/// and nothing needs to be. Its whole content is a `Cow<'_, [u8]>` alias and
+/// five constructors, because the C struct's `dtor` function pointer, its
+/// `0x5c48e9b2` signature and its `ptr || !len` invariant all vanish into the
+/// standard library rather than being reproduced.
+pub(crate) mod bufref;
+
+/// The growable, size-capped byte buffer -- supersedes
+/// `lib/curlx/dynbuf.c` and `lib/curlx/dynbuf.h`.
+///
+/// `pub(crate)` with no `pub` item at all, unlike the two children below it:
+/// nothing in `curl-rs-ffi` reaches this type. Its nineteen size limits are
+/// nevertheless behaviour rather than tuning -- crossing one produces
+/// `CURLE_TOO_LARGE`, a code a caller observes -- which is why they are
+/// transcribed there verbatim from the C header and asserted by test.
+pub(crate) mod dynbuf;
+
+/// Wildcard pattern matching -- supersedes `lib/curl_fnmatch.c`.
+///
+/// `pub(crate)` and nothing wider: no exported symbol is backed from here.
+/// `Curl_fnmatch` is internal, and the ABI surface it is reachable from is
+/// `CURLOPT_FNMATCH_FUNCTION`, which takes a comparator from the user rather
+/// than handing curl's own out.
+///
+/// Declared unconditionally even though its contents are gated. The whole of
+/// the C is inside `#ifndef CURL_DISABLE_FTP`, so the file carries an inner
+/// `#![cfg(feature = "ftp")]` -- the form `crate::ffi::gss` already uses --
+/// which keeps the gate beside the code it governs and leaves this line free
+/// of a condition that would have to be repeated at every future FTP child.
+pub(crate) mod fnmatch;
+
+/// The string-keyed hash table -- supersedes `lib/hash.c` and `lib/hash.h`.
+///
+/// Declared here rather than only listed above because the file now exists,
+/// which is the rule stated in the twenty-two-children note: a declaration
+/// arrives WITH its file, in the unit of work that creates it.
+///
+/// It carries no `pub` item. Nothing in `lib/hash.h` is reachable from
+/// `curl-rs-ffi` -- the C header is internal, and the two helpers it
+/// exports, `Curl_hash_str` and `curlx_str_key_compare`, are `Curl_`- and
+/// `curlx_`-prefixed rather than members of the 100-symbol export set -- so
+/// this child stays entirely `pub(crate)`, unlike [`parsedate`] and
+/// [`strcase`].
+///
+/// The one thing a reader of THIS file should carry away: `HashMap`
+/// iteration order is randomised per process where the C's chained table
+/// walked buckets deterministically. The child documents the per-call-site
+/// audit of that difference, and the conclusion matters to two modules that
+/// have yet to land -- `conn/pool.rs` inherits it, `dns/` does not.
+pub(crate) mod hash;
+
+/// The general-purpose ordered collection -- supersedes `lib/llist.c`.
+///
+/// `pub(crate)` and, unlike [`parsedate`] and [`strcase`], carrying no `pub`
+/// item at all: no exported C symbol is backed from here, so nothing needs to
+/// become reachable through the crate root.
+///
+/// It declares no list type either. `std::collections::VecDeque<T>` is what
+/// replaced `Curl_llist`, and the module holds the three helpers that
+/// container genuinely lacks plus the documentation recording the substitution
+/// -- including the one divergence, that `Curl_llist_destroy` disposes of
+/// elements tail-first where dropping a `VecDeque` disposes of them front to
+/// back.
+pub(crate) mod llist;
+
+/// Reverse byte search -- supersedes `lib/curl_memrchr.c`.
+///
+/// `pub(crate)` with no `pub` item at all, unlike the two children below.
+/// Neither `memrchr` nor `Curl_memrchr` appears in `lib/libcurl.def`, so no
+/// exported symbol is backed from there and nothing in `curl-rs-ffi` reaches
+/// it. Its single function delegates to the `memchr` crate, which the crate
+/// manifest already declares for exactly that purpose.
+pub(crate) mod memrchr;
+
 /// Date parsing -- supersedes `lib/parsedate.c`.
 ///
 /// `pub(crate)` like every other child: its own `pub fn getdate` is what
@@ -382,6 +557,18 @@
 /// justification for that `pub` lives in the file, next to the item, as the
 /// policy above requires.
 pub(crate) mod parsedate;
+
+/// The `curl_slist` string list -- supersedes `lib/slist.c` and
+/// `lib/slist.h`.
+///
+/// The third child that carries `pub` items, and for the same reason as
+/// [`parsedate`] and [`strcase`]: `curl_slist_append` and
+/// `curl_slist_free_all` are exported symbols, at `lib/libcurl.def:85-86`, so
+/// the items backing them are `pub` there. The intrusive chain does NOT come
+/// with them -- the `#[repr(C)]` `struct curl_slist` lives only in
+/// `curl-rs-ffi/src/ffi/slist.rs`, and this child exposes an owned, ordered
+/// sequence with no node type and no successor pointer.
+pub(crate) mod slist;
 
 /// Locale-independent ASCII case comparison -- supersedes the public half of
 /// `lib/strcase.c` and all of `lib/strequal.c`.
@@ -393,6 +580,73 @@ pub(crate) mod parsedate;
 /// transcribed -- the file records the entry-by-entry measurement proving
 /// `u8::to_ascii_uppercase` is the same function as `Curl_raw_toupper`.
 pub(crate) mod strcase;
+
+/// Time differences and the millisecond conversions -- supersedes
+/// `lib/curlx/timediff.c` and `lib/curlx/timediff.h`.
+///
+/// The third child to land, and the first that carries NO `pub` item: unlike
+/// [`parsedate`] and [`strcase`], nothing in it backs an exported symbol, so
+/// every item is `pub(crate)` and none is re-exported by the crate root. It
+/// is nevertheless the base of the time half of this layer -- the monotonic
+/// clock (`timeval`) and the expiry splay tree (`splay`) both take their
+/// `TimeDiff` from here -- which is why it exists before either of them.
+///
+/// No `#[allow(dead_code)]` appears on this declaration, deliberately: the
+/// visibility policy above places that allowance on the ITEM whose consumer
+/// has yet to land, never on a module, so that an item added later with no
+/// consumer is still reported.
+pub(crate) mod timediff;
+
+/// Integer-keyed bitsets -- supersedes `lib/uint-bset.c` and
+/// `lib/uint-spbset.c`, the pair the inventory above lists together.
+///
+/// The third child to land, and unlike [`parsedate`] and [`strcase`] it backs
+/// no exported symbol: it carries no `pub` item and nothing in it is reachable
+/// from `curl-rs-ffi`. It exists this early because the multi handle cannot be
+/// written without it -- `struct Curl_multi` holds four of these bitsets beside
+/// its transfer table (`lib/multihandle.h:90-95`), and the state machine keys
+/// all of them by transfer identifier.
+///
+/// Two types rather than one, because the C has two whose guarantees genuinely
+/// differ: the dense set has a capacity that `add` enforces and that a
+/// downward resize truncates, while the sparse set holds any `u32`. The file
+/// records which representation each one uses and why the answers differ.
+pub(crate) mod uint_bset;
+
+/// The integer-keyed hash -- supersedes `lib/uint-hash.c` (240 lines) and
+/// `lib/uint-hash.h` (61).
+///
+/// `pub(crate)` with no `pub` item inside it, unlike [`parsedate`] and
+/// [`strcase`]: no exported symbol is backed from here. Its consumers are
+/// `crate::protocols::http2` and `crate::protocols::http3`, for which it is
+/// the transfer-identifier to per-stream-state map -- all three C call sites
+/// construct it with 63 slots and key it on `data->mid`. The C's own unit
+/// test, `tests/unit/unit1616.c`, relocates into the file as a
+/// `#[cfg(test)]` module, per the policy recorded above.
+pub(crate) mod uint_hash;
+
+/// The integer-keyed table that assigns `mid` -- supersedes
+/// `lib/uint-table.c` and `lib/uint-table.h`.
+///
+/// The third child to land, and `pub(crate)` with no `pub` item at all: the
+/// table backs no exported symbol, so nothing in it is reachable from
+/// `curl-rs-ffi` and none of it is re-exported by the crate root.
+///
+/// It is the one module in this layer whose OUTPUT is frozen behaviour rather
+/// than merely its behaviour. The key it hands out is the transfer identifier
+/// `mid`, and `mid` is printed in trace output -- `lib/multi.c:529`, `:887`
+/// and five further sites the file enumerates -- so the round-robin key
+/// assignment of `lib/uint-table.c:116-150` is transcribed rather than
+/// improved, and `tests/unit/unit3212.c` is ported into it assertion by
+/// assertion.
+///
+/// Carries no `#[allow(dead_code)]` on this declaration by design: an
+/// attribute on a `mod` covers the module's whole contents, which
+/// `mod source_policy`'s
+/// `no_lint_level_for_dead_code_is_set_on_a_crate_or_module_root` rejects for
+/// the reason given at the head of this file. The allowances are written at
+/// the items instead.
+pub(crate) mod uint_table;
 
 /// Reads a 16-bit unsigned integer in little-endian order.
 ///
@@ -1346,12 +1600,27 @@ mod tests {
     /// coverage is identical and the hygiene gate stays green.
     #[test]
     fn basename_borrows_and_respects_character_boundaries() {
-        // "directory/na<U+00EF>ve-caf<U+00E9>.txt": the two accented
-        // characters occupy two bytes each in UTF-8, so the tail begins at
-        // byte 10 and spans 16 bytes rather than 14 characters' worth.
-        let path = String::from("directory/na\u{ef}ve-caf\u{e9}.txt");
+        // "directory/na<U+00EF>ve-caf<U+00E9>.txt": spellchecker:disable-line
+        // the two accented characters occupy two bytes each in UTF-8, so the
+        // tail begins at byte 10 and spans 16 bytes rather than 14
+        // characters' worth.
+        //
+        // The marker above and the one on the binding below are the
+        // repository's documented suppression for a false positive, not a
+        // concession that anything here is spelled wrongly. Both spell
+        // checkers split the literal at the `\u{..}` escape and read the
+        // three ASCII letters left in front of it as a truncated English
+        // word. `.github/scripts/typos.toml:19` registers
+        // `.*spellchecker:disable-line` for exactly this case, and
+        // `curl-rs-lib/src/util/parsedate.rs:276` already uses the same
+        // marker for one of its timezone abbreviations. Naming the string
+        // once keeps the suppression to a single line, and spelling the
+        // reason out without repeating either flagged token keeps this
+        // explanation from tripping the very gates it describes.
+        let name = "na\u{ef}ve-caf\u{e9}.txt"; // spellchecker:disable-line
+        let path = String::from("directory/") + name;
         let base = basename(&path);
-        assert_eq!(base, "na\u{ef}ve-caf\u{e9}.txt");
+        assert_eq!(base, name);
         assert!(std::ptr::eq(base.as_bytes(), &path.as_bytes()[10..]));
 
         // A separator immediately before multi-byte text.

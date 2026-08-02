@@ -6,9 +6,10 @@
 # SANITIZER.
 #
 # The gate, verbatim: AddressSanitizer with zero errors across the FFI surface.
-# This file adds `--locked`, an explicit target triple, `-Zbuild-std`,
-# `--all-targets`, and assertions that the instrumentation was real and the run
-# was not vacuous. Nothing else.
+# This file installs a pinned nightly, rebuilds the standard library under
+# instrumentation, exercises the FFI surface from Rust AND from a real C
+# consumer, and asserts that the instrumentation was genuine, that the run was
+# not vacuous, and that the detectors are still able to fire. Nothing else.
 #
 # It does nothing further. The build lives in rust-build.yml, lint in
 # rust-clippy.yml, the tests in rust-test.yml, undefined behaviour in
@@ -24,20 +25,22 @@
 #   Miri INTERPRETS. It models the abstract machine, so it sees violations of
 #   the language's rules - an invalidated pointer, a data race in its model, an
 #   aliasing rule broken - including in code paths that a concrete execution
-#   would optimise away. What it cannot do is run code it has no shim for, and
-#   it cannot execute the FFI boundary against a real allocator.
+#   would optimise away. What it cannot do is execute FOREIGN FUNCTIONS: it has
+#   no shim for a call that arrives from C, and it cannot run against a real
+#   allocator.
 #
 #   ASan EXECUTES. It instruments real machine code and real allocations, so it
 #   sees what actually happens at the boundary this workspace exists to
 #   provide: an out-of-bounds access through a raw pointer handed in by a C
-#   caller, a use-after-free of a `Box::into_raw`'d handle, a leak of a handle
-#   the C side never freed. Those are exactly the failure modes of an FFI shim,
-#   and they are the ones Miri is worst placed to find.
+#   caller, a use-after-free of a `Box::into_raw`'d handle, a leak of an
+#   allocation the C side never freed. Those are exactly the failure modes of an
+#   FFI shim, and they are the ones Miri is worst placed to find.
 #
-# So the two gates have different subjects. Miri's is `curl-rs-lib`, the safe
-# engine. This one's is the FFI surface: `curl-rs-ffi`, the C ABI shim built as
-# a cdylib and staticlib, plus `curl-rs-lib/src/ffi/`, the one sanctioned
-# `unsafe` island in the engine.
+# So the two gates have different subjects, and the split is not a division of
+# convenience. Miri's subject is `curl-rs-lib`, the safe engine.
+# THIS one's subject is the FFI surface, and the consequence worth stating
+# plainly is that `curl-rs-ffi`'s C boundary IS AUDITED HERE AND NOT BY MIRI.
+# Neither crate is unaudited; they are audited by the gate that can see them.
 #
 # LINEAGE. This file succeeds the sanitizer legs of
 # .github/workflows/linux.yml, which built the C tree under
@@ -46,17 +49,45 @@
 # sanitizer over C code, and the ten-gate framework this file belongs to names
 # only AddressSanitizer. Adding the other three here would be scope this file
 # does not have; Miri covers a large part of what UBSan covered, and safe Rust
-# plus a single-threaded engine covers most of what TSan did.
+# plus a single-threaded engine covers most of what TSan did. linux.yml itself
+# is untouched - it is a source for this file, not a target.
 #
 # WHY curl-rs IS NOT A SUBJECT. The command-line crate carries
-# `#![forbid(unsafe_code)]` at its root and has no `mod ffi`, so it contains no
-# `unsafe` block for ASan to find anything in - a claim the compiler enforces
-# rather than one this comment asserts. It is also not part of "the FFI
-# surface", which is what gate 6 names. Note that instrumentation is not
-# narrowed to the named packages anyway: RUSTFLAGS plus `-Zbuild-std` rebuilds
-# and instruments the ENTIRE dependency graph including the standard library,
-# so an error inside rustls, quinn or `core` reached from the FFI surface is
-# still caught here.
+# `#![forbid(unsafe_code)]` at its root with no exemption and declares no
+# `mod ffi`, so it contains no `unsafe` block for ASan to find anything in - a
+# claim the compiler enforces rather than one this comment asserts. It is also
+# not part of "the FFI surface", which is what gate 6 names. Note that
+# instrumentation is not narrowed to the named packages anyway: RUSTFLAGS plus
+# a standard-library rebuild instruments the ENTIRE dependency graph including
+# `core`, `alloc` and `std`, so an error inside rustls, quinn or `core` reached
+# from the FFI surface is still caught here.
+#
+# TWO PROFILE FACTS FROM THE ROOT Cargo.toml THAT THIS GATE DEPENDS ON.
+#
+#   1. `[profile.release] debug = 1` exists partly FOR THIS GATE. Debug
+#      information is what lets the sanitizer runtime turn a report into a
+#      function-and-line list instead of a column of raw addresses, and a
+#      report nobody can read is barely a report. The steps below build with
+#      the DEV profile rather than release, because dev carries fuller debug
+#      information again (`debug = 2` by default) and this gate has no interest
+#      in optimised code - it has an interest in legible reports. The release
+#      setting still matters, because the C-consumer leg links the same
+#      artifacts a downstream consumer would and because rust-build.yml's
+#      release output must stay symbolisable. Measured here: symbolisation only
+#      materialises when an `llvm-symbolizer` binary is reachable, which is why
+#      one is installed and pointed at explicitly below.
+#
+#   2. `panic = "abort"` is PROHIBITED workspace-wide, and the reason is
+#      architectural rather than stylistic: unwinding must never cross the C
+#      ABI, so `curl-rs-ffi` CONTAINS a panic at the boundary
+#      (`src/ffi/panic_boundary.rs`, whose `guard`, `guard_ptr` and `guard_void`
+#      wrap every exported function) instead of letting it abort the host
+#      process. Nothing in this file may add `panic = "abort"` or a codegen flag
+#      equivalent to it, however much simpler that would make a sanitizer
+#      configuration, because it would delete the very boundary semantics this
+#      gate exists to validate. The standard-library rebuild is consequently
+#      spelled with the UNWINDING panic runtime - `panic_unwind`, never
+#      `panic_abort`.
 
 name: 'Rust sanitizer'
 
@@ -79,6 +110,12 @@ name: 'Rust sanitizer'
       - 'Dockerfile'
       - 'projects/**'
 
+# A deny-list, deliberately, and never an allow-list. An allow-list would have
+# to enumerate every path that can affect memory safety, and the day it missed
+# `curl-rs-ffi/src/**` this gate would stay silent on exactly the change it
+# exists to judge. The four entries below are the ones linux.yml ignores and
+# cannot influence a Rust build.
+
 concurrency:
   group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}'
   cancel-in-progress: true
@@ -86,10 +123,10 @@ concurrency:
 permissions: {}
 
 env:
-  # Colour off. Two steps below parse tool output with `grep`, `sed` and `awk`
-  # to decide a verdict, and an ANSI escape sequence embedded in a diagnostic
-  # would make an anchored pattern silently stop matching. An assertion that
-  # silently stops matching is worse than no assertion.
+  # Colour off. Several steps below parse tool output with `grep`, `sed` and
+  # `awk` to decide a verdict, and an ANSI escape sequence embedded in a
+  # diagnostic would make an anchored pattern silently stop matching. An
+  # assertion that silently stops matching is worse than no assertion.
   CARGO_TERM_COLOR: never
 
   # A nightly toolchain and the locked dependency graph are both downloaded
@@ -97,18 +134,19 @@ env:
   # gate and send somebody hunting for a memory error that is not there.
   CARGO_NET_RETRY: '3'
 
-  # No cache is restored in this job, so incremental state is output that
-  # nothing ever reads. Not a speed tuning - performance is an explicit
-  # non-goal of this work and no step below is ordered or configured for it.
+  # No cache is restored in this job - see the cache decision recorded on the
+  # job's timeout below - so incremental state is output that nothing ever
+  # reads. Not a speed tuning: performance is an explicit non-goal of this work
+  # and no step below is ordered or configured for it.
   CARGO_INCREMENTAL: '0'
 
   # THE NIGHTLY PIN. A DATED channel, never the moving `nightly` alias, for the
   # same reason rust-miri.yml pins its own: with a moving channel an unchanged
   # commit gains or loses findings over time, in both directions, and neither
   # direction is detectable after the fact because the log of the earlier run
-  # names a nightly that no longer resolves to the same compiler. `-Zsanitizer`
-  # and `-Zbuild-std` are both unstable, so their behaviour is explicitly
-  # allowed to change between nightlies.
+  # names a nightly that no longer resolves to the same compiler. The sanitizer
+  # flag and the standard-library rebuild are both unstable, so their behaviour
+  # is explicitly allowed to change between nightlies.
   #
   # This is a SEPARATE copy of the pin from the one in rust-miri.yml, and the
   # duplication is deliberate: the two gates are independent, and being able to
@@ -116,52 +154,106 @@ env:
   # a single value. Neither belongs in rust-toolchain.toml, which pins the
   # stable channel every other leg builds on and records that the nightly
   # belongs to "the Miri and AddressSanitizer gates" which "name it explicitly
-  # per invocation".
+  # per invocation" - and which says of this file that it "installs its own
+  # dated nightly with rust-src". This env var is that dated nightly. It is
+  # also, deliberately, not a renovate-managed pin: rust-toolchain.toml owns the
+  # toolchain policy for the workspace, and neither renovate.json nor
+  # .github/dependabot.yml is touched by this file.
   #
   # MEASURED, because the naming is counter-intuitive: a dated nightly channel
   # is the channel PUBLISHED on that date and carries a compiler BUILT THE
   # PREVIOUS DAY. nightly-2026-07-31 resolves to
   # `rustc 1.99.0-nightly (8ab9fdff5 2026-07-30)`, and it ships `rust-src`,
-  # which `-Zbuild-std` requires.
+  # which the standard-library rebuild requires.
   NIGHTLY_TOOLCHAIN: 'nightly-2026-07-31'
 
-  # -Zbuild-std demands an explicit --target: without one, cargo would apply
-  # RUSTFLAGS to build scripts and proc-macros as well, and a build script
-  # linked against the sanitizer runtime fails to run. Naming the triple splits
-  # host artifacts from target artifacts and is what makes the instrumented
-  # build work at all.
+  # An explicit target triple is MANDATORY for a standard-library rebuild:
+  # without one, cargo applies RUSTFLAGS to build scripts and proc-macro crates
+  # as well, and a build script linked against the sanitizer runtime fails to
+  # run. Naming the triple splits host artifacts from target artifacts and is
+  # what makes the instrumented build work at all.
   #
-  # x86_64-unknown-linux-gnu is one of the four mandated targets and the one
-  # ubuntu-latest runs natively. ASan requires executing the instrumented code,
-  # so the other three would need an emulator or a foreign runner; compilation
-  # for all four is gate 1 and is asserted in rust-build.yml.
+  # x86_64-unknown-linux-gnu is one of the four mandated targets and the one an
+  # Ubuntu runner executes natively. ASan requires RUNNING the instrumented
+  # code, so the other three - aarch64-unknown-linux-gnu, x86_64-apple-darwin
+  # and aarch64-apple-darwin - would need an emulator or a foreign runner.
+  # Compilation for all four is gate 1 and is asserted in rust-build.yml; this
+  # gate deliberately does not duplicate it.
   ASAN_TARGET: 'x86_64-unknown-linux-gnu'
 
-  # The sanitizer itself. This is the whole gate expressed as a compiler flag.
+  # THE SANITIZER FLAG, held here as the single source of truth and mapped onto
+  # the real RUSTFLAGS variable by a STEP-SCOPED `env:` on each instrumented
+  # step - never at workflow scope, and never at repository scope.
   #
-  # It is set as RUSTFLAGS rather than passed after `--` so that it applies to
-  # every crate in the graph rather than only to the top-level one. An
+  # Why the scoping is load-bearing rather than tidy. `.cargo/config.toml`
+  # deliberately sets NO rustflags for any target, and records why: an unstable
+  # compiler flag placed there "would be rejected by the pinned toolchain and
+  # would break EVERY build, not just those two legs". The same file refuses a
+  # deny-warnings flag on a second ground that applies here too - rustflags
+  # participate in Cargo's fingerprint, so a flag visible to more steps than
+  # need it forces rebuilds and destroys per-gate attribution. Keeping the flag
+  # on the steps that sanitize means the toolchain install, the version probes,
+  # the dependency fetch and the working-tree check all run un-instrumented,
+  # and a failure in any of them is unambiguously theirs.
+  #
+  # It is set through RUSTFLAGS rather than passed after `--` so that it reaches
+  # every crate in the graph rather than only the top-level one. An
   # uninstrumented dependency is a blind spot, and the interesting allocations
-  # in this workspace - rustls buffers, quinn packet buffers, the `Box`ed handles
-  # the C ABI hands out - live in dependencies.
-  RUSTFLAGS: '-Zsanitizer=address'
+  # in this workspace - rustls buffers, quinn packet buffers, the `Box`ed
+  # handles the C ABI hands out - live in dependencies.
+  ASAN_RUSTFLAGS: '-Zsanitizer=address'
 
-  # ASan's own configuration, and each option earns its place:
+  # The standard-library rebuild, as a cargo flag rather than a rustc one. This
+  # is why it is NOT part of ASAN_RUSTFLAGS: rustc rejects it outright, and the
+  # resulting "unknown -Z flag" would look like a broken pin rather than a
+  # misplaced argument. `std,panic_unwind` and never `panic_abort`, for the
+  # panic-containment reason recorded in this file's prologue.
   #
-  #   detect_leaks=1                  a handle that C never frees is a leak,
-  #                                   and leak detection is the single most
-  #                                   relevant check for an ownership-transfer
-  #                                   boundary built on Box::into_raw.
-  #   abort_on_error=1                stop at the first error with a core-worthy
-  #                                   abort rather than unwinding through more
-  #                                   code and producing a second, derived
-  #                                   report that obscures the first.
+  # Without this, an out-of-bounds write that lands inside a `Vec`'s buffer is
+  # invisible, which is most of them.
+  ASAN_BUILD_STD: '-Zbuild-std=std,panic_unwind'
+
+  # ASan's own run-time configuration, mapped onto ASAN_OPTIONS by a
+  # step-scoped `env:` alongside RUSTFLAGS. Each option earns its place:
+  #
+  #   detect_leaks=1                  an allocation C never frees is a leak, and
+  #                                   leak detection is the single most relevant
+  #                                   check for an ownership-transfer boundary
+  #                                   built on Box::into_raw. It is ON, and the
+  #                                   positive control below proves it fires.
+  #   abort_on_error=1                stop at the first error rather than
+  #                                   unwinding through more code and producing
+  #                                   a second, derived report that obscures the
+  #                                   first. Note the consequence for anything
+  #                                   that reads an exit status: an aborting
+  #                                   process reports 134, not 1, so the
+  #                                   assertions below test for the REPORT TEXT
+  #                                   and for a non-zero status, never for 1.
+  #   allocator_may_return_null=1     restores malloc's contract - a request the
+  #                                   allocator cannot serve returns NULL. ASan
+  #                                   otherwise treats an over-large request as
+  #                                   a fatal `allocation-size-too-big` error,
+  #                                   which is not a memory-safety finding but
+  #                                   an emulation gap: it makes an
+  #                                   out-of-memory branch unreachable and so
+  #                                   UNTESTABLE. curl-rs-lib/src/ffi/gss.rs
+  #                                   contains exactly such a test - it hands a
+  #                                   security-context buffer an impossible
+  #                                   length to prove the fallible reservation
+  #                                   REPORTS CURLE_OUT_OF_MEMORY rather than
+  #                                   aborting the host process - and it already
+  #                                   carries a `cfg_attr(miri, ignore)` for the
+  #                                   same emulation gap in the interpreter.
+  #                                   This option narrows nothing that this gate
+  #                                   is for: measured here, the leak and
+  #                                   use-after-free controls below both still
+  #                                   fire with it enabled.
   #   strict_string_checks=1          C string functions are checked for reading
   #                                   past a terminator, which is precisely what
-  #                                   a mis-sized CStr conversion does.
+  #                                   an incorrectly sized CStr conversion does.
   #   detect_stack_use_after_return=1 catches returning a pointer into a frame
   #                                   that has gone, the classic way an FFI shim
-  #                                   leaks a dangling pointer to C.
+  #                                   hands C a dangling pointer.
   #   check_initialization_order=1    and
   #   strict_init_order=1             catch a static initialiser reading another
   #                                   static that has not run yet - reachable
@@ -169,8 +261,11 @@ env:
   #                                   foreign runtime whose init order is not
   #                                   Rust's.
   #
-  # Measured: with all six enabled, both subjects below pass with zero reports.
-  ASAN_OPTIONS: 'detect_leaks=1:abort_on_error=1:strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1'
+  # detect_leaks is NEVER set to 0, and there is no blanket suppression file.
+  # The one narrowing that exists is a single named leak rule, written inline
+  # below, individually justified there, and accounted for by an exact
+  # count-and-bytes assertion so it cannot quietly grow.
+  ASAN_RUNTIME_OPTIONS: 'detect_leaks=1:abort_on_error=1:allocator_may_return_null=1:strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1'
 
   # Deterministic execution, so that the log the assertion steps parse reads the
   # same every time, and a full backtrace when something does fire - an ASan
@@ -185,29 +280,67 @@ env:
   # `negotiate` feature. That module's extern block carries
   # `#[cfg_attr(target_os = "linux", link(name = "gssapi_krb5"))]`, and an
   # instrumented test binary is a LINKED artifact, so the step asks the linker
-  # for `-lgssapi_krb5`. With no provider installed the leg dies with
-  # `rust-lld: error: unable to find library -lgssapi_krb5`, which this file
-  # would then have to report as "an FFI surface that cannot be instrumented"
-  # when the truth is a missing system package.
+  # for the GSS-API provider. With none installed the leg dies with an
+  # unable-to-find-library error, which this file would then have to report as
+  # "an FFI surface that cannot be instrumented" when the truth is a missing
+  # system package.
   #
-  # `libgssapi_krb5.so` - the UNVERSIONED symlink a linker resolves against, not
-  # the `libgssapi_krb5.so.2` a runtime needs - ships only in the MIT Kerberos
-  # development package. Same name and same value as rust-build.yml's env block,
-  # deliberately: gates that link the same feature set must not disagree about
-  # what that feature set requires.
+  # The UNVERSIONED `libgssapi_krb5.so` symlink - the one a linker resolves
+  # against, not the versioned object a runtime needs - ships only in the MIT
+  # Kerberos development package. Same name and same value as rust-build.yml's
+  # env block, deliberately: gates that link the same feature set must not
+  # disagree about what that feature set requires.
   NATIVE_LINK_PACKAGES: 'libkrb5-dev'
 
+  # THE SYMBOLISATION AND C-CONSUMER PREREQUISITES.
+  #
+  # `llvm` supplies `llvm-symbolizer`, without which every frame of every report
+  # is a bare hexadecimal offset. Measured here: with no symbolizer reachable a
+  # genuine leak printed twenty-eight unresolved addresses, and with one it
+  # printed `curl::ffi::escape::curl_easy_escape` followed by the exact
+  # `panic_boundary.rs` line - the difference between a report and a puzzle.
+  # This is what the debug-information settings in the root Cargo.toml are for.
+  #
+  # `clang` links the C-consumer leg. It is clang rather than the default C
+  # compiler on purpose: rustc's instrumentation is LLVM's, so linking the C
+  # driver with LLVM's own sanitizer runtime keeps ONE runtime in the process
+  # image instead of asking two implementations to share an allocator.
+  SYMBOLIZER_PACKAGES: 'llvm clang'
+
 jobs:
+  # ONE job, and no matrix. Gate 6 names one sanitizer over one surface;
+  # cross-target coverage is gate 1 and belongs to rust-build.yml. A matrix here
+  # would multiply a standard-library rebuild across targets this runner cannot
+  # execute, and would report the same verdict several times under different
+  # names - the opposite of "a failure names its own cause".
   asan:
     name: 'AddressSanitizer over the FFI surface'
 
+    # ubuntu-latest, the tree's most common label. The choice is forced rather
+    # than conventional: AddressSanitizer must EXECUTE the instrumented code, so
+    # the runner architecture has to match ASAN_TARGET, and the sanitizer
+    # runtime plus a standard-library rebuild are best supported on
+    # x86_64-unknown-linux-gnu. The slimmer image is not used because this job
+    # installs system packages and needs a full apt environment.
     runs-on: ubuntu-latest
 
-    # -Zbuild-std recompiles core, alloc and std from source under
-    # instrumentation, twice over (once per subject, with different features),
-    # and there is no cache. The budget is generous for that reason; a gate that
-    # times out reports a timeout, which teaches a reader nothing about memory
-    # safety.
+    # A standard-library rebuild recompiles core, alloc and std from source
+    # under instrumentation, and it does so more than once here because the two
+    # ASan subjects are configured with different feature sets and the
+    # C-consumer leg links a third artifact. The budget is generous for that
+    # reason; the tree's usual 10 or 15 minutes would expire mid-build, and a
+    # gate that times out reports a timeout, which teaches a reader nothing
+    # about memory safety.
+    #
+    # THE CACHE DECISION, recorded rather than left implicit: nothing is cached.
+    # A cache keyed on the nightly pin would shorten the rebuild, but an
+    # instrumented standard library is exactly the artifact whose staleness
+    # would be invisible - a restored `std` compiled by a different nightly, or
+    # compiled before the sanitizer flag was added, produces a green run with a
+    # blind spot rather than an error. Rebuilding every time costs minutes and
+    # buys certainty, and this gate is not on the critical path of a merge.
+    # Performance is an explicit non-goal of this work, so the trade is not
+    # close.
     timeout-minutes: 60
 
     steps:
@@ -224,27 +357,33 @@ jobs:
           # rust-toolchain.toml pins a STABLE channel and deliberately does not
           # pin a nightly, naming this file and rust-miri.yml as the two gates
           # that install one for themselves. So installing the nightly is this
-          # workflow's job.
+          # workflow's job, and rust-toolchain.toml is not modified - it is owned
+          # elsewhere and correct as it stands.
           #
-          # rust-src is the component `-Zbuild-std` needs: it is the standard
-          # library's SOURCE, and without it there is nothing to rebuild under
-          # instrumentation. miri is deliberately NOT requested - that component
-          # belongs to rust-miri.yml and downloading it here would be dead
-          # weight.
+          # rust-src is the component the standard-library rebuild needs: it is
+          # the standard library's SOURCE, and without it there is nothing to
+          # rebuild under instrumentation. miri is deliberately NOT requested -
+          # that component belongs to rust-miri.yml and downloading it here
+          # would be dead weight.
           #
           # --profile minimal because nothing in this job needs rustfmt, clippy
           # or rust-docs. --no-self-update keeps rustup itself fixed. --override
           # is deliberately NOT passed: it would write a directory override and
           # mutate the state of the checkout, and every invocation below names
-          # +${NIGHTLY_TOOLCHAIN} instead.
+          # the toolchain explicitly instead.
+          #
+          # There is no Rust-toolchain action anywhere in this repository, so
+          # rustup is driven directly. The only two actions this tree pins are
+          # checkout and cache, and only checkout is used here.
           command -v rustup
           rustup --version
 
           if [ -z "${NIGHTLY_TOOLCHAIN}" ]; then
             echo 'FAIL: NIGHTLY_TOOLCHAIN is empty.'
-            echo 'An empty value would make every +NIGHTLY_TOOLCHAIN use below collapse to a bare'
-            echo 'invocation on the pinned STABLE channel, where -Zsanitizer and -Zbuild-std do not'
-            echo 'exist, and the failure would look like an unknown flag rather than a missing pin.'
+            echo 'An empty value would make every explicit-toolchain use below collapse to a bare'
+            echo 'invocation on the pinned STABLE channel, where the sanitizer flag and the'
+            echo 'standard-library rebuild do not exist, and the failure would look like an unknown'
+            echo 'flag rather than a missing pin.'
             exit 1
           fi
 
@@ -256,9 +395,9 @@ jobs:
             *)
               echo "FAIL: NIGHTLY_TOOLCHAIN is '${NIGHTLY_TOOLCHAIN}', which is not a dated nightly."
               echo 'It must be exactly nightly-YYYY-MM-DD. The moving nightly alias is what this'
-              echo 'pin exists to prevent: -Zsanitizer and -Zbuild-std are unstable, so with a'
-              echo 'moving channel an unchanged commit gains or loses findings over time and the'
-              echo 'gate stops being a statement about the commit.'
+              echo 'pin exists to prevent: the sanitizer flag and the standard-library rebuild are'
+              echo 'unstable, so with a moving channel an unchanged commit gains or loses findings'
+              echo 'over time and the gate stops being a statement about the commit.'
               exit 1
               ;;
           esac
@@ -279,6 +418,49 @@ jobs:
             exit "${status}"
           fi
 
+      - name: 'install the native-link, symbolisation and C-consumer prerequisites'
+        run: |
+          # Its own step, for the same attribution reason as every other step in
+          # this family: a missing system package must be reported as a missing
+          # system package and not as a memory-safety verdict. See this file's
+          # env block for why each package is required.
+          #
+          # The house apt pattern, taken verbatim from rust-build.yml.
+          sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
+          sudo apt-get -o Dpkg::Use-Pty=0 update
+          sudo apt-get -o Dpkg::Use-Pty=0 install \
+            ${NATIVE_LINK_PACKAGES} \
+            ${SYMBOLIZER_PACKAGES}
+
+          # Prove the linker input exists, by the name the Rust `link` attribute
+          # actually asks for rather than by the package name.
+          echo '::group::the GSS-API provider the --all-features subject will link'
+          krb5-config --libs gssapi
+          ldconfig -p | grep -F 'libgssapi_krb5.so' || true
+          echo '::endgroup::'
+
+          # And prove the two tools the reports and the C leg depend on are
+          # reachable. `command -v`, never the deprecated alternative.
+          echo '::group::symbolisation and C-consumer tooling'
+          if ! command -v llvm-symbolizer > /dev/null 2>&1; then
+            echo 'FAIL: llvm-symbolizer is not on PATH after installing the LLVM package.'
+            echo 'Without it every sanitizer report degrades to unresolved addresses, which'
+            echo 'defeats the debug-information settings this gate relies on. Fix the install'
+            echo 'rather than accepting unreadable reports.'
+            exit 1
+          fi
+          if ! command -v clang > /dev/null 2>&1; then
+            echo 'FAIL: clang is not on PATH after installing the LLVM package.'
+            echo 'The C-consumer leg links the instrumented static library with LLVM'"'"'s own'
+            echo 'sanitizer runtime; without clang that leg cannot be built.'
+            exit 1
+          fi
+          command -v llvm-symbolizer
+          llvm-symbolizer --version || true
+          command -v clang
+          clang --version | head -n 1
+          echo '::endgroup::'
+
       - name: 'toolchain versions'
         run: |
           # Evidence before use. Every verdict this workflow reaches is a
@@ -288,6 +470,7 @@ jobs:
           command -v rustup
           rustc "+${NIGHTLY_TOOLCHAIN}" --version
           cargo "+${NIGHTLY_TOOLCHAIN}" --version
+          rustc "+${NIGHTLY_TOOLCHAIN}" --print host-tuple
           echo '::endgroup::'
 
           # Printed for contrast, not for use. Bare `cargo` in this directory
@@ -299,10 +482,14 @@ jobs:
           cargo --version
           echo '::endgroup::'
 
-          echo '::group::sanitizer configuration actually in effect'
-          echo "RUSTFLAGS     = ${RUSTFLAGS}"
-          echo "ASAN_OPTIONS  = ${ASAN_OPTIONS}"
-          echo "ASAN_TARGET   = ${ASAN_TARGET}"
+          echo '::group::sanitizer configuration this gate will apply, step-scoped'
+          echo "ASAN_RUSTFLAGS       = ${ASAN_RUSTFLAGS}"
+          echo "ASAN_BUILD_STD       = ${ASAN_BUILD_STD}"
+          echo "ASAN_RUNTIME_OPTIONS = ${ASAN_RUNTIME_OPTIONS}"
+          echo "ASAN_TARGET          = ${ASAN_TARGET}"
+          echo 'These are applied as RUSTFLAGS and ASAN_OPTIONS by a step-scoped env block on'
+          echo 'the sanitizing steps only. They are deliberately absent from .cargo/config.toml,'
+          echo 'from Cargo.toml and from this workflow-level environment under those names.'
           echo '::endgroup::'
 
           echo '::group::rust-toolchain.toml (the pin this gate deliberately bypasses)'
@@ -315,10 +502,13 @@ jobs:
           # authoritative for a bare `cargo`, so in this checkout `rustc
           # --version` reports the pinned stable release. An explicit
           # `+toolchain` argument outranks that file, which is why every
-          # invocation in this job carries +${NIGHTLY_TOOLCHAIN}. A gate that
-          # merely assumed the override wins would be a gate that silently ran
-          # on stable - where `-Zsanitizer` is rejected outright - the day that
-          # ever changed.
+          # invocation in this job carries one. A gate that merely ASSUMED the
+          # override wins would be a gate that silently ran on stable - where
+          # the sanitizer flag is rejected outright - the day that ever changed.
+          #
+          # If the override ever stops winning, the fix is a step-scoped
+          # RUSTUP_TOOLCHAIN env entry on the steps below. It is NEVER an edit to
+          # rust-toolchain.toml.
           nightly_rustc="$(rustc "+${NIGHTLY_TOOLCHAIN}" --version)"
           nightly_cargo="$(cargo "+${NIGHTLY_TOOLCHAIN}" --version)"
 
@@ -326,9 +516,9 @@ jobs:
             *nightly*) ;;
             *)
               echo "FAIL: rustc +${NIGHTLY_TOOLCHAIN} reports '${nightly_rustc}', not a nightly."
-              echo '-Zsanitizer and -Zbuild-std are unstable, so this gate cannot run on stable.'
-              echo 'Add a step-scoped RUSTUP_TOOLCHAIN to the steps in this file; do not edit'
-              echo 'rust-toolchain.toml, which is owned elsewhere and correct as it stands.'
+              echo 'The sanitizer flag and the standard-library rebuild are unstable, so this gate'
+              echo 'cannot run on stable. Add a step-scoped RUSTUP_TOOLCHAIN to the steps in this'
+              echo 'file; do not edit rust-toolchain.toml, which is owned elsewhere.'
               exit 1
               ;;
           esac
@@ -344,10 +534,14 @@ jobs:
           esac
 
           # The pinned channel must exist under its own name. rustup does not
-          # silently substitute a different toolchain for an explicit `+name`, so
+          # silently substitute a different toolchain for an explicit name, so
           # this is what proves the install step materialised the pin rather than
           # the job coasting on a nightly the runner image happened to ship.
-          if ! rustup toolchain list | grep -q -E "^${NIGHTLY_TOOLCHAIN}(-|\b)"; then
+          # `grep -c` rather than `grep -q` for the same reason as the nm check
+          # further down: it consumes the whole stream, so the result cannot
+          # depend on whether the shell promotes a producer's SIGPIPE.
+          installed_pin="$(rustup toolchain list | grep -c -E "^${NIGHTLY_TOOLCHAIN}(-|\b)" || true)"
+          if [ "${installed_pin}" -eq 0 ]; then
             echo "FAIL: ${NIGHTLY_TOOLCHAIN} is not among the installed toolchains:"
             rustup toolchain list | sed 's/^/  /'
             exit 1
@@ -379,26 +573,81 @@ jobs:
             echo "FAIL: rustc reports build date ${rustc_date}, outside [${floor}, ${pinned_date}]."
             echo "  NIGHTLY_TOOLCHAIN : ${NIGHTLY_TOOLCHAIN}"
             echo "  rustc             : ${nightly_rustc}"
-            echo 'The +toolchain argument resolved to a different dated channel than the pin names.'
-            echo 'A verdict from an unpinned sanitizer is not reproducible, so this gate refuses to'
-            echo 'report one. Fix the pin; do not widen this window to make it pass.'
+            echo 'The explicit-toolchain argument resolved to a different dated channel than the'
+            echo 'pin names. A verdict from an unpinned sanitizer is not reproducible, so this gate'
+            echo 'refuses to report one. Fix the pin; do not widen this window to make it pass.'
             exit 1
           fi
 
           # rust-src, checked directly rather than inferred from the install
-          # step's exit status. Without it `-Zbuild-std` fails with a message
-          # about a missing `std` source that reads like a broken toolchain
-          # rather than a missing component.
+          # step's exit status. Without it the standard-library rebuild fails
+          # with a message about a missing `std` source that reads like a broken
+          # toolchain rather than a missing component.
           sysroot="$(rustc "+${NIGHTLY_TOOLCHAIN}" --print sysroot)"
           if [ ! -f "${sysroot}/lib/rustlib/src/rust/library/std/Cargo.toml" ]; then
             echo 'FAIL: the rust-src component is not present in the pinned nightly sysroot:'
             echo "  ${sysroot}/lib/rustlib/src/rust/library/std/Cargo.toml"
-            echo '-Zbuild-std rebuilds the standard library from source under instrumentation, so'
+            echo 'The standard-library rebuild compiles std from source under instrumentation, so'
             echo 'without rust-src there is nothing to instrument and std stays a blind spot.'
             exit 1
           fi
 
           echo "pinned nightly ${NIGHTLY_TOOLCHAIN} is active, dated ${rustc_date}, with rust-src present"
+
+      - name: 'declare the instrumented surface, and what is NOT instrumented'
+        run: |
+          # The log has to say what this gate actually looked at, because a
+          # green result is otherwise a claim without a scope. Under-claiming is
+          # safe here; over-claiming is not.
+          echo '::group::INSTRUMENTED: the FFI surface'
+          echo 'curl-rs-ffi  the C ABI shim, built as a cdylib and a staticlib with [lib] name'
+          echo '             = "curl", so its artifacts are libcurl.so and libcurl.a. This is'
+          echo '             where every exported #[no_mangle] pub extern "C" function lives, and'
+          echo '             where Box::into_raw hands ownership to C and Box::from_raw takes it'
+          echo '             back. A double free, a use-after-free or a leak in that transfer is'
+          echo '             precisely an AddressSanitizer finding, and it is the reason this gate'
+          echo '             exists. The export set is asserted by rust-abi.yml, not here.'
+          echo 'curl-rs-lib/src/ffi/  the one sanctioned unsafe island in the engine crate:'
+          echo '             mod.rs, sys.rs (the residue of socket and host calls that socket2'
+          echo '             cannot absorb) and gss.rs (the optional GSS-API binding).'
+          echo 'the standard library and the whole dependency graph, rebuilt from source under'
+          echo '             instrumentation, so an error inside core, alloc, std, rustls or quinn'
+          echo '             reached from the FFI surface is caught too.'
+          echo 'the C-consumer leg below, which enters the ABI the way a linked C program does.'
+          echo '::endgroup::'
+
+          echo '::group::NOT instrumented, stated honestly'
+          echo 'Under DEFAULT features curl-rs-lib/src/ffi/gss.rs is NOT instrumented, because'
+          echo 'the negotiate feature that compiles it is default-off. That is why the second'
+          echo 'subject below runs --all-features rather than defaults: without the flag this'
+          echo 'gate would clear an FFI surface while never compiling, let alone instrumenting,'
+          echo 'the largest single body of unsafe in the crate. Read the two subjects together:'
+          echo 'gss.rs is covered by the --all-features subject and by nothing else here.'
+          echo
+          echo 'A caveat on --all-features that must be reported rather than papered over: of'
+          echo 'the workspace features, hickory-dns is the one with no pinned dependency behind'
+          echo 'it - it is a declared name that no crate currently backs, and the capability is'
+          echo 'withheld through the version banner rather than through a build failure. If'
+          echo '--all-features ever fails to build or link for that reason, the failure is a'
+          echo 'DEPENDENCY GAP owned by curl-rs-lib/Cargo.toml and must be reported as such. It'
+          echo 'is not a memory-safety finding, and this gate must not be narrowed to hide it.'
+          echo
+          echo 'curl-rs, the command-line crate, is not a subject: it forbids unsafe_code with'
+          echo 'no exemption, declares no mod ffi, and is not part of the FFI surface gate 6'
+          echo 'names. Its behaviour is covered by rust-test.yml and curl-testsuite.yml.'
+          echo '::endgroup::'
+
+          echo '::group::WHO OWNS A FAILURE OF THIS WORKFLOW'
+          echo '(a) the nightly install, the rust-src component or the standard-library rebuild'
+          echo '    fails  ->  THIS WORKFLOW. Advance or repair the pin here.'
+          echo '(b) a compilation or link error appears once the sanitizer flag is applied, or a'
+          echo '    system package is missing  ->  THIS WORKFLOW. It is a build-configuration'
+          echo '    problem, and an FFI surface that cannot be instrumented cannot be cleared.'
+          echo '(c) an AddressSanitizer or LeakSanitizer REPORT appears - heap-use-after-free,'
+          echo '    double-free, buffer overflow, leak  ->  A DEFECT IN curl-rs-ffi OR IN'
+          echo '    curl-rs-lib/src/ffi/*, owned by those crates. This workflow reports it with'
+          echo '    a symbolised frame list and does not work around it.'
+          echo '::endgroup::'
 
       - name: 'fetch the locked dependency graph'
         run: |
@@ -408,90 +657,150 @@ jobs:
           # The pinned nightly's cargo does the fetching, because that is the
           # cargo the instrumented builds below use, and a lockfile that one
           # cargo accepts and another rejects should fail here rather than three
-          # steps later.
+          # steps later. No network access is needed by the tests themselves -
+          # the resolver, the clock and the TLS provider are injected rather than
+          # reached for globally - so this is the only step that wants a network.
           cargo "+${NIGHTLY_TOOLCHAIN}" fetch --locked --target "${ASAN_TARGET}"
 
-      - name: 'install the native-link prerequisites for negotiate'
+      - name: 'write the one narrow leak suppression, and prove it is narrow'
         run: |
-          # Its own step, for the same attribution reason as every other step in
-          # this family: a missing system package must be reported as a missing
-          # system package and not as a memory-safety verdict. See this file's env
-          # block for why the --all-features subject below cannot link without it.
+          # THE ONE NARROWING IN THIS GATE, justified individually as required
+          # rather than applied as policy.
           #
-          # The house apt pattern, taken verbatim from rust-build.yml.
-          sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
-          sudo apt-get -o Dpkg::Use-Pty=0 update
-          sudo apt-get -o Dpkg::Use-Pty=0 install \
-            ${NATIVE_LINK_PACKAGES}
+          # THE SPECIFIC REPORT, measured on this tree:
+          #   ERROR: LeakSanitizer: detected memory leaks
+          #   Direct leak of 8 byte(s) in 1 object(s) allocated from:
+          #     ... CString::new::<&str>
+          #     ... curl::ffi::misc::tests::the_string_helper_truncates_at_an_interior_nul
+          #         curl-rs-ffi/src/ffi/misc.rs:694
+          #
+          # WHY IT IS A FALSE POSITIVE - a sanitizer artefact of Rust `static`
+          # storage, not a defect. The allocation is made by `immortal_c_string`
+          # (curl-rs-ffi/src/ffi/misc.rs), whose whole contract is to LEAK: it
+          # backs curl_version and curl_version_info, whose C signatures hand out
+          # a `const char *` that must stay valid for the life of the process,
+          # and the C it supersedes used `static` buffers for exactly these
+          # strings. In production the pointer stays reachable from a static, so
+          # LeakSanitizer finds a root and reports nothing. The report above comes
+          # from a #[cfg(test)] function that calls the helper DIRECTLY to assert
+          # its documented truncation behaviour and then discards the pointer,
+          # which makes an intentionally immortal allocation unreachable at exit.
+          #
+          # WHY THE RULE NAMES A TEST AND NOT THE HELPER: measured here, a rule
+          # naming `immortal_c_string` does not match, because the helper is
+          # inlined into its caller and never appears as its own frame. A rule
+          # naming the file or the module DOES match but would silence the whole
+          # of misc.rs, including the exported functions. The test function's own
+          # name is the narrowest pattern that matches - and no exported ABI
+          # symbol is or could be called that, so this rule cannot mask a real
+          # finding in the C boundary.
+          #
+          # WHY NOT FIX IT INSTEAD: curl-rs-ffi/src/** is owned by another crate
+          # and is not this workflow's to edit. The finding is REPORTED loudly
+          # below so it reaches its owner.
+          #
+          # detect_leaks stays 1. This is one named rule, not a blanket
+          # suppression, and the step after the subjects asserts its exact hit
+          # count and byte total so it cannot silently grow.
+          supp="${RUNNER_TEMP}/lsan-immortal-strings.supp"
+          cat > "${supp}" <<'LSAN_SUPPRESSIONS'
+          leak:the_string_helper_truncates_at_an_interior_nul
+          LSAN_SUPPRESSIONS
 
-          # Prove the linker input exists, by the name the Rust `#[link]`
-          # attribute actually asks for rather than by the package name.
-          echo '::group::the GSS-API provider the --all-features subject will link'
-          krb5-config --libs gssapi
-          ldconfig -p | grep -F 'libgssapi_krb5.so' || true
+          # Leak rules must travel in LSAN_OPTIONS, never ASAN_OPTIONS: measured
+          # here, ASan parses its own suppression vocabulary only and rejects a
+          # `leak:` rule outright with "failed to parse suppressions".
+          echo '::group::the suppression file, in full'
+          cat "${supp}"
           echo '::endgroup::'
 
-          echo 'the MIT Kerberos development package is installed'
+          rules="$(grep -c -E '^[[:space:]]*[^[:space:]#]' "${supp}" || true)"
+          if [ "${rules}" -ne 1 ]; then
+            echo "FAIL: the suppression file carries ${rules} rules; exactly 1 is permitted."
+            echo 'Every additional rule widens what this gate cannot see. If another false'
+            echo 'positive genuinely appears, justify it in this step the way the first one is'
+            echo 'justified and raise this bound deliberately - never quietly.'
+            exit 1
+          fi
+
+          echo 'REPORTED FINDING, for the owner of curl-rs-ffi/src/ffi/misc.rs:'
+          echo '  the #[cfg(test)] function the_string_helper_truncates_at_an_interior_nul calls'
+          echo '  immortal_c_string directly and drops the returned pointer, so an allocation that'
+          echo '  is immortal BY DESIGN becomes unreachable at process exit and LeakSanitizer'
+          echo '  reports 8 bytes. Nothing in the shipped ABI leaks; the production callers keep'
+          echo '  the pointer reachable from a static. Holding the pointer in the test - or'
+          echo '  reclaiming it there - would remove the need for the suppression above.'
 
       - name: 'asan: curl-rs-ffi, the C ABI shim'
+        env:
+          # STEP-SCOPED, on the sanitizing step only. See the env block for why
+          # this may not live in .cargo/config.toml, in Cargo.toml, or at
+          # workflow scope under these names.
+          RUSTFLAGS: '${{ env.ASAN_RUSTFLAGS }}'
+          ASAN_OPTIONS: '${{ env.ASAN_RUNTIME_OPTIONS }}'
+          LSAN_OPTIONS: 'suppressions=${{ runner.temp }}/lsan-immortal-strings.supp:print_suppressions=1'
+          ASAN_SYMBOLIZER_PATH: '/usr/bin/llvm-symbolizer'
         run: |
-          # SUBJECT ONE: the crate that is the FFI surface. Built as a cdylib and
-          # a staticlib, it is where `Box::into_raw` hands ownership to C and
-          # `Box::from_raw` takes it back, and where every raw pointer a C caller
+          # SUBJECT ONE: the crate that IS the FFI surface. Built as a cdylib and
+          # a staticlib, it is where Box::into_raw hands ownership to C and
+          # Box::from_raw takes it back, and where every raw pointer a C caller
           # supplies is first touched.
           #
           # --all-targets, and this is not cosmetic. It selects lib, bins, tests
           # and benches, and it EXCLUDES doctests. Measured: with doctests
-          # included the run fails with `error: linking with cc failed` during
-          # the doctest link step, because rustdoc's per-doctest link does not
-          # pick up the sanitizer runtime under -Zbuild-std. That is a limitation
-          # of the toolchain, not a finding about this workspace, and it would
-          # otherwise turn this gate permanently red for a reason unrelated to
-          # memory safety. Doctests are executed unsanitized by rust-test.yml,
-          # so nothing goes unrun.
+          # included the run fails during the doctest link step, because rustdoc's
+          # per-doctest link does not pick up the sanitizer runtime when the
+          # standard library has been rebuilt. That is a limitation of the
+          # toolchain, not a finding about this workspace, and it would otherwise
+          # turn this gate permanently red for a reason unrelated to memory
+          # safety. Doctests are executed uninstrumented by rust-test.yml, so
+          # nothing goes unrun.
           #
-          # -Zbuild-std so that core, alloc and std are themselves instrumented.
-          # Without it, an out-of-bounds write that lands inside a `Vec`'s buffer
-          # is invisible, which is most of them.
+          # The dev profile, not release: this gate wants the fullest debug
+          # information it can get, because that is what turns a report into a
+          # frame list. See the prologue on the root Cargo.toml's debug setting.
           log="${RUNNER_TEMP}/asan-ffi.log"
           status=0
           cargo "+${NIGHTLY_TOOLCHAIN}" test \
             --locked \
-            -Zbuild-std \
+            "${ASAN_BUILD_STD}" \
             --target "${ASAN_TARGET}" \
             -p curl-rs-ffi \
             --all-targets 2>&1 | tee "${log}" || status=$?
 
           if [ "${status}" -ne 0 ]; then
             echo "FAIL: AddressSanitizer run over curl-rs-ffi exited ${status}."
-            echo 'If the log above contains an "ERROR: AddressSanitizer" block, that block is the'
-            echo 'finding and its Rust frame list names the offending code. If it does not, the'
-            echo 'failure is a compilation or link failure of the instrumented build, which is'
-            echo 'still this gate: an FFI surface that cannot be instrumented cannot be cleared.'
+            echo 'If the log above contains an "ERROR: AddressSanitizer" or "ERROR: LeakSanitizer"'
+            echo 'block, that block is the finding and its symbolised frame list names the'
+            echo 'offending code - owner (c) in the ownership map printed earlier. If it does not,'
+            echo 'the failure is a compilation or link failure of the instrumented build - owner'
+            echo '(b) - which is still this gate: an FFI surface that cannot be instrumented'
+            echo 'cannot be cleared.'
             exit "${status}"
           fi
 
           echo 'curl-rs-ffi under AddressSanitizer: exit 0'
 
       - name: 'asan: curl-rs-lib --all-features, the sanctioned unsafe island'
+        env:
+          RUSTFLAGS: '${{ env.ASAN_RUSTFLAGS }}'
+          ASAN_OPTIONS: '${{ env.ASAN_RUNTIME_OPTIONS }}'
+          LSAN_OPTIONS: 'suppressions=${{ runner.temp }}/lsan-immortal-strings.supp:print_suppressions=1'
+          ASAN_SYMBOLIZER_PATH: '/usr/bin/llvm-symbolizer'
         run: |
-          # SUBJECT TWO: `curl-rs-lib/src/ffi/`, the only place in the engine
-          # where `unsafe` is permitted - `mod sys` for the socket and host calls
-          # that have no safe expression, and `mod gss` for the optional GSS-API
-          # binding.
+          # SUBJECT TWO: curl-rs-lib/src/ffi/, the only place in the engine where
+          # unsafe is permitted - mod sys for the socket and host calls that have
+          # no safe expression, and mod gss for the optional GSS-API binding.
           #
-          # --all-features is load-bearing here rather than thoroughness for its
-          # own sake. `mod gss` sits behind the default-off `negotiate` feature,
-          # and it is the largest single body of `unsafe` in the crate. Without
-          # the flag this gate would clear an FFI surface while never compiling,
-          # let alone instrumenting, most of it.
-          #
-          # --all-targets for the same measured reason as the step above.
+          # --all-features is load-bearing rather than thoroughness for its own
+          # sake: mod gss sits behind the default-off negotiate feature, and the
+          # step that declared the surface said so explicitly. --all-targets for
+          # the same measured reason as the step above.
           log="${RUNNER_TEMP}/asan-lib.log"
           status=0
           cargo "+${NIGHTLY_TOOLCHAIN}" test \
             --locked \
-            -Zbuild-std \
+            "${ASAN_BUILD_STD}" \
             --target "${ASAN_TARGET}" \
             -p curl-rs-lib \
             --all-features \
@@ -501,28 +810,374 @@ jobs:
             echo "FAIL: AddressSanitizer run over curl-rs-lib --all-features exited ${status}."
             echo 'A failure here with curl-rs-ffi green points at curl-rs-lib/src/ffi/ - most'
             echo 'likely mod gss, which only exists under the negotiate feature this step enables.'
+            echo 'If the message is about a MISSING DEPENDENCY rather than memory, re-read the'
+            echo 'hickory-dns caveat printed by the surface-declaration step: that is a dependency'
+            echo 'gap to be reported to curl-rs-lib/Cargo.toml, not a reason to drop the flag.'
             exit "${status}"
           fi
 
           echo 'curl-rs-lib --all-features under AddressSanitizer: exit 0'
 
+      - name: 'build the instrumented static library for the C consumer'
+        env:
+          RUSTFLAGS: '${{ env.ASAN_RUSTFLAGS }}'
+          ASAN_OPTIONS: '${{ env.ASAN_RUNTIME_OPTIONS }}'
+          ASAN_SYMBOLIZER_PATH: '/usr/bin/llvm-symbolizer'
+        run: |
+          # The two subjects above enter the FFI surface from Rust. That is
+          # necessary and not sufficient: the exported functions exist to be
+          # called from C, and a Rust test calling curl_easy_escape is not a C
+          # program linking against libcurl.a. The next two steps close that gap
+          # by building the real static library under instrumentation and linking
+          # a real C consumer against it, so Box::into_raw and Box::from_raw are
+          # crossed the way a downstream consumer crosses them.
+          status=0
+          cargo "+${NIGHTLY_TOOLCHAIN}" build \
+            --locked \
+            "${ASAN_BUILD_STD}" \
+            --target "${ASAN_TARGET}" \
+            -p curl-rs-ffi || status=$?
+
+          if [ "${status}" -ne 0 ]; then
+            echo "FAIL: the instrumented cdylib/staticlib build exited ${status}."
+            echo 'Owner (b): the artifacts a C consumer links could not be produced under'
+            echo 'instrumentation, so the C-consumer leg below cannot run.'
+            exit "${status}"
+          fi
+
+          archive="target/${ASAN_TARGET}/debug/libcurl.a"
+          shared="target/${ASAN_TARGET}/debug/libcurl.so"
+
+          for artifact in "${archive}" "${shared}"; do
+            if [ ! -f "${artifact}" ]; then
+              echo "FAIL: ${artifact} was not produced."
+              echo 'curl-rs-ffi declares crate-type cdylib and staticlib with [lib] name = "curl",'
+              echo 'so both artifacts must exist. If one is missing, the crate configuration'
+              echo 'changed and this gate no longer audits what it claims to.'
+              exit 1
+            fi
+          done
+
+          echo '::group::instrumented artifacts a C consumer would link'
+          ls -l "${archive}" "${shared}"
+          echo '::endgroup::'
+
+      - name: 'asan: a real C consumer crossing the ownership boundary'
+        env:
+          ASAN_OPTIONS: '${{ env.ASAN_RUNTIME_OPTIONS }}'
+          ASAN_SYMBOLIZER_PATH: '/usr/bin/llvm-symbolizer'
+        run: |
+          # The driver is written to RUNNER_TEMP and never into the checkout, so
+          # the working-tree assertion at the end of this job stays meaningful and
+          # no source file is added to the repository. It deliberately does not
+          # live under docs/examples/ - those 129 programs are reference material,
+          # compiled and never edited - nor under .github/scripts/.
+          #
+          # It declares only the prototypes it calls rather than including
+          # include/curl/curl.h. That is a scope decision, not laziness: whether
+          # the generated header DECLARES the ABI correctly is rust-abi.yml's
+          # gate, and compiling against it here would duplicate that gate and
+          # blur which workflow a failure belongs to. What this leg asserts is
+          # narrower and complementary - that the ownership transfer BEHAVES
+          # correctly at run time when a C caller performs it.
+          #
+          # The heredoc is quoted so the shell expands nothing inside the C
+          # source.
+          driver="${RUNNER_TEMP}/curl_asan_consumer.c"
+          binary="${RUNNER_TEMP}/curl_asan_consumer"
+          cat > "${driver}" <<'CURL_ASAN_DRIVER'
+          /* A C consumer of the instrumented libcurl.a, used only by
+             .github/workflows/rust-asan.yml. Declares exactly the entry points it calls.
+
+             Three modes. "clean" must be silent; "leak" and "uaf" are POSITIVE CONTROLS
+             that must produce a report, and they are what proves this gate can still
+             fail. */
+          #include <stdio.h>
+          #include <string.h>
+
+          struct curl_slist { char *data; struct curl_slist *next; };
+
+          extern int   curl_global_init(long flags);
+          extern void  curl_global_cleanup(void);
+          extern void  curl_free(void *p);
+          extern char *curl_easy_escape(void *handle, const char *string, int length);
+          extern char *curl_easy_unescape(void *h, const char *s, int len, int *outlen);
+          extern char *curl_getenv(const char *variable);
+          extern char *curl_version(void);
+          extern const char *curl_easy_strerror(int code);
+          extern struct curl_slist *curl_slist_append(struct curl_slist *l, const char *d);
+          extern void  curl_slist_free_all(struct curl_slist *list);
+          extern int   curl_strequal(const char *s1, const char *s2);
+
+          /* Provided by the sanitizer runtime. Declared rather than included so the
+             driver needs no sanitizer headers on the include path. */
+          extern int __lsan_do_recoverable_leak_check(void);
+
+          /* Rust allocates, C reads, C releases through the ABI's own deallocator. This
+             is the ownership transfer the gate exists to audit, crossed for real. */
+          static int clean_roundtrip(void)
+          {
+            struct curl_slist *list = NULL;
+            char *escaped;
+            char *unescaped;
+            char *banner;
+            char *from_env;
+            int outlength = 0;
+            int i;
+
+            if (curl_global_init(3L) != 0) {
+              fprintf(stderr, "curl_global_init refused\n");
+              return 1;
+            }
+
+            escaped = curl_easy_escape(NULL, "a b/c?d=e&f", 0);
+            if (escaped == NULL) {
+              fprintf(stderr, "curl_easy_escape returned NULL\n");
+              return 1;
+            }
+            printf("escaped   = %s\n", escaped);
+            curl_free(escaped);
+
+            unescaped = curl_easy_unescape(NULL, "a%20b%2Fc", 0, &outlength);
+            if (unescaped == NULL) {
+              fprintf(stderr, "curl_easy_unescape returned NULL\n");
+              return 1;
+            }
+            printf("unescaped = %s (%d bytes)\n", unescaped, outlength);
+            curl_free(unescaped);
+
+            /* A chain grown one node at a time and released in a single call, so both
+               the per-node allocation and the whole-chain teardown are exercised. */
+            for (i = 0; i < 64; i++) {
+              struct curl_slist *grown = curl_slist_append(list, "X-Probe: value");
+              if (grown == NULL) {
+                fprintf(stderr, "curl_slist_append refused at %d\n", i);
+                curl_slist_free_all(list);
+                return 1;
+              }
+              list = grown;
+            }
+            curl_slist_free_all(list);
+
+            from_env = curl_getenv("PATH");
+            if (from_env != NULL) {
+              curl_free(from_env);
+            }
+
+            banner = curl_version();
+            if (banner == NULL) {
+              fprintf(stderr, "curl_version returned NULL\n");
+              return 1;
+            }
+            printf("banner    = %s\n", banner);
+
+            if (curl_easy_strerror(0) == NULL) {
+              fprintf(stderr, "curl_easy_strerror returned NULL\n");
+              return 1;
+            }
+            if (curl_strequal("Aa", "aA") != 1) {
+              fprintf(stderr, "curl_strequal disagreed\n");
+              return 1;
+            }
+
+            curl_global_cleanup();
+            return 0;
+          }
+
+          /* POSITIVE CONTROL: Rust allocates, C drops the only reference. The pointer is
+             volatile and cleared inside this frame on purpose - LeakSanitizer scans the
+             live stack for roots, so a plain local left in scope would keep the
+             allocation reachable and the control would not fire. */
+          static void drop_one_allocation(void)
+          {
+            char *volatile escaped = curl_easy_escape(NULL, "control", 0);
+            if (escaped != NULL) {
+              printf("allocated = %s\n", escaped);
+            }
+            escaped = NULL;
+          }
+
+          int main(int argc, char **argv)
+          {
+            const char *mode = (argc > 1) ? argv[1] : "clean";
+
+            if (strcmp(mode, "clean") == 0) {
+              return clean_roundtrip();
+            }
+
+            if (strcmp(mode, "leak") == 0) {
+              drop_one_allocation();
+              if (__lsan_do_recoverable_leak_check() == 0) {
+                fprintf(stderr, "CONTROL FAILED: LeakSanitizer reported nothing\n");
+                return 1;
+              }
+              return 0;
+            }
+
+            if (strcmp(mode, "uaf") == 0) {
+              char *escaped = curl_easy_escape(NULL, "control", 0);
+              if (escaped == NULL) {
+                fprintf(stderr, "curl_easy_escape returned NULL\n");
+                return 1;
+              }
+              curl_free(escaped);
+              /* Deliberate read of released memory. */
+              printf("stale     = %c\n", escaped[0]);
+              fprintf(stderr, "CONTROL FAILED: the read of released memory was not reported\n");
+              return 1;
+            }
+
+            fprintf(stderr, "unknown mode '%s'\n", mode);
+            return 2;
+          }
+          CURL_ASAN_DRIVER
+
+          # clang, and the same sanitizer the Rust side used, so one runtime
+          # serves the whole process image. -O0 and -g keep the C frames as
+          # legible as the Rust ones.
+          echo '::group::linking the C consumer against the instrumented libcurl.a'
+          clang -fsanitize=address -fno-omit-frame-pointer -g -O0 \
+            -o "${binary}" "${driver}" \
+            "target/${ASAN_TARGET}/debug/libcurl.a" \
+            -lpthread -ldl -lm
+          ls -l "${binary}"
+          echo '::endgroup::'
+
+          # 1. The clean round trip must be SILENT. No suppression is applied to
+          #    this leg at all - LSAN_OPTIONS is deliberately absent from this
+          #    step's env - because the only justified suppression names a Rust
+          #    #[cfg(test)] function that this binary cannot reach. So the C
+          #    boundary is audited here with leak detection entirely unnarrowed.
+          clean_log="${RUNNER_TEMP}/asan-c-clean.log"
+          status=0
+          "${binary}" clean 2>&1 | tee "${clean_log}" || status=$?
+
+          if [ "${status}" -ne 0 ]; then
+            echo "FAIL: the C consumer exited ${status} on the clean round trip."
+            echo 'Owner (c): a C caller performing the documented allocate-and-release sequence'
+            echo 'through the exported ABI triggered a sanitizer report or an error return. The'
+            echo 'symbolised frame list above names the offending code.'
+            exit "${status}"
+          fi
+
+          if grep -q -E 'ERROR: (AddressSanitizer|LeakSanitizer)' "${clean_log}"; then
+            echo 'FAIL: the clean round trip produced a sanitizer report despite exiting 0:'
+            grep -n -A 20 -E 'ERROR: (AddressSanitizer|LeakSanitizer)' "${clean_log}" | head -40
+            exit 1
+          fi
+
+          # The clean run must actually have done something. A driver that
+          # printed nothing proves nothing.
+          for expected in 'escaped   =' 'unescaped =' 'banner    ='; do
+            if ! grep -q -F "${expected}" "${clean_log}"; then
+              echo "FAIL: the clean round trip never printed '${expected}'."
+              echo 'The C consumer did not reach the calls it exists to make, so its silence is'
+              echo 'not evidence of anything.'
+              exit 1
+            fi
+          done
+
+          echo 'the C consumer crossed the ownership boundary cleanly, with no report'
+
+      - name: 'assert: the detectors can still fail - two positive controls'
+        env:
+          ASAN_OPTIONS: '${{ env.ASAN_RUNTIME_OPTIONS }}'
+          ASAN_SYMBOLIZER_PATH: '/usr/bin/llvm-symbolizer'
+        run: |
+          # PROOF THAT THIS GATE WORKS, run every time rather than trusted once.
+          #
+          # A sanitizer gate has a characteristic way of dying quietly: the flags
+          # stop reaching the compiler, or a runtime option turns a detector off,
+          # and everything goes green because nothing is being watched. Checking
+          # for the runtime's presence in the binary catches the first case and is
+          # done in the next step. Only executing a defect catches the second.
+          #
+          # So the C consumer is asked to commit two real errors at the FFI
+          # boundary - an allocation from curl_easy_escape that is never released,
+          # and a read of memory curl_free has already released - and BOTH must be
+          # reported. If either is not, this gate has stopped being able to fail
+          # and it says so instead of passing.
+          #
+          # Note on exit status: abort_on_error=1 makes a reporting process abort,
+          # so the status is 134 rather than 1. These checks therefore require a
+          # NON-ZERO status plus the report text, never a particular number.
+          binary="${RUNNER_TEMP}/curl_asan_consumer"
+
+          echo '::group::positive control 1 of 2 - a leak across the C boundary'
+          leak_log="${RUNNER_TEMP}/asan-c-leak.log"
+          status=0
+          "${binary}" leak > "${leak_log}" 2>&1 || status=$?
+          sed -n '1,30p' "${leak_log}"
+          echo '::endgroup::'
+
+          if [ "${status}" -eq 0 ]; then
+            echo 'FAIL: the leak control exited 0.'
+            echo 'An allocation handed to C and never released was NOT reported, so leak detection'
+            echo 'is not in effect. Check that detect_leaks is still 1 in ASAN_RUNTIME_OPTIONS and'
+            echo 'that no suppression has widened to cover the exported escape function. Until'
+            echo 'this control fails on purpose, no green result from this gate means anything.'
+            exit 1
+          fi
+          if ! grep -q -E 'ERROR: LeakSanitizer' "${leak_log}"; then
+            echo 'FAIL: the leak control exited non-zero but printed no LeakSanitizer report.'
+            echo 'It failed for some other reason, so it is not proving what it exists to prove.'
+            exit 1
+          fi
+
+          echo '::group::positive control 2 of 2 - a read of released memory'
+          uaf_log="${RUNNER_TEMP}/asan-c-uaf.log"
+          status=0
+          "${binary}" uaf > "${uaf_log}" 2>&1 || status=$?
+          sed -n '1,30p' "${uaf_log}"
+          echo '::endgroup::'
+
+          if [ "${status}" -eq 0 ]; then
+            echo 'FAIL: the use-after-free control exited 0.'
+            echo 'A read of memory the ABI had already released was NOT reported, so'
+            echo 'AddressSanitizer is not in effect for the C consumer.'
+            exit 1
+          fi
+          if ! grep -q -E 'ERROR: AddressSanitizer: heap-use-after-free' "${uaf_log}"; then
+            echo 'FAIL: the use-after-free control exited non-zero without a heap-use-after-free'
+            echo 'report. It failed for some other reason, so it proves nothing.'
+            exit 1
+          fi
+
+          # And prove the reports are legible, because an unsymbolised report is
+          # a defect nobody can act on. This is the payoff of the debug
+          # information the root Cargo.toml keeps and of the symbolizer installed
+          # earlier.
+          if ! grep -q -E 'curl_easy_escape|curl_asan_consumer\.c' "${uaf_log}"; then
+            echo 'FAIL: the use-after-free report names neither the exported function nor the C'
+            echo 'driver, so it was not symbolised. Reports must be actionable; check that'
+            echo 'llvm-symbolizer is reachable and that debug information is still emitted.'
+            exit 1
+          fi
+
+          echo 'both detectors fired on demand: this gate is able to fail, so its green runs count'
+
       - name: 'assert: the instrumentation was real'
+        env:
+          RUSTFLAGS: '${{ env.ASAN_RUSTFLAGS }}'
         run: |
           # The check that makes this gate more than a second copy of
           # rust-test.yml.
           #
-          # Everything above would pass, green and fast, if RUSTFLAGS were
-          # dropped, misspelled, or overridden by a `[build] rustflags` entry in
+          # Every subject above would pass, green and fast, if RUSTFLAGS were
+          # dropped, misspelled, or overridden by a rustflags entry in
           # .cargo/config.toml - cargo would simply build the tests without a
           # sanitizer and they would pass, because they pass anyway. That is the
           # most likely way for this gate to become a no-op, and no exit status
           # anywhere reports it.
           #
-          # So the binaries are inspected. An ASan-instrumented executable
-          # contains the runtime's initialiser, `__asan_init`; an uninstrumented
-          # one does not. Asking cargo which executables it produced, rather
-          # than guessing at paths under target/, keeps this correct when a
-          # crate gains or loses a test target.
+          # So the binaries are inspected. An instrumented executable contains
+          # the runtime's initialiser; an uninstrumented one does not. Asking
+          # cargo which executables it produced, rather than guessing at paths
+          # under target/, keeps this correct when a crate gains or loses a test
+          # target. Note that RUSTFLAGS is step-scoped here too: without it cargo
+          # would see a different fingerprint, rebuild the targets
+          # uninstrumented, and this assertion would fail against binaries the
+          # subjects never ran.
           exes="${RUNNER_TEMP}/asan-exes.txt"
           : > "${exes}"
 
@@ -530,7 +1185,7 @@ jobs:
             # shellcheck disable=SC2086
             cargo "+${NIGHTLY_TOOLCHAIN}" test \
               --locked \
-              -Zbuild-std \
+              "${ASAN_BUILD_STD}" \
               --target "${ASAN_TARGET}" \
               ${spec} \
               --all-targets \
@@ -541,20 +1196,27 @@ jobs:
               | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' >> "${exes}"
           done
 
-          sort -u "${exes}" -o "${exes}"
-          count="$(wc -l < "${exes}" | tr -d ' ')"
+          # The C consumer belongs in the same census: it is the artifact that
+          # enters the ABI from outside Rust, so if it were somehow linked without
+          # the runtime the most valuable leg would be the least trustworthy.
+          printf '%s\n' "${RUNNER_TEMP}/curl_asan_consumer" >> "${exes}"
 
-          if [ "${count}" -eq 0 ]; then
-            echo 'FAIL: cargo reported zero test executables for the two subjects.'
-            echo 'Nothing was instrumented and nothing ran, which a zero exit status above did'
-            echo 'not reveal. Check that both packages still declare test targets.'
+          sort -u "${exes}" -o "${exes}"
+          count="$(grep -c . "${exes}" || true)"
+
+          if [ "${count}" -lt 2 ]; then
+            echo "FAIL: only ${count} executable(s) were found for the whole gate."
+            echo 'cargo reported no test executables for one or both subjects, so nothing was'
+            echo 'instrumented and nothing ran - which a zero exit status above did not reveal.'
+            echo 'Check that both packages still declare test targets.'
             exit 1
           fi
 
           if ! command -v nm > /dev/null 2>&1; then
             echo 'FAIL: nm is not available, so the instrumentation cannot be verified.'
-            echo 'binutils is part of every ubuntu runner image; install it rather than skipping'
-            echo 'this check, which is the only thing standing between this gate and a silent no-op.'
+            echo 'binutils is part of every Ubuntu runner image; install it rather than skipping'
+            echo 'this check, which is one of the two things standing between this gate and a'
+            echo 'silent no-op.'
             exit 1
           fi
 
@@ -562,35 +1224,52 @@ jobs:
           while IFS= read -r exe; do
             [ -n "${exe}" ] || continue
             if [ ! -f "${exe}" ]; then
-              echo "FAIL: cargo named '${exe}' as a test executable, but it does not exist."
+              echo "FAIL: '${exe}' was named as an executable, but it does not exist."
               uninstrumented=1
               continue
             fi
-            if nm "${exe}" 2>/dev/null | grep -q '__asan_init'; then
+            # `grep -c`, deliberately, rather than the shorter `grep -q`.
+            # `nm` on one of these binaries emits tens of thousands of lines
+            # and `__asan_init` sits in the middle of them, so `grep -q` would
+            # exit on the match while `nm` still had thousands of lines to
+            # write and `nm` would die of SIGPIPE. Under the shell GitHub uses
+            # for `run:` today that is harmless, because the pipeline reports
+            # the status of its LAST command and `grep` succeeded. Adding a
+            # `shell: bash` key would silently change that: that spelling is
+            # `bash -eo pipefail`, and pipefail promotes nm's 141 to the
+            # pipeline's status, which would read as "no match" and report
+            # every instrumented binary as uninstrumented. `grep -c` consumes
+            # the whole stream, so there is no signal to promote and the check
+            # means the same thing under either shell. Measured both ways.
+            # `|| true` because grep exits 1 when the count is zero.
+            asan_init_syms="$(nm "${exe}" 2>/dev/null | grep -c '__asan_init' || true)"
+            if [ "${asan_init_syms}" -gt 0 ]; then
               echo "  instrumented: $(basename "${exe}")"
             else
-              echo "FAIL: $(basename "${exe}") contains no __asan_init symbol."
-              echo '  It was built WITHOUT AddressSanitizer, so its green result means nothing.'
+              echo "FAIL: $(basename "${exe}") contains no AddressSanitizer initialiser."
+              echo '  It was built WITHOUT the sanitizer, so its green result means nothing.'
               uninstrumented=1
             fi
           done < "${exes}"
 
           if [ "${uninstrumented}" -ne 0 ]; then
-            echo 'RUSTFLAGS did not reach the compiler. The usual causes are a [build] rustflags'
-            echo 'entry in .cargo/config.toml overriding the environment variable, a target-specific'
-            echo 'rustflags table for this target doing the same, or RUSTFLAGS being unset by a'
-            echo 'step-level env block. Fix the plumbing; a green uninstrumented run is worse than'
-            echo 'a red one because it looks like evidence.'
+            echo 'The sanitizer flag did not reach the compiler. The usual causes are a rustflags'
+            echo 'entry in .cargo/config.toml overriding the environment variable, a'
+            echo 'target-specific rustflags table for this target doing the same, or a step-level'
+            echo 'env block unsetting RUSTFLAGS. Fix the plumbing; a green uninstrumented run is'
+            echo 'worse than a red one because it looks like evidence.'
             exit 1
           fi
 
-          echo "all ${count} test executable(s) carry the AddressSanitizer runtime"
+          echo "all ${count} executable(s) carry the AddressSanitizer runtime"
 
       - name: 'assert: the run was not vacuous, and no report was swallowed'
         run: |
-          # Two vacuity failures that a zero exit status does not cover.
+          # Three vacuity failures that a zero exit status does not cover, plus
+          # the accounting that keeps the single suppression honest.
           ffi_log="${RUNNER_TEMP}/asan-ffi.log"
           lib_log="${RUNNER_TEMP}/asan-lib.log"
+          total_passed=0
 
           for log in "${ffi_log}" "${lib_log}"; do
             if [ ! -s "${log}" ]; then
@@ -598,9 +1277,10 @@ jobs:
               exit 1
             fi
 
-            # (1) Something must have executed. `cargo test` over a package with
-            # no tests prints "0 passed; 0 failed" and exits 0, and an
-            # instrumented binary that is never run reports nothing at all.
+            # (1) Something must have EXECUTED. `cargo test` over a package with
+            # no tests prints a zero-count summary and exits 0, and an
+            # instrumented binary that is never run reports nothing at all. A run
+            # of nothing must fail here rather than pass vacuously.
             if ! grep -q '^test result:' "${log}"; then
               echo "FAIL: ${log} contains no 'test result:' summary line."
               echo 'The instrumented binaries were built but never executed, so the sanitizer had'
@@ -611,9 +1291,11 @@ jobs:
             passed="$(grep -oE '[0-9]+ passed' "${log}" | awk '{ s += $1 } END { print s + 0 }')"
             failed="$(grep -oE '[0-9]+ failed' "${log}" | awk '{ s += $1 } END { print s + 0 }')"
             echo "${log}: ${passed} passed, ${failed} failed"
+            total_passed=$((total_passed + passed))
 
             if [ "${passed}" -le 0 ]; then
               echo "FAIL: ${log} reports ${passed} passing tests under instrumentation."
+              echo 'Zero executed tests is a vacuous pass, not a pass.'
               exit 1
             fi
             if [ "${failed}" -ne 0 ]; then
@@ -621,7 +1303,7 @@ jobs:
               exit 1
             fi
 
-            # (2) No ASan report may appear anywhere in the log. abort_on_error=1
+            # (2) No report may appear anywhere in the log. abort_on_error=1
             # should make a report fatal, but a report emitted by a child process
             # that the harness reaps, or one printed while unwinding, can leave
             # the summary line green. The text is the authority, not the status.
@@ -640,19 +1322,55 @@ jobs:
             fi
           done
 
-          echo 'both subjects executed real tests under a real sanitizer, and neither produced a report'
+          # (3) THE SUPPRESSION ACCOUNT. print_suppressions=1 makes the runtime
+          # print a table of every rule that matched, with a hit count and a byte
+          # total. Measured on this tree the single justified rule matches once
+          # for eight bytes, so those are the exact figures required below. If the
+          # suppressed leak ever grows, or matches more than once, the narrowing
+          # is no longer the one that was justified and this gate says so.
+          echo '::group::suppression account'
+          grep -A 3 -E 'Suppressions used' "${ffi_log}" "${lib_log}" || true
+          echo '::endgroup::'
+
+          hits="$(grep -E '^[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+the_string_helper_truncates_at_an_interior_nul' \
+            "${ffi_log}" "${lib_log}" | awk '{ print $(NF-2), $(NF-1) }' | sort -u)"
+
+          case "${hits}" in
+            '1 8')
+              echo 'the single justified suppression matched exactly once, for exactly 8 bytes'
+              ;;
+            '')
+              echo 'FAIL: the justified leak suppression never matched.'
+              echo 'Either the report it covers is gone - in which case DELETE the suppression'
+              echo 'rather than leaving a rule that hides a future finding - or the rule stopped'
+              echo 'matching and a genuine leak is now being reported instead. Both need action.'
+              exit 1
+              ;;
+            *)
+              echo "FAIL: the justified suppression accounted for '${hits}', not '1 8'."
+              echo 'The suppressed allocation changed size or multiplied, so it is no longer the'
+              echo 'single by-design immortal string that was justified. Re-derive the'
+              echo 'justification before touching the expected figures.'
+              exit 1
+              ;;
+          esac
+
+          echo "both subjects executed ${total_passed} tests under a real sanitizer, with no report"
 
       - name: 'assert: this gate wrote nothing outside target/'
         run: |
           # The property that makes everything above trustworthy. Every cargo
           # invocation in this job was passed --locked, so nothing should have
-          # been able to modify a tracked file or regenerate Cargo.lock.
+          # been able to modify a tracked file or regenerate Cargo.lock, and the
+          # C driver, its binary and the suppression file were all written to
+          # RUNNER_TEMP rather than into the checkout.
           #
-          # A finding means one of three things, all worth failing on: --locked
+          # A finding means one of four things, all worth failing on: --locked
           # was dropped and cargo rewrote the lockfile, a build script wrote into
-          # the source tree instead of OUT_DIR, or the sanitizer left a report
-          # file next to the sources. The root .gitignore already covers /target,
-          # so a clean run leaves this empty.
+          # the source tree instead of its output directory, the sanitizer left a
+          # report file next to the sources, or a step below started writing its
+          # scratch files into the working tree. The root .gitignore already
+          # covers the build directories, so a clean run leaves this empty.
           changed="${RUNNER_TEMP}/worktree-status.txt"
           git status --porcelain > "${changed}"
           if [ -s "${changed}" ]; then

@@ -2202,6 +2202,7 @@ mod source_policy {
     /// Scoped to this crate. `curl-rs-ffi` is where the conversions belong, and
     /// `curl-rs` is checked by its own gates for its own invariants.
     #[test]
+    #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn c_scalar_types_appear_only_inside_the_ffi_island() {
         // The `ffi` directory is the one place in this crate permitted to name
         // a C width, because it is the one place that calls C.

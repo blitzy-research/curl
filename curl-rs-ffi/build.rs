@@ -270,12 +270,37 @@ fn tracked_env_keys() -> Vec<String> {
 // local `t`. `check_variadic_strategy` REQUIRES that trampoline, on every
 // target, of any plain non-variadic definition of the four -- so the hazard
 // cannot be introduced unnoticed from a Linux workstation, which is where it
-// would otherwise be introduced. Two things the trampoline does not do, and
-// they are why this section stays: it cannot make the eleven above
-// implementable at the declared minimum, and it is exercised by nothing
-// today, because none of the four has a Rust body -- all four are carried
-// into the generated headers as verbatim prototypes. A4 remains open, and
-// `check_variadic_abi` remains the instrument that says so out loud.
+// would otherwise be introduced. One thing that trampoline does not do, and
+// it is why this section stays: it is exercised by nothing today, because none
+// of the four has a Rust body -- all four are carried into the generated
+// headers as verbatim prototypes.
+//
+// AND A LARGER REMEDY HAS SINCE BEEN MEASURED, WHICH NARROWS THE OPEN ITEM
+// WITHOUT CLOSING IT. This section used to claim that a trampoline "cannot
+// make the eleven above implementable at the declared minimum". That claim was
+// wrong, and it was wrong in the direction that matters -- it argued for
+// leaving something unbuilt. A four-instruction thunk cannot reach a
+// format-driven function, but the whole of `va_start` can be written out: spill
+// the general-purpose and floating-point argument registers into the record the
+// target's own ABI defines, synthesise the `va_list` that indexes it, and call
+// the `va_list` sibling. That was built for all four required targets, and the
+// assembled prologue was disassembled and compared field by field against the
+// one the target's own C compiler emits.
+//
+// `src/ffi/printf.rs` now does exactly that for ten of the eleven, so those ten
+// are implemented and ABI-correct by construction rather than open. Two honest
+// qualifications, both stated rather than buried:
+//
+//  * The Apple legs are cross-assembled and disassembled here, never executed,
+//    because no Apple host is available. That residual gap is why A4 is
+//    narrowed and not closed.
+//  * `curl_formadd` is untouched. Its `CURLFORM_*` sequence carries no type
+//    encoding to recover the argument shapes from, so `va_start` alone does not
+//    help: the problem there is semantic, not mechanical.
+//
+// The four option-identifier functions are equally untouched, so
+// `check_variadic_abi` remains the instrument that says A4 is open out loud,
+// and `check_printf_trampolines` is what keeps the ten from regressing.
 
 /// Records the A4 decision, which is a user's to make and not this file's.
 const A4_DECISION_ENV: &str = "CURL_RS_A4_VARIADIC_DECISION";
@@ -291,12 +316,31 @@ const A4_DECISION_ENV: &str = "CURL_RS_A4_VARIADIC_DECISION";
 ///   `curl_share_setopt` are NOT ABI-correct on aarch64-apple-darwin. A C
 ///   caller reaches them through the variadic prototype in the generated
 ///   header and the callee reads a register the caller did not write.
-/// * The eleven exports in [`VARIADIC_UNIMPLEMENTABLE`] remain unimplemented
-///   on every target until the minimum Rust version rises or an approved C
-///   shim is added.
+/// * Of the eleven exports in [`VARIADIC_UNIMPLEMENTABLE`], `curl_formadd`
+///   remains unimplemented on every target until the minimum Rust version rises
+///   or an approved C shim is added. The ten `curl_m*printf` forms no longer
+///   do: `src/ffi/printf.rs` implements them with a per-target `va_start`
+///   written in `global_asm!`, which needs neither. What acceptance concedes
+///   for those ten is narrower and is stated on
+///   [`check_printf_trampolines`] -- their Apple prologues are
+///   cross-assembled and disassembled rather than executed, no Apple host
+///   being available.
 const A4_ACCEPTED: &str = "accept-unsupported-varargs";
 
-/// The eleven exports with no ABI-correct expression at the declared minimum.
+/// The eleven exports with no ABI-correct expression **as a Rust function** at
+/// the declared minimum.
+///
+/// The qualification is load-bearing and was added after measurement. Every one
+/// of the eleven is inexpressible as a Rust `extern "C" fn` at MSRV 1.75 --
+/// `extern "C" fn f(x: T, ...)` is `error[E0658]`, and there is no stable way to
+/// walk a `va_list` -- and that is what this list records. It does not follow
+/// that they cannot be *exported*: ten of them are, from
+/// `src/ffi/printf.rs`, by writing the target's `va_start` in `global_asm!` and
+/// calling a `va_list` sibling that is an ordinary Rust function. The list
+/// therefore stays at eleven because the Rust-level constraint is unchanged,
+/// while [`VARIADIC_IMPLEMENTATION_FILES`] no longer vetoes the printf module
+/// and [`check_printf_trampolines`] enforces the arrangement per symbol
+/// instead.
 ///
 /// Single source of truth, and asserted against the verbatim header text by
 /// [`self_check_variadic_inventory`] so the list cannot drift from what the
@@ -341,14 +385,40 @@ const VARIADIC_TRAILING_POINTER: [&str; 4] = [
     "curl_share_setopt",
 ];
 
-/// The two modules that would implement the eleven, relative to the manifest.
+/// The modules that would ship an argument-passing shape nobody has verified,
+/// relative to the manifest.
 ///
-/// Their absence is what keeps the second half of the gate inert today: there
-/// is nothing to ship, so nothing can ship wrongly. The moment either appears,
-/// the gate applies -- which is the point at which the decision genuinely has
-/// to have been made.
-const VARIADIC_IMPLEMENTATION_FILES: [&str; 2] =
-    ["src/ffi/printf.rs", "src/ffi/form.rs"];
+/// Their absence is what keeps the second half of the gate inert: there is
+/// nothing to ship, so nothing can ship wrongly. The moment one appears, the
+/// gate applies -- which is the point at which the decision genuinely has to
+/// have been made.
+///
+/// # Why `src/ffi/printf.rs` is no longer listed
+///
+/// It was, and its removal is a narrowing of the gate rather than a weakening
+/// of it, because a stricter check replaced it.
+///
+/// This list answers one question: "is a variadic entry point about to be
+/// shipped with its argument passing merely *assumed*?" For the ten
+/// `curl_m*printf` forms that question now has a mechanical answer, so the
+/// blanket refusal is the wrong instrument. The five plain-variadic forms are
+/// not Rust functions at all: each is an assembly trampoline that performs the
+/// target's own `va_start` and then calls its `va_list` sibling, with a
+/// separate prologue for x86-64 System V, AAPCS64, Apple x86-64 and Apple
+/// arm64. Apple arm64 -- the target A4 is about -- is the simplest of the four,
+/// because its `va_list` *is* the entry stack pointer, so the trampoline is
+/// `mov x<n>, sp` followed by a tail call and there is no register for a callee
+/// to read by mistake.
+///
+/// [`check_printf_trampolines`] enforces that arrangement per name: it refuses
+/// a plain Rust `extern "C" fn` definition of any of the five, and it requires
+/// a `global_asm!` trampoline naming that export and its `va_list` sibling.
+/// That is a per-symbol obligation where this list is a per-file veto, and it
+/// cannot be satisfied by recording a decision in an environment variable.
+///
+/// `curl_formadd` is untouched by any of this and remains listed, because
+/// nothing has yet been built for it.
+const VARIADIC_IMPLEMENTATION_FILES: [&str; 1] = ["src/ffi/form.rs"];
 
 // The four headers that must never be written
 
@@ -4968,12 +5038,115 @@ fn emit_link_args() {
     //
     // A4 itself stays open, and stays escalated from `check_variadic_abi`
     // below. That is not a duplicate of the check just described: the
-    // trampoline makes a definition of the four sound, while the eleven
-    // printf and va_list exports have no ABI-correct expression at the
-    // declared minimum on ANY target, and none of the four has a Rust body
-    // to trampoline yet. Refusing a target and requiring a trampoline answer
-    // different questions; both are kept, and only one of them prints.
+    // trampoline makes a definition of the four sound, while none of the four
+    // has a Rust body to trampoline yet. Refusing a target and requiring a
+    // trampoline answer different questions; both are kept, and only one of
+    // them prints.
+    //
+    // One clause that used to sit in this paragraph has been removed because
+    // measurement contradicted it. It read that "the eleven printf and va_list
+    // exports have no ABI-correct expression at the declared minimum on ANY
+    // target". Ten of the eleven now have one, in `src/ffi/printf.rs`: the five
+    // `va_list` forms are ordinary Rust functions over a per-target `va_list`
+    // walker, and the five plain-variadic forms are `global_asm!` spill
+    // prologues that hand a synthesised `va_list` to their sibling. What remains
+    // true of the eleventh, `curl_formadd`, is unchanged, and what remains open
+    // about the ten is narrower and is stated where it belongs: the Apple
+    // prologues are cross-assembled here but have never been executed.
 }
+
+// MEASURED FINDING, Trap 3: the five assembled printf entry points cannot be
+// exported from this crate's shared library at the declared minimum Rust
+// version, and no linker flag changes that. Recorded here rather than acted on,
+// because every available action is worse than the gap.
+//
+// WHAT WAS OBSERVED. `src/ffi/printf.rs` defines its five plain-variadic forms
+// with `global_asm!`, for the reason `check_printf_trampolines` sets out. On
+// x86_64-unknown-linux-gnu, in BOTH profiles:
+//
+//   nm -D --defined-only target/release/libcurl.so | grep -c curl_m.*printf  -> 5
+//   nm -a               target/release/libcurl.so | grep -c curl_mprintf     -> 0
+//   nm --defined-only   target/release/libcurl.a  | grep -c ' T curl_m.*printf' -> 10
+//
+// Five, not ten, and the missing five were not merely hidden: localised and then
+// unreferenced, they were discarded outright, absent from a `.symtab` of 2703
+// entries. The static library was untouched. Every unit test still passed,
+// because a test binary links the rlib, where the labels are plainly visible.
+//
+// WHY. rustc builds a cdylib's export list from Rust items carrying
+// `#[no_mangle]` or `#[export_name]` and hands the linker an anonymous version
+// script. Captured verbatim from rustc 1.75.0 and 1.97.1 alike, through a
+// logging `-C linker=` wrapper, it reads `{ global: <those items>; local: *; };`
+// -- byte-identical between the two. An assembled `.globl` label matches nothing
+// in `global:`, falls to the wildcard, and is localised. Specification 0.6.4 put
+// this in one sentence before any of it was measured here: export parity "comes
+// from declaration discipline, not from link-time filtering."
+//
+// EVERY ROUTE MEASURED, against a probe cdylib holding one Rust item and three
+// assembled labels, one of them in its own `.text.<name>` section:
+//
+// | Route                                  | GNU ld 1.75 | LLD 1.97 | aarch64 GNU ld |
+// |----------------------------------------|-------------|----------|----------------|
+// | baseline                               | 1 of 4      | 1 of 4   | 1 of 4         |
+// | -Wl,--export-dynamic-symbol=<name>     | 1 of 4      | 1 of 4   | -              |
+// | -Wl,--export-dynamic-symbol-list=<f>   | 1 of 4      | 1 of 4   | -              |
+// | -Wl,--dynamic-list=<file>              | 1 of 4      | 1 of 4   | -              |
+// | -Wl,-u,<name> + --export-dynamic-symbol| 1 of 4      | -        | -              |
+// | -Wl,--export-dynamic                   | 1 of 4      | -        | -              |
+// | a second anonymous --version-script    | LINK ERROR  | 4 of 4   | LINK ERROR     |
+// | a named version tag                    | LINK ERROR  | -        | -              |
+//
+// The link error is `anonymous version tag cannot be combined with other version
+// tags`. The one route that works, works on exactly ONE of the four required
+// targets, and only because rustc passes `-fuse-ld=lld` for
+// x86_64-unknown-linux-gnu from 1.9x onward; LLD merges version scripts and GNU
+// ld refuses to. It was implemented and verified end to end here -- 29 defined
+// exports became 34, exactly the five, all `curl_`-prefixed, soname intact, and a
+// `-Wall -Wextra -Werror` C driver linked against the shared library exercised all
+// ten forms correctly -- and then REMOVED, because it fails
+// `cargo +1.75.0 build --workspace` and it fails
+// `--target aarch64-unknown-linux-gnu` on rustc 1.97.1. A flag that breaks three
+// of four required targets is not a fix.
+//
+// THE THREE ALTERNATIVES, AND WHY EACH IS WORSE THAN THE GAP.
+//
+// 1. A Rust item whose body is one `asm!(..., options(noreturn))` block. The
+//    symbol IS exported. But a prologue is emitted -- `push %rax` in release,
+//    `push %rax` plus a store of the first argument in debug -- so the assembly
+//    cannot see the true incoming stack pointer and `overflow_arg_area` would be
+//    wrong by an unspecified, profile-dependent amount. `#[naked]`, which is
+//    what would make it exact, is stable at 1.88 and this crate declares 1.75.
+//
+// 2. Declaring the register-resident variadic arguments as ordinary parameters.
+//    This is ABI-correct, needs no assembly, is exported on all four targets, and
+//    would even close A4's Apple hazard for these five. It caps the argument
+//    count: measured, `addr_of!` of the last stack-passed parameter is the
+//    caller's slot in debug and a callee-local COPY in release (debug read the
+//    true 6 7 8 9, release read 6 455266533382 0 0), so the overflow area is
+//    unreachable and only explicitly declared slots can be consumed. A capped
+//    printf silently mis-renders a legal C call, which specification 0.8.1
+//    forbids, and eagerly copying N slots of the caller's frame invites a report
+//    from the AddressSanitizer gate.
+//
+// 3. A `cc`-compiled C shim, which is route (b) of the ambiguity as filed. NEW
+//    FINDING: it does not solve THIS problem at all. The version script governs
+//    the whole link, so a C object's symbols are localised exactly as an
+//    assembled label is. Route (b) answers the varargs question and is silent on
+//    the export question.
+//
+// WHAT WAS CHOSEN, AND WHY IT IS THE LEAST BAD. Keep the trampolines; emit no
+// flag. The two failure modes are not equivalent. Absence from the shared library
+// is LOUD -- an undefined symbol at link or load time, and the specification 0.8.4
+// parity gate fails on it by design. A capped argument list is SILENT, and
+// specification 0.6.2 says of precisely this class of hazard that "silent
+// acceptance is the worst option." The static library carries all ten and is
+// correct; the shared library carries the five `va_list` forms.
+//
+// The only complete remedy makes the five Rust items, which means raising the
+// minimum Rust version -- and that is the user decision ambiguity A4 already
+// reserves, not a decision for this build script. What this finding adds to A4 is
+// that the obstacle is wider than first filed: it is not only Apple's variadic
+// ABI, it is Rust's cdylib export model, and it applies on every target.
 
 /// Refuses to build a configuration whose variadic ABI is known to be wrong.
 ///
@@ -5233,7 +5406,7 @@ impl VersionFacts {
         // protect. `curl-config.in:110`, `:111` and `:114` place it inside
         // BACKTICKS (`vmajor=`echo '@CURLVERSION@' | cut -d. -f1``) and `:130`
         // places it inside DOUBLE quotes, where `$` and a backtick are live.
-        // libcurl.pc:35 makes it the `Version:` field, where a `#` truncates.
+        // libcurl.pc:124 makes it the `Version:` field, where a `#` truncates.
         //
         // The set below admits every version curl has ever carried --
         // `8.19.0-DEV`, `8.4.0`, a `-rc1` suffix -- and excludes every
@@ -6591,6 +6764,170 @@ fn check_variadic_strategy(manifest: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The printf module, relative to the manifest.
+const PRINTF_MODULE: &str = "src/ffi/printf.rs";
+
+/// The five plain-variadic `curl_m*printf` forms, each paired with the
+/// `va_list` sibling its trampoline must reach.
+///
+/// The pairing is the header's, and it is not guessable from the names alone --
+/// `curl_maprintf` reaches `curl_mvaprintf`, which returns `char *` where the
+/// other four siblings return `int`. Recording it here means a trampoline wired
+/// to the wrong sibling is a build failure rather than a silent type confusion
+/// across the ABI boundary.
+const PRINTF_TRAMPOLINES: [(&str, &str); 5] = [
+    ("curl_mprintf", "curl_mvprintf"),
+    ("curl_mfprintf", "curl_mvfprintf"),
+    ("curl_msprintf", "curl_mvsprintf"),
+    ("curl_msnprintf", "curl_mvsnprintf"),
+    ("curl_maprintf", "curl_mvaprintf"),
+];
+
+/// The two `.globl` spellings a trampoline macro must emit, and the object
+/// format each one serves.
+///
+/// Mach-O decorates every symbol with a leading underscore and ELF does not, so
+/// a macro that emits only one spelling exports nothing on half the required
+/// targets. Measured, not assumed: cross-assembling the ELF form for
+/// `x86_64-apple-darwin` also rejects `.type` and `.size` with
+/// `error: unknown directive`, which is why the two dialects need separate
+/// macro arms in the first place.
+const GLOBL_SPELLINGS: [(&str, &str); 2] = [
+    (r#"".globl ", $name"#, "ELF"),
+    (r#"".globl _", $name"#, "Mach-O"),
+];
+
+/// Require the five plain-variadic printf forms to be trampolines, per symbol.
+///
+/// # Why this is stricter than the file-level gate it replaced
+///
+/// [`VARIADIC_IMPLEMENTATION_FILES`] used to list `src/ffi/printf.rs` and refuse
+/// the build outright the moment it appeared, on every target, unless a decision
+/// was recorded in the environment. That was the right instrument while nothing
+/// had been built: it made "shipped without anyone deciding" impossible.
+///
+/// It is the wrong instrument once something *has* been built, because it cannot
+/// tell a correct implementation from an incorrect one -- it only counts files,
+/// and an environment variable silences it. This check cannot be silenced and
+/// looks at each symbol individually. It refuses, for every one of the five:
+///
+/// 1. a plain Rust `extern "C" fn` definition, which is the actual A4 hazard --
+///    a non-variadic callee reached through a variadic prototype reads a
+///    register the Apple arm64 caller never wrote, and the failure is silent;
+/// 2. the absence of a `global_asm!` trampoline naming that export;
+/// 3. a trampoline wired to the wrong `va_list` sibling, or to one that does not
+///    exist as a Rust export;
+/// 4. a macro that emits only one object format's `.globl` spelling.
+///
+/// The trampoline is recognised by the `export = "name"` argument rather than by
+/// the label, because the label is assembled with `concat!` and so never appears
+/// literally in the source. Point 4 is what keeps that indirection honest: it
+/// pins the fact that the argument does become a `.globl`, in both spellings.
+///
+/// Inert until the module exists, so this cannot fail a tree that has not
+/// reached it yet.
+fn check_printf_trampolines(manifest: &Path) -> Result<(), Box<dyn Error>> {
+    if !manifest.join(PRINTF_MODULE).exists() {
+        return Ok(());
+    }
+
+    let sources = rust_sources(&manifest.join("src"))?;
+
+    for (exported, sibling) in PRINTF_TRAMPOLINES {
+        if let Some((path, _)) = find_c_definition(&sources, exported) {
+            return Err(format!(
+                "{} defines `extern \"C\" fn {exported}` as a Rust function, \
+                 but `{exported}` is variadic in include/curl/mprintf.h and a \
+                 Rust function cannot be. On aarch64-apple-darwin -- a \
+                 required target -- Apple's arm64 ABI passes every variadic \
+                 argument on the stack (measured: `str x1, [sp]`), so a \
+                 non-variadic callee would read a register the caller never \
+                 wrote and would do it silently. Emit a `global_asm!` \
+                 trampoline that performs the target's own `va_start` and \
+                 calls `{sibling}`; that is proven to build at the declared \
+                 MSRV of 1.75 and needs no C compiler.",
+                path.display()
+            )
+            .into());
+        }
+
+        let export_arg = format!("export = \"{exported}\",");
+        let callee_arg = format!("callee = {sibling},");
+        let trampolined = sources.iter().any(|(_, text)| {
+            let code = strip_rust_comments(text);
+            code.contains("global_asm!")
+                && code.contains(&export_arg)
+                && code.contains(&callee_arg)
+        });
+        if !trampolined {
+            return Err(format!(
+                "{PRINTF_MODULE} exists, so `{exported}` has to be exported, \
+                 but no `global_asm!` trampoline declaring `{export_arg}` and \
+                 `{callee_arg}` was found. All 100 symbols in lib/libcurl.def \
+                 are compared as one set by the nm parity gate, so a missing \
+                 one fails it outright.",
+            )
+            .into());
+        }
+
+        if find_c_definition(&sources, sibling).is_none() {
+            return Err(format!(
+                "a trampoline names `{sibling}` as the target of \
+                 `{exported}`, but nothing defines \
+                 `extern \"C\" fn {sibling}`. The trampoline would assemble \
+                 and then fail to link, or worse, bind to some other \
+                 translation unit's symbol of that name.",
+            )
+            .into());
+        }
+    }
+
+    let printf = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("printf.rs"))
+        .ok_or_else(|| {
+            format!("{PRINTF_MODULE} exists but was not read back")
+        })?;
+    let code = strip_rust_comments(&printf.1);
+    for (fragment, object_format) in GLOBL_SPELLINGS {
+        if !code.contains(fragment) {
+            return Err(format!(
+                "{} carries printf trampolines but never emits `{fragment}`, \
+                 so nothing exports them on {object_format}. Mach-O decorates \
+                 symbols with a leading underscore and ELF does not; a macro \
+                 that emits one spelling exports nothing on the targets \
+                 needing the other.",
+                printf.0.display()
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Find the file defining `name` as a C-ABI Rust function, if any.
+///
+/// Anchored to an item declaration -- `pub `, `extern ` or `unsafe ` must begin
+/// the line -- so the same text inside a string literal, which
+/// [`strip_rust_comments`] deliberately leaves alone, cannot be mistaken for a
+/// definition.
+fn find_c_definition<'a>(
+    sources: &'a [(PathBuf, String)],
+    name: &str,
+) -> Option<&'a (PathBuf, String)> {
+    let signature = format!("extern \"C\" fn {name}(");
+    sources.iter().find(|(_, text)| {
+        strip_rust_comments(text).lines().any(|line| {
+            let line = line.trim();
+            line.contains(&signature)
+                && (line.starts_with("pub ")
+                    || line.starts_with("extern ")
+                    || line.starts_with("unsafe "))
+        })
+    })
+}
+
 /// Every `.rs` file under `dir`, read, with its path.
 ///
 /// Used by the checks that have to reason about this crate's own source
@@ -7053,11 +7390,34 @@ fn rewrite_preprocessor_comment(line: &str) -> String {
 
 /// Collect every symbol this crate actually defines as a C export.
 ///
+/// Two mechanisms produce one, and both are recognised.
+///
+/// # A Rust function
+///
 /// A name is counted only when `#[no_mangle]` and an `extern "C"` definition
 /// appear together, because either alone produces a symbol the dynamic linker
 /// will not resolve under the exported name: `#[no_mangle]` without
 /// `extern "C"` keeps the Rust ABI, and `extern "C"` without `#[no_mangle]`
 /// keeps the mangled name.
+///
+/// # An assembly trampoline
+///
+/// The five plain-variadic `curl_m*printf` forms cannot be Rust functions at
+/// the declared MSRV -- `extern "C" fn f(x: T, ...)` is `error[E0658]` -- so
+/// they are emitted by `global_asm!` instead, each declaring its own `.globl`.
+/// Those symbols are every bit as real as a `#[no_mangle]` function's, and a
+/// scan that could not see them would report all five as undefined forever,
+/// leaving the export-surface accounting permanently wrong in the one direction
+/// that matters: it would understate what ships.
+///
+/// Both spellings a trampoline can use are matched. A hand-written label is
+/// found by its `.globl`, in either the ELF or the Mach-O form, since Mach-O
+/// decorates symbols with a leading underscore. A macro-generated label is
+/// found by the `export = "name"` argument that becomes it, which is necessary
+/// because the label is assembled with `concat!` and so never appears literally
+/// in the source. That argument is only honoured in a file that actually
+/// contains `global_asm!`, so prose or a table of names cannot be mistaken for
+/// an emission.
 ///
 /// The scan is textual on purpose. A build script cannot ask the compiler for
 /// this set -- the crate has not been compiled yet, and the whole point of the
@@ -7088,6 +7448,8 @@ fn implemented_exports(manifest: &Path) -> Result<Vec<String>, Box<dyn Error>> {
             }
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+
+            names.extend(assembled_exports(&text));
 
             // `#[no_mangle]` may be separated from the signature by further
             // attributes and doc comments, so the flag persists until a line
@@ -7132,6 +7494,44 @@ fn implemented_exports(manifest: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+/// The C exports one source file establishes through `global_asm!`.
+///
+/// Documented at length on [`implemented_exports`], which is the only caller.
+/// Kept separate so the two mechanisms can be reasoned about -- and tested --
+/// independently of each other.
+fn assembled_exports(text: &str) -> Vec<String> {
+    // Without this, a table of names or a paragraph of prose in any file would
+    // read as an emission. The label and the macro argument only mean anything
+    // in a file that actually assembles something.
+    if !text.contains("global_asm!") {
+        return Vec::new();
+    }
+
+    let code = strip_rust_comments(text);
+    let mut names = Vec::new();
+
+    // Both markers are scanned over the whole text rather than one being tried
+    // first, because `.globl _foo` matches the shorter marker too. The
+    // `curl_` requirement resolves it: the shorter marker yields `_foo`, which
+    // is discarded, and the longer yields `foo`, which is kept when it is one
+    // of ours.
+    for marker in [".globl ", ".globl _", "export = \""] {
+        let mut rest = code.as_str();
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.starts_with("curl_") {
+                names.push(name);
+            }
+        }
+    }
+
+    names
 }
 
 /// Every one of the 100 exported symbols this crate does not yet define.
@@ -7252,6 +7652,9 @@ fn generate_headers(
     // Likewise preflight: a variadic strategy this target's ABI cannot honour
     // must stop the build before any header advertises symbols it cannot keep.
     check_variadic_strategy(manifest)?;
+    // And the same obligation, discharged per symbol, for the five
+    // plain-variadic printf forms that are assembled rather than compiled.
+    check_printf_trampolines(manifest)?;
 
     // THE SECOND THING THIS FUNCTION DOES, AND DELIBERATELY BEFORE ANY RENDER.
     //
@@ -9079,19 +9482,19 @@ fn render_libcurl_pc(
     check_pkgconfig_value("prefix", &prefix, false)?;
 
     let values: Vec<(&str, String)> = vec![
-        // libcurl.pc.in:25-28, the same four directories curl-config uses.
+        // libcurl.pc.in:56-59, the same four directories curl-config uses.
         ("prefix", prefix),
         ("exec_prefix", "${prefix}".to_string()),
         ("libdir", "${exec_prefix}/lib".to_string()),
         ("includedir", "${prefix}/include".to_string()),
-        // :29 and :30, read back by
+        // :112 and :113, read back by
         // `pkg-config --variable=supported_protocols libcurl`. The same two
         // functions feed curl-config, so the two files cannot disagree.
         //
         // Routed through the pkg-config encoder even though both are joins of
         // static tokens and cannot today contain anything it would touch. Two
         // reasons, and the second is the one that matters: the template quotes
-        // them (`supported_protocols="@SUPPORT_PROTOCOLS@"`, :29-30), so a
+        // them (`supported_protocols="@SUPPORT_PROTOCOLS@"`, :112-113), so a
         // metacharacter would break the field rather than the file, and
         // `validate_environment_substitutions` currently guarantees they are
         // safe only by applying the STRICTER unquoted-shell rule. That
@@ -9130,7 +9533,7 @@ fn render_libcurl_pc(
         // leave both empty too.
         ("LIBCURL_PC_REQUIRES", String::new()),
         ("LIBCURL_PC_REQUIRES_PRIVATE", String::new()),
-        // :38 keeps the literal -lcurl, which is why curl-rs-ffi/Cargo.toml
+        // :153 keeps the literal -lcurl, which is why curl-rs-ffi/Cargo.toml
         // sets [lib] name = "curl": the artifacts must really be libcurl.so
         // and libcurl.a. Nothing further is needed here.
         ("LIBCURL_PC_LIBS", String::new()),
@@ -9151,7 +9554,7 @@ fn render_libcurl_pc(
     // varies per platform -- so the check belongs on the grammar, not on
     // provenance. `${...}` is allowed only for the three tokens whose values
     // ARE deliberate pkg-config variable references; `"` is rejected for the
-    // two fields the template double-quotes (`libcurl.pc.in:29-30`), where a
+    // two fields the template double-quotes (`libcurl.pc.in:112-113`), where a
     // quote would end the value early and leave the rest as stray text.
     const PKGCONFIG_VARIABLE_TOKENS: [&str; 3] =
         ["exec_prefix", "libdir", "includedir"];

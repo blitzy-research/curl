@@ -1,50 +1,163 @@
-// Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
-//
-// SPDX-License-Identifier: curl
-
-//! MD5, RFC 1321. Supersedes `lib/md5.c` and `lib/curl_md5.h`.
+// /***************************************************************************
+//  *                                  _   _ ____  _
+//  *  Project                     ___| | | |  _ \| |
+//  *                             / __| | | | |_) | |
+//  *                            | (__| |_| |  _ <| |___
+//  *                             \___|\___/|_| \_\_____|
+//  *
+//  * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+//  *
+//  * This software is licensed as described in the file COPYING, which
+//  * you should have received as part of this distribution. The terms
+//  * are also available at https://curl.se/docs/copyright.html.
+//  *
+//  * You may opt to use, copy, modify, merge, publish, distribute and/or sell
+//  * copies of the Software, and permit persons to whom the Software is
+//  * furnished to do so, under the terms of the COPYING file.
+//  *
+//  * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+//  * KIND, either express or implied.
+//  *
+//  * SPDX-License-Identifier: curl
+//  *
+//  ***************************************************************************/
+//! MD5, RFC 1321. Supersedes `lib/md5.c` (609 lines) and `lib/curl_md5.h`
+//! (67 lines).
 //!
-//! Two shapes, because the C tree needs both. `lib/curl_md5.h:40` declares the
-//! one-shot `Curl_md5it`, and `lib/curl_md5.h:59-63` declares the incremental
-//! `Curl_MD5_init` / `Curl_MD5_update` / `Curl_MD5_final` trio that
-//! `lib/vauth/digest.c:388`, `:402`, `:425` and `:443` feed in pieces while
-//! composing a Digest response.
+//! The primitive itself comes from the **`md-5 0.10.6`** crate, pinned exactly
+//! in the workspace manifest's `[workspace.dependencies]` and inherited here
+//! with `{ workspace = true }`. The crate is published as `md-5` while its
+//! library target is `md5`, so `use ::md5::Md5` is correct despite the hyphen.
+//! Nothing in this file implements a compression function.
 //!
-//! The parameter values are contractual rather than chosen.
-//! `lib/md5.c:528-535` fixes the keyed parameter table at a 64-byte block and
-//! a 16-byte result, and `lib/md5.c:537-543` fixes the unkeyed result at 16
-//! bytes. [`crate::crypto`] asserts both at compile time next to those
-//! citations.
+//! # Two shapes, because the C contract has two
 //!
-//! MD5 is used here only where curl's wire protocols demand it -- HTTP Digest
-//! (`lib/vauth/digest.c`) and the NTLM session response
-//! (`lib/curl_ntlm_core.c`) -- and never as a security primitive of this
-//! implementation's own choosing.
+//! `lib/curl_md5.h:56-57` declares the one-shot `Curl_md5it`, implemented at
+//! `lib/md5.c:549-561` and carrying the `@unittest: 1601` marker at
+//! `lib/md5.c:546`. `lib/curl_md5.h:59-63` declares the incremental
+//! `Curl_MD5_init` / `Curl_MD5_update` / `Curl_MD5_final` trio, implemented at
+//! `lib/md5.c:563-589`, `:591-597` and `:599-607`.
+//!
+//! Both are reproduced because HTTP Digest needs both. `lib/vauth/digest.c`
+//! composes one Digest response from **four** separate streaming contexts --
+//! `lib/vauth/digest.c:388`, `:402`, `:425` and `:443` -- feeding every `':'`
+//! separator as a one-byte update and, at `lib/vauth/digest.c:406`, feeding a
+//! previous 16-byte digest straight back in as input. A one-shot-only surface
+//! cannot express that, so [`Md5Context`] is not optional convenience.
+//!
+//! # The parameter values are contractual, not chosen
+//!
+//! `lib/md5.c:528-535` fixes the keyed table `Curl_HMAC_MD5` at a 64-byte
+//! maximum key length (`lib/md5.c:533`) and a 16-byte result
+//! (`lib/md5.c:534`). `lib/md5.c:537-543` fixes the unkeyed `Curl_DIGEST_MD5`
+//! result at 16 bytes (`lib/md5.c:542`), agreeing with `MD5_DIGEST_LEN` at
+//! `lib/curl_md5.h:32`. [`crate::crypto`] re-exports [`DIGEST_LEN`] and
+//! [`BLOCK_LEN`] under prefixed names and pins both with `const` assertions,
+//! so changing either value fails the build beside the citation that explains
+//! why it cannot change.
+//!
+//! # What was deliberately dropped
+//!
+//! The `MD5_params` / `MD5_context` vtable (`lib/curl_md5.h:40-51`) is gone.
+//! It existed only to make the digest pluggable across the C tree's several
+//! TLS backends; there is exactly one implementation now, so the indirection
+//! would be surface with no call site behind it.
+//!
+//! The build guard at `lib/curl_md5.h:27-28` is **not** reproduced as a
+//! feature `cfg`. No workspace feature corresponds to it, and a `cfg` naming
+//! a feature that does not exist compiles the guarded item away silently
+//! rather than failing. MD5 is unconditionally available here.
+//!
+//! # Upstream attribution: recorded, not carried forward
+//!
+//! `lib/md5.c:237-273` carries a second attribution block, separate from and
+//! not covered by the licence banner above. It is a public-domain notice for
+//! the fallback MD5 implementation curl bundled for the case where no crypto
+//! library was linked, together with a credit at `lib/md5.c:273` for the
+//! optimised form of that implementation's round functions.
+//!
+//! That block is **not** reproduced here, and the omission is deliberate
+//! rather than an oversight. Attribution travels with the code it covers, and
+//! that implementation is not ported: `md-5 0.10.6` supplies the primitive, so
+//! none of the attributed code is present in this file and no attribution is
+//! owed for it. The contrasting case one directory over is `util/inet.rs`,
+//! which does carry an ISC/BIND banner precisely because its Rust body *is* a
+//! port of ISC code. The distinguishing test is whether the attributed code is
+//! present, not whether it was read. [`crate::crypto`] records the same fact
+//! at directory level.
+//!
+//! # Scope, and where rendering belongs
+//!
+//! MD5 is present only because curl's wire formats specify it: HTTP Digest
+//! (`lib/vauth/digest.c`) and the NTLMv2 response, whose three HMAC-MD5 call
+//! sites are `lib/curl_ntlm_core.c:524`, `:610` and `:653`. It is never a
+//! security primitive chosen by this implementation. AAP section 0.8.1 freezes
+//! those formats, so the algorithm cannot be substituted for a stronger one.
+//!
+//! Turning a digest into text is not this module's job. Every digest curl puts
+//! on the wire is written with `"%02x"` and is therefore **lowercase** --
+//! `lib/vauth/digest.c:139`, and again at `:417`, `:440` and `:470` -- which
+//! [`crate::crypto::hex_lower`] owns. `Curl_hexbyte` at `lib/escape.c:218-225`
+//! is the uppercase renderer and must never be used for a digest.
 
 use ::md5::{Digest, Md5 as Md5Hasher};
 
-/// Length of an MD5 digest in bytes (`lib/curl_md5.h:32`, `MD5_DIGEST_LEN`).
+/// Length of an MD5 digest in bytes.
+///
+/// `MD5_DIGEST_LEN` (`lib/curl_md5.h:32`), and the result size both C
+/// parameter tables declare (`lib/md5.c:534` and `:542`).
 pub(crate) const DIGEST_LEN: usize = 16;
 
-/// MD5's compression block size in bytes (`lib/md5.c:530`).
+/// MD5's HMAC block size in bytes: the maximum key length `Curl_HMAC_MD5`
+/// declares at `lib/md5.c:533`.
+///
+/// This constant is documentation and assertion, never arithmetic.
+/// `hmac 0.12.1` derives the block size from `Md5::BlockSize` itself, so
+/// neither this module nor [`crate::crypto::hmac`] computes a key-padding
+/// length from this value. It is published so that [`crate::crypto`] can pin
+/// the C table's number at compile time.
+///
+/// The allowance is required by the MSRV floor and is not redundant, however
+/// much it looks it on a current toolchain. This constant's only consumer is
+/// the `const _: () = assert!(MD5_BLOCK_LEN == 64);` contract in
+/// [`crate::crypto`], and rustc 1.75 does not count a reference from inside a
+/// `const _` item as a use, so 1.75 reports it unused where 1.97 does not.
+/// Measured on both. The sibling modules carry the attribute on the same two
+/// item kinds for the same reason. Delete it only alongside the attribute on
+/// [`md5`], and only once a real caller exists.
 #[allow(dead_code)]
 pub(crate) const BLOCK_LEN: usize = 64;
 
-/// The `digest` marker type for MD5, re-exported so that
-/// [`crate::crypto::hmac`] can instantiate `Hmac<Md5>` without importing the
-/// `md-5` crate a second time.
+/// The `digest` marker type for MD5.
 ///
-/// Named `Md5` rather than re-exported under the module's own name because
-/// `Hmac<D>` takes the hasher type, and a caller writing
-/// `crypto::md5::Md5` reads as the algorithm it is.
-#[allow(dead_code)]
+/// Published so that [`crate::crypto::hmac`] can instantiate `Hmac<Md5>` --
+/// the keyed form `Curl_HMAC_MD5` provided -- without importing the `md-5`
+/// crate a second time.
+///
+/// It is a plain alias for the crate's own type and deliberately not a
+/// newtype: `Hmac<D>` is bounded on the RustCrypto `CoreProxy` machinery that
+/// only the real type carries, so wrapping it would make the bound
+/// unsatisfiable.
 pub(crate) type Md5 = Md5Hasher;
 
-/// Digest a whole message: `Curl_md5it` (`lib/md5.c:537-543`).
+/// Digest a whole message: `Curl_md5it` (`lib/md5.c:549-561`).
 ///
-/// Returns the 16 raw bytes. Rendering to ASCII is
-/// [`crate::crypto::hex_lower`]'s job, and it is lowercase because every
-/// digest curl puts on the wire is written with `"%02x"`.
+/// The signature is infallible, which narrows the C one deliberately.
+/// `Curl_md5it` returns `CURLcode` only because the pluggable backend's `init`
+/// could fail (`lib/md5.c:555`); with a single infallible backend there is no
+/// error left to report, so a `Result` would be a lie the caller must still
+/// handle. Returning the array also retires C's output pointer, as AAP
+/// section 0.1.2 requires: out-parameters do not survive the port.
+///
+/// The shape matches [`crate::crypto::sha256::sha256`] and its SHA-512/256
+/// counterpart on purpose: `lib/vauth/digest.c:991-1010` selects among the
+/// three digests through one function pointer, so the Rust caller must be able
+/// to select among them without special-casing MD5.
+///
+/// The allowance is required by the MSRV floor, for the reason recorded on
+/// [`BLOCK_LEN`]: this function's only consumer today is the `let _ = md5;`
+/// existence check in [`crate::crypto`], which rustc 1.75 does not count as a
+/// use. It is deleted when `auth/digest.rs` calls this for real.
 #[allow(dead_code)]
 pub(crate) fn md5(input: &[u8]) -> [u8; DIGEST_LEN] {
     let mut hasher = Md5Hasher::new();
@@ -52,18 +165,27 @@ pub(crate) fn md5(input: &[u8]) -> [u8; DIGEST_LEN] {
     hasher.finalize().into()
 }
 
-/// The incremental form: `Curl_MD5_init` / `_update` / `_final`
-/// (`lib/curl_md5.h:59-63`).
+/// The incremental form: `Curl_MD5_init` / `Curl_MD5_update` /
+/// `Curl_MD5_final` (`lib/curl_md5.h:59-63`, implemented at
+/// `lib/md5.c:563-589`, `:591-597` and `:599-607`).
 ///
-/// C exposed this over a vtable (`MD5_params`, `lib/curl_md5.h:41-43`) because
-/// the backend was selected at build time. There is one implementation here,
-/// so the indirection is gone while the call sequence is preserved: construct,
-/// feed any number of times, finish once.
+/// Construct, feed any number of times, finish once -- the sequence each of
+/// the four Digest contexts in `lib/vauth/digest.c` follows, minus the
+/// `MD5_params` vtable that C needed only to reach a build-selected backend.
 ///
-/// `finish` consumes the context, which is stricter than C's `Curl_MD5_final`
-/// -- that function frees the context and leaves the caller holding a dangling
-/// pointer if it is called twice. Consuming makes the second call a compile
-/// error.
+/// Finishing consumes the context, which is stricter than the C it replaces.
+/// `Curl_MD5_final` frees the context it is handed (`lib/md5.c:603-604`) and
+/// leaves the caller holding a dangling pointer, so calling it twice is a
+/// use-after-free there. Here it does not compile.
+///
+/// The `#[allow(dead_code)]` attributes below are inventory entries in the
+/// sense the crate root defines: this type's consumer is `auth/digest.rs`,
+/// which has not landed yet, and each attribute is deleted when it does. They
+/// are deliberately per item rather than one blanket allowance on the `impl`,
+/// because a blanket form would also silence the next method somebody adds --
+/// which is the reason the crate forbids a `dead_code` lint level on a module
+/// root at all. The constants, the `Md5` alias and [`md5`] carry no allowance
+/// because [`crate::crypto`] and `crypto/hmac.rs` already consume them.
 #[derive(Clone, Default)]
 pub(crate) struct Md5Context {
     #[allow(dead_code)]
@@ -71,7 +193,15 @@ pub(crate) struct Md5Context {
 }
 
 impl Md5Context {
-    /// A fresh context, equivalent to `Curl_MD5_init` (`lib/md5.c:481-501`).
+    /// A fresh context: `Curl_MD5_init` (`lib/md5.c:563-589`).
+    ///
+    /// C could return `NULL` from either of two allocations or from the
+    /// backend's `init` (`lib/md5.c:568`, `:573`, `:582`), which is why every
+    /// call site in `lib/vauth/digest.c` tests the result and maps it to
+    /// `CURLE_OUT_OF_MEMORY`. None of those failure modes survives the port,
+    /// so this cannot fail and callers need no check.
+    ///
+    /// [`Default`] is derived alongside this and agrees with it.
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
@@ -79,53 +209,166 @@ impl Md5Context {
         }
     }
 
-    /// Feed the next chunk: `Curl_MD5_update` (`lib/md5.c:503-513`).
+    /// Feed the next chunk: `Curl_MD5_update` (`lib/md5.c:591-597`).
+    ///
+    /// Any length is accepted, which the Digest composition depends on twice
+    /// over: `lib/vauth/digest.c:394` feeds a single separator byte, and
+    /// `lib/vauth/digest.c:406` feeds a previous 16-byte digest back in as
+    /// input.
+    ///
+    /// C narrowed `size_t` to `unsigned int` through `curlx_uztoui` to reach
+    /// this call (`lib/md5.c:557`). The Rust length is a `usize` end to end,
+    /// and that narrowing is deliberately not reintroduced.
     #[allow(dead_code)]
     pub(crate) fn update(&mut self, input: &[u8]) {
         self.hasher.update(input);
     }
 
-    /// Finish and return the digest: `Curl_MD5_final` (`lib/md5.c:515-526`).
+    /// Finish and return the digest: `Curl_MD5_final` (`lib/md5.c:599-607`).
+    #[allow(dead_code)]
+    pub(crate) fn finalize(self) -> [u8; DIGEST_LEN] {
+        self.hasher.finalize().into()
+    }
+
+    /// [`Md5Context::finalize`] under the name the sibling contexts use.
+    ///
+    /// [`crate::crypto::sha256::Sha256Context`] and the HMAC context both
+    /// spell this operation `finish`, and [`crate::crypto`] records that the
+    /// incremental contexts exist to give a caller one shape across
+    /// algorithms. Both spellings are accepted so that code written against
+    /// either sibling compiles unchanged against this one.
+    ///
+    /// This delegates and adds no behaviour; the two are the same digest.
     #[allow(dead_code)]
     pub(crate) fn finish(self) -> [u8; DIGEST_LEN] {
-        self.hasher.finalize().into()
+        self.finalize()
     }
 }
 
+// Tests
+//
+// `tests/unit/unit1601.c` is the C unit test for this code. It gates on
+// `<features>unittest</features>` through `tests/data/test1601`, which this
+// binary does not advertise, so that fixture skips and its coverage lives
+// here instead -- AAP section 0.8.7 relocates those assertions into the Rust
+// crates rather than re-exporting internals to make the C program link.
+//
+// The vector tables carry `#[rustfmt::skip]` so that the formatter cannot
+// regroup the literals into rows that no longer line up with the published
+// specification or with the C source they were transcribed from.
+
 #[cfg(test)]
 mod tests {
-    use super::{md5, Md5Context, BLOCK_LEN, DIGEST_LEN};
+    use super::{md5, Digest, Md5, Md5Context, BLOCK_LEN, DIGEST_LEN};
 
-    /// RFC 1321 appendix A.5, and the same vectors `tests/unit/unit1601.c`
-    /// asserts against `Curl_md5it`.
+    /// The seven vectors of RFC 1321 appendix A.5, with the digests written
+    /// the way the specification prints them: lowercase hex.
+    ///
+    /// Lowercase is not a presentation choice here. `"%02x"` at
+    /// `lib/vauth/digest.c:139` is what puts these bytes on the wire, so
+    /// comparing through [`crate::crypto::hex_lower`] asserts the digest and
+    /// the casing curl actually emits in one step. The uppercase renderer,
+    /// `Curl_hexbyte` at `lib/escape.c:218-225`, would fail this table.
+    #[rustfmt::skip]
+    const RFC_1321: &[(&[u8], &str)] = &[
+        (b"", "d41d8cd98f00b204e9800998ecf8427e"),
+        (b"a", "0cc175b9c0f1b6a831c399e269772661"),
+        (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+        (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+        (b"abcdefghijklmnopqrstuvwxyz",
+         "c3fcd3d76192e4007dfb496cca67e13b"),
+        (b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+         "d174ab98d277d9f5a5611c2c9f419d9f"),
+        // "1234567890" eight times over: 80 bytes, which crosses the 64-byte
+        // block boundary and so exercises the padded second block.
+        (b"12345678901234567890123456789012345678901234567890\
+           123456789012345678901234567890",
+         "57edf4a22be3c955ac49da2e2107b67a"),
+    ];
+
     #[test]
     fn one_shot_matches_the_rfc_1321_test_suite() {
+        for &(message, expected) in RFC_1321 {
+            assert_eq!(
+                crate::crypto::hex_lower(&md5(message)),
+                expected,
+                "RFC 1321 vector of {} bytes",
+                message.len()
+            );
+        }
+    }
+
+    /// `tests/unit/unit1601.c:40-48`, relocated.
+    ///
+    /// That program asserts with `verify_memory` against raw byte strings, so
+    /// these compare raw bytes rather than hex, preserving both what it
+    /// checked and how it checked it. The second vector is not a published
+    /// specification value; it exists only in the C test, which is why it is
+    /// kept separate from the RFC table above.
+    #[rustfmt::skip]
+    #[test]
+    fn one_shot_matches_the_relocated_unit1601_vectors() {
         assert_eq!(
-            md5(b""),
-            [
-                0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80,
-                0x09, 0x98, 0xec, 0xf8, 0x42, 0x7e
-            ]
+            md5(b"1"),
+            [0xc4, 0xca, 0x42, 0x38, 0xa0, 0xb9, 0x23, 0x82,
+             0x0d, 0xcc, 0x50, 0x9a, 0x6f, 0x75, 0x84, 0x9b]
         );
         assert_eq!(
-            md5(b"abc"),
-            [
-                0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96,
-                0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72
-            ]
-        );
-        assert_eq!(
-            md5(b"message digest"),
-            [
-                0xf9, 0x6b, 0x69, 0x7d, 0x7c, 0xb7, 0x93, 0x8d, 0x52, 0x5a,
-                0x2f, 0x31, 0xaa, 0xf1, 0x61, 0xd0
-            ]
+            md5(b"hello-you-fool"),
+            [0x88, 0x67, 0x0b, 0x6d, 0x5d, 0x74, 0x2f, 0xad,
+             0xa5, 0xcd, 0xf9, 0xb6, 0x82, 0x87, 0x5f, 0x22]
         );
     }
 
-    /// A streamed digest must equal the one-shot digest of the same bytes, or
-    /// the two call sites in `lib/vauth/digest.c` would disagree with each
-    /// other.
+    /// The specific pattern HTTP Digest depends on, and the reason a
+    /// one-shot-only surface would not serve it.
+    ///
+    /// `lib/vauth/digest.c:392-399` feeds text, then `':'` as a **single
+    /// byte**, then more text. A context that mishandled a one-byte update
+    /// would produce a wrong `HA1` and a Digest header that no fixture
+    /// matches.
+    #[test]
+    fn incremental_feeds_a_one_byte_separator_like_http_digest() {
+        let mut ctx = Md5Context::new();
+        ctx.update(b"a");
+        ctx.update(b":");
+        ctx.update(b"b");
+        assert_eq!(ctx.finalize(), md5(b"a:b"));
+    }
+
+    /// `lib/vauth/digest.c:402-413` feeds the *digest* of the first context
+    /// into the second as input, then a separator, then more text.
+    ///
+    /// Nothing renders it to hex first at that point -- the hex conversion
+    /// happens afterwards at `lib/vauth/digest.c:416-417` -- so the context
+    /// must accept 16 arbitrary bytes, including any that are not valid text.
+    #[test]
+    fn incremental_accepts_a_digest_fed_back_as_input() {
+        // The three fields C feeds in that order, named after the parameters
+        // at `lib/vauth/digest.c:392-399` so that nothing here reads as a
+        // credential. Any bytes would do; these document the shape.
+        let ha1 = md5(b"userp:realm:passwdp");
+
+        let mut ctx = Md5Context::new();
+        ctx.update(&ha1);
+        ctx.update(b":");
+        ctx.update(b"nonce");
+        ctx.update(b":");
+        ctx.update(b"cnonce");
+
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(&ha1);
+        concatenated.extend_from_slice(b":nonce:cnonce");
+
+        assert_eq!(ctx.finalize(), md5(&concatenated));
+    }
+
+    /// A streamed digest must equal the one-shot digest of the same bytes at
+    /// every split, or the four contexts in `lib/vauth/digest.c` could
+    /// disagree with each other depending only on how the input arrived.
+    ///
+    /// The splits bracket the 64-byte block boundary deliberately, since that
+    /// is where a buffered implementation goes wrong.
     #[test]
     fn incremental_agrees_with_one_shot_across_chunk_boundaries() {
         let message: Vec<u8> = (0u8..=255).collect();
@@ -135,13 +378,76 @@ mod tests {
             let mut ctx = Md5Context::new();
             ctx.update(&message[..split]);
             ctx.update(&message[split..]);
-            assert_eq!(ctx.finish(), md5(&message), "split at {split}");
+            assert_eq!(ctx.finalize(), md5(&message), "split at {split}");
         }
     }
 
+    /// A context that is never fed, and one fed only empty slices, must both
+    /// produce the digest of the empty message.
+    ///
+    /// [`Default`] is derived rather than written, so it is asserted to agree
+    /// with [`Md5Context::new`] rather than assumed to.
     #[test]
-    fn digest_length_is_the_contracted_sixteen() {
+    fn a_context_with_no_input_digests_the_empty_message() {
+        let empty = md5(b"");
+        assert_eq!(Md5Context::new().finalize(), empty);
+        assert_eq!(Md5Context::default().finalize(), empty);
+
+        let mut ctx = Md5Context::new();
+        ctx.update(b"");
+        ctx.update(b"");
+        assert_eq!(ctx.finalize(), empty);
+    }
+
+    /// The two spellings of finishing are the same operation.
+    ///
+    /// `finish` exists for shape parity with the sibling contexts, so it must
+    /// never drift from `finalize`.
+    #[test]
+    fn finish_and_finalize_produce_the_same_digest() {
+        let mut by_finalize = Md5Context::new();
+        by_finalize.update(b"curl");
+
+        let mut by_finish = Md5Context::new();
+        by_finish.update(b"curl");
+
+        assert_eq!(by_finalize.finalize(), by_finish.finish());
+        assert_eq!(Md5Context::new().finish(), md5(b""));
+    }
+
+    /// The published marker type must be the `md-5` crate's own type.
+    ///
+    /// `crypto/hmac.rs` instantiates `Hmac<Md5>`, whose bounds only the real
+    /// RustCrypto type satisfies. Driving it through the `Digest` trait here
+    /// proves the alias still names that type and still agrees with the
+    /// one-shot function, so a future newtype would fail this test rather
+    /// than only failing at the HMAC call site.
+    #[test]
+    fn the_published_marker_type_agrees_with_the_one_shot_form() {
+        let mut hasher = Md5::new();
+        hasher.update(b"abc");
+        let digest: [u8; DIGEST_LEN] = hasher.finalize().into();
+        assert_eq!(digest, md5(b"abc"));
+    }
+
+    /// The two numbers the C parameter tables fix, asserted by value.
+    ///
+    /// `MD5_DIGEST_LEN` at `lib/curl_md5.h:32` and `Curl_HMAC_MD5`'s maximum
+    /// key length at `lib/md5.c:533`. [`crate::crypto`] pins the same pair
+    /// with `const` assertions; these restate them at test time so that the
+    /// failure names this module when a value is changed here.
+    #[test]
+    fn the_contracted_constants_hold() {
+        assert_eq!(DIGEST_LEN, 16);
+        assert_eq!(BLOCK_LEN, 64);
+
+        // And the published surface really does produce that many bytes.
         assert_eq!(md5(b"anything").len(), DIGEST_LEN);
-        assert_eq!(Md5Context::new().finish().len(), DIGEST_LEN);
+        assert_eq!(Md5Context::new().finalize().len(), DIGEST_LEN);
+
+        // The hex rendering HTTP Digest writes is two characters per byte;
+        // `lib/vauth/digest.c:134-135` sizes its buffer 16 in, 33 out, the
+        // extra byte being C's NUL terminator.
+        assert_eq!(crate::crypto::hex_lower(&md5(b"")).len(), DIGEST_LEN * 2);
     }
 }

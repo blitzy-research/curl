@@ -37,3 +37,9 @@ threshold during transfer.
 Starting in curl 8.19.0, the maximum size can be specified using a fraction as
 in `2.5M` for two and a half megabytes. It only works with a period (`.`)
 delimiter, independent of what your locale might prefer.
+
+Transfers for `MQTT` and `MQTTS` are not implemented in this build, so
+neither scheme appears in the `Protocols:` line of the --version output and
+a request for either one fails with `CURLE_UNSUPPORTED_PROTOCOL` even though
+the option and its byte value are still parsed. The size limit remains fully
+effective for `FTP`, `FTPS`, `HTTP` and `HTTPS`.

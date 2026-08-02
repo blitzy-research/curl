@@ -71,19 +71,51 @@
 //! alias -> target mapping is still held here, in [`OPTION_ALIASES`], and
 //! asserted against the enumeration by test.
 //!
+//! # The identifier enumerations this module owns, and the four it does not
+//!
+//! The governing division is arithmetic rather than alphabetical: an
+//! enumeration whose members are COMPOSED -- from the `CURLOPT(na, t, nu)`
+//! macro, or from `CURLINFO_<BASE> + n` -- is option identity and belongs
+//! here. An enumeration whose members are plain declaration ordinals is a
+//! status, code or kind, and belongs to `ffi/codes.rs`. Four of the five
+//! composed enumerations are therefore declared below: [`CURLoption`],
+//! [`CURLINFO`], [`curl_easytype`] and [`CURLformoption`], together with
+//! the [`EASY_OPTIONS`] metadata array, the nine `CURLOPTTYPE_*` bases,
+//! the nine `CURLINFO_*` bases and the two `CURLOPT_WS_OPTIONS` argument
+//! bits.
+//!
+//! Four types that a reader might expect here are deliberately absent, and
+//! the reason is the same rule that put the rest here. `curl_easyoption`
+//! (include/curl/options.h:51) is LAYOUT-visible -- a consumer reads its
+//! fields through a returned pointer -- so it lives with the crate's other
+//! `#[repr(C)]` layout types in `ffi/types.rs`, and `ffi/easy.rs` projects
+//! this module's [`EasyOptionRow`] into it. `CURLMoption` and
+//! `CURLMinfo_offt` are `ffi/types.rs`'s for the same reason they are
+//! declared in `include/curl/multi.h` rather than `curl.h`: they belong to
+//! the multi surface. `CURLSHoption` is `ffi/codes.rs`'s, its members being
+//! bare ordinals.
+//!
+//! That split is not a matter of taste. Declaring `curl_easyoption` here as
+//! well would give the crate two structurally identical but DISTINCT Rust
+//! types for one C struct, and `ffi/easy.rs` would have to pick one -- the
+//! second population this module exists to prevent, arriving by the back
+//! door. It would also close a cycle, since this module would need
+//! `ffi/types.rs` for the struct while `ffi/types.rs` needs this module for
+//! nothing at all. The dependency runs one way, from `types` to `opts`
+//! nowhere and from `easy` to both.
+//!
 //! # The `dead_code` allowances
 //!
 //! Several items below carry `#[allow(dead_code)]`. Every one of them is
 //! exercised by this module's tests, but the plain `lib` target compiles
 //! without `#[cfg(test)]` code, and the exported functions that will read
-//! this data -- `curl_easy_setopt`, `curl_easy_option_by_name`,
-//! `curl_easy_option_by_id` and `curl_easy_option_next` -- are not landed
-//! yet. The allowances are per ITEM rather than a blanket
-//! `#![allow(dead_code)]` on the module, so each one disappears on its
-//! own as its consumer arrives and none of them can mask an unrelated
-//! unused item in the meantime.
+//! this data -- `curl_easy_setopt`, `curl_easy_getinfo`, `curl_multi_setopt`
+//! and the `curl_form*` trio -- are not all landed yet. The allowances are
+//! per ITEM rather than a blanket `#![allow(dead_code)]` on the module, so
+//! each one disappears on its own as its consumer arrives and none of them
+//! can mask an unrelated unused item in the meantime.
 
-use core::ffi::c_uint;
+use core::ffi::{c_int, c_long, c_uint};
 
 // Option type bases.
 //
@@ -848,11 +880,28 @@ pub enum CURLoption {
     CURLOPT_UPLOAD_FLAGS = 327,
     /// set TLS supported signature algorithms
     CURLOPT_SSL_SIGNATURE_ALGORITHMS = 10328,
-    /// One past the last real option. The frozen header leaves it implicit
-    /// after `CURLOPT_SSL_SIGNATURE_ALGORITHMS`, so its value is 10329.
-    /// `lib/optiontable.pl` asserts `10329 % 10000 != (328 + 1)` as its own
-    /// guard against a stale table, which is the check this value has to
-    /// satisfy.
+    /// One past the last real option, and **10329 -- not 328**.
+    ///
+    /// CORRECTION 1. 328 is the highest `nu` INDEX, carried by
+    /// `CURLOPT(CURLOPT_SSL_SIGNATURE_ALGORITHMS, CURLOPTTYPE_STRINGPOINT,
+    /// 328)` at `curl.h:2259`. The sentinel at `:2261` is written bare, so
+    /// it takes the next ordinal after that member's COMPOSED value of
+    /// 10328. Reading 328 as the sentinel's value understates it by 10001
+    /// and shifts nothing else, which is why the mistake survives a
+    /// compile: `CURLOPT_LASTENTRY` is a bound, never an option, so only
+    /// code that compares against it misbehaves.
+    ///
+    /// curl proves the value itself. `Curl_easyopts_check` at
+    /// `lib/easyoptions.c:388` returns an ERROR when
+    /// `(CURLOPT_LASTENTRY % 10000) != (328 + 1)`, so a correct table
+    /// satisfies the equality `10329 % 10000 == 329`. The `% 10000` is only
+    /// necessary because the value is neither 328 nor 329.
+    ///
+    /// The same trap has a twin in the multi interface:
+    /// `CURLMOPT_LASTENTRY` is 10020, an ordinal follow-on from
+    /// `CURLMOPT_NOTIFYDATA = 10019` (`multi.h:407`), and not 20. That
+    /// enumeration lives in `ffi/types.rs`, which already pins it
+    /// correctly; it is noted here because the two are the same error.
     CURLOPT_LASTENTRY = 10329,
 }
 
@@ -3941,6 +3990,1346 @@ const _: () = assert!(
      CURLOPTDEPRECATED)"
 );
 
+// ---------------------------------------------------------------------------
+// CURLINFO: the second composed identifier space.
+// ---------------------------------------------------------------------------
+
+// Information type bases (include/curl/curl.h:2890-2898).
+//
+// `pub(crate)` is load-bearing here for exactly the reason it is on the
+// `CURLOPTTYPE_*` bases above: `curl-rs-ffi/build.rs:2095-2103` carries
+// these nine `#define` lines verbatim, and cbindgen would render a `pub`
+// constant as a SECOND `#define` of the same name.
+//
+// The type is `c_int` rather than `i32` because every one of these is used
+// as the right operand of a mask against a value that arrived from C as an
+// `int` -- `lib/getinfo.c:636` is `type = CURLINFO_TYPEMASK & (int)info;`.
+// `c_int` is `i32` on all four targets AAP 0.8.3 mandates, so nothing about
+// the arithmetic changes; only the declared intent does.
+//
+// CORRECTION 2 -- `curl_easytype` is not recoverable from `id / 10000` --
+// HAS AN EXACT TWIN HERE, and it is why [`InfoBase`] exists below instead
+// of a bare integer. `CURLINFO_PTR` and `CURLINFO_SLIST` are DELIBERATELY
+// the same value, and the frozen header says so in the comment `/* same as
+// SLIST */`. Five members are affected: three are spelled `CURLINFO_PTR`
+// (`CERTINFO`, `TLS_SESSION`, `TLS_SSL_PTR`) and two `CURLINFO_SLIST`
+// (`SSL_ENGINES`, `COOKIELIST`). A renderer that recovered the spelling
+// from the integer would emit the wrong one for all five, and the emitted
+// header would still compile -- which is precisely the silent failure mode
+// this module exists to make impossible.
+pub(crate) const CURLINFO_STRING: c_int = 0x100000;
+pub(crate) const CURLINFO_LONG: c_int = 0x200000;
+pub(crate) const CURLINFO_DOUBLE: c_int = 0x300000;
+pub(crate) const CURLINFO_SLIST: c_int = 0x400000;
+/// Same value as [`CURLINFO_SLIST`], deliberately, and not a defect to fix.
+pub(crate) const CURLINFO_PTR: c_int = 0x400000;
+pub(crate) const CURLINFO_SOCKET: c_int = 0x500000;
+pub(crate) const CURLINFO_OFF_T: c_int = 0x600000;
+/// Isolates the ordinal from a composed `CURLINFO` value.
+///
+/// The one base with no production caller yet, so it carries the same
+/// per-item allowance the `CURLOPTTYPE_*` bases above do. The other eight
+/// are reached from [`InfoBase::value`] and [`info_value_kind`]; this one is
+/// exercised only by the const assertion below and by the tests, and rustc
+/// 1.75 -- the declared MSRV -- does not count a use inside
+/// `const _: () = assert!(...)` as a use, though 1.97 does. Without the
+/// allowance the floor build warns and the newer build does not, which is
+/// the most confusing shape a warning can take.
+///
+/// `CURLINFO::ordinal` deliberately does NOT mask: it consults
+/// [`INFO_COMPOSITION`] so that `CURLINFO_NONE` and `CURLINFO_LASTONE`
+/// report `None` rather than the 0 and 70 a mask would hand back.
+#[allow(dead_code)]
+pub(crate) const CURLINFO_MASK: c_int = 0x0fffff;
+/// Isolates the type base from a composed `CURLINFO` value.
+pub(crate) const CURLINFO_TYPEMASK: c_int = 0xf00000;
+
+// The two collisions above are asserted rather than described, so that
+// "fixing" either one is a build failure and not a merge.
+const _: () = assert!(
+    CURLINFO_PTR == CURLINFO_SLIST,
+    "curl.h:2894 defines CURLINFO_PTR as CURLINFO_SLIST; the getinfo \
+     dispatch has no PTR arm because of it"
+);
+const _: () = assert!(
+    CURLINFO_TYPEMASK == 0xf00000 && CURLINFO_MASK == 0x0fffff,
+    "the two masks are frozen at curl.h:2897-2898"
+);
+
+/// The `CURLINFO_*` base a member was composed from, kept as a SPELLING.
+///
+/// Seven spellings, six distinct values. This type exists because the
+/// arithmetic that produces a `CURLINFO` value is lossy in exactly one
+/// place -- `Ptr` and `Slist` share 0x400000 -- so a table that stored only
+/// the integer could not re-render the frozen header's
+/// `= CURLINFO_<BASE> + n` form. `build.rs` renders that text from
+/// [`INFO_COMPOSITION`], which carries this type per row.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+pub(crate) enum InfoBase {
+    /// `CURLINFO_STRING`, 0x100000.
+    String,
+    /// `CURLINFO_LONG`, 0x200000.
+    Long,
+    /// `CURLINFO_DOUBLE`, 0x300000.
+    Double,
+    /// `CURLINFO_SLIST`, 0x400000.
+    Slist,
+    /// `CURLINFO_PTR`, 0x400000 -- the same value as `Slist`.
+    Ptr,
+    /// `CURLINFO_SOCKET`, 0x500000.
+    Socket,
+    /// `CURLINFO_OFF_T`, 0x600000.
+    OffT,
+}
+
+impl InfoBase {
+    /// Every spelling, in the order the frozen header declares them.
+    #[allow(dead_code)]
+    pub(crate) const ALL: &'static [InfoBase] = &[
+        InfoBase::String,
+        InfoBase::Long,
+        InfoBase::Double,
+        InfoBase::Slist,
+        InfoBase::Ptr,
+        InfoBase::Socket,
+        InfoBase::OffT,
+    ];
+
+    /// The integer this base contributes to a composed value.
+    #[allow(dead_code)]
+    pub(crate) const fn value(self) -> c_int {
+        match self {
+            InfoBase::String => CURLINFO_STRING,
+            InfoBase::Long => CURLINFO_LONG,
+            InfoBase::Double => CURLINFO_DOUBLE,
+            InfoBase::Slist => CURLINFO_SLIST,
+            InfoBase::Ptr => CURLINFO_PTR,
+            InfoBase::Socket => CURLINFO_SOCKET,
+            InfoBase::OffT => CURLINFO_OFF_T,
+        }
+    }
+
+    /// The C spelling, which is the half the arithmetic loses.
+    #[allow(dead_code)]
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            InfoBase::String => "CURLINFO_STRING",
+            InfoBase::Long => "CURLINFO_LONG",
+            InfoBase::Double => "CURLINFO_DOUBLE",
+            InfoBase::Slist => "CURLINFO_SLIST",
+            InfoBase::Ptr => "CURLINFO_PTR",
+            InfoBase::Socket => "CURLINFO_SOCKET",
+            InfoBase::OffT => "CURLINFO_OFF_T",
+        }
+    }
+
+    /// The value class a member on this base carries.
+    ///
+    /// This is where the seven spellings become six kinds: `Ptr` collapses
+    /// onto `Slist`, because the two bases are one integer and the C
+    /// dispatch can only see the integer.
+    #[allow(dead_code)]
+    pub(crate) const fn kind(self) -> InfoValueKind {
+        match self {
+            InfoBase::String => InfoValueKind::String,
+            InfoBase::Long => InfoValueKind::Long,
+            InfoBase::Double => InfoValueKind::Double,
+            InfoBase::Slist | InfoBase::Ptr => InfoValueKind::Slist,
+            InfoBase::Socket => InfoValueKind::Socket,
+            InfoBase::OffT => InfoValueKind::OffT,
+        }
+    }
+}
+
+/// The six arms of `curl_easy_getinfo`'s type switch.
+///
+/// Six, not seven, and the missing one is not an omission: `lib/getinfo.c`
+/// masks with `CURLINFO_TYPEMASK` and then switches on the result
+/// (`:636-671`), so `CURLINFO_PTR` and `CURLINFO_SLIST` reach the same arm
+/// and a `Ptr` arm would be unreachable. Rust would reject a duplicate
+/// pattern outright, which is a better outcome than C's silent acceptance.
+///
+/// Each variant names the pointer type the caller must have passed, and
+/// that is the whole reason the classification has to be right: reading the
+/// wrong pointer type out of the variadic argument list is undefined
+/// behaviour, not a wrong answer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+pub(crate) enum InfoValueKind {
+    /// `const char **`
+    String,
+    /// `long *`
+    Long,
+    /// `double *`
+    Double,
+    /// `struct curl_slist **`, and also every `CURLINFO_PTR` member.
+    Slist,
+    /// `curl_socket_t *`
+    Socket,
+    /// `curl_off_t *`
+    OffT,
+}
+
+/// Classify a raw `CURLINFO` argument the way `curl_easy_getinfo` must.
+///
+/// Takes a `c_int` and not a [`CURLINFO`], deliberately. A C caller may
+/// legally pass any `int`, so the value cannot be materialised as a
+/// `#[repr(C)]` enum without undefined behaviour, and -- more importantly
+/// for behavioural parity -- the C classifies BEFORE it validates. An
+/// unrecognised id whose type bits are nonetheless valid still consumes the
+/// matching varargs slot and only then fails in the per-type getter. Mapping
+/// `None` onto `CURLE_UNKNOWN_OPTION` reproduces the `default:` arm at
+/// `lib/getinfo.c:668`.
+#[allow(dead_code)]
+pub(crate) const fn info_value_kind(info: c_int) -> Option<InfoValueKind> {
+    match info & CURLINFO_TYPEMASK {
+        CURLINFO_STRING => Some(InfoValueKind::String),
+        CURLINFO_LONG => Some(InfoValueKind::Long),
+        CURLINFO_DOUBLE => Some(InfoValueKind::Double),
+        // CURLINFO_PTR is this same value. One arm, by construction.
+        CURLINFO_SLIST => Some(InfoValueKind::Slist),
+        CURLINFO_SOCKET => Some(InfoValueKind::Socket),
+        CURLINFO_OFF_T => Some(InfoValueKind::OffT),
+        _ => None,
+    }
+}
+
+// The information enumeration, carried verbatim into `include/curl/curl.h`.
+//
+// `cbindgen.toml:917` lists `CURLINFO` under `[export] exclude`, and unlike
+// `CURLoption` that exclusion is NOT lifted: `CURL_H_GENERATED_DESPITE_
+// EXCLUSION` (build.rs:6212) holds exactly one name. The reason is the nine
+// `CURL_DEPRECATED` attributes below. cbindgen renders a deprecation note
+// through `format.replace("{}", &format!("{note:?}"))`, which Debug-quotes
+// the version token, while the frozen header needs it UNQUOTED and uses
+// four different versions in this one enumeration. So `curl.h`'s CURLINFO
+// block is carried verbatim (build.rs:2106-2996) and this declaration is
+// the RUST-side authority that the verbatim text is asserted against --
+// not a second population, because the assertion is what makes them one.
+//
+// Why the integers are written out rather than composed. A Rust
+// `#[repr(C)]` enum discriminant is an `isize` expression, so it cannot
+// name the `c_int` bases above without a cast that would obscure the value.
+// Writing `0x100001` and asserting `== CURLINFO_STRING + 1` from
+// [`INFO_COMPOSITION`] keeps both halves visible and pins the integer, which
+// is what AAP 0.6.1 requires. The doc comment on each member carries the
+// header's own `CURLINFO_<BASE> + n` spelling so a reader never has to do
+// the hexadecimal in their head.
+
+/// Every `CURLINFO_*` identifier, with its integer pinned.
+///
+/// 79 members. Two are not composed from a base -- `CURLINFO_NONE` is the
+/// ordinal 0 and `CURLINFO_LASTONE` is a bare 70 -- and the remaining 77
+/// are `CURLINFO_<BASE> + n`. The values are neither contiguous nor
+/// ordered, so the contiguity assertion `ffi/codes.rs` uses would be wrong
+/// here; what is asserted instead is that every value equals its base plus
+/// its ordinal, that no two members share a value, and that no two share a
+/// `(base, ordinal)` pair.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+// Frozen C ABI name: `include/curl/curl.h:2996` spells it this way and AAP
+// 0.8.1 forbids changing a public typedef, so the style lints yield to the
+// contract.
+#[allow(clippy::upper_case_acronyms)]
+#[allow(clippy::enum_variant_names)]
+pub enum CURLINFO {
+    /// Ordinal zero, and one of only two members that is not composed from a
+    /// base. First, never use this.
+    CURLINFO_NONE = 0,
+    /// `CURLINFO_STRING + 1`. Last used URL.
+    CURLINFO_EFFECTIVE_URL = 0x100001,
+    /// `CURLINFO_LONG + 2`. Last received response code.
+    CURLINFO_RESPONSE_CODE = 0x200002,
+    /// `CURLINFO_DOUBLE + 3`. Total time of previous transfer.
+    CURLINFO_TOTAL_TIME = 0x300003,
+    /// `CURLINFO_DOUBLE + 4`. Time from start until name resolving completed as
+    /// a double.
+    CURLINFO_NAMELOOKUP_TIME = 0x300004,
+    /// `CURLINFO_DOUBLE + 5`. The time it took from the start until the connect
+    /// to the remote host (or proxy) was completed.
+    CURLINFO_CONNECT_TIME = 0x300005,
+    /// `CURLINFO_DOUBLE + 6`. The time it took from the start until the file
+    /// transfer is just about to begin.
+    CURLINFO_PRETRANSFER_TIME = 0x300006,
+    /// `CURLINFO_DOUBLE + 7`. Number of bytes uploaded.
+    ///
+    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_SIZE_UPLOAD_T")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLINFO_SIZE_UPLOAD = 0x300007,
+    /// `CURLINFO_OFF_T + 7`. Number of bytes uploaded.
+    CURLINFO_SIZE_UPLOAD_T = 0x600007,
+    /// `CURLINFO_DOUBLE + 8`. Number of bytes downloaded.
+    ///
+    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_SIZE_DOWNLOAD_T")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLINFO_SIZE_DOWNLOAD = 0x300008,
+    /// `CURLINFO_OFF_T + 8`. Number of bytes downloaded.
+    CURLINFO_SIZE_DOWNLOAD_T = 0x600008,
+    /// `CURLINFO_DOUBLE + 9`. Average download speed.
+    ///
+    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_SPEED_DOWNLOAD_T")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLINFO_SPEED_DOWNLOAD = 0x300009,
+    /// `CURLINFO_OFF_T + 9`. Average download speed.
+    CURLINFO_SPEED_DOWNLOAD_T = 0x600009,
+    /// `CURLINFO_DOUBLE + 10`. Average upload speed.
+    ///
+    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_SPEED_UPLOAD_T")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLINFO_SPEED_UPLOAD = 0x30000a,
+    /// `CURLINFO_OFF_T + 10`. Average upload speed in number of bytes per
+    /// second.
+    CURLINFO_SPEED_UPLOAD_T = 0x60000a,
+    /// `CURLINFO_LONG + 11`. Number of bytes of all headers received.
+    CURLINFO_HEADER_SIZE = 0x20000b,
+    /// `CURLINFO_LONG + 12`. Number of bytes sent in the issued HTTP requests.
+    CURLINFO_REQUEST_SIZE = 0x20000c,
+    /// `CURLINFO_LONG + 13`. Certificate verification result.
+    CURLINFO_SSL_VERIFYRESULT = 0x20000d,
+    /// `CURLINFO_LONG + 14`. Remote time of the retrieved document.
+    CURLINFO_FILETIME = 0x20000e,
+    /// `CURLINFO_OFF_T + 14`. Remote time of the retrieved document.
+    CURLINFO_FILETIME_T = 0x60000e,
+    /// `CURLINFO_DOUBLE + 15`. Content length from the Content-Length header.
+    ///
+    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_CONTENT_LENGTH_DOWNLOAD_T")` in
+    /// the frozen header. Kept, because AAP 0.8.2 forbids removing a deprecated
+    /// public name.
+    CURLINFO_CONTENT_LENGTH_DOWNLOAD = 0x30000f,
+    /// `CURLINFO_OFF_T + 15`. Content length from the Content-Length header.
+    CURLINFO_CONTENT_LENGTH_DOWNLOAD_T = 0x60000f,
+    /// `CURLINFO_DOUBLE + 16`. Upload size.
+    ///
+    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_CONTENT_LENGTH_UPLOAD_T")` in the
+    /// frozen header. Kept, because AAP 0.8.2 forbids removing a deprecated
+    /// public name.
+    CURLINFO_CONTENT_LENGTH_UPLOAD = 0x300010,
+    /// `CURLINFO_OFF_T + 16`. Upload size.
+    CURLINFO_CONTENT_LENGTH_UPLOAD_T = 0x600010,
+    /// `CURLINFO_DOUBLE + 17`. The time it took from the start until the first
+    /// byte is received by libcurl.
+    CURLINFO_STARTTRANSFER_TIME = 0x300011,
+    /// `CURLINFO_STRING + 18`. Content type from the `Content-Type:` header.
+    CURLINFO_CONTENT_TYPE = 0x100012,
+    /// `CURLINFO_DOUBLE + 19`. The time it took for all redirection steps
+    /// include name lookup, connect, pretransfer and transfer before final
+    /// transaction was started.
+    CURLINFO_REDIRECT_TIME = 0x300013,
+    /// `CURLINFO_LONG + 20`. Total number of redirects that were followed.
+    CURLINFO_REDIRECT_COUNT = 0x200014,
+    /// `CURLINFO_STRING + 21`. User's private data pointer.
+    CURLINFO_PRIVATE = 0x100015,
+    /// `CURLINFO_LONG + 22`. Last proxy CONNECT response code.
+    CURLINFO_HTTP_CONNECTCODE = 0x200016,
+    /// `CURLINFO_LONG + 23`. Available HTTP authentication methods.
+    CURLINFO_HTTPAUTH_AVAIL = 0x200017,
+    /// `CURLINFO_LONG + 24`. Available HTTP proxy authentication methods.
+    CURLINFO_PROXYAUTH_AVAIL = 0x200018,
+    /// `CURLINFO_LONG + 25`. The errno from the last failure to connect.
+    CURLINFO_OS_ERRNO = 0x200019,
+    /// `CURLINFO_LONG + 26`. Number of new successful connections used for
+    /// previous transfer.
+    CURLINFO_NUM_CONNECTS = 0x20001a,
+    /// `CURLINFO_SLIST + 27`. A list of OpenSSL crypto engines.
+    CURLINFO_SSL_ENGINES = 0x40001b,
+    /// `CURLINFO_SLIST + 28`. List of all known cookies.
+    CURLINFO_COOKIELIST = 0x40001c,
+    /// `CURLINFO_LONG + 29`. Last socket used.
+    ///
+    /// `CURL_DEPRECATED(7.45.0, "Use CURLINFO_ACTIVESOCKET")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLINFO_LASTSOCKET = 0x20001d,
+    /// `CURLINFO_STRING + 30`. The entry path after logging in to an FTP
+    /// server.
+    CURLINFO_FTP_ENTRY_PATH = 0x10001e,
+    /// `CURLINFO_STRING + 31`. URL a redirect would take you to, had you
+    /// enabled redirects.
+    CURLINFO_REDIRECT_URL = 0x10001f,
+    /// `CURLINFO_STRING + 32`. Destination IP address of the last connection.
+    CURLINFO_PRIMARY_IP = 0x100020,
+    /// `CURLINFO_DOUBLE + 33`. The time it took from the start until the SSL
+    /// connect/handshake with the remote host was completed as a double in
+    /// number of seconds.
+    CURLINFO_APPCONNECT_TIME = 0x300021,
+    /// `CURLINFO_PTR + 34`. Certificate chain.
+    CURLINFO_CERTINFO = 0x400022,
+    /// `CURLINFO_LONG + 35`. Whether or not a time conditional was met or 304
+    /// HTTP response.
+    CURLINFO_CONDITION_UNMET = 0x200023,
+    /// `CURLINFO_STRING + 36`. RTSP session ID.
+    CURLINFO_RTSP_SESSION_ID = 0x100024,
+    /// `CURLINFO_LONG + 37`. The RTSP client CSeq that is expected next.
+    CURLINFO_RTSP_CLIENT_CSEQ = 0x200025,
+    /// `CURLINFO_LONG + 38`. The RTSP server CSeq that is expected next.
+    CURLINFO_RTSP_SERVER_CSEQ = 0x200026,
+    /// `CURLINFO_LONG + 39`. RTSP CSeq last received.
+    CURLINFO_RTSP_CSEQ_RECV = 0x200027,
+    /// `CURLINFO_LONG + 40`. Destination port of the last connection.
+    CURLINFO_PRIMARY_PORT = 0x200028,
+    /// `CURLINFO_STRING + 41`. Source IP address of the last connection.
+    CURLINFO_LOCAL_IP = 0x100029,
+    /// `CURLINFO_LONG + 42`. Source port number of the last connection.
+    CURLINFO_LOCAL_PORT = 0x20002a,
+    /// `CURLINFO_PTR + 43`. TLS session info that can be used for further
+    /// processing.
+    ///
+    /// `CURL_DEPRECATED(7.48.0, "Use CURLINFO_TLS_SSL_PTR")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLINFO_TLS_SESSION = 0x40002b,
+    /// `CURLINFO_SOCKET + 44`. The session's active socket.
+    CURLINFO_ACTIVESOCKET = 0x50002c,
+    /// `CURLINFO_PTR + 45`. TLS session info that can be used for further
+    /// processing.
+    CURLINFO_TLS_SSL_PTR = 0x40002d,
+    /// `CURLINFO_LONG + 46`. The http version used in the connection.
+    CURLINFO_HTTP_VERSION = 0x20002e,
+    /// `CURLINFO_LONG + 47`. Proxy certificate verification result.
+    CURLINFO_PROXY_SSL_VERIFYRESULT = 0x20002f,
+    /// `CURLINFO_LONG + 48`. The protocol used for the connection.
+    ///
+    /// `CURL_DEPRECATED(7.85.0, "Use CURLINFO_SCHEME")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLINFO_PROTOCOL = 0x200030,
+    /// `CURLINFO_STRING + 49`. The scheme used for the connection.
+    CURLINFO_SCHEME = 0x100031,
+    /// `CURLINFO_OFF_T + 50`. Total time of previous transfer.
+    CURLINFO_TOTAL_TIME_T = 0x600032,
+    /// `CURLINFO_OFF_T + 51`. Time from start until name resolving completed in
+    /// number of microseconds.
+    CURLINFO_NAMELOOKUP_TIME_T = 0x600033,
+    /// `CURLINFO_OFF_T + 52`. The time it took from the start until the connect
+    /// to the remote host (or proxy) was completed.
+    CURLINFO_CONNECT_TIME_T = 0x600034,
+    /// `CURLINFO_OFF_T + 53`. The time it took from the start until the file
+    /// transfer is just about to begin.
+    CURLINFO_PRETRANSFER_TIME_T = 0x600035,
+    /// `CURLINFO_OFF_T + 54`. The time it took from the start until the first
+    /// byte is received by libcurl.
+    CURLINFO_STARTTRANSFER_TIME_T = 0x600036,
+    /// `CURLINFO_OFF_T + 55`. The time it took for all redirection steps
+    /// include name lookup, connect, pretransfer and transfer before final
+    /// transaction was started.
+    CURLINFO_REDIRECT_TIME_T = 0x600037,
+    /// `CURLINFO_OFF_T + 56`. The time it took from the start until the SSL
+    /// connect/handshake with the remote host was completed in number of
+    /// microseconds.
+    CURLINFO_APPCONNECT_TIME_T = 0x600038,
+    /// `CURLINFO_OFF_T + 57`. The value from the Retry-After header.
+    CURLINFO_RETRY_AFTER = 0x600039,
+    /// `CURLINFO_STRING + 58`. Last used HTTP method.
+    CURLINFO_EFFECTIVE_METHOD = 0x10003a,
+    /// `CURLINFO_LONG + 59`. Detailed proxy error.
+    CURLINFO_PROXY_ERROR = 0x20003b,
+    /// `CURLINFO_STRING + 60`. Referrer header.
+    CURLINFO_REFERER = 0x10003c,
+    /// `CURLINFO_STRING + 61`. Get the default value for CURLOPT_CAINFO.
+    CURLINFO_CAINFO = 0x10003d,
+    /// `CURLINFO_STRING + 62`. Get the default value for CURLOPT_CAPATH.
+    CURLINFO_CAPATH = 0x10003e,
+    /// `CURLINFO_OFF_T + 63`. The ID of the transfer.
+    CURLINFO_XFER_ID = 0x60003f,
+    /// `CURLINFO_OFF_T + 64`. The ID of the last connection used by the
+    /// transfer.
+    CURLINFO_CONN_ID = 0x600040,
+    /// `CURLINFO_OFF_T + 65`. The time during which the transfer was held in a
+    /// waiting queue before it could start for real in number of microseconds.
+    CURLINFO_QUEUE_TIME_T = 0x600041,
+    /// `CURLINFO_LONG + 66`. Whether the proxy was used (Added in 8.7.0).
+    CURLINFO_USED_PROXY = 0x200042,
+    /// `CURLINFO_OFF_T + 67`. The time it took from the start until the last
+    /// byte is sent by libcurl.
+    CURLINFO_POSTTRANSFER_TIME_T = 0x600043,
+    /// `CURLINFO_OFF_T + 68`. Amount of TLS early data sent (in number of
+    /// bytes) when CURLSSLOPT_EARLYDATA is enabled.
+    CURLINFO_EARLYDATA_SENT_T = 0x600044,
+    /// `CURLINFO_LONG + 69`. Used HTTP authentication method.
+    CURLINFO_HTTPAUTH_USED = 0x200045,
+    /// `CURLINFO_LONG + 70`. Used HTTP proxy authentication methods.
+    CURLINFO_PROXYAUTH_USED = 0x200046,
+    /// Written in the frozen header as a BARE 70 (curl.h:2995): not a base
+    /// composition, and not the 79 that is the token count.
+    CURLINFO_LASTONE = 70,
+}
+
+impl CURLINFO {
+    /// Every variant, in the frozen header's declaration order.
+    ///
+    /// `CURLINFO_LASTONE` is last, as in the header. Read by
+    /// [`CURLINFO::from_c_int`] and by every test that asserts coverage.
+    #[allow(dead_code)]
+    pub(crate) const ABI_VARIANTS: &'static [CURLINFO] = &[
+        CURLINFO::CURLINFO_NONE,
+        CURLINFO::CURLINFO_EFFECTIVE_URL,
+        CURLINFO::CURLINFO_RESPONSE_CODE,
+        CURLINFO::CURLINFO_TOTAL_TIME,
+        CURLINFO::CURLINFO_NAMELOOKUP_TIME,
+        CURLINFO::CURLINFO_CONNECT_TIME,
+        CURLINFO::CURLINFO_PRETRANSFER_TIME,
+        CURLINFO::CURLINFO_SIZE_UPLOAD,
+        CURLINFO::CURLINFO_SIZE_UPLOAD_T,
+        CURLINFO::CURLINFO_SIZE_DOWNLOAD,
+        CURLINFO::CURLINFO_SIZE_DOWNLOAD_T,
+        CURLINFO::CURLINFO_SPEED_DOWNLOAD,
+        CURLINFO::CURLINFO_SPEED_DOWNLOAD_T,
+        CURLINFO::CURLINFO_SPEED_UPLOAD,
+        CURLINFO::CURLINFO_SPEED_UPLOAD_T,
+        CURLINFO::CURLINFO_HEADER_SIZE,
+        CURLINFO::CURLINFO_REQUEST_SIZE,
+        CURLINFO::CURLINFO_SSL_VERIFYRESULT,
+        CURLINFO::CURLINFO_FILETIME,
+        CURLINFO::CURLINFO_FILETIME_T,
+        CURLINFO::CURLINFO_CONTENT_LENGTH_DOWNLOAD,
+        CURLINFO::CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
+        CURLINFO::CURLINFO_CONTENT_LENGTH_UPLOAD,
+        CURLINFO::CURLINFO_CONTENT_LENGTH_UPLOAD_T,
+        CURLINFO::CURLINFO_STARTTRANSFER_TIME,
+        CURLINFO::CURLINFO_CONTENT_TYPE,
+        CURLINFO::CURLINFO_REDIRECT_TIME,
+        CURLINFO::CURLINFO_REDIRECT_COUNT,
+        CURLINFO::CURLINFO_PRIVATE,
+        CURLINFO::CURLINFO_HTTP_CONNECTCODE,
+        CURLINFO::CURLINFO_HTTPAUTH_AVAIL,
+        CURLINFO::CURLINFO_PROXYAUTH_AVAIL,
+        CURLINFO::CURLINFO_OS_ERRNO,
+        CURLINFO::CURLINFO_NUM_CONNECTS,
+        CURLINFO::CURLINFO_SSL_ENGINES,
+        CURLINFO::CURLINFO_COOKIELIST,
+        CURLINFO::CURLINFO_LASTSOCKET,
+        CURLINFO::CURLINFO_FTP_ENTRY_PATH,
+        CURLINFO::CURLINFO_REDIRECT_URL,
+        CURLINFO::CURLINFO_PRIMARY_IP,
+        CURLINFO::CURLINFO_APPCONNECT_TIME,
+        CURLINFO::CURLINFO_CERTINFO,
+        CURLINFO::CURLINFO_CONDITION_UNMET,
+        CURLINFO::CURLINFO_RTSP_SESSION_ID,
+        CURLINFO::CURLINFO_RTSP_CLIENT_CSEQ,
+        CURLINFO::CURLINFO_RTSP_SERVER_CSEQ,
+        CURLINFO::CURLINFO_RTSP_CSEQ_RECV,
+        CURLINFO::CURLINFO_PRIMARY_PORT,
+        CURLINFO::CURLINFO_LOCAL_IP,
+        CURLINFO::CURLINFO_LOCAL_PORT,
+        CURLINFO::CURLINFO_TLS_SESSION,
+        CURLINFO::CURLINFO_ACTIVESOCKET,
+        CURLINFO::CURLINFO_TLS_SSL_PTR,
+        CURLINFO::CURLINFO_HTTP_VERSION,
+        CURLINFO::CURLINFO_PROXY_SSL_VERIFYRESULT,
+        CURLINFO::CURLINFO_PROTOCOL,
+        CURLINFO::CURLINFO_SCHEME,
+        CURLINFO::CURLINFO_TOTAL_TIME_T,
+        CURLINFO::CURLINFO_NAMELOOKUP_TIME_T,
+        CURLINFO::CURLINFO_CONNECT_TIME_T,
+        CURLINFO::CURLINFO_PRETRANSFER_TIME_T,
+        CURLINFO::CURLINFO_STARTTRANSFER_TIME_T,
+        CURLINFO::CURLINFO_REDIRECT_TIME_T,
+        CURLINFO::CURLINFO_APPCONNECT_TIME_T,
+        CURLINFO::CURLINFO_RETRY_AFTER,
+        CURLINFO::CURLINFO_EFFECTIVE_METHOD,
+        CURLINFO::CURLINFO_PROXY_ERROR,
+        CURLINFO::CURLINFO_REFERER,
+        CURLINFO::CURLINFO_CAINFO,
+        CURLINFO::CURLINFO_CAPATH,
+        CURLINFO::CURLINFO_XFER_ID,
+        CURLINFO::CURLINFO_CONN_ID,
+        CURLINFO::CURLINFO_QUEUE_TIME_T,
+        CURLINFO::CURLINFO_USED_PROXY,
+        CURLINFO::CURLINFO_POSTTRANSFER_TIME_T,
+        CURLINFO::CURLINFO_EARLYDATA_SENT_T,
+        CURLINFO::CURLINFO_HTTPAUTH_USED,
+        CURLINFO::CURLINFO_PROXYAUTH_USED,
+        CURLINFO::CURLINFO_LASTONE,
+    ];
+
+    /// The number of tokens the frozen enumeration declares.
+    ///
+    /// Seventy-nine, and NOT seventy: AAP 0.4.1's phrase "70 CURLINFO
+    /// accessors" describes how many the getinfo implementation answers
+    /// for, which is the value of `CURLINFO_LASTONE`, not the size of the
+    /// enumeration. The two numbers are asserted separately below so that
+    /// neither can be mistaken for the other.
+    #[allow(dead_code)]
+    pub(crate) const TOKEN_COUNT: usize = 79;
+
+    /// The number of tokens written as `CURLINFO_<BASE> + n`.
+    #[allow(dead_code)]
+    pub(crate) const COMPOSED_COUNT: usize = 77;
+
+    /// The C spelling of this member.
+    ///
+    /// An explicit match rather than `Debug`, because the spelling is ABI
+    /// data that `build.rs` renders into the header, and the `Debug`
+    /// representation of an enum carries no stability guarantee.
+    #[allow(dead_code)]
+    pub(crate) const fn c_name(self) -> &'static str {
+        match self {
+            CURLINFO::CURLINFO_NONE => "CURLINFO_NONE",
+            CURLINFO::CURLINFO_EFFECTIVE_URL => "CURLINFO_EFFECTIVE_URL",
+            CURLINFO::CURLINFO_RESPONSE_CODE => "CURLINFO_RESPONSE_CODE",
+            CURLINFO::CURLINFO_TOTAL_TIME => "CURLINFO_TOTAL_TIME",
+            CURLINFO::CURLINFO_NAMELOOKUP_TIME => "CURLINFO_NAMELOOKUP_TIME",
+            CURLINFO::CURLINFO_CONNECT_TIME => "CURLINFO_CONNECT_TIME",
+            CURLINFO::CURLINFO_PRETRANSFER_TIME => "CURLINFO_PRETRANSFER_TIME",
+            CURLINFO::CURLINFO_SIZE_UPLOAD => "CURLINFO_SIZE_UPLOAD",
+            CURLINFO::CURLINFO_SIZE_UPLOAD_T => "CURLINFO_SIZE_UPLOAD_T",
+            CURLINFO::CURLINFO_SIZE_DOWNLOAD => "CURLINFO_SIZE_DOWNLOAD",
+            CURLINFO::CURLINFO_SIZE_DOWNLOAD_T => "CURLINFO_SIZE_DOWNLOAD_T",
+            CURLINFO::CURLINFO_SPEED_DOWNLOAD => "CURLINFO_SPEED_DOWNLOAD",
+            CURLINFO::CURLINFO_SPEED_DOWNLOAD_T => "CURLINFO_SPEED_DOWNLOAD_T",
+            CURLINFO::CURLINFO_SPEED_UPLOAD => "CURLINFO_SPEED_UPLOAD",
+            CURLINFO::CURLINFO_SPEED_UPLOAD_T => "CURLINFO_SPEED_UPLOAD_T",
+            CURLINFO::CURLINFO_HEADER_SIZE => "CURLINFO_HEADER_SIZE",
+            CURLINFO::CURLINFO_REQUEST_SIZE => "CURLINFO_REQUEST_SIZE",
+            CURLINFO::CURLINFO_SSL_VERIFYRESULT => "CURLINFO_SSL_VERIFYRESULT",
+            CURLINFO::CURLINFO_FILETIME => "CURLINFO_FILETIME",
+            CURLINFO::CURLINFO_FILETIME_T => "CURLINFO_FILETIME_T",
+            CURLINFO::CURLINFO_CONTENT_LENGTH_DOWNLOAD => {
+                "CURLINFO_CONTENT_LENGTH_DOWNLOAD"
+            }
+            CURLINFO::CURLINFO_CONTENT_LENGTH_DOWNLOAD_T => {
+                "CURLINFO_CONTENT_LENGTH_DOWNLOAD_T"
+            }
+            CURLINFO::CURLINFO_CONTENT_LENGTH_UPLOAD => {
+                "CURLINFO_CONTENT_LENGTH_UPLOAD"
+            }
+            CURLINFO::CURLINFO_CONTENT_LENGTH_UPLOAD_T => {
+                "CURLINFO_CONTENT_LENGTH_UPLOAD_T"
+            }
+            CURLINFO::CURLINFO_STARTTRANSFER_TIME => {
+                "CURLINFO_STARTTRANSFER_TIME"
+            }
+            CURLINFO::CURLINFO_CONTENT_TYPE => "CURLINFO_CONTENT_TYPE",
+            CURLINFO::CURLINFO_REDIRECT_TIME => "CURLINFO_REDIRECT_TIME",
+            CURLINFO::CURLINFO_REDIRECT_COUNT => "CURLINFO_REDIRECT_COUNT",
+            CURLINFO::CURLINFO_PRIVATE => "CURLINFO_PRIVATE",
+            CURLINFO::CURLINFO_HTTP_CONNECTCODE => "CURLINFO_HTTP_CONNECTCODE",
+            CURLINFO::CURLINFO_HTTPAUTH_AVAIL => "CURLINFO_HTTPAUTH_AVAIL",
+            CURLINFO::CURLINFO_PROXYAUTH_AVAIL => "CURLINFO_PROXYAUTH_AVAIL",
+            CURLINFO::CURLINFO_OS_ERRNO => "CURLINFO_OS_ERRNO",
+            CURLINFO::CURLINFO_NUM_CONNECTS => "CURLINFO_NUM_CONNECTS",
+            CURLINFO::CURLINFO_SSL_ENGINES => "CURLINFO_SSL_ENGINES",
+            CURLINFO::CURLINFO_COOKIELIST => "CURLINFO_COOKIELIST",
+            CURLINFO::CURLINFO_LASTSOCKET => "CURLINFO_LASTSOCKET",
+            CURLINFO::CURLINFO_FTP_ENTRY_PATH => "CURLINFO_FTP_ENTRY_PATH",
+            CURLINFO::CURLINFO_REDIRECT_URL => "CURLINFO_REDIRECT_URL",
+            CURLINFO::CURLINFO_PRIMARY_IP => "CURLINFO_PRIMARY_IP",
+            CURLINFO::CURLINFO_APPCONNECT_TIME => "CURLINFO_APPCONNECT_TIME",
+            CURLINFO::CURLINFO_CERTINFO => "CURLINFO_CERTINFO",
+            CURLINFO::CURLINFO_CONDITION_UNMET => "CURLINFO_CONDITION_UNMET",
+            CURLINFO::CURLINFO_RTSP_SESSION_ID => "CURLINFO_RTSP_SESSION_ID",
+            CURLINFO::CURLINFO_RTSP_CLIENT_CSEQ => "CURLINFO_RTSP_CLIENT_CSEQ",
+            CURLINFO::CURLINFO_RTSP_SERVER_CSEQ => "CURLINFO_RTSP_SERVER_CSEQ",
+            CURLINFO::CURLINFO_RTSP_CSEQ_RECV => "CURLINFO_RTSP_CSEQ_RECV",
+            CURLINFO::CURLINFO_PRIMARY_PORT => "CURLINFO_PRIMARY_PORT",
+            CURLINFO::CURLINFO_LOCAL_IP => "CURLINFO_LOCAL_IP",
+            CURLINFO::CURLINFO_LOCAL_PORT => "CURLINFO_LOCAL_PORT",
+            CURLINFO::CURLINFO_TLS_SESSION => "CURLINFO_TLS_SESSION",
+            CURLINFO::CURLINFO_ACTIVESOCKET => "CURLINFO_ACTIVESOCKET",
+            CURLINFO::CURLINFO_TLS_SSL_PTR => "CURLINFO_TLS_SSL_PTR",
+            CURLINFO::CURLINFO_HTTP_VERSION => "CURLINFO_HTTP_VERSION",
+            CURLINFO::CURLINFO_PROXY_SSL_VERIFYRESULT => {
+                "CURLINFO_PROXY_SSL_VERIFYRESULT"
+            }
+            CURLINFO::CURLINFO_PROTOCOL => "CURLINFO_PROTOCOL",
+            CURLINFO::CURLINFO_SCHEME => "CURLINFO_SCHEME",
+            CURLINFO::CURLINFO_TOTAL_TIME_T => "CURLINFO_TOTAL_TIME_T",
+            CURLINFO::CURLINFO_NAMELOOKUP_TIME_T => {
+                "CURLINFO_NAMELOOKUP_TIME_T"
+            }
+            CURLINFO::CURLINFO_CONNECT_TIME_T => "CURLINFO_CONNECT_TIME_T",
+            CURLINFO::CURLINFO_PRETRANSFER_TIME_T => {
+                "CURLINFO_PRETRANSFER_TIME_T"
+            }
+            CURLINFO::CURLINFO_STARTTRANSFER_TIME_T => {
+                "CURLINFO_STARTTRANSFER_TIME_T"
+            }
+            CURLINFO::CURLINFO_REDIRECT_TIME_T => "CURLINFO_REDIRECT_TIME_T",
+            CURLINFO::CURLINFO_APPCONNECT_TIME_T => {
+                "CURLINFO_APPCONNECT_TIME_T"
+            }
+            CURLINFO::CURLINFO_RETRY_AFTER => "CURLINFO_RETRY_AFTER",
+            CURLINFO::CURLINFO_EFFECTIVE_METHOD => "CURLINFO_EFFECTIVE_METHOD",
+            CURLINFO::CURLINFO_PROXY_ERROR => "CURLINFO_PROXY_ERROR",
+            CURLINFO::CURLINFO_REFERER => "CURLINFO_REFERER",
+            CURLINFO::CURLINFO_CAINFO => "CURLINFO_CAINFO",
+            CURLINFO::CURLINFO_CAPATH => "CURLINFO_CAPATH",
+            CURLINFO::CURLINFO_XFER_ID => "CURLINFO_XFER_ID",
+            CURLINFO::CURLINFO_CONN_ID => "CURLINFO_CONN_ID",
+            CURLINFO::CURLINFO_QUEUE_TIME_T => "CURLINFO_QUEUE_TIME_T",
+            CURLINFO::CURLINFO_USED_PROXY => "CURLINFO_USED_PROXY",
+            CURLINFO::CURLINFO_POSTTRANSFER_TIME_T => {
+                "CURLINFO_POSTTRANSFER_TIME_T"
+            }
+            CURLINFO::CURLINFO_EARLYDATA_SENT_T => "CURLINFO_EARLYDATA_SENT_T",
+            CURLINFO::CURLINFO_HTTPAUTH_USED => "CURLINFO_HTTPAUTH_USED",
+            CURLINFO::CURLINFO_PROXYAUTH_USED => "CURLINFO_PROXYAUTH_USED",
+            CURLINFO::CURLINFO_LASTONE => "CURLINFO_LASTONE",
+        }
+    }
+
+    /// The pinned integer, as it crosses the C boundary.
+    #[allow(dead_code)]
+    pub(crate) const fn as_c_int(self) -> c_int {
+        self as c_int
+    }
+
+    /// Recover a member from the integer a C caller passed.
+    ///
+    /// `None` for anything the enumeration does not declare. A caller that
+    /// maps `None` onto `CURLE_UNKNOWN_OPTION` reproduces curl's behaviour
+    /// for an unrecognised request.
+    #[allow(dead_code)]
+    pub(crate) fn from_c_int(value: c_int) -> Option<CURLINFO> {
+        CURLINFO::ABI_VARIANTS
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_c_int() == value)
+    }
+
+    /// The base this member was composed from, as a SPELLING.
+    ///
+    /// `None` for the two members that are not composed. Read from
+    /// [`INFO_COMPOSITION`] rather than derived, because `CURLINFO_PTR` and
+    /// `CURLINFO_SLIST` are one integer and the spelling cannot be
+    /// recovered from it.
+    #[allow(dead_code)]
+    pub(crate) fn base(self) -> Option<InfoBase> {
+        INFO_COMPOSITION
+            .iter()
+            .find(|(info, _, _)| *info == self)
+            .map(|(_, base, _)| *base)
+    }
+
+    /// The ordinal this member was composed with -- the `n` in
+    /// `CURLINFO_<BASE> + n`. `None` for the two uncomposed members.
+    #[allow(dead_code)]
+    pub(crate) fn ordinal(self) -> Option<c_int> {
+        INFO_COMPOSITION
+            .iter()
+            .find(|(info, _, _)| *info == self)
+            .map(|(_, _, ordinal)| *ordinal)
+    }
+
+    /// The pointer type `curl_easy_getinfo` must read for this member.
+    ///
+    /// Masks the value exactly as `lib/getinfo.c:636` does, so a member
+    /// whose base is `CURLINFO_PTR` reports [`InfoValueKind::Slist`] and
+    /// the two uncomposed members report `None`.
+    #[allow(dead_code)]
+    pub(crate) const fn value_kind(self) -> Option<InfoValueKind> {
+        info_value_kind(self.as_c_int())
+    }
+}
+
+/// The `(member, base spelling, ordinal)` triple for each composed member.
+///
+/// 77 rows -- every member except `CURLINFO_NONE` and `CURLINFO_LASTONE`.
+/// The base and the ordinal are INDEPENDENT axes, and they have to be: the
+/// ordinal is reused across bases (`n = 7` is both
+/// `CURLINFO_SIZE_UPLOAD` on `CURLINFO_DOUBLE` and
+/// `CURLINFO_SIZE_UPLOAD_T` on `CURLINFO_OFF_T`), so `(base, ordinal)` is
+/// the unique key and the ordinal alone never is. This is the data
+/// `build.rs` renders back into the header's `= CURLINFO_<BASE> + n` form;
+/// a table holding only the composed integer could not produce it.
+#[allow(dead_code)]
+pub(crate) const INFO_COMPOSITION: &[(CURLINFO, InfoBase, c_int)] = &[
+    (CURLINFO::CURLINFO_EFFECTIVE_URL, InfoBase::String, 1),
+    (CURLINFO::CURLINFO_RESPONSE_CODE, InfoBase::Long, 2),
+    (CURLINFO::CURLINFO_TOTAL_TIME, InfoBase::Double, 3),
+    (CURLINFO::CURLINFO_NAMELOOKUP_TIME, InfoBase::Double, 4),
+    (CURLINFO::CURLINFO_CONNECT_TIME, InfoBase::Double, 5),
+    (CURLINFO::CURLINFO_PRETRANSFER_TIME, InfoBase::Double, 6),
+    (CURLINFO::CURLINFO_SIZE_UPLOAD, InfoBase::Double, 7),
+    (CURLINFO::CURLINFO_SIZE_UPLOAD_T, InfoBase::OffT, 7),
+    (CURLINFO::CURLINFO_SIZE_DOWNLOAD, InfoBase::Double, 8),
+    (CURLINFO::CURLINFO_SIZE_DOWNLOAD_T, InfoBase::OffT, 8),
+    (CURLINFO::CURLINFO_SPEED_DOWNLOAD, InfoBase::Double, 9),
+    (CURLINFO::CURLINFO_SPEED_DOWNLOAD_T, InfoBase::OffT, 9),
+    (CURLINFO::CURLINFO_SPEED_UPLOAD, InfoBase::Double, 10),
+    (CURLINFO::CURLINFO_SPEED_UPLOAD_T, InfoBase::OffT, 10),
+    (CURLINFO::CURLINFO_HEADER_SIZE, InfoBase::Long, 11),
+    (CURLINFO::CURLINFO_REQUEST_SIZE, InfoBase::Long, 12),
+    (CURLINFO::CURLINFO_SSL_VERIFYRESULT, InfoBase::Long, 13),
+    (CURLINFO::CURLINFO_FILETIME, InfoBase::Long, 14),
+    (CURLINFO::CURLINFO_FILETIME_T, InfoBase::OffT, 14),
+    (
+        CURLINFO::CURLINFO_CONTENT_LENGTH_DOWNLOAD,
+        InfoBase::Double,
+        15,
+    ),
+    (
+        CURLINFO::CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
+        InfoBase::OffT,
+        15,
+    ),
+    (
+        CURLINFO::CURLINFO_CONTENT_LENGTH_UPLOAD,
+        InfoBase::Double,
+        16,
+    ),
+    (
+        CURLINFO::CURLINFO_CONTENT_LENGTH_UPLOAD_T,
+        InfoBase::OffT,
+        16,
+    ),
+    (CURLINFO::CURLINFO_STARTTRANSFER_TIME, InfoBase::Double, 17),
+    (CURLINFO::CURLINFO_CONTENT_TYPE, InfoBase::String, 18),
+    (CURLINFO::CURLINFO_REDIRECT_TIME, InfoBase::Double, 19),
+    (CURLINFO::CURLINFO_REDIRECT_COUNT, InfoBase::Long, 20),
+    (CURLINFO::CURLINFO_PRIVATE, InfoBase::String, 21),
+    (CURLINFO::CURLINFO_HTTP_CONNECTCODE, InfoBase::Long, 22),
+    (CURLINFO::CURLINFO_HTTPAUTH_AVAIL, InfoBase::Long, 23),
+    (CURLINFO::CURLINFO_PROXYAUTH_AVAIL, InfoBase::Long, 24),
+    (CURLINFO::CURLINFO_OS_ERRNO, InfoBase::Long, 25),
+    (CURLINFO::CURLINFO_NUM_CONNECTS, InfoBase::Long, 26),
+    (CURLINFO::CURLINFO_SSL_ENGINES, InfoBase::Slist, 27),
+    (CURLINFO::CURLINFO_COOKIELIST, InfoBase::Slist, 28),
+    (CURLINFO::CURLINFO_LASTSOCKET, InfoBase::Long, 29),
+    (CURLINFO::CURLINFO_FTP_ENTRY_PATH, InfoBase::String, 30),
+    (CURLINFO::CURLINFO_REDIRECT_URL, InfoBase::String, 31),
+    (CURLINFO::CURLINFO_PRIMARY_IP, InfoBase::String, 32),
+    (CURLINFO::CURLINFO_APPCONNECT_TIME, InfoBase::Double, 33),
+    (CURLINFO::CURLINFO_CERTINFO, InfoBase::Ptr, 34),
+    (CURLINFO::CURLINFO_CONDITION_UNMET, InfoBase::Long, 35),
+    (CURLINFO::CURLINFO_RTSP_SESSION_ID, InfoBase::String, 36),
+    (CURLINFO::CURLINFO_RTSP_CLIENT_CSEQ, InfoBase::Long, 37),
+    (CURLINFO::CURLINFO_RTSP_SERVER_CSEQ, InfoBase::Long, 38),
+    (CURLINFO::CURLINFO_RTSP_CSEQ_RECV, InfoBase::Long, 39),
+    (CURLINFO::CURLINFO_PRIMARY_PORT, InfoBase::Long, 40),
+    (CURLINFO::CURLINFO_LOCAL_IP, InfoBase::String, 41),
+    (CURLINFO::CURLINFO_LOCAL_PORT, InfoBase::Long, 42),
+    (CURLINFO::CURLINFO_TLS_SESSION, InfoBase::Ptr, 43),
+    (CURLINFO::CURLINFO_ACTIVESOCKET, InfoBase::Socket, 44),
+    (CURLINFO::CURLINFO_TLS_SSL_PTR, InfoBase::Ptr, 45),
+    (CURLINFO::CURLINFO_HTTP_VERSION, InfoBase::Long, 46),
+    (
+        CURLINFO::CURLINFO_PROXY_SSL_VERIFYRESULT,
+        InfoBase::Long,
+        47,
+    ),
+    (CURLINFO::CURLINFO_PROTOCOL, InfoBase::Long, 48),
+    (CURLINFO::CURLINFO_SCHEME, InfoBase::String, 49),
+    (CURLINFO::CURLINFO_TOTAL_TIME_T, InfoBase::OffT, 50),
+    (CURLINFO::CURLINFO_NAMELOOKUP_TIME_T, InfoBase::OffT, 51),
+    (CURLINFO::CURLINFO_CONNECT_TIME_T, InfoBase::OffT, 52),
+    (CURLINFO::CURLINFO_PRETRANSFER_TIME_T, InfoBase::OffT, 53),
+    (CURLINFO::CURLINFO_STARTTRANSFER_TIME_T, InfoBase::OffT, 54),
+    (CURLINFO::CURLINFO_REDIRECT_TIME_T, InfoBase::OffT, 55),
+    (CURLINFO::CURLINFO_APPCONNECT_TIME_T, InfoBase::OffT, 56),
+    (CURLINFO::CURLINFO_RETRY_AFTER, InfoBase::OffT, 57),
+    (CURLINFO::CURLINFO_EFFECTIVE_METHOD, InfoBase::String, 58),
+    (CURLINFO::CURLINFO_PROXY_ERROR, InfoBase::Long, 59),
+    (CURLINFO::CURLINFO_REFERER, InfoBase::String, 60),
+    (CURLINFO::CURLINFO_CAINFO, InfoBase::String, 61),
+    (CURLINFO::CURLINFO_CAPATH, InfoBase::String, 62),
+    (CURLINFO::CURLINFO_XFER_ID, InfoBase::OffT, 63),
+    (CURLINFO::CURLINFO_CONN_ID, InfoBase::OffT, 64),
+    (CURLINFO::CURLINFO_QUEUE_TIME_T, InfoBase::OffT, 65),
+    (CURLINFO::CURLINFO_USED_PROXY, InfoBase::Long, 66),
+    (CURLINFO::CURLINFO_POSTTRANSFER_TIME_T, InfoBase::OffT, 67),
+    (CURLINFO::CURLINFO_EARLYDATA_SENT_T, InfoBase::OffT, 68),
+    (CURLINFO::CURLINFO_HTTPAUTH_USED, InfoBase::Long, 69),
+    (CURLINFO::CURLINFO_PROXYAUTH_USED, InfoBase::Long, 70),
+];
+
+/// One `CURL_DEPRECATED(version, message)` attribute from the frozen header.
+///
+/// Held in Rust because cbindgen cannot express the attribute in any of the
+/// four positions the headers use it in, so the affected declarations are
+/// carried verbatim; this table is what lets a test assert that the
+/// verbatim text still covers exactly the members it covered in curl
+/// 8.19.0-DEV. Deprecated is not removed: AAP 0.8.2 keeps every one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct Deprecation<T> {
+    /// The enumerator the attribute is written on.
+    pub(crate) member: T,
+    /// The version token, UNQUOTED in the frozen header.
+    pub(crate) since: &'static str,
+    /// The advisory message, empty for the members that have no successor.
+    pub(crate) message: &'static str,
+}
+
+/// The nine deprecated `CURLINFO` members (curl.h:2908-2971).
+///
+/// All nine carry the attribute in the position between the member name and
+/// its `=`, which is one of the four positions cbindgen cannot write.
+#[allow(dead_code)]
+pub(crate) const INFO_DEPRECATIONS: &[Deprecation<CURLINFO>] = &[
+    Deprecation {
+        member: CURLINFO::CURLINFO_SIZE_UPLOAD,
+        since: "7.55.0",
+        message: "Use CURLINFO_SIZE_UPLOAD_T",
+    },
+    Deprecation {
+        member: CURLINFO::CURLINFO_SIZE_DOWNLOAD,
+        since: "7.55.0",
+        message: "Use CURLINFO_SIZE_DOWNLOAD_T",
+    },
+    Deprecation {
+        member: CURLINFO::CURLINFO_SPEED_DOWNLOAD,
+        since: "7.55.0",
+        message: "Use CURLINFO_SPEED_DOWNLOAD_T",
+    },
+    Deprecation {
+        member: CURLINFO::CURLINFO_SPEED_UPLOAD,
+        since: "7.55.0",
+        message: "Use CURLINFO_SPEED_UPLOAD_T",
+    },
+    Deprecation {
+        member: CURLINFO::CURLINFO_CONTENT_LENGTH_DOWNLOAD,
+        since: "7.55.0",
+        message: "Use CURLINFO_CONTENT_LENGTH_DOWNLOAD_T",
+    },
+    Deprecation {
+        member: CURLINFO::CURLINFO_CONTENT_LENGTH_UPLOAD,
+        since: "7.55.0",
+        message: "Use CURLINFO_CONTENT_LENGTH_UPLOAD_T",
+    },
+    Deprecation {
+        member: CURLINFO::CURLINFO_LASTSOCKET,
+        since: "7.45.0",
+        message: "Use CURLINFO_ACTIVESOCKET",
+    },
+    Deprecation {
+        member: CURLINFO::CURLINFO_TLS_SESSION,
+        since: "7.48.0",
+        message: "Use CURLINFO_TLS_SSL_PTR",
+    },
+    Deprecation {
+        member: CURLINFO::CURLINFO_PROTOCOL,
+        since: "7.85.0",
+        message: "Use CURLINFO_SCHEME",
+    },
+];
+
+/// `#define CURLINFO_HTTP_CODE CURLINFO_RESPONSE_CODE` (curl.h:3000).
+///
+/// The one preprocessor alias in the information space, and the only reason
+/// it is a `pub(crate) const` of enum type rather than an integer is that
+/// the alias expands to an IDENTIFIER in the frozen header: it resolves
+/// THROUGH the enumeration, so it cannot drift from it. `build.rs` carries
+/// the `#define` verbatim, which is why this is not `pub`.
+#[allow(dead_code)]
+pub(crate) const CURLINFO_HTTP_CODE: CURLINFO =
+    CURLINFO::CURLINFO_RESPONSE_CODE;
+
+// ---------------------------------------------------------------------------
+// CURLformoption: the legacy form-post option space.
+// ---------------------------------------------------------------------------
+
+// Unlike the two spaces above, these members are plain declaration
+// ordinals: `include/curl/curl.h:2555-2584` composes nothing. They live
+// here anyway, and not in `ffi/codes.rs`, because they are the argument
+// VALUES `curl_formadd` reads out of its variadic argument list -- option
+// identity for the retired form API, exactly as `CURLoption` is option
+// identity for the easy API. `CURLFORMcode`, which is a RESULT and not an
+// argument, is `ffi/codes.rs`'s; note also the spelling difference, a
+// lowercase `f` here against `CURLFORMcode`'s uppercase.
+//
+// CORRECTION 12. Exactly EIGHTEEN of the 22 members carry
+// `CURL_DEPRECATED(7.56.0, ...)`, not 21. The four without it are
+// `CURLFORM_OBSOLETE` (:2566), `CURLFORM_END` (:2576),
+// `CURLFORM_OBSOLETE2` (:2577) and `CURLFORM_LASTENTRY` (:2583); the first,
+// third and fourth are retired or sentinel slots with nothing to advise,
+// and `CURLFORM_END` cannot be deprecated because a caller has no way to
+// stop passing it. Measured by brace-and-paren-balanced scanning of the
+// enumeration body; a per-line regex under-counts, which is how the 21
+// figure arises.
+//
+// CORRECTION 20. `CURLFORM_CONTENTLEN` puts the attribute in a FOURTH
+// position -- the member name and its trailing comment on :2580, the
+// attribute alone on :2581. Across the twelve public headers the positions
+// are: post-name pre-`=` (`curl_sslbackend`, `CURLINFO`), an attribute line
+// BEFORE the name (five prototypes), post-name (`CURLformoption`,
+// `CURLFORMcode`), and post-name-post-comment-on-the-next-line (here).
+// cbindgen can express none of the four, which is why all of them are
+// carried verbatim by `build.rs` and asserted against
+// [`FORM_DEPRECATIONS`].
+
+/// Every `CURLFORM_*` identifier, with its ordinal pinned.
+///
+/// 22 members, values 0 through 21, none written explicitly in the frozen
+/// header. They are written explicitly here so that inserting a member in
+/// the middle cannot silently renumber its successors -- the same discipline
+/// AAP 0.6.1 requires of `CURLcode`, and for the same reason: a caller
+/// compiled against curl 8.19.0-DEV holds the number, not the name.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+// Frozen C ABI name: `include/curl/curl.h:2584` spells it with a lowercase
+// `f`, and AAP 0.8.1 forbids changing a public typedef.
+#[allow(clippy::enum_variant_names)]
+pub enum CURLformoption {
+    /// The first one is unused.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "")` in the frozen header. Kept, because AAP
+    /// 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_NOTHING = 0,
+    /// Name of the part, copied.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_name()")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_COPYNAME = 1,
+    /// Name of the part, by pointer.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_name()")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_PTRNAME = 2,
+    /// Length of a name that is not NUL terminated.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "")` in the frozen header. Kept, because AAP
+    /// 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_NAMELENGTH = 3,
+    /// Contents of the part, copied.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_COPYCONTENTS = 4,
+    /// Contents of the part, by pointer.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_PTRCONTENTS = 5,
+    /// Length of the contents, as a long.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_CONTENTSLENGTH = 6,
+    /// Read the contents from a named file.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data_cb()")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLFORM_FILECONTENT = 7,
+    /// Continue reading options from a `curl_forms` array.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "")` in the frozen header. Kept, because AAP
+    /// 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_ARRAY = 8,
+    /// Retired slot, held so the successors keep their ordinals.
+    CURLFORM_OBSOLETE = 9,
+    /// Upload the named file as this part.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_filedata()")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLFORM_FILE = 10,
+    /// Set the remote file name for a buffer upload.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_filename()")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLFORM_BUFFER = 11,
+    /// Contents of a buffer upload.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_BUFFERPTR = 12,
+    /// Length of a buffer upload.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_BUFFERLENGTH = 13,
+    /// Content-Type of the part.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_type()")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_CONTENTTYPE = 14,
+    /// Extra headers for the part.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_headers()")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLFORM_CONTENTHEADER = 15,
+    /// Remote file name of the part.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_filename()")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLFORM_FILENAME = 16,
+    /// Terminates the option list. Never deprecated: a caller cannot stop
+    /// passing it.
+    CURLFORM_END = 17,
+    /// Second retired slot, held for the same reason as the first.
+    CURLFORM_OBSOLETE2 = 18,
+    /// Read the contents through the read callback.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data_cb()")` in the frozen
+    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
+    /// name.
+    CURLFORM_STREAM = 19,
+    /// Length of the contents, as a `curl_off_t`. Added in 7.46.0.
+    ///
+    /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
+    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
+    CURLFORM_CONTENTLEN = 20,
+    /// The last unused.
+    CURLFORM_LASTENTRY = 21,
+}
+
+impl CURLformoption {
+    /// Every variant, in the frozen header's declaration order.
+    #[allow(dead_code)]
+    pub(crate) const ABI_VARIANTS: &'static [CURLformoption] = &[
+        CURLformoption::CURLFORM_NOTHING,
+        CURLformoption::CURLFORM_COPYNAME,
+        CURLformoption::CURLFORM_PTRNAME,
+        CURLformoption::CURLFORM_NAMELENGTH,
+        CURLformoption::CURLFORM_COPYCONTENTS,
+        CURLformoption::CURLFORM_PTRCONTENTS,
+        CURLformoption::CURLFORM_CONTENTSLENGTH,
+        CURLformoption::CURLFORM_FILECONTENT,
+        CURLformoption::CURLFORM_ARRAY,
+        CURLformoption::CURLFORM_OBSOLETE,
+        CURLformoption::CURLFORM_FILE,
+        CURLformoption::CURLFORM_BUFFER,
+        CURLformoption::CURLFORM_BUFFERPTR,
+        CURLformoption::CURLFORM_BUFFERLENGTH,
+        CURLformoption::CURLFORM_CONTENTTYPE,
+        CURLformoption::CURLFORM_CONTENTHEADER,
+        CURLformoption::CURLFORM_FILENAME,
+        CURLformoption::CURLFORM_END,
+        CURLformoption::CURLFORM_OBSOLETE2,
+        CURLformoption::CURLFORM_STREAM,
+        CURLformoption::CURLFORM_CONTENTLEN,
+        CURLformoption::CURLFORM_LASTENTRY,
+    ];
+
+    /// The number of tokens the frozen enumeration declares.
+    #[allow(dead_code)]
+    pub(crate) const TOKEN_COUNT: usize = 22;
+
+    /// The C spelling of this member.
+    #[allow(dead_code)]
+    pub(crate) const fn c_name(self) -> &'static str {
+        match self {
+            CURLformoption::CURLFORM_NOTHING => "CURLFORM_NOTHING",
+            CURLformoption::CURLFORM_COPYNAME => "CURLFORM_COPYNAME",
+            CURLformoption::CURLFORM_PTRNAME => "CURLFORM_PTRNAME",
+            CURLformoption::CURLFORM_NAMELENGTH => "CURLFORM_NAMELENGTH",
+            CURLformoption::CURLFORM_COPYCONTENTS => "CURLFORM_COPYCONTENTS",
+            CURLformoption::CURLFORM_PTRCONTENTS => "CURLFORM_PTRCONTENTS",
+            CURLformoption::CURLFORM_CONTENTSLENGTH => {
+                "CURLFORM_CONTENTSLENGTH"
+            }
+            CURLformoption::CURLFORM_FILECONTENT => "CURLFORM_FILECONTENT",
+            CURLformoption::CURLFORM_ARRAY => "CURLFORM_ARRAY",
+            CURLformoption::CURLFORM_OBSOLETE => "CURLFORM_OBSOLETE",
+            CURLformoption::CURLFORM_FILE => "CURLFORM_FILE",
+            CURLformoption::CURLFORM_BUFFER => "CURLFORM_BUFFER",
+            CURLformoption::CURLFORM_BUFFERPTR => "CURLFORM_BUFFERPTR",
+            CURLformoption::CURLFORM_BUFFERLENGTH => "CURLFORM_BUFFERLENGTH",
+            CURLformoption::CURLFORM_CONTENTTYPE => "CURLFORM_CONTENTTYPE",
+            CURLformoption::CURLFORM_CONTENTHEADER => "CURLFORM_CONTENTHEADER",
+            CURLformoption::CURLFORM_FILENAME => "CURLFORM_FILENAME",
+            CURLformoption::CURLFORM_END => "CURLFORM_END",
+            CURLformoption::CURLFORM_OBSOLETE2 => "CURLFORM_OBSOLETE2",
+            CURLformoption::CURLFORM_STREAM => "CURLFORM_STREAM",
+            CURLformoption::CURLFORM_CONTENTLEN => "CURLFORM_CONTENTLEN",
+            CURLformoption::CURLFORM_LASTENTRY => "CURLFORM_LASTENTRY",
+        }
+    }
+
+    /// The pinned integer, as it crosses the C boundary.
+    #[allow(dead_code)]
+    pub(crate) const fn as_c_int(self) -> c_int {
+        self as c_int
+    }
+
+    /// Recover a member from the integer a C caller passed.
+    ///
+    /// `None` for anything outside 0..=21. `curl_formadd` returns
+    /// `CURL_FORMADD_UNKNOWN_OPTION` for such a value.
+    #[allow(dead_code)]
+    pub(crate) fn from_c_int(value: c_int) -> Option<CURLformoption> {
+        CURLformoption::ABI_VARIANTS
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_c_int() == value)
+    }
+}
+
+/// The eighteen deprecated `CURLformoption` members (curl.h:2557-2581).
+#[allow(dead_code)]
+pub(crate) const FORM_DEPRECATIONS: &[Deprecation<CURLformoption>] = &[
+    Deprecation {
+        member: CURLformoption::CURLFORM_NOTHING,
+        since: "7.56.0",
+        message: "",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_COPYNAME,
+        since: "7.56.0",
+        message: "Use curl_mime_name()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_PTRNAME,
+        since: "7.56.0",
+        message: "Use curl_mime_name()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_NAMELENGTH,
+        since: "7.56.0",
+        message: "",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_COPYCONTENTS,
+        since: "7.56.0",
+        message: "Use curl_mime_data()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_PTRCONTENTS,
+        since: "7.56.0",
+        message: "Use curl_mime_data()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_CONTENTSLENGTH,
+        since: "7.56.0",
+        message: "Use curl_mime_data()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_FILECONTENT,
+        since: "7.56.0",
+        message: "Use curl_mime_data_cb()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_ARRAY,
+        since: "7.56.0",
+        message: "",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_FILE,
+        since: "7.56.0",
+        message: "Use curl_mime_filedata()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_BUFFER,
+        since: "7.56.0",
+        message: "Use curl_mime_filename()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_BUFFERPTR,
+        since: "7.56.0",
+        message: "Use curl_mime_data()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_BUFFERLENGTH,
+        since: "7.56.0",
+        message: "Use curl_mime_data()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_CONTENTTYPE,
+        since: "7.56.0",
+        message: "Use curl_mime_type()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_CONTENTHEADER,
+        since: "7.56.0",
+        message: "Use curl_mime_headers()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_FILENAME,
+        since: "7.56.0",
+        message: "Use curl_mime_filename()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_STREAM,
+        since: "7.56.0",
+        message: "Use curl_mime_data_cb()",
+    },
+    Deprecation {
+        member: CURLformoption::CURLFORM_CONTENTLEN,
+        since: "7.56.0",
+        message: "Use curl_mime_data()",
+    },
+];
+
+// ---------------------------------------------------------------------------
+// CURLOPT_WS_OPTIONS argument bits.
+// ---------------------------------------------------------------------------
+
+// These two are `setopt` ARGUMENT VALUES, which is why they are here and
+// not with the websocket frame flags: a caller passes them to
+// `curl_easy_setopt(h, CURLOPT_WS_OPTIONS, ...)`, so they belong to option
+// identity. `ffi/ws.rs` owns the seven `CURLWS_*` FRAME flags, which are a
+// different space that happens to share a prefix.
+//
+// The type is `c_long`, and that is an ABI distinction rather than a
+// preference. `include/curl/websockets.h:89-90` writes these two as
+// `(1L << 0)` and `(1L << 1)` while the frame flags at :40-60 are written
+// `(1 << n)`. The `L` matters because these values are passed through a
+// variadic argument list, where the default promotions apply and
+// `curl_easy_setopt`'s `CURLOPTTYPE_LONG` slot is read as a `long`: an
+// `int` argument on LP64 would leave the upper half of the slot
+// unspecified. The frame flags are passed as a declared `unsigned int`
+// parameter instead, so they need no suffix.
+//
+// `pub(crate)` because `build.rs:1231` carries both `#define` lines
+// verbatim.
+
+/// `CURLWS_RAW_MODE`, bit 0 of `CURLOPT_WS_OPTIONS`.
+#[allow(dead_code)]
+pub(crate) const CURLWS_RAW_MODE: c_long = 1 << 0;
+
+/// `CURLWS_NOAUTOPONG`, bit 1 of `CURLOPT_WS_OPTIONS`.
+#[allow(dead_code)]
+pub(crate) const CURLWS_NOAUTOPONG: c_long = 1 << 1;
+
+// ---------------------------------------------------------------------------
+// The introspection contract this table has to satisfy.
+// ---------------------------------------------------------------------------
+
+// `curl_easy_option_by_name`, `_by_id` and `_next` are exported from
+// `ffi/easy.rs`, and they read [`EASY_OPTIONS`] directly rather than a
+// projection of it, so there is one population and no lookup logic here to
+// drift from theirs. What follows is the behaviour `lib/easygetopt.c:31-76`
+// defines, recorded at the authority so that a future re-implementation has
+// no room to guess. Every clause is asserted over the table by this
+// module's tests.
+//
+//   * By NAME the comparison is `curl_strequal(o->name, name)`, so it is
+//     case-insensitive over ASCII, and alias rows are INCLUDED -- there is
+//     no flag test in that branch.
+//   * By ID the branch is `(o->id == id) && !(o->flags &
+//     CURLOT_FLAG_ALIAS)`, carrying the in-source comment "do not match
+//     alias options". An id shared by a retired spelling and its preferred
+//     option therefore always resolves to the preferred one.
+//   * `by_name` is `lookup(name, CURLOPT_LASTENTRY)` with the comment "when
+//     name is used, the id argument is ignored".
+//   * The walk is `do { ... o++; } while(o->name);`, so the NULL-name
+//     sentinel terminates it and is never compared against. It has to be a
+//     real, addressable element, which is why it is the 324th row of the
+//     table rather than an absence.
+//   * `_next(NULL)` yields the first row, `_next(row)` the following one,
+//     and `_next` of the last real row yields NULL. Iteration INCLUDES the
+//     15 alias rows.
+//
+// CORRECTION 3, and it contradicts a sibling requirement note. Rows store
+// the name WITHOUT its `CURLOPT_` prefix and the lookup does no prefix
+// handling, so:
+//
+//     by_name("ENCODING")         -> the CURLOPT_ACCEPT_ENCODING alias row
+//     by_name("encoding")         -> the same row, case-insensitively
+//     by_name("CURLOPT_ENCODING") -> NULL
+//
+// A validation item of the form `by_name("CURLOPT_X")->id == CURLOPT_X` is
+// therefore wrong, and both the positive and the negative case are asserted
+// below so the wrong reading cannot be reintroduced.
+//
+// `lib/easygetopt.c` wraps the whole API in `#ifndef
+// CURL_DISABLE_GETOPTIONS` and returns NULL from every entry point when it
+// is defined. That symbol is not among the capabilities this workspace
+// makes configurable, so the enabled behaviour is the only behaviour.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4079,8 +5468,40 @@ mod tests {
             last.as_c_int() + 1
         );
         assert_eq!(CURLoption::CURLOPT_LASTENTRY.as_c_int(), 10329);
-        // lib/optiontable.pl guards its own output with exactly this.
+        // CORRECTION 1. 328 is the highest `nu` index, NOT the sentinel's
+        // value, and the two differ by 10001.
+        assert_ne!(CURLoption::CURLOPT_LASTENTRY.as_c_int(), 328);
+        assert_eq!(
+            CURLoption::CURLOPT_LASTENTRY.as_c_int() - 328,
+            10001,
+            "the exact size of the mistake CORRECTION 1 names"
+        );
+        // `Curl_easyopts_check` (lib/easyoptions.c:388) reports an ERROR
+        // when this differs from 328 + 1, so a correct table satisfies the
+        // EQUALITY. The `% 10000` in the C is only needed because the
+        // sentinel is neither 328 nor 329.
         assert_eq!(CURLoption::CURLOPT_LASTENTRY.type_ordinal(), 328 + 1);
+        assert_eq!(CURLoption::CURLOPT_LASTENTRY.as_c_int() % 10000, 329);
+    }
+
+    /// CORRECTION 1's twin, asserted ACROSS the module boundary.
+    ///
+    /// `CURLMoption` is declared in `ffi/types.rs`, but the identical trap
+    /// lives there, so the guard belongs wherever someone reads about it.
+    /// If that enumeration is ever "corrected" to 20 this fails here.
+    #[test]
+    fn the_multi_sentinel_carries_the_same_trap() {
+        use crate::ffi::types::CURLMoption;
+
+        assert_eq!(CURLMoption::CURLMOPT_NOTIFYDATA as i64, 10019);
+        assert_eq!(CURLMoption::CURLMOPT_LASTENTRY as i64, 10020);
+        assert_ne!(CURLMoption::CURLMOPT_LASTENTRY as i64, 20);
+        // An ordinal follow-on from an OBJECTPOINT member, exactly like
+        // CURLOPT_LASTENTRY follows a STRINGPOINT one.
+        assert_eq!(
+            CURLMoption::CURLMOPT_LASTENTRY as i64,
+            CURLMoption::CURLMOPT_NOTIFYDATA as i64 + 1
+        );
     }
 
     #[test]
@@ -4353,5 +5774,729 @@ mod tests {
         assert_eq!(CURLOPTTYPE_FUNCTIONPOINT, 20000);
         assert_eq!(CURLOPTTYPE_OFF_T, 30000);
         assert_eq!(CURLOPTTYPE_BLOB, 40000);
+    }
+
+    // -- CURLINFO ---------------------------------------------------------
+
+    /// Values transcribed BY HAND from the frozen `include/curl/curl.h`,
+    /// independently of the script that wrote the enumeration. Chosen to
+    /// cover all seven base spellings, both uncomposed members, the reused
+    /// ordinal and the highest ordinal in use.
+    const INFO_ANCHORS: &[(CURLINFO, c_int)] = &[
+        (CURLINFO::CURLINFO_NONE, 0),
+        (CURLINFO::CURLINFO_EFFECTIVE_URL, 0x100001),
+        (CURLINFO::CURLINFO_RESPONSE_CODE, 0x200002),
+        (CURLINFO::CURLINFO_TOTAL_TIME, 0x300003),
+        (CURLINFO::CURLINFO_SIZE_UPLOAD, 0x300007),
+        (CURLINFO::CURLINFO_SIZE_UPLOAD_T, 0x600007),
+        (CURLINFO::CURLINFO_SSL_ENGINES, 0x40001b),
+        (CURLINFO::CURLINFO_CERTINFO, 0x400022),
+        (CURLINFO::CURLINFO_TLS_SESSION, 0x40002b),
+        (CURLINFO::CURLINFO_ACTIVESOCKET, 0x50002c),
+        (CURLINFO::CURLINFO_TLS_SSL_PTR, 0x40002d),
+        (CURLINFO::CURLINFO_PROXYAUTH_USED, 0x200046),
+        (CURLINFO::CURLINFO_LASTONE, 70),
+    ];
+
+    #[test]
+    fn info_anchors_hold() {
+        for &(info, expected) in INFO_ANCHORS {
+            assert_eq!(
+                info.as_c_int(),
+                expected,
+                "{} must be 0x{:06x}",
+                info.c_name(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn info_token_count_is_seventy_nine_and_lastone_is_seventy() {
+        assert_eq!(CURLINFO::ABI_VARIANTS.len(), CURLINFO::TOKEN_COUNT);
+        assert_eq!(CURLINFO::TOKEN_COUNT, 79);
+        // The two numbers AAP 0.4.1's prose conflates. `CURLINFO_LASTONE`
+        // is the highest ordinal in use, written as a bare 70 at
+        // curl.h:2995; 79 is how many tokens the enumeration declares.
+        assert_eq!(CURLINFO::CURLINFO_LASTONE.as_c_int(), 70);
+        assert_eq!(CURLINFO::CURLINFO_NONE.as_c_int(), 0);
+        assert_ne!(CURLINFO::CURLINFO_LASTONE.as_c_int(), 79);
+    }
+
+    #[test]
+    fn info_bases_match_the_frozen_header() {
+        assert_eq!(CURLINFO_STRING, 0x100000);
+        assert_eq!(CURLINFO_LONG, 0x200000);
+        assert_eq!(CURLINFO_DOUBLE, 0x300000);
+        assert_eq!(CURLINFO_SLIST, 0x400000);
+        assert_eq!(CURLINFO_SOCKET, 0x500000);
+        assert_eq!(CURLINFO_OFF_T, 0x600000);
+        assert_eq!(CURLINFO_MASK, 0x0fffff);
+        assert_eq!(CURLINFO_TYPEMASK, 0xf00000);
+        // Deliberately identical, per curl.h:2894's `/* same as SLIST */`.
+        // Asserted, not corrected.
+        assert_eq!(CURLINFO_PTR, CURLINFO_SLIST);
+        // Every base is a distinct nibble in the type field, so the mask
+        // and the type mask partition a composed value exactly.
+        assert_eq!(CURLINFO_MASK & CURLINFO_TYPEMASK, 0);
+        assert_eq!(CURLINFO_MASK | CURLINFO_TYPEMASK, 0xffffff);
+        // Seven spellings, six values: the collision is the whole reason
+        // `InfoBase` carries a spelling rather than an integer.
+        assert_eq!(InfoBase::ALL.len(), 7);
+        let mut values: Vec<c_int> =
+            InfoBase::ALL.iter().map(|b| b.value()).collect();
+        values.sort_unstable();
+        values.dedup();
+        assert_eq!(values.len(), 6);
+        let mut names: Vec<&str> =
+            InfoBase::ALL.iter().map(|b| b.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 7);
+    }
+
+    #[test]
+    fn every_info_value_is_a_base_plus_an_ordinal() {
+        assert_eq!(INFO_COMPOSITION.len(), CURLINFO::COMPOSED_COUNT);
+        assert_eq!(CURLINFO::COMPOSED_COUNT, 77);
+        for &(info, base, ordinal) in INFO_COMPOSITION {
+            assert_eq!(
+                info.as_c_int(),
+                base.value() + ordinal,
+                "{} must be {} + {}",
+                info.c_name(),
+                base.name(),
+                ordinal
+            );
+            assert_eq!(info.as_c_int() & CURLINFO_TYPEMASK, base.value());
+            assert_eq!(info.as_c_int() & CURLINFO_MASK, ordinal);
+            assert_eq!(info.base(), Some(base));
+            assert_eq!(info.ordinal(), Some(ordinal));
+        }
+        // The two members the composition table deliberately omits, and
+        // there are exactly two.
+        let composed: Vec<CURLINFO> =
+            INFO_COMPOSITION.iter().map(|(i, _, _)| *i).collect();
+        let missing: Vec<CURLINFO> = CURLINFO::ABI_VARIANTS
+            .iter()
+            .copied()
+            .filter(|i| !composed.contains(i))
+            .collect();
+        assert_eq!(
+            missing,
+            vec![CURLINFO::CURLINFO_NONE, CURLINFO::CURLINFO_LASTONE]
+        );
+        for info in missing {
+            assert_eq!(info.base(), None);
+            assert_eq!(info.ordinal(), None);
+        }
+    }
+
+    #[test]
+    fn info_base_and_ordinal_pairs_are_unique_but_ordinals_are_not() {
+        let mut pairs: Vec<(&str, c_int)> = INFO_COMPOSITION
+            .iter()
+            .map(|(_, base, ordinal)| (base.name(), *ordinal))
+            .collect();
+        let total = pairs.len();
+        pairs.sort_unstable();
+        pairs.dedup();
+        assert_eq!(pairs.len(), total, "(base, ordinal) must be unique");
+
+        // The ordinal ALONE is not a key, and this is the case that proves
+        // it: 7 is both CURLINFO_SIZE_UPLOAD on DOUBLE and
+        // CURLINFO_SIZE_UPLOAD_T on OFF_T.
+        let sevens: Vec<&str> = INFO_COMPOSITION
+            .iter()
+            .filter(|(_, _, ordinal)| *ordinal == 7)
+            .map(|(info, _, _)| info.c_name())
+            .collect();
+        assert_eq!(
+            sevens,
+            vec!["CURLINFO_SIZE_UPLOAD", "CURLINFO_SIZE_UPLOAD_T"]
+        );
+        let mut ordinals: Vec<c_int> =
+            INFO_COMPOSITION.iter().map(|(_, _, n)| *n).collect();
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        assert!(
+            ordinals.len() < total,
+            "at least one ordinal is reused across bases"
+        );
+    }
+
+    #[test]
+    fn info_values_and_names_are_unique() {
+        let mut values: Vec<c_int> = CURLINFO::ABI_VARIANTS
+            .iter()
+            .map(|i| i.as_c_int())
+            .collect();
+        let count = values.len();
+        values.sort_unstable();
+        values.dedup();
+        assert_eq!(values.len(), count, "two members share an integer");
+
+        let mut names: Vec<&str> =
+            CURLINFO::ABI_VARIANTS.iter().map(|i| i.c_name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "two members share a spelling");
+        for info in CURLINFO::ABI_VARIANTS {
+            assert!(
+                info.c_name().starts_with("CURLINFO_"),
+                "{} is not a CURLINFO_ spelling",
+                info.c_name()
+            );
+        }
+    }
+
+    #[test]
+    fn info_base_distribution_matches_the_measurement() {
+        // Measured over include/curl/curl.h:2900-2996 by brace-balanced
+        // scanning of the enumeration body.
+        let expected = [
+            ("CURLINFO_STRING", 13),
+            ("CURLINFO_LONG", 25),
+            ("CURLINFO_DOUBLE", 13),
+            ("CURLINFO_SLIST", 2),
+            ("CURLINFO_PTR", 3),
+            ("CURLINFO_SOCKET", 1),
+            ("CURLINFO_OFF_T", 20),
+        ];
+        let mut total = 0;
+        for (name, count) in expected {
+            let seen = INFO_COMPOSITION
+                .iter()
+                .filter(|(_, base, _)| base.name() == name)
+                .count();
+            assert_eq!(seen, count, "{name} carries {seen} members");
+            total += count;
+        }
+        assert_eq!(total, CURLINFO::COMPOSED_COUNT);
+    }
+
+    #[test]
+    fn info_integers_round_trip_through_the_c_boundary() {
+        for &info in CURLINFO::ABI_VARIANTS {
+            assert_eq!(CURLINFO::from_c_int(info.as_c_int()), Some(info));
+        }
+        // A C caller may pass any int. None of these is declared, and
+        // mapping None onto CURLE_UNKNOWN_OPTION is what curl does.
+        for stranger in [-1, 1, 69, 71, 0x0fffff, 0x700000, i32::MAX] {
+            assert_eq!(CURLINFO::from_c_int(stranger), None);
+        }
+    }
+
+    #[test]
+    fn info_value_kind_reproduces_the_getinfo_switch() {
+        for &(info, base, _) in INFO_COMPOSITION {
+            assert_eq!(
+                info.value_kind(),
+                Some(base.kind()),
+                "{} classifies wrongly",
+                info.c_name()
+            );
+        }
+        // The collapse, stated as a test: a CURLINFO_PTR member is read as
+        // a slist pointer, because the two bases are one integer and
+        // lib/getinfo.c:637 has no PTR arm.
+        assert_eq!(InfoBase::Ptr.kind(), InfoValueKind::Slist);
+        assert_eq!(
+            CURLINFO::CURLINFO_CERTINFO.value_kind(),
+            Some(InfoValueKind::Slist)
+        );
+        assert_eq!(
+            CURLINFO::CURLINFO_TLS_SSL_PTR.value_kind(),
+            Some(InfoValueKind::Slist)
+        );
+        // The two uncomposed members have no type bits, so they reach the
+        // `default:` arm.
+        assert_eq!(CURLINFO::CURLINFO_NONE.value_kind(), None);
+        assert_eq!(CURLINFO::CURLINFO_LASTONE.value_kind(), None);
+        // Classification is by MASK and happens BEFORE validation, exactly
+        // as the C does it: an undeclared id whose type bits are valid
+        // still names a pointer type, and only the per-type getter then
+        // rejects it.
+        assert_eq!(CURLINFO::from_c_int(CURLINFO_LONG + 999), None);
+        assert_eq!(
+            info_value_kind(CURLINFO_LONG + 999),
+            Some(InfoValueKind::Long)
+        );
+        // 0x700000 and 0x000000 are the two type-mask values no base uses.
+        assert_eq!(info_value_kind(0x700000), None);
+        assert_eq!(info_value_kind(0), None);
+    }
+
+    #[test]
+    fn info_http_code_is_response_code() {
+        assert_eq!(CURLINFO_HTTP_CODE, CURLINFO::CURLINFO_RESPONSE_CODE);
+        assert_eq!(CURLINFO_HTTP_CODE.as_c_int(), 0x200002);
+    }
+
+    #[test]
+    fn the_nine_deprecated_info_members_are_all_present() {
+        let expected = [
+            "CURLINFO_SIZE_UPLOAD",
+            "CURLINFO_SIZE_DOWNLOAD",
+            "CURLINFO_SPEED_DOWNLOAD",
+            "CURLINFO_SPEED_UPLOAD",
+            "CURLINFO_CONTENT_LENGTH_DOWNLOAD",
+            "CURLINFO_CONTENT_LENGTH_UPLOAD",
+            "CURLINFO_LASTSOCKET",
+            "CURLINFO_TLS_SESSION",
+            "CURLINFO_PROTOCOL",
+        ];
+        assert_eq!(INFO_DEPRECATIONS.len(), 9);
+        let seen: Vec<&str> = INFO_DEPRECATIONS
+            .iter()
+            .map(|d| d.member.c_name())
+            .collect();
+        assert_eq!(seen, expected);
+        for entry in INFO_DEPRECATIONS {
+            // Deprecated is not removed. AAP 0.8.2.
+            assert!(CURLINFO::ABI_VARIANTS.contains(&entry.member));
+            assert!(!entry.since.is_empty());
+            assert!(
+                entry.message.starts_with("Use CURLINFO_"),
+                "{} advises {:?}",
+                entry.member.c_name(),
+                entry.message
+            );
+        }
+        let mut versions: Vec<&str> =
+            INFO_DEPRECATIONS.iter().map(|d| d.since).collect();
+        versions.sort_unstable();
+        versions.dedup();
+        assert_eq!(versions, vec!["7.45.0", "7.48.0", "7.55.0", "7.85.0"]);
+    }
+
+    // -- CURLformoption ---------------------------------------------------
+
+    #[test]
+    fn form_options_are_twenty_two_declaration_ordinals() {
+        assert_eq!(
+            CURLformoption::ABI_VARIANTS.len(),
+            CURLformoption::TOKEN_COUNT
+        );
+        assert_eq!(CURLformoption::TOKEN_COUNT, 22);
+        for (index, &option) in CURLformoption::ABI_VARIANTS.iter().enumerate()
+        {
+            assert_eq!(
+                option.as_c_int(),
+                index as c_int,
+                "{} must be {index}",
+                option.c_name()
+            );
+            assert!(option.c_name().starts_with("CURLFORM_"));
+        }
+        assert_eq!(CURLformoption::CURLFORM_NOTHING.as_c_int(), 0);
+        assert_eq!(CURLformoption::CURLFORM_OBSOLETE.as_c_int(), 9);
+        assert_eq!(CURLformoption::CURLFORM_END.as_c_int(), 17);
+        assert_eq!(CURLformoption::CURLFORM_OBSOLETE2.as_c_int(), 18);
+        assert_eq!(CURLformoption::CURLFORM_CONTENTLEN.as_c_int(), 20);
+        assert_eq!(CURLformoption::CURLFORM_LASTENTRY.as_c_int(), 21);
+    }
+
+    #[test]
+    fn eighteen_form_options_are_deprecated_not_twenty_one() {
+        // CORRECTION 12. A per-line regex over the header under-counts and
+        // yields 21 for the wrong reason; brace-balanced scanning of the
+        // enumeration body yields 18, and these are the four without the
+        // attribute.
+        assert_eq!(FORM_DEPRECATIONS.len(), 18);
+        let undeprecated: Vec<&str> = CURLformoption::ABI_VARIANTS
+            .iter()
+            .filter(|option| {
+                !FORM_DEPRECATIONS.iter().any(|d| d.member == **option)
+            })
+            .map(|option| option.c_name())
+            .collect();
+        assert_eq!(
+            undeprecated,
+            vec![
+                "CURLFORM_OBSOLETE",
+                "CURLFORM_END",
+                "CURLFORM_OBSOLETE2",
+                "CURLFORM_LASTENTRY",
+            ]
+        );
+        assert_eq!(
+            FORM_DEPRECATIONS.len() + undeprecated.len(),
+            CURLformoption::TOKEN_COUNT
+        );
+        for entry in FORM_DEPRECATIONS {
+            // One version for the whole family, unlike CURLINFO's four.
+            assert_eq!(entry.since, "7.56.0");
+            assert!(CURLformoption::ABI_VARIANTS.contains(&entry.member));
+        }
+        // Three of the eighteen carry an EMPTY message in the frozen
+        // header, which is why `Deprecation::message` may not be asserted
+        // non-empty the way `since` may.
+        let silent: Vec<&str> = FORM_DEPRECATIONS
+            .iter()
+            .filter(|d| d.message.is_empty())
+            .map(|d| d.member.c_name())
+            .collect();
+        assert_eq!(
+            silent,
+            vec!["CURLFORM_NOTHING", "CURLFORM_NAMELENGTH", "CURLFORM_ARRAY",]
+        );
+    }
+
+    #[test]
+    fn form_options_round_trip_through_the_c_boundary() {
+        for &option in CURLformoption::ABI_VARIANTS {
+            assert_eq!(
+                CURLformoption::from_c_int(option.as_c_int()),
+                Some(option)
+            );
+        }
+        for stranger in [-1, 22, 23, i32::MAX] {
+            assert_eq!(CURLformoption::from_c_int(stranger), None);
+        }
+    }
+
+    // -- CURLOPT_WS_OPTIONS argument bits ---------------------------------
+
+    #[test]
+    fn ws_option_bits_are_bit_zero_and_bit_one_and_long_typed() {
+        assert_eq!(CURLWS_RAW_MODE, 1);
+        assert_eq!(CURLWS_NOAUTOPONG, 2);
+        assert_eq!(CURLWS_RAW_MODE & CURLWS_NOAUTOPONG, 0);
+        // The `1L` in websockets.h:89-90 is an ABI distinction and not a
+        // typo: these two are read out of a variadic argument list through
+        // CURLOPT_WS_OPTIONS's CURLOPTTYPE_LONG slot, so the argument has
+        // to be a `long`. The frame flags in `ffi/ws.rs` are written
+        // `1 <<` because they are passed as a declared `unsigned int`
+        // parameter instead.
+        assert_eq!(
+            core::mem::size_of_val(&CURLWS_RAW_MODE),
+            core::mem::size_of::<c_long>()
+        );
+    }
+
+    // -- the introspection contract ---------------------------------------
+
+    /// `lookup(name, CURLOPT_LASTENTRY)` from `lib/easygetopt.c:31`.
+    ///
+    /// Case-insensitive over ASCII, which is what `curl_strequal` is;
+    /// alias rows are INCLUDED, because that branch tests no flag; and the
+    /// walk stops at the NULL-name sentinel without comparing against it,
+    /// which is what the C's `do { ... } while(o->name)` does.
+    fn lookup_by_name(name: &str) -> Option<&'static EasyOptionRow> {
+        for row in EASY_OPTIONS {
+            let Some(candidate) = row.name_str() else {
+                break;
+            };
+            if candidate.eq_ignore_ascii_case(name) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    /// `lookup(NULL, id)`. Skips alias rows -- "do not match alias
+    /// options", `lib/easygetopt.c:44`.
+    fn lookup_by_id(id: CURLoption) -> Option<&'static EasyOptionRow> {
+        for row in EASY_OPTIONS {
+            if row.name.is_none() {
+                break;
+            }
+            if row.id == id && !row.is_alias() {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    /// `curl_easy_option_next` walked to exhaustion from NULL.
+    fn walk_all() -> Vec<&'static EasyOptionRow> {
+        let mut out = Vec::new();
+        let mut index = 0;
+        while EASY_OPTIONS[index].name.is_some() {
+            out.push(&EASY_OPTIONS[index]);
+            index += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn by_name_takes_the_stripped_name_case_insensitively() {
+        // CORRECTION 3. Rows store the name WITHOUT its CURLOPT_ prefix and
+        // the lookup does no prefix handling, so the prefixed spelling
+        // MISSES. A validation item of the form
+        // `by_name("CURLOPT_X")->id == CURLOPT_X` is wrong.
+        let hit = lookup_by_name("ENCODING").expect("ENCODING is a row");
+        assert_eq!(hit.name_str(), Some("ENCODING"));
+        assert_eq!(hit.id, CURLoption::CURLOPT_ACCEPT_ENCODING);
+        assert_eq!(hit.value_type, curl_easytype::CURLOT_STRING);
+        assert_eq!(hit.flags, CURLOT_FLAG_ALIAS);
+
+        // Case-insensitive, and it is the same row.
+        let lower = lookup_by_name("encoding").expect("case-insensitive");
+        assert_eq!(lower.name_str(), hit.name_str());
+        assert_eq!(lower.id, hit.id);
+
+        // The negative half of CORRECTION 3.
+        assert!(lookup_by_name("CURLOPT_ENCODING").is_none());
+        assert!(lookup_by_name("curlopt_encoding").is_none());
+        // No trimming either.
+        assert!(lookup_by_name("ENCODING ").is_none());
+        assert!(lookup_by_name("").is_none());
+        // A preferred spelling resolves to its own, non-alias row.
+        let preferred =
+            lookup_by_name("ACCEPT_ENCODING").expect("preferred row");
+        assert_eq!(preferred.flags, 0);
+        assert_eq!(preferred.id, CURLoption::CURLOPT_ACCEPT_ENCODING);
+    }
+
+    #[test]
+    fn by_id_skips_alias_rows_and_by_name_does_not() {
+        // CURLOPT_SERVER_RESPONSE_TIMEOUT is reachable under two spellings.
+        // By id it must always be the preferred one.
+        let by_id = lookup_by_id(CURLoption::CURLOPT_SERVER_RESPONSE_TIMEOUT)
+            .expect("a preferred row exists");
+        assert_eq!(by_id.name_str(), Some("SERVER_RESPONSE_TIMEOUT"));
+        assert_eq!(by_id.flags, 0);
+
+        // By name the retired spelling still resolves, to its own row.
+        let by_name = lookup_by_name("FTP_RESPONSE_TIMEOUT")
+            .expect("the retired spelling still resolves");
+        assert_eq!(by_name.id, CURLoption::CURLOPT_SERVER_RESPONSE_TIMEOUT);
+        assert_eq!(by_name.flags, CURLOT_FLAG_ALIAS);
+
+        // Every alias row's id resolves by id to a NON-alias row carrying
+        // the same id, so the two lookups never disagree about the option.
+        for row in EASY_OPTIONS.iter().filter(|r| r.is_alias()) {
+            let preferred = lookup_by_id(row.id).unwrap_or_else(|| {
+                panic!("{:?} has no preferred row", row.name_str())
+            });
+            assert_eq!(preferred.id, row.id);
+            assert!(!preferred.is_alias());
+        }
+
+        // The sentinel is never entered into the loop body, so the one id
+        // only it carries is unreachable by id. Measured behaviour of the
+        // C, not an accident of this transcription.
+        assert!(lookup_by_id(CURLoption::CURLOPT_LASTENTRY).is_none());
+    }
+
+    #[test]
+    fn the_walk_covers_every_real_row_and_stops_at_the_sentinel() {
+        let walked = walk_all();
+        assert_eq!(walked.len(), EASY_OPTION_REAL_ROWS);
+        assert_eq!(walked.len(), 323);
+        assert_eq!(
+            walked.first().map(|r| r.name_str()),
+            Some(Some("ABSTRACT_UNIX_SOCKET"))
+        );
+        assert_eq!(
+            walked.last().map(|r| r.name_str()),
+            Some(Some("XOAUTH2_BEARER"))
+        );
+        // Iteration INCLUDES alias rows.
+        let aliases = walked.iter().filter(|r| r.is_alias()).count();
+        assert_eq!(aliases, EASY_OPTION_ALIAS_ROWS);
+        assert_eq!(aliases, 15);
+        // And it stops before the sentinel, which is a real element.
+        assert_eq!(EASY_OPTIONS.len(), walked.len() + 1);
+        assert!(EASY_OPTIONS[walked.len()].name.is_none());
+        assert_eq!(
+            EASY_OPTIONS[walked.len()].id,
+            CURLoption::CURLOPT_LASTENTRY
+        );
+        assert_eq!(
+            EASY_OPTIONS[walked.len()].value_type,
+            curl_easytype::CURLOT_LONG
+        );
+        assert_eq!(EASY_OPTIONS[walked.len()].flags, 0);
+    }
+
+    #[test]
+    fn the_fifteen_alias_rows_are_the_ones_optiontable_pl_emits() {
+        // Name, preferred option and declared type for each surviving
+        // alias, transcribed from `perl lib/optiontable.pl <
+        // include/curl/curl.h`. Five of them are the counter-examples that
+        // make CORRECTION 2 concrete: the type is NOT the one `id / 10000`
+        // would suggest.
+        let expected: &[(&str, CURLoption, curl_easytype)] = &[
+            (
+                "ENCODING",
+                CURLoption::CURLOPT_ACCEPT_ENCODING,
+                curl_easytype::CURLOT_STRING,
+            ),
+            (
+                "FILE",
+                CURLoption::CURLOPT_WRITEDATA,
+                curl_easytype::CURLOT_CBPTR,
+            ),
+            (
+                "FTPAPPEND",
+                CURLoption::CURLOPT_APPEND,
+                curl_easytype::CURLOT_LONG,
+            ),
+            (
+                "FTPLISTONLY",
+                CURLoption::CURLOPT_DIRLISTONLY,
+                curl_easytype::CURLOT_LONG,
+            ),
+            (
+                "FTP_RESPONSE_TIMEOUT",
+                CURLoption::CURLOPT_SERVER_RESPONSE_TIMEOUT,
+                curl_easytype::CURLOT_LONG,
+            ),
+            (
+                "FTP_SSL",
+                CURLoption::CURLOPT_USE_SSL,
+                curl_easytype::CURLOT_VALUES,
+            ),
+            (
+                "INFILE",
+                CURLoption::CURLOPT_READDATA,
+                curl_easytype::CURLOT_CBPTR,
+            ),
+            (
+                "KRB4LEVEL",
+                CURLoption::CURLOPT_KRBLEVEL,
+                curl_easytype::CURLOT_STRING,
+            ),
+            (
+                "MAIL_RCPT_ALLLOWFAILS",
+                CURLoption::CURLOPT_MAIL_RCPT_ALLOWFAILS,
+                curl_easytype::CURLOT_LONG,
+            ),
+            (
+                "POST301",
+                CURLoption::CURLOPT_POSTREDIR,
+                curl_easytype::CURLOT_VALUES,
+            ),
+            (
+                "PROGRESSDATA",
+                CURLoption::CURLOPT_XFERINFODATA,
+                curl_easytype::CURLOT_CBPTR,
+            ),
+            (
+                "RTSPHEADER",
+                CURLoption::CURLOPT_HTTPHEADER,
+                curl_easytype::CURLOT_SLIST,
+            ),
+            (
+                "SSLCERTPASSWD",
+                CURLoption::CURLOPT_KEYPASSWD,
+                curl_easytype::CURLOT_STRING,
+            ),
+            (
+                "SSLKEYPASSWD",
+                CURLoption::CURLOPT_KEYPASSWD,
+                curl_easytype::CURLOT_STRING,
+            ),
+            (
+                "WRITEHEADER",
+                CURLoption::CURLOPT_HEADERDATA,
+                curl_easytype::CURLOT_CBPTR,
+            ),
+        ];
+        let seen: Vec<&str> = EASY_OPTIONS
+            .iter()
+            .filter(|r| r.is_alias())
+            .map(|r| r.name_str().expect("an alias row has a name"))
+            .collect();
+        let want: Vec<&str> = expected.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(seen, want);
+        for (name, id, value_type) in expected {
+            let row =
+                lookup_by_name(name).expect("every alias row is reachable");
+            assert_eq!(row.id, *id, "{name} points at the wrong option");
+            assert_eq!(
+                row.value_type, *value_type,
+                "{name} has the wrong type"
+            );
+            assert_eq!(row.flags, CURLOT_FLAG_ALIAS);
+        }
+        // The two aliases `lib/optiontable.pl` SKIPS, because their target
+        // is an obsolete slot rather than an option: 17 true aliases less
+        // these two is 15.
+        assert!(lookup_by_name("WRITEINFO").is_none());
+        assert!(lookup_by_name("CLOSEPOLICY").is_none());
+    }
+
+    #[test]
+    fn the_per_type_row_distribution_matches_optiontable_pl() {
+        // Measured over the generator's output, counting DATA rows only.
+        // The widely quoted "LONG 120" counts the sentinel, which is a
+        // CURLOT_LONG row; over the 323 data rows the figure is 119. Both
+        // are asserted, in their own frames, so neither can be mistaken
+        // for the other.
+        let expected = [
+            (curl_easytype::CURLOT_LONG, 119),
+            (curl_easytype::CURLOT_STRING, 96),
+            (curl_easytype::CURLOT_FUNCTION, 26),
+            (curl_easytype::CURLOT_CBPTR, 25),
+            (curl_easytype::CURLOT_VALUES, 20),
+            (curl_easytype::CURLOT_SLIST, 11),
+            (curl_easytype::CURLOT_OBJECT, 11),
+            (curl_easytype::CURLOT_BLOB, 8),
+            (curl_easytype::CURLOT_OFF_T, 7),
+        ];
+        let mut total = 0;
+        for (value_type, count) in expected {
+            let seen = EASY_OPTIONS
+                .iter()
+                .filter(|r| r.name.is_some())
+                .filter(|r| r.value_type == value_type)
+                .count();
+            assert_eq!(seen, count, "{value_type:?} covers {seen} data rows");
+            total += count;
+        }
+        assert_eq!(total, EASY_OPTION_REAL_ROWS);
+        assert_eq!(total, 323);
+        let with_sentinel = EASY_OPTIONS
+            .iter()
+            .filter(|r| r.value_type == curl_easytype::CURLOT_LONG)
+            .count();
+        assert_eq!(with_sentinel, 120);
+        assert_eq!(EASY_OPTIONS.len(), 324);
+    }
+
+    #[test]
+    fn the_projected_struct_has_the_layout_a_consumer_reads() {
+        // `ffi/easy.rs` projects the rows above into
+        // `ffi/types.rs`'s `curl_easyoption` and hands a POINTER to a C
+        // caller, which then reads the fields and reaches the next row with
+        // `prev++`. The layout is therefore directly observable, and it is
+        // asserted here -- at the authority for the data -- rather than
+        // only where the type happens to be declared.
+        //
+        // The numbers are LP64. All four targets AAP 0.8.3 mandates are
+        // 64-bit, and AAP 0.6.2 records that 32-bit is deliberately
+        // forfeited, so a target where these fail is a target this
+        // workspace does not claim.
+        use crate::ffi::types::curl_easyoption;
+        use core::{mem, ptr};
+
+        assert_eq!(mem::size_of::<curl_easyoption>(), 24);
+        assert_eq!(mem::align_of::<curl_easyoption>(), 8);
+        let probe = curl_easyoption {
+            name: ptr::null(),
+            id: 0,
+            r#type: 0,
+            flags: 0,
+        };
+        let base = ptr::addr_of!(probe) as usize;
+        let name = ptr::addr_of!(probe.name) as usize - base;
+        let id = ptr::addr_of!(probe.id) as usize - base;
+        let value_type = ptr::addr_of!(probe.r#type) as usize - base;
+        let flags = ptr::addr_of!(probe.flags) as usize - base;
+        assert_eq!(name, 0);
+        assert_eq!(id, 8);
+        assert_eq!(value_type, 12);
+        assert_eq!(flags, 16);
+        // The field ORDER the frozen `struct curl_easyoption`
+        // (include/curl/options.h:51-56) declares: name, id, type, flags.
+        // Asserted separately from the offsets so that the intent survives
+        // even on a hypothetical target with different padding.
+        assert!(name < id);
+        assert!(id < value_type);
+        assert!(value_type < flags);
     }
 }

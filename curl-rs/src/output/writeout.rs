@@ -1699,14 +1699,23 @@ fn write_variable(
 ///   the C comment at `:72` insisting on it: "do not use tolower() since that
 ///   is locale specific".
 ///
+/// # Visibility
+///
+/// `pub(crate)` because `src/tool_writeout_json.c:37` declares `jsonquoted` in
+/// its header and `src/var.c:117` calls it from outside this translation unit:
+/// the `{{name:json}}` variable function is the second consumer, and
+/// [`crate::cli::vars`] delegates to it here rather than escaping again. A
+/// second escaper would drift from `--write-out '%{json}'`, and every one of
+/// the three properties above is exactly the kind of detail that would drift
+/// first.
+///
 /// # Errors
 ///
 /// `Err(())` when the escaped form would reach `limit` bytes, which is how
 /// C's dynbuf reports `CURLE_TOO_LARGE`. `out` is then left with whatever had
 /// already been appended, and the caller is expected to discard it whole --
 /// C frees the buffer.
-#[allow(dead_code)]
-fn json_quoted(
+pub(crate) fn json_quoted(
     input: &[u8],
     out: &mut Vec<u8>,
     lowercase: bool,

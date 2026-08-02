@@ -22,20 +22,157 @@
 #
 ###########################################################################
 
+# HOW THIS FILE IS RENDERED, NOW THAT THERE IS NO C BUILD
+#
+# This is the pkg-config template. Autotools substituted it through
+# AC_SUBST and config.status; CMake substitutes it with configure_file()
+# in @ONLY mode at CMakeLists.txt:2326-2328. A Cargo build runs neither,
+# so the renderer is now curl-rs-ffi/build.rs: it reads this file, fills
+# in the fourteen substitution tokens and writes lib/pkgconfig/libcurl.pc,
+# mode 0644, into an install-staging directory under target/ -- or wherever
+# CURL_RS_STAGING_DIR names, and never into the checkout.
+#
+# The token spelling is deliberately unchanged. Both CMake's
+# configure_file() and the new renderer understand it, so a packager
+# diffing this template against curl 8.x sees added comments and nothing
+# else. Those comments therefore name each token WITHOUT its surrounding
+# at-signs: substitution is a plain global replacement in both renderers,
+# so a real token written inside a comment would be replaced there too.
+#
+# The pkg-config contract is frozen, not merely preserved. Every field
+# name below, and the order of the fields, is the one curl 8.x published.
+# Consumers run `pkg-config --libs libcurl`, `--cflags libcurl`,
+# `--modversion libcurl`, `--variable=supported_protocols libcurl` and
+# `--variable=supported_features libcurl`, and every one of them must keep
+# answering in the same shape now that a Rust library stands behind it.
+#
+# The install layout. prefix is the only externally supplied value: the
+# renderer reads CURL_RS_PREFIX and otherwise falls back to the same
+# /usr/local Autotools defaulted to. The other three are pkg-config
+# variable references resolved against it, so relocating the package needs
+# no edit here. Only that namespaced variable is consulted -- a bare
+# PREFIX inherited from an unrelated tool would silently describe install
+# paths libcurl was never installed to.
 prefix=@prefix@
 exec_prefix=@exec_prefix@
 libdir=@libdir@
 includedir=@includedir@
+# The two variables a consumer reads back with `pkg-config --variable=`.
+#
+# SUPPORT_PROTOCOLS expands to the schemes this implementation really
+# serves, space separated and upper-cased exactly as curl 8.x spells them
+# here: FILE FTP FTPS HTTP HTTPS SCP SFTP WS WSS. Those nine are the whole
+# of it. The twenty-four schemes that remain registered for ABI
+# completeness but are not implemented -- DICT, GOPHER, GOPHERS, IMAP,
+# IMAPS, LDAP, LDAPS, MQTT, POP3, POP3S, RTMP and its variants, RTSP, SMB,
+# SMBS, SMTP, SMTPS, TELNET and TFTP -- are deliberately absent, and that
+# absence is the point rather than an oversight: they are out of scope for
+# implementation but not for the ABI, so their absence has to be reported
+# honestly. The asymmetry decides it. Under-reporting a capability only
+# makes a test fixture skip, while over-reporting makes it run and fail,
+# and 283 fixtures -- 14.8% of the corpus -- depend on this omission to
+# skip cleanly. A request for one of them returns
+# CURLE_UNSUPPORTED_PROTOCOL.
+#
+# SUPPORT_FEATURES expands to the truthful subset of curl's own feature
+# vocabulary, each name spelled as configure.ac spells it from :5143
+# onward and the list sorted case-insensitively as CMakeLists.txt:2040-2045
+# sorts it: SSL, IPv6, UnixSockets, libz, brotli, zstd, AsynchDNS, IDN,
+# PSL, alt-svc, HSTS, NTLM, HTTP2, HTTP3, Largefile, threadsafe and their
+# neighbours, each one only when this build genuinely has it.
+#
+# Withheld on purpose, because each one would be a claim a test harness
+# then acts on:
+#
+#   Debug, and with it TrackMemory -- advertising Debug arms the harness's
+#   allocation-cap and leak accounting against a Rust allocator whose
+#   allocation pattern cannot match a C one. The cost of withholding it is
+#   stated rather than hidden: 98 fixtures skip and torture-test does not
+#   apply.
+#
+#   Every name belonging to a dropped backend, since rustls, quinn and
+#   russh are the sole implementations: MultiSSL, OpenSSL, GnuTLS,
+#   mbedtls, wolfssl, Schannel, SSPI, TLS-SRP, NTLM_WB, WinIDN, AppleIDN,
+#   libssh, libssh2, c-ares and gsasl.
+#
+#   GSS-API, SPNEGO and Kerberos, which are compiled in only behind the
+#   non-default `negotiate` Cargo feature -- and even then stay out of
+#   this file, because whether a usable mechanism exists on the host is a
+#   runtime property that a file written at build time cannot know. That
+#   question is left to `curl --version`, which can ask.
+#
+# Neither list is maintained here, and neither is maintained in the
+# renderer. Both are projections of the one capability table in
+# curl-rs-lib/src/version.rs that also renders the `curl --version`
+# banner, so this file and that banner cannot describe different products
+# -- which matters because tests/runtests.pl parses the banner's
+# Protocols: line and derives the -ipv6 and -unix variants, http-proxy and
+# https-mtls from it. A scheme appears here only once the engine module
+# that serves it is present, so the list is never ahead of the code.
 supported_protocols="@SUPPORT_PROTOCOLS@"
 supported_features="@SUPPORT_FEATURES@"
 
 Name: libcurl
 URL: https://curl.se/
 Description: Library to transfer files with HTTP, FTP, etc.
+# CURLVERSION expands to 8.19.0-DEV, read from include/curl/curlver.h:35
+# exactly as configure.ac:129 read it, with LIBCURL_VERSION_NUM 0x081300
+# at :61 as its numeric twin. It is NOT bumped: the version is part of the
+# frozen contract, and every parity claim made about this artifact -- 100
+# exported symbols, 103 CURLcode discriminants, 308 CURLoption
+# identifiers -- is a claim against curl 8.19.0-DEV.
 Version: @CURLVERSION@
+# Both of the next two fields expand to EMPTY, and empty is the truthful
+# value rather than an omission. Requires: names other pkg-config modules
+# and pkg-config fails outright when one of them cannot be found, so a
+# stale name here would break `pkg-config --cflags libcurl` for every
+# consumer. Every C library curl used to require has become a statically
+# linked Rust crate with no .pc file of its own: OpenSSL, GnuTLS, mbedTLS
+# and wolfSSL became rustls; nghttp2 became h2; ngtcp2, nghttp3 and quiche
+# became quinn, h3 and h3-quinn; libssh2 and libssh became russh; zlib
+# became flate2; the C brotli and zstd libraries became the brotli and
+# zstd crates; c-ares became the system resolver; libidn2 became idna;
+# libpsl became publicsuffix; libuv became tokio. There is nothing left to
+# require. CMakeLists.txt:2144 and :2260 leave both empty as well.
 Requires: @LIBCURL_PC_REQUIRES@
 Requires.private: @LIBCURL_PC_REQUIRES_PRIVATE@
+# The link line, and the one literal in this file that must never change:
+# consumers link -lcurl. That is why curl-rs-ffi/Cargo.toml:114-126 builds
+# the cdylib and the staticlib under [lib] name = "curl", so the artifacts
+# really are libcurl.so and libcurl.a rather than libcurl_rs_ffi.so.
+#
+# The shared object carries DT_SONAME = libcurl.so.4. The 4 is derived,
+# never chosen: lib/Makefile.soname sets VERSIONCHANGE=12, VERSIONADD=0
+# and VERSIONDEL=8, giving libtool -version-info 12:0:8, whose soname
+# major is current - age = 12 - 8 = 4. Cargo stamps no soname of its own,
+# and .cargo/config.toml deliberately does not either -- rustflags are not
+# artifact-scoped and were measured to put that soname on the two
+# command-line binaries as well. curl-rs-ffi/build.rs emits the
+# correctly-scoped cdylib-only link argument instead, and an
+# -install_name form of it on macOS.
 Libs: -L${libdir} -lcurl @LIBCURL_PC_LIBS@
+# What a consumer must add when it links the static archive instead. On
+# the four mandated targets this is the platform C runtime and nothing
+# exotic: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc on the two
+# unknown-linux-gnu triples, and -lSystem -lm with the Security and
+# CoreFoundation frameworks on the two apple-darwin ones, plus
+# -lgssapi_krb5 or the GSS framework when the `negotiate` feature is on.
+# ring, the pinned cryptographic provider, contributes nothing here: its C
+# and assembly are compiled into the archive, so there is no external
+# library to name. The order is the one a left-to-right static linker
+# needs, which is why -lc is last. The same authority renders
+# `curl-config --static-libs`, so the two cannot disagree.
 Libs.private: @LIBCURL_PC_LDFLAGS_PRIVATE@ @LIBCURL_PC_LIBS_PRIVATE@
+# includedir must be the directory that HOLDS the curl subdirectory, not
+# the subdirectory itself, because the public headers are included as
+# <curl/curl.h> -- see include/README.md. The header found there is now
+# generated: curl-rs-ffi/build.rs runs cbindgen over the ABI crate to
+# produce include/curl/curl.h, and include/curl/typecheck-gcc.h ships
+# verbatim beside it as a hand-maintained file, because its 258 curlcheck_
+# macros give curl_easy_setopt compile-time type checking that cbindgen
+# cannot express.
 Cflags: -I${includedir} @LIBCURL_PC_CFLAGS@
+# -DCURL_STATICLIB, exactly as CMakeLists.txt:2255 sets it. A consumer
+# linking the static archive must define it so the public headers do not
+# decorate the API for import from a shared library.
 Cflags.private: @LIBCURL_PC_CFLAGS_PRIVATE@

@@ -525,8 +525,11 @@
 //! the worst option, so `build.rs`'s `check_variadic_abi` makes it
 //! impossible: building for `aarch64-apple-darwin` **fails** unless
 //! `CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs` is set, and
-//! any target fails if `src/ffi/printf.rs` or `src/ffi/form.rs` appears
-//! while the decision is unrecorded. Setting that variable is an assertion
+//! any target fails if `src/ffi/form.rs` appears while the decision is
+//! unrecorded. `src/ffi/printf.rs` was once on that list and has been
+//! removed, because a stricter per-symbol check replaced the per-file veto
+//! for it; the next-but-one paragraph gives the measurement that made that
+//! possible. Setting that variable is an assertion
 //! that both consequences below are accepted; it fixes nothing, and where
 //! it actually suppresses a refusal the build says so. The two lists the
 //! gate reasons about are asserted against the verbatim header text this
@@ -582,18 +585,98 @@
 //! synthesising the `va_list` that indexes it. That is expressible in
 //! `global_asm!` in principle, but it is a separate per-target
 //! implementation for each of the three `va_list` layouts above rather than
-//! a four-instruction thunk, and none of it is written. So these eleven
-//! remain **open**: raising the minimum, adding a C shim that captures the
-//! `va_list` and delegates -- which would add a build-time C compiler
-//! dependency the manifest does not currently permit -- and hand-writing the
-//! spill prologue are the ABI-exact routes. Dropping the symbols is not an
-//! option, because they are eleven of the 100.
+//! a four-instruction thunk. Raising the minimum, adding a C shim that
+//! captures the `va_list` and delegates -- which would add a build-time C
+//! compiler dependency the manifest does not currently permit -- and
+//! hand-writing the spill prologue are the ABI-exact routes. Dropping the
+//! symbols is not an option, because they are eleven of the 100.
 //!
-//! Ten of the eleven additionally need a formatter that does not exist yet:
-//! `lib/mprintf.c` is a complete `printf` implementation with curl's own
-//! conversion set, and specification 0.4.1 maps it to this crate's
-//! `ffi/printf.rs`. So for the `curl_m*printf` family the variadic question
-//! is not currently the binding constraint.
+//! **The third of those routes has since been taken for ten of the eleven, and
+//! the paragraph above is left standing because its reasoning is still the
+//! reason it was needed.** The one claim in it that measurement overtook is
+//! "none of it is written". The spill prologue is now written, once per ABI, in
+//! `src/ffi/printf.rs`: x86-64 System V and AAPCS64 each save their argument
+//! registers into a frame and synthesise the record their ABI defines, while
+//! Apple arm64 needs two instructions because its `va_list` *is* the entry
+//! stack pointer. Each was compared against the prologue the target's own C
+//! compiler emits, field by field, and the five `va_list` siblings the
+//! trampolines call are ordinary Rust functions with no `unsafe` beyond what a
+//! documented `// SAFETY:` comment covers. So `curl_mprintf`, `curl_mfprintf`,
+//! `curl_msprintf`, `curl_msnprintf`, `curl_maprintf`, `curl_mvprintf`,
+//! `curl_mvfprintf`, `curl_mvsprintf`, `curl_mvsnprintf` and `curl_mvaprintf`
+//! are all implemented and correct at the declared minimum, with no new
+//! dependency, and all ten are exported from the **static** library. Five of
+//! them are not exported from the shared library, for a reason that is nothing
+//! to do with the prologues and is set out two paragraphs below.
+//! `curl_formadd` is not implemented at all, and its obstacle is different in kind: a
+//! `CURLFORM_*` sequence carries no type encoding to recover the argument shapes
+//! from, so `va_start` alone does not help.
+//!
+//! **What remains open for those ten, stated rather than glossed.** The Apple
+//! prologues are cross-assembled and disassembled in this environment, never
+//! executed, because no Apple host is available -- so their correctness rests on
+//! a reading of Apple's ABI plus a disassembly, not on a passing test. That is a
+//! narrower open item than the one it replaced, and it is enforced rather than
+//! merely noted: `build.rs`'s `check_printf_trampolines` refuses a plain Rust
+//! definition of any of the five variadic forms, requires a trampoline naming
+//! each export and its correct `va_list` sibling, and requires both the ELF and
+//! the Mach-O `.globl` spelling, so no required target can be left without an
+//! exporter. Unlike the per-file veto it replaced, no environment variable
+//! silences it.
+//!
+//! **A second open item, discovered by measurement and materially widening A4:
+//! an assembled entry point cannot be exported from a Rust `cdylib` at the
+//! declared minimum, on any target, by any mechanism.** rustc builds a cdylib's
+//! export list from Rust items carrying `#[no_mangle]` or `#[export_name]` and
+//! hands the linker an anonymous version script shaped
+//! `{ global: <those items>; local: *; };` -- captured verbatim from 1.75.0 and
+//! 1.97.1 alike and byte-identical between them. A `.globl` label matches nothing
+//! in `global:`, falls to the wildcard, is localised, and -- being unreferenced --
+//! is discarded outright. Measured on x86_64-unknown-linux-gnu in both profiles:
+//! `nm -D --defined-only libcurl.so` reports the five `va_list` forms and not the
+//! five trampolines, which appear nowhere in a symbol table of 2703 entries,
+//! while `nm --defined-only libcurl.a` reports all ten as `T`. Every unit test
+//! passes either way, because a test binary links the rlib.
+//!
+//! Eight linker routes were measured; seven have no effect at all
+//! (`--export-dynamic-symbol`, `--export-dynamic-symbol-list`, `--dynamic-list`,
+//! `-u`, `--export-dynamic`, and combinations of them). The eighth, a second
+//! anonymous `--version-script` naming the five, works under LLD -- which is why
+//! it appeared to work at first, since rustc passes `-fuse-ld=lld` for
+//! x86_64-unknown-linux-gnu -- and **fails the link** under GNU ld with
+//! `anonymous version tag cannot be combined with other version tags`, which is
+//! three of the four required targets and the 1.75 floor among them. It was
+//! implemented, verified where it works, and removed; `build.rs` carries the full
+//! matrix under "Trap 3". Two further findings belong with it. The C-shim route
+//! this section describes above would not have helped either, because the version
+//! script governs the whole link and a C object's symbols are localised exactly
+//! as an assembled label is -- that route answers the variadic question and is
+//! silent on the export question. And the one design that *would* export all ten,
+//! declaring the register-resident variadic arguments as ordinary parameters,
+//! caps the argument count: `addr_of!` of the last stack-passed parameter was
+//! measured to be the caller's slot in debug and a callee-local copy in release,
+//! putting the overflow area out of reach.
+//!
+//! So the gap is accepted deliberately and it is LOUD: a consumer linking
+//! `-lcurl` against the shared library gets `undefined reference to
+//! 'curl_maprintf'` at link time, and specification 0.8.4's parity gate fails on
+//! it by design. That is the deciding property, because the alternative -- a
+//! capped printf -- mis-renders a legal C call **silently**, and specification
+//! 0.6.2 says of exactly this class of hazard that silent acceptance is the worst
+//! option. A loud absence beats a quiet wrong answer. The complete remedy makes
+//! the five Rust items, which means raising the minimum (`#[naked]` at 1.88, or
+//! `c_variadic` at 1.99), and that is the decision A4 reserves for whoever set
+//! the requirements.
+//!
+//! The formatter those ten need is written too, and it is curl's own rather than
+//! the platform's or Rust's: `lib/mprintf.c` supports `%zd`, `curl_off_t` and a
+//! quoted `%S`, and it differs from the C library in ways the byte-exact fixture
+//! corpus is entitled to depend on -- `%08.2f` loses its zero padding, `%10.8s`
+//! charges the width the requested precision rather than the delivered length,
+//! and `%10p` of a null pointer pads on the side left alignment would. Every one
+//! of those was verified differentially against a real libcurl rather than
+//! inferred, as specification 0.4.1 requires when it maps that file to this
+//! crate's `ffi/printf.rs`.
 //!
 //! **32-bit support is forfeited deliberately and must not be claimed.** A
 //! single register-width argument slot holds a `curl_off_t` only where
