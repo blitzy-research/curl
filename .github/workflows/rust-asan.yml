@@ -60,7 +60,7 @@
 
 name: 'Rust sanitizer'
 
-on:
+'on':
   push:
     branches:
       - master
@@ -177,6 +177,25 @@ env:
   # report without a Rust frame list is a great deal less useful.
   RUST_TEST_THREADS: '1'
   RUST_BACKTRACE: '1'
+
+  # THE NATIVE-LINK PREREQUISITE FOR THE --all-features SUBJECT.
+  #
+  # The second ASan subject below is `curl-rs-lib --all-features`, and it is
+  # `--all-features` precisely to reach `mod gss` behind the default-off
+  # `negotiate` feature. That module's extern block carries
+  # `#[cfg_attr(target_os = "linux", link(name = "gssapi_krb5"))]`, and an
+  # instrumented test binary is a LINKED artifact, so the step asks the linker
+  # for `-lgssapi_krb5`. With no provider installed the leg dies with
+  # `rust-lld: error: unable to find library -lgssapi_krb5`, which this file
+  # would then have to report as "an FFI surface that cannot be instrumented"
+  # when the truth is a missing system package.
+  #
+  # `libgssapi_krb5.so` - the UNVERSIONED symlink a linker resolves against, not
+  # the `libgssapi_krb5.so.2` a runtime needs - ships only in the MIT Kerberos
+  # development package. Same name and same value as rust-build.yml's env block,
+  # deliberately: gates that link the same feature set must not disagree about
+  # what that feature set requires.
+  NATIVE_LINK_PACKAGES: 'libkrb5-dev'
 
 jobs:
   asan:
@@ -391,6 +410,28 @@ jobs:
           # cargo accepts and another rejects should fail here rather than three
           # steps later.
           cargo "+${NIGHTLY_TOOLCHAIN}" fetch --locked --target "${ASAN_TARGET}"
+
+      - name: 'install the native-link prerequisites for negotiate'
+        run: |
+          # Its own step, for the same attribution reason as every other step in
+          # this family: a missing system package must be reported as a missing
+          # system package and not as a memory-safety verdict. See this file's env
+          # block for why the --all-features subject below cannot link without it.
+          #
+          # The house apt pattern, taken verbatim from rust-build.yml.
+          sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
+          sudo apt-get -o Dpkg::Use-Pty=0 update
+          sudo apt-get -o Dpkg::Use-Pty=0 install \
+            ${NATIVE_LINK_PACKAGES}
+
+          # Prove the linker input exists, by the name the Rust `#[link]`
+          # attribute actually asks for rather than by the package name.
+          echo '::group::the GSS-API provider the --all-features subject will link'
+          krb5-config --libs gssapi
+          ldconfig -p | grep -F 'libgssapi_krb5.so' || true
+          echo '::endgroup::'
+
+          echo 'the MIT Kerberos development package is installed'
 
       - name: 'asan: curl-rs-ffi, the C ABI shim'
         run: |

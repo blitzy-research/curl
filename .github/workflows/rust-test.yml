@@ -65,7 +65,7 @@ name: 'Rust tests'
 # paths-ignore: docs/cmdline-opts/ and docs/libcurl/ are inputs to generated
 # code and are asserted against by tests, so a documentation-only change can
 # genuinely break this gate.
-on:
+'on':
   push:
     branches:
       - master
@@ -118,6 +118,29 @@ env:
   # A panic backtrace in the log is the difference between a diagnosable
   # failure and a line saying a test failed.
   RUST_BACKTRACE: '1'
+
+  # THE NATIVE-LINK PREREQUISITE FOR THE --all-features RUN.
+  #
+  # `--all-features` turns on `negotiate`, and that feature is the whole of
+  # curl-rs-lib/src/ffi/gss.rs, whose extern block carries
+  # `#[cfg_attr(target_os = "linux", link(name = "gssapi_krb5"))]`. A test
+  # binary is a LINKED artifact, so the second run below does not merely
+  # type-check that module - it asks the linker for `-lgssapi_krb5`. Without a
+  # provider the leg dies with `rust-lld: error: unable to find library
+  # -lgssapi_krb5` before a single test executes, which reports a missing
+  # system package as a test-gate failure.
+  #
+  # `libgssapi_krb5.so` - the UNVERSIONED symlink a linker resolves against, as
+  # distinct from the `libgssapi_krb5.so.2` a runtime needs - arrives only with
+  # the MIT Kerberos development package. `krb5-config --libs gssapi` reports
+  # `-lgssapi_krb5 -lkrb5 -lk5crypto -lcom_err`; the transitive three arrive
+  # through the shared object's own DT_NEEDED entries, so only the first is
+  # named by a Rust `link` attribute and only this one package is needed.
+  #
+  # Same name and same value as rust-build.yml's env block, deliberately: that
+  # workflow already installs it for its own native-link leg, and two gates
+  # that link the same feature set must not disagree about what that requires.
+  NATIVE_LINK_PACKAGES: 'libkrb5-dev'
 
 jobs:
   test:
@@ -275,6 +298,40 @@ jobs:
           fi
 
           echo 'cargo test --workspace: exit 0'
+
+      - name: 'install the native-link prerequisites for negotiate'
+        run: |
+          # Its own step, and placed AFTER the default run, for the same
+          # attribution reason every other step in this family is separated: a
+          # missing system package must be reported as a missing system package,
+          # not as a test failure. The default run above links nothing from GSS
+          # (negotiate is default-off), so nothing before this point needs it and
+          # putting it here keeps the default leg provably GSS-free.
+          #
+          # The house apt pattern, taken verbatim from rust-build.yml: drop the
+          # pre-seeded third-party sources first, because they are the usual
+          # cause of an `apt-get update` failure on a hosted runner, then update,
+          # then install without a pseudo-tty so the log stays readable.
+          sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
+          sudo apt-get -o Dpkg::Use-Pty=0 update
+          sudo apt-get -o Dpkg::Use-Pty=0 install \
+            ${NATIVE_LINK_PACKAGES}
+
+          # Prove the linker input exists, and prove it by the name the Rust
+          # `#[link]` attribute actually asks for rather than by the package
+          # name. Checking the versioned runtime object instead would pass here
+          # and still fail at link time.
+          echo '::group::the GSS-API provider the --all-features run will link'
+          krb5-config --libs gssapi
+          ldconfig -p | grep -F 'libgssapi_krb5.so' || true
+          echo '::endgroup::'
+
+          if ! ldconfig -p | grep -q -E 'libgssapi_krb5\.so$|libgssapi_krb5\.so ' ; then
+            echo 'NOTE: the unversioned symlink was not found in the ldconfig cache; the link'
+            echo 'step below is the real test and will say so plainly if it is genuinely absent.'
+          fi
+
+          echo 'the MIT Kerberos development package is installed'
 
       - name: 'test: cargo test --locked --workspace --all-features'
         run: |
