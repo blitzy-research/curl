@@ -83,7 +83,7 @@
 
 name: 'Rust ABI parity'
 
-on:
+'on':
   push:
     branches:
       - master

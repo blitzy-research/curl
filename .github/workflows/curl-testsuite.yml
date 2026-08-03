@@ -93,7 +93,7 @@
 
 name: 'curl test suite'
 
-on:
+'on':
   push:
     branches:
       - master

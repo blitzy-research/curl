@@ -58,7 +58,7 @@
 
 name: 'Rust coverage'
 
-on:
+'on':
   push:
     branches:
       - master
