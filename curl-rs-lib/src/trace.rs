@@ -764,9 +764,22 @@ impl fmt::Display for TraceFilter {
 /// single instance for the process, applies `--trace-config` to it once through
 /// the exported `curl_global_trace()`, and lends it to each transfer, which is
 /// what C's globals amount to in the only configuration curl itself ships.
+///
+/// `pub` for exactly that reason, and reachable only through the crate root's
+/// named re-export, because `mod trace` is `pub(crate)`. The holder of the
+/// process-wide instance is the ABI facade -- `curl-rs-ffi/src/ffi/global.rs`,
+/// which already owns the `curl_global_init` reference count and the five
+/// replaceable allocator hooks -- since a C consumer has no command-line tool
+/// to hold one for it. What stays crate-private is everything the levels are
+/// *interpreted* with: `TraceFeature`, `TraceFilter`, `TraceCategory`,
+/// `TraceLevel` and the accessors keyed on them -- named in prose rather than
+/// linked, because a link from public documentation to a crate-private item is
+/// an error under `RUSTDOCFLAGS=-D warnings`. The facade therefore cannot
+/// read or forge a level; it can only construct a configuration, apply a
+/// `--trace-config` string to it, and lend it back. That is the whole of what
+/// `curl_global_trace()` needs and no more.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)]
-pub(crate) struct TraceConfig {
+pub struct TraceConfig {
     /// Levels indexed by [`TraceFeature::slot`].
     features: [TraceLevel; TraceFeature::SLOTS],
     /// Levels indexed by [`TraceFilter::slot`].
@@ -780,8 +793,7 @@ impl TraceConfig {
     /// the eleven features and every filter starts at `CURL_LOG_LVL_NONE`
     /// (`lib/curl_trc.c:85`, `:207`, `:211`, `:215`, `:219`, `:223`, `:410`,
     /// `:446`, `:464`, `:482`).
-    #[allow(dead_code)]
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             features: [TraceLevel::None; TraceFeature::SLOTS],
             filters: [TraceLevel::None; TraceFilter::SLOTS],
@@ -917,8 +929,8 @@ impl TraceConfig {
     ///
     /// # Grammar
     ///
-    /// Comma-separated tokens. A leading `-` selects [`TraceLevel::None`], a
-    /// leading `+` or no sign selects [`TraceLevel::Info`]. The sign counts
+    /// Comma-separated tokens. A leading `-` selects `TraceLevel::None`, a
+    /// leading `+` or no sign selects `TraceLevel::Info`. The sign counts
     /// towards the token's length, because C strips it with
     /// `curlx_str_nudge()` only after the token has been measured
     /// (`lib/curl_trc.c:611-616`). Four keywords select a category --
@@ -935,7 +947,7 @@ impl TraceConfig {
     /// module documentation, and it is C's real behaviour rather than the
     /// truncation one might expect from a length cap:
     ///
-    /// * a token longer than [`TRACE_CONFIG_TOKEN_MAX`] bytes, which
+    /// * a token longer than `TRACE_CONFIG_TOKEN_MAX` (32) bytes, which
     ///   `curlx_str_until()` reports as `STRE_BIG`
     ///   (`lib/curlx/strparse.c:48-53`);
     /// * an empty token, reported as `STRE_SHORT`
@@ -958,7 +970,7 @@ impl TraceConfig {
     /// the configuration outright, which C never does, or expand it lossily --
     /// and a lossy expansion is worse than it looks, because each invalid byte
     /// becomes a three-byte `U+FFFD`, which can push an otherwise legal token
-    /// past [`TRACE_CONFIG_TOKEN_MAX`] and, per the rules above, abandon the
+    /// past `TRACE_CONFIG_TOKEN_MAX` and, per the rules above, abandon the
     /// rest of the string including later valid tokens.
     ///
     /// Bytes remove the choice. A token that is not valid UTF-8 matches no
@@ -971,8 +983,7 @@ impl TraceConfig {
     /// because `curl_global_trace()` must return a `CURLcode`; C's own body
     /// can only produce `CURLE_OK`, and a caller that treated a malformed
     /// configuration as fatal would be a behaviour change.
-    #[allow(dead_code)] // consumer module not landed
-    pub(crate) fn apply(&mut self, config: Option<&[u8]>) -> CodeResult<()> {
+    pub fn apply(&mut self, config: Option<&[u8]>) -> CodeResult<()> {
         let Some(config) = config else {
             return Ok(());
         };
@@ -1029,8 +1040,11 @@ impl TraceConfig {
     /// The argument is bytes for the reason [`apply`](Self::apply) gives: the
     /// shim can pass `CStr::to_bytes()` straight through, with no decode and
     /// therefore no way to reject or mangle a configuration C would accept.
-    #[allow(dead_code)] // consumer module not landed
-    pub(crate) fn apply_code(&mut self, config: Option<&[u8]>) -> CURLcode {
+    ///
+    /// Consumed by `curl_global_trace` in `curl-rs-ffi/src/ffi/global.rs`, which
+    /// is why the `dead_code` allowance these two methods carried is gone: the
+    /// consumer has landed.
+    pub fn apply_code(&mut self, config: Option<&[u8]>) -> CURLcode {
         match self.apply(config) {
             Ok(()) => CURLcode::Ok,
             Err(code) => code,

@@ -255,7 +255,12 @@ pub(crate) const BLOCK_LEN: usize = 64;
 /// that compiles is the compiler's own proof that `sha2` and `hmac` resolved to
 /// one `digest` generation. The test module asserts exactly that, and asserts
 /// in addition that keying through this alias agrees with
-/// `crate::crypto::hmac_sha256`, which reaches for `sha2` independently.
+/// `crate::crypto::hmac_sha256`. That wrapper keys through this very alias --
+/// `crypto/hmac.rs:222` imports it and `:451` keys with it -- so what the
+/// second comparison pins is that the wrapper has not been pointed at a
+/// different SHA-2 member: `Sha512Trunc256` emits the same 32 bytes, so no
+/// length or self-agreement check in the keyed module would notice, and this
+/// one would.
 #[allow(dead_code)]
 pub(crate) type Sha256 = Sha256Hasher;
 

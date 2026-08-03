@@ -21,3 +21,10 @@ Enable ASCII transfer mode. For FTP, this can also be enforced by using a URL
 that ends with `;type=A`. For TFTP, this can also be enforced by using a URL
 that ends with `;mode=netascii`. This option causes data sent to stdout to be
 in text mode for Win32 systems.
+
+Transfers for `LDAP`, `LDAPS` and `TFTP` are not implemented in this build.
+The `Protocols:` line of the --version output withholds all three, and a
+request using any of them fails with `CURLE_UNSUPPORTED_PROTOCOL`. This
+option and the `;mode=netascii` suffix are still parsed, and no `TFTP`
+transfer takes place. ASCII mode for `FTP` and `FTPS`, including the
+`;type=A` form, remains fully supported exactly as described above.

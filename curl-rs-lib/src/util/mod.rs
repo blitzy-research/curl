@@ -371,6 +371,14 @@
 // Address presentation and parsing -- supersedes `lib/curlx/inet_ntop.c`
 // (222) and `lib/curlx/inet_pton.c` (221). ISC-licensed, NOT curl-licensed --
 // a distinction that must survive into the file superseding them.
+//   LANDED, and declared below. It is the ONE file in this directory whose
+//   licence banner differs from every other, and the exception recorded at
+//   the head of this file is the reason: the banner it carries is the ISC
+//   notice of its two C originals, and `reuse lint-file` on it is silent.
+//   Both formatters are infallible where the C can fail twice, because the
+//   family collapses into the type system and the caller's buffer becomes an
+//   owned `String`; both parsers return `Option`, so the C's promise to
+//   leave `dst` untouched on failure becomes structural.
 // The general-purpose ordered collection -- supersedes `lib/llist.c` (268).
 //   LANDED, and declared below. It holds no list type: `VecDeque<T>` is the
 //   successor, per AAP 0.6.9, and the module holds the three helpers that
@@ -386,6 +394,13 @@
 //   of the 22 to exist because `curl_getdate` is an exported symbol and
 //   `curl-rs-ffi` cannot be written without it.
 // Byte-range parsing -- supersedes `lib/curl_range.c` (91).
+//   LANDED, and declared below rather than only listed here. It backs no
+//   exported symbol, and it exists at this point because it is the first of
+//   the two children the layering rule above bites on: its C original writes
+//   into `struct Curl_easy`, so it becomes a pure parse function whose answer
+//   the caller stores. Its two consumers are `crate::protocols::file` and
+//   `crate::protocols::ftp`, and HTTP is deliberately not among them -- that
+//   path forwards the range string in a `Range:` header instead.
 // The `curl_slist` chain -- supersedes `lib/slist.c` (139). Backs the exported
 // `curl_slist_append` and `curl_slist_free_all`.
 //   LANDED, and declared below rather than only listed here, for the same
@@ -394,6 +409,11 @@
 //   it -- the C-shaped struct stays at the ABI boundary and this module holds
 //   an owned, ordered sequence instead.
 // The splay tree behind expiry timers -- supersedes `lib/splay.c` (291).
+//   LANDED, and declared below. It backs no exported symbol, so it carries no
+//   `pub` item, and it is the second child in this directory whose NAME no
+//   longer describes its contents: like `llist`, it holds an owned collection
+//   rather than the pointer structure it supersedes. The path is the one the
+//   transformation map gives it, and the type inside says what it is.
 // Case-insensitive comparison -- supersedes `lib/strcase.c` (146) and
 // `lib/strequal.c` (95). Backs `curl_strequal` and `curl_strnequal`.
 //   LANDED, and declared below, for the same reason as `parsedate`: both
@@ -619,6 +639,30 @@ pub(crate) mod get_line;
 /// have yet to land -- `conn/pool.rs` inherits it, `dns/` does not.
 pub(crate) mod hash;
 
+/// Address presentation and parsing -- supersedes `lib/curlx/inet_ntop.c`
+/// and `lib/curlx/inet_pton.c`.
+///
+/// **The one child of this directory that is not curl-licensed.** Both C
+/// originals are Internet Software Consortium code from BIND and declare an
+/// SPDX licence identifier naming `ISC`; the file carries that notice, both
+/// of the two copyright lines, and the BIND 4.9.4 provenance note. The
+/// exception is recorded at the head of this file for exactly this reason,
+/// and applying the neighbours' banner to it would be a licence violation.
+///
+/// `pub(crate)` with no `pub` item: neither `curlx_inet_ntop` nor
+/// `curlx_inet_pton` appears in `lib/libcurl.def`, so nothing in
+/// `curl-rs-ffi` reaches it and the crate root adds no re-export.
+///
+/// The one thing a reader of THIS file should carry away: the strings that
+/// module produces are wire-visible. They reach `Host:` headers, FTP `EPRT`
+/// and `PORT` arguments, SOCKS requests, the Alt-Svc cache file and
+/// `--write-out`, so its rendering is transcribed from the C rather than
+/// delegated to `std::net`, whose answers differ in two measured places --
+/// the deprecated IPv4-compatible form, and a trailing colon on parse. Both
+/// are established by running the two against each other, not by reading
+/// either one's documentation, and both are pinned by a test.
+pub(crate) mod inet;
+
 /// The general-purpose ordered collection -- supersedes `lib/llist.c`.
 ///
 /// `pub(crate)` and, unlike [`parsedate`] and [`strcase`], carrying no `pub`
@@ -650,6 +694,33 @@ pub(crate) mod memrchr;
 /// policy above requires.
 pub(crate) mod parsedate;
 
+/// Byte-range parsing -- supersedes `lib/curl_range.c` and
+/// `lib/curl_range.h`.
+///
+/// Declared here rather than only listed above because the file now exists,
+/// which is the rule stated in the twenty-two-children note: a declaration
+/// arrives WITH its file, in the unit of work that creates it.
+///
+/// `pub(crate)` with no `pub` item, unlike [`parsedate`] and [`strcase`]:
+/// `grep -i range lib/libcurl.def` finds nothing, so no exported symbol is
+/// backed from here and nothing in `curl-rs-ffi` reaches it. `CURLOPT_RANGE`
+/// is set through `curl_easy_setopt`, and the string it stores arrives here
+/// later as a slice.
+///
+/// It is the FIRST of the two places the layering rule at the head of this
+/// file is honoured by parameterization, and the more consequential of them:
+/// the C's `Curl_range(struct Curl_easy *data)` writes its two results into
+/// the handle, and `lib/curl_range.h` includes `urldata.h` to make that
+/// signature expressible. Here it is a pure parse function returning a
+/// `RangeSpec`, because reproducing the C's shape would place `crate::easy`
+/// and `crate::transfer` below the base of the module graph.
+///
+/// Declared unconditionally even though the C guards the whole file on
+/// `#if !defined(CURL_DISABLE_FTP) || !defined(CURL_DISABLE_FILE)`, for the
+/// reason recorded on [`get_line`]: the disjunction is always true here,
+/// because the `file` scheme has no feature to switch it off.
+pub(crate) mod range;
+
 /// The `curl_slist` string list -- supersedes `lib/slist.c` and
 /// `lib/slist.h`.
 ///
@@ -661,6 +732,28 @@ pub(crate) mod parsedate;
 /// `curl-rs-ffi/src/ffi/slist.rs`, and this child exposes an owned, ordered
 /// sequence with no node type and no successor pointer.
 pub(crate) mod slist;
+
+/// The expiry timer tree -- supersedes `lib/splay.c` and `lib/splay.h`.
+///
+/// `pub(crate)` with no `pub` item inside it, unlike [`parsedate`],
+/// [`strcase`] and [`slist`]: `grep -i splay lib/libcurl.def` finds nothing,
+/// so no exported symbol is backed from here and nothing in `curl-rs-ffi`
+/// reaches it. Its only consumer is `crate::multi`, mirroring the C tree,
+/// where `grep -rln 'Curl_splay' lib/` returns exactly `splay.c`, `splay.h`
+/// and `multi.c`.
+///
+/// It declares no tree type and contains no rotation. A `BTreeMap` keyed by
+/// the instant paired with an arrival number is the successor, and that
+/// substitution is a SAFETY decision rather than a performance one:
+/// `Curl_splay` rewires four pointer fields through a stack-allocated
+/// sentinel node, which has no safe hand-written expression. The file records
+/// the measurement, including the one property that had to be preserved
+/// exactly -- two timers registered for the same instant fire in insertion
+/// order, and that order reaches `--trace` output.
+///
+/// The `tests/unit/unit1309.c` coverage relocates into the file as a
+/// `#[cfg(test)]` module, per the policy recorded above.
+pub(crate) mod splay;
 
 /// Locale-independent ASCII case comparison -- supersedes the public half of
 /// `lib/strcase.c` and all of `lib/strequal.c`.

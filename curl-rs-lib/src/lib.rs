@@ -595,11 +595,16 @@ pub mod version;
 /// where the identifier block sits relative to the two-character kind
 /// prefix -- which differs between a stream sink and a user callback.
 ///
-/// `pub(crate)`, verified against the module itself: every item it declares
-/// is already `pub(crate)`, so widening this declaration would export
-/// nothing and would only weaken the boundary. The command-line tool reaches
-/// trace output through `CURLOPT_DEBUGFUNCTION` and the option surface, not
-/// by naming this module.
+/// `pub(crate)`, and the declaration stays that way even though one item
+/// inside it is now `pub`. [`TraceConfig`] is re-exported by name at the crate
+/// root, because `curl_global_trace` is one of the 100 exported symbols and its
+/// entire C body is `Curl_trc_opt(config)`; the re-export site records why the
+/// grammar may have only one owner. Everything the levels are *interpreted*
+/// with -- `Tracer`, `TraceSink`, `TraceFeature`, `TraceFilter`, `TraceLevel`,
+/// `TraceCategory` and the record layouts -- remains crate-private, so widening
+/// this declaration would export a great deal that is not an exported symbol.
+/// The command-line tool reaches trace output through `CURLOPT_DEBUGFUNCTION`
+/// and the option surface, not by naming this module.
 pub(crate) mod trace;
 
 /// The portability and utility layer.
@@ -741,6 +746,38 @@ pub(crate) mod tls;
 /// lands.
 pub mod multi;
 
+/// Connection establishment, the filter chain and socket readiness.
+///
+/// Supersedes `lib/connect.c`, `lib/cfilters.c`, `lib/cf-socket.c`,
+/// `lib/cf-ip-happy.c`, `lib/conncache.c`, `lib/cshutdn.c`, `lib/select.c`
+/// and `lib/curlx/wait.c`. `struct Curl_cftype`'s 14-member vtable with its
+/// untyped `void *ctx` (`lib/cfilters.h:210-226`) becomes a
+/// `Box<dyn ConnFilter>` chain with a TYPED context field, which removes the
+/// cast at every filter boundary and with it the largest single category of
+/// unsound pattern in the C tree. Because HTTP/3 is already a filter in the C
+/// design, QUIC, TLS, SOCKS, HAProxy and raw sockets all compose through that
+/// one trait instead of three parallel abstractions.
+///
+/// Together with the transfer layer this is the crate's ASYNCHRONOUS half,
+/// and it is where `tokio` enters: `poll` and `select` become the reactor,
+/// and `lib/hostip.c`'s `alarm()` with `sigsetjmp`/`siglongjmp` -- a
+/// non-local jump out of a signal handler across allocation boundaries, the
+/// most hazardous construct in the C tree -- becomes
+/// `tokio::time::timeout`. The utility layer deliberately keeps the runtime
+/// out for exactly this reason: `crate::util::bufq` and
+/// `crate::util::timeval` say so in their own documentation.
+///
+/// `pub(crate)`: no exported symbol is backed from here directly. Connection
+/// state reaches C through [`multi`] and [`easy`], which is what keeps it out
+/// of the ABI's reach.
+/// **Partially delivered.** Of this module's planned children, only `select`
+/// exists yet -- the foundation the other six consume, since `lib/select.c`
+/// and `lib/select.h` name the filter chain nowhere while
+/// `lib/cfilters.c:33` and `lib/cf-socket.c:64` both include `select.h`. The
+/// filter chain, the socket filter, Happy Eyeballs, the connection pool and
+/// the shutdown sequencer arrive with their files.
+pub(crate) mod conn;
+
 /// The easy interface: one handle, one transfer.
 ///
 /// Supersedes `lib/easy.c`, `lib/setopt.c` (308 options), `lib/getinfo.c`
@@ -773,26 +810,174 @@ pub mod multi;
 /// declares exactly that one.
 pub mod easy;
 
-// THE TEN REMAINING SUBSYSTEMS -- SPECIFIED TARGET DESIGN, NOT DECLARED
+/// Header storage and the header-inspection API.
+///
+/// Supersedes `lib/headers.c` (the public inspection API, the internal push
+/// and cleanup entry points and the client writer that collects response
+/// headers as they arrive) together with `lib/dynhds.c` (the bounded, ordered,
+/// duplicate-permitting field set the HTTP/1, HTTP/2, HTTP/3 and
+/// CONNECT-proxy layers compose requests in).
+///
+/// `pub` because it backs four of the 100 exported symbols: the
+/// `curl_easy_header` and `curl_easy_nextheader` pair, and
+/// `curl_pushheader_byname` with `curl_pushheader_bynum`. The `curl_header`
+/// struct those fill is layout-visible to callers, so its field order and
+/// types are frozen; this module supplies the borrowed projection that fills
+/// it, and `curl-rs-ffi` owns the `#[repr(C)]` mirror.
+///
+/// Storage is an ordered `Vec` of byte strings that preserves arrival order
+/// and the case each name arrived in. That is not a stylistic choice: 1,476
+/// of the 1,914 fixtures compare full request bytes as a single joined
+/// string, so a map, a sorted container or `http::HeaderMap` would each
+/// change an observable result.
+pub mod headers;
+
+/// Persisted client state: the cookie jar, `.netrc`, HSTS and Alt-Svc.
+///
+/// Supersedes `lib/cookie.c`, `lib/psl.c`, `lib/netrc.c`, `lib/hsts.c` and
+/// `lib/altsvc.c`. What these five share, and the reason they share a
+/// module, is that every one of them reads and writes a file on the user's
+/// disk whose format is frozen: a jar written by curl 8.19.0-DEV must be
+/// readable here and vice versa, and the HSTS cache, the Alt-Svc cache and
+/// `.netrc` carry the same obligation. No general-purpose cookie crate
+/// commits to the Netscape on-disk shape, so the jar is implemented
+/// natively and `publicsuffix` supplies only the domain-matching rules that
+/// libpsl previously supplied.
+///
+/// `pub(crate)`: no exported symbol resolves a name here. The cookie
+/// engine, the two caches and `.netrc` are all reached through an easy
+/// handle's option surface.
+///
+/// The jar, the HSTS cache and the Alt-Svc cache are gated by the
+/// capability names `cookies`, `hsts` and `altsvc` when they land.
+/// **`.netrc` is NOT gated and must never become so**: the C's
+/// `CURL_DISABLE_NETRC` has no counterpart in the fifteen-name vocabulary,
+/// and credential lookup serves every protocol rather than only HTTP, so
+/// attaching it to the cookie engine would silently disable `--netrc` for
+/// FTP and SFTP.
+/// **Partially delivered.** Of this module's planned children, only `netrc`
+/// exists yet; the cookie jar, the public-suffix rules, the HSTS cache and
+/// the Alt-Svc cache arrive with their files. `cookies/mod.rs` is the module
+/// root and declares exactly that one.
+pub(crate) mod cookies;
+
+/// Authentication mechanism selection, vocabulary and shared plumbing.
+///
+/// Supersedes `lib/vauth/vauth.c` with `lib/vauth/vauth.h` as its declaration
+/// contract, the mechanism-arbitration logic of `lib/http.c`, and the
+/// HTTP-relevant slice of `lib/curl_sasl.c`. When its children land it also
+/// supersedes `lib/vauth/cleartext.c` (Basic), `lib/vauth/digest.c` with
+/// `lib/http_digest.c`, `lib/vauth/oauth2.c` (Bearer), `lib/vauth/ntlm.c` with
+/// `lib/curl_ntlm_core.c` and `lib/http_ntlm.c` (NTLM, in pure Rust),
+/// `lib/http_aws_sigv4.c`, and -- behind the default-off `negotiate` feature --
+/// `lib/vauth/krb5_gssapi.c`, `lib/vauth/spnego_gssapi.c`,
+/// `lib/http_negotiate.c` and `lib/curl_gssapi.c`.
+///
+/// `lib/curl_sasl.c` sits astride the scope boundary: it serves SMTP, IMAP and
+/// POP3, which are stubbed, as well as HTTP authentication, which is
+/// implemented. The mechanism is therefore SPLIT rather than migrated or
+/// dropped wholesale -- the mechanism-name vocabulary, its prefix matcher and
+/// the `CURLAUTH_*` to `SASL_MECH_*` translation are ported, and the SASL
+/// command state machine is not. The module root says so in as many words, so
+/// that a later reader does not "finish" it.
+///
+/// Message construction is byte-exact: a Digest or NTLM message is compared
+/// against a literal expectation in the fixture corpus, and 168 fixtures carry
+/// an `Authorization: ` line inside a byte-exact comparison block, so the
+/// bytes are the specification rather than an implementation detail.
+///
+/// `pub(crate)`: no exported symbol is an authentication mechanism. The
+/// application selects one through `CURLOPT_HTTPAUTH` and `CURLOPT_PROXYAUTH`
+/// and observes the outcome through `CURLINFO_HTTPAUTH_AVAIL` and
+/// `CURLINFO_HTTPAUTH_USED`, all of which are option and info surface.
+/// **Partially delivered.** `auth/mod.rs` is the module root -- the
+/// `CURLAUTH_*` vocabulary, the three mechanism-ordering tables,
+/// arbitration, the `lib/vauth/vauth.c` plumbing, the SASL vocabulary slice
+/// and the mechanism trait -- and it declares no children yet, because none of
+/// the six exists. Each declaration arrives with its file.
+pub(crate) mod auth;
+
+/// The transfer core: the loop, its buffers and its accounting.
+///
+/// Supersedes `lib/transfer.c` (the transfer loop, which becomes async),
+/// `lib/request.c` (per-request state), `lib/sendf.c` (manual buffers become
+/// `BytesMut`), `lib/cw-out.c` with `lib/cw-pause.c` (the client-writer chain
+/// and pause handling), `lib/progress.c` (accounting, with the output format
+/// frozen), `lib/ratelimit.c` (`--limit-rate` pacing),
+/// `lib/content_encoding.c` (zlib, brotli and zstd calls become `flate2`,
+/// `brotli` and `zstd`) and `lib/http_chunks.c` (chunked framing, byte-exact
+/// in both directions).
+///
+/// One of the two modules the line-coverage gate measures, which is why the
+/// clock and the resolver reach it by injection rather than being read for
+/// globally. Everything here is time-driven -- pacing, progress, pause
+/// expiry -- so a module that read the host clock itself could not be tested
+/// deterministically and the gate would be unreachable.
+///
+/// `pub(crate)`: a transfer is driven through an easy or a multi handle, and
+/// no exported symbol names a transfer directly.
+/// **Partially delivered.** Of this module's planned children, only
+/// `ratelimit` exists yet; the transfer loop, per-request state, the send and
+/// client-writer paths, progress accounting, content encoding and chunked
+/// framing arrive with their files. `transfer/mod.rs` is the module root and
+/// declares exactly that one. The order is dependency order: `ratelimit` is a
+/// self-contained arithmetic primitive that progress accounting EMBEDS,
+/// following `lib/urldata.h:788-793`, where `struct pgrs_dir` carries a
+/// `struct Curl_rlimit` as a member.
+pub(crate) mod transfer;
+
+/// The protocol implementations and the scheme registry.
+///
+/// Supersedes `lib/url.c`'s scheme lookup and `lib/cf-https-connect.c`'s ALPN
+/// version negotiation, plus `lib/http.c` with `lib/http1.c`, `lib/http2.c`,
+/// `lib/vquic/*`, `lib/ftp.c` with `lib/pingpong.c`, `lib/ftplistparser.c` and
+/// `lib/fileinfo.c`, `lib/vssh/*`, `lib/file.c` and `lib/ws.c`.
+///
+/// **Declared unconditionally**, and that is load-bearing: the per-protocol
+/// capability names (`http2`, `http3`, `ftp`, `ssh`, `websockets`) belong INSIDE
+/// the module, on its children, not on this declaration, so that the registry
+/// itself always exists. A build with every protocol feature off must still
+/// answer an unsupported scheme with `CURLE_UNSUPPORTED_PROTOCOL` and still
+/// report a truthful `Protocols:` line, rather than fail to compile.
+///
+/// The C tree defines and registers 33 URL schemes. Nine are implemented here;
+/// the other 24 are registered for ABI completeness, return
+/// `CURLE_UNSUPPORTED_PROTOCOL`, and are deliberately withheld from the
+/// `Protocols:` banner so that the 283 fixtures targeting them skip cleanly
+/// instead of running and failing. A note for anyone reading the C: the backing
+/// array is declared `all_schemes[67]` at `lib/url.c:1488` but only 33 entries
+/// are defined and registered -- the array is over-allocated, and 67 must not be
+/// read as a count.
+///
+/// The HTTP/1.1 module owns request-line composition and header emission in
+/// curl's exact order, using `hyper` only for connection management, keep-alive
+/// and framing. Delegating serialization would fail a large fraction of the
+/// 1,476 byte-exact fixtures for reasons unrelated to correctness.
+///
+/// The other module the line-coverage gate measures, alongside [`transfer`].
+///
+/// `pub(crate)`: a scheme is selected by URL, never named by a caller.
+/// **Partially delivered.** Of this directory's planned modules only the FTP
+/// directory-listing parser exists yet; `protocols/mod.rs` is the module root
+/// and `protocols/ftp/mod.rs` is the FTP root, each declaring exactly the one
+/// child that exists. The rest arrive with their files.
+pub(crate) mod protocols;
+
+// THE FOUR REMAINING SUBSYSTEMS -- SPECIFIED TARGET DESIGN, NOT DECLARED
 //
-// The AAP's module graph gives this crate ten further subsystems; the
-// eleventh, `easy`, is declared above now that the first of its children
-// exists. None of the ten has a file yet, and a `mod` line without its file is
-// E0583 -- a
-// hard error that no `#[allow]` can reach, because module resolution never
-// gets far enough to produce a lint. They are therefore DESCRIBED here, in
+// The AAP's module graph gives this crate four further subsystems -- `dns`,
+// `proxy`, `mime` and `share`. The seven beyond them -- `easy`, `conn`,
+// `headers`, `cookies`, `auth`, `transfer` and `protocols` -- are declared
+// above now that the first of each one's children exists. None of the four
+// has a file yet, and a `mod` line without its file is E0583 -- a hard error
+// that no `#[allow]` can reach, because module resolution never gets far
+// enough to produce a lint. They are therefore DESCRIBED here, in
 // the same dependency order the declarations above follow, and each
 // declaration arrives WITH its file in the unit of work that creates it.
 //
 // The visibility recorded for each is part of the specification, not a
 // suggestion: `pub` appears only where `curl-rs-ffi` or `curl-rs`
 // demonstrably needs it to back a named family of the 100 exported symbols.
-//
-// --- headers (pub) -- lib/headers.c, lib/dynhds.c ------------------------
-// Backs the exported `curl_easy_header` and `curl_easy_nextheader` pair
-// together with `curl_pushheader_byname` and `curl_pushheader_bynum`, which
-// is the whole reason it is `pub`. The `curl_header` struct it fills is
-// layout-visible to callers, so its field order and types are frozen.
 //
 // --- dns (pub(crate)) ----------------------------------------------------
 // Supersedes lib/hostip.c, hostip4.c, hostip6.c, curl_addrinfo.c,
@@ -812,22 +997,6 @@ pub mod easy;
 // resolver is injected into the modules that need it rather than reached for
 // globally, which is what makes them testable without a network.
 //
-// --- conn (pub(crate)) ---------------------------------------------------
-// Supersedes lib/connect.c, cfilters.c, cf-socket.c, socketpair.c,
-// curlx/nonblock.c, cf-ip-happy.c, conncache.c, cshutdn.c, select.c and
-// curlx/wait.c.
-//
-// The filter chain is the load-bearing abstraction of the whole crate.
-// `struct Curl_cftype` is a 14-member vtable carrying a `void *ctx` that
-// every filter casts to its own type; replacing that context with a typed
-// field removes an entire class of defect by construction. Because HTTP/3
-// already participates in the same chain in C, QUIC, TLS, SOCKS, HAProxy and
-// raw sockets unify under one trait here instead of requiring three parallel
-// abstractions. Happy-eyeballs racing becomes a `select!` over the candidate
-// addresses, and `poll`/`select` become the runtime's reactor.
-//
-// `pub(crate)`: connections are reached through an easy or multi handle.
-//
 // --- proxy (pub(crate)) --------------------------------------------------
 // Supersedes lib/http_proxy.c, cf-h1-proxy.c and cf-h2-proxy.c (CONNECT
 // tunnelling over HTTP/1 and HTTP/2), lib/socks.c (SOCKS4 and SOCKS5),
@@ -838,78 +1007,12 @@ pub mod easy;
 // Every one of these is a filter in the chain owned by `conn`, which is why
 // proxying needs no special case in the protocol layer.
 //
-// --- auth (pub(crate)) ---------------------------------------------------
-// Supersedes lib/vauth/vauth.c (mechanism selection), cleartext.c (Basic),
-// digest.c with lib/http_digest.c (Digest), oauth2.c (Bearer), ntlm.c with
-// lib/curl_ntlm_core.c and lib/http_ntlm.c (NTLM, in pure Rust),
-// lib/http_aws_sigv4.c (AWS SigV4), and -- behind the default-off
-// `negotiate` feature -- krb5_gssapi.c, spnego_gssapi.c,
-// lib/http_negotiate.c and lib/curl_gssapi.c.
-//
-// lib/curl_sasl.c sits astride the scope boundary: it serves SMTP, IMAP and
-// POP3, which are stubbed, as well as HTTP authentication, which is
-// implemented. The mechanism is therefore split rather than migrated or
-// dropped wholesale, and only the HTTP portion lives here.
-//
-// Message construction is byte-exact. A Digest or NTLM message is compared
-// against a literal expectation in the fixture corpus, so the bytes are the
-// specification.
-//
-// --- cookies (pub(crate)) ------------------------------------------------
-// Supersedes lib/cookie.c, psl.c, netrc.c, hsts.c and altsvc.c, gated by
-// `cookies`, `hsts` and `altsvc` respectively.
-//
-// The Netscape cookie-jar file format must remain byte-compatible in both
-// directions -- a jar written by curl 8.19.0-DEV must be readable here and
-// vice versa -- and no general-purpose cookie crate commits to that on-disk
-// format, so the jar is implemented natively. `publicsuffix` supplies only
-// the domain-matching rules that libpsl previously supplied. The HSTS and
-// Alt-Svc caches carry the same obligation for their own file formats.
 //
 // --- mime (pub) -- lib/mime.c, lib/formdata.c ----------------------------
 // `pub` because it backs 15 exported symbols: the 12 `curl_mime_*` functions
 // and the three legacy `curl_formadd`, `curl_formfree` and `curl_formget`
 // entry points, which are deprecated in the documentation yet still exported
 // and therefore still part of the parity set.
-//
-// --- transfer (pub(crate)) -----------------------------------------------
-// Supersedes lib/transfer.c (the transfer loop, which becomes async),
-// request.c (per-request state), sendf.c (manual buffers become `BytesMut`),
-// cw-out.c with cw-pause.c (the client-writer chain and pause handling),
-// progress.c (accounting, with the output format frozen), ratelimit.c
-// (`--limit-rate` pacing), content_encoding.c (zlib, brotli and zstd calls
-// become `flate2`, `brotli` and `zstd`) and http_chunks.c (chunked framing,
-// byte-exact in both directions).
-//
-// One of the two modules the line-coverage gate measures, which is why the
-// clock and the resolver reach it by injection.
-//
-// --- protocols (pub(crate)) ----------------------------------------------
-// Supersedes lib/url.c's scheme lookup and lib/cf-https-connect.c's ALPN
-// version negotiation, plus lib/http.c with http1.c, http2.c, vquic/*,
-// ftp.c with pingpong.c, ftplistparser.c and fileinfo.c, vssh/*, file.c and
-// ws.c.
-//
-// Declared unconditionally when it lands; the per-protocol feature gates
-// (`http2`, `http3`, `ftp`, `ssh`, `websockets`) belong inside the module,
-// not on the declaration, so that the registry itself always exists.
-//
-// The C tree defines and registers 33 URL schemes. Nine are implemented
-// here; the other 24 are registered for ABI completeness and return
-// `CURLE_UNSUPPORTED_PROTOCOL`, and they are deliberately withheld from the
-// `Protocols:` banner so that the 283 fixtures targeting them skip cleanly
-// instead of running and failing. A note for anyone reading the C: the
-// backing array is declared `all_schemes[67]` at lib/url.c:1488 but only 33
-// entries are defined and registered -- the array is over-allocated, and 67
-// must not be read as a count.
-//
-// The HTTP/1.1 module owns request-line composition and header emission in
-// curl's exact order, using `hyper` only for connection management,
-// keep-alive and framing. Delegating serialization would fail a large
-// fraction of the 1,476 byte-exact fixtures for reasons unrelated to
-// correctness.
-//
-// The other module the line-coverage gate measures.
 //
 // --- share (pub) -- lib/curl_share.c -------------------------------------
 // Cookie, DNS, TLS-session, HSTS and connection state can be shared across
@@ -941,15 +1044,6 @@ pub mod easy;
 // the consumer that justifies it, so that widening one later is a decision
 // made against a recorded reason rather than a guess.
 
-// The header API.
-//
-// Supersedes `lib/headers.c` and `lib/dynhds.c`, and backs the exported
-// `curl_easy_header` and `curl_easy_nextheader` pair together with
-// `curl_pushheader_byname` and `curl_pushheader_bynum`.
-//
-// `pub` for exactly that reason. The `curl_header` struct it fills is
-// layout-visible to callers, so its field order and types are frozen.
-//
 // Name resolution.
 //
 // Supersedes `lib/hostip.c`, `lib/hostip4.c`, `lib/hostip6.c`,
@@ -969,24 +1063,6 @@ pub mod easy;
 // is injected into the modules that need it rather than reached for
 // globally, which is what makes them testable without a network.
 //
-// Connection establishment, the filter chain and the connection pool.
-//
-// Supersedes `lib/connect.c`, `lib/cfilters.c`, `lib/cf-socket.c`,
-// `lib/socketpair.c`, `lib/curlx/nonblock.c`, `lib/cf-ip-happy.c`,
-// `lib/conncache.c`, `lib/cshutdn.c`, `lib/select.c` and
-// `lib/curlx/wait.c`.
-//
-// The filter chain is the load-bearing abstraction of the whole crate.
-// `struct Curl_cftype` is a 14-member vtable carrying a `void *ctx` that
-// every filter casts to its own type; replacing that context with a typed
-// field removes an entire class of defect by construction. Because HTTP/3
-// already participates in the same chain in C, QUIC, TLS, SOCKS, HAProxy
-// and raw sockets unify under one trait here instead of requiring three
-// parallel abstractions. Happy-eyeballs racing becomes a `select!` over the
-// candidate addresses, and `poll`/`select` become the runtime's reactor.
-//
-// `pub(crate)`: connections are reached through an easy or multi handle.
-//
 // Proxy support.
 //
 // Supersedes `lib/http_proxy.c`, `lib/cf-h1-proxy.c`, `lib/cf-h2-proxy.c`
@@ -1002,41 +1078,6 @@ pub mod easy;
 // `pub(crate)`: proxies are configured through options, never named
 // directly by a caller.
 //
-// Authentication.
-//
-// Supersedes `lib/vauth/vauth.c` (mechanism selection), `cleartext.c`
-// (Basic), `digest.c` with `lib/http_digest.c` (Digest), `oauth2.c`
-// (Bearer), `ntlm.c` with `lib/curl_ntlm_core.c` and `lib/http_ntlm.c`
-// (NTLM, in pure Rust), `lib/http_aws_sigv4.c` (AWS SigV4), and -- behind
-// the default-off `negotiate` feature -- `krb5_gssapi.c`,
-// `spnego_gssapi.c`, `lib/http_negotiate.c` and `lib/curl_gssapi.c`.
-//
-// `lib/curl_sasl.c` sits astride the scope boundary: it serves SMTP, IMAP
-// and POP3, which are stubbed, as well as HTTP authentication, which is
-// implemented. The mechanism is therefore split rather than migrated or
-// dropped wholesale, and only the HTTP portion lives here.
-//
-// Message construction is byte-exact. A Digest or NTLM message is compared
-// against a literal expectation in the fixture corpus, so the bytes are the
-// specification.
-//
-// `pub(crate)`: credentials arrive through options.
-//
-// Cookies and the three persistent on-disk caches.
-//
-// Supersedes `lib/cookie.c`, `lib/psl.c`, `lib/netrc.c`, `lib/hsts.c` and
-// `lib/altsvc.c`, gated by `cookies`, `hsts` and `altsvc` respectively.
-//
-// The Netscape cookie-jar file format must remain byte-compatible in both
-// directions -- a jar written by curl 8.19.0-DEV must be readable here and
-// vice versa -- and no general-purpose cookie crate commits to that on-disk
-// format, so the jar is implemented natively. `publicsuffix` supplies only
-// the domain-matching rules that libpsl previously supplied. The HSTS and
-// Alt-Svc caches carry the same obligation for their own file formats.
-//
-// `pub(crate)`: the cookie engine is driven through options and through the
-// share interface.
-//
 // MIME and the legacy form API.
 //
 // Supersedes `lib/mime.c` and `lib/formdata.c`.
@@ -1045,53 +1086,6 @@ pub mod easy;
 // functions and the three legacy `curl_formadd`, `curl_formfree` and
 // `curl_formget` entry points, which are deprecated in the documentation
 // yet still exported and therefore still part of the parity set.
-//
-// The transfer core.
-//
-// Supersedes `lib/transfer.c` (the transfer loop, which becomes async),
-// `lib/request.c` (per-request state), `lib/sendf.c` (manual buffers become
-// `BytesMut`), `lib/cw-out.c` with `lib/cw-pause.c` (the client-writer
-// chain and pause handling), `lib/progress.c` (accounting, with the output
-// format frozen), `lib/ratelimit.c` (`--limit-rate` pacing),
-// `lib/content_encoding.c` (zlib, brotli and zstd calls become `flate2`,
-// `brotli` and `zstd`) and `lib/http_chunks.c` (chunked framing, byte-exact
-// in both directions).
-//
-// One of the two modules the line-coverage gate measures, which is why the
-// clock and the resolver reach it by injection.
-//
-// `pub(crate)`: a transfer is driven through an easy or multi handle.
-//
-// The protocol implementations and the scheme registry.
-//
-// Supersedes `lib/url.c`'s scheme lookup and `lib/cf-https-connect.c`'s
-// ALPN version negotiation, plus `lib/http.c` with `lib/http1.c`,
-// `lib/http2.c`, `lib/vquic/*`, `lib/ftp.c` with `lib/pingpong.c`,
-// `lib/ftplistparser.c` and `lib/fileinfo.c`, `lib/vssh/*`, `lib/file.c`
-// and `lib/ws.c`.
-//
-// Declared unconditionally; the per-protocol feature gates
-// (`http2`, `http3`, `ftp`, `ssh`, `websockets`) belong inside the module,
-// not on this declaration, so that the registry itself always exists.
-//
-// The C tree defines and registers 33 URL schemes. Nine are implemented
-// here; the other 24 are registered for ABI completeness and return
-// `CURLE_UNSUPPORTED_PROTOCOL`, and they are deliberately withheld from the
-// `Protocols:` banner so that the 283 fixtures targeting them skip cleanly
-// instead of running and failing. A note for anyone reading the C: the
-// backing array is declared `all_schemes[67]` at `lib/url.c:1488` but only
-// 33 entries are defined and registered -- the array is over-allocated, and
-// 67 must not be read as a count.
-//
-// The HTTP/1.1 module owns request-line composition and header emission in
-// curl's exact order, using `hyper` only for connection management,
-// keep-alive and framing. Delegating serialization would fail a large
-// fraction of the 1,476 byte-exact fixtures for reasons unrelated to
-// correctness.
-//
-// The other module the line-coverage gate measures.
-//
-// `pub(crate)`: a scheme is selected by URL, never named by a caller.
 //
 // The share interface: state deliberately shared between easy handles.
 //
@@ -1254,6 +1248,41 @@ pub use crate::util::parsedate::getdate;
 // Deliberately TWO names, not the module: `casecompare` and `ncasecompare` are
 // internal comparators and no other crate has any business calling them.
 pub use crate::util::strcase::{strequal, strnequal};
+
+// The trace configuration. Re-exported by the same idiom and for the same
+// reason as `getdate` and the two comparators above: `curl_global_trace` is one
+// of the 100 symbols `lib/libcurl.def` exports (`:34`), its whole body in C is
+// `Curl_trc_opt(config)` (`lib/easy.c:292-308`), and `curl-rs-ffi` has no other
+// way in because `trace` is crate-private by enforcement.
+//
+// WITHOUT this line the facade would have to reimplement `trc_opt()`'s grammar
+// -- the 32-byte token cap, the two sign prefixes, the four category keywords,
+// the `doh` alias and the by-name fallback over both component registries --
+// giving one wire-visible grammar two owners in one workspace, which is exactly
+// the drift the single-source-of-truth discipline exists to prevent. WITH it,
+// the facade converts a `*const c_char` into `Option<&[u8]>`, calls
+// `apply_code`, and returns the `CURLcode`. Every parsing decision stays here,
+// where [`TraceConfig::apply`] already documents and tests it against the frozen
+// library.
+//
+// WHY THE PROCESS-WIDE INSTANCE IS NOT HERE. C keeps the levels in file-scope
+// statics that `trc_opt()` writes through (`lib/curl_trc.c:578`, `:584`,
+// `:596`, `:600`). This crate deliberately holds them in an owned value
+// instead, because the protocol and transfer modules are tested by injection
+// and a process-global level would make those tests order-dependent. So the
+// single instance lives in the ABI facade -- `curl-rs-ffi/src/ffi/global.rs`,
+// which already owns the `curl_global_init` reference count and the five
+// allocator hooks -- and is lent to each transfer. A C consumer has no
+// command-line tool to hold one on its behalf, so somebody must, and the
+// facade is the only layer that may.
+//
+// Deliberately ONE name, not the module. `pub use crate::trace;` would expose
+// `Tracer`, `TraceSink`, `TraceFeature`, `TraceFilter`, `TraceLevel` and the
+// `--trace` record layouts, none of which is an exported symbol; widening it
+// would misrepresent the ABI surface as larger than the 100 names. The four
+// interpreting types stay `pub(crate)`, so the facade can construct, configure
+// and lend a configuration but can neither read nor forge a level.
+pub use crate::trace::TraceConfig;
 
 // THE EXTENDED-ATTRIBUTE PRIMITIVE IS NOT RE-EXPORTED HERE, and the absence is
 // deliberate rather than an omission.

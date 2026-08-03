@@ -351,10 +351,11 @@ pub(crate) const BLOCK_LEN: usize = 128;
 /// spelling, which is upper camel case throughout, and the lint is left alone:
 /// no allowance is written for it here, and certainly none at module scope.
 ///
-/// The name is contractual, not a local preference. `crypto/hmac.rs:52` imports
-/// it as `use super::sha512_256::Sha512Trunc256;` and `:176` keys through it,
-/// and both keyed siblings publish the same shape, so `crypto/hmac.rs` imports
-/// one marker per algorithm rather than one crate per algorithm.
+/// The name is contractual, not a local preference.
+/// `crypto/hmac.rs:223` imports it as
+/// `use super::sha512_256::Sha512Trunc256;` and `:471` keys through it, and
+/// all three keyed siblings publish the same shape, so `crypto/hmac.rs`
+/// imports one marker per algorithm rather than one crate per algorithm.
 ///
 /// It also stands in for the coherence the whole directory depends on.
 /// `Hmac<D>` bounds `D` on the `digest 0.10` core traits, so an
@@ -983,7 +984,7 @@ mod tests {
     /// The alias must be reachable under the path a sibling module spells, not
     /// only under the `super::` path this test module happens to use.
     ///
-    /// `crypto/hmac.rs:52` reaches it as `super::sha512_256::Sha512Trunc256`,
+    /// `crypto/hmac.rs:223` reaches it as `super::sha512_256::Sha512Trunc256`,
     /// which resolves to the fully qualified path below. Naming it the same way
     /// here makes the visibility a compile-time obligation of this file rather
     /// than something a reader has to take on trust: drop the `pub(crate)` from
