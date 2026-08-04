@@ -243,41 +243,91 @@
 // somebody adds -- and because the crate's own policy test in `lib.rs`
 // (`mod source_policy`) fails the build if it is.
 
-// THE SIX SIBLING MODULES ARE NOT DECLARED HERE YET, AND THAT IS DELIBERATE.
+// EACH SIBLING MODULE IS DECLARED WITH THE FILE IT NAMES, AND NOT BEFORE.
 //
 // The target design places `basic`, `bearer`, `digest`, `ntlm`, `aws_sigv4`
 // and -- behind the default-off `negotiate` feature -- `negotiate` beside this
-// file. None of the six exists on disk at this checkpoint, and a `mod` item
-// naming an absent file is `error[E0583]: file not found for module`, which
-// would take the whole crate down rather than leave one capability missing.
+// file. All six exist on disk and all six are declared below. The convention
+// that got them here still governs the next module root: a `mod` item naming
+// an absent file is `error[E0583]: file not found for module`, which would
+// take the whole crate down rather than leave one capability missing, so no
+// declaration is written ahead of the file it names.
 //
 // So the convention this crate already applies elsewhere applies here: a
 // module root declares exactly the children present on disk, and each child's
 // declaration lands with the child. `curl-rs-lib/src/tls/mod.rs` declares
 // `cipher_suite` and `keylog` and not the three planned modules absent beside
-// them; `curl-rs-lib/src/url/mod.rs` says so in as many words. The
-// declarations to add, verbatim, when the files arrive:
+// them; `curl-rs-lib/src/url/mod.rs` says so in as many words. Nothing is
+// outstanding here: the six declarations below are the complete set the target
+// design asks for.
 //
-//     pub(crate) mod aws_sigv4;
-//     pub(crate) mod basic;
-//     pub(crate) mod bearer;
-//     pub(crate) mod digest;
-//     #[cfg(feature = "negotiate")]
-//     pub(crate) mod negotiate;
-//     pub(crate) mod ntlm;
+// `negotiate` is the only gated one, and its declaration carries the
+// `#[cfg(feature = "negotiate")]` that keeps the default build free of any C
+// security library. `bearer` is not gated, because there is no `bearer` name
+// in this workspace's fifteen-name feature vocabulary and
+// `CURL_DISABLE_BEARER_AUTH` is therefore not translated into a cfg. Every
+// item below is complete and exercised by the tests at the foot of the file.
 //
-// `negotiate` is the only gated one. Nothing else in this file is contingent
-// on their arrival: every item below is complete, exercised by the tests at
-// the foot of the file, and reachable by a sibling the moment it is declared.
+// The capability banner deliberately does NOT move because these files exist.
+// `crate::version`'s `ENGINE_AUTH`, `ENGINE_AUTH_BASIC`, `ENGINE_AUTH_BEARER`,
+// `ENGINE_AUTH_DIGEST`, `ENGINE_AUTH_AWS_SIGV4` and `ENGINE_GSS` all still
+// report absent, so `NTLM`, `GSS-API`, `Kerberos` and `SPNEGO` stay withheld
+// from `Features:`. That is under-reporting, which is the safe direction: a
+// withheld capability makes a fixture skip, while a claimed one makes it run
+// and fail.
 //
-// The capability banner already reflects the same absence and needs no edit
-// when they land beyond flipping its own markers: `crate::version`'s
-// `ENGINE_AUTH`, `ENGINE_AUTH_BASIC`, `ENGINE_AUTH_BEARER` and `ENGINE_GSS`
-// name `auth/ntlm.rs`, `auth/basic.rs`, `auth/bearer.rs` and
-// `auth/negotiate.rs` respectively and all four report absent, so `NTLM`,
-// `GSS-API`, `Kerberos` and `SPNEGO` are withheld from `Features:`. That is
-// under-reporting, which is the safe direction: a withheld capability makes a
-// fixture skip, while a claimed one makes it run and fail.
+// The asymmetry is the reason, not an oversight. A capability marker answers
+// "can this build do the thing", and composing a header is not doing the
+// thing: `crate::protocols::http1` is what puts one into a request, and it has
+// not landed. `ENGINE_AUTH_DISPATCH` names this very file and stayed absent
+// for the same reason when it landed. Claiming `basic-auth`, `NTLM` or the
+// Negotiate family early would make fixtures run that cannot pass; withholding
+// them makes those fixtures skip. The markers move with the driver that
+// executes the mechanism, not with the mechanism.
+
+/// HTTP Basic authentication: supersedes `http_output_basic()`
+/// (`lib/http.c:243-297`).
+///
+/// Joins the username and the password with a colon, base64 encodes the bytes
+/// verbatim, and composes the single `Authorization:` or
+/// `Proxy-Authorization:` line. The two halves of Basic that are *not* there
+/// stay here: [`select_emitter`] holds the guard deciding whether to emit at
+/// all, and `scan_bit_only` holds the challenge handling, because both are
+/// shared with the mechanisms beside it.
+pub(crate) mod basic;
+
+pub(crate) mod bearer;
+
+/// HTTP Digest -- `lib/vauth/digest.c`, `lib/vauth/digest.h` and
+/// `lib/http_digest.c`.
+///
+/// Implements [`HttpAuthMechanism`] and [`ChallengeDecoder`], consumes
+/// [`AuthContext`], [`Credentials`],
+/// [`AuthEmission`] and [`authorization_header`] from this file, and is the
+/// one scheme [`state_scope`] answers [`StateScope::Transfer`] for.
+pub(crate) mod digest;
+
+/// NTLM, `lib/vauth/ntlm.c` with `lib/curl_ntlm_core.c` and
+/// `lib/http_ntlm.c`.
+///
+/// Declared here, unconditionally, per the convention recorded above: a
+/// module root declares exactly the children present on disk, and each
+/// child's declaration arrives with the child.
+///
+/// NTLM is unconditional because its cryptography is: `des`, `md4`, `md-5`
+/// and `hmac` are unqualified dependencies of this crate, so `USE_NTLM` --
+/// which in C required an SSL library for DES and MD4 -- has no successor
+/// and [`is_ntlm_supported`] is a `const fn` returning `true`. Only
+/// `negotiate` is feature-gated.
+pub(crate) mod ntlm;
+
+// AWS SigV4 has landed, so its declaration lands with it -- see the note
+// above, which asks for exactly this line and nothing else. `aws_sigv4.rs`
+// supersedes `lib/http_aws_sigv4.c` and is reached from the `AWS_SIGV4` arm of
+// `select_emitter`; it implements no `HttpAuthMechanism`, because AWS SigV4
+// answers no challenge and its signature covers a request description this
+// file's `AuthContext` does not carry.
+pub(crate) mod aws_sigv4;
 
 use core::fmt;
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
@@ -286,6 +336,16 @@ use crate::error::CURLcode;
 use crate::trace::{infof, Tracer};
 use crate::util::strcase::{casecompare, checkprefix};
 use crate::util::strparse::{is_alnum, str_passblanks};
+
+/// SPNEGO (Negotiate) over GSS-API -- `lib/vauth/spnego_gssapi.c`,
+/// `lib/http_negotiate.c` and the HTTP half of `lib/curl_gssapi.c`.
+///
+/// The only gated child of this module. AAP 0.8.5 conflict C2 makes
+/// `negotiate` non-default so that the default build links no C security
+/// library at all, and the binding it reaches is confined to
+/// `crate::ffi::gss`.
+#[cfg(feature = "negotiate")]
+pub(crate) mod negotiate;
 
 // ---------------------------------------------------------------------------
 // The `CURLAUTH_*` bit vocabulary. Public ABI, integer-exact.

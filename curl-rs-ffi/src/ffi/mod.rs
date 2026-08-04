@@ -50,24 +50,39 @@
 //! distinction between it and what exists today is load-bearing rather than
 //! pedantic, so both are stated:
 //!
-//! * MEASURED TODAY: 24 of the 100 are defined, 76 are not, and 0 extra symbols
-//!   are exported (`nm -D --defined-only` over the built cdylib, and
-//!   `build.rs`'s `undefined_abi_exports` computed from the same
-//!   `lib/libcurl.def`, agree exactly). The declarations below are therefore
-//!   SIX symbol-family modules, not twelve: `easy`, `escape`, `global`, `misc`,
-//!   `slist` and `strerror`. `escape` does not appear in the twelve-name list
-//!   above because it is not a family of its own -- it holds `curl_escape`,
-//!   `curl_unescape`, `curl_easy_escape` and `curl_easy_unescape`, which the
-//!   target partition assigns to `misc` and `easy`.
-//! * The 76 that are absent are the remainder of `curl_easy_*` (15), all of
+//! * MEASURED, at the commit that completed `misc`: 39 of the 100 are defined,
+//!   61 are not, and 0 extra symbols are exported. Two independent measurements
+//!   agree on the export set -- `nm -D --defined-only` over the built cdylib,
+//!   and `build.rs`'s `undefined_abi_exports` computed from `lib/libcurl.def` --
+//!   and `build.rs` prints the live figure as a `cargo:warning` on every build,
+//!   which is the authority to consult rather than this sentence. The
+//!   declarations below are therefore SIX symbol-family modules, not twelve:
+//!   `easy`, `escape`, `global`, `misc`, `slist` and `strerror`. `escape` does
+//!   not appear in the twelve-name list above because it is not a family of its
+//!   own -- it now holds only `curl_easy_escape` and `curl_easy_unescape`, which
+//!   the target partition assigns to `easy`; the two legacy names `curl_escape`
+//!   and `curl_unescape` have moved to `misc`, which the same partition assigns
+//!   them to, and they forward into `escape` exactly as `lib/escape.c:36-45`
+//!   forwards.
+//! * The 61 that are absent are the remainder of `curl_easy_*` (15), all of
 //!   `curl_multi_*` (21), `curl_share_*` (3), one `curl_global_*`,
-//!   `curl_mime_*` (12), the legacy `curl_form*` trio, `curl_url*` (5),
-//!   `curl_ws_*` (4), the ten `curl_m*printf` functions and the two
-//!   `curl_pushheader_by*` helpers. They are unwritten work, not a defect: the
-//!   modules that back them are assigned to units of work beyond this
-//!   checkpoint, and `include/curl/` is deliberately NOT regenerated while any
-//!   of them is missing, so the reviewed curl 8.19.0-DEV headers remain the ABI
-//!   contract rather than being replaced by a truncated one.
+//!   `curl_mime_*` (12), the legacy `curl_form*` trio and `curl_url*` (5).
+//!   The `curl_ws_*` quartet is likewise unwritten. They are unwritten work,
+//!   not a defect: the modules that back them are assigned to units of work
+//!   beyond this checkpoint, and `include/curl/` is deliberately NOT
+//!   regenerated while any of them is missing, so the reviewed curl 8.19.0-DEV
+//!   headers remain the ABI contract rather than being replaced by a truncated
+//!   one.
+//! * One caveat that belongs with the export figure rather than buried in it:
+//!   the five plain-variadic `curl_m*printf` forms are defined by
+//!   `core::arch::global_asm!` in `printf`, and a `global_asm!` symbol reaches
+//!   the STATICLIB but not the CDYLIB -- measured `T curl_mprintf` in
+//!   `libcurl.a` and absent entirely from `libcurl.so`, because rustc's cdylib
+//!   export list covers only the `#[no_mangle] pub extern` items it knows of
+//!   and the section is then collected. `build.rs`'s source-scanning count
+//!   therefore reads 39 where `nm` over the shared object reads 34. That gap is
+//!   `printf`'s to close and is recorded here so the two numbers are not
+//!   mistaken for a discrepancy in this partition.
 //!
 //! What holds unconditionally, now and at completion, is the partition's SHAPE:
 //! it is disjoint, and every name defined has exactly one `#[no_mangle] pub

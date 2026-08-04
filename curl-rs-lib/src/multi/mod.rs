@@ -70,6 +70,22 @@
 //! module that owns the feature, rather than being re-derived by the
 //! diagnostic binary, so the report and the behaviour cannot disagree.
 
+/// Socket-callback plumbing, the poll surface and the two-level timer.
+///
+/// `pub(crate)`, like [`state`] and unlike [`notify`]: the eleven exported
+/// symbols this module backs -- `curl_multi_socket_action`, the two
+/// deprecated socket entry points, `curl_multi_fdset`, `curl_multi_waitfds`,
+/// `curl_multi_wait`, `curl_multi_poll`, `curl_multi_wakeup`,
+/// `curl_multi_timeout` and `curl_multi_assign`, plus the machinery behind
+/// `CURLMOPT_TIMERFUNCTION` -- name no engine-side type in their signatures
+/// that `curl-rs-ffi` cannot reach through this crate's multi handle. The
+/// vocabulary they do name is `struct curl_waitfd` and the three poll bit
+/// families, and those are the ABI crate's to declare (AAP 0.6.3).
+///
+/// Declared before [`notify`] because `rustfmt.toml` sets
+/// `reorder_modules = true` and would otherwise move it.
+pub(crate) mod events;
+
 /// The completion-message queue and the notification subsystem.
 ///
 /// `pub`, unlike [`state`] beside it, and the difference is the ABI. Four
@@ -87,7 +103,7 @@
 /// through this crate's multi handle, never directly, so a static library that
 /// does not export `pub(crate)` items costs nothing here.
 ///
-/// Declared before [`state`] because `rustfmt.toml` sets
+/// Declared after [`events`] because `rustfmt.toml` sets
 /// `reorder_modules = true` and would otherwise move it.
 pub mod notify;
 

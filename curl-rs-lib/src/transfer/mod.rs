@@ -48,19 +48,37 @@
 //!
 //! # Partially delivered
 //!
-//! Of this module's planned children, only [`ratelimit`] exists. The transfer
-//! loop itself, per-request state, the send and client-writer paths, progress
-//! accounting, content encoding and chunked framing arrive with their own
-//! files, and each declaration lands WITH its file -- a `mod` line without a
-//! file is `error[E0583]`, which no attribute can reach, because module
-//! resolution never gets far enough to produce a lint.
+//! Of this module's planned children, [`ratelimit`] and [`progress`] exist.
+//! The transfer loop itself, per-request state, the send and client-writer
+//! paths, content encoding and chunked framing arrive with their own files,
+//! and each declaration lands WITH its file -- a `mod` line without a file is
+//! `error[E0583]`, which no attribute can reach, because module resolution
+//! never gets far enough to produce a lint.
 //!
 //! The order in which they compose is dependency order rather than
-//! preference. [`ratelimit`] is first because it depends on nothing but the
+//! preference. [`ratelimit`] came first because it depends on nothing but the
 //! utility layer: it is a self-contained arithmetic primitive that progress
-//! accounting will EMBED, following `lib/urldata.h:788-793`, where
-//! `struct pgrs_dir` carries a `struct Curl_rlimit` as a member. Nothing in
-//! this directory may invert that direction.
+//! accounting EMBEDS, following `lib/urldata.h:786-791`, where
+//! `struct pgrs_dir` carries a `struct Curl_rlimit` as a member. [`progress`]
+//! is second, and it is the only module in this directory that may name
+//! [`ratelimit`]; nothing may invert that direction.
+
+/// Transfer accounting and timing: supersedes `lib/progress.c` and
+/// `lib/progress.h`.
+///
+/// Owns the state `CURLINFO_*_T`, the progress callbacks, the low-speed abort
+/// and `--write-out`'s `%{time_*}`, `%{size_*}` and `%{speed_*}` variables all
+/// read -- the measured `struct Progress` and `struct pgrs_dir` of
+/// `lib/urldata.h:786-831`.
+///
+/// It renders nothing. The built-in meter's layout, `time2str` and `max6out`
+/// belong to `curl-rs/src/output/progress.rs` and
+/// `curl-rs/src/callbacks/progress.rs`, where the emitted bytes are frozen;
+/// this module preserves every value they read and hands it over in one
+/// snapshot. It reads no clock and arms no timer either: an instant arrives as
+/// a parameter or a `Clock` to sample, and the low-speed check RETURNS the
+/// `EXPIRE_SPEEDCHECK` request rather than making it.
+pub(crate) mod progress;
 
 /// The token bucket behind `--limit-rate`: supersedes `lib/ratelimit.c` and
 /// `lib/ratelimit.h`.

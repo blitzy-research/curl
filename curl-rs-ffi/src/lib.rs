@@ -102,19 +102,24 @@
 //! the target rather than an inventory.** The measured state, which every
 //! claim here is to be read against:
 //!
-//! * `curl-rs-ffi/src/ffi/` holds fifteen files: the six symbol-family modules
-//!   `easy`, `escape`, `global`, `misc`, `slist` and `strerror`; the
-//!   type-and-metadata modules `codes`, `handle`, `opts` and `types`; the
-//!   support modules `memory` and `panic_boundary`; `mod.rs`; and two oracle
-//!   fixtures. `multi`, `share`, `mime`, `form`, `url`, `ws` and `printf` are
+//! * `curl-rs-ffi/src/ffi/` holds sixteen files: the seven symbol-family
+//!   modules `easy`, `escape`, `global`, `misc`, `printf`, `slist` and
+//!   `strerror`; the type-and-metadata modules `codes`, `handle`, `opts` and
+//!   `types`; the support modules `memory` and `panic_boundary`; `mod.rs`; and
+//!   two oracle fixtures. `multi`, `share`, `mime`, `form`, `url` and `ws` are
 //!   still targets.
-//! * **24 of the 100 symbols are exported, 76 are not, and 0 extra symbols
-//!   leak.** Measured two independent ways that agree exactly: `nm -D
-//!   --defined-only` over the built `cdylib`, and `build.rs`'s
-//!   `undefined_abi_exports`, which parses `lib/libcurl.def` and this crate's
-//!   `#[no_mangle]` declarations. The crate therefore exports something, but it
-//!   is **not** a drop-in replacement yet, and nothing here should be read as
-//!   claiming otherwise.
+//! * **39 of the 100 symbols are defined, 61 are not, and 0 extra symbols
+//!   leak**, as measured at the commit that completed `misc`. `build.rs` prints
+//!   the live figure as a `cargo:warning` on every build, so that -- not this
+//!   sentence -- is the number to consult. Two independent measurements agree on
+//!   the export SET: `nm -D --defined-only` over the built `cdylib`, and
+//!   `build.rs`'s `undefined_abi_exports`, which parses `lib/libcurl.def` and
+//!   this crate's `#[no_mangle]` declarations. They differ by five on the COUNT,
+//!   for a reason `ffi/mod.rs` records in full: `printf`'s five plain-variadic
+//!   forms are defined in `global_asm!`, which reaches `libcurl.a` but not
+//!   `libcurl.so`, so `nm` over the shared object reads 34. The crate therefore
+//!   exports something, but it is **not** a drop-in replacement yet, and nothing
+//!   here should be read as claiming otherwise.
 //! * Because the header is generated FROM this crate, an incomplete surface
 //!   would generate an incomplete header. `build.rs` refuses: while any of the
 //!   100 is undefined it writes no header at all and says so, leaving the
@@ -211,7 +216,7 @@
 //!
 //! An unwind that crosses the C boundary is undefined behaviour, so no
 //! panic may escape any entry point -- the rule covers all 100 names and is
-//! obeyed by each of the 24 defined today. The containment
+//! obeyed by every one defined today. The containment
 //! mechanism is code, not a build setting: `panic = "abort"` is prohibited
 //! in the release profile -- the workspace root sets `panic = "unwind"`
 //! explicitly -- because aborting would terminate the host application,

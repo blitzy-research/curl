@@ -1367,7 +1367,7 @@ sort_by = "None"
 
 # [export.rename] -- spell tag-only structs with the `struct` keyword
 #
-# NECESSARY, and proven so rather than assumed. These five structs are
+# NECESSARY, and proven so rather than assumed. These six structs are
 # declared in the frozen headers in TAG form only --  `struct curl_slist { .. };`
 # -- and are never typedef'd, so the bare name is not a type in C. Measured
 # with gcc against the frozen headers:
@@ -1390,7 +1390,25 @@ sort_by = "None"
 #
 # curl_khkey is tag-only too but needs no entry: its only referent,
 # curl_sshkeycallback, is written verbatim.
+#
+# curl_header is the sixth entry and was ADDED when ffi/misc.rs landed
+# curl_easy_header and curl_easy_nextheader, which are the first and only
+# generated prototypes to reference the type. header.h:31-38 declares
+# `struct curl_header { .. };` with no typedef -- the verbatim prologue in
+# build.rs (HEADER_H_DECLS) reproduces it in exactly that tag form -- so
+# without this entry cbindgen emitted
+#
+#     CURLHcode curl_easy_header(CURL *easy, .., curl_header **hout);
+#     curl_header *curl_easy_nextheader(CURL *easy, .., curl_header *prev);
+#
+# measured against the crate on the pinned toolchain: two more instances of
+# the same invalid C the five entries below already exist to prevent, and two
+# that docs/examples/headerapi.c would have failed to compile. Being listed
+# under [export] exclude, as curl_header already is, does not help: exclusion
+# governs whether the DEFINITION is emitted, while this table governs how a
+# REFERENCE is spelled. curl_pushheaders needs both for the same reason.
 [export.rename]
+"curl_header" = "struct curl_header"
 "curl_hstsentry" = "struct curl_hstsentry"
 "curl_index" = "struct curl_index"
 "curl_pushheaders" = "struct curl_pushheaders"

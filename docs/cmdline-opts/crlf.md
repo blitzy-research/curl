@@ -17,3 +17,8 @@ Example:
 
 Convert line feeds to carriage return plus line feeds in upload. Useful for
 **MVS (OS/390)**.
+
+Transfers for `SMTP` and `SMTPS` are not implemented in this build, so the
+`Protocols:` line of the --version output withholds both schemes and an SMTP
+transfer fails with `CURLE_UNSUPPORTED_PROTOCOL` after this option parses.
+Line-ending conversion remains fully available for `FTP` and `FTPS` uploads.

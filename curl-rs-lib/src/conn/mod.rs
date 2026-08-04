@@ -78,3 +78,26 @@
 /// belong on the ITEMS whose consumers have yet to land, so that an item added
 /// later with no consumer is still reported.
 pub(crate) mod select;
+
+/// The connection filter chain -- supersedes `lib/cfilters.c` and
+/// `lib/cfilters.h`.
+///
+/// The second module of this directory in the order the module documentation
+/// above sets out, and for the reason recorded there: it CONSUMES the readiness
+/// vocabulary [`select`] defines -- a filter adjusts an `easy_pollset`
+/// (`Curl_cft_adjust_pollset`, `lib/cfilters.h:82-84`) and the connect driver
+/// waits on one (`lib/cfilters.c:563-579`) -- while `select.h` names nothing
+/// from `cfilters.h`.
+///
+/// It owns the composition mechanism for everything that follows: C's
+/// `Curl_cftype` vtable becomes [`filters::ConnFilter`], its untyped
+/// `void *ctx` becomes a typed field on each implementing struct, and the
+/// intrusive `next` pointer becomes an owned, pinned link. Sockets, Happy
+/// Eyeballs, TLS, the proxies, HTTP/2 and HTTP/3 all arrive later as
+/// IMPLEMENTATIONS of that one trait rather than as parallel stacks -- which is
+/// what lets `crate::protocols` name no TLS type while TLS is interposed
+/// beneath it.
+///
+/// No `#[allow(dead_code)]` on this declaration, for the same reason as
+/// [`select`]: the allowances belong on the items.
+pub(crate) mod filters;

@@ -679,10 +679,17 @@ pub(crate) mod crypto;
 /// `curl_url_strerror` -- plus `curl_escape` and `curl_unescape`. `CURLU` is
 /// the one public handle that is a genuine opaque struct rather than a
 /// `void`, so its representation is part of the contract.
-/// **Partially delivered.** Of this module's planned children, `escape` (from
-/// `lib/escape.c`) and `idn` (from `lib/idn.c`) exist; the URL API itself,
-/// from `lib/urlapi.c`, arrives with its file. `url/mod.rs` is the module root
-/// and declares exactly those two.
+///
+/// Complete. `url/mod.rs` carries the URL API from `lib/urlapi.c` and
+/// declares its two children, `escape` (from `lib/escape.c`) and `idn` (from
+/// `lib/idn.c`) -- the three files specification 0.3.1 names for this folder,
+/// and no more. The scheme table the parser needs is **injected** rather than
+/// imported: `url` defines `SchemeInfo` and the `SchemeRegistry` trait, and
+/// `protocols` is expected to implement it and to expose
+/// `scheme_registry() -> &'static dyn crate::url::SchemeRegistry`, re-exported
+/// from this root so that `curl-rs-ffi`'s argument-less `curl_url()` can reach
+/// it. That direction is what keeps the graph acyclic: the URL API must not
+/// depend on the transfer engine.
 pub mod url;
 
 /// TLS -- rustls, and rustls only.
@@ -745,6 +752,40 @@ pub(crate) mod tls;
 /// `wakeup_available`, and no `curl_multi_*` symbol is backed until the handle
 /// lands.
 pub mod multi;
+
+/// Name resolution: the DNS cache, the address types and the resolver seam.
+///
+/// Supersedes `lib/hostip.c`, `lib/hostip4.c`, `lib/hostip6.c`,
+/// `lib/curl_addrinfo.c`, `lib/fake_addrinfo.c`, `lib/asyn-base.c`,
+/// `lib/asyn-thrdd.c` and `lib/curl_threads.c`, plus `lib/doh.c` behind the
+/// `doh` feature, `lib/httpsrr.c` and `lib/if2ip.c`. The system resolver is
+/// the default; `hickory-dns` is an optional, default-off alternative.
+///
+/// This is where the migration retires the single most hazardous construct
+/// in the C tree: `lib/hostip.c` bounds a blocking lookup with `alarm()`
+/// plus `sigsetjmp`/`siglongjmp`, a non-local jump out of a signal handler
+/// across allocation boundaries, guarded by a process-global `sigjmp_buf`
+/// behind a spinlock. `tokio::time::timeout` replaces all of it, and the
+/// thread abstraction of `lib/curl_threads.c` is subsumed by the runtime.
+///
+/// Declared BEFORE [`conn`] because that is the dependency direction: a
+/// connection needs an address, and nothing here needs a connection. The one
+/// edge that would have pointed the other way -- DoH, which performs an
+/// HTTPS transfer in order to resolve a name -- is an injected transport
+/// seam rather than an import, for exactly that reason.
+///
+/// `pub(crate)`: no exported symbol of `lib/libcurl.def` resolves a name
+/// directly. The resolver is injected into the modules that need it rather
+/// than reached for globally, which is what makes them testable without a
+/// network and what puts the 80% line-coverage gate of specification 0.8.4
+/// within reach at all.
+/// **Partially delivered.** `dns/mod.rs` is the module root and carries the
+/// cache, the entry and address types, the ALPN identifiers, the
+/// `CURLOPT_RESOLVE` loader and the injection seams; the four children the
+/// AAP names -- `resolver`, `doh`, `httpsrr` and `if2ip` -- are specified in
+/// that file, and each declaration arrives WITH its file for the E0583
+/// reason this file records for its own remaining subsystems.
+pub(crate) mod dns;
 
 /// Connection establishment, the filter chain and socket readiness.
 ///
@@ -963,56 +1004,74 @@ pub(crate) mod transfer;
 /// child that exists. The rest arrive with their files.
 pub(crate) mod protocols;
 
-// THE FOUR REMAINING SUBSYSTEMS -- SPECIFIED TARGET DESIGN, NOT DECLARED
+/// Proxy support: tunnelling, SOCKS, the PROXY protocol header, and the
+/// no-proxy predicate.
+///
+/// Supersedes `lib/http_proxy.c`, `lib/cf-h1-proxy.c` and
+/// `lib/cf-h2-proxy.c` (CONNECT tunnelling over HTTP/1 and HTTP/2),
+/// `lib/socks.c` (SOCKS4 and SOCKS5), `lib/socks_gssapi.c` (behind the
+/// default-off `negotiate` feature), `lib/cf-haproxy.c` (the PROXY protocol
+/// header) and `lib/noproxy.c` (`NO_PROXY` matching semantics, which are
+/// quirky and are preserved exactly).
+///
+/// Five of the six are filters in the chain owned by [`conn`], which is why
+/// proxying needs no special case in the protocol layer. The sixth,
+/// `noproxy`, deliberately is not: it is a pure predicate consulted BEFORE
+/// any filter is inserted, and its answer decides whether the proxy filters
+/// are built at all.
+///
+/// `pub(crate)`: proxies are configured through options, never named
+/// directly by a caller.
+/// **Partially delivered.** Of this directory's planned modules only the
+/// no-proxy predicate exists yet -- the one module here that names the filter
+/// chain nowhere, and therefore the one that can be built and tested before
+/// the chain does. `proxy/mod.rs` is the module root and declares exactly
+/// that one. CONNECT tunnelling, SOCKS, GSS-API SOCKS5 and the PROXY protocol
+/// header arrive with their files.
+pub(crate) mod proxy;
+
+/// MIME multipart bodies and the legacy form API.
+///
+/// Supersedes `lib/mime.c` (2,228 lines) and `lib/mime.h` (173 lines), and,
+/// when its `formdata` child lands, `lib/formdata.c` as well.
+///
+/// `pub` because it backs 15 of the 100 exported symbols: the 12
+/// `curl_mime_*` functions of `lib/libcurl.def:37-48`, and the three legacy
+/// `curl_formadd`, `curl_formfree` and `curl_formget` entry points
+/// (`:24-26`), which are deprecated in the documentation yet still exported
+/// and therefore still part of the parity set.
+///
+/// Every literal in that module is protocol data rather than source
+/// formatting. `compareparts` (`tests/getpart.pm:351+`) joins both arrays
+/// into one string and compares them as one string, so the boundary's 24
+/// dashes and 22 alphanumeric characters, the order of the three generated
+/// headers, the elision of the first delimiter's leading CRLF and the absence
+/// of a space after `boundary=` are all observable results. 48 fixtures gate
+/// on the `Mime` feature, 20 of them through `<strippart>` substitutions
+/// whose match sides are exact dash counts, and `tests/data/test44` asserts a
+/// literal `Content-Length: 432` that reproduces only with a 46-byte
+/// boundary.
+///
+/// **Partially delivered.** The multipart engine is the module root; the
+/// `formdata` child arrives with its own file, per the convention this file
+/// states for the whole crate.
+pub mod mime;
+
+// THE ONE REMAINING SUBSYSTEM -- SPECIFIED TARGET DESIGN, NOT DECLARED
 //
-// The AAP's module graph gives this crate four further subsystems -- `dns`,
-// `proxy`, `mime` and `share`. The seven beyond them -- `easy`, `conn`,
-// `headers`, `cookies`, `auth`, `transfer` and `protocols` -- are declared
-// above now that the first of each one's children exists. None of the four
-// has a file yet, and a `mod` line without its file is E0583 -- a hard error
-// that no `#[allow]` can reach, because module resolution never gets far
-// enough to produce a lint. They are therefore DESCRIBED here, in
-// the same dependency order the declarations above follow, and each
-// declaration arrives WITH its file in the unit of work that creates it.
+// The AAP's module graph gives this crate one further subsystem -- `share`.
+// The ten beyond it -- `easy`, `conn`, `dns`, `headers`, `cookies`, `auth`,
+// `transfer`, `protocols`, `proxy` and `mime` -- are declared above now that
+// the first of each one's children exists. `share` alone has no file yet, and
+// a `mod` line without its file is E0583 -- a hard error that no `#[allow]`
+// can reach, because module resolution never gets far enough to produce a
+// lint. It is therefore DESCRIBED here, in the same dependency order the
+// declarations above follow, and its declaration arrives WITH its file in the
+// unit of work that creates it.
 //
 // The visibility recorded for each is part of the specification, not a
 // suggestion: `pub` appears only where `curl-rs-ffi` or `curl-rs`
 // demonstrably needs it to back a named family of the 100 exported symbols.
-//
-// --- dns (pub(crate)) ----------------------------------------------------
-// Supersedes lib/hostip.c, hostip4.c, hostip6.c, curl_addrinfo.c,
-// fake_addrinfo.c, asyn-base.c, asyn-thrdd.c and curl_threads.c, plus
-// lib/doh.c behind the `doh` feature, lib/httpsrr.c and lib/if2ip.c. The
-// system resolver is the default; `hickory-dns` is an optional, default-off
-// alternative.
-//
-// This is where the migration retires the single most hazardous construct in
-// the C tree: lib/hostip.c bounds a blocking lookup with `alarm()` plus
-// `sigsetjmp`/`siglongjmp` -- a non-local jump out of a signal handler
-// across allocation boundaries, guarded by a process-global `sigjmp_buf`
-// behind a spinlock. `tokio::time::timeout` replaces all of it, and the
-// thread abstraction of lib/curl_threads.c is subsumed by the runtime.
-//
-// `pub(crate)` because no exported symbol resolves a name directly. The
-// resolver is injected into the modules that need it rather than reached for
-// globally, which is what makes them testable without a network.
-//
-// --- proxy (pub(crate)) --------------------------------------------------
-// Supersedes lib/http_proxy.c, cf-h1-proxy.c and cf-h2-proxy.c (CONNECT
-// tunnelling over HTTP/1 and HTTP/2), lib/socks.c (SOCKS4 and SOCKS5),
-// lib/socks_gssapi.c (behind the default-off `negotiate` feature),
-// lib/cf-haproxy.c (the PROXY protocol header) and lib/noproxy.c (`NO_PROXY`
-// matching semantics, which are quirky and are preserved exactly).
-//
-// Every one of these is a filter in the chain owned by `conn`, which is why
-// proxying needs no special case in the protocol layer.
-//
-//
-// --- mime (pub) -- lib/mime.c, lib/formdata.c ----------------------------
-// `pub` because it backs 15 exported symbols: the 12 `curl_mime_*` functions
-// and the three legacy `curl_formadd`, `curl_formfree` and `curl_formget`
-// entry points, which are deprecated in the documentation yet still exported
-// and therefore still part of the parity set.
 //
 // --- share (pub) -- lib/curl_share.c -------------------------------------
 // Cookie, DNS, TLS-session, HSTS and connection state can be shared across
@@ -1044,48 +1103,21 @@ pub(crate) mod protocols;
 // the consumer that justifies it, so that widening one later is a decision
 // made against a recorded reason rather than a guess.
 
-// Name resolution.
+// Name resolution -- NOW DECLARED above as `pub(crate) mod dns;`, whose own
+// documentation carries the detail this entry used to. It is kept in the map
+// because the map enumerates the whole tree rather than only its unwritten
+// part, which is the point of replacing `lib/Makefile.inc` with this file.
 //
-// Supersedes `lib/hostip.c`, `lib/hostip4.c`, `lib/hostip6.c`,
-// `lib/curl_addrinfo.c`, `lib/fake_addrinfo.c`, `lib/asyn-base.c`,
-// `lib/asyn-thrdd.c` and `lib/curl_threads.c`, plus `lib/doh.c` behind the
-// `doh` feature, `lib/httpsrr.c` and `lib/if2ip.c`. The system resolver is
-// the default; `hickory-dns` is an optional, default-off alternative.
+// Proxy support is no longer described here: it is DECLARED above, with its
+// map entry promoted to the documentation on `pub(crate) mod proxy`, because
+// the first of its children -- the `NO_PROXY` predicate of `lib/noproxy.c` --
+// now exists. This map holds only the subsystems that have no file yet.
 //
-// This is where the migration retires the single most hazardous construct
-// in the C tree: `lib/hostip.c` bounds a blocking lookup with `alarm()`
-// plus `sigsetjmp`/`siglongjmp`, a non-local jump out of a signal handler
-// across allocation boundaries, guarded by a process-global `sigjmp_buf`
-// behind a spinlock. `tokio::time::timeout` replaces all of it, and the
-// thread abstraction of `lib/curl_threads.c` is subsumed by the runtime.
-//
-// `pub(crate)`: no exported symbol resolves a name directly. The resolver
-// is injected into the modules that need it rather than reached for
-// globally, which is what makes them testable without a network.
-//
-// Proxy support.
-//
-// Supersedes `lib/http_proxy.c`, `lib/cf-h1-proxy.c`, `lib/cf-h2-proxy.c`
-// (CONNECT tunnelling over HTTP/1 and HTTP/2), `lib/socks.c` (SOCKS4 and
-// SOCKS5), `lib/socks_gssapi.c` (behind the default-off `negotiate`
-// feature), `lib/cf-haproxy.c` (the PROXY protocol header) and
-// `lib/noproxy.c` (`NO_PROXY` matching semantics, which are quirky and are
-// preserved exactly).
-//
-// Every one of these is a filter in the chain owned by [`conn`], which is
-// why proxying needs no special case in the protocol layer.
-//
-// `pub(crate)`: proxies are configured through options, never named
-// directly by a caller.
-//
-// MIME and the legacy form API.
-//
-// Supersedes `lib/mime.c` and `lib/formdata.c`.
-//
-// `pub` because it backs 15 exported symbols: the 12 `curl_mime_*`
-// functions and the three legacy `curl_formadd`, `curl_formfree` and
-// `curl_formget` entry points, which are deprecated in the documentation
-// yet still exported and therefore still part of the parity set.
+// MIME and the legacy form API are no longer described here either: they are
+// DECLARED above as `pub mod mime`, which carries the detail this entry used
+// to, because the multipart engine of `lib/mime.c` now exists. What remains
+// unwritten is `formdata`, a child of that module rather than a subsystem of
+// its own.
 //
 // The share interface: state deliberately shared between easy handles.
 //

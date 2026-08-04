@@ -41,10 +41,10 @@
 //!
 //! # Partially delivered
 //!
-//! Of this module's planned children, [`netrc`] and the public-suffix rules
-//! of `psl` exist; the cookie jar itself (`lib/cookie.c`), the HSTS cache
-//! (`lib/hsts.c`) and the Alt-Svc cache (`lib/altsvc.c`) arrive with their
-//! own files. This file is the module root and declares exactly the two
+//! Of this module's planned children, [`netrc`], the public-suffix rules of
+//! `psl`, the HSTS cache of `hsts` and the Alt-Svc cache of `altsvc` exist;
+//! only the cookie jar itself (`lib/cookie.c`) arrives with its own file.
+//! This file is the module root and declares exactly the four
 //! children that exist: a `mod` line without its file is
 //! `error[E0583]`, which no attribute can suppress, so each declaration
 //! lands with the file it names -- the convention `curl-rs-lib/src/lib.rs`
@@ -56,8 +56,9 @@
 //! The capability names are `cookies`, `hsts` and `altsvc`, and they gate
 //! the jar, the HSTS cache and the Alt-Svc cache respectively -- matching
 //! the C's `CURL_DISABLE_COOKIES`, `CURL_DISABLE_HSTS` and
-//! `CURL_DISABLE_ALTSVC`. The gates belong on those declarations when they
-//! land.
+//! `CURL_DISABLE_ALTSVC`. `hsts` and `altsvc` carry theirs on the
+//! declarations below; the `cookies` gate belongs on the jar's declaration
+//! when it lands.
 //!
 //! `cookies` additionally gates `psl`, which the C expresses as a separate
 //! `USE_LIBPSL` switch. The reason is mechanical rather than stylistic:
@@ -77,6 +78,26 @@
 //! `curl-rs-lib/Cargo.toml` and none of them is a netrc switch, so there is
 //! nothing to attach it to in any case. The module's own header records the
 //! measurement.
+
+/// The Alt-Svc cache (RFC 7838), behind `--alt-svc <file>`.
+///
+/// Supersedes `lib/altsvc.c` and `lib/altsvc.h`, and backs `CURLOPT_ALTSVC`
+/// (10287) and `CURLOPT_ALTSVC_CTRL` (286).
+///
+/// **Gated on `altsvc`**, the successor of C's `CURL_DISABLE_ALTSVC`, as this
+/// module's header says it must be. The C additionally gates the file on
+/// `CURL_DISABLE_HTTP` (`lib/altsvc.c:30`); there is no counterpart, because
+/// the crate's capability vocabulary is closed at fifteen names and none of
+/// them switches HTTP off.
+///
+/// It carries two things beyond the cache itself, and both are recorded here
+/// so that a later module imports rather than redeclares them: `AlpnId`, the
+/// successor of `enum alpnid` (`lib/hostip.h:49-54`), whose eventual home is
+/// `crate::dns`; and the two name conversions of `lib/connect.c:73-95`, whose
+/// eventual home is `crate::conn`. Neither module provides them at this
+/// commit. The child's own header states the contract for moving them.
+#[cfg(feature = "altsvc")]
+pub(crate) mod altsvc;
 
 /// `.netrc` credential lookup, behind `--netrc`, `--netrc-file` and
 /// `--netrc-optional`.
@@ -107,3 +128,24 @@ pub(crate) mod netrc;
 /// public-suffix grounds.
 #[cfg(feature = "cookies")]
 pub(crate) mod psl;
+
+/// The HTTP Strict Transport Security cache, behind `--hsts <file>`.
+///
+/// Supersedes `lib/hsts.c` and `lib/hsts.h`, and backs `CURLOPT_HSTS`
+/// (10300), `CURLOPT_HSTS_CTRL` (299) and the four callback options
+/// `CURLOPT_HSTSREADFUNCTION` (20301), `CURLOPT_HSTSREADDATA` (10302),
+/// `CURLOPT_HSTSWRITEFUNCTION` (20303) and `CURLOPT_HSTSWRITEDATA` (10304).
+///
+/// **Gated on `hsts`**, matching the C's `CURL_DISABLE_HSTS`. The C
+/// additionally requires HTTP -- `#if !defined(CURL_DISABLE_HTTP) &&
+/// !defined(CURL_DISABLE_HSTS)` at `lib/hsts.c:30` -- which has no
+/// counterpart here because HTTP/1.1 is unconditional in this crate and the
+/// capability vocabulary is closed at fifteen names in
+/// `curl-rs-lib/Cargo.toml`, none of which is an HTTP switch.
+///
+/// Its on-disk format is a frozen, consumer-visible contract and is NOT the
+/// Netscape jar's: the HSTS header carries no trailing blank line where the
+/// jar's does. The module's own header records the measurement and the two
+/// are deliberately not shared.
+#[cfg(feature = "hsts")]
+pub(crate) mod hsts;

@@ -2,30 +2,29 @@
 //
 // SPDX-License-Identifier: curl
 
-//! The four percent-encoding entry points.
+//! The two modern percent-encoding entry points.
 //!
 //! | Symbol | Authority | Engine backing |
 //! |--------|-----------|----------------|
 //! | `curl_easy_escape`   | `lib/escape.c:50-87`   | `curl_rs_lib::url::escape::escape` |
 //! | `curl_easy_unescape` | `lib/escape.c:163-184` | `curl_rs_lib::url::escape::unescape` |
-//! | `curl_escape`        | `lib/escape.c:36-39`   | forwards to `curl_easy_escape` |
-//! | `curl_unescape`      | `lib/escape.c:42-45`   | forwards to `curl_easy_unescape` |
 //!
-//! Not one of the four decides what a byte encodes to. The unreserved set, the
-//! case of the hex digits, and the exact conditions under which a `%`
-//! introduces an escape all live in the engine module, which asserts them
-//! against an oracle measured from the frozen library. This file marshals, and
-//! marshalling is the whole of its job (specification 0.3.3, pattern P10).
+//! Neither decides what a byte encodes to. The unreserved set, the case of the
+//! hex digits, and the exact conditions under which a `%` introduces an escape
+//! all live in the engine module, which asserts them against an oracle measured
+//! from the frozen library. This file marshals, and marshalling is the whole of
+//! its job (specification 0.3.3, pattern P10).
 //!
-//! # The two legacy names forward rather than duplicate
+//! # Where the two legacy names went, and why they are not here
 //!
 //! `curl_escape` and `curl_unescape` predate the `curl_easy_` spelling and are
 //! kept for ABI compatibility. `lib/escape.c:36-45` implements each as a single
-//! call into its modern counterpart with `NULL` for the handle, and that is
-//! reproduced literally here: the pair below calls the pair above rather than
-//! repeating the marshalling. Duplicating it would create two places for the
-//! length convention to drift, and the drift would be invisible because the
-//! legacy names have far fewer callers.
+//! call into its modern counterpart with `NULL` for the handle, and that forward
+//! is reproduced literally -- but in [`super::misc`], not here, because the
+//! target partition assigns the two legacy names to `ffi/misc.rs` and the two
+//! modern ones to `ffi/easy.rs`. The forward direction is what matters and it is
+//! unchanged: `misc` calls the pair below rather than repeating the
+//! marshalling, so the length convention has exactly one implementation.
 //!
 //! # The handle argument is accepted and ignored
 //!
@@ -244,56 +243,15 @@ pub unsafe extern "C" fn curl_easy_unescape(
     })
 }
 
-/// Percent-encodes a string. The pre-7.15.4 name for [`curl_easy_escape`].
-///
-/// Supersedes `curl_escape` (`lib/escape.c:36-39`), which is a single call into
-/// `curl_easy_escape` with a null handle. Retained because it is one of the 100
-/// symbols `lib/libcurl.def` exports and specification 0.8.2 forbids dropping a
-/// deprecated export.
-///
-/// # Safety
-///
-/// As [`curl_easy_escape`].
-#[no_mangle]
-pub unsafe extern "C" fn curl_escape(
-    string: *const c_char,
-    length: c_int,
-) -> *mut c_char {
-    // SAFETY: the contract is identical and is forwarded unchanged; the null
-    // handle is what the C passes at `lib/escape.c:38`.
-    unsafe { curl_easy_escape(ptr::null_mut(), string, length) }
-}
-
-/// Percent-decodes a string. The pre-7.15.4 name for [`curl_easy_unescape`].
-///
-/// Supersedes `curl_unescape` (`lib/escape.c:42-45`), which is a single call
-/// into `curl_easy_unescape` with a null handle and no out-parameter. Because
-/// the length is discarded, a decoded NUL truncates the result as far as any
-/// caller can tell -- which is why the modern name exists and why this one is
-/// not merely a shorter spelling.
-///
-/// # Safety
-///
-/// As [`curl_easy_unescape`].
-#[no_mangle]
-pub unsafe extern "C" fn curl_unescape(
-    string: *const c_char,
-    length: c_int,
-) -> *mut c_char {
-    // SAFETY: the contract is identical and is forwarded unchanged; the null
-    // handle and null out-parameter are what the C passes at
-    // `lib/escape.c:44`.
-    unsafe {
-        curl_easy_unescape(ptr::null_mut(), string, length, ptr::null_mut())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        curl_easy_escape, curl_easy_unescape, curl_escape, curl_unescape,
-    };
+    use super::{curl_easy_escape, curl_easy_unescape};
     use crate::ffi::memory;
+    // The two legacy names live in `ffi/misc.rs`, which the target partition
+    // assigns them to, and they forward here. The equivalence test below reaches
+    // across that boundary on purpose: it is the forward itself that is under
+    // test, so testing it from either side alone would leave the seam unchecked.
+    use crate::ffi::misc::{curl_escape, curl_unescape};
 
     use core::ffi::c_int;
     use core::ptr;
@@ -453,8 +411,11 @@ mod tests {
             .expect("the function this test is about must exist");
         // Bound the search to the function body: an unbounded scan would answer
         // about some other function, which is a trap this project has hit before.
+        // `curl_easy_unescape` is now the last item in the module -- the two
+        // legacy names that used to follow it moved to `ffi/misc.rs` -- so the
+        // test module's own attribute is what delimits the body.
         let body = &body[..body
-            .find("\n/// Percent-encodes a string. The pre-7.15.4 name")
+            .find("\n#[cfg(test)]")
             .expect("the next item delimits the body")];
 
         let alloc = body
