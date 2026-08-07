@@ -1316,6 +1316,31 @@ pub use crate::util::strcase::{strequal, strnequal};
 // and lend a configuration but can neither read nor forge a level.
 pub use crate::trace::TraceConfig;
 
+// The scheme table. Re-exported by the same idiom and for the same reason as
+// `getdate`, the two comparators and `TraceConfig` above: `curl_url` is one of
+// the 100 symbols `lib/libcurl.def` exports (`:90`), it takes NO arguments
+// (`include/curl/urlapi.h:113`), and `crate::url::Url::new` requires a
+// `&'static dyn crate::url::SchemeRegistry` -- so `curl-rs-ffi/src/ffi/url.rs`
+// must obtain the table without being handed one, and `protocols` is
+// crate-private by enforcement.
+//
+// This line is the wiring contract that `crate::url::SchemeRegistry` and the
+// `protocols` declaration above BOTH already spell out; it exists now because
+// the URL API's five entry points do.
+//
+// WITHOUT it, the facade would have to carry the 33-scheme table itself --
+// putting protocol knowledge in a crate whose stated job is the C ABI and
+// nothing else (pattern P10), and duplicating a table AAP section 0.4.1 assigns
+// to `protocols/mod.rs` from `lib/url.c`. WITH it, the facade calls one function
+// and every port, every `PROTOPT_URLOPTIONS` flag and every runnable predicate
+// stays here.
+//
+// Deliberately ONE name, not the module, and NOT a glob. `pub use
+// crate::protocols::*;` would expose whatever the protocol modules add next --
+// none of which is an exported symbol -- and would misrepresent the ABI surface
+// as larger than the 100 names. `protocols` itself stays `pub(crate)`.
+pub use crate::protocols::scheme_registry;
+
 // THE EXTENDED-ATTRIBUTE PRIMITIVE IS NOT RE-EXPORTED HERE, and the absence is
 // deliberate rather than an omission.
 //

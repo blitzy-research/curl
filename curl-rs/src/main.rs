@@ -123,12 +123,16 @@
 //! - [`util`] -- `src/tool_util.c` and `src/toolx/tool_time.c`.
 //! - [`ca_embed`] -- `src/tool_ca_embed.c`, a build artifact rather than a
 //!   committed source, produced by `build.rs`.
+//! - [`urlglob`] -- `src/tool_urlglob.c`: the `{a,b}` / `[1-100]` expansion that
+//!   turns one command-line URL into many transfers, and the `#1` substitution
+//!   an `-o` file name uses to follow it.
 
 mod ca_embed;
 mod callbacks;
 mod cli;
 mod output;
 mod terminal;
+mod urlglob;
 mod util;
 
 use std::io::Write;

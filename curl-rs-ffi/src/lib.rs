@@ -102,14 +102,14 @@
 //! the target rather than an inventory.** The measured state, which every
 //! claim here is to be read against:
 //!
-//! * `curl-rs-ffi/src/ffi/` holds sixteen files: the seven symbol-family
-//!   modules `easy`, `escape`, `global`, `misc`, `printf`, `slist` and
-//!   `strerror`; the type-and-metadata modules `codes`, `handle`, `opts` and
+//! * `curl-rs-ffi/src/ffi/` holds seventeen files: the eight symbol-family
+//!   modules `easy`, `escape`, `global`, `misc`, `printf`, `slist`, `strerror`
+//!   and `url`; the type-and-metadata modules `codes`, `handle`, `opts` and
 //!   `types`; the support modules `memory` and `panic_boundary`; `mod.rs`; and
-//!   two oracle fixtures. `multi`, `share`, `mime`, `form`, `url` and `ws` are
-//!   still targets.
-//! * **39 of the 100 symbols are defined, 61 are not, and 0 extra symbols
-//!   leak**, as measured at the commit that completed `misc`. `build.rs` prints
+//!   two oracle fixtures. `multi`, `share`, `mime`, `form` and `ws` are still
+//!   targets.
+//! * **44 of the 100 symbols are defined, 56 are not, and 0 extra symbols
+//!   leak**, as measured at the commit that completed `url`. `build.rs` prints
 //!   the live figure as a `cargo:warning` on every build, so that -- not this
 //!   sentence -- is the number to consult. Two independent measurements agree on
 //!   the export SET: `nm -D --defined-only` over the built `cdylib`, and
@@ -117,9 +117,9 @@
 //!   this crate's `#[no_mangle]` declarations. They differ by five on the COUNT,
 //!   for a reason `ffi/mod.rs` records in full: `printf`'s five plain-variadic
 //!   forms are defined in `global_asm!`, which reaches `libcurl.a` but not
-//!   `libcurl.so`, so `nm` over the shared object reads 34. The crate therefore
-//!   exports something, but it is **not** a drop-in replacement yet, and nothing
-//!   here should be read as claiming otherwise.
+//!   `libcurl.so`, so `nm` over the shared object reads five fewer. The crate
+//!   therefore exports something, but it is **not** a drop-in replacement yet,
+//!   and nothing here should be read as claiming otherwise.
 //! * Because the header is generated FROM this crate, an incomplete surface
 //!   would generate an incomplete header. `build.rs` refuses: while any of the
 //!   100 is undefined it writes no header at all and says so, leaving the

@@ -101,3 +101,30 @@ pub(crate) mod select;
 /// No `#[allow(dead_code)]` on this declaration, for the same reason as
 /// [`select`]: the allowances belong on the items.
 pub(crate) mod filters;
+
+/// The graceful-shutdown queue -- supersedes `lib/cshutdn.c` and
+/// `lib/cshutdn.h`.
+///
+/// The third module of this directory, and it consumes both of the two before
+/// it: it drives [`filters::FilterChain::shutdown`] and
+/// [`filters::FilterChain::close_and_clear`] one non-blocking step at a time,
+/// and it folds many of the resulting [`select::EasyPollset`]s into one wait
+/// (`lib/cshutdn.c:474-533`). Nothing in `cfilters.h` or `select.h` names
+/// anything from `cshutdn.h`, so the direction is one-way.
+///
+/// It owns what C keeps as `struct cshutdn` on the multi handle
+/// (`lib/multihandle.h:147`): a FIFO of connections that a transfer has
+/// finished with but whose protocols have not yet said goodbye. C links them
+/// with a non-owning intrusive list; here the queue owns each connection by
+/// value and termination consumes it, which is what makes a double free or a
+/// re-queue unrepresentable rather than merely avoided.
+///
+/// Its two seams onto the rest of the crate are INJECTED traits --
+/// [`shutdown::ShutdownHost`] for the multi handle and
+/// [`shutdown::ProtocolDisconnect`] for the scheme's disconnect handler -- so
+/// that neither `crate::multi` nor `crate::protocols` is named from here and
+/// the module graph stays acyclic.
+///
+/// No `#[allow(dead_code)]` on this declaration, for the same reason as
+/// [`select`] and [`filters`]: the allowances belong on the items.
+pub(crate) mod shutdown;

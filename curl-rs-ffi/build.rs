@@ -676,18 +676,28 @@ const MULTI_H_ITEMS: &[&str] = &[
     // cbindgen emits at all.
 ];
 
-/// Items owned by `urlapi.h`: the two URL-API enums and six functions.
+/// Items owned by `urlapi.h`: the two URL-API enums and six functions, three
+/// of which are generated and three carried verbatim.
+///
 /// `CURLU` itself is verbatim, because `urlapi.h:107` spells it
 /// `typedef struct Curl_URL CURLU;`, where the tag differs from the typedef
 /// name, and cbindgen would emit `typedef struct CURLU CURLU;`.
+///
+/// `curl_url_get` and `curl_url_set` are ALSO verbatim, in [`URLAPI_H_POST`]
+/// with `curl_url_strerror`, and for the same reason as it: their `CURLUPart
+/// what` parameter must stay a `CURLUPart` in the header while the Rust
+/// definition takes a `c_int`, because a C caller may legally pass a value
+/// outside `0..=10` and curl answers it with `CURLUE_UNKNOWN_PART`
+/// (`lib/urlapi.c:1626-1628`, `:1773-1774` and `:1873-1874`). Rendering that
+/// parameter as the Rust enum would make a DEFINED C input an invalid Rust
+/// value. This is the same arrangement `curl_version_info(CURLversion)` and
+/// `curl_easy_option_by_id(CURLoption)` already use.
 const URLAPI_H_ITEMS: &[&str] = &[
     "CURLUcode",
     "CURLUPart",
     "curl_url",
     "curl_url_cleanup",
     "curl_url_dup",
-    "curl_url_get",
-    "curl_url_set",
     // The 16 CURLU_* flag bits, urlapi.h:84-105.
 ];
 
@@ -699,14 +709,27 @@ const OPTIONS_H_ITEMS: &[&str] = &[
     "CURLOT_FLAG_ALIAS",
 ];
 
-/// Items owned by `header.h`: `CURLHcode`, the five `origin` bits and two
-/// functions. `struct curl_header` is verbatim, being layout-visible.
-const HEADER_H_ITEMS: &[&str] = &[
-    "CURLHcode",
-    // The 'origin' bits, header.h:41-45.
-    "curl_easy_header",
-    "curl_easy_nextheader",
-];
+/// Items owned by `header.h`: none.
+///
+/// The second empty partition, alongside [`MPRINTF_H_ITEMS`], and empty for
+/// the same kind of reason: every construct the header declares is one
+/// cbindgen cannot render to the frozen bytes. `struct curl_header` is
+/// layout-visible, the five `origin` bits are `pub(crate)` and so invisible
+/// to cbindgen at all, `CURLHcode`'s eight frozen trailing comments become
+/// eight multi-line blocks above the members, and both prototypes acquire
+/// their whole Rust doc comment plus a line break after `CURL_EXTERN`.
+/// [`HEADER_H_DECLS`] carries all four, and each of the three names that
+/// would otherwise be generated is listed in this header's
+/// [`HeaderSpec::verbatim`] so no pass -- including `curl.h`'s -- emits a
+/// second declaration.
+///
+/// An empty list is load-bearing rather than inert. `apply_partition` sets
+/// `export.include` to it and appends every observed name to
+/// `export.exclude`, so this pass generates nothing at all; and because
+/// `curl.h`'s suppression list is built from `observed` intersected with the
+/// SIBLING ITEM LISTS, a name dropped from here without being added to
+/// `verbatim` would migrate into the umbrella instead of disappearing.
+const HEADER_H_ITEMS: &[&str] = &[];
 
 /// Items owned by `websockets.h`: nine flag bits and four functions.
 /// `struct curl_ws_frame` is verbatim, being layout-visible.
@@ -1138,11 +1161,74 @@ CURL_EXTERN CURLMcode curl_multi_setopt(CURLM *multi_handle,
 CURL_EXTERN const char *curl_multi_strerror(CURLMcode);
 "#;
 
-/// `header.h`, after the `extern "C"` open. Layout-visible, so verbatim:
-/// consumers read all six fields. Nothing it names is generated, so the
-/// full definition sits in the prologue, exactly where `header.h:31` has
-/// it, and every prototype that takes a `struct curl_header **` therefore
-/// sees a complete type.
+/// `header.h`, after the `extern "C"` open: `header.h:31-68` verbatim, which
+/// is every declaration the header carries.
+///
+/// `struct curl_header` is LAYOUT-VISIBLE -- consumers read all six fields
+/// off the pointer the two functions hand back -- so cbindgen's opaque
+/// rendering would be wrong and the definition is spliced. Placing it first
+/// also gives the two prototypes below, which take
+/// `struct curl_header **` and return `struct curl_header *`, a complete
+/// type to refer to.
+///
+/// The five `origin` bits are here for a different and stronger reason:
+/// they are `pub(crate)` in `ffi::codes::curlh_origin`, and cbindgen emits
+/// only `pub` items, so NO pass can generate them however the partition is
+/// arranged. Measured on the one comparable constant that is `pub` --
+/// `CURLOT_FLAG_ALIAS` in `ffi/opts.rs` -- cbindgen does keep the
+/// `(1 << n)` expression, but it writes a single space after the name and
+/// lifts the Rust doc comment into a block comment ABOVE the `#define`. That
+/// loses both the frozen four-space macro column and the per-bit trailing
+/// comments, and the bytes of a public header are frozen.
+///
+/// `CURLHcode` is spliced for the reason that governs every comment in this
+/// file's output: cbindgen renders `documentation = true` faithfully, and
+/// `ffi::codes::CURLHcode` carries a Rust doc comment per member. Generated,
+/// the enumeration came out with each comment lifted into its own multi-line
+/// `/* .. */` block ABOVE the member, carrying Rust intra-doc links
+/// (`` [`engine::CURLHcode`] ``), backticks and markdown emphasis into a C
+/// header -- 42 lines where the authority has 10, and not one of the frozen
+/// trailing comments left in place. Turning `documentation` off is not the
+/// remedy: it is a GLOBAL key in `cbindgen.toml` and the other seven headers
+/// depend on it. So this header owns its enumeration, exactly as
+/// `mprintf.h` owns all ten of its prototypes.
+///
+/// Splicing it does NOT weaken the integer pinning AAP 0.6.1 requires; three
+/// independent mechanisms still assert it, and the text below is the fourth
+/// party to the same agreement rather than an unchecked copy:
+/// `ffi::codes::CURLHcode` writes all eight discriminants explicitly and
+/// exposes them as `ABI_VALUES`; `curl_rs_lib::error::CURLHcode` does the
+/// same and is bridged to it by exhaustive `match` in both directions, so a
+/// divergence cannot compile; and every one of the 129 `docs/examples/`
+/// programs compiles against this text, where a missing or misspelled
+/// `CURLHcode` is `unknown type name` in all of them at once, because
+/// `curl_easy_header` below returns it.
+///
+/// The two prototypes -- the only two of the 100 exported symbols this header
+/// declares -- are spliced for the comment reason above and for a second,
+/// independent one. Measured: cbindgen puts `[fn] prefix` on a LINE OF ITS
+/// OWN, so it emitted `CURL_EXTERN` and then `CURLHcode curl_easy_header(`
+/// beneath it. That is valid C and still wrong, because it moves the open
+/// paren from column 39 to column 27 and so re-indents all six continuation
+/// lines. Their alignment is part of the frozen bytes, and
+/// `docs/libcurl/curl_easy_header.md`'s `# SYNOPSIS` block is cross-checked
+/// against this declaration by `.github/scripts/verify-synopsis.pl`.
+///
+/// Their deliberate ASYMMETRY is reproduced rather than tidied:
+/// `curl_easy_header` returns `CURLHcode` and yields the record through a
+/// `struct curl_header **hout` out-parameter, while `curl_easy_nextheader`
+/// returns `struct curl_header *` directly and signals exhaustion with NULL.
+/// Harmonising them would change two of the 100 public signatures.
+///
+/// WHAT THIS BLOCK DELIBERATELY DOES NOT CONTAIN: any explanation of itself.
+/// Everything above is Rust documentation, read by whoever maintains this
+/// script; none of it reaches `include/curl/header.h`, which ships to
+/// consumers and is compiled by all 129 programs under `docs/examples/`.
+/// A previous form of this constant embedded seven lines of build-script
+/// commentary INSIDE the emitted string, so a note about cbindgen dropping
+/// `L` suffixes and rewriting hex was published in the ABI contract -- where
+/// it was also simply untrue, `(1 << n)` having neither an `L` suffix nor a
+/// hexadecimal literal anywhere in it.
 const HEADER_H_DECLS: &str = r#"
 struct curl_header {
   char *name;    /* this might not use the same case */
@@ -1153,19 +1239,35 @@ struct curl_header {
   void *anchor; /* handle privately used by libcurl */
 };
 
-/* ---- verbatim from header.h, not generated ---- */
-/* cbindgen cannot carry these faithfully, measured on all three
-   forms: it DROPS an `L` suffix (`2L` becomes `2`, changing the
-   varargs type of a long option), rewrites hex as decimal, and
-   cannot express a #define whose value is another identifier.
-   The five `origin` bits of `struct curl_header` are therefore
-   spliced from the frozen header exactly as written. */
 /* 'origin' bits */
 #define CURLH_HEADER    (1 << 0) /* plain server header */
 #define CURLH_TRAILER   (1 << 1) /* trailers */
 #define CURLH_CONNECT   (1 << 2) /* CONNECT headers */
 #define CURLH_1XX       (1 << 3) /* 1xx headers */
 #define CURLH_PSEUDO    (1 << 4) /* pseudo headers */
+
+typedef enum {
+  CURLHE_OK,
+  CURLHE_BADINDEX,      /* header exists but not with this index */
+  CURLHE_MISSING,       /* no such header exists */
+  CURLHE_NOHEADERS,     /* no headers at all exist (yet) */
+  CURLHE_NOREQUEST,     /* no request with this number was used */
+  CURLHE_OUT_OF_MEMORY, /* out of memory while processing */
+  CURLHE_BAD_ARGUMENT,  /* a function argument was not okay */
+  CURLHE_NOT_BUILT_IN   /* if API was disabled in the build */
+} CURLHcode;
+
+CURL_EXTERN CURLHcode curl_easy_header(CURL *easy,
+                                       const char *name,
+                                       size_t index,
+                                       unsigned int origin,
+                                       int request,
+                                       struct curl_header **hout);
+
+CURL_EXTERN struct curl_header *curl_easy_nextheader(CURL *easy,
+                                                     unsigned int origin,
+                                                     int request,
+                                                     struct curl_header *prev);
 "#;
 
 /// `options.h`, after the `extern "C"` open: a tag forward declaration.
@@ -1221,11 +1323,44 @@ const URLAPI_H_INCLUDES: &str = "\n#include \"curl.h\"\n";
 /// typedef name. cbindgen would emit `typedef struct CURLU CURLU;`, which
 /// compiles and is still wrong, because it introduces a different
 /// incomplete type than the one libcurl's own translation units define.
-/// `urlapi.h`, after the generated block: the one prototype whose parameter is
-/// a CURLUcode while the Rust definition must take a c_int. It has to follow
-/// the generated block because that is where CURLUcode is declared. See
-/// cbindgen.toml, "Group 5e".
+/// `urlapi.h`, after the generated block: the three prototypes whose parameters
+/// name a URL-API enum while the Rust definitions must take a `c_int`. All
+/// three have to follow the generated block because that is where `CURLUcode`
+/// and `CURLUPart` are declared. See cbindgen.toml, "Group 5e".
+///
+/// The rule they share, and why it is a rule rather than three coincidences: a
+/// C caller may pass any value of an enum parameter's compatible integer type,
+/// and libcurl ANSWERS an out-of-range one -- `curl_url_strerror` with
+/// `"CURLUcode unknown"` (`lib/strerror.c:524`), and `curl_url_get` and
+/// `curl_url_set` with `CURLUE_UNKNOWN_PART` (`lib/urlapi.c:1626-1628`,
+/// `:1773-1774`, `:1873-1874`). A Rust `#[repr(C)]` enum parameter would make
+/// each of those DEFINED inputs an invalid Rust value, which is undefined
+/// behaviour before the callee runs. So the Rust signature takes a `c_int` and
+/// the header's spelling is preserved here, exactly as it is for
+/// `curl_version_info(CURLversion)` in `curl.h` and
+/// `curl_easy_option_by_id(CURLoption)` in `options.h`.
+///
+/// The parameter names and the `const` qualifiers are those of
+/// `include/curl/urlapi.h:133-134` and `:141-142`, character for character: the
+/// `const` on `curl_url_get`'s handle is ABI-visible documentation that the
+/// call does not mutate, and `curl_url_set`'s handle deliberately lacks it.
 const URLAPI_H_POST: &str = r#"
+/*
+ * curl_url_get() extracts a specific part of the URL from a CURLU
+ * handle. Returns error code. The returned pointer MUST be freed with
+ * curl_free() afterwards.
+ */
+CURL_EXTERN CURLUcode curl_url_get(const CURLU *handle, CURLUPart what,
+                                   char **part, unsigned int flags);
+
+/*
+ * curl_url_set() sets a specific part of the URL in a CURLU handle. Returns
+ * error code. The passed in string will be copied. Passing a NULL instead of
+ * a part string, clears that part.
+ */
+CURL_EXTERN CURLUcode curl_url_set(CURLU *handle, CURLUPart what,
+                                   const char *part, unsigned int flags);
+
 /*
  * curl_url_strerror turns a CURLUcode value into the equivalent human
  * readable error string. This is useful for printing meaningful error
@@ -1448,7 +1583,14 @@ const SIBLING_HEADERS: [HeaderSpec; 7] = [
         blank_before_guard_close: true,
         named_guard_close: true,
         items: HEADER_H_ITEMS,
-        verbatim: &[],
+        // All three are declared by HEADER_H_DECLS, so every pass must
+        // suppress them -- this one included, or they would be declared
+        // twice in the same file. `CURLHcode` additionally has to be named
+        // here because it is listed under `[export] include` in
+        // cbindgen.toml: that list is replaced per pass by
+        // `apply_partition`, so the entry is inert, but the exclusion is
+        // what actually keeps the enumeration out of the umbrella.
+        verbatim: &["CURLHcode", "curl_easy_header", "curl_easy_nextheader"],
     },
     HeaderSpec {
         file: "websockets.h",
@@ -3805,9 +3947,24 @@ const OPTION_LASTENTRY_INDEX: usize = 328;
 const EXPORTED_SYMBOLS: usize = 100;
 
 /// Of those 100, the number carried verbatim rather than generated: the
-/// four C-variadic setters, the five deprecated prototypes and the ten
-/// `curl_m*printf` functions.
-const VERBATIM_FUNCTIONS: usize = 31;
+/// four C-variadic setters, the five deprecated prototypes, the ten
+/// `curl_m*printf` functions, the twelve whose frozen signature names a type
+/// this crate's Rust spelling cannot ask cbindgen to produce
+/// (`cbindgen.toml`, "Group 5e"), the two whose parameter names a public enum
+/// and the two the header API declares. 4 + 5 + 10 + 12 + 2 + 2 = 35.
+///
+/// The two that name a public enum are `curl_url_get` and `curl_url_set`,
+/// whose `CURLUPart what` must survive into the header while the Rust
+/// definition takes a `c_int`. [`URLAPI_H_POST`] records why.
+///
+/// The last two are `curl_easy_header` and `curl_easy_nextheader`. They were
+/// generated until the render of `include/curl/header.h` was measured against
+/// the frozen file: cbindgen emitted `CURL_EXTERN` on a line of its own,
+/// re-indenting every continuation line, and prefixed each prototype with its
+/// whole Rust doc comment -- 40 and 29 lines of `# Safety` headings, markdown
+/// and `lib/headers.c` internals in a header that carries no prototype
+/// comment at all. See [`HEADER_H_DECLS`].
+const VERBATIM_FUNCTIONS: usize = 35;
 
 // Three further facts about the option metadata, recorded as comments
 // because they are shape rather than count:
@@ -4200,8 +4357,8 @@ fn run_self_checks() -> Result<(), Box<dyn Error>> {
     }
 
     // The per-header function partition has to account for every exported
-    // symbol exactly once. 100 symbols, 31 of them verbatim, so the eight
-    // partitions must contribute 69 function names between them. Counting
+    // symbol exactly once. 100 symbols, 35 of them verbatim, so the eight
+    // partitions must contribute 65 function names between them. Counting
     // them directly would require distinguishing functions from types, so
     // the weaker but still useful invariant is asserted: the partition
     // cannot contain more names than the header set can possibly declare.
@@ -4771,12 +4928,20 @@ fn callables_on(line: &str) -> Vec<String> {
 /// partition, and therefore generated, or present as a verbatim prototype,
 /// and therefore hand-written -- never both and never neither.
 ///
-/// Measured today: 69 claimed, 31 verbatim, disjoint, union 100 of 100,
-/// nothing unaccounted. The 31 are the four C-variadic setters, the five
-/// deprecated prototypes, the ten `curl_m*printf` functions and the twelve
+/// Measured today: 65 claimed, 35 verbatim, disjoint, union 100 of 100,
+/// nothing unaccounted. The 35 are the four C-variadic setters, the five
+/// deprecated prototypes, the ten `curl_m*printf` functions, the twelve
 /// whose frozen signature names a type this crate's Rust spelling cannot ask
-/// cbindgen to produce (cbindgen.toml, "Group 5e"), which matches
-/// [`VERBATIM_FUNCTIONS`] exactly.
+/// cbindgen to produce (cbindgen.toml, "Group 5e"), the two `urlapi.h`
+/// declares with a `CURLUPart` parameter and the two `header.h` declares,
+/// which matches [`VERBATIM_FUNCTIONS`] exactly.
+///
+/// This check is not defence in depth; it earns its place. Emptying
+/// `header.h`'s partition without adding its two prototypes to
+/// [`HEADER_H_DECLS`] made it fail immediately and by name -- "2 of the 100
+/// symbols ... are neither claimed by a header partition nor written
+/// verbatim: curl_easy_header, curl_easy_nextheader" -- which is the exact
+/// gap it exists to find.
 ///
 /// This is a declaration-coverage check, not an export check: it asserts the
 /// public headers will DECLARE all 100. Whether the library EXPORTS all 100 is
@@ -4946,7 +5111,7 @@ fn emit_rerun_directives(manifest: &Path) -> Result<(), Box<dyn Error>> {
     // changes the type of every handle-passing call and breaks the widespread
     // idiom of assigning a `CURL *` to a `void *` -- silently, in the
     // consumer's build rather than in ours. It also carries the `[export]`
-    // exclusions and the verbatim carriers that keep 31 prototypes and 53
+    // exclusions and the verbatim carriers that keep 35 prototypes and 53
     // `#define`s byte-identical to the authority. A build that proceeded
     // without it would either fail with a less obvious message or, worse,
     // succeed and promote headers that no longer match.

@@ -185,53 +185,47 @@ use crate::util::strparse::{
 use crate::util::timediff::TimeDiff;
 use crate::util::timeval::{timediff_ms, Clock, CurlTime};
 
-// THE FOUR SUBMODULES OF THIS DIRECTORY -- SPECIFIED, NOT YET DECLARED.
+// `--interface` resolution: `lib/if2ip.c` and `lib/if2ip.h`. The declaration
+// described below arriving WITH its file, exactly as that description
+// prescribes. It owns the five `IPV6_SCOPE_*` constants
+// (`lib/if2ip.h:29-33`) and the three-valued `if2ip_result_t` (`:41-45`);
+// neither is declared anywhere else in this directory, and neither may be.
+pub(crate) mod if2ip;
+
+// THE FOUR SUBMODULES OF THIS DIRECTORY -- THREE DECLARED, ONE SPECIFIED.
 //
 // AAP 0.3.1's layout line for this directory is
 // `curl-rs-lib/src/dns/{mod,resolver,doh,httpsrr,if2ip}.rs`, so the target
-// design is exactly four children and no more. None of the four has a file
-// at this commit, and a `mod` line without its file is E0583 -- a hard error
-// that no `#[allow]` can reach, because module resolution never gets far
-// enough to produce a lint. They are therefore DESCRIBED here with the
-// declaration each one takes, and each declaration arrives WITH its file in
-// the unit of work that creates it. This is the same discipline
-// `curl-rs-lib/src/lib.rs` states for its own not-yet-written subsystems,
-// and it was verified by compiling: declaring a child that does not exist
-// breaks the whole crate, so describing it is the only way this module root
-// can be delivered at all.
+// design is exactly four children and no more. A `mod` line without its file
+// is E0583 -- a hard error that no `#[allow]` can reach, because module
+// resolution never gets far enough to produce a lint. Each declaration
+// therefore arrives WITH its file in the unit of work that creates it, and
+// the ones still to come are DESCRIBED here with the declaration each takes.
+// This is the same discipline `curl-rs-lib/src/lib.rs` states for its own
+// not-yet-written subsystems, and it was verified by compiling: declaring a
+// child that does not exist breaks the whole crate, so describing it is the
+// only way this module root could be delivered at all.
 //
-// The declarations, verbatim, for whoever lands each file:
-//
-//     pub(crate) mod resolver;
-//     pub(crate) mod httpsrr;
-//     pub(crate) mod if2ip;
+// `if2ip` is declared immediately above; `resolver` and `httpsrr` are
+// declared below. `doh` is the one child still to come, and this is its
+// declaration verbatim, for whoever lands the file:
 //
 //     #[cfg(feature = "doh")]
 //     pub(crate) mod doh;
 //
-// --- resolver (pub(crate)) -----------------------------------------------
-// The resolution engine: `Curl_resolv` and its decision tree
-// (`lib/hostip.c:860-1012`), `lib/hostip4.c`, `lib/hostip6.c`, and the
-// entire threaded apparatus of `lib/asyn.h`, `lib/asyn-base.c`,
-// `lib/asyn-thrdd.c` and `lib/curl_threads.c`. It implements the
-// [`Resolver`] trait declared below and must not declare a second one. This
-// is where AAP 0.6.9 deletes the `alarm()` plus `sigsetjmp`/`siglongjmp`
-// timeout outright in favour of `tokio::time::timeout`. `hickory-dns`
-// support, if any, is `#[cfg(feature = "hickory-dns")]` INSIDE that file --
-// there is no `hickory.rs` and none may be created.
+// --- resolver (pub(crate)) -- DECLARED BELOW -----------------------------
+// The resolution engine, described in full on its declaration below.
 //
-// --- httpsrr (pub(crate)) ------------------------------------------------
+// --- httpsrr (pub(crate)) -- DECLARED BELOW ------------------------------
 // `lib/httpsrr.c` and `lib/httpsrr.h`: the HTTPS resource record, whose
-// `Curl_https_rrinfo` successor is the type [`DnsEntry`] will carry in the
-// slot described on that struct. Compiled UNCONDITIONALLY -- `httpsrr` is
-// not one of the fifteen features; only its advertisement in the version
-// banner is conditional, and that belongs to `crate::version`. It stores
-// [`AlpnId`] values as raw bytes in a four-element array and dedupes them
-// with `memchr` (`lib/httpsrr.c:57-61`), which is why the integers below are
-// not free to change.
-//
-// --- if2ip (pub(crate)) --------------------------------------------------
-// `lib/if2ip.c`: resolving `--interface` to a local address.
+// `Curl_https_rrinfo` successor is [`httpsrr::HttpsRrInfo`], the type
+// [`DnsEntry`] carries in its `hinfo` field. Compiled UNCONDITIONALLY --
+// `httpsrr` is not one of the fifteen features; only its advertisement in
+// the version banner is conditional, and that belongs to `crate::version`.
+// It stores [`AlpnId`] values as raw bytes in a four-element array and
+// dedupes them with `memchr` (`lib/httpsrr.c:57-61`), which is why the
+// integers below are not free to change, and it reads them back through
+// [`AlpnId::from_u8`].
 //
 // --- doh (pub(crate), behind the default-ON `doh` feature) ---------------
 // `lib/doh.c`: DNS-over-HTTPS. Feature-gated because `doh` is one of the
@@ -239,6 +233,26 @@ use crate::util::timeval::{timediff_ms, Clock, CurlTime};
 // the injected [`DohTransport`] below and must never write
 // `use crate::protocols`: a `dns -> protocols -> dns` import cycle is
 // exactly what that seam exists to avoid.
+
+/// The resolution engine: the decision tree, the system resolver and the
+/// deadline.
+///
+/// Supersedes `Curl_resolv` and its decision tree
+/// (`lib/hostip.c:860-1012`), `Curl_resolv_blocking`, `Curl_resolv_timeout`,
+/// `lib/hostip4.c`, `lib/hostip6.c`, and the entire threaded apparatus of
+/// `lib/asyn.h`, `lib/asyn-base.c`, `lib/asyn-thrdd.c` and
+/// `lib/curl_threads.c`. It implements the [`Resolver`] trait declared below
+/// and declares no second one.
+///
+/// This is where AAP 0.6.9 deletes the `alarm()` plus
+/// `sigsetjmp`/`siglongjmp` timeout outright in favour of
+/// `tokio::time::timeout`, and where the thread abstraction of
+/// `lib/curl_threads.c` is subsumed by `tokio::task::spawn_blocking`.
+/// `hickory-dns` support is `#[cfg(feature = "hickory-dns")]` INSIDE that
+/// file - there is no `hickory.rs` and none may be created.
+pub(crate) mod resolver;
+
+pub(crate) mod httpsrr;
 
 /// The size of C's cache-key buffer, and therefore the truncation rule.
 ///
@@ -530,7 +544,6 @@ pub(crate) mod msg {
 /// `#[repr(u8)]` is sound for every value here because the largest is 32.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
-#[allow(dead_code)] // No consumer yet; httpsrr.rs and conn/ consume it.
 pub(crate) enum AlpnId {
     /// `ALPN_none = 0` - nothing negotiated, or unrecognised input.
     None = 0,
@@ -544,9 +557,40 @@ pub(crate) enum AlpnId {
 
 impl AlpnId {
     /// The pinned integer, as the byte `lib/httpsrr.c` stores.
-    #[allow(dead_code)] // No consumer yet; httpsrr.rs stores this byte.
     pub(crate) const fn as_u8(self) -> u8 {
         self as u8
+    }
+
+    /// Recovers an identifier from the byte [`Self::as_u8`] produced.
+    ///
+    /// The inverse of [`Self::as_u8`], and it lives here for the reason that
+    /// constructor does: the four integers are declared above, so the only
+    /// place that can convert without copying them is this one. C needs no
+    /// counterpart because C's `unsigned char alpns[4]`
+    /// (`lib/httpsrr.h:52`) and its `enum alpnid` are the same integers with
+    /// a cast between them; Rust's enumeration is a distinct type, so the
+    /// cast becomes this function.
+    ///
+    /// [`None`] for any other byte, which is a *rejection* and not
+    /// [`AlpnId::None`]: `dns/httpsrr.rs` reads back an array whose writer it
+    /// does not control, so "zero, the terminator" and "a byte no
+    /// enumerator claims" have to be distinguishable. `AlpnId::None` itself
+    /// therefore round-trips as `Some(AlpnId::None)`.
+    ///
+    /// No `_` arm over the enumeration: the `match` is on the byte, so a
+    /// fifth identifier added above will not silently fail to decode -- the
+    /// two functions sit next to each other precisely so that adding one
+    /// means editing both in the same edit.
+    ///
+    /// [`None`]: Option::None
+    pub(crate) const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::None),
+            8 => Some(Self::H1),
+            16 => Some(Self::H2),
+            32 => Some(Self::H3),
+            _ => None,
+        }
     }
 
     /// Parses an ALPN protocol name off the wire.
@@ -579,7 +623,6 @@ impl AlpnId {
     /// The type is declared in `lib/hostip.h`, a source of this file, so its
     /// constructor belongs beside it; a second copy in the module that
     /// supersedes `lib/connect.c` would drift from this one.
-    #[allow(dead_code)] // No consumer yet; conn/ must delegate to it.
     pub(crate) fn from_wire(name: &[u8]) -> Self {
         match name.len() {
             2 => match name {
@@ -1197,22 +1240,19 @@ fn itoa_u16(value: u16) -> impl AsRef<str> {
 /// NULL (Unix domain sockets)"* case, and an [`Option`] would force every
 /// consumer to re-decide which of `None` and `Some("")` C meant.
 ///
-/// # The HTTPS-RR slot is specified and not yet present
+/// # The HTTPS-RR slot
 ///
 /// C carries `struct Curl_https_rrinfo *hinfo` under `USE_HTTPSRR`; in Rust
 /// the handling is unconditional, so the field takes no `cfg`. Its type is
-/// owned by `dns/httpsrr.rs`, which does not exist at this commit, and
-/// defining a placeholder here would create a second definition that file
-/// would then have to displace - the drift AAP 0.1.2 forbids. The field this
-/// struct gains with that file is therefore recorded rather than invented:
+/// owned by [`httpsrr`], which arrived with the field, so nothing here
+/// duplicates a definition that file would then have to displace - the drift
+/// AAP 0.1.2 forbids.
 ///
-/// ```text
-///     /// C's `hinfo`, unconditional here. Released by `Drop`.
-///     pub(crate) hinfo: Option<Box<httpsrr::HttpsRrInfo>>,
-/// ```
-///
-/// Its arrival is additive: nothing in this module reads `hinfo`, because
-/// nothing in `lib/hostip.c` does either beyond freeing it.
+/// The addition is additive in the strict sense: nothing in this module
+/// reads `hinfo`, because nothing in `lib/hostip.c` does either beyond
+/// freeing it (`:188-190`). Its writer is the DoH path
+/// (`lib/doh.c:1274`) and its reader is the HTTPS connection filter
+/// (`lib/cf-https-connect.c:670`), so this struct only carries it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // No consumer yet; resolver.rs and conn/ consume it.
 pub(crate) struct DnsEntry {
@@ -1233,6 +1273,18 @@ pub(crate) struct DnsEntry {
     /// C's `hostname`, ASCII-cased as the caller supplied it. The cache key
     /// is lowercased; this is not, because `show_resolve_info` prints it.
     pub(crate) hostname: String,
+    /// C's `hinfo`, unconditional here. Released by `Drop`, which is what
+    /// replaces `dnscache_entry_free`'s explicit `Curl_httpsrr_cleanup` plus
+    /// `curlx_free` pair (`lib/hostip.c:188-190`).
+    ///
+    /// [`None`] is C's `NULL`: the entry was resolved without an HTTPS
+    /// record, which is every entry [`DnsCache::mk_entry`] builds -- C's
+    /// `Curl_dnscache_mk_entry` leaves the field as its `calloc` found it
+    /// and the DoH path fills it in afterwards (`lib/doh.c:1274`).
+    ///
+    /// Boxed because the record is several times the size of the rest of this
+    /// struct and almost always absent, so the common entry stays small.
+    pub(crate) hinfo: Option<Box<httpsrr::HttpsRrInfo>>,
 }
 
 impl DnsEntry {
@@ -1659,6 +1711,10 @@ impl DnsCache {
             timestamp,
             hostport: port,
             hostname: hostname.to_owned(),
+            // `Curl_dnscache_mk_entry` writes no HTTPS record: its entry
+            // comes from `calloc`, so the field starts NULL and the DoH
+            // path assigns it later (`lib/doh.c:1274`).
+            hinfo: None,
         })
     }
 
@@ -3058,6 +3114,7 @@ mod tests {
             timestamp: at,
             hostport: port,
             hostname: host.to_owned(),
+            hinfo: None,
         }
     }
 

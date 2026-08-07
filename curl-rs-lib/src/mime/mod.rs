@@ -105,15 +105,17 @@
 //! [`contenttype`], which returns `None` for an unmatched suffix exactly as
 //! `Curl_mime_contenttype` (`lib/mime.c:1654`) returns `NULL`.
 //!
-//! **The `formdata` child arrives with its own file.** `lib/formdata.c`'s
-//! successor is `curl-rs-lib/src/mime/formdata.rs`, which does not exist yet.
-//! A `mod formdata;` line without that file is `error[E0583]`, which no
-//! attribute can suppress, so this file follows the convention
+//! **The `formdata` child arrived with its own file.** `lib/formdata.c`'s
+//! successor is [`crate::mime::formdata`], and it landed together with the
+//! single line
+//! `pub mod formdata;` beneath the imports below -- the convention
 //! `curl-rs-lib/src/lib.rs` states for the whole crate and that
-//! `curl-rs-lib/src/protocols/mod.rs` already applies -- each declaration
-//! lands in the same unit of work as the file it names. Everything
-//! `formdata.rs` needs is `pub(crate)` here, so adding the single line
-//! `pub mod formdata;` beneath the imports is the whole of its integration.
+//! `curl-rs-lib/src/protocols/mod.rs` already applies: each declaration lands
+//! in the same unit of work as the file it names, because a `mod formdata;`
+//! line without that file is `error[E0583]`, which no attribute can suppress.
+//! That one line was the whole of its integration; everything the child needs
+//! from here was already `pub(crate)` or private-to-the-ancestor, which a
+//! child module may name, so nothing had to be widened for it.
 //!
 //! # What this module deliberately does not do
 //!
@@ -138,6 +140,19 @@ use crate::util::dynbuf::DynBuf;
 use crate::util::slist::SList;
 use crate::util::strcase::{casecompare, checkprefix, ncasecompare};
 use crate::util::{basename, sotouz, uztoso, CurlOffT};
+
+// The `formdata` child, declared in the same unit of work as the file it
+// names -- the convention `curl-rs-lib/src/lib.rs` states for the whole crate
+// and that this module's documentation records above. `lib/formdata.c`'s
+// successor now exists, so the declaration this module described as "the
+// whole of its integration" lands here.
+//
+// `pub`, because the three symbols it backs -- `curl_formadd`,
+// `curl_formfree` and `curl_formget` (`lib/libcurl.def:24-26`) -- are exported
+// by `curl-rs-ffi`, which reaches them through this path. Everything the child
+// needs from this module is `pub(crate)` or private-to-the-ancestor, which a
+// child module may name; nothing here had to be widened for it.
+pub mod formdata;
 
 // ---------------------------------------------------------------------------
 // Constants transcribed from lib/mime.h
@@ -2265,8 +2280,11 @@ impl MimePart {
     /// matching the C's `while(bufsize)` never running.
     ///
     /// This is the entry point a transfer's client reader drives, and the one
-    /// `formdata.rs` will drive for `curl_formget`.
-    #[allow(dead_code)] // consumer module not landed: crate::transfer, not yet landed
+    /// `formdata::form_get` drives for `curl_formget`.
+    // The allowance this carried -- "consumer module not landed:
+    // crate::transfer" -- is gone, because a consumer has landed:
+    // `formdata::form_get` drives this entry point for `curl_formget`
+    // (`lib/formdata.c:645`). `crate::transfer` will be the second.
     pub(crate) fn read(&mut self, buffer: &mut [u8]) -> ReadStatus {
         loop {
             let mut call = ReadCall::new();
@@ -3215,7 +3233,11 @@ impl MimePart {
     ///
     /// Whatever [`escape_string`] reports for a name or filename that exceeds
     /// [`MAX_INPUT_LENGTH`].
-    #[allow(dead_code)] // consumer module not landed: crate::protocols::http1, not yet landed
+    // The allowance this carried -- "consumer module not landed:
+    // crate::protocols::http1" -- is gone, because a consumer has landed:
+    // `formdata::form_get` prepares the top part's headers with the four
+    // arguments `lib/formdata.c:640-641` passes. `crate::protocols::http1`
+    // will be the second.
     pub(crate) fn prepare_headers(
         &mut self,
         contenttype: Option<&str>,
@@ -3865,7 +3887,12 @@ impl MimePart {
     /// Retained as an explicit method rather than left to `Drop` because
     /// `Curl_mime_duppart` calls it to roll back a partial duplication, and
     /// that caller needs the part to survive the call.
-    #[allow(dead_code)] // consumer module not landed: crate::easy::setopt, replacing a CURLOPT_MIMEPOST
+    // The allowance this carried -- "consumer module not landed:
+    // crate::easy::setopt, replacing a CURLOPT_MIMEPOST" -- is gone, because a
+    // consumer has landed: `formdata::get_form_data` cleans the destination
+    // part before it builds and again on failure (`lib/formdata.c:727`,
+    // `:838`), and `formdata::form_get` cleans the top part before returning
+    // (`:657`). `crate::easy::setopt` will be the third.
     pub(crate) fn clean(&mut self) {
         self.cleanup_content();
         self.curlheaders.clear();

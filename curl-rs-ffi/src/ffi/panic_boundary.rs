@@ -6,8 +6,8 @@
 //!
 //! Every exported entry point routes its body through exactly one of the four
 //! functions here. That is the rule for all 100 names in `lib/libcurl.def`;
-//! measured today, 24 of the 100 are defined and every one of those 24 obeys
-//! it, with the remaining 76 unwritten. The rule is stated as a rule rather
+//! measured today, 44 of the 100 are defined and every one of those 44 obeys
+//! it, with the remaining 56 unwritten. The rule is stated as a rule rather
 //! than as an accomplished fact because a future export that skipped this
 //! module would be a defect, and a comment claiming completeness would hide
 //! it. See the crate-level documentation for the fallback each return type

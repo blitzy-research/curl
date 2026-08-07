@@ -80,6 +80,36 @@
 /// `EXPIRE_SPEEDCHECK` request rather than making it.
 pub(crate) mod progress;
 
+/// The client reader and writer chains: supersedes `lib/sendf.c` and
+/// `lib/sendf.h`.
+///
+/// The shared substrate of this directory. Every response byte in the crate
+/// reaches the application through `ClientIo::client_write` and every request
+/// byte leaves it through `ClientIo::client_read`, so `writeout`, `chunked`,
+/// `content_encoding` and `request` all compose out of the two traits declared
+/// here -- `ClientWriter` and `ClientReader` -- rather than out of a
+/// per-protocol arrangement of their own.
+///
+/// It names neither this module root nor `writeout`: `lib/sendf.c` includes
+/// `transfer.h`, `cw-out.h` and `cw-pause.h`, and all three include `sendf.h`
+/// straight back, so the C's include cycle would become a module cycle. What
+/// the C reaches through those includes for arrives instead as three narrow
+/// seams the dependency-last engine implements -- `TransferControl` for the
+/// three operations that belong to the transfer loop, `ClientIoFactory` for the
+/// two writer stages `lib/cw-out.c` and `lib/cw-pause.c` own, and `TraceSink`
+/// for the five diagnostic emitters. The base writer stack is still assembled
+/// HERE, in the exact order of `lib/sendf.c:325-368`, because that order is the
+/// contract: the pause stage is installed FIRST and therefore ends up BEHIND
+/// the download stage, so a length check happens before any byte is buffered
+/// for a paused transfer.
+///
+/// It reads no clock either. The one instant it needs arrives as an injected
+/// [`Clock`], which is what lets the upload rate-limit clamp and the
+/// `TIMER_STARTTRANSFER` record be asserted deterministically.
+///
+/// [`Clock`]: crate::util::timeval::Clock
+pub(crate) mod sendf;
+
 /// The token bucket behind `--limit-rate`: supersedes `lib/ratelimit.c` and
 /// `lib/ratelimit.h`.
 ///

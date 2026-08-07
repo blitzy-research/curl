@@ -50,23 +50,28 @@
 //! distinction between it and what exists today is load-bearing rather than
 //! pedantic, so both are stated:
 //!
-//! * MEASURED, at the commit that completed `misc`: 39 of the 100 are defined,
-//!   61 are not, and 0 extra symbols are exported. Two independent measurements
+//! * MEASURED, at the commit that completed `url` and `mime`: 56 of the 100
+//!   are defined, 44 are not, and 0 extra symbols are exported. Two
+//!   independent measurements
 //!   agree on the export set -- `nm -D --defined-only` over the built cdylib,
 //!   and `build.rs`'s `undefined_abi_exports` computed from `lib/libcurl.def` --
 //!   and `build.rs` prints the live figure as a `cargo:warning` on every build,
 //!   which is the authority to consult rather than this sentence. The
-//!   declarations below are therefore SIX symbol-family modules, not twelve:
-//!   `easy`, `escape`, `global`, `misc`, `slist` and `strerror`. `escape` does
+//!   declarations below are therefore EIGHT symbol-family modules, not twelve:
+//!   `easy`, `escape`, `global`, `mime`, `misc`, `slist`, `strerror` and
+//!   `url`.
+//!   `escape` does
 //!   not appear in the twelve-name list above because it is not a family of its
 //!   own -- it now holds only `curl_easy_escape` and `curl_easy_unescape`, which
 //!   the target partition assigns to `easy`; the two legacy names `curl_escape`
 //!   and `curl_unescape` have moved to `misc`, which the same partition assigns
 //!   them to, and they forward into `escape` exactly as `lib/escape.c:36-45`
 //!   forwards.
-//! * The 61 that are absent are the remainder of `curl_easy_*` (15), all of
-//!   `curl_multi_*` (21), `curl_share_*` (3), one `curl_global_*`,
-//!   `curl_mime_*` (12), the legacy `curl_form*` trio and `curl_url*` (5).
+//! * The 44 that are absent are the remainder of `curl_easy_*` (15), all of
+//!   `curl_multi_*` (21), `curl_share_*` (3), one `curl_global_*` and the
+//!   legacy `curl_form*` trio. Neither `curl_mime_*` nor `curl_url*` is among
+//!   them any longer: `mime` carries all 12 of the first and `url` all of the
+//!   second.
 //!   The `curl_ws_*` quartet is likewise unwritten. They are unwritten work,
 //!   not a defect: the modules that back them are assigned to units of work
 //!   beyond this checkpoint, and `include/curl/` is deliberately NOT
@@ -80,7 +85,7 @@
 //!   `libcurl.a` and absent entirely from `libcurl.so`, because rustc's cdylib
 //!   export list covers only the `#[no_mangle] pub extern` items it knows of
 //!   and the section is then collected. `build.rs`'s source-scanning count
-//!   therefore reads 39 where `nm` over the shared object reads 34. That gap is
+//!   therefore reads 56 where `nm` over the shared object reads 51. That gap is
 //!   `printf`'s to close and is recorded here so the two numbers are not
 //!   mistaken for a discrepancy in this partition.
 //!
@@ -105,18 +110,27 @@ pub(crate) mod opts;
 pub(crate) mod panic_boundary;
 pub(crate) mod types;
 
-// The symbol-family modules that EXIST at this commit -- six of the twelve the
-// target partition names. Each owns a disjoint slice of the 100 names in
+// The symbol-family modules that EXIST at this commit -- eight of the twelve
+// the target partition names. Each owns a disjoint slice of the 100 names in
 // `lib/libcurl.def`, and `build.rs`'s `check_export_coverage` asserts that the
-// partition stays disjoint and exhaustive as families land. The six below
-// carry 24 definitions between them; `multi`, `share`, `mime`, `form`, `url`
-// and `ws` are not yet declared because they are not yet written.
+// partition stays disjoint and exhaustive as families land. The eight below
+// carry 46 definitions between them; `multi`, `share`, `form` and `ws` are not
+// yet declared because they are not yet written. With `printf`'s five
+// `#[no_mangle]` forms that is the 51 `nm -D --defined-only` reports over the
+// built cdylib, which is the figure to trust: it was measured, not accumulated
+// from the previous value of this sentence.
+//
+// `url` and `mime` are the newest of the eight. `mime` carries the whole
+// `curl_mime_*` family -- all 12 of its names -- and `url` the URL API's
+// exported entry points; none of either family's names lives anywhere else.
 pub(crate) mod easy;
 pub(crate) mod escape;
 pub(crate) mod global;
+pub(crate) mod mime;
 pub(crate) mod misc;
 pub(crate) mod slist;
 pub(crate) mod strerror;
+pub(crate) mod url;
 
 // The `curl_m*printf` family, declared apart from the six above because it is
 // unlike every other family in this crate in two ways.
