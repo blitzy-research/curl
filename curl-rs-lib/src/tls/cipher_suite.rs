@@ -886,9 +886,10 @@ impl fmt::Display for SuiteDiagnostic<'_> {
     ///    that layer by design, and only the sender can know that this
     ///    particular payload is a single line.
     /// 4. **Safe by default beats safe if remembered.** The consumer of these
-    ///    diagnostics is `tls/rustls_backend.rs`, which does not exist yet. If
-    ///    the raw form were the one `{diagnostic}` produced, the natural call --
-    ///    the one this module's own example shows -- would be the unsafe one.
+    ///    diagnostics is `tls/rustls_backend.rs`, and safety there must not
+    ///    rest on every call site remembering. If the raw form were the one
+    ///    `{diagnostic}` produced, the natural call -- the one this module's
+    ///    own example shows -- would be the unsafe one.
     ///
     /// The raw spelling stays reachable through
     /// [`spelling`](Self::spelling) for a caller that needs the original bytes.

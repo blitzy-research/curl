@@ -148,10 +148,51 @@ pub(crate) mod shutdown;
 /// [`select`], [`filters`] and [`shutdown`]: the allowances belong on the items.
 pub(crate) mod socket;
 
+/// Dual-stack connection racing -- supersedes `lib/cf-ip-happy.c` and
+/// `lib/cf-ip-happy.h`.
+///
+/// The fifth module of this directory, and it consumes three of the four before
+/// it: its candidate filters come from [`socket`]'s factories, each candidate is
+/// an independent [`filters::FilterChain`] it drives itself, and the readiness it
+/// waits on is a [`select::EasyPollset`]. Nothing in `cf-socket.h`,
+/// `cfilters.h` or `select.h` names anything from `cf-ip-happy.h`, so the
+/// direction is one-way -- and `lib/cf-socket.h:84-89` says why the dependency
+/// runs this way round: a socket filter *"will not touch any connection/data
+/// flags and can be used in happy eyeballing"*, which is a property the socket
+/// module provides and this one consumes.
+///
+/// It owns the IPv6-first alternating race of `struct cf_ip_ballers`: two
+/// address streams, one candidate per address tried, a delay between families,
+/// and a winner that is TRANSFERRED into the main chain. C links the candidates
+/// with an intrusive `next` pointer and reaches each one's filter through a raw
+/// pointer it also stores on the connection; here each candidate owns its whole
+/// subchain by value, so a losing socket cannot leak, be closed twice, or become
+/// reachable from the main chain before it has won.
+///
+/// # The deadline contract this module shares with this file
+///
+/// `Curl_timeleft_ms` (`lib/connect.c:105-141`) is the transfer's own deadline
+/// and it belongs to THIS file, which supersedes `lib/connect.c`. The racing
+/// module consumes it through the injected
+/// [`socket::Deadline`] interface and duplicates no timeout policy: it neither
+/// stores a budget nor computes one. The convention that travels across the seam
+/// is the C's exactly -- **zero means no limit and a NEGATIVE value means the
+/// deadline has already passed** -- and the implementor owes the rest:
+/// `Curl_timeleft_now_ms` computes the CONNECT limit and the OPERATION limit
+/// separately and applies the fake-zero-to-`-1` correction to EACH of them
+/// (`lib/connect.c:117-118`, `:127-128`) before folding them with `CURLMIN`,
+/// because a computed exact zero must not be misread as "unlimited". Applying it
+/// once, to the folded answer, would report no limit for a transfer whose
+/// deadline expired at that instant.
+///
+/// No `#[allow(dead_code)]` on this declaration, for the same reason as
+/// [`select`], [`filters`] and [`shutdown`]: the allowances belong on the items.
+pub(crate) mod happy_eyeballs;
+
 /// The connection pool -- supersedes `lib/conncache.c` and
 /// `lib/conncache.h`.
 ///
-/// The fifth module of this directory, and it consumes the first three of
+/// The sixth module of this directory, and it consumes the first three of
 /// them: it owns connections whose teardown half is [`shutdown`]'s
 /// [`shutdown::ShuttingDownConnection`], it hands them to
 /// [`shutdown::ShutdownQueue`] or to [`shutdown::terminate`] when they are

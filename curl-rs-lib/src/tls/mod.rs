@@ -104,7 +104,7 @@
 //! `include/curl/curl.h`, so no value is invented and no enumeration is
 //! renumbered. The name is `rustls`.
 //!
-//! # This directory's five children, and why four are declared
+//! # This directory's five children, all of them declared
 //!
 //! The module root owns five children:
 //!
@@ -114,23 +114,21 @@
 //! | [`keylog`] | `lib/vtls/keylog.c` |
 //! | [`verify`] | `lib/vtls/x509asn1.c`, `lib/vtls/hostcheck.c` |
 //! | [`session_cache`] | `lib/vtls/vtls_scache.c`, `lib/vtls/vtls_spack.c` |
-//! | `rustls_backend` | `lib/vtls/rustls.c` |
+//! | [`rustls_backend`] | `lib/vtls/rustls.c` |
 //!
-//! Four are declared below because four exist. The remaining one is named
-//! here rather than declared for a measured reason and not a stylistic one:
+//! All five are declared below because all five exist. Each one arrived
+//! WITH its file, for a measured reason and not a stylistic one:
 //! `mod rustls_backend;` without a `rustls_backend.rs` beside it is rustc
 //! `E0583`, a hard error that would stop this crate compiling and take every
 //! downstream gate with it -- the symbol-parity comparison, the 129 example
-//! compilations and the fixture corpus all need a library that builds. A
-//! declaration therefore arrives with its file, which is the convention the
-//! whole tree already follows: `conn/mod.rs` declares five of its planned
-//! children, `protocols/mod.rs` one, `multi/mod.rs` two, and the crate root
-//! records the same for this directory at `lib.rs:726-729`.
+//! compilations and the fixture corpus all need a library that builds. That
+//! is the convention the whole tree follows: `conn/mod.rs` declares six of
+//! its planned children, `protocols/mod.rs` one, `multi/mod.rs` three, and
+//! the crate root records the same for this directory at `lib.rs:725-729`.
 //!
-//! What the absent child will own is fixed, so that nothing here has to be
-//! revisited when it lands. `rustls_backend` owns the one [`TlsBackend`]
-//! implementation, following the mapping `lib/vtls/rustls.c` already
-//! established rather than reinventing it. [`session_cache`] already owns the
+//! What each child owns is fixed. [`rustls_backend`] owns the one
+//! [`TlsBackend`] implementation, following the mapping `lib/vtls/rustls.c`
+//! already established rather than reinventing it. [`session_cache`] owns the
 //! resumption cache, its serialisation and the peer session-cache key -- which
 //! is why [`SslPeer::scache_key`] is *supplied* to this module rather than
 //! computed in it: `Curl_ssl_peer_key_make` lives in `vtls_scache.c`, not in
@@ -187,6 +185,17 @@ pub(crate) mod verify;
 /// run and reads it in another, possibly across builds. It is therefore
 /// reproduced byte for byte and held there by golden tests.
 pub(crate) mod session_cache;
+
+/// The one [`TlsBackend`] implementation: supersedes `lib/vtls/rustls.c`.
+///
+/// Declared here because the file now exists beside this one, which is the
+/// convention the note above records: `mod rustls_backend;` without
+/// `rustls_backend.rs` is rustc `E0583`, so a declaration arrives with its
+/// file. It owns the native rustls 0.23.42 session -- the configuration, the
+/// connection, the two safe I/O adapters over the filter below, and the
+/// `plain_out_buffered` retry protocol -- and it follows `lib/vtls/rustls.c`'s
+/// existing curl-to-rustls mapping rather than reinventing it.
+pub(crate) mod rustls_backend;
 
 use core::fmt;
 use std::rc::Rc;

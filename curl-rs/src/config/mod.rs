@@ -121,23 +121,28 @@
 //! `?`. Inventing matching semantics the C never had is exactly the behaviour
 //! change AAP section 0.8.2 forbids.
 //!
-//! # The four sibling modules -- specified target design, not declared
+//! # The four sibling modules -- declared as each one arrives
 //!
-//! AAP section 0.3.1 caps this folder at five files, and the other four are
-//! absent from this checkout. A `mod` line without its file is `E0583`, a hard
-//! error that no `#[allow]` can reach because module resolution never gets far
-//! enough to produce a lint, so declaring them would stop the crate compiling
-//! rather than merely assert something unverified. Each declaration arrives
-//! with its file, and every one is `pub(crate)` -- that visibility is part of
-//! the specification, and the alphabetical order is what
-//! `rustfmt.toml`'s `reorder_modules` produces:
+//! AAP section 0.3.1 caps this folder at five files. A `mod` line without its
+//! file is `E0583`, a hard error that no `#[allow]` can reach because module
+//! resolution never gets far enough to produce a lint, so declaring a module
+//! ahead of its file would stop the crate compiling rather than merely assert
+//! something unverified. Each declaration therefore arrives with its file, and
+//! every one is `pub(crate)` -- that visibility is part of the specification,
+//! and the alphabetical order is what `rustfmt.toml`'s `reorder_modules`
+//! produces:
 //!
 //! ```text
-//! pub(crate) mod findfile;     // src/tool_findfile.c
+//! pub(crate) mod findfile;     // src/tool_findfile.c   -- declared below
 //! pub(crate) mod parseconfig;  // src/tool_parsecfg.c
 //! pub(crate) mod ssls;         // src/tool_ssls.c
 //! pub(crate) mod to_setopts;   // src/config2setopts.c, src/tool_setopt.c
 //! ```
+//!
+//! `findfile` has landed and is declared; the remaining three are still absent
+//! from this checkout and stay undeclared until they are not.
+
+pub(crate) mod findfile;
 
 use std::collections::TryReserveError;
 use std::fs::File;

@@ -722,10 +722,10 @@ pub mod url;
 ///
 /// `pub(crate)`: the multi-backend dispatch collapses to one implementation,
 /// and backend identity reaches C through [`version`].
-/// **Partially delivered.** Of this module's planned children,
-/// `cipher_suite`, `keylog`, `verify` and `session_cache` exist; only the
-/// rustls backend arrives with its file -- the backend trait itself lives in
-/// the module root. `tls/mod.rs` declares exactly those four.
+/// **Delivered.** All five of this module's planned children exist --
+/// `cipher_suite`, `keylog`, `verify`, `session_cache` and `rustls_backend` --
+/// while the backend trait itself lives in the module root. `tls/mod.rs`
+/// declares exactly those five.
 pub(crate) mod tls;
 
 /// The multi interface: many transfers, one driver.
@@ -811,12 +811,11 @@ pub(crate) mod dns;
 /// `pub(crate)`: no exported symbol is backed from here directly. Connection
 /// state reaches C through [`multi`] and [`easy`], which is what keeps it out
 /// of the ABI's reach.
-/// **Partially delivered.** Of this module's planned children, `select`,
-/// `filters`, `shutdown`, `socket` and `pool` exist. `select` came first as
-/// the foundation the others consume, since `lib/select.c` and
-/// `lib/select.h` name the filter chain nowhere while `lib/cfilters.c:33` and
-/// `lib/cf-socket.c:64` both include `select.h`. Only Happy Eyeballs arrives
-/// with its file.
+/// **Delivered.** All six of this module's planned children exist --
+/// `select`, `filters`, `shutdown`, `socket`, `happy_eyeballs` and `pool`.
+/// `select` came first as the foundation the others consume, since
+/// `lib/select.c` and `lib/select.h` name the filter chain nowhere while
+/// `lib/cfilters.c:33` and `lib/cf-socket.c:64` both include `select.h`.
 pub(crate) mod conn;
 
 /// The easy interface: one handle, one transfer.
@@ -1057,36 +1056,29 @@ pub(crate) mod proxy;
 /// states for the whole crate.
 pub mod mime;
 
-// THE ONE REMAINING SUBSYSTEM -- SPECIFIED TARGET DESIGN, NOT DECLARED
-//
-// The AAP's module graph gives this crate one further subsystem -- `share`.
-// The ten beyond it -- `easy`, `conn`, `dns`, `headers`, `cookies`, `auth`,
-// `transfer`, `protocols`, `proxy` and `mime` -- are declared above now that
-// the first of each one's children exists. `share` alone has no file yet, and
-// a `mod` line without its file is E0583 -- a hard error that no `#[allow]`
-// can reach, because module resolution never gets far enough to produce a
-// lint. It is therefore DESCRIBED here, in the same dependency order the
-// declarations above follow, and its declaration arrives WITH its file in the
-// unit of work that creates it.
-//
-// The visibility recorded for each is part of the specification, not a
-// suggestion: `pub` appears only where `curl-rs-ffi` or `curl-rs`
-// demonstrably needs it to back a named family of the 100 exported symbols.
-//
-// --- share (pub) -- lib/curl_share.c -------------------------------------
-// Cookie, DNS, TLS-session, HSTS and connection state can be shared across
-// handles, with the caller's lock and unlock callbacks honoured. C guards
-// this with the hand-rolled `curl_simple_lock` of lib/easy_lock.h -- an
-// `SRWLOCK` on Windows, an `atomic_int` spin loop with
-// `__builtin_ia32_pause` or an `aarch64` `yield` where C11 atomics exist, a
-// `pthread_mutex_t` otherwise, and no thread safety at all when none of
-// those is available. Rust's `std::sync` primitives replace all four cases,
-// which is why the `threadsafe` capability is advertised unconditionally.
-//
-// `pub` because it backs the four exported `curl_share_*` symbols:
-// `curl_share_init`, `curl_share_setopt`, `curl_share_cleanup` and
-// `curl_share_strerror`.
-//
+/// State deliberately shared between easy handles.
+///
+/// Supersedes `lib/curl_share.c` and `lib/curl_share.h`. Cookie, DNS,
+/// TLS-session, HSTS, Public-Suffix-List and connection state can be shared
+/// across handles, with the caller's `CURLSHOPT_LOCKFUNC` and
+/// `CURLSHOPT_UNLOCKFUNC` callbacks honoured at exactly the points the C
+/// invokes them. C guards its own global initialization with the hand-rolled
+/// `curl_simple_lock` of `lib/easy_lock.h` -- an `SRWLOCK` on Windows, an
+/// `atomic_int` spin loop with `__builtin_ia32_pause` or an `aarch64`
+/// `yield` where C11 atomics exist, a `pthread_mutex_t` otherwise, and no
+/// thread safety at all when none of those is available -- and gives the
+/// share itself no internal lock whatsoever, delegating that entirely to the
+/// application's callbacks. Rust's `std::sync` primitives replace all four
+/// cases, which is why the `threadsafe` capability is advertised
+/// unconditionally, and they additionally give the share the interior
+/// locking the C leaves to its caller.
+///
+/// `pub` because it backs the four exported `curl_share_*` symbols:
+/// `curl_share_init`, `curl_share_setopt`, `curl_share_cleanup` and
+/// `curl_share_strerror` -- rows 81 to 84 of the 100 names in
+/// `lib/libcurl.def`.
+pub mod share;
+
 // MODULE MAP -- the remaining subsystems of the target design.
 //
 // The entries below name the rest of this crate's module graph and the C
@@ -1119,21 +1111,12 @@ pub mod mime;
 // unwritten is `formdata`, a child of that module rather than a subsystem of
 // its own.
 //
-// The share interface: state deliberately shared between easy handles.
-//
-// Supersedes `lib/curl_share.c`. Cookie, DNS, TLS-session, HSTS and
-// connection state can be shared across handles, with the caller's
-// lock and unlock callbacks honoured. C guards this with the hand-rolled
-// `curl_simple_lock` of `lib/easy_lock.h` -- an `SRWLOCK` on Windows, an
-// `atomic_int` spin loop with `__builtin_ia32_pause` or an `aarch64`
-// `yield` where C11 atomics exist, a `pthread_mutex_t` otherwise, and no
-// thread safety at all when none of those is available. Rust's
-// `std::sync` primitives replace all four cases, which is why the
-// `threadsafe` capability is advertised unconditionally.
-//
-// `pub` because it backs the four exported `curl_share_*` symbols:
-// `curl_share_init`, `curl_share_setopt`, `curl_share_cleanup` and
-// `curl_share_strerror`.
+// The share interface is no longer described here either: it is DECLARED
+// above as `pub mod share`, which carries the detail this entry used to,
+// because `lib/curl_share.c`'s successor now exists. With it the map holds
+// no unwritten subsystem at all -- every entry above names a module that is
+// declared, and what remains unwritten is children of those modules rather
+// than subsystems of their own.
 //
 // THE OPTIONAL ALLOCATION LOG -- `memdebug`, default OFF.
 //
@@ -1204,15 +1187,18 @@ static MEMDEBUG_ALLOCATOR: crate::ffi::sys::memdebug::TrackingAllocator =
 //
 // TWO EXCLUSIONS, stated rather than silently omitted:
 //
-//  * The easy, multi and share HANDLE TYPES are NOT re-exported. Those
-//    modules are authored separately and do not exist at this commit, so any
-//    type name written here would be an unverified claim about code this file
-//    cannot inspect -- and the discipline this work is held to is that claims
-//    are evidenced, not asserted. Nothing is lost: `easy`, `multi` and
-//    `share` are all `pub`, so a consumer names the type through its owning
-//    module, which is the one-import-per-type discipline in any case. Adding
-//    a re-export later is a compatible change; a wrong one is a build break
-//    for two other crates.
+//  * The easy, multi and share HANDLE TYPES are NOT re-exported. The easy and
+//    multi handles are authored separately and do not exist at this commit,
+//    so any type name written here for them would be an unverified claim
+//    about code this file cannot inspect -- and the discipline this work is
+//    held to is that claims are evidenced, not asserted. `share::Share` does
+//    exist, and it is left unexported for consistency with the other two
+//    rather than for want of a name: re-exporting one handle type and not its
+//    siblings would make the root's surface depend on authoring order. Nothing
+//    is lost: `easy`, `multi` and `share` are all `pub`, so a consumer names
+//    the type through its owning module, which is the one-import-per-type
+//    discipline in any case. Adding a re-export later is a compatible change;
+//    a wrong one is a build break for two other crates.
 //  * No blanket `pub use error::*;` or `pub use version::*;`. A glob
 //    re-export makes the crate's public surface implicit, and the C ABI it
 //    backs is the opposite of implicit.
