@@ -820,7 +820,12 @@ compile_error!(
 /// Dynamically dispatched so that the parser exists once for both
 /// implementations: the real C argument list, and the fixed list [`out_double`]
 /// uses for its own recursive conversion.
-trait ArgSource {
+/// `pub(crate)` because `super::form` reads the identical slots for
+/// `curl_formadd`'s open-ended `CURLFORM_*` list, and the per-ABI slot
+/// arithmetic below is the memory-safety-critical part of both: a second copy
+/// of it could drift, and a drift would read a caller's stack through the wrong
+/// record. One implementation, two consumers.
+pub(crate) trait ArgSource {
     fn next_str(&mut self) -> *const c_char;
     fn next_ptr(&mut self) -> *mut c_void;
     fn next_int(&mut self) -> c_int;
@@ -903,7 +908,9 @@ pub(crate) type CVaList = c_char;
 /// over. What this module does guarantee is that it never reads a slot the
 /// format did not direct it to: the parser fetches exactly one argument per
 /// conversion, in the order and of the type the conversion names.
-struct VaArgs {
+/// `pub(crate)` for the reason [`ArgSource`] gives: `super::form` walks the
+/// same slots with the same cursor rather than with a second copy of it.
+pub(crate) struct VaArgs {
     /// On x86-64 and AAPCS64 this points at the caller's own record and is
     /// mutated through, which is what C's `va_arg` does to a `va_list` passed
     /// by pointer -- and the reason C forbids reusing one afterwards. On Apple
@@ -1075,7 +1082,7 @@ impl VaArgs {
     /// have supplied at least as many arguments, of exactly the types, as the
     /// accompanying format string names; that is `printf`'s contract and no
     /// implementation in any language can check it.
-    const unsafe fn new(list: *mut CVaList) -> Self {
+    pub(crate) const unsafe fn new(list: *mut CVaList) -> Self {
         Self { list }
     }
 

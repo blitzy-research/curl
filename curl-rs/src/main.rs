@@ -117,6 +117,12 @@
 //!   `src/tool_writeout.c`, `src/tool_formparse.c`, `src/tool_dirhie.c`,
 //!   `src/tool_filetime.c`, `src/tool_xattr.c`: every byte the tool emits and
 //!   everything it does to a file it has saved.
+//! - [`config`] -- `src/tool_cfgable.c` and `src/slist_wc.c`: the
+//!   `GlobalConfig` and `OperationConfig` model, and the init and teardown
+//!   lifecycle that `src/tool_main.c:186` and `:192` drive. This is where the
+//!   file-scope `struct GlobalConfig *global` of `src/tool_cfgable.c:33-34`
+//!   does *not* go: the value is constructed here and threaded down by
+//!   reference, so nothing can reach it without being handed it.
 //! - [`callbacks`] -- the seven `src/tool_cb_*.c` units the tool installs on
 //!   the easy handle.
 //! - [`terminal`] -- `src/terminal.c` and `src/tool_getpass.c`.
@@ -130,6 +136,7 @@
 mod ca_embed;
 mod callbacks;
 mod cli;
+mod config;
 mod output;
 mod terminal;
 mod urlglob;

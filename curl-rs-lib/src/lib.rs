@@ -722,10 +722,10 @@ pub mod url;
 ///
 /// `pub(crate)`: the multi-backend dispatch collapses to one implementation,
 /// and backend identity reaches C through [`version`].
-/// **Partially delivered.** Of this module's planned children, only
-/// `cipher_suite` and `keylog` exist yet; the backend trait, the rustls
-/// backend, certificate verification and the session cache arrive with their
-/// files. `tls/mod.rs` is the module root and declares exactly those two.
+/// **Partially delivered.** Of this module's planned children,
+/// `cipher_suite`, `keylog`, `verify` and `session_cache` exist; only the
+/// rustls backend arrives with its file -- the backend trait itself lives in
+/// the module root. `tls/mod.rs` declares exactly those four.
 pub(crate) mod tls;
 
 /// The multi interface: many transfers, one driver.
@@ -779,12 +779,12 @@ pub mod multi;
 /// than reached for globally, which is what makes them testable without a
 /// network and what puts the 80% line-coverage gate of specification 0.8.4
 /// within reach at all.
-/// **Partially delivered.** `dns/mod.rs` is the module root and carries the
-/// cache, the entry and address types, the ALPN identifiers, the
-/// `CURLOPT_RESOLVE` loader and the injection seams; the four children the
-/// AAP names -- `resolver`, `doh`, `httpsrr` and `if2ip` -- are specified in
-/// that file, and each declaration arrives WITH its file for the E0583
-/// reason this file records for its own remaining subsystems.
+/// `dns/mod.rs` is the module root and carries the cache, the entry and
+/// address types, the ALPN identifiers, the `CURLOPT_RESOLVE` loader and the
+/// injection seams; the four children the AAP names -- `resolver`, `doh`,
+/// `httpsrr` and `if2ip` -- are all declared, each having arrived WITH its
+/// file for the E0583 reason this file records for its own remaining
+/// subsystems.
 pub(crate) mod dns;
 
 /// Connection establishment, the filter chain and socket readiness.
@@ -811,12 +811,12 @@ pub(crate) mod dns;
 /// `pub(crate)`: no exported symbol is backed from here directly. Connection
 /// state reaches C through [`multi`] and [`easy`], which is what keeps it out
 /// of the ABI's reach.
-/// **Partially delivered.** Of this module's planned children, only `select`
-/// exists yet -- the foundation the other six consume, since `lib/select.c`
-/// and `lib/select.h` name the filter chain nowhere while
-/// `lib/cfilters.c:33` and `lib/cf-socket.c:64` both include `select.h`. The
-/// filter chain, the socket filter, Happy Eyeballs, the connection pool and
-/// the shutdown sequencer arrive with their files.
+/// **Partially delivered.** Of this module's planned children, `select`,
+/// `filters`, `shutdown`, `socket` and `pool` exist. `select` came first as
+/// the foundation the others consume, since `lib/select.c` and
+/// `lib/select.h` name the filter chain nowhere while `lib/cfilters.c:33` and
+/// `lib/cf-socket.c:64` both include `select.h`. Only Happy Eyeballs arrives
+/// with its file.
 pub(crate) mod conn;
 
 /// The easy interface: one handle, one transfer.
@@ -957,13 +957,13 @@ pub(crate) mod auth;
 ///
 /// `pub(crate)`: a transfer is driven through an easy or a multi handle, and
 /// no exported symbol names a transfer directly.
-/// **Partially delivered.** Of this module's planned children, only
-/// `ratelimit` exists yet; the transfer loop, per-request state, the send and
-/// client-writer paths, progress accounting, content encoding and chunked
-/// framing arrive with their files. `transfer/mod.rs` is the module root and
-/// declares exactly that one. The order is dependency order: `ratelimit` is a
-/// self-contained arithmetic primitive that progress accounting EMBEDS,
-/// following `lib/urldata.h:788-793`, where `struct pgrs_dir` carries a
+/// **Partially delivered.** Of this module's planned children, `ratelimit`,
+/// `progress`, `sendf`, `request` and `writeout` exist; the transfer loop,
+/// content encoding and chunked framing arrive with their files.
+/// `transfer/mod.rs` is the module root and declares exactly those five. The
+/// order is dependency order: `ratelimit` came first as a self-contained
+/// arithmetic primitive that progress accounting EMBEDS, following
+/// `lib/urldata.h:788-793`, where `struct pgrs_dir` carries a
 /// `struct Curl_rlimit` as a member.
 pub(crate) mod transfer;
 

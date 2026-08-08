@@ -197,6 +197,40 @@ pub(crate) const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
 /// descriptor really carries it rather than trusting either layer.
 pub(crate) const O_CLOEXEC: i32 = libc::O_CLOEXEC;
 
+/// `SOCKEINPROGRESS` (`lib/curlx/../curl_setup.h`, `EINPROGRESS` on Unix).
+///
+/// Here for exactly the reason [`O_NOFOLLOW`] is: the number differs between
+/// the mandated targets -- 115 on Linux and 36 on Apple platforms -- so a
+/// literal would silently mean something else on one of the four, and `libc` is
+/// named nowhere outside this directory.
+///
+/// Its consumer is `conn/socket.rs`, which needs it because
+/// [`std::io::ErrorKind`] cannot express the condition under the mandated
+/// minimum Rust version: `ErrorKind::InProgress` exists only behind the
+/// unstable `io_error_more` feature, and `rustc 1.75.0` rejects it with
+/// `error[E0599]: no variant or associated item named 'InProgress' found for
+/// enum 'ErrorKind'`. The distinction is not cosmetic -- `cf_socket_send`
+/// treats `SOCKEINPROGRESS` as `CURLE_AGAIN` (`lib/cf-socket.c:1441`) and
+/// `cf_socket_recv` deliberately does NOT (`:1512-1514`) -- so the two
+/// classifications differ by precisely this value and it has to be nameable.
+///
+/// Not a syscall and not `unsafe`: an integer, evaluated at compile time.
+#[allow(dead_code)]
+pub(crate) const SOCKEINPROGRESS: i32 = libc::EINPROGRESS;
+
+/// `SOCKEAFNOSUPPORT` (`EAFNOSUPPORT` on Unix).
+///
+/// The `errno` `Curl_addr2string` sets for a family that is neither `AF_INET`,
+/// `AF_INET6` nor `AF_UNIX`: `errno = SOCKEAFNOSUPPORT; return FALSE;`
+/// (`lib/connect.c:256-257`). Its consumer is `crate::conn::addr2string`, whose
+/// failure is reported to the user as *"... inet_ntop() failed with errno %d"*
+/// -- so the number is observable output and cannot be approximated.
+///
+/// Exported from here rather than written as a literal for the same reason as
+/// [`SOCKEINPROGRESS`]: it is 97 on Linux and 47 on Apple platforms.
+#[allow(dead_code)]
+pub(crate) const SOCKEAFNOSUPPORT: i32 = libc::EAFNOSUPPORT;
+
 // The syscall seam
 
 /// One address of one interface, copied out of operating-system memory.

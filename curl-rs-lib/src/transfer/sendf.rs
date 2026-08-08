@@ -908,10 +908,29 @@ pub(crate) trait TransferControl: fmt::Debug {
     /// `Curl_xfer_pause_send(data, pause)`, as called at `lib/sendf.c:711`
     /// when the input callback returns the pause sentinel.
     ///
-    /// This is the ONE seam method that can fail, and its result is returned
+    /// One of the two seam methods that can fail, and its result is returned
     /// to the caller of [`ClientIo::client_read`] unchanged -- the C assigns it
     /// straight to `result` and lets it propagate.
     fn pause_send(&mut self, pause: bool) -> CurlResult<()>;
+
+    /// `Curl_xfer_pause_recv(data, pause)`, as called at `lib/cw-out.c:205`
+    /// when the application's WRITE callback returns the pause sentinel.
+    ///
+    /// The receive-direction twin of [`Self::pause_send`], and the reason this
+    /// trait carries four methods rather than the three `lib/sendf.c` alone
+    /// needs. `lib/cw-out.c` is the client-output stage that
+    /// `transfer/writeout.rs` supersedes, and it is installed into the chain
+    /// through [`ClientIoFactory::client_out_writer`], so the only channel it
+    /// has to the transfer engine is the [`ClientCtx`] it is handed. Adding the
+    /// operation here rather than inventing a second seam keeps every
+    /// engine-owned operation in one trait.
+    ///
+    /// The C's result handling is specific and is preserved by its caller: a
+    /// failure is returned as-is, and SUCCESS becomes
+    /// [`CURLcode::Again`] -- `result ? result : CURLE_AGAIN`
+    /// (`lib/cw-out.c:206`) -- so that the pause is reported as backpressure
+    /// rather than as completion.
+    fn pause_recv(&mut self, pause: bool) -> CurlResult<()>;
 }
 
 /// The flag that says an application callback is currently running.
@@ -1969,6 +1988,39 @@ pub(crate) trait ClientWriter: fmt::Debug {
         let _ = (ctx, tail);
         Ok(())
     }
+
+    /// Clears this stage's paused state without flushing anything.
+    ///
+    /// `ctx->paused = FALSE` (`lib/cw-out.c:496`) alone, separated from the two
+    /// flushes that follow it there so that an upstream stage can perform the
+    /// C's first step at the C's moment. [`WriterTail::clear_pause`] documents
+    /// why the separation is needed and which order it restores.
+    ///
+    /// Defaults to nothing, which is right for every stage that cannot be
+    /// paused -- and only the client-output stage can be.
+    fn clear_pause(&mut self) {}
+
+    /// Flushes everything this stage still holds, because the download has
+    /// ended.
+    ///
+    /// `Curl_cw_out_done` (`lib/cw-out.c:504-517`) is the entry point, and it
+    /// differs from [`Self::unpause`] in exactly one respect that is
+    /// observable: it flushes with `flush_all` TRUE, so a stage that would
+    /// otherwise hold a short write back for collation must emit it. Nothing is
+    /// unpaused -- a paused transfer that is finished stays paused and the C's
+    /// two flushes both decline, which is why this is a separate operation
+    /// rather than an argument to the one above.
+    ///
+    /// The stage receives its own tail, so a flush travels downstream exactly
+    /// as an ordinary write does. Defaults to nothing.
+    fn done(
+        &mut self,
+        ctx: &mut ClientCtx<'_>,
+        tail: &mut WriterTail<'_, '_>,
+    ) -> CurlResult<()> {
+        let _ = (ctx, tail);
+        Ok(())
+    }
 }
 
 /// The remainder of a writer chain, below the stage currently running.
@@ -2014,6 +2066,69 @@ impl<'stack, 'data> WriterTail<'stack, 'data> {
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.stages.is_empty()
+    }
+
+    /// `Curl_cwriter_is_paused(data)` (`lib/sendf.c:505-508`), asked of the
+    /// stages BELOW the caller.
+    ///
+    /// The C walks the whole chain from `data`; a stage asking through its tail
+    /// reaches strictly less. That is not a narrowing in practice, and the
+    /// phase ordering is what guarantees it: the only stage that can be paused
+    /// is the client-output stage at [`ClientWriterPhase::Client`], which is
+    /// last in the chain, so it is in the tail of every stage that could ask.
+    ///
+    /// `lib/cw-pause.c:107` and `:151` are the two call sites this exists for,
+    /// and both are inside a stage at [`ClientWriterPhase::Protocol`].
+    #[allow(dead_code)]
+    pub(crate) fn is_paused(&self) -> bool {
+        self.stages.iter().any(|stage| stage.is_paused())
+    }
+
+    /// `Curl_cwriter_is_content_decoding(data)` (`lib/sendf.c:495-503`), asked
+    /// of the stages BELOW the caller.
+    ///
+    /// The same reasoning as [`Self::is_paused`], and the same guarantee from
+    /// the same source: [`ClientWriterPhase::ContentDecode`] sorts after
+    /// [`ClientWriterPhase::Protocol`], so every decoder is in the tail of the
+    /// pause stage that asks. A PHASE test and not a kind test, exactly as the
+    /// C's is.
+    ///
+    /// `lib/cw-pause.c:103` and `:149` are the call sites.
+    #[allow(dead_code)]
+    pub(crate) fn is_content_decoding(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|stage| stage.phase() == ClientWriterPhase::ContentDecode)
+    }
+
+    /// `ctx->paused = FALSE` (`lib/cw-out.c:496`), applied to the stages BELOW
+    /// the caller.
+    ///
+    /// This exists so that `Curl_cw_out_unpause`'s ORDER survives the
+    /// decomposition. The C is one function that clears the client stage's flag
+    /// and then flushes two stages in a fixed sequence (`lib/cw-out.c:487-502`):
+    ///
+    /// 1. clear the client stage's `paused` flag;
+    /// 2. `Curl_cw_pause_flush(data)` -- drain the bytes that were in flight;
+    /// 3. `cw_out_flush(data, cw_out, FALSE)` -- drain the client stage.
+    ///
+    /// [`ClientWriterStack::unpause`] walks the chain from the top, so it
+    /// reaches the pause stage (at [`ClientWriterPhase::Protocol`]) BEFORE the
+    /// client stage (at [`ClientWriterPhase::Client`]). Step 2 therefore runs
+    /// first -- and its loop condition is `!Curl_cwriter_is_paused(data)`, so
+    /// without step 1 having happened it would find the transfer still paused
+    /// and drain nothing. Calling this at the top of the pause stage's
+    /// [`ClientWriter::unpause`] performs step 1 at exactly the point the C
+    /// performs it, and the walk then delivers step 3 on its own.
+    ///
+    /// Clearing rather than toggling: there is no counterpart that SETS the
+    /// flag, because a pause originates inside the client stage itself, from a
+    /// callback's return value.
+    #[allow(dead_code)]
+    pub(crate) fn clear_pause(&mut self) {
+        for stage in self.stages.iter_mut() {
+            stage.clear_pause();
+        }
     }
 
     /// `Curl_cwriter_write(data, writer->next, type, buf, nbytes)`
@@ -2399,6 +2514,35 @@ impl<'data> ClientWriterStack<'data> {
                 .expect("the index is below the length just measured");
             let mut tail = WriterTail::new(rest);
             head.unpause(ctx, &mut tail)?;
+        }
+        Ok(())
+    }
+
+    /// `Curl_cw_out_done` (`lib/cw-out.c:504-517`): the download has ended, so
+    /// flush everything every stage still holds.
+    ///
+    /// Walks from the TOP of the chain, and that direction is the C's sequence
+    /// rather than an arbitrary choice. `Curl_cw_out_done` calls
+    /// `Curl_cw_pause_flush(data)` first and `cw_out_flush(data, cw_out, TRUE)`
+    /// second; the pause stage is at [`ClientWriterPhase::Protocol`] and the
+    /// client stage at [`ClientWriterPhase::Client`], so a top-down walk
+    /// delivers them in exactly that order. Draining the in-flight buffer first
+    /// is what puts those bytes AHEAD of nothing and BEHIND whatever the client
+    /// stage already holds, because the pause stage writes downstream through
+    /// the client stage, which appends and replays in arrival order.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the first failing [`ClientWriter::done`] returns. The walk
+    /// stops there, as the C's `if(!result)` between its two flushes does.
+    #[allow(dead_code)]
+    pub(crate) fn done(&mut self, ctx: &mut ClientCtx<'_>) -> CurlResult<()> {
+        for index in 0..self.stages.len() {
+            let (head, rest) = self.stages[index..]
+                .split_first_mut()
+                .expect("the index is below the length just measured");
+            let mut tail = WriterTail::new(rest);
+            head.done(ctx, &mut tail)?;
         }
         Ok(())
     }
@@ -5889,6 +6033,9 @@ mod tests {
         stream_closes: Vec<&'static str>,
         conn_closes: Vec<&'static str>,
         pauses: Vec<bool>,
+        /// Every `Curl_xfer_pause_recv`, kept apart from the send direction
+        /// because the two are different operations on different chains.
+        recv_pauses: Vec<bool>,
         pause_fail: Option<CURLcode>,
     }
 
@@ -5903,6 +6050,14 @@ mod tests {
 
         fn pause_send(&mut self, pause: bool) -> CurlResult<()> {
             self.pauses.push(pause);
+            match self.pause_fail {
+                None => Ok(()),
+                Some(code) => Err(Error::new(code)),
+            }
+        }
+
+        fn pause_recv(&mut self, pause: bool) -> CurlResult<()> {
+            self.recv_pauses.push(pause);
             match self.pause_fail {
                 None => Ok(()),
                 Some(code) => Err(Error::new(code)),

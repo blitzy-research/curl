@@ -1412,9 +1412,16 @@ pub const ENGINE_AUTH_DISPATCH: Engine =
 /// DNS-over-HTTPS -- `curl-rs-lib/src/dns/doh.rs`.
 ///
 /// Gates the `DoH` row (`CURL_DISABLE_DOH`), conjoined with the default-on
-/// `doh` feature. Absent, and doubly unreachable: the module is unwritten and
-/// the resolver and TLS engines it would layer on are too. 5 fixtures gate on
-/// the label and skip.
+/// `doh` feature. Still absent, but for one reason rather than two: the module
+/// `curl-rs-lib/src/dns/doh.rs` now exists and carries the RFC 8484 codec, the
+/// probe orchestration and the HTTPS-RR record walk, yet the TLS engine it
+/// would layer on does not (see [`ENGINE_TLS`]) and no implementor of
+/// `dns::DohTransport` exists either -- that seam is filled from `protocols/`
+/// or `conn/`, neither of which is written. [`Engine::is_present`] means the
+/// build can *execute* the work, not merely that the source is on disk, so the
+/// label stays withheld: AAP 0.6.5 measures that over-reporting a capability
+/// makes a fixture run and fail while under-reporting only makes it skip. 5
+/// fixtures gate on the label and skip.
 pub const ENGINE_DOH: Engine = Engine::absent("curl-rs-lib/src/dns/doh.rs");
 
 /// MIME multipart construction -- `curl-rs-lib/src/mime/mod.rs`.

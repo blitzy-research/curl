@@ -206,12 +206,16 @@ pub(crate) mod if2ip;
 // child that does not exist breaks the whole crate, so describing it is the
 // only way this module root could be delivered at all.
 //
-// `if2ip` is declared immediately above; `resolver` and `httpsrr` are
-// declared below. `doh` is the one child still to come, and this is its
-// declaration verbatim, for whoever lands the file:
+// `if2ip` is declared immediately above; `resolver`, `httpsrr` and `doh` are
+// declared below. `doh` was the last child to arrive, and it arrived with the
+// declaration this comment had reserved for it verbatim:
 //
 //     #[cfg(feature = "doh")]
 //     pub(crate) mod doh;
+//
+// That gate is the ONLY one on the module. `doh` is one of the fifteen
+// features and is default-ON, and gating both here and inside the file would
+// mean two places to keep in step for no gain.
 //
 // --- resolver (pub(crate)) -- DECLARED BELOW -----------------------------
 // The resolution engine, described in full on its declaration below.
@@ -253,6 +257,17 @@ pub(crate) mod if2ip;
 pub(crate) mod resolver;
 
 pub(crate) mod httpsrr;
+
+/// DNS-over-HTTPS, behind the default-ON `doh` feature.
+///
+/// Supersedes `lib/doh.c` and `lib/doh.h`. Feature-gated because `doh` is one
+/// of the fifteen and gates a whole capability; the gate is here and nowhere
+/// else. It performs its transfers through the injected [`DohTransport`]
+/// declared at the foot of this file and must never write
+/// `use crate::protocols`: a `dns -> protocols -> dns` import cycle is exactly
+/// what that seam exists to avoid.
+#[cfg(feature = "doh")]
+pub(crate) mod doh;
 
 /// The size of C's cache-key buffer, and therefore the truncation rule.
 ///

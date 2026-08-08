@@ -287,20 +287,37 @@ fn tracked_env_keys() -> Vec<String> {
 // assembled prologue was disassembled and compared field by field against the
 // one the target's own C compiler emits.
 //
-// `src/ffi/printf.rs` now does exactly that for ten of the eleven, so those ten
-// are implemented and ABI-correct by construction rather than open. Two honest
-// qualifications, both stated rather than buried:
+// `src/ffi/printf.rs` now does exactly that for ten of the eleven, and
+// `src/ffi/form.rs` for the eleventh, so all eleven are implemented and
+// ABI-correct by construction rather than open. Two honest qualifications, both
+// stated rather than buried:
 //
 //  * The Apple legs are cross-assembled and disassembled here, never executed,
 //    because no Apple host is available. That residual gap is why A4 is
 //    narrowed and not closed.
-//  * `curl_formadd` is untouched. Its `CURLFORM_*` sequence carries no type
-//    encoding to recover the argument shapes from, so `va_start` alone does not
-//    help: the problem there is semantic, not mechanical.
+//  * Six of the eleven -- the five plain `curl_m*printf` forms and
+//    `curl_formadd` -- reach the STATIC library and not the shared one, for the
+//    reason set out under "Trap 3" below, which is Rust's cdylib export model
+//    and has nothing to do with the prologues.
 //
-// The four option-identifier functions are equally untouched, so
-// `check_variadic_abi` remains the instrument that says A4 is open out loud,
-// and `check_printf_trampolines` is what keeps the ten from regressing.
+// MEASUREMENT THAT OVERTOOK AN EARLIER CLAIM HERE. This paragraph used to read
+// that `curl_formadd` was "untouched" because its "`CURLFORM_*` sequence carries
+// no type encoding to recover the argument shapes from, so `va_start` alone does
+// not help: the problem there is semantic, not mechanical". That is wrong, and
+// the correction is worth keeping visible because it is the reason the eleventh
+// symbol exists at all. `lib/formdata.c:346-347` reads the option with
+// `va_arg(params, int)` and its switch then reads exactly one argument of a type
+// that option names -- `char *`, `long`, `curl_off_t`, `struct curl_slist *`,
+// `struct curl_forms *`, or nothing. That IS a type encoding: per-option instead
+// of arithmetic. Every one of those shapes occupies a single general-purpose slot
+// of at most eight bytes on all four required targets and none is a
+// floating-point type, so one cursor over the general-purpose slots decodes the
+// whole list, and `va_start` is precisely what was missing.
+//
+// The four option-identifier functions ARE still untouched, so
+// `check_variadic_abi` remains the instrument that says A4 is open out loud, and
+// `check_printf_trampolines` and `check_formadd_trampoline` are what keep the
+// eleven from regressing.
 
 /// Records the A4 decision, which is a user's to make and not this file's.
 const A4_DECISION_ENV: &str = "CURL_RS_A4_VARIADIC_DECISION";
@@ -316,15 +333,16 @@ const A4_DECISION_ENV: &str = "CURL_RS_A4_VARIADIC_DECISION";
 ///   `curl_share_setopt` are NOT ABI-correct on aarch64-apple-darwin. A C
 ///   caller reaches them through the variadic prototype in the generated
 ///   header and the callee reads a register the caller did not write.
-/// * Of the eleven exports in [`VARIADIC_UNIMPLEMENTABLE`], `curl_formadd`
-///   remains unimplemented on every target until the minimum Rust version rises
-///   or an approved C shim is added. The ten `curl_m*printf` forms no longer
-///   do: `src/ffi/printf.rs` implements them with a per-target `va_start`
-///   written in `global_asm!`, which needs neither. What acceptance concedes
-///   for those ten is narrower and is stated on
-///   [`check_printf_trampolines`] -- their Apple prologues are
-///   cross-assembled and disassembled rather than executed, no Apple host
-///   being available.
+/// * None of the eleven exports in [`VARIADIC_UNIMPLEMENTABLE`] is unimplemented
+///   any longer. `src/ffi/printf.rs` implements ten of them and
+///   `src/ffi/form.rs` the eleventh, each with a per-target `va_start` written
+///   in `global_asm!`, which needs neither a newer toolchain nor a C compiler.
+///   What acceptance concedes for them is narrower and is stated on
+///   [`check_printf_trampolines`] and [`check_formadd_trampoline`] -- their
+///   Apple prologues are cross-assembled and disassembled rather than executed,
+///   no Apple host being available, and six of the eleven reach the static
+///   library but not the shared one, for the separate reason recorded under
+///   "Trap 3".
 const A4_ACCEPTED: &str = "accept-unsupported-varargs";
 
 /// The eleven exports with no ABI-correct expression **as a Rust function** at
@@ -416,9 +434,22 @@ const VARIADIC_TRAILING_POINTER: [&str; 4] = [
 /// That is a per-symbol obligation where this list is a per-file veto, and it
 /// cannot be satisfied by recording a decision in an environment variable.
 ///
-/// `curl_formadd` is untouched by any of this and remains listed, because
-/// nothing has yet been built for it.
-const VARIADIC_IMPLEMENTATION_FILES: [&str; 1] = ["src/ffi/form.rs"];
+/// # Why `src/ffi/form.rs` is no longer listed either, and why the list is now
+/// empty
+///
+/// The same narrowing, for the same reason, applied to the eleventh symbol.
+/// `src/ffi/form.rs` was listed while nothing had been built for `curl_formadd`.
+/// It has been built now, by the same route: an assembled `va_start` prologue
+/// per ABI, plus the per-target cursor `src/ffi/printf.rs` already owned. So the
+/// per-file veto is again the wrong instrument -- it cannot tell a correct
+/// implementation from an incorrect one -- and [`check_formadd_trampoline`]
+/// replaces it with a per-symbol obligation that no environment variable
+/// silences.
+///
+/// An empty list keeps the mechanism rather than deleting it. A future module
+/// claiming one of the eleven with nothing to show for it goes back in here, and
+/// the refusal below still says exactly what has to be decided.
+const VARIADIC_IMPLEMENTATION_FILES: [&str; 0] = [];
 
 // The four headers that must never be written
 
@@ -676,29 +707,67 @@ const MULTI_H_ITEMS: &[&str] = &[
     // cbindgen emits at all.
 ];
 
-/// Items owned by `urlapi.h`: the two URL-API enums and six functions, three
-/// of which are generated and three carried verbatim.
+/// Items owned by `urlapi.h`: none.
 ///
-/// `CURLU` itself is verbatim, because `urlapi.h:107` spells it
-/// `typedef struct Curl_URL CURLU;`, where the tag differs from the typedef
-/// name, and cbindgen would emit `typedef struct CURLU CURLU;`.
+/// The third empty partition, alongside [`HEADER_H_ITEMS`] and
+/// [`MPRINTF_H_ITEMS`], and empty for the same measured reason as `header.h`:
+/// every construct this header declares is one cbindgen cannot render to the
+/// frozen bytes. The two enums and all six prototypes are therefore carried
+/// by [`URLAPI_H_DECLS`] and [`URLAPI_H_POST`], and each of the five names
+/// that would otherwise be generated is listed in this header's
+/// [`HeaderSpec::verbatim`] so no pass -- including `curl.h`'s -- emits a
+/// second declaration.
 ///
-/// `curl_url_get` and `curl_url_set` are ALSO verbatim, in [`URLAPI_H_POST`]
-/// with `curl_url_strerror`, and for the same reason as it: their `CURLUPart
-/// what` parameter must stay a `CURLUPart` in the header while the Rust
-/// definition takes a `c_int`, because a C caller may legally pass a value
-/// outside `0..=10` and curl answers it with `CURLUE_UNKNOWN_PART`
-/// (`lib/urlapi.c:1626-1628`, `:1773-1774` and `:1873-1874`). Rendering that
-/// parameter as the Rust enum would make a DEFINED C input an invalid Rust
-/// value. This is the same arrangement `curl_version_info(CURLversion)` and
+/// MEASURED, by rendering this header with the five names owned and diffing
+/// against `include/curl/urlapi.h`. Seven divergences, in four families:
+///
+/// 1. ORDER. The frozen file interleaves generated and verbatim material:
+///    `CURLUcode` and `CURLUPart` (`:34-82`), then the 16 `CURLU_*` flag bits
+///    (`:84-105`), then `typedef struct Curl_URL CURLU;` (`:107`), then the
+///    six prototypes. A cbindgen pass emits ONE contiguous generated region
+///    between `after_includes` and the trailer, so no preamble/postamble split
+///    can place the flag bits and the handle typedef BETWEEN the enums and the
+///    prototypes. Owning the enums hoisted the typedef and the flags above
+///    them, which reorders the public contract.
+/// 2. TRAILING COMMENTS. `CURLUcode`'s 31 ordinal comments -- `/* 1 */`
+///    through `/* 31 */`, the C tree's own drift guard against an accidental
+///    insertion -- and `CURLUPART_ZONEID`'s `/* added in 7.65.0 */` become
+///    multi-line blocks ABOVE each member, and every member acquires an
+///    explicit `= N`. Exactly what was measured for `CURLHcode`; cbindgen has
+///    no trailing-comment form. `cbindgen.toml`'s hope that "those comments
+///    survive because `documentation` is on" was measured FALSE.
+/// 3. PROTOTYPE SPELLING. `curl_url`, `curl_url_cleanup` and `curl_url_dup`
+///    acquire `CURL_EXTERN` on a line of its own plus their whole Rust doc
+///    comment -- `# Safety` headings, markdown emphasis and
+///    `super::panic_boundary::guard_tx` intra-doc links -- where the frozen
+///    header carries a four-line C comment per prototype that
+///    `docs/libcurl/curl_url*.md` cross-references.
+/// 4. PARAMETER NAME. `urlapi.h:126` spells it `curl_url_dup(const CURLU *in)`
+///    and `in` is a RUST KEYWORD, so the Rust definition must name the
+///    parameter something else and cbindgen renders whatever it is named.
+///
+/// `CURLU` was already verbatim before this measurement, because `urlapi.h:107`
+/// spells it `typedef struct Curl_URL CURLU;`, where the struct tag differs
+/// from the typedef name and cbindgen would emit `typedef struct CURLU CURLU;`
+/// -- valid C that introduces a DIFFERENT incomplete type from the one
+/// libcurl's own translation units define.
+///
+/// `curl_url_get` and `curl_url_set` were already verbatim too, and for a
+/// reason that survives this change: their `CURLUPart what` parameter must
+/// stay a `CURLUPart` in the header while the Rust definition takes a `c_int`,
+/// because a C caller may legally pass a value outside `0..=10` and curl
+/// answers it with `CURLUE_UNKNOWN_PART` (`lib/urlapi.c:1626-1628`,
+/// `:1773-1774` and `:1873-1874`). Rendering that parameter as the Rust enum
+/// would make a DEFINED C input an invalid Rust value. This is the same
+/// arrangement `curl_version_info(CURLversion)` and
 /// `curl_easy_option_by_id(CURLoption)` already use.
+///
+/// An empty list is load-bearing rather than inert, exactly as it is for
+/// `header.h`: `apply_partition` sets `export.include` to it and appends every
+/// observed name to `export.exclude`, so this pass generates nothing at all.
 const URLAPI_H_ITEMS: &[&str] = &[
-    "CURLUcode",
-    "CURLUPart",
-    "curl_url",
-    "curl_url_cleanup",
-    "curl_url_dup",
-    // The 16 CURLU_* flag bits, urlapi.h:84-105.
+    // The two enums, the 16 CURLU_* flag bits and the handle typedef are in
+    // URLAPI_H_DECLS; the six prototypes are in URLAPI_H_POST.
 ];
 
 /// Items owned by `options.h`: `curl_easytype` and the three introspection
@@ -1314,19 +1383,35 @@ curl_easy_option_next(const struct curl_easyoption *prev);
 "#;
 
 /// `urlapi.h`, before the `extern "C"` open.
-const URLAPI_H_INCLUDES: &str = "\n#include \"curl.h\"\n";
-
-/// `urlapi.h`, after the `extern "C"` open.
 ///
-/// The subtler of the two handle mis-renderings. `urlapi.h:107` spells this
-/// `typedef struct Curl_URL CURLU;`, where the struct tag differs from the
-/// typedef name. cbindgen would emit `typedef struct CURLU CURLU;`, which
-/// compiles and is still wrong, because it introduces a different
-/// incomplete type than the one libcurl's own translation units define.
-/// `urlapi.h`, after the generated block: the three prototypes whose parameters
-/// name a URL-API enum while the Rust definitions must take a `c_int`. All
-/// three have to follow the generated block because that is where `CURLUcode`
-/// and `CURLUPart` are declared. See cbindgen.toml, "Group 5e".
+/// TWO leading newlines, not one, and the difference is a line of the public
+/// header. `sibling_prologue` appends this straight onto the banner, whose last
+/// line is unterminated, so the first newline ends `***/` and only the second
+/// produces the blank line that `include/curl/urlapi.h:26` carries between the
+/// banner and the include. Measured: with one newline the render was
+/// byte-identical to the frozen header except for that missing blank line.
+/// `MPRINTF_H_INCLUDES` has two for the same reason; `MULTI_H_INCLUDES`
+/// deliberately has one, because `include/curl/multi.h:25-26` runs `***/`
+/// straight into its `/*` comment with no blank line at all.
+const URLAPI_H_INCLUDES: &str = "\n\n#include \"curl.h\"\n";
+
+/// `urlapi.h`, after the generated block: all six prototypes, each preceded by
+/// the frozen C comment the header carries for it.
+///
+/// SIX rather than three since [`URLAPI_H_ITEMS`] emptied. The three that
+/// joined -- `curl_url`, `curl_url_cleanup` and `curl_url_dup` -- are here for
+/// the measured reason recorded there: cbindgen writes a prototype with
+/// `CURL_EXTERN` on a line of its own and prefixes it with its ENTIRE Rust doc
+/// comment, so the frozen four-line C comment that
+/// `docs/libcurl/curl_url*.md` cross-references would be replaced by
+/// Rust-internal prose -- `# Safety` headings, markdown emphasis and
+/// `super::panic_boundary::guard_tx` intra-doc links -- in a shipped public C
+/// header. Identical in kind to what was measured for `header.h`'s two
+/// prototypes; see [`VERBATIM_FUNCTIONS`].
+///
+/// The other three were here already: `curl_url_get`, `curl_url_set` and
+/// `curl_url_strerror` name a URL-API enum in a parameter while the Rust
+/// definitions must take a `c_int`. See cbindgen.toml, "Group 5e".
 ///
 /// The rule they share, and why it is a rule rather than three coincidences: a
 /// C caller may pass any value of an enum parameter's compatible integer type,
@@ -1340,11 +1425,35 @@ const URLAPI_H_INCLUDES: &str = "\n#include \"curl.h\"\n";
 /// `curl_version_info(CURLversion)` in `curl.h` and
 /// `curl_easy_option_by_id(CURLoption)` in `options.h`.
 ///
-/// The parameter names and the `const` qualifiers are those of
-/// `include/curl/urlapi.h:133-134` and `:141-142`, character for character: the
-/// `const` on `curl_url_get`'s handle is ABI-visible documentation that the
-/// call does not mutate, and `curl_url_set`'s handle deliberately lacks it.
+/// Every byte below is `include/curl/urlapi.h:109-149`, character for
+/// character. Three spellings there are load-bearing and easy to "tidy" by
+/// accident: the `const` on `curl_url_get`'s handle is ABI-visible
+/// documentation that the call does not mutate and `curl_url_set`'s handle
+/// deliberately lacks it; `curl_url_dup`'s parameter is named `in`, which is a
+/// Rust keyword and therefore a name no Rust definition can carry; and
+/// `curl_url_strerror`'s parameter is UNNAMED, which
+/// `.github/scripts/verify-synopsis.pl` compiles
+/// `docs/libcurl/curl_url_strerror.md` against.
 const URLAPI_H_POST: &str = r#"
+/*
+ * curl_url() creates a new CURLU handle and returns a pointer to it.
+ * Must be freed with curl_url_cleanup().
+ */
+CURL_EXTERN CURLU *curl_url(void);
+
+/*
+ * curl_url_cleanup() frees the CURLU handle and related resources used for
+ * the URL parsing. It will not free strings previously returned with the URL
+ * API.
+ */
+CURL_EXTERN void curl_url_cleanup(CURLU *handle);
+
+/*
+ * curl_url_dup() duplicates a CURLU handle and returns a new copy. The new
+ * handle must also be freed with curl_url_cleanup().
+ */
+CURL_EXTERN CURLU *curl_url_dup(const CURLU *in);
+
 /*
  * curl_url_get() extracts a specific part of the URL from a CURLU
  * handle. Returns error code. The returned pointer MUST be freed with
@@ -1362,23 +1471,92 @@ CURL_EXTERN CURLUcode curl_url_set(CURLU *handle, CURLUPart what,
                                    const char *part, unsigned int flags);
 
 /*
- * curl_url_strerror turns a CURLUcode value into the equivalent human
+ * curl_url_strerror() turns a CURLUcode value into the equivalent human
  * readable error string. This is useful for printing meaningful error
  * messages.
  */
 CURL_EXTERN const char *curl_url_strerror(CURLUcode);
 "#;
 
+/// `urlapi.h`, after the `extern "C"` open: the two URL-API enums, the 16
+/// `CURLU_*` flag bits and the handle typedef, in the frozen order.
+///
+/// Every byte below is `include/curl/urlapi.h:33-107`, character for
+/// character. Four measured reasons none of it can be generated, each
+/// recorded at [`URLAPI_H_ITEMS`]:
+///
+/// * ORDER. The flag bits and the handle typedef sit BETWEEN the enums and the
+///   prototypes. A cbindgen pass emits one contiguous generated region, so no
+///   preamble/postamble split can place verbatim text there.
+/// * TRAILING COMMENTS. `CURLUcode`'s `/* 1 */` through `/* 31 */` -- the C
+///   tree's own drift guard against an accidental insertion -- and
+///   `CURLUPART_ZONEID`'s `/* added in 7.65.0 */` are TRAILING comments.
+///   cbindgen has no trailing-comment form: it writes a block ABOVE the member
+///   and adds an explicit `= N`.
+/// * THE HANDLE TYPEDEF, the subtler of the two handle mis-renderings.
+///   `urlapi.h:107` spells it `typedef struct Curl_URL CURLU;`, where the
+///   struct tag differs from the typedef name. cbindgen would emit
+///   `typedef struct CURLU CURLU;`, which compiles and is still wrong, because
+///   it introduces a DIFFERENT incomplete type from the one libcurl's own
+///   translation units define. This is also the one header whose handle is a
+///   genuine opaque struct rather than `void`, so it must stay incomplete and
+///   must never be flattened to `typedef void CURLU;` for uniformity with
+///   `CURL`, `CURLM` and `CURLSH`.
+/// * THE FLAG BITS, for the reason the block's own comment gives: cbindgen
+///   DROPS an `L` suffix, rewrites hex as decimal, and cannot express a
+///   `#define` whose value is another identifier.
 const URLAPI_H_DECLS: &str = r#"
-typedef struct Curl_URL CURLU;
+/* the error codes for the URL API */
+typedef enum {
+  CURLUE_OK,
+  CURLUE_BAD_HANDLE,          /* 1 */
+  CURLUE_BAD_PARTPOINTER,     /* 2 */
+  CURLUE_MALFORMED_INPUT,     /* 3 */
+  CURLUE_BAD_PORT_NUMBER,     /* 4 */
+  CURLUE_UNSUPPORTED_SCHEME,  /* 5 */
+  CURLUE_URLDECODE,           /* 6 */
+  CURLUE_OUT_OF_MEMORY,       /* 7 */
+  CURLUE_USER_NOT_ALLOWED,    /* 8 */
+  CURLUE_UNKNOWN_PART,        /* 9 */
+  CURLUE_NO_SCHEME,           /* 10 */
+  CURLUE_NO_USER,             /* 11 */
+  CURLUE_NO_PASSWORD,         /* 12 */
+  CURLUE_NO_OPTIONS,          /* 13 */
+  CURLUE_NO_HOST,             /* 14 */
+  CURLUE_NO_PORT,             /* 15 */
+  CURLUE_NO_QUERY,            /* 16 */
+  CURLUE_NO_FRAGMENT,         /* 17 */
+  CURLUE_NO_ZONEID,           /* 18 */
+  CURLUE_BAD_FILE_URL,        /* 19 */
+  CURLUE_BAD_FRAGMENT,        /* 20 */
+  CURLUE_BAD_HOSTNAME,        /* 21 */
+  CURLUE_BAD_IPV6,            /* 22 */
+  CURLUE_BAD_LOGIN,           /* 23 */
+  CURLUE_BAD_PASSWORD,        /* 24 */
+  CURLUE_BAD_PATH,            /* 25 */
+  CURLUE_BAD_QUERY,           /* 26 */
+  CURLUE_BAD_SCHEME,          /* 27 */
+  CURLUE_BAD_SLASHES,         /* 28 */
+  CURLUE_BAD_USER,            /* 29 */
+  CURLUE_LACKS_IDN,           /* 30 */
+  CURLUE_TOO_LARGE,           /* 31 */
+  CURLUE_LAST
+} CURLUcode;
 
-/* ---- verbatim from urlapi.h, not generated ---- */
-/* cbindgen cannot carry these faithfully, measured on all three
-   forms: it DROPS an `L` suffix (`2L` becomes `2`, changing the
-   varargs type of a long option), rewrites hex as decimal, and
-   cannot express a #define whose value is another identifier.
-   The sixteen CURLU_* flag bits are therefore
-   spliced from the frozen header exactly as written. */
+typedef enum {
+  CURLUPART_URL,
+  CURLUPART_SCHEME,
+  CURLUPART_USER,
+  CURLUPART_PASSWORD,
+  CURLUPART_OPTIONS,
+  CURLUPART_HOST,
+  CURLUPART_PORT,
+  CURLUPART_PATH,
+  CURLUPART_QUERY,
+  CURLUPART_FRAGMENT,
+  CURLUPART_ZONEID /* added in 7.65.0 */
+} CURLUPart;
+
 #define CURLU_DEFAULT_PORT (1 << 0)       /* return default port number */
 #define CURLU_NO_DEFAULT_PORT (1 << 1)    /* act as if no port number was set,
                                              if the port number matches the
@@ -1401,6 +1579,8 @@ typedef struct Curl_URL CURLU;
                                              when extracting the URL or the
                                              components */
 #define CURLU_NO_GUESS_SCHEME (1 << 15)   /* for get, do not accept a guess */
+
+typedef struct Curl_URL CURLU;
 "#;
 
 /// `websockets.h`, after the `extern "C"` open. Layout-visible, so
@@ -1558,7 +1738,21 @@ const SIBLING_HEADERS: [HeaderSpec; 7] = [
         blank_before_guard_close: true,
         named_guard_close: true,
         items: URLAPI_H_ITEMS,
-        verbatim: &[],
+        // All five are declared by URLAPI_H_DECLS and URLAPI_H_POST, so every
+        // pass must suppress them -- this one included, or they would be
+        // declared twice in the same file. Naming them here is what keeps them
+        // out of the UMBRELLA as well: `curl.h`'s suppression list is built
+        // from `observed` intersected with the sibling ITEM lists, so a name
+        // dropped from `URLAPI_H_ITEMS` without being added here would migrate
+        // into `curl.h` instead of disappearing. Same arrangement as
+        // `header.h`'s three.
+        verbatim: &[
+            "CURLUcode",
+            "CURLUPart",
+            "curl_url",
+            "curl_url_cleanup",
+            "curl_url_dup",
+        ],
     },
     HeaderSpec {
         file: "options.h",
@@ -3950,21 +4144,30 @@ const EXPORTED_SYMBOLS: usize = 100;
 /// four C-variadic setters, the five deprecated prototypes, the ten
 /// `curl_m*printf` functions, the twelve whose frozen signature names a type
 /// this crate's Rust spelling cannot ask cbindgen to produce
-/// (`cbindgen.toml`, "Group 5e"), the two whose parameter names a public enum
-/// and the two the header API declares. 4 + 5 + 10 + 12 + 2 + 2 = 35.
+/// (`cbindgen.toml`, "Group 5e"), the two whose parameter names a public enum,
+/// the two the header API declares and the three remaining URL-API
+/// constructors. 4 + 5 + 10 + 12 + 2 + 2 + 3 = 38.
 ///
 /// The two that name a public enum are `curl_url_get` and `curl_url_set`,
 /// whose `CURLUPart what` must survive into the header while the Rust
 /// definition takes a `c_int`. [`URLAPI_H_POST`] records why.
 ///
-/// The last two are `curl_easy_header` and `curl_easy_nextheader`. They were
+/// The next two are `curl_easy_header` and `curl_easy_nextheader`. They were
 /// generated until the render of `include/curl/header.h` was measured against
 /// the frozen file: cbindgen emitted `CURL_EXTERN` on a line of its own,
 /// re-indenting every continuation line, and prefixed each prototype with its
 /// whole Rust doc comment -- 40 and 29 lines of `# Safety` headings, markdown
 /// and `lib/headers.c` internals in a header that carries no prototype
 /// comment at all. See [`HEADER_H_DECLS`].
-const VERBATIM_FUNCTIONS: usize = 35;
+///
+/// The last three are `curl_url`, `curl_url_cleanup` and `curl_url_dup`, and
+/// they joined for exactly that measured reason plus two more that are specific
+/// to `urlapi.h`: the frozen file interleaves the flag bits and the handle
+/// typedef BETWEEN the enums and the prototypes, which one contiguous generated
+/// region cannot express, and `curl_url_dup`'s frozen parameter name `in`
+/// (`urlapi.h:126`) is a Rust keyword. [`URLAPI_H_ITEMS`] records the full
+/// measurement.
+const VERBATIM_FUNCTIONS: usize = 38;
 
 // Three further facts about the option metadata, recorded as comments
 // because they are shape rather than count:
@@ -4928,13 +5131,14 @@ fn callables_on(line: &str) -> Vec<String> {
 /// partition, and therefore generated, or present as a verbatim prototype,
 /// and therefore hand-written -- never both and never neither.
 ///
-/// Measured today: 65 claimed, 35 verbatim, disjoint, union 100 of 100,
-/// nothing unaccounted. The 35 are the four C-variadic setters, the five
+/// Measured today: 62 claimed, 38 verbatim, disjoint, union 100 of 100,
+/// nothing unaccounted. The 38 are the four C-variadic setters, the five
 /// deprecated prototypes, the ten `curl_m*printf` functions, the twelve
 /// whose frozen signature names a type this crate's Rust spelling cannot ask
 /// cbindgen to produce (cbindgen.toml, "Group 5e"), the two `urlapi.h`
-/// declares with a `CURLUPart` parameter and the two `header.h` declares,
-/// which matches [`VERBATIM_FUNCTIONS`] exactly.
+/// declares with a `CURLUPart` parameter, the two `header.h` declares and the
+/// three remaining `urlapi.h` constructors, which matches
+/// [`VERBATIM_FUNCTIONS`] exactly.
 ///
 /// This check is not defence in depth; it earns its place. Emptying
 /// `header.h`'s partition without adding its two prototypes to
@@ -5499,7 +5703,9 @@ fn variadic_abi_verdict(
         return Ok(Some(format!(
             "A4 decision on record ({A4_DECISION_ENV}={A4_ACCEPTED}): this \
              artifact is NOT a drop-in replacement for {} of the 100 exported \
-             symbols. {} are unimplemented; on aarch64-apple-darwin {} are \
+             symbols. {} have no expression as a Rust function at the declared \
+             minimum and are assembled instead, so six of them reach \
+             libcurl.a and not libcurl.so; on aarch64-apple-darwin {} are \
              additionally not ABI-correct. Specification 0.8.6 records this as \
              an accepted limitation, not as a fix.",
             VARIADIC_UNIMPLEMENTABLE.len(),
@@ -7139,6 +7345,113 @@ fn check_printf_trampolines(manifest: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The module that owns the legacy `curl_form*` trio, relative to the manifest.
+const FORM_MODULE: &str = "src/ffi/form.rs";
+
+/// `curl_formadd` and the non-exported Rust function its trampoline calls.
+///
+/// Kept as a pair for the same reason [`PRINTF_TRAMPOLINES`] is: recording which
+/// function the trampoline must reach turns a mis-wired one into a build failure
+/// rather than a silent type confusion across the ABI boundary. Unlike the printf
+/// pairs the callee here is **not** itself an export -- `curl_formadd` has no
+/// `va_list` sibling in `lib/libcurl.def` -- so the check below requires it to
+/// exist as a Rust definition without requiring it to be exported. An exported
+/// callee would be a 101st symbol and would fail the parity gate.
+const FORMADD_TRAMPOLINE: (&str, &str) = ("curl_formadd", "formadd_va");
+
+/// Require `curl_formadd` to be a trampoline, not a Rust function.
+///
+/// The per-symbol counterpart of [`check_printf_trampolines`], and it exists for
+/// the same reason: the per-file veto that used to list [`FORM_MODULE`] in
+/// [`VARIADIC_IMPLEMENTATION_FILES`] could only count files, and an environment
+/// variable silenced it. This cannot be silenced and refuses four things:
+///
+/// 1. a plain Rust `extern "C" fn curl_formadd`, which is the actual A4 hazard --
+///    a non-variadic callee reached through a variadic prototype reads a register
+///    the Apple arm64 caller never wrote, and the failure is silent;
+/// 2. the absence of a `global_asm!` trampoline exporting the name;
+/// 3. the absence of the Rust function that trampoline calls, which would
+///    assemble and then fail to link, or worse, bind to some other translation
+///    unit's symbol of that name;
+/// 4. only one object format's `.globl` spelling, which would leave half the
+///    required targets with no exporter at all.
+///
+/// Point 4 uses the literal labels rather than a macro argument, because unlike
+/// the printf family this module writes its four prologues out directly -- one
+/// per ABI, with no macro between -- so the label IS the source text.
+///
+/// Inert until the module exists, so this cannot fail a tree that has not reached
+/// it yet.
+fn check_formadd_trampoline(manifest: &Path) -> Result<(), Box<dyn Error>> {
+    if !manifest.join(FORM_MODULE).exists() {
+        return Ok(());
+    }
+
+    let (exported, callee) = FORMADD_TRAMPOLINE;
+    let sources = rust_sources(&manifest.join("src"))?;
+
+    if let Some((path, _)) = find_c_definition(&sources, exported) {
+        return Err(format!(
+            "{} defines `extern \"C\" fn {exported}` as a Rust function, but \
+             `{exported}` is variadic in include/curl/curl.h:2632-2635 and a \
+             Rust function cannot be: `extern \"C\" fn f(x: T, ...)` is \
+             error[E0658] at the declared MSRV of 1.75. On \
+             aarch64-apple-darwin -- a required target -- Apple's arm64 ABI \
+             passes every variadic argument on the stack, so a non-variadic \
+             callee would read a register the caller never wrote and would do \
+             it silently. Emit a `global_asm!` trampoline that performs the \
+             target's own `va_start` and calls `{callee}`; that is proven to \
+             build at 1.75 and needs no C compiler.",
+            path.display()
+        )
+        .into());
+    }
+
+    let form = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("form.rs"))
+        .ok_or_else(|| format!("{FORM_MODULE} exists but was not read back"))?;
+    let code = strip_rust_comments(&form.1);
+
+    if !code.contains("global_asm!") {
+        return Err(format!(
+            "{FORM_MODULE} exists, so `{exported}` has to be exported, but the \
+             module assembles nothing. All 100 symbols in lib/libcurl.def are \
+             compared as one set by the nm parity gate, so a missing one fails \
+             it outright.",
+        )
+        .into());
+    }
+
+    for (label, object_format) in [
+        (format!(".globl {exported}"), "ELF"),
+        (format!(".globl _{exported}"), "Mach-O"),
+    ] {
+        if !code.contains(&label) {
+            return Err(format!(
+                "{FORM_MODULE} assembles a trampoline but never emits \
+                 `{label}`, so nothing exports `{exported}` on \
+                 {object_format}. Mach-O decorates symbols with a leading \
+                 underscore and ELF does not; emitting one spelling exports \
+                 nothing on the targets needing the other.",
+            )
+            .into());
+        }
+    }
+
+    if find_c_definition(&sources, callee).is_none() {
+        return Err(format!(
+            "{FORM_MODULE} assembles `{exported}`, but nothing defines \
+             `extern \"C\" fn {callee}` for it to call. The trampoline would \
+             assemble and then fail to link, or worse, bind to some other \
+             translation unit's symbol of that name.",
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 /// Find the file defining `name` as a C-ABI Rust function, if any.
 ///
 /// Anchored to an item declaration -- `pub `, `extern ` or `unsafe ` must begin
@@ -7959,6 +8272,10 @@ fn generate_headers(
     // And the same obligation, discharged per symbol, for the five
     // plain-variadic printf forms that are assembled rather than compiled.
     check_printf_trampolines(manifest)?;
+    // The eleventh of the same family, whose argument list is open-ended rather
+    // than format-driven but whose exported name is assembled for the same
+    // reason.
+    check_formadd_trampoline(manifest)?;
 
     // THE SECOND THING THIS FUNCTION DOES, AND DELIBERATELY BEFORE ANY RENDER.
     //

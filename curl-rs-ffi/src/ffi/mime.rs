@@ -231,8 +231,20 @@ struct Location {
 /// and becomes an inert tombstone, which is what makes a caller's mistaken
 /// `curl_mime_free` on a transferred handle a detectable no-op rather than a
 /// double free.
+/// `#[repr(C)]` so that `magic` is guaranteed to sit at offset 0.
+///
+/// That guarantee is load-bearing rather than cosmetic. A caller can hand any
+/// pointer to an entry point -- most realistically a `curl_mimepart *` where a
+/// `curl_mime *` belongs, which is precisely the confusion the two magic words
+/// exist to catch -- and the record it addresses may be SMALLER than this one.
+/// The magic therefore has to be readable before anything asserts that the rest
+/// of the record exists, and under `repr(Rust)` the compiler is free to place it
+/// anywhere. `repr(C)` costs nothing here: the type never crosses the ABI as a
+/// layout contract, only its address does, as an opaque pointer.
+#[repr(C)]
 struct MimeBox {
-    /// [`MIME_MAGIC`] in a live handle.
+    /// [`MIME_MAGIC`] in a live handle. **Must remain the first field**; see the
+    /// `repr(C)` note above.
     magic: u64,
 
     /// The abandoned-mutation flag `guard_tx` consults.
@@ -290,8 +302,11 @@ struct MimeBox {
 /// Never independently freeable: it is owned by the [`MimeBox`] whose `parts`
 /// vector holds its `Box`, and is released when that handle is. There is no
 /// `curl_mime_freepart` in the export set and this module offers no equivalent.
+/// `#[repr(C)]` for the same reason as [`MimeBox`]: the magic must be readable
+/// at a fixed offset before the record's extent is assumed.
+#[repr(C)]
 struct PartBox {
-    /// [`PART_MAGIC`] in a live record.
+    /// [`PART_MAGIC`] in a live record. **Must remain the first field.**
     magic: u64,
 
     /// The engine part this record stands for.
@@ -514,6 +529,28 @@ fn part_at<'a>(tree: &'a mut Mime, path: &[usize]) -> Option<&'a mut MimePart> {
 /// genuine use-after-free onto still-mapped memory that still holds the word
 /// cannot be distinguished from a live handle by any means available to a
 /// library.
+/// Reads a candidate record's magic word without asserting its extent.
+///
+/// Both [`MimeBox`] and [`PartBox`] are `repr(C)` with `magic: u64` first, so
+/// the record pointer IS a pointer to the magic. Reading through it touches
+/// eight bytes at offset 0 and forms no reference, which is what makes it safe
+/// to call on a pointer that might address a smaller record of the other family
+/// -- the case the magic words exist to detect.
+///
+/// # Safety
+///
+/// `record` must be non-null and must address at least eight readable,
+/// initialised bytes. Every opaque pointer this module accepts satisfies that as
+/// soon as it is known non-null, because the smallest record either family
+/// allocates is larger than a `u64`.
+unsafe fn magic_of<T>(record: *const T) -> u64 {
+    // SAFETY: the contract above guarantees eight readable initialised bytes at
+    // this address. `read_unaligned` rather than `read` because nothing promises
+    // a caller's foreign pointer is eight-byte aligned, and a misaligned read
+    // must be a wrong answer rather than undefined behaviour.
+    unsafe { record.cast::<u64>().read_unaligned() }
+}
+
 unsafe fn mime_identity(
     handle: *mut curl_mime,
 ) -> Option<(*mut curl_mime, Vec<usize>)> {
@@ -521,15 +558,23 @@ unsafe fn mime_identity(
         return None;
     }
 
-    // SAFETY: non-null by the check above, and by contract the pointer
-    // addresses a live `MimeBox` that `curl_mime_init` allocated. The borrow
-    // is shared, is confined to this block, and ends before any caller of this
-    // function takes an exclusive one.
-    let boxed = unsafe { &*handle.cast::<MimeBox>() };
-    if boxed.magic != MIME_MAGIC {
+    // SAFETY: non-null by the check above, and `MimeBox` is `repr(C)` with
+    // `magic` first, so this reads eight bytes at offset 0 of whatever the
+    // caller passed. That is deliberately WEAKER than forming a
+    // `&MimeBox`: the pointer may address a smaller record of another family --
+    // a `curl_mimepart *` given where a `curl_mime *` belongs -- and asserting
+    // the whole record before the magic has vouched for it would read past that
+    // record. AddressSanitizer reported exactly that heap-buffer-overflow before
+    // this read was narrowed.
+    if unsafe { magic_of(handle) } != MIME_MAGIC {
         return None;
     }
 
+    // SAFETY: the magic word above vouches for the record being one of ours, so
+    // it is a live, fully initialised `MimeBox`. The borrow is shared, is
+    // confined to this block, and ends before any caller of this function takes
+    // an exclusive one.
+    let boxed = unsafe { &*handle.cast::<MimeBox>() };
     if boxed.tree.is_some() {
         return Some((handle, Vec::new()));
     }
@@ -550,15 +595,19 @@ unsafe fn part_identity(
         return None;
     }
 
-    // SAFETY: non-null by the check above, and by contract the pointer
-    // addresses a live `PartBox` that `curl_mime_addpart` allocated and that
-    // its root still owns. The shared borrow ends inside this block, before
-    // any exclusive borrow of the root is taken -- which matters, because the
-    // record's `Box` is held by that same root.
-    let boxed = unsafe { &*part.cast::<PartBox>() };
-    if boxed.magic != PART_MAGIC {
+    // SAFETY: non-null by the check above, and `PartBox` is `repr(C)` with
+    // `magic` first, so this reads offset 0 of whatever was passed without
+    // assuming the record's extent. See the note in `mime_identity`.
+    if unsafe { magic_of(part) } != PART_MAGIC {
         return None;
     }
+
+    // SAFETY: the magic vouches for the record, so the pointer addresses a live
+    // `PartBox` that `curl_mime_addpart` allocated and that its root still owns.
+    // The shared borrow ends inside this block, before any exclusive borrow of
+    // the root is taken -- which matters, because the record's `Box` is held by
+    // that same root.
+    let boxed = unsafe { &*part.cast::<PartBox>() };
     if boxed.at.root.is_null() {
         return None;
     }
@@ -783,9 +832,17 @@ pub unsafe extern "C" fn curl_mime_free(mime: *mut curl_mime) {
         // SAFETY: non-null by the check above and, by this function's
         // contract, addressing a live `MimeBox`. The shared borrow ends inside
         // this block.
+        //
+        // The magic is read FIRST, through `magic_of`, so that a pointer to a
+        // smaller record of the other family is rejected before anything
+        // asserts this record's extent.
         let (ours, transferred) = unsafe {
-            let boxed = &*mime.cast::<MimeBox>();
-            (boxed.magic == MIME_MAGIC, boxed.forward.is_some())
+            if magic_of(mime) != MIME_MAGIC {
+                (false, false)
+            } else {
+                let boxed = &*mime.cast::<MimeBox>();
+                (true, boxed.forward.is_some())
+            }
         };
 
         if !ours || transferred {
@@ -1442,12 +1499,13 @@ unsafe fn attach_subparts(
         // SAFETY: by contract `subparts` is null or a live handle; null is
         // excluded here, and the shared borrow ends inside the block.
         let already = unsafe {
-            let donor = &*subparts.cast::<MimeBox>();
-            donor.magic == MIME_MAGIC
-                && donor
+            magic_of(subparts) == MIME_MAGIC && {
+                let donor = &*subparts.cast::<MimeBox>();
+                donor
                     .forward
                     .as_ref()
                     .is_some_and(|at| ptr::eq(at.root, root) && at.path == path)
+            }
         };
         if already {
             return CURLcode::CURLE_OK;
@@ -1482,8 +1540,12 @@ unsafe fn attach_subparts(
         // handle. The shared borrow ends inside this block, before the
         // exclusive one the transfer needs.
         let (ours, is_root) = unsafe {
-            let donor = &*subparts.cast::<MimeBox>();
-            (donor.magic == MIME_MAGIC, donor.tree.is_some())
+            if magic_of(subparts) != MIME_MAGIC {
+                (false, false)
+            } else {
+                let donor = &*subparts.cast::<MimeBox>();
+                (true, donor.tree.is_some())
+            }
         };
         if !ours {
             return bad;
@@ -1894,22 +1956,54 @@ mod tests {
 
     #[test]
     fn a_foreign_pointer_is_rejected_by_every_family_convention() {
-        // A block that is readable and is emphatically not one of ours. The
-        // magic word is what separates the two.
-        let mut impostor = [0_u64; 8];
-        let handle: *mut curl_mime = impostor.as_mut_ptr().cast();
+        // A record that is emphatically not one of ours. The magic word is what
+        // separates the two.
+        //
+        // WHY THIS IS A REAL `MimeBox` RATHER THAN A SMALL SCRATCH BLOCK. An
+        // earlier form of this test used `[0_u64; 8]`, and AddressSanitizer
+        // reported a stack-buffer-overflow: `mime_identity` reaches its magic
+        // through `&*handle.cast::<MimeBox>()`, and forming that shared
+        // reference asserts the WHOLE record is readable, which 64 bytes are
+        // not. Merely enlarging the block would not have been enough either --
+        // `MimeBox` holds a `Box<Poison>`, and a zeroed `Box` is a null `Box`,
+        // so a reference to zeroed bytes would be an invalid value even where it
+        // was in bounds. A genuine, fully valid record carrying a deliberately
+        // wrong magic is therefore the only construction that tests what this
+        // test means to test -- that the magic, not the address, is what
+        // decides -- without depending on undefined behaviour to do it.
+        let mut impostor = MimeBox {
+            magic: 0,
+            poison: Box::new(Poison::new()),
+            tree: None,
+            forward: None,
+            parts: Vec::new(),
+            absorbed: Vec::new(),
+        };
+        let handle: *mut curl_mime = (&mut impostor as *mut MimeBox).cast();
 
-        // SAFETY: `handle` addresses eight readable, initialised words, which
-        // is more than any of the reads below touch. Every entry point checks
-        // the magic word before it interprets anything else.
+        // SAFETY: `handle` addresses a live, fully initialised `MimeBox` this
+        // test owns, so every read the entry points make is in bounds and of a
+        // valid value. Each one checks the magic word before it interprets
+        // anything else, and this record's magic is not `MIME_MAGIC`.
         unsafe {
             assert!(curl_mime_addpart(handle).is_null());
             // A `void` function can only stay silent, and must not free it.
             curl_mime_free(handle);
         }
-        assert_eq!(impostor[0], 0, "a foreign block must not be written");
+        assert_eq!(impostor.magic, 0, "a foreign record must not be written");
+        assert!(impostor.parts.is_empty(), "nor gain a part");
 
-        let part: *mut curl_mimepart = impostor.as_mut_ptr().cast();
+        // The same again for the part convention, with a valid `PartBox` whose
+        // magic is likewise not `PART_MAGIC`.
+        let mut fake_part = PartBox {
+            magic: 0,
+            at: Location {
+                root: ptr::null_mut(),
+                path: Vec::new(),
+            },
+            owned_headers: ptr::null_mut(),
+        };
+        let part: *mut curl_mimepart = (&mut fake_part as *mut PartBox).cast();
         // SAFETY: as above; each of these validates before dereferencing.
         unsafe {
             assert_eq!(

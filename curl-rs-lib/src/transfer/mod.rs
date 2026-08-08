@@ -48,10 +48,10 @@
 //!
 //! # Partially delivered
 //!
-//! Of this module's planned children, [`ratelimit`] and [`progress`] exist.
-//! The transfer loop itself, per-request state, the send and client-writer
-//! paths, content encoding and chunked framing arrive with their own files,
-//! and each declaration lands WITH its file -- a `mod` line without a file is
+//! Of this module's planned children, [`ratelimit`], [`progress`], [`sendf`],
+//! [`request`] and [`writeout`] exist. The transfer loop itself, content
+//! encoding and chunked framing arrive with their own files, and each
+//! declaration lands WITH its file -- a `mod` line without a file is
 //! `error[E0583]`, which no attribute can reach, because module resolution
 //! never gets far enough to produce a lint.
 //!
@@ -110,6 +110,34 @@ pub(crate) mod progress;
 /// [`Clock`]: crate::util::timeval::Clock
 pub(crate) mod sendf;
 
+/// Per-request state: supersedes `lib/request.c` and `lib/request.h`.
+///
+/// One `SingleRequest` covers one request attempt -- its counters, its upload
+/// send queue, its send and flush path, its pause and blocking predicates, its
+/// completion, and the redirect and retry bookkeeping that carries an
+/// operation from one attempt to the next.
+///
+/// It names neither this module root nor a protocol module, and both omissions
+/// are structural. `lib/request.c` includes `transfer.h` and `url.h`, which
+/// include `request.h` straight back, so the C's include cycle would become a
+/// module cycle; and `Curl_http_follow` lives in `lib/http.c`, so a literal
+/// transcription would put HTTP inside the request layer. What the C reaches
+/// through those includes for arrives instead as two narrow seams the
+/// dependency-last engine and the protocol modules implement -- `RequestIo` for
+/// the transport, client-chain, resolver, progress and diagnostic operations,
+/// and `ProtocolFollow` for the URL, scheme, port and request-method work a
+/// redirect needs. The bookkeeping around that work -- the counters, the
+/// ceiling, the fake-follow storage, the soft reset and the frozen log lines --
+/// stays here, so no protocol module reimplements it.
+///
+/// It reads no clock. Every instant arrives through `RequestIo::pgrs_now`,
+/// which is `Curl_pgrs_now` (`lib/progress.c:171-177`), so the request start
+/// time and the `TIMER_POSTRANSFER` record are both assertable against a
+/// pinned [`TestClock`].
+///
+/// [`TestClock`]: crate::util::timeval::TestClock
+pub(crate) mod request;
+
 /// The token bucket behind `--limit-rate`: supersedes `lib/ratelimit.c` and
 /// `lib/ratelimit.h`.
 ///
@@ -125,3 +153,22 @@ pub(crate) mod sendf;
 /// `lib/multi.c:1880-1921` into the documentation of the module's `wait_ms`
 /// and `next_step_ms`.
 pub(crate) mod ratelimit;
+
+/// The client-output and pause-handling writer stages: supersedes
+/// `lib/cw-out.c` with `lib/cw-out.h` and `lib/cw-pause.c` with
+/// `lib/cw-pause.h`.
+///
+/// The bottom of the writer chain, and the only module in the crate that
+/// invokes `CURLOPT_WRITEFUNCTION` and `CURLOPT_HEADERFUNCTION`. It owns the
+/// two stages [`sendf`] deliberately does not name -- `cw-out` at
+/// `CURL_CW_CLIENT` and `cw-pause` at `CURL_CW_PROTOCOL`, both reached there
+/// through `ClientIoFactory` -- together with the ordered buffering that makes
+/// `curl_easy_pause` replay a paused transfer's bytes in their original order,
+/// and the `hds-collect` stage that fills the store `curl_easy_header` reads.
+///
+/// It depends on [`sendf`] and never the other way round, which is what keeps
+/// the C's `sendf.h` / `cw-out.h` / `cw-pause.h` include cycle from becoming a
+/// module cycle. It does not name this module root either: the one operation it
+/// needs from the transfer loop, `Curl_xfer_pause_recv`, arrives through
+/// `sendf`'s `TransferControl` seam.
+pub(crate) mod writeout;

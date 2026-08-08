@@ -613,9 +613,24 @@
 //! dependency, and all ten are exported from the **static** library. Five of
 //! them are not exported from the shared library, for a reason that is nothing
 //! to do with the prologues and is set out two paragraphs below.
-//! `curl_formadd` is not implemented at all, and its obstacle is different in kind: a
-//! `CURLFORM_*` sequence carries no type encoding to recover the argument shapes
-//! from, so `va_start` alone does not help.
+//!
+//! **`curl_formadd`, the eleventh, is implemented by the same route, and the
+//! claim that stood here -- that its obstacle was "different in kind" because a
+//! `CURLFORM_*` sequence "carries no type encoding to recover the argument shapes
+//! from" -- was overtaken by measurement.** It does carry one: `lib/formdata.c`
+//! reads the option itself with `va_arg(params, int)` and its switch then reads
+//! exactly one argument of the type that option names -- `char *`, `long`,
+//! `curl_off_t`, `struct curl_slist *`, `struct curl_forms *`, or nothing at all.
+//! The encoding is per-option rather than arithmetic, every one of those shapes
+//! is a single general-purpose slot of at most eight bytes on all four required
+//! targets, and none is a floating-point type, so one cursor decodes the whole
+//! list and `va_start` was the only thing missing. `src/ffi/form.rs` supplies it
+//! with the same four per-ABI prologues, calls a non-exported Rust function with
+//! the synthesised list, and shares `src/ffi/printf.rs`'s cursor rather than
+//! keeping a second copy of the slot arithmetic. It inherits the same shared-library
+//! gap: `curl_formadd` is a `T` in `libcurl.a` and absent from `libcurl.so`,
+//! which makes six such symbols rather than five. `curl_formget` and
+//! `curl_formfree` are ordinary Rust items and are exported from both.
 //!
 //! **What remains open for those ten, stated rather than glossed.** The Apple
 //! prologues are cross-assembled and disassembled in this environment, never

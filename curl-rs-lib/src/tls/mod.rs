@@ -104,7 +104,7 @@
 //! `include/curl/curl.h`, so no value is invented and no enumeration is
 //! renumbered. The name is `rustls`.
 //!
-//! # This directory's five children, and why two are declared
+//! # This directory's five children, and why four are declared
 //!
 //! The module root owns five children:
 //!
@@ -112,30 +112,29 @@
 //! |-------|------------|
 //! | [`cipher_suite`] | `lib/vtls/cipher_suite.c` |
 //! | [`keylog`] | `lib/vtls/keylog.c` |
-//! | `verify` | `lib/vtls/x509asn1.c`, `lib/vtls/hostcheck.c` |
-//! | `session_cache` | `lib/vtls/vtls_scache.c`, `lib/vtls/vtls_spack.c` |
+//! | [`verify`] | `lib/vtls/x509asn1.c`, `lib/vtls/hostcheck.c` |
+//! | [`session_cache`] | `lib/vtls/vtls_scache.c`, `lib/vtls/vtls_spack.c` |
 //! | `rustls_backend` | `lib/vtls/rustls.c` |
 //!
-//! Two are declared below because two exist. The other three are named here
-//! rather than declared for a measured reason and not a stylistic one: `mod
-//! verify;` without a `verify.rs` beside it is rustc `E0583`, a hard error
-//! that would stop this crate compiling and take every downstream gate with
-//! it -- the symbol-parity comparison, the 129 example compilations and the
-//! fixture corpus all need a library that builds. A declaration therefore
-//! arrives with its file, which is the convention the whole tree already
-//! follows: `conn/mod.rs` declares two of seven planned children,
-//! `protocols/mod.rs` one, `multi/mod.rs` two, and the crate root records the
-//! same for this directory at `lib.rs:726-729`.
+//! Four are declared below because four exist. The remaining one is named
+//! here rather than declared for a measured reason and not a stylistic one:
+//! `mod rustls_backend;` without a `rustls_backend.rs` beside it is rustc
+//! `E0583`, a hard error that would stop this crate compiling and take every
+//! downstream gate with it -- the symbol-parity comparison, the 129 example
+//! compilations and the fixture corpus all need a library that builds. A
+//! declaration therefore arrives with its file, which is the convention the
+//! whole tree already follows: `conn/mod.rs` declares five of its planned
+//! children, `protocols/mod.rs` one, `multi/mod.rs` two, and the crate root
+//! records the same for this directory at `lib.rs:726-729`.
 //!
-//! What each absent child will own is fixed, so that nothing here has to be
-//! revisited when it lands. `verify` owns certificate and hostname
-//! verification, on by default, with `--insecure` warning on standard error
-//! before proceeding. `session_cache` owns the resumption cache, its
-//! serialisation and the peer session-cache key -- which is why
-//! [`SslPeer::scache_key`] is *supplied* to this module rather than computed
-//! in it: `Curl_ssl_peer_key_make` lives in `vtls_scache.c`, not in `vtls.c`.
-//! `rustls_backend` owns the one [`TlsBackend`] implementation, following the
-//! mapping `lib/vtls/rustls.c` already established rather than reinventing it.
+//! What the absent child will own is fixed, so that nothing here has to be
+//! revisited when it lands. `rustls_backend` owns the one [`TlsBackend`]
+//! implementation, following the mapping `lib/vtls/rustls.c` already
+//! established rather than reinventing it. [`session_cache`] already owns the
+//! resumption cache, its serialisation and the peer session-cache key -- which
+//! is why [`SslPeer::scache_key`] is *supplied* to this module rather than
+//! computed in it: `Curl_ssl_peer_key_make` lives in `vtls_scache.c`, not in
+//! `vtls.c`.
 //!
 //! # Visibility
 //!
@@ -161,6 +160,33 @@ pub(crate) mod cipher_suite;
 /// destination comes from the environment, exactly as in C, and the record
 /// text is frozen output rather than a formatting choice.
 pub(crate) mod keylog;
+
+/// Certificate trust, revocation, hostname checking and certificate
+/// introspection: supersedes `lib/vtls/x509asn1.c` and
+/// `lib/vtls/hostcheck.c`, plus the trust half of `lib/vtls/rustls.c`.
+///
+/// Verification is on by default and `--insecure` is the only switch that
+/// turns it off: the module's default policy enables both the peer-chain and
+/// the hostname check, and one private constructor -- the equivalent of C
+/// `cr_verify_none` -- is the only route to a configuration that verifies
+/// nothing.
+pub(crate) mod verify;
+
+/// The session resumption cache and its serialisation: supersedes
+/// `lib/vtls/vtls_scache.c` and `lib/vtls/vtls_spack.c`.
+///
+/// Owns the peer session-cache key -- which is why [`SslPeer::scache_key`] is
+/// *supplied* to this module rather than computed in it -- the bounded peer
+/// slab and its least-recently-used eviction, the insertion policy that
+/// distinguishes a single-use TLS 1.3 ticket from a reusable pre-1.3 session,
+/// and the HMAC-protected import and export paths behind
+/// `curl_easy_ssls_import` and `curl_easy_ssls_export`.
+///
+/// The `vtls_spack` byte format is a *consumer-visible* contract, not an
+/// internal detail: the command-line tool's `--ssl-sessions` writes it in one
+/// run and reads it in another, possibly across builds. It is therefore
+/// reproduced byte for byte and held there by golden tests.
+pub(crate) mod session_cache;
 
 use core::fmt;
 use std::rc::Rc;
