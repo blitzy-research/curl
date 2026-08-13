@@ -16,69 +16,6 @@
 //! definition of either name anywhere in the crate is a link error rather
 //! than a review finding.
 //!
-//! `curl_slist_free_all` is declared `void`, so it has **no error channel at
-//! all**. A null list is a silent no-op, exactly as
-//! `docs/libcurl/curl_slist_free_all.md:31-32` documents, and a contained
-//! panic is a silent return. Whatever it learns about a fault, it keeps to
-//! itself.
-//!
-//! # Why this list keeps its intrusive C shape
-//!
-//! Specification 0.1.2 and 0.6.9 are explicit that the intrusive linked list
-//! is one of the constructs the rewrite exists to remove, and that internally
-//! `curl_slist` becomes a `Vec`. That applies to the ENGINE. It cannot apply
-//! here, because `struct curl_slist` is layout-visible:
-//! `include/curl/curl.h:2793-2797` declares both fields, `docs/examples/`
-//! walks them, and a consumer legally builds a list by hand and hands it to
-//! `curl_easy_setopt`. So the boundary keeps the C representation exactly --
-//! two words, `data` then `next` -- and the conversion into an owned `Vec`
-//! happens where an option value is consumed, in
-//! [`handle::slist_to_vec`](super::handle::slist_to_vec), not here. This
-//! module builds and releases real C-shaped nodes and owns no conversion of
-//! its own; the node type itself is declared once, by [`super::types`], and
-//! is only named here.
-//!
-//! # The allocator is the application's, not Rust's
-//!
-//! Every allocation and release below goes through [`super::memory`], which
-//! is libcurl's five replaceable hooks. Three facts make that mandatory
-//! rather than tidy:
-//!
-//! * A consumer may release a node's string with `curl_free`, or a whole
-//!   chain that libcurl built -- `curl_easy_getinfo(CURLINFO_SSL_ENGINES,
-//!   &list)` hands back exactly that -- so the allocator has to be uniform
-//!   across the entire crate, never per module.
-//! * `curl_global_init_mem` lets an application replace the allocator
-//!   wholesale (`lib/easy.c:238` assigns the hooks), and a block produced by
-//!   Rust's `GlobalAlloc` could not be released by the application's `free`.
-//! * The C duplicates the string with `curlx_strdup`, which inside libcurl is
-//!   `Curl_cstrdup` (`lib/curl_setup.h:1474`) -- the *strdup* hook, not the
-//!   malloc hook. So this module duplicates through
-//!   [`memory::strdup`](super::memory::strdup) too: an application that
-//!   installed five hooks and counts them sees the same one called that C
-//!   libcurl calls.
-//!
-//! A mismatch here is heap corruption rather than a wrong answer, which is
-//! why the pairing is asserted by test rather than assumed.
-//!
-//! # Why the three allocations are injected
-//!
-//! [`NodeAllocator`] gathers the three calls `lib/slist.c` makes --
-//! `curlx_strdup`, `curlx_malloc` and `curlx_free` -- and the entry points
-//! pass [`LIBCURL_HOOKS`], the table that names the real hooks. The seam
-//! exists for one reason: the failure paths are the part of this file most
-//! easily got wrong and least easily observed, and injecting the allocations
-//! is the only way to execute them.
-//!
-//! The alternative was measured and rejected. Inducing a real allocation
-//! failure means installing a failing hook, the hook registry is
-//! process-wide, and this crate has no test-visible lock over it -- `escape.rs`
-//! records the same finding, and `printf.rs` asserts that no hooks are
-//! installed without taking any lock at all. A test that installed one would
-//! make unrelated tests flaky. Injection is deterministic, costs the shipped
-//! code one indirect call through a `const` table, and leaves exactly one
-//! implementation of each behaviour rather than a test-only copy.
-//!
 //! # The append contract, exactly
 //!
 //! `curl_slist_append` duplicates the string, wraps it in a node, and returns
@@ -95,28 +32,12 @@
 //!   `docs/libcurl/curl_slist_append.md:74-79` states the consequence from the
 //!   caller's side -- "To avoid overwriting an existing non-empty list on
 //!   failure, the new list should be returned to a temporary variable" -- so
-//!   the leak trap is part of the documented contract. Preserving it is
-//!   required: specification 0.8.2 prohibits a behaviour change justified as
-//!   an improvement, and a caller written against curl 8.x already keeps its
-//!   own copy of the head for exactly this reason. Do not "fix" it.
+//!   the leak trap is part of the documented contract. Do not "fix" it.
 //! * **Append is O(n).** `slist_get_last` walks to the tail on every call
 //!   (`lib/slist.c:29-43`). This module walks it too. A tail cache would be
 //!   faster and would change nothing a caller can observe -- but performance
-//!   is an explicit non-goal (specification 0.1.1), and the extra pointer
+//!   is an explicit non-goal, and the extra pointer
 //!   would have nowhere to live in a struct whose layout is frozen.
-//!
-//! # A NULL string
-//!
-//! `curl_slist_append(list, NULL)` reaches `curlx_strdup(NULL)`, whose
-//! behaviour is undefined -- in practice a segmentation fault --
-//! and `Curl_slist_append_nodup` guards it only with `DEBUGASSERT(data)`,
-//! which compiles away in a release build.
-//! `docs/libcurl/curl_slist_append.md:33-34` puts it on the caller: the
-//! string "must be a valid string pointer and cannot be NULL". There is
-//! therefore no defined output to preserve, and this module returns null: the
-//! same answer it gives for an allocation failure, which is a documented
-//! return value that every correct caller already handles. That is a
-//! deliberate divergence from an UNDEFINED behaviour, not from a defined one.
 //!
 //! # Panic containment
 //!
@@ -280,12 +201,6 @@ unsafe fn free_all_through(alloc: &NodeAllocator, list: *mut curl_slist) {
 
 /// Appends a copy of a string to a linked list, returning the list head.
 ///
-/// Supersedes `curl_slist_append` (`lib/slist.c:85-97`). Passing a null
-/// `list` starts a new one; the string is copied, so the caller may reuse or
-/// release its own buffer as soon as this returns. Failure answers null and
-/// leaves an existing list untouched, so the return value belongs in a
-/// temporary until it is known to be non-null.
-///
 /// # Safety
 ///
 /// `list` must be either null or the head of a well-formed `curl_slist` chain
@@ -306,9 +221,6 @@ pub unsafe extern "C" fn curl_slist_append(
 }
 
 /// Releases an entire list, including every string it holds.
-///
-/// Supersedes `curl_slist_free_all` (`lib/slist.c:124-139`). A null argument
-/// is a no-op, as it is in C.
 ///
 /// # Safety
 ///
@@ -674,10 +586,6 @@ mod tests {
     static SILENT_FREE_RELEASES: AtomicUsize = AtomicUsize::new(0);
 
     /// Releases the block, then panics on the second call.
-    ///
-    /// Ordered that way deliberately: releasing a one-node chain takes exactly
-    /// two calls -- the string, then the node -- so every block is freed
-    /// before the panic and the test leaks nothing for a sanitizer to report.
     ///
     /// # Safety
     ///

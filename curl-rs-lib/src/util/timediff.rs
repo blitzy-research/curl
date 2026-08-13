@@ -23,7 +23,7 @@
 //***************************************************************************
 
 //! Time differences and the millisecond conversions -- supersedes
-//! `lib/curlx/timediff.c` (85 lines) and `lib/curlx/timediff.h` (51).
+//! `lib/curlx/timediff.c` and `lib/curlx/timediff.h`.
 //!
 //! Small and foundational. [`TimeDiff`] is the type in which *every* timeout,
 //! every elapsed-time measurement and every `CURLINFO_*_TIME` figure in this
@@ -47,102 +47,6 @@
 //! | `FMT_TIMEDIFF_T` | `timediff.h:31` | none -- subsumed, see below |
 //! | `curlx_mstotv` | `timediff.c:34-77` | [`mstotv`] |
 //! | `curlx_tvtoms` | `timediff.c:82-85` | [`tvtoms`] |
-//!
-//! # The three-way mapping, which is the point of the module
-//!
-//! The C states its contract twice, identically, at `timediff.c:26-33` and
-//! `timediff.h:36-43`. Reproduced here with only the C block comment's `*`
-//! decoration removed, because it is the contract every reactor call site
-//! depends on:
-//!
-//! ```text
-//! Return values:
-//!    NULL IF tv is NULL or ms < 0 (eg. no timeout -> blocking select)
-//!    tv with 0 in both fields IF ms == 0 (eg. 0ms timeout -> polling select)
-//!    tv with converted fields IF ms > 0 (eg. >0ms timeout -> waiting select)
-//! ```
-//!
-//! Three outcomes, and `Option<Duration>` carries them exactly:
-//!
-//! | Input | C result | Rust result | Meaning to the caller |
-//! |---|---|---|---|
-//! | `ms < 0` | `NULL` | `None` | no timeout: block indefinitely |
-//! | `ms == 0` | zero in both fields | `Some(Duration::ZERO)` | poll |
-//! | `ms > 0` | converted fields | `Some(d)` | wait at most `d` |
-//!
-//! `None` and `Some(Duration::ZERO)` mean *opposite* things and must never be
-//! conflated: `None` blocks forever, `Some(Duration::ZERO)` refuses to block
-//! at all. The C call sites make that concrete -- `lib/select.c:74` assigns
-//! the result to `ptimeout` and hands it straight to `select` at `:92` and
-//! `:94`, where a null pointer is the platform's own "no timeout", and
-//! `lib/curlx/wait.c:83` does the same inline. Swapping the two turns a poll
-//! into a hang or a bounded wait into a busy spin, which is the single
-//! highest-consequence mistake available in this file.
-//!
-//! # Two collapses, both deliberate and both recorded
-//!
-//! **The out-parameter disappears.** The C signature is
-//! `struct timeval *curlx_mstotv(struct timeval *tv, timediff_t ms)`: the
-//! caller owns the storage, passes a pointer to it, and reads a pointer back
-//! that is either that same pointer or null. So the C has to check `if(!tv)`
-//! (`timediff.c:36-37`) and fold "you gave me nowhere to write" into the same
-//! null return as "you asked for no timeout" -- two unrelated conditions
-//! sharing one result. Returning an owned value removes the first condition
-//! outright: there is no storage to be absent, so `None` means only "no
-//! timeout". The C's `struct timeval` is a platform ABI type and does not
-//! appear here at all; the storage it provided is what `Duration` now owns.
-//!
-//! **The second-and-microsecond split disappears too.** `timediff.c:42-44`
-//! computes `tv_sec = ms / 1000` and `tv_usec = (ms % 1000) * 1000`, with the
-//! C's own comment recording that the second of those is at most `999000`.
-//! `Duration::from_millis` produces exactly that value -- the same whole
-//! seconds and the same subsecond microseconds -- so the split is not
-//! reimplemented, only its equivalence is asserted, by
-//! `mstotv_splits_seconds_and_microseconds_as_the_c_does`. The C's separate
-//! `else` branch writing zero into both fields (`timediff.c:71-74`) collapses
-//! into the same expression for the same reason: `Duration::from_millis(0)`
-//! *is* `Duration::ZERO`, which
-//! `zero_milliseconds_is_the_zero_duration_not_none` proves.
-//!
-//! # The three clamp branches, and the licence for collapsing them
-//!
-//! `timediff.c:45-69` is three `#ifdef` arms -- `HAVE_SUSECONDS_T`, `_WIN32`,
-//! and a fallback -- each guarded in turn by `#if TIMEDIFF_T_MAX > TIME_T_MAX`
-//! / `> LONG_MAX` / `> INT_MAX`, and each clamping `tv_sec` to the maximum of
-//! whichever type the platform's `tv_sec` field happens to be:
-//!
-//! ```text
-//! HAVE_SUSECONDS_T -> tv_sec = (time_t)tv_sec, clamped at TIME_T_MAX
-//! _WIN32           -> tv_sec = (long)tv_sec,   clamped at LONG_MAX
-//! otherwise        -> tv_sec = (int)tv_sec,    clamped at INT_MAX
-//! ```
-//!
-//! All three collapse to one unconditional conversion here, and the reason is
-//! specific rather than a shrug. The mandated targets are
-//! `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-//! `x86_64-apple-darwin` and `aarch64-apple-darwin`; all four are 64-bit,
-//! where `time_t` is 64 bits and `TIMEDIFF_T_MAX > TIME_T_MAX` is false, so
-//! the first arm's clamp is compiled out on every one of them and the other
-//! two arms are not compiled at all. The 32-bit case the guards exist for is
-//! a deliberate forfeit of the migration (AAP 0.2.2), not an oversight, and it
-//! must not be claimed as supported. Independently of the platform, the Rust
-//! side has nothing left to clamp *against*: `Duration` counts whole seconds
-//! in a `u64` and cannot overflow for any non-negative [`TimeDiff`], because
-//! [`i64::MAX`] milliseconds is about 2.9e8 years and still only 9.2e15
-//! seconds.
-//!
-//! # Signedness is load-bearing: a negative difference is legal
-//!
-//! `timediff_t` is signed and stays signed. `lib/curlx/timeval.h:44-45`
-//! documents the reason in the C's own words -- "Make sure that the first
-//! argument (newer) is the more recent time and older is the older time, as
-//! otherwise you get a weird negative time-diff back..." -- and repeats it at
-//! `:54-55` and `:63-64`. A negative value is therefore a *caller* mistake
-//! that the type deliberately surfaces, not an error the callee traps. An
-//! unsigned type, or a clamp at zero, would hide exactly the bug the C
-//! exposes, so neither is used; [`mstotv`] answers `None` for a negative
-//! input, which is what the C does, and nothing else in this module rejects
-//! or rewrites one.
 //!
 //! # `FMT_TIMEDIFF_T` has no successor, and that is not an omission
 //!
@@ -172,57 +76,6 @@
 //! `lib/splay.c`), depends on this file the same way, so the name
 //! [`TimeDiff`] and the two constant names are a stable contract and should
 //! not be renamed for tidiness.
-//!
-//! # What is deliberately absent
-//!
-//! - **No millisecond or microsecond factor constant.** `1_000` and
-//!   `1_000_000` appear nowhere in the code below, because `Duration`'s own
-//!   constructors and accessors are where the factors live. A `pub(crate)
-//!   const` for either would be an item with no consumer, which this layer's
-//!   policy treats as scaffolding to be recorded rather than written.
-//! - **No `millis_to_duration` / `duration_to_millis` alias.** The C stems
-//!   `mstotv` and `tvtoms` are kept precisely so that a grep against
-//!   `lib/curlx/timediff.c` still lands on this file; a second name for each
-//!   function would double the audit surface and let the two drift.
-//! - **No newtype around [`TimeDiff`].** It is a plain alias on purpose. The
-//!   crate does arithmetic on time differences everywhere -- expiry
-//!   bookkeeping, rate limiting, progress accounting -- and a newtype would
-//!   push operator boilerplate into every consumer while buying no safety
-//!   that the alias does not already provide. Recorded here so that a later
-//!   reader does not "improve" it.
-//!
-//! # Conventions
-//!
-//! Every item is `pub(crate)`: the C tree's `curlx_` prefix made these
-//! private by convention and still visible to the linker, whereas
-//! `pub(crate)` is private by enforcement (AAP 0.4.2). Nothing here is
-//! reachable from `curl-rs-ffi`, none of it is re-exported by the crate root,
-//! and none of it is widened to make `tests/unit` or `tests/libtest` link --
-//! that is a documented deviation (AAP 0.8.7), not a defect to work around.
-//!
-//! The file adds no dependency and imports exactly one item,
-//! [`core::time::Duration`]. It names no sibling module, so the layering rule
-//! that makes `util` the base of the crate's module graph holds here by
-//! construction. Edition 2021, and the minimum supported Rust version is
-//! 1.75: `Duration::ZERO` and `Duration::MAX` were stabilized in 1.53,
-//! `Duration::as_millis` in 1.33, `i64::unsigned_abs` in 1.51 and
-//! `TryFrom<u128> for i64` in 1.34, so nothing below needs a newer compiler.
-//! Performance is an explicit non-goal, so nothing here carries an `#[inline]`
-//! hint or is shaped by a speed argument.
-//!
-//! HOW TO CHECK THE PLATFORM-TYPE CLAIM, because an unanchored search reports
-//! a false failure against this file itself: the prose above legitimately
-//! names the C structure this module replaces and cites the two C files whose
-//! stem it shares, so a bare `grep -n 'timeval' <this file>` matches those
-//! citations. The claim is about *code*, and the anchored form is
-//!
-//! ```text
-//! grep -nE '^[^/]*\btimeval\b' curl-rs-lib/src/util/timediff.rs
-//! ```
-//!
-//! which must print nothing. Requiring the token before any slash on the line
-//! is what excludes every `//`, `///` and `//!` line: a comment begins with a
-//! slash, so it can never match. Measured on this file: it prints nothing.
 
 use core::time::Duration;
 
@@ -235,38 +88,10 @@ use core::time::Duration;
 /// microseconds both fit here with room to spare -- [`i64::MAX`] microseconds
 /// is roughly 292,000 years -- and it is why the type is wider than the
 /// platform's own clock type rather than matching it.
-///
-/// It resolves to [`i64`] on every mandated target. `curl_off_t` is
-/// `CURL_TYPEOF_CURL_OFF_T` (`include/curl/system.h:396`), which is `long` or
-/// `long long` depending on the platform, and `lib/curl_setup.h:595-596`
-/// rejects outright any platform where it is narrower than 8 bytes with
-/// `#error "too small curl_off_t"`. So 64-bit signed is not an assumption made
-/// here; it is the only width the C tree compiles for.
-///
-/// The parent module already aliases the same C type as
-/// [`CurlOffT`](super::CurlOffT), for offsets and file sizes rather than for
-/// durations. Two names for one width is deliberate: a signature reading
-/// `TimeDiff` says "this is a span of time", and one reading `CurlOffT` says
-/// "this is a position in a stream". This alias is written against [`i64`]
-/// directly rather than layered on the other so that the module depends on
-/// nothing but [`core::time::Duration`]; that the two agree is asserted by
-/// `time_diff_and_curl_off_t_are_the_same_integer` rather than assumed.
-///
-/// A plain alias, not a newtype, and not by accident -- see the module's "What
-/// is deliberately absent" section for why, and do not convert it.
 #[allow(dead_code)]
 pub(crate) type TimeDiff = i64;
 
 /// The largest representable difference: `TIMEDIFF_T_MAX`.
-///
-/// `lib/curlx/timediff.h:33` defines it as `CURL_OFF_T_MAX`, which
-/// `lib/curl_setup.h:599` pins to `0x7FFFFFFFFFFFFFFF`. That is exactly
-/// [`i64::MAX`], which is why this is expressed against the Rust constant
-/// instead of transcribing the hexadecimal literal -- and
-/// `the_bounds_are_the_signed_64_bit_bounds` checks the two agree.
-///
-/// [`tvtoms`] saturates here rather than wrapping, which is this constant's
-/// one consumer today.
 pub(crate) const TIMEDIFF_T_MAX: TimeDiff = TimeDiff::MAX;
 
 /// The most negative representable difference: `TIMEDIFF_T_MIN`.
@@ -277,10 +102,6 @@ pub(crate) const TIMEDIFF_T_MAX: TimeDiff = TimeDiff::MAX;
 /// negation of the maximum only because a C source file cannot write the most
 /// negative 64-bit literal directly without the compiler treating it as an
 /// unsigned value first.
-///
-/// It exists here for the same reason it exists in the C: a difference may
-/// legitimately be negative, and code that reasons about the range needs both
-/// ends of it. See the module's note on signedness.
 #[allow(dead_code)]
 pub(crate) const TIMEDIFF_T_MIN: TimeDiff = TimeDiff::MIN;
 
@@ -294,28 +115,6 @@ pub(crate) const TIMEDIFF_T_MIN: TimeDiff = TimeDiff::MIN;
 /// | negative | [`None`] | blocks indefinitely -- there is no timeout |
 /// | zero | `Some(Duration::ZERO)` | polls, without blocking at all |
 /// | positive | `Some(d)` | waits at most `d` |
-///
-/// Two branches implement three outcomes because the second and third share
-/// one expression, exactly as the arithmetic permits: `Duration::from_millis`
-/// applied to `0` yields `Duration::ZERO`, which is what the C writes into
-/// both fields on its `else` path (`timediff.c:71-74`). The module
-/// documentation records both collapses, and two tests pin them.
-///
-/// # Conversion, without a bare cast
-///
-/// `ms` is signed and `Duration::from_millis` takes a `u64`, so a conversion
-/// is unavoidable. `as` is not used for it: `-1i64 as u64` is
-/// `18446744073709551615`, which would turn "no timeout" into a wait of about
-/// 584 million years -- the exact class of silent narrowing that
-/// `lib/curlx/warnless.c` exists to catch, and the reason its successors in
-/// the parent module mask explicitly instead. [`i64::unsigned_abs`] is used
-/// after the sign test instead. It is total, it cannot panic and it cannot
-/// wrap even at [`i64::MIN`], and past the sign test it is the identity on
-/// magnitude, so its only observable effect is the change of type.
-///
-/// A checked `u64::try_from(ms)` would be equally correct and equally cheap,
-/// but its error arm is unreachable once `ms` is known to be non-negative, so
-/// it would introduce a branch that no test can cover and no input can reach.
 #[allow(dead_code)]
 pub(crate) fn mstotv(ms: TimeDiff) -> Option<Duration> {
     if ms < 0 {
@@ -330,37 +129,11 @@ pub(crate) fn mstotv(ms: TimeDiff) -> Option<Duration> {
 
 /// Converts a duration into a count of milliseconds -- `curlx_tvtoms`.
 ///
-/// Supersedes `curlx_tvtoms` (`lib/curlx/timediff.c:82-85`, declared at
-/// `lib/curlx/timediff.h:49`), whose whole body is
-///
 /// ```text
 /// return (tv->tv_sec * 1000) + (timediff_t)(tv->tv_usec / 1000);
 /// ```
 ///
-/// # It truncates, and it must
-///
-/// `tv_usec / 1000` is integer division on a non-negative value, so it
-/// truncates toward zero and does not round: 999 microseconds contribute
-/// **zero** milliseconds, and 1,999 contribute one. `Duration::as_millis`
-/// truncates identically, which is why it is used unaltered rather than
-/// wrapped in any rounding correction. Rounding up instead would inflate every
-/// converted timeout by up to a millisecond, and
-/// `tvtoms_truncates_it_does_not_round` fixes the behaviour so that a later
-/// "fix" of that kind fails a test rather than shipping.
-///
-/// Ceiling behaviour is a *different* function in the C, namely
-/// `curlx_timediff_ceil_ms` (`lib/curlx/timeval.h:59-60`), and it belongs to
-/// the clock module rather than here.
-///
 /// # Saturation, and the asymmetry that disappears
-///
-/// `Duration::as_millis` returns a `u128`, whose range exceeds
-/// [`TimeDiff`]'s: `Duration::MAX` is about 1.8e22 milliseconds against a
-/// ceiling of 9.2e18. The conversion therefore saturates at
-/// [`TIMEDIFF_T_MAX`] rather than wrapping into a negative value, which is
-/// both what the C's own clamps do at every width boundary and the only answer
-/// that keeps the sign meaningful. No `as` cast appears, for the reason given
-/// on [`mstotv`].
 ///
 /// One asymmetry in the C vanishes here rather than being reproduced:
 /// `curlx_mstotv` checks its pointer while `curlx_tvtoms` dereferences its own
@@ -375,16 +148,6 @@ pub(crate) fn tvtoms(d: Duration) -> TimeDiff {
 }
 
 // TESTS
-//
-// `tests/unit/*.c` (59 files) and `tests/libtest/*.c` (235) link a debug
-// static build of the C library and call internal `Curl_*` symbols, which a
-// Rust static library does not export. Their coverage therefore relocates into
-// `#[cfg(test)]` modules inside the files under test (AAP 0.8.7), and this is
-// this file's share of that relocation.
-//
-// Nothing here needs a network, a clock or a fixture: every assertion is a
-// hand-computed value taken from the C, so the whole module is also valid
-// under Miri and under `cargo test --release`.
 
 #[cfg(test)]
 mod tests {

@@ -26,104 +26,15 @@
 // rendered as Rust line comments, byte-identical to the block at the head of
 // `crate::util`'s own `mod.rs`. `reuse lint` runs in continuous integration and
 // wants a licence-identifier tag naming `curl`; line 21 is it.
-//
-// That tag's spelling appears EXACTLY ONCE in this file, on line 21, and must
-// stay that way. `reuse` scans every line for the tag WITH its trailing colon
-// and parses whatever follows as a licence expression, so a second, prose
-// mention becomes a parse error rather than prose -- the measurement behind
-// that rule is recorded at `util/mod.rs:33-42`. Every reference below therefore
-// says "the licence-identifier tag" and never spells it.
 
 //! The integer-keyed transfer table: the slab that assigns `mid`.
 //!
-//! Supersedes `lib/uint-table.c` (200 lines) and `lib/uint-table.h` (96),
-//! whose eleven public functions and two file-static helpers are reproduced
-//! here in full. It is a fixed-capacity array of rows addressed directly by an
-//! unsigned 32-bit key, and it hands those keys out ITSELF rather than
-//! accepting them from a caller. That is the whole reason it exists, and the
-//! reason it is not a hash map.
-//!
-//! # Why the key sequence is frozen behaviour and not an implementation detail
-//!
-//! The key this table assigns IS the transfer identifier `mid`
-//! (`lib/urldata.h:1630`, `uint32_t mid;`, with `uint32_t master_mid;`
-//! immediately after it), and `mid` is printed. Measured rather than assumed:
-//!
-//! | Emitting site | Format string |
-//! |---|---|
-//! | `lib/multi.c:529` | `"added to multi, mid=%u, running=%u, total=%u"` |
-//! | `lib/multi.c:887` | `"removed from multi, mid=%u, running=%u, ..."` |
-//! | `lib/multi.c:2860` | `"multi_cleanup: still present with mid=%u, ..."` |
-//! | `lib/multi.c:3959` | `"invalid easy handle in xfer table for mid=%u"` |
-//! | `lib/http2.c:860` | `"promise easy handle added to multi, mid=%u"` |
-//! | `lib/multi_ntfy.c:171` | `"[NTFY] add %u for xfer %u"` |
-//! | `lib/doh.c:1313` | `"Curl_doh_close: xfer for mid=%u not found!"` |
-//!
-//! A `--trace` transcript therefore contains these integers verbatim. The
-//! preservation mandate of specification 0.8.1 freezes observable behaviour,
-//! and the test corpus compares captured output as ONE string rather than line
-//! by line (specification 0.6.7), so the algorithm below is transcribed and
-//! not improved. `tests/unit/unit3212.c` pins the assigned sequence in seven
-//! separate places, and every one of its assertions is ported into this file's
-//! own test module -- the relocation that specification 0.8.7 requires, since
-//! a Rust static library genuinely does not export `pub(crate)` items and no
-//! quality of implementation would let that C program link.
-//!
-//! Two consequences follow, and both are prohibitions:
-//!
-//! * A hash map is wrong. Its key comes from the caller; this table's key
-//!   comes from the table, by a deterministic rule.
-//! * No free list, no bitmap of vacant rows, and no "next free" cursor beyond
-//!   the C's own `last_key_added`. Each of those would change which key a
-//!   given `add` returns. Performance is an explicit non-goal of this work
-//!   (specification 0.1.1), so the two linear scans in [`Uint32Tbl::add`] and
-//!   the one in [`Uint32Tbl::next`] stay linear.
-//!
-//! # The C structure, and the one initial value that decides everything
-//!
-//! `lib/uint-table.h:31-40` and `lib/uint-table.c:35-44`:
-//!
-//! ```text
-//! typedef void Curl_uint32_tbl_entry_dtor(uint32_t key, void *entry);
-//!
-//! struct uint32_tbl {
-//!   void **rows;                 /* array of void* holding entries */
-//!   Curl_uint32_tbl_entry_dtor *entry_dtor;
-//!   uint32_t nrows;              /* length of `rows` array */
-//!   uint32_t nentries;           /* entries in table */
-//!   uint32_t last_key_added;     /* UINT_MAX or last key added */
-//! #ifdef DEBUGBUILD
-//!   int init;
-//! #endif
-//! };
-//!
-//! void Curl_uint32_tbl_init(struct uint32_tbl *tbl,
-//!                           Curl_uint32_tbl_entry_dtor *entry_dtor)
-//! {
-//!   memset(tbl, 0, sizeof(*tbl));
-//!   tbl->entry_dtor = entry_dtor;
-//!   tbl->last_key_added = UINT32_MAX;      /* <-- NOT zero */
-//! }
-//! ```
-//!
-//! `init` zeroes the struct and then writes `UINT32_MAX` -- [`NO_KEY`] here --
-//! over `last_key_added`. That single assignment is what makes the first
-//! assigned key 0; the arithmetic is worked through in [`Uint32Tbl::add`].
-//! A derived `Default` would leave the field at zero and silently change the
-//! first key from 0 to 1, which is why [`Uint32Tbl`]'s `Default` is written by
-//! hand and delegates to [`Uint32Tbl::new`].
-//!
-//! `init` also leaves the capacity at zero: `rows` is NULL and `nrows` is 0,
-//! so a table is unusable until [`Uint32Tbl::resize`] has been called. The
-//! consumer does exactly that, at `lib/multi.c:245` and `:263`.
-//!
-//! Two fields have no successor here. `entry_dtor` collapses into `Drop` on
-//! the entry type, and the DEBUGBUILD `init` sentinel guarded against use
-//! after free, which Rust's ownership rules make unrepresentable. The sentinel
-//! value is `CURL_UINT32_TBL_MAGIC 0x62757473` (`lib/uint-table.c:29`) and it
-//! is byte-identical to `CURL_UINT32_BSET_MAGIC` in `lib/uint-bset.c` -- an
-//! upstream copy-paste, recorded here only so that a reader does not go
-//! hunting for a relationship that is not there.
+//! Supersedes `lib/uint-table.c` and `lib/uint-table.h`, whose eleven public
+//! functions and two file-static helpers are reproduced here in full. It is a
+//! fixed-capacity array of rows addressed directly by an unsigned 32-bit key,
+//! and it hands those keys out ITSELF rather than accepting them from a
+//! caller. That is the whole reason it exists, and the reason it is not a hash
+//! map.
 //!
 //! # Flagged for whoever ports `lib/multi.c`: the destructor is NULL
 //!
@@ -139,108 +50,6 @@
 //! handle. This is raised, not resolved -- it belongs to the module that
 //! instantiates the table.
 //!
-//! One detail is lost in the collapse and is worth naming: the C destructor
-//! receives BOTH the key and the entry, `void (*)(uint32_t key, void *entry)`,
-//! because a `void *` carries no type information and a destructor might need
-//! to know which row it was in. `Drop::drop` receives only `&mut self`. No
-//! consumer depends on the key argument, because the only consumer passes NULL.
-//!
-//! # The rest of the consumer contract, recorded so it is not re-derived
-//!
-//! Everything below is measured in `lib/multi.c` and `lib/multihandle.h`. The
-//! arithmetic belongs in the ported multi handle rather than here, but it
-//! constrains this module's contract and so is written down:
-//!
-//! * `#define CURL_XFER_TABLE_SIZE 512` (`lib/multi.c:52`), "initial
-//!   multi->xfers table size for a full multi". `curl_multi_init` passes it
-//!   at `:337`; the single-transfer path passes a much smaller value.
-//! * `#define INITIAL_MAX_CONCURRENT_STREAMS ((1U << 31) - 1)`
-//!   (`lib/multihandle.h:79`).
-//! * `const uint32_t max_capacity = UINT_MAX - 1;` (`lib/multi.c:373`), with
-//!   the comment "UINT_MAX is our \"invalid\" id, do not let the table grow up
-//!   to that." That clamp is the second half of the never-assign-`UINT_MAX`
-//!   guarantee; the first half is this module's own use of the value as a
-//!   sentinel, and the two together are why [`NO_KEY`] can never be returned
-//!   by [`Uint32Tbl::add`].
-//! * The growth policy (`lib/multi.c:374-397`): aim for at least 25% vacant
-//!   rows with a floor of four, `min_unused = CURLMAX(capacity >> 2, 4)`; grow
-//!   when `unused <= min_unused`; round the new size up to a multiple of 64,
-//!   `new_size = (((used + min_unused) + 63) / 64) * 64`, because -- in the
-//!   C's own words at `:391`, typo included -- "make it a 64 multiple, since
-//!   our bitsets frow by that and small (easy_multi) grows to at least 64 on
-//!   first resize"; and three corner-case guards clamp to `max_capacity` so
-//!   that the rounding cannot overflow near `UINT_MAX`.
-//! * The cross-module ordering invariant, quoted verbatim from
-//!   `lib/multi.c:400-403`: "Grow the bitsets first. Should one fail, we do
-//!   not need to downsize the already resized ones. The sets continue to work
-//!   properly when larger than the table, but not the other way around."
-//!   **Resize the four bitsets before the table, always.**
-//!   `lib/multi.c:258-263` observes the same order on the initialisation
-//!   path, before any transfer exists. A bitset wider than
-//!   the table is harmless; a table wider than a bitset is not.
-//! * `Curl_uint32_tbl_add(&multi->xfers, multi->admin, &multi->admin->mid)`
-//!   (`lib/multi.c:278`) runs before any application transfer, so the internal
-//!   admin easy handle "gets assigned `mid` 0 on multi init"
-//!   (`lib/multihandle.h:100-101`). **`mid` 0 is live and meaningful and is
-//!   never a sentinel.** `lib/multi.c:449-450` leans on that directly, testing
-//!   "only the admin handle remains" as `count() != 1 || !contains(0)`, which
-//!   is why both accessors are load-bearing rather than conveniences.
-//! * `lib/multi.c:413` discards the entry when `add` fails and returns
-//!   `CURLM_OUT_OF_MEMORY`. It never needs the rejected value back, which is
-//!   what settles [`Uint32Tbl::add`]'s return type as `Option<u32>` rather
-//!   than `Result<u32, T>`.
-//! * `lib/multi.c:2852-2891` and `:3734-3740` walk the table with
-//!   `first`/`next` and call `remove` INSIDE the loop. That is the whole
-//!   reason this module exposes no iterator; see [`Uint32Tbl::next`].
-//!
-//! # Generational keys, layered on and never replacing the index
-//!
-//! Specification 0.6.9 asks the multi handle for "a slab with generational
-//! keys so a stale handle is detectably stale rather than a dangling pointer".
-//! This module is that slab. The generation is an ADDITIONAL field:
-//!
-//! * [`Uint32Tbl::add`] returns the plain round-robin row index, unchanged and
-//!   unpacked. That integer is the `mid` that reaches trace output, so it must
-//!   be exactly what the C would have assigned.
-//! * The generation is NEVER encoded into the key integer. Packing an index
-//!   and a counter into one `u32` would change every `mid` and break the
-//!   preservation mandate.
-//! * [`Key`] pairs an index with the generation that was current when its row
-//!   was filled, and [`Uint32Tbl::get_checked`] is an opt-in stale-key check
-//!   ALONGSIDE [`Uint32Tbl::get`], never a replacement for it. A caller that
-//!   holds a bare `u32` keeps the C's exact semantics.
-//!
-//! The counter is a `u64` on the table rather than a `u32` on the row, and it
-//! advances on every occupancy change -- each row filled and each row vacated.
-//! Advancing on `add` alone would already make a [`Key`] stale the moment its
-//! row is removed, because a vacant row matches no generation at all;
-//! advancing on removal too is what the specification's design note asks for
-//! and costs nothing. `u64` rather than `u32` removes the last theoretical
-//! hole: a 32-bit counter wraps after about 4.3 billion occupancy changes, and
-//! a long-lived process could reach that and revive a stale key, whereas 2^64
-//! changes is unreachable -- at one change every nanosecond it is roughly 584
-//! years. [`Key`] is crate-internal and never crosses the C ABI, so its width
-//! costs nothing there either.
-//!
-//! # Defects removed, which is the point of the migration
-//!
-//! * The `void **rows` array with hand-written `calloc`, `memcpy` and `free`
-//!   becomes a `Vec`, so length and capacity are the type's responsibility.
-//! * The `void *` entry becomes a generic `T`, so no cast happens at any
-//!   boundary and `Box<dyn Any>` is not used to imitate one.
-//! * The C's `add` can read one element past the end of `rows`. The
-//!   analysis and the fix are in [`Uint32Tbl::add`] and
-//!   [`Uint32Tbl::free_row_from`], and the equivalence of the fixed loop to
-//!   the C's is asserted by test rather than argued in prose.
-//! * `remove(u32::MAX)` and `next(u32::MAX)` both overflow `key + 1` in the C.
-//!   Each is handled with `checked_add` here, and each divergence is recorded
-//!   at the method that makes it.
-//!
-//! There is no `unsafe` in this file, no raw pointer and no
-//! `#[allow(unsafe_code)]`. `crate::util` is granted no exemption from the
-//! crate root's lint level, and `mod source_policy` in `src/lib.rs` asserts
-//! that mechanically over the whole tree.
-//!
 //! # Layering
 //!
 //! `crate::util` is the base of this crate's module graph and depends on
@@ -252,29 +61,9 @@ use crate::error::CURLcode;
 
 /// The one key value the table never assigns, and the initial
 /// `last_key_added`.
-///
-/// `Curl_uint32_tbl_init` writes `UINT32_MAX` into `last_key_added`
-/// (`lib/uint-table.c:40`), and the C's `add` and `next_at` both write it into
-/// their out-parameter on failure with the comment "always invalid"
-/// (`lib/uint-table.c:172`, `:185`, `:197`). `lib/uint-table.h:68` states the
-/// guarantee as a contract: "No matter the capacity, UINT_MAX is never
-/// assigned."
-///
-/// Two mechanisms keep that true and neither is sufficient alone. Here, the
-/// value doubles as "no key has been assigned yet", so [`Uint32Tbl::add`]
-/// treats it as a cursor before the first row rather than as a row. In the
-/// consumer, `lib/multi.c:373` clamps capacity to `UINT_MAX - 1`, so the
-/// highest row index a maximal table can hold is `UINT_MAX - 2` and a key can
-/// never reach this value from below.
 const NO_KEY: u32 = u32::MAX;
 
 /// One occupied row: the caller's entry, plus the generation that dates it.
-///
-/// The C stores a bare `void *` per row and uses "the row is NULL" as its only
-/// occupancy marker -- which is precisely what `Option<Row<T>>` expresses, and
-/// the reason `add` rejecting a NULL entry (`lib/uint-table.c:121`) has no
-/// counterpart here: a `T` value cannot be null, so the branch disappears
-/// rather than being ported.
 struct Row<T> {
     /// The value the caller handed to [`Uint32Tbl::add`].
     entry: T,
@@ -284,9 +73,6 @@ struct Row<T> {
     generation: u64,
 }
 
-/// A row index paired with the generation that was current when the row was
-/// filled: the generational key of specification 0.6.9.
-///
 /// Obtained from [`Uint32Tbl::key_of`] and consumed by
 /// [`Uint32Tbl::get_checked`], [`Uint32Tbl::get_checked_mut`],
 /// [`Uint32Tbl::contains_key`] and [`Uint32Tbl::remove_key`]. The usual
@@ -296,12 +82,6 @@ struct Row<T> {
 /// let mid = table.add(entry)?;        // the `mid`, exactly as the C assigns
 /// let key = table.key_of(mid)?;       // the same row, now dated
 /// ```
-///
-/// Both fields are private on purpose. A caller cannot construct a [`Key`]
-/// from an index and a guessed generation, so the only keys in circulation are
-/// ones this table issued -- which is what makes a failed
-/// [`Uint32Tbl::get_checked`] mean "that row has been reused or vacated"
-/// rather than "the caller made the numbers up".
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) struct Key {
@@ -359,15 +139,6 @@ pub(crate) struct Uint32Tbl<T> {
 
 impl<T> Default for Uint32Tbl<T> {
     /// Delegates to [`Self::new`], and must keep doing so.
-    ///
-    /// `#[derive(Default)]` would be WRONG here, not merely different. It
-    /// would leave `last_key_added` at 0, whereas
-    /// `Curl_uint32_tbl_init` writes `UINT32_MAX` over the zeroed struct
-    /// (`lib/uint-table.c:38-40`). The arithmetic in [`Self::add`] turns that
-    /// one difference into a different first key -- 1 instead of 0 -- which
-    /// would shift every `mid` in a trace transcript by one and hand the
-    /// multi handle's admin easy handle the wrong identifier
-    /// (`lib/multihandle.h:100-101`). A test asserts the delegation.
     fn default() -> Self {
         Self::new()
     }
@@ -377,16 +148,6 @@ impl<T> Default for Uint32Tbl<T> {
 impl<T> Uint32Tbl<T> {
     /// An empty table of zero capacity: `Curl_uint32_tbl_init`
     /// (`lib/uint-table.c:35-44`).
-    ///
-    /// [`Self::resize`] must be called before the table can hold anything,
-    /// exactly as in the C, where `init` leaves `rows` NULL. The consumer does
-    /// so immediately (`lib/multi.c:245` then `:263`). Until then
-    /// [`Self::add`] reports the table full, because zero entries in zero rows
-    /// satisfies the C's `nentries == nrows` test.
-    ///
-    /// The `entry_dtor` parameter has no counterpart: destruction is `Drop` on
-    /// `T`. See this module's documentation for what that means for the caller
-    /// that passes NULL.
     pub(crate) const fn new() -> Self {
         Self {
             rows: Vec::new(),
@@ -426,11 +187,6 @@ impl<T> Uint32Tbl<T> {
 
     /// Resize the table: `Curl_uint32_tbl_resize`
     /// (`lib/uint-table.c:63-83`).
-    ///
-    /// `lib/uint-table.h:48-49` states the shrink semantic: "When `nmax` is
-    /// reduced, all present entries with key equal or larger to `nmax` are
-    /// removed." Each such entry is dropped and the count is decremented for
-    /// each, by way of [`Self::clear_rows`].
     ///
     /// # Errors
     ///
@@ -498,19 +254,6 @@ impl<T> Uint32Tbl<T> {
     }
 
     /// Empty the table: `Curl_uint32_tbl_clear` (`lib/uint-table.c:93-99`).
-    ///
-    /// Every entry is dropped and the count returns to zero; the capacity is
-    /// untouched. Crucially, `last_key_added` is reset to [`NO_KEY`], which
-    /// [`Self::remove`] does NOT do. That asymmetry is the whole reason
-    /// `tests/unit/unit3212.c` gets key 0 after a clear (`:116-117`) but key
-    /// 17 after removing key 17 from a full table (`:127-129`).
-    ///
-    /// The C declares this `UNITTEST`, meaning `static` in a production build
-    /// and `extern` only when the unit tests are compiled, yet calls it
-    /// internally from `Curl_uint32_tbl_destroy` (`lib/uint-table.c:88`). Here
-    /// it is unconditionally `pub(crate)`: the visibility trick existed to let
-    /// a C test program reach a file-static symbol, and the test that needed
-    /// it now lives inside this file.
     pub(crate) fn clear(&mut self) {
         let capacity = self.capacity();
         self.clear_rows(0, capacity);
@@ -524,21 +267,11 @@ impl<T> Uint32Tbl<T> {
     /// The entry stored under `key`, or `None`: `Curl_uint32_tbl_get`
     /// (`lib/uint-table.c:111-114`), whose body is
     /// `(key < tbl->nrows) ? tbl->rows[key] : NULL`.
-    ///
-    /// Out-of-range keys are answered with `None` rather than a panic, which
-    /// is what the C's bound test does. `key == u32::MAX` is therefore safe,
-    /// and a test says so.
     pub(crate) fn get(&self, key: u32) -> Option<&T> {
         self.row(key).map(|row| &row.entry)
     }
 
     /// [`Self::get`] with a mutable borrow of the entry.
-    ///
-    /// No C counterpart is needed: the C hands back a `void *` and the caller
-    /// mutates through it regardless of how it was obtained. Rust needs the
-    /// two forms to be separate, and this one is what lets a consumer update
-    /// an entry in place instead of removing and re-adding it -- which would
-    /// change the key.
     pub(crate) fn get_mut(&mut self, key: u32) -> Option<&mut T> {
         self.rows
             .get_mut(key as usize)?
@@ -591,68 +324,6 @@ impl<T> Uint32Tbl<T> {
     /// frozen behaviour and two scans are what produce it. The `or_else`
     /// below is that ordering: the wrap scan runs only when the upward scan
     /// found nothing.
-    ///
-    /// The C's comment names a field, `maybe_next_key`, that no longer exists
-    /// -- the struct calls it `last_key_added` -- which is recorded so that a
-    /// reader does not go looking for it.
-    ///
-    /// # Why the first key after `new` or [`Self::clear`] is 0
-    ///
-    /// This is the heart of the module and it is not obvious. With
-    /// `last_key_added == NO_KEY == u32::MAX`, the clamp
-    /// `min(u32::MAX, capacity)` yields `capacity`, so `start_pos` is
-    /// `capacity + 1`. The upward scan `(capacity + 1)..capacity` is empty,
-    /// the wrap scan starts at 0, and row 0 is vacant on a fresh or cleared
-    /// table. Hence key 0 -- which `tests/unit/unit3212.c:113-117` asserts
-    /// directly, and which is how the multi handle's admin easy handle comes
-    /// to hold `mid` 0.
-    ///
-    /// The same clamp does a second job: after a shrinking [`Self::resize`]
-    /// the cursor can sit at or above the new capacity, and clamping brings it
-    /// back into range instead of skipping the upward scan by accident.
-    ///
-    /// # The latent out-of-bounds read in the C, and why the fix is equivalent
-    ///
-    /// When `start_pos == capacity + 1`, the C's wrap condition
-    /// `key < start_pos` admits `key == tbl->nrows`, so `tbl->rows[nrows]`
-    /// would be read one element past the array -- and, if that byte pattern
-    /// happened to look NULL, WRITTEN past it. Nothing in `add` prevents that;
-    /// it is prevented only by the `nentries == nrows` test above, which
-    /// guarantees a vacant row somewhere in `0..nrows` and so guarantees the
-    /// loop returns before reaching `nrows`.
-    ///
-    /// [`Self::free_row_from`] clamps its exclusive bound to the capacity, so
-    /// the wrap scan here visits `0..min(start_pos, capacity)` and the extra
-    /// index is unreachable by construction rather than by argument. Note that
-    /// the C already applies exactly this clamp in `uint32_tbl_clear_rows`
-    /// (`lib/uint-table.c:52`, `CURLMIN(upto_excluding, tbl->nrows)`) and
-    /// simply omits it here -- so the fix is the C's own idiom applied
-    /// consistently, not a new invention.
-    ///
-    /// The two loops still visit the same keys in the same order. `start_pos`
-    /// is `min(last_key_added, capacity) + 1`, hence at most `capacity + 1`,
-    /// so the only index the clamp removes is `capacity` itself, which the C
-    /// can never reach. `the_wrap_scan_visits_the_same_keys_the_c_would`
-    /// asserts that rather than leaving it as prose.
-    ///
-    /// # The return type
-    ///
-    /// `Option<u32>`, not `Result<u32, T>`. The C returns a plain `bool` and
-    /// writes `UINT32_MAX` into the out-parameter on failure, and the only
-    /// caller -- `lib/multi.c:413` -- turns that into `CURLM_OUT_OF_MEMORY`
-    /// without wanting the rejected entry back. So `entry` is dropped on the
-    /// full-table path, exactly as the C leaves it unstored.
-    ///
-    /// The C's `if(!entry || !pkey) return FALSE` guard has no counterpart: a
-    /// `T` value cannot be null and the key comes back by return rather than
-    /// through a pointer.
-    ///
-    /// # Never `u32::MAX`
-    ///
-    /// Every key returned is a valid row index, so it is strictly less than
-    /// the capacity. [`NO_KEY`] documents the two mechanisms that keep the
-    /// capacity itself below `u32::MAX`, and a test fills a table and checks
-    /// the value never appears.
     pub(crate) fn add(&mut self, entry: T) -> Option<u32> {
         let capacity = self.capacity();
         if self.nentries == capacity {
@@ -703,20 +374,6 @@ impl<T> Uint32Tbl<T> {
     /// (`lib/uint-table.c:152-155`), whose whole body is
     /// `uint32_tbl_clear_rows(tbl, key, key + 1)`.
     ///
-    /// Returns nothing, deliberately. The C returns nothing, so a `bool`
-    /// saying whether the key was present would be a value no caller could
-    /// have been written against, and offering it would invite a consumer to
-    /// branch on information the C never provided. [`Self::remove_key`] does
-    /// report, because it has no C counterpart to be faithful to.
-    ///
-    /// Removing an absent or out-of-range key is a silent no-op that leaves
-    /// the count untouched; `tests/unit/unit3212.c:71-74` removes the same
-    /// keys twice and asserts the count does not move.
-    ///
-    /// `last_key_added` is NOT touched. That is what makes a freed key the
-    /// next key assigned when the table is otherwise full -- see
-    /// [`Self::clear`], which does the opposite.
-    ///
     /// One divergence, and it is a defect removal rather than a behaviour
     /// change. The C computes `key + 1` in `uint32_t`, so
     /// `remove(UINT32_MAX)` overflows to 0; the resulting range
@@ -734,15 +391,6 @@ impl<T> Uint32Tbl<T> {
 
     /// The occupied row with the smallest key: `Curl_uint32_tbl_first`
     /// (`lib/uint-table.c:177-188`).
-    ///
-    /// `lib/uint-table.h:77-78`: "Get the first entry in the table (with the
-    /// smallest `key`). Returns FALSE if the table is empty."
-    ///
-    /// The C's two out-parameters and `bool` return become one
-    /// `Option<(u32, &T)>`. The `tbl->nentries &&` short-circuit at
-    /// `lib/uint-table.c:182` is reproduced with [`Self::is_empty`]; it is
-    /// redundant, since an empty table has no occupied row for the scan to
-    /// find either, but it is what the C does and it is free.
     pub(crate) fn first(&self) -> Option<(u32, &T)> {
         if self.is_empty() {
             return None;
@@ -770,8 +418,6 @@ impl<T> Uint32Tbl<T> {
     /// > - removed keys lower or equal to 'last_key' will not show up.
     /// > - removed keys higher than 'last_key' will not be visited.
     ///
-    /// All four bullets have a test of their own.
-    ///
     /// # Why this module implements no iterator, and must not
     ///
     /// `Iterator` and `IntoIterator` are deliberately absent. A borrowing
@@ -782,30 +428,12 @@ impl<T> Uint32Tbl<T> {
     /// `Curl_uint32_tbl_next` calls. Keeping this a stateless `&self` query
     /// keyed on `last_key` is what lets the caller mutate freely between
     /// steps: each call re-reads the table as it stands.
-    ///
-    /// So this is not an oversight to be tidied up later. An iterator would be
-    /// a smaller API that cannot express the consumer's access pattern.
-    ///
-    /// # The `u32::MAX` divergence, recorded as a defect removal
-    ///
-    /// The C computes `last_key + 1` in `uint32_t`, so `next(UINT32_MAX)`
-    /// overflows to 0 and RESTARTS the scan from the beginning -- it would
-    /// hand back the first entry again and a caller looping on it would never
-    /// terminate. `u32::MAX` is never a valid key, so no correct caller
-    /// reaches that path, and `checked_add` turns it into `None` instead. This
-    /// is a deliberate divergence: the C's behaviour there is a wrap, not a
-    /// documented feature, and reproducing it would mean reproducing an
-    /// infinite loop.
     pub(crate) fn next(&self, last_key: u32) -> Option<(u32, &T)> {
         self.next_at(last_key.checked_add(1)?)
     }
 
     /// A dated key for the occupied row `key`, or `None` if it is vacant or
     /// out of range.
-    ///
-    /// No C counterpart -- this is the generational half of specification
-    /// 0.6.9. The returned [`Key`] carries the row's current generation, so it
-    /// stops matching the moment the row is vacated or refilled.
     pub(crate) fn key_of(&self, key: u32) -> Option<Key> {
         self.row(key).map(|row| Key {
             index: key,
@@ -815,12 +443,6 @@ impl<T> Uint32Tbl<T> {
 
     /// [`Self::get`] with the stale-key check: the entry only if `key` still
     /// names the occupant it was issued for.
-    ///
-    /// This is the opt-in safety check specification 0.6.9 asks for, and it is
-    /// ADDITIONAL to [`Self::get`] rather than a replacement. A caller holding
-    /// a bare `u32` keeps the C's semantics exactly, including the C's
-    /// inability to tell "the transfer I meant" from "whatever occupies that
-    /// row now".
     pub(crate) fn get_checked(&self, key: Key) -> Option<&T> {
         let row = self.row(key.index)?;
         if row.generation == key.generation {
@@ -851,17 +473,6 @@ impl<T> Uint32Tbl<T> {
     }
 
     /// Remove the row `key` names, but only if the key is still live.
-    ///
-    /// Returns whether anything was removed. This is the one place a report is
-    /// offered where [`Self::remove`] gives none, and the difference is
-    /// deliberate: [`Self::remove`] mirrors a C function whose `void` return
-    /// is part of the contract, whereas this method has no C counterpart and
-    /// exists precisely so that a caller can detect a stale key. Discarding
-    /// that answer would defeat its whole purpose.
-    ///
-    /// Under a stale key the table is left completely untouched, which is what
-    /// makes this safe to call with a key of unknown age: it cannot evict some
-    /// unrelated transfer that has since been given the same row.
     pub(crate) fn remove_key(&mut self, key: Key) -> bool {
         if !self.contains_key(key) {
             return false;
@@ -872,24 +483,11 @@ impl<T> Uint32Tbl<T> {
 
     /// The occupied row under `key`, or `None` for a vacant or out-of-range
     /// key.
-    ///
-    /// The shared bound test behind [`Self::get`], [`Self::contains`],
-    /// [`Self::key_of`] and [`Self::get_checked`]. `Vec::get` performs the
-    /// C's `key < tbl->nrows` comparison, so the `u32` to `usize` widening
-    /// follows the bound test rather than preceding it -- and the widening is
-    /// lossless on all four mandated targets, every one of which is 64-bit.
     fn row(&self, key: u32) -> Option<&Row<T>> {
         self.rows.get(key as usize)?.as_ref()
     }
 
     /// The next generation stamp, advancing the counter.
-    ///
-    /// `wrapping_add` because the arithmetic must be total, not because the
-    /// wrap is reachable: 2^64 occupancy changes at one per nanosecond is
-    /// roughly 584 years. A `u32` counter would wrap after about 4.3 billion,
-    /// which a long-lived process could plausibly reach, and a wrapped
-    /// generation could revive a stale [`Key`]. That is the whole reason the
-    /// field is 64 bits wide.
     fn advance_generation(&mut self) -> u64 {
         let issued = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
@@ -897,13 +495,6 @@ impl<T> Uint32Tbl<T> {
     }
 
     /// Fill the vacant row `key` with `entry` and return `key`.
-    ///
-    /// The four assignments the C's `add` performs on a hit
-    /// (`lib/uint-table.c:129-134`): store the entry, bump the count, record
-    /// the cursor, report the key. Factored out so that both scans in
-    /// [`Self::add`] share one body and cannot drift apart, exactly as the C's
-    /// two loops share one hand-copied block -- except that here the copy is
-    /// impossible.
     ///
     /// # Panics
     ///
@@ -929,19 +520,6 @@ impl<T> Uint32Tbl<T> {
 
     /// The lowest vacant row in `from..upto_excluding`, clamped to the
     /// capacity.
-    ///
-    /// One of the C's two scan loops in `add` (`lib/uint-table.c:128-136` and
-    /// `:138-146`), which are byte-for-byte identical apart from their bounds.
-    ///
-    /// The clamp is where the C's latent one-past-the-end read is eliminated;
-    /// [`Self::add`] carries the analysis and the proof that the visited keys
-    /// are unchanged. Clamping HERE rather than at each call site means the
-    /// two scans cannot disagree about it, and it mirrors what the C already
-    /// does in `uint32_tbl_clear_rows` (`lib/uint-table.c:52`).
-    ///
-    /// The scan is linear, over a subslice, and stays that way: a free list or
-    /// a vacancy bitmap would find a different row and so change the key
-    /// sequence, which specification 0.8.1 freezes.
     fn free_row_from(&self, from: u32, upto_excluding: u32) -> Option<u32> {
         let end = upto_excluding.min(self.capacity());
         if from >= end {
@@ -959,15 +537,6 @@ impl<T> Uint32Tbl<T> {
 
     /// The lowest occupied row at or above `from`: `uint32_tbl_next_at`
     /// (`lib/uint-table.c:162-175`).
-    ///
-    /// The shared scan behind [`Self::first`] and [`Self::next`]. The C writes
-    /// `UINT32_MAX` and NULL into its out-parameters on a miss, both marked
-    /// "always invalid"; `None` supersedes the pair.
-    ///
-    /// `from` beyond the capacity yields `None`, which is the C's
-    /// `for(; key < tbl->nrows; ...)` declining to run at all. The scan is
-    /// linear and stays linear -- an index of occupied rows would have to be
-    /// maintained across every mutation, and the walk is not on a hot path.
     fn next_at(&self, from: u32) -> Option<(u32, &T)> {
         let mut key = from;
         for slot in self.rows.iter().skip(from as usize) {
@@ -993,24 +562,6 @@ impl<T> Uint32Tbl<T> {
     ///     tbl->rows[i] = NULL; tbl->nentries--;
     ///   }
     /// ```
-    ///
-    /// The single mutation primitive behind [`Self::remove`], [`Self::clear`]
-    /// and [`Self::resize`]'s shrink path, kept as one function for the same
-    /// reason the C does: three callers that each cleared rows their own way
-    /// could disagree about the count.
-    ///
-    /// `Option::take` is where the entry is dropped -- the taken value is a
-    /// temporary that falls out of scope at the end of the statement, running
-    /// `T`'s `Drop`. That is the destructor call the C makes explicitly, and
-    /// it happens for every vacated row whether or not the caller wants it,
-    /// which is the one place where "the C passes NULL for `entry_dtor`"
-    /// becomes a decision for whoever chooses `T`. This module's
-    /// documentation flags it.
-    ///
-    /// The count and the generation counter are updated after the scan rather
-    /// than inside it, because the loop holds a mutable borrow of `rows`.
-    /// Advancing the counter by the number of rows vacated is exactly
-    /// equivalent to advancing it once per row.
     fn clear_rows(&mut self, from: u32, upto_excluding: u32) {
         let end = upto_excluding.min(self.capacity());
         if from >= end {
@@ -1045,9 +596,6 @@ impl<T> Uint32Tbl<T> {
 // field, or dropping twice -- to no end, and an empty `impl Drop` would be
 // worse than nothing, because it would silently make `Uint32Tbl<T>` unable to
 // be destructured or partially moved.
-//
-// A test confirms the automatic drop really runs, with a payload that counts
-// its own destructions, so this paragraph is checked rather than asserted.
 
 #[cfg(test)]
 mod tests {
@@ -1074,12 +622,6 @@ mod tests {
     }
 
     /// A payload that counts its own destructions.
-    ///
-    /// The C table takes an `entry_dtor` and its only consumer passes NULL, so
-    /// no C test exercises destruction at all. In Rust the destructor IS
-    /// `Drop`, so it is exercised here: the counter is shared, and every test
-    /// that uses this type asserts an exact number of drops rather than "at
-    /// least one".
     struct Tracked {
         /// Which entry this is, so a test can tell them apart.
         tag: u32,
@@ -1103,10 +645,8 @@ mod tests {
         })
     }
 
-    // ---------------------------------------------------------------------
     // `tests/unit/unit3212.c`, ported step for step. The line reference on
     // each test names the assertion it reproduces.
-    // ---------------------------------------------------------------------
 
     /// `:54` -- the capacity is what `resize` asked for.
     #[test]
@@ -1374,9 +914,7 @@ mod tests {
         assert_eq!(key, 17, "unexpected key assigned");
     }
 
-    // ---------------------------------------------------------------------
     // Behaviour the C unit test does not reach.
-    // ---------------------------------------------------------------------
 
     /// A zero capacity is rejected, and the table is left exactly as it was.
     ///
@@ -1544,11 +1082,6 @@ mod tests {
 
     /// `next(u32::MAX)` yields `None` without panicking and without
     /// restarting the scan from 0.
-    ///
-    /// The deliberate divergence: the C computes `last_key + 1` in `uint32_t`,
-    /// wraps to 0 and hands back the first entry again, which turns a caller's
-    /// loop into a non-terminating one. `u32::MAX` is never a valid key, so no
-    /// correct caller reaches this.
     #[test]
     fn next_from_the_invalid_key_yields_nothing() {
         let mut table = setup();
@@ -1588,13 +1121,6 @@ mod tests {
 
     /// The clamped wrap scan visits exactly the keys the C's unclamped one
     /// would, in the same order.
-    ///
-    /// The C's bound is `key < start_pos` where `start_pos` is at most
-    /// `capacity + 1`, so the only index the clamp removes is `capacity`
-    /// itself -- which the C can never reach, because the full-table test
-    /// guarantees a vacant row below it. This reproduces the C's own scan over
-    /// every reachable state of a small table and checks that the key `add`
-    /// picks is identical.
     #[test]
     fn the_wrap_scan_visits_the_same_keys_the_c_would() {
         /// The C's `add`, key-selection half only, with its unclamped wrap
@@ -1718,10 +1244,8 @@ mod tests {
         assert_eq!(defaulted.add(1), Some(0));
     }
 
-    // ---------------------------------------------------------------------
     // Destruction accounting. The C's `entry_dtor` becomes `Drop`, so these
     // are the tests the C unit test could not have.
-    // ---------------------------------------------------------------------
 
     /// `remove` drops exactly the one entry it vacates, exactly once.
     #[test]
@@ -1820,10 +1344,8 @@ mod tests {
         assert_eq!(drops.get(), 16, "fourteen more, one each");
     }
 
-    // ---------------------------------------------------------------------
     // The iteration-under-modification contract of `lib/uint-table.h:88-92`,
     // one test per bullet. The multi handle depends on all four.
-    // ---------------------------------------------------------------------
 
     /// "added keys higher than 'last_key' will be picked up by the iteration."
     #[test]
@@ -1928,11 +1450,6 @@ mod tests {
         }
         assert_eq!(visited, vec![0, 1, 2, 3, 4, 6], "5 and 7 are skipped");
     }
-
-    // ---------------------------------------------------------------------
-    // Generational keys. Specification 0.6.9's slab, layered on top of the
-    // frozen index API rather than replacing it.
-    // ---------------------------------------------------------------------
 
     /// A key obtained before a `remove` fails the checked lookup afterwards,
     /// while the plain index API keeps behaving exactly as the C does.
@@ -2108,8 +1625,6 @@ mod tests {
         for pair in seen.windows(2) {
             assert!(pair[0] < pair[1], "the counter went backwards: {pair:?}");
         }
-        // And a vacated row advances it too, which is what specification
-        // 0.6.9's design note asks for: sixteen fills plus sixteen vacatings.
         assert_eq!(table.next_generation, 32);
     }
 }

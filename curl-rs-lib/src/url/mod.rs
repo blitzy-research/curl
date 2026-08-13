@@ -24,23 +24,9 @@
 
 // THE CONVENTIONS OF THIS DIRECTORY, APPLIED HERE.
 //
-// 1. The 23-line banner above is the block measured at `lib/urlapi.c:1-23`,
-//    rendered as Rust line comments with the C block-comment decorations
-//    stripped. Byte-identical to `src/lib.rs`, `src/error.rs`,
-//    `src/url/escape.rs`, `src/url/idn.rs`, `src/util/strparse.rs` and
-//    `src/version.rs`. The licence-identifier line is line 21 and is
-//    verbatim; it is the only place in this file where that spelling
-//    appears, which is what `reuse lint` needs. `REUSE.toml` does not list
-//    this path, so the annotation has to be in-file.
-//    `scripts/spacecheck.pl`, run by the `spacecheck` step of
-//    `.github/workflows/hygiene.yml`, additionally rejects tabs, trailing
-//    whitespace, consecutive blank lines and any byte at or above 0x80 in a
-//    tracked file, so every byte below is plain ASCII.
-//
-// 2. `dead_code` allowances are written at the ITEM, never on a module
-//    declaration and never at a file root. `mod source_policy` in
-//    `curl-rs-lib/src/lib.rs` enforces that as an executable gate. Each one
-//    below names the C call site that will remove it.
+// 2. `mod source_policy` in `curl-rs-lib/src/lib.rs` enforces that as an
+//    executable gate. Each one below names the C call site that will remove
+//    it.
 //
 // 3. No level for the `unsafe_code` lint is set here, at any level. The
 //    crate root carries `#![deny(unsafe_code)]` and grants exactly one
@@ -65,14 +51,6 @@
 
 //! The URL API, percent-encoding and internationalised domain names.
 //!
-//! Supersedes `lib/urlapi.c` (1,998 lines) and its internal header
-//! `lib/urlapi-int.h` (40 lines), together with `lib/escape.c` and
-//! `lib/idn.c` in the sibling modules. `pub` because it backs eight of the
-//! 100 exported symbols: the six-strong URL API -- `curl_url`,
-//! `curl_url_cleanup`, `curl_url_dup`, `curl_url_get`, `curl_url_set` and
-//! `curl_url_strerror` (`include/curl/urlapi.h:112-149`) -- together with
-//! `curl_escape` and `curl_unescape`.
-//!
 //! The pinned ABI is `include/curl/urlapi.h`: the 33 `CURLUcode` tokens at
 //! `:34-68`, the 11 `CURLUPart` members at `:70-82`, the 16 `CURLU_*` flags
 //! at `:84-105` and the handle typedef at `:107`. The error enumeration
@@ -80,81 +58,18 @@
 //! along with the message table behind `curl_url_strerror`
 //! (`lib/strerror.c:420-531`).
 //!
-//! Nothing in this module is `extern "C"` and nothing carries
-//! `#[no_mangle]`. The six exported wrappers live in
-//! `curl-rs-ffi/src/ffi/url.rs`, which AAP section 0.8.5 conflict C1
-//! sanctions as one of exactly two `src/ffi/` locations; a stray exported
-//! symbol here would corrupt the 100-symbol `nm` parity gate against
-//! `lib/libcurl.def`. This module is the safe engine those wrappers call.
-//!
 //! # `CURLU` is the one public handle that is a real struct
 //!
-//! The handle typedefs of the public headers are deliberately **not**
-//! uniform, and treating them uniformly breaks consumers. `CURL`, `CURLM`
-//! and `CURLSH` are `typedef void` (`include/curl/curl.h:109-110`,
-//! `include/curl/multi.h:57`), so a consumer may assign any of them to a
-//! `void *` and many do. `CURLU` alone is
-//! `typedef struct Curl_URL CURLU` (`include/curl/urlapi.h:107`) -- a
-//! genuine opaque struct. Its representation is therefore part of the
-//! contract in a way the others' is not, and `curl-rs-ffi` carries it as an
-//! opaque pointer to [`Url`] rather than as a `*mut c_void`, moving
-//! ownership across the boundary with `Box::into_raw` and `Box::from_raw`
-//! (AAP section 0.3.3, pattern P8).
-//!
-//! # curl's parsing quirks are preserved, not delegated
-//!
-//! AAP section 0.4.1 is explicit: *"curl's parsing quirks preserved rather
-//! than delegated wholesale to the `url` crate"*. The `url` crate is a
-//! workspace dependency and is used where it helps, but the WHATWG URL
-//! Standard it implements is not the specification curl implements, and the
-//! differences are directly observable -- through `curl_url_get` part by
-//! part, and through the fixture corpus, whose comparison joins the expected
-//! and actual protocol blocks into single strings and compares them whole
-//! (AAP section 0.6.7). Where curl and a general-purpose parser disagree,
-//! curl wins, and the disagreement is documented at the site that
-//! implements it. The measured divergences are the scheme accept set, the
-//! three scheme-guessing flags, [`UrlFlags::ALLOW_SPACE`],
-//! [`UrlFlags::NO_AUTHORITY`], [`UrlFlags::PATH_AS_IS`],
-//! [`UrlFlags::GET_EMPTY`]'s empty-versus-absent distinction, IPv6 zone
-//! identifiers, and an IPv4 parser far more permissive than either
-//! `std::net` or the `url` crate ([`ipv4_normalize`]).
-//!
-//! # Every part is a byte string, and that is not a stylistic choice
-//!
-//! The ten stored parts are `Option<Vec<u8>>`, not `Option<String>`, because
-//! a host can hold bytes that are not UTF-8 at all. `tests/libtest/lib1560.c`
-//! requires `https://_%c0_` to store the host `_\xC0_` and to render it back
-//! raw, and requires a literal `\xFF` in a host to survive to
-//! `%FF` under [`UrlFlags::URLENCODE`]. A `String` cannot hold either.
-//!
-//! The `Option` is equally load-bearing, and for a different reason: it
-//! distinguishes a part that is absent from a part that is present and
-//! empty. `https://x/?` stores an empty query **and** records
-//! `query_present`, which [`UrlFlags::GET_EMPTY`] exposes;
-//! `set(QUERY, "")` stores an empty query, while the same call with
-//! [`UrlFlags::URLENCODE`] stores no query at all, because the C's encode
-//! loop makes no append and `curlx_dyn_ptr` then answers null
-//! (`lib/urlapi.c:1934`, and see [`Buf`]). `None` and `Some(vec![])` are
-//! never interchangeable below.
-//!
-//! # The measured constants
-//!
-//! `MAX_SCHEME_LEN` is 40 (`lib/urlapi.c:55`), `DEFAULT_SCHEME` is
-//! `"https"` (`:84`), and `CURL_MAX_INPUT_LENGTH` is 8,000,000
-//! (`lib/urldata.h:131`) -- the ceiling on every input this module accepts
-//! and on every buffer it fills. The struct being reproduced is at `:67-82`;
-//! the `CURLcode`-to-`CURLUcode` bridge is `cc2cu` at `:120-122`; the
-//! default ports come from the injected registry rather than from a table
-//! here, and `lib/urldata.h:29-53` is where the C keeps them.
-//!
-//! Three measured quirks are reproduced deliberately and are each guarded by
-//! a test, because each one looks like a defect and "fixing" it would break
-//! the corpus: `curl_url_dup` does not copy `guessed_scheme`
-//! (`lib/urlapi.c:1310-1332`); `allowed_in_path` admits **19** characters
-//! including `/` at `:1799` where the manual page lists 18; and
-//! `curl_url_set` lower-cases pre-existing percent triplets when
-//! [`UrlFlags::URLENCODE`] is absent (`:1922-1932`) even though the encoder
-//! it shares a directory with emits upper case.
+//! The handle typedefs of the public headers are deliberately **not** uniform,
+//! and treating them uniformly breaks consumers. `CURL`, `CURLM` and `CURLSH`
+//! are `typedef void` (`include/curl/curl.h:109-110`,
+//! `include/curl/multi.h:57`), so a consumer may assign any of them to a `void
+//! *` and many do. `CURLU` alone is `typedef struct Curl_URL CURLU`
+//! (`include/curl/urlapi.h:107`) -- a genuine opaque struct. Its
+//! representation is therefore part of the contract in a way the others' is
+//! not, and `curl-rs-ffi` carries it as an opaque pointer to [`Url`] rather
+//! than as a `*mut c_void`, moving ownership across the boundary with
+//! `Box::into_raw` and `Box::from_raw`.
 //!
 //! # The modules declared here
 //!
@@ -165,15 +80,6 @@
 //! `curl_unescape`, which `lib/escape.c:36-45` defines as nothing but calls
 //! into them.
 //!
-//! It is a module of its own rather than part of the URL parser because the
-//! transformation is independent of any parsed URL: the four exported
-//! functions ignore the `CURL *` handle they accept, and have done since
-//! 7.82.0 (`lib/escape.c:48`, `:161`). The parser is a consumer of the
-//! module, not the other way round -- this file is the caller that retires
-//! the `dead_code` allowance on its two strict `urlreject` modes, selecting
-//! `REJECT_CTRL` at the three sites `lib/urlapi.c:590`, `:1385` and `:1980`
-//! measure.
-//!
 //! [`idn`] carries internationalised domain names, superseding `lib/idn.c`
 //! with the `idna` crate in place of libidn2. It is separable from the rest
 //! of the URL surface because it is a pure host-name transformation with no
@@ -183,23 +89,6 @@
 //! and `lib/version.c:496` registers it as `FEATURE("IDN", idn_present,
 //! CURL_VERSION_IDN)`, so the answer has to be reachable from
 //! [`crate::version`] and, through it, from `curl_version_info`.
-//!
-//! One consequence of that decoupling is recorded here because it is easy to
-//! get wrong in the other direction: an `idna`-backed build advertises the
-//! `IDN` feature yet reports no `libidn` version, because libidn2 is not
-//! what is linked. In C those two are coupled -- `idn_present` *is*
-//! `info->libidn != NULL` -- so reproducing the coupling would mean emitting
-//! a `libidn2/...` token, which additionally sets `$feature{"libidn2"}` in
-//! the test harness (`tests/runtests.pl:625-626`) on a false premise.
-//! Truthful advertisement is the requirement (AAP section 0.6.5), and it
-//! decouples them.
-//!
-//! Because `idna` is unconditional in this workspace and AAP section 0.5.2
-//! closes the feature vocabulary at 15 names with no `idn` among them,
-//! `CURLUE_LACKS_IDN` (30) is unreachable from this module. The variant
-//! stays because it is ABI. In C it comes from
-//! `#define host_decode(x, y) CURLUE_LACKS_IDN` at `lib/urlapi.c:1335-1336`,
-//! active only when `USE_IDN` is undefined.
 
 use core::fmt;
 use core::ops::{BitOr, BitOrAssign};
@@ -207,6 +96,7 @@ use core::ops::{BitOr, BitOrAssign};
 use crate::error::{CURLUcode, CURLcode, UrlResult};
 use crate::util::inet;
 use crate::util::memrchr::memrchr;
+use crate::util::redact::RedactedOpt;
 use crate::util::strcase;
 use crate::util::strparse;
 
@@ -215,18 +105,9 @@ use crate::util::strparse;
 /// Owns the unreserved-byte set, the uppercase hex digits, and the decode
 /// walk's strict `alloc > 2` lookahead test, each asserted against a
 /// self-describing oracle measured from the frozen library.
-///
-/// `pub` because [`escape::escape`] and [`escape::unescape`] back four of the
-/// 100 symbols `lib/libcurl.def` exports, and `curl-rs-ffi` has no other
-/// route to them.
 pub mod escape;
 
 /// Internationalised domain names: supersedes `lib/idn.c`.
-///
-/// Converts hostnames between their Unicode and A-label forms with the
-/// `idna` crate, reproducing curl's acceptance rules and error codes, and
-/// answers the two capability questions the `--version` banner asks about
-/// IDN support.
 ///
 /// `pub` for that second reason: [`idn::available`] and
 /// [`idn::version_string`] are the authority behind the `IDN` feature bit
@@ -236,12 +117,6 @@ pub mod idn;
 
 /// The longest scheme this module accepts, in bytes.
 ///
-/// `MAX_SCHEME_LEN` (`lib/urlapi.c:55`), whose own comment reads *"scheme is
-/// not URL encoded, the longest libcurl supported ones are..."*. Consumed at
-/// `:195` (the scheme scan), `:1114` (`char schemebuf[MAX_SCHEME_LEN + 1]`),
-/// `:1452` (`char schemebuf[MAX_SCHEME_LEN + 5]`, the four extra bytes being
-/// `"://"` and its terminator) and `:1641` (the length test on set).
-///
 /// Note that a scheme this long can never be *resolved*: `Curl_getn_scheme`
 /// is gated `if(len && (len <= 7))` (`lib/url.c:1523`), so no registry entry
 /// longer than seven bytes is reachable. Both bounds are deliberate and both
@@ -250,17 +125,6 @@ pub mod idn;
 const MAX_SCHEME_LEN: usize = 40;
 
 /// The universal input ceiling, in bytes.
-///
-/// `CURL_MAX_INPUT_LENGTH` (`lib/urldata.h:131`), described there as *"a
-/// precaution against abuse and to detect junk input easier and better"*.
-/// Tested directly by [`junkscan`] (`lib/urlapi.c:229`) and by [`Url::set`]
-/// (`:1824`), and used as the `toobig` ceiling of every dynamic buffer in
-/// the C file: `:664`, `:1021`, `:1044`, `:1072`, `:1122`, `:1272`, `:1394`,
-/// `:1485` and `:1944`.
-///
-/// `docs/libcurl/curl_url_set.md:277-278` states the consequence for the
-/// public API: an input longer than eight million bytes yields
-/// `CURLUE_MALFORMED_INPUT`.
 const MAX_INPUT_LENGTH: usize = 8_000_000;
 
 /// The scheme [`UrlFlags::DEFAULT_SCHEME`] supplies.
@@ -270,19 +134,6 @@ const MAX_INPUT_LENGTH: usize = 8_000_000;
 const DEFAULT_SCHEME: &[u8] = b"https";
 
 /// What curl's own `printf` writes for a null `%s` argument.
-///
-/// `nilstr` (`lib/mprintf.c:837`), and it is reachable through the public
-/// API. `urlget_url` guards `u->query` and `u->fragment` with
-/// `x ? x : ""` but passes `u->path` unguarded (`lib/urlapi.c:1442`), so a
-/// `file:` handle with no stored path renders as `file://(nil)`. Measured
-/// against a real libcurl: `curl_url_set(u, CURLUPART_URL, "file:///", 0)`
-/// followed by `curl_url_get(u, CURLUPART_URL, &p, 0)` yields exactly that
-/// string, while `curl_url_get(u, CURLUPART_PATH, ...)` yields `/`.
-///
-/// Reproduced rather than repaired. AAP section 0.8.1 freezes observable
-/// behaviour and AAP section 0.8.2 rejects a refactor that produces
-/// different-but-arguably-better output; a caller that has learned to
-/// recognise this string would stop recognising it.
 const NIL_STRING: &[u8] = b"(nil)";
 
 /// The bytes `hostname_check` refuses in a host that is not bracketed.
@@ -295,10 +146,6 @@ const NIL_STRING: &[u8] = b"(nil)";
 /// ```text
 /// " \r\n\t/:#?!@{}[]\\$\'\"^`*<>=;,+&()%"
 /// ```
-///
-/// The set is a denial list, not an allow list, which is why a host may hold
-/// bytes at or above 0x80 -- an IDN host does, and
-/// `tests/libtest/lib1560.c` requires those bytes to survive.
 const HOST_REJECT: &[u8] = b" \r\n\t/:#?!@{}[]\\$'\"^`*<>=;,+&()%";
 
 /// The bytes `ipv6_parse` accepts inside brackets before a zone identifier.
@@ -308,21 +155,7 @@ const HOST_REJECT: &[u8] = b" \r\n\t/:#?!@{}[]\\$'\"^`*<>=;,+&()%";
 /// embedded dotted quad is legal in the tail of an IPv6 literal.
 const IPV6_ACCEPT: &[u8] = b"0123456789abcdefABCDEF:.";
 
-// ---------------------------------------------------------------------------
 // Reading a byte string the way C reads one.
-//
-// `lib/urlapi.c` works on NUL-terminated buffers and carries lengths
-// alongside them, so it routinely reads one byte past the extent it is
-// counting -- `url[i]` after the scheme scan, `p[1]` and `p[2]` behind a
-// length test, `*portptr` after a number. Every one of those reads lands on
-// the terminator, and the code depends on the terminator not matching
-// whatever it is looking for.
-//
-// The three helpers below reproduce that exactly over slices, so a read past
-// the end answers zero rather than panicking, and `strspn` and `strcspn`
-// treat zero as the end of the string just as the C library does. Nothing
-// else in this file indexes a slice.
-// ---------------------------------------------------------------------------
 
 /// The byte at `index`, or zero past the end.
 ///
@@ -389,12 +222,6 @@ fn strchr(bytes: &[u8], needle: u8) -> Option<usize> {
 /// #define cc2cu(x) \
 ///   ((x) == CURLE_TOO_LARGE ? CURLUE_TOO_LARGE : CURLUE_OUT_OF_MEMORY)
 /// ```
-///
-/// Applied by the C at `:170`, `:598`, `:623`, `:893`, `:1885`, `:1905`,
-/// `:1912` and `:1920`. Every one of those sites is a buffer append, whose
-/// only two failures are the ceiling and a refused allocation -- so the
-/// collapse to two codes loses nothing, and any other code arriving here
-/// becomes `CURLUE_OUT_OF_MEMORY` exactly as the C's conditional does.
 const fn cc2cu(code: CURLcode) -> CURLUcode {
     match code {
         CURLcode::TooLarge => CURLUcode::TooLarge,
@@ -422,17 +249,6 @@ const fn cc2cu(code: CURLcode) -> CURLUcode {
 /// curl_url_set(u, CURLUPART_QUERY, "", 0)               -> query is ""
 /// curl_url_set(u, CURLUPART_QUERY, "", CURLU_URLENCODE) -> query is absent
 /// ```
-///
-/// Measured against a real libcurl, and the mechanism is exactly this: the
-/// encode loop at `:1890-1914` iterates over an empty string and appends
-/// nothing at all, whereas `curlx_dyn_add` at `:1918` appends unconditionally
-/// and `dyn_nappend` allocates even for a zero-length append
-/// (`lib/curlx/dynbuf.c:75-102`, where `fit` is `len + idx + 1` and is
-/// therefore never zero).
-///
-/// So this type keeps the distinction in its type: the payload is an
-/// [`Option`], `None` is the C's null `bufr`, and any append -- including one
-/// of no bytes -- materialises it.
 struct Buf {
     /// The bytes appended so far. [`None`] until the first append, which is
     /// the C's `bufr` starting as null.
@@ -471,10 +287,6 @@ impl Buf {
     ///   **null**, not merely empty. A caller that ignores the error and
     ///   reads the pointer afterwards therefore sees absence.
     ///
-    /// The addition is saturating because `mem.len()` is caller-controlled;
-    /// saturation can only push `fit` above the ceiling, which is the
-    /// rejecting branch, so it cannot admit anything the C refuses.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::TooLarge`] when the append would cross the ceiling. The
@@ -506,12 +318,6 @@ impl Buf {
 
     /// The accumulated bytes for in-place mutation, empty when there are
     /// none.
-    ///
-    /// The C mutates a buffer through the very pointer `curlx_dyn_ptr`
-    /// returned, without a dedicated accessor for it. The one place this
-    /// module needs that is `curl_url_set`'s percent-triplet lower-casing walk
-    /// at `lib/urlapi.c:1922-1932`, which rewrites the assembled buffer in
-    /// place before it is stored.
     fn as_mut_slice(&mut self) -> &mut [u8] {
         match &mut self.bytes {
             Some(bytes) => bytes,
@@ -531,12 +337,6 @@ impl Buf {
     }
 
     /// Empties the buffer without releasing it.
-    ///
-    /// `curlx_dyn_reset` (`lib/curlx/dynbuf.c:227-235`), which zeroes the
-    /// first byte and sets `leng` to zero but leaves `bufr` alone. So a
-    /// buffer that had been appended to stays non-null after a reset, and one
-    /// that had not stays null -- a distinction `parse_file` depends on when
-    /// it resets the host buffer at `lib/urlapi.c:912`.
     fn reset(&mut self) {
         if let Some(bytes) = &mut self.bytes {
             bytes.clear();
@@ -544,13 +344,6 @@ impl Buf {
     }
 
     /// Truncates the buffer to `set` bytes.
-    ///
-    /// `curlx_dyn_setlen` (`lib/curlx/dynbuf.c:279-289`), which refuses a
-    /// `set` above the current length with `CURLE_BAD_FUNCTION_ARGUMENT`.
-    /// Infallible here, and equivalently so: the C's two callers --
-    /// `Curl_parse_port` at `:370` and `dedotdotify` at `:787` -- both
-    /// discard the return value, and `Vec::truncate` above the length is the
-    /// same no-op the C performs on the field it declines to change.
     fn setlen(&mut self, set: usize) {
         if let Some(bytes) = &mut self.bytes {
             bytes.truncate(set);
@@ -568,16 +361,6 @@ impl Buf {
 }
 
 /// Which component of a URL a get or a set addresses.
-///
-/// `CURLUPart` (`include/curl/urlapi.h:70-82`). Eleven members occupying
-/// `0..=10` with no gaps and none of them explicit in C, so the explicit
-/// discriminants below are the drift guard the C header does not have.
-/// `CURLUPART_ZONEID` is annotated *"added in 7.65.0"* there.
-///
-/// A discriminant outside `0..=10` is not representable, which is the point:
-/// [`Self::from_i32`] is the single place an unknown value from a C caller
-/// becomes [`CURLUcode::UnknownPart`], and every `match` over this type below
-/// is exhaustive without a fall-through arm.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(i32)]
 pub enum UrlPart {
@@ -632,14 +415,6 @@ impl UrlPart {
     }
 
     /// The member with this integer value, or [`None`].
-    ///
-    /// The C has no counterpart because C has no such check: passing 9999 to
-    /// `curl_url_get` simply falls through the `switch` to the `default:` arm
-    /// at `lib/urlapi.c:1626`, which leaves `ifmissing` at its initial
-    /// `CURLUE_UNKNOWN_PART`. `curl_url_set` does the same at `:1873`, and so
-    /// does `urlset_clear` at `:1773`. [`Url::get_by_id`] and
-    /// [`Url::set_by_id`] are where that mapping happens here, so this
-    /// answering [`None`] is what stands in for all three arms.
     #[must_use]
     pub const fn from_i32(raw: i32) -> Option<Self> {
         match raw {
@@ -660,11 +435,6 @@ impl UrlPart {
 }
 
 /// The `CURLU_*` bitmask a get or a set is modified by.
-///
-/// The sixteen flags of `include/curl/urlapi.h:84-105`, which occupy
-/// `1 << 0` through `1 << 15` with no gaps. A newtype over `u32` rather than
-/// a `bitflags` dependency: AAP section 0.5.1 pins the dependency set and
-/// nothing in it is a bitflag crate, so adding one is out of scope.
 ///
 /// The bits are not independent. The interactions, each measured:
 ///
@@ -801,73 +571,18 @@ impl BitOrAssign for UrlFlags {
 }
 
 /// The per-scheme facts the URL parser needs, and nothing else.
-///
-/// Mirrors the fields of `struct Curl_scheme` (`lib/urldata.h:515-524`) that
-/// `lib/urlapi.c` actually reads. The full C struct additionally carries the
-/// `CURLPROTO_*` bit, the protocol family and the remaining `PROTOPT_*`
-/// flags; none of those is consulted by any line of the URL API, so none is
-/// reproduced here.
-///
-/// This type is declared in `url/` rather than in `protocols/` on purpose.
-/// AAP section 0.4.2 fixes an acyclic module graph and AAP section 0.3.3
-/// pattern P12 makes the resolver, the clock and the TLS provider injected
-/// rather than reached for; the same rule applies to the scheme table. If
-/// `url/` imported `protocols/`, the URL API would depend on the transfer
-/// engine, and every test of the parser would need the engine to exist. The
-/// abstraction therefore lives with the consumer, and the concrete table is
-/// supplied at construction.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SchemeInfo {
     /// The scheme's name **as the registry stores it**.
-    ///
-    /// `const char *name` (`lib/urldata.h:516`), whose comment claims *"URL
-    /// scheme name in lowercase"*. That comment is wrong for four of the 33
-    /// entries: `"WS"` (`lib/ws.c:1985`), `"WSS"` (`lib/ws.c:2000`),
-    /// `"SFTP"` (`lib/vssh/vssh.c:339`) and `"SCP"` (`lib/vssh/vssh.c:353`)
-    /// are upper case. The table works only because
-    /// `Curl_getn_scheme` folds case on both sides (`lib/url.c:1523-1538`).
-    ///
-    /// So **never compare this field case-sensitively**, and never assume it
-    /// is lower case. Nothing in this module compares it at all: the scheme
-    /// it stores comes from the input, folded to lower case by
-    /// [`is_absolute_url`], and this field exists because a registry
-    /// implementation needs somewhere to put the name it matched.
     pub name: &'static str,
 
     /// The scheme's default port.
-    ///
-    /// `uint16_t defport` (`lib/urldata.h:523`). Consulted only on get, at
-    /// `lib/urlapi.c:1465`, `:1472`, `:1591` and `:1599`.
-    ///
-    /// The values are `lib/urldata.h:29-53`: HTTP 80, HTTPS 443, FTP 21,
-    /// FTPS 990, SSH 22 for **both** SCP and SFTP, and zero for `file`,
-    /// whose handler declares `defport 0`. That table is **not** duplicated
-    /// here -- there is one source of truth for it and it is the registry.
     pub default_port: u16,
 
     /// Whether a `;options` tail is parsed out of this scheme's userinfo.
-    ///
-    /// `flags & PROTOPT_URLOPTIONS` (`lib/urldata.h:545`), set by exactly
-    /// three protocol pairs: imap and imaps (`lib/imap.c:2341`, `:2359`),
-    /// pop3 and pop3s (`lib/pop3.c:1730`, `:1747`) and smtp and smtps
-    /// (`lib/smtp.c:2022`, `:2039`). All six are stubbed in this rewrite,
-    /// which changes nothing here: the flag is consulted when extracting the
-    /// options from a URL (`lib/urlapi.c:290`) and when rendering them back
-    /// (`:1477`), and both must keep working for a scheme whose transfer
-    /// implementation is absent.
     pub url_options: bool,
 
     /// Whether an implementation of this scheme is present.
-    ///
-    /// `h->run != NULL`. `lib/url.c:1473-1475` states the contract
-    /// verbatim: *"Returns a struct scheme pointer if the name is a known
-    /// scheme. Check the ->run struct field for non-NULL to figure out if an
-    /// implementation is present."* A protocol disabled at build time stays
-    /// in the table with `run = ZERO_NULL` -- measured at
-    /// `lib/file.c:626-629`, `lib/ftp.c:4348-4351` and `:4367-4370`,
-    /// `lib/http.c:5011-5014` and `:5028-5031`, `lib/ws.c:1984-1987` and
-    /// `:1999-2002`, `lib/vssh/vssh.c:338-341` and `:352-355`, and
-    /// `lib/smtp.c:2012-2018`.
     ///
     /// This field is why a bare port would not have been enough. **Parsing
     /// and setting disagree**: `parse_scheme` accepts any scheme in the table
@@ -881,36 +596,7 @@ pub struct SchemeInfo {
 
 /// The scheme table, injected rather than imported.
 ///
-/// # Implementing this
-///
-/// `lookup` must be **case-insensitive**, because `Curl_getn_scheme` folds
-/// both sides (`lib/url.c:1523-1538`) and four of its entries are stored in
-/// upper case. Fold with ASCII-only rules --
-/// [`crate::util::strcase`] internally, or
-/// `[u8]::eq_ignore_ascii_case` from outside the crate -- and never with
-/// `char::to_lowercase`, which is Unicode-aware and would fold bytes curl
-/// leaves alone.
-///
-/// `None` means "not a known scheme", the C's `h == NULL`. Answering
-/// `Some(SchemeInfo { runnable: false, .. })` means something different and
-/// weaker: the name is known but has no implementation. The two answers are
-/// distinguished by the caller and produce different results, so a registry
-/// must not collapse them.
-///
-/// Two measured bounds of the C's own lookup are worth preserving in an
-/// implementation, and neither is enforced here because neither belongs to
-/// this module. `Curl_getn_scheme` is gated `if(len && (len <= 7))`, so **no
-/// scheme longer than seven bytes can ever resolve**, even though
-/// [`MAX_SCHEME_LEN`] admits 40 on the way in. And the backing array is
-/// declared `all_schemes[67]` (`lib/url.c:1488`) while only 33 entries are
-/// defined: 67 is the modulus of the hash, **not a count**. AAP section
-/// 0.3.3 pattern P4 records the same. Neither is a defect and neither should
-/// be "corrected".
-///
 /// # The wiring contract, for the agents that land the rest of the workspace
-///
-/// This is a coordination item rather than an implementation note, and it is
-/// written down here because nothing else in the tree states it yet.
 ///
 /// `curl_url()` takes no arguments (`include/curl/urlapi.h:113`), so
 /// `curl-rs-ffi/src/ffi/url.rs` has to obtain a registry from somewhere
@@ -927,15 +613,6 @@ pub struct SchemeInfo {
 /// instead: no `static mut`, no lazily-initialised singleton, no
 /// registration side effect. The registry is a constructor argument and
 /// [`Url`] holds the borrow.
-///
-/// Whether the 24 out-of-scope schemes appear in that table is the
-/// `protocols/` author's decision, not this module's, and this module is
-/// correct either way because it reads [`SchemeInfo::runnable`] rather than
-/// hard-coding a list. The recommendation is to register all 33 with
-/// `runnable: false` for the 24, which is the exact analogue of the C's
-/// `CURL_DISABLE_<PROTO>` builds and is what keeps `guess_scheme`'s
-/// `smtp.`/`imap.`/`pop3.`/`dict.`/`ldap.` prefixes working and the
-/// parse-versus-set asymmetry observable.
 pub trait SchemeRegistry: Sync {
     /// The metadata for `scheme`, matched case-insensitively, or [`None`]
     /// when the name is not in the table.
@@ -943,19 +620,6 @@ pub trait SchemeRegistry: Sync {
 }
 
 /// A parsed URL: the engine behind `CURLU`.
-///
-/// Supersedes `struct Curl_URL` (`lib/urlapi.c:67-82`), whose own comment is
-/// *"Internal representation of CURLU. Point to URL-encoded strings."* The
-/// ten byte strings, the numeric port and the three bits are the C's fields
-/// one for one; the registry is this implementation's replacement for the C's
-/// free-standing `Curl_get_scheme` call, and the reason is
-/// [`SchemeRegistry`].
-///
-/// The stored parts are URL-**encoded**, with one measured exception the C
-/// documents: *"When a full URL is set (parsed), the hostname component is
-/// stored URL decoded"* (`docs/libcurl/curl_url_set.md:94`). That is
-/// [`urldecode_host`], and it is why a host may hold bytes at or above 0x80
-/// while every other part may not.
 ///
 /// # Examples
 ///
@@ -1052,6 +716,32 @@ pub struct Url {
 /// every implementation for no benefit. The parts are rendered with
 /// [`String::from_utf8_lossy`] because a host may hold bytes that are not
 /// UTF-8 and a debug format must not be the thing that fails.
+///
+/// # The userinfo is redacted, and the three parts that carry it
+///
+/// `user`, `password` and `options` render through
+/// `crate::util::redact::RedactedOpt` -- a byte count and no bytes -- while
+/// every other part renders in full. A URL is the single most widely copied
+/// value in this crate: it appears in errors, in traces, in
+/// `CURLINFO_EFFECTIVE_URL`, in redirect decisions and in configuration state,
+/// so a formatter that printed `https://user:hunter2@host/` put a password
+/// wherever any of those went. `curl` itself treats userinfo as a credential
+/// -- `lib/urlapi.c` parses it into the same fields `CURLOPT_USERPWD` sets,
+/// and `crate::auth::basic` base64-encodes it straight into
+/// `Authorization:` -- so this is the same secret by another route.
+///
+/// `options` is included because it is the FTP/IMAP login-options field, which
+/// `docs/cmdline-opts/login-options.md` documents as carrying authentication
+/// parameters; it arrives from the same `user:password;options@` production in
+/// `lib/urlapi.c` and is set by the same `CURLOPT_LOGIN_OPTIONS`.
+///
+/// Nothing else is redacted. `host`, `port`, `path`, `query` and `fragment`
+/// are what make a trace useful, and a query string's contents are already
+/// visible on the wire and in `--trace` output, so redacting them would cost a
+/// debugging capability for no confidentiality gain. What this does NOT change
+/// is any byte the URL yields: [`Url::get`] and the serialising paths are
+/// untouched, so `CURLUPART_PASSWORD` still returns the password verbatim to a
+/// caller who asks for it.
 impl fmt::Debug for Url {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fn show(part: Option<&Vec<u8>>) -> String {
@@ -1063,11 +753,16 @@ impl fmt::Debug for Url {
             }
         }
 
+        /// The userinfo parts: a length, never the bytes.
+        fn hide(part: Option<&Vec<u8>>) -> String {
+            format!("{:?}", RedactedOpt(part.map(Vec::as_slice)))
+        }
+
         f.debug_struct("Url")
             .field("scheme", &show(self.scheme.as_ref()))
-            .field("user", &show(self.user.as_ref()))
-            .field("password", &show(self.password.as_ref()))
-            .field("options", &show(self.options.as_ref()))
+            .field("user", &hide(self.user.as_ref()))
+            .field("password", &hide(self.password.as_ref()))
+            .field("options", &hide(self.options.as_ref()))
             .field("host", &show(self.host.as_ref()))
             .field("zoneid", &show(self.zoneid.as_ref()))
             .field("port", &show(self.port.as_ref()))
@@ -1084,15 +779,6 @@ impl fmt::Debug for Url {
 
 impl Url {
     /// An empty handle bound to `registry`.
-    ///
-    /// Supersedes `curl_url` (`lib/urlapi.c:1288-1291`), whose whole body is
-    /// `curlx_calloc(1, sizeof(struct Curl_URL))` -- every field zero, which
-    /// is every part absent, a zero port and all three bits clear. The
-    /// registry is the one field a `calloc` cannot supply.
-    ///
-    /// `curl_url_cleanup` (`:1293-1299`) has no counterpart: it frees the ten
-    /// strings and then the handle, all of which `Drop` does. The FFI
-    /// wrapper's `Box::from_raw` is the whole of it.
     #[must_use]
     pub fn new(registry: &'static dyn SchemeRegistry) -> Self {
         Self {
@@ -1126,23 +812,6 @@ impl Url {
     /// u->fragment_present = in->fragment_present;
     /// u->query_present = in->query_present;
     /// ```
-    ///
-    /// `guessed_scheme` is not among them. **That omission is reproduced
-    /// deliberately and is not an oversight in this transcription.** It is
-    /// observable: [`UrlFlags::NO_GUESS_SCHEME`] treats a guessed scheme as
-    /// absent on get, so the original and the duplicate answer differently
-    /// for both [`UrlPart::Scheme`] and [`UrlPart::Url`]. The duplicate
-    /// behaves as though the scheme had been given explicitly.
-    ///
-    /// This is why the type does not derive [`Clone`]: a derived clone would
-    /// copy all fourteen fields and would silently "fix" a difference the
-    /// fixture corpus can see. `tests::dup_does_not_carry_the_guessed_scheme`
-    /// is the guard.
-    ///
-    /// The C can return null here, from a failed allocation. That has no
-    /// expression in Rust -- `Vec` aborts rather than reporting -- so this is
-    /// infallible, and the FFI wrapper's only null return is for a null
-    /// input.
     #[must_use]
     pub fn dup(&self) -> Self {
         Self {
@@ -1176,17 +845,10 @@ impl Url {
     // `Self::urlset_clear`. A method here would have no caller.
 }
 
-// ---------------------------------------------------------------------------
 // Scanning and encoding the input -- `lib/urlapi.c:104-239`.
-// ---------------------------------------------------------------------------
 
 /// The offset of the separator that ends the host, or of the `?` that
 /// replaces it.
-///
-/// `find_host_sep` (`lib/urlapi.c:104-118`), whose comment gives the second
-/// case: *"or the '?' in cases like http://www.example.com?id=2380"*. The
-/// walk skips to just past the first `//` if there is one, then to the first
-/// `/` or `?`, and answers the end of the string if there is neither.
 fn find_host_sep(url: &[u8]) -> usize {
     // `sep = strstr(url, "//"); if(!sep) sep = url; else sep += 2;`
     let mut sep = match url.windows(2).position(|pair| pair == b"//") {
@@ -1241,12 +903,6 @@ fn urlencode_str(
 
     // `if(!relative) { host_sep = find_host_sep(url); dyn_addn(o, url, n);
     //   len -= n; }`
-    //
-    // The C subtracts the copied prefix from its carried length. Here the
-    // prefix is a slice split, so there is no subtraction to underflow --
-    // which matters because the C's would, if `len` were ever shorter than
-    // the prefix. It is not: `relative` is false at exactly one call site,
-    // `redirect_url` at `:1275`, which passes `strlen(useurl)`.
     let mut rest = url;
     if !relative {
         let sep = find_host_sep(url).min(url.len());
@@ -1289,32 +945,6 @@ fn urlencode_str(
 }
 
 /// The scheme of `url` folded to lower case, when `url` is absolute.
-///
-/// Supersedes `Curl_is_absolute_url` (`lib/urlapi.c:182-220`), one of the
-/// three non-unittest exports of `lib/urlapi-int.h`. The C returns the length
-/// and optionally fills a caller's buffer with the folded name; returning the
-/// name itself covers both, since its length is the C's return value.
-///
-/// The grammar is RFC 3986 section 3.1, quoted in the C at `:198-200`:
-/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, capped at
-/// [`MAX_SCHEME_LEN`]. A first byte that is not a letter means not absolute,
-/// which is what rejects `1h://`, `..://`, `-ht://` and `+ftp://`.
-///
-/// # `guess_scheme` changes what counts as a scheme
-///
-/// The colon test at `:206` is
-/// `if(i && (url[i] == ':') && ((url[i + 1] == '/') || !guess_scheme))`, and
-/// the C explains it at `:207-209`: without guessing, any `scheme:` is a
-/// scheme, so `data:` is detected; with guessing, a slash must follow,
-/// because `data:1234` might be the host `data` with a port. Both readings
-/// are preserved, and `tests/libtest/lib1560.c` requires both -- `boing:80`
-/// parses as a host and a port under
-/// [`UrlFlags::GUESS_SCHEME`] while `about:config` is an unsupported scheme
-/// without it.
-///
-/// The Windows drive-prefix arm at `:190-193` has no counterpart: AAP section
-/// 0.2.2 excludes Windows, and this module writes no
-/// `STARTS_WITH_DRIVE_PREFIX`.
 // The remaining C call site is `lib/transfer.c`'s redirect handling, which
 // arrives with `transfer/`. `set_url` below is the in-module caller.
 #[allow(dead_code)]
@@ -1371,14 +1001,6 @@ pub(crate) fn is_absolute_url(
 /// *urllen = n;
 /// ```
 ///
-/// Two details are easy to lose and both are reproduced. **The length test
-/// runs before the byte scan**, so an over-long input is refused for its
-/// length whatever it contains. And the threshold is a `<=` against a
-/// value that *includes* the space when spaces are not allowed, so
-/// `allowspace` is expressed by lowering the bound rather than by a second
-/// test -- which is why a space is refused by the same comparison that
-/// refuses a tab.
-///
 /// # Errors
 ///
 /// [`CURLUcode::MalformedInput`], the only code this function produces.
@@ -1400,9 +1022,7 @@ pub(crate) fn junkscan(url: &[u8], allowspace: bool) -> UrlResult<usize> {
     Ok(url.len())
 }
 
-// ---------------------------------------------------------------------------
 // The authority -- `lib/urlapi.c:248-655`.
-// ---------------------------------------------------------------------------
 
 /// The three components of a userinfo field.
 ///
@@ -1437,18 +1057,6 @@ struct LoginDetails {
 /// olen = (osep ? (psep && psep > osep ? (size_t)(psep - osep)
 ///                          : (size_t)(login + len - osep)) - 1 : 0);
 /// ```
-///
-/// So `user;opt:pass` yields `user`, `pass` and `opt` just as
-/// `user:pass;opt` does, and `tests/libtest/lib1560.c` requires the latter.
-/// `want_options` is the C's decision to pass a null `optionsp`, which
-/// suppresses the search for `;` entirely -- which is why
-/// `http://user:pass;word@host/` keeps the semicolon **in the password**
-/// while `imap://user:pass;word@host/` does not.
-///
-/// Every subtraction below is saturating. None can underflow -- `osep > psep`
-/// makes `osep - psep` at least one, and a separator is always inside `login`
-/// so `len - sep` is at least one -- and stating it in the operator means the
-/// argument does not have to be re-derived to be sure.
 fn parse_login_details(login: &[u8], want_options: bool) -> LoginDetails {
     let len = login.len();
     let psep = strchr(login, b':');
@@ -1507,9 +1115,6 @@ fn parse_login_details(login: &[u8], want_options: bool) -> LoginDetails {
 }
 
 /// Strips `user:password;options@` from the front of an authority.
-///
-/// Supersedes `parse_hostname_login` (`lib/urlapi.c:248-333`). Answers the
-/// offset at which the host name begins.
 ///
 /// Three behaviours are load-bearing:
 ///
@@ -1584,12 +1189,6 @@ fn parse_hostname_login(
 }
 
 /// Splits a trailing `:port` off the host buffer and stores it.
-///
-/// Supersedes `Curl_parse_port` (`lib/urlapi.c:335-387`), the one export of
-/// `lib/urlapi-int.h` the C guards with `UNITTEST`. Kept private here for
-/// exactly that reason -- `tests` below is a child module and reaches it
-/// without any of it becoming crate API. `tests/unit/unit1653.c` is the C
-/// test and every one of its eleven cases is ported.
 ///
 /// Four behaviours, each measured:
 ///
@@ -1678,12 +1277,6 @@ fn parse_port(u: &mut Url, host: &mut Buf, has_scheme: bool) -> UrlResult<()> {
 
 /// Normalises a bracketed IPv6 literal and lifts out its zone identifier.
 ///
-/// Supersedes `ipv6_parse` (`lib/urlapi.c:390-441`), which assumes its input
-/// starts with `[`. The zone identifier is **entirely this module's
-/// business**: [`crate::util::inet::pton6`] documents that it rejects one,
-/// so it is stripped before the address is parsed and re-attached after the
-/// address is rendered.
-///
 /// The measured rules:
 ///
 /// * The shortest valid input is four bytes, `[::]`.
@@ -1701,19 +1294,6 @@ fn parse_port(u: &mut Url, host: &mut Buf, has_scheme: bool) -> UrlResult<()> {
 ///   canonicalised and lower-cased. `docs/libcurl/curl_url_get.md:181-182`:
 ///   *"IPv6 names are normalized when set, which should make them as short as
 ///   possible while maintaining correct syntax."*
-///
-/// # Two orderings that are observable
-///
-/// The zone identifier is stored **before** the address is validated, so a
-/// zone identifier survives a failure to normalise: measured against a real
-/// libcurl, `curl_url_set(u, CURLUPART_HOST, "[:::%25eth0]", 0)` answers
-/// `CURLUE_BAD_HOSTNAME` and leaves the zone identifier `eth0` on the handle.
-///
-/// And the normalised text replaces the input **only when it is no longer**.
-/// The C hands `inet_ntop` a buffer of `hlen + 1` bytes (`:435`) and
-/// `curlx_inet_ntop` refuses when the result needs at least that much
-/// (`lib/curlx/inet_ntop.c:186`), leaving the un-normalised text in place. So
-/// the test is `rendered.len() <= hlen`, not a comparison of forms.
 ///
 /// # Errors
 ///
@@ -1806,24 +1386,7 @@ fn ipv6_parse(u: &mut Url, host: &mut Buf) -> UrlResult<()> {
 
 /// Refuses a host name that a URL may not carry.
 ///
-/// Supersedes `hostname_check` (`lib/urlapi.c:444-461`). Three arms: an empty
-/// host is [`CURLUcode::NoHost`], a bracketed host is handed to
-/// [`ipv6_parse`], and anything else must contain no byte of
-/// [`HOST_REJECT`] -- otherwise [`CURLUcode::BadHostname`].
-///
-/// The reject test is a `strcspn` compared against the length, so an interior
-/// zero fails it too: `cspn` stops at a zero and the lengths then disagree.
-///
 /// # This function mutates, and one caller throws the mutation away
-///
-/// The bracketed arm normalises the host in place and may store a zone
-/// identifier. `parse_authority` keeps both. `Url::set` keeps only the zone
-/// identifier and the verdict, because it validates a **decoded copy** and
-/// stores the input the caller gave it -- which is why
-/// `curl_url_set(u, CURLUPART_HOST, "[fe80::1%25eth0]", 0)` leaves the host
-/// as that exact string with `eth0` beside it, and why asking for the full
-/// URL afterwards renders the zone identifier twice. Measured against a real
-/// libcurl; reproduced under AAP section 0.8.1.
 ///
 /// # Errors
 ///
@@ -1868,31 +1431,6 @@ enum HostKind {
 }
 
 /// Rewrites a numeric IPv4 host in canonical dotted-decimal form.
-///
-/// Supersedes `ipv4_normalize` (`lib/urlapi.c:483-574`), whose comment names
-/// the job: *"Handle partial IPv4 numerical addresses and different bases,
-/// like '16843009', '0x7f', '0x7f.1' '0177.1.1.1' etc."*
-///
-/// **This must not delegate to [`crate::util::inet::pton4`]**, and the reason
-/// is not stylistic: that function is the transcription of curl's own
-/// `inet_pton`, which is strict -- exactly four octets, decimal only, no
-/// leading zero. This one accepts **one to four** parts, each in decimal,
-/// `0x` hexadecimal or leading-zero octal, each up to `UINT_MAX`, and
-/// re-splits them by the documented bit widths: one part is 32 bits, two are
-/// 8 and 24, three are 8, 8 and 16, four are 8 apiece. Delegating would
-/// refuse `0x7f000001`, `0177.1` and `127.1`, all of which curl accepts and
-/// `tests/libtest/lib1560.c` requires.
-///
-/// **Any syntax failure answers [`HostKind::Name`]**, never an error: the
-/// host falls through to name handling. That is what makes `1.2.3.4.5`,
-/// `018.0.0.0` (`8` is not an octal digit), `0x.0x.0` and `4294967296` plain
-/// host names rather than rejected input.
-///
-/// Two details worth stating because they are easy to smooth over. The
-/// hexadecimal prefix is tested as `c[1] == 'x'` (`:498`), **lower case
-/// only**, so `0X8` is octal `0` followed by a stray `X` and therefore a
-/// name. And a part is octal whenever it begins with `0`, which is why `08`
-/// is a name while `07` is the address `0.0.0.7`.
 ///
 /// # Errors
 ///
@@ -2003,12 +1541,6 @@ fn ipv4_normalize(host: &mut Buf) -> UrlResult<HostKind> {
 /// `docs/libcurl/curl_url_set.md:94` states the resulting invariant: *"When a
 /// full URL is set (parsed), the hostname component is stored URL decoded."*
 ///
-/// Two measured details. The decode is attempted **only** when a `%` is
-/// present, which is the C's `strchr` guard -- so a host with no escape is
-/// not copied. And a decode failure becomes [`CURLUcode::BadHostname`], not
-/// [`CURLUcode::Urldecode`]: control bytes are rejected by the decode mode,
-/// and the caller reports the host as bad rather than the escaping.
-///
 /// # Errors
 ///
 /// [`CURLUcode::BadHostname`], or [`cc2cu`]'s mapping of a buffer refusal.
@@ -2080,12 +1612,6 @@ impl Url {
     /// credentials is refused, and it passes `!!u->scheme` as `has_scheme` so
     /// that a bare trailing colon behaves as it would in a full URL.
     ///
-    /// The host is replaced only on success; on failure the handle keeps the
-    /// host it had. The three userinfo parts are **not** protected that way --
-    /// [`parse_hostname_login`] clears them whatever happens, which is
-    /// visible here precisely because this method runs against a populated
-    /// handle.
-    ///
     /// # Errors
     ///
     /// As [`parse_authority`].
@@ -2106,24 +1632,9 @@ impl Url {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Removing dot segments -- `lib/urlapi.c:682-821`.
-// ---------------------------------------------------------------------------
 
 /// Consumes a leading dot, spelled either way, and says whether it did.
-///
-/// `is_dot` (`lib/urlapi.c:682-697`). The second spelling is the point: a
-/// percent-encoded dot counts as a dot, and `(p[2] | 0x20) == 'e'` accepts
-/// both `%2e` and `%2E`. It is guarded by `*clen >= 3`, so a truncated escape
-/// at the end of the path is not a dot.
-///
-/// One cursor rather than the C's pointer-and-length pair, because the slice
-/// carries the length. That is not a simplification of behaviour: the C's
-/// `clen` is frequently **shorter** than the NUL-terminated remainder, since
-/// `handle_path` counts a path whose buffer still has the query and fragment
-/// after it. A slice bounded to the counted extent reproduces that, and the
-/// reads the C makes one byte past it land on [`at`]'s zero rather than on the
-/// `?` -- neither of which is a dot or a slash, so no branch changes.
 fn is_dot(cursor: &mut &[u8]) -> bool {
     let bytes = *cursor;
 
@@ -2148,21 +1659,6 @@ fn is_dot(cursor: &mut &[u8]) -> bool {
 }
 
 /// Applies RFC 3986 section 5.2.4 to a path.
-///
-/// Supersedes `dedotdotify` (`lib/urlapi.c:716-820`), annotated
-/// `@unittest: 1395` there; all 71 pairs of `tests/unit/unit1395.c` are
-/// ported below. The C's lettered comments name the rules and are kept at the
-/// branches they belong to.
-///
-/// [`None`] is the C's `*outp == NULL`, which happens for an input shorter
-/// than two bytes -- the early return at `:723-724`, whose comment is *"the
-/// path always starts with a slash, and a slash has not dot"*. The caller
-/// then leaves the path alone. An empty [`Vec`] is a different answer, the
-/// C's `curlx_strdup("")` at `:815`, and `./` produces it.
-///
-/// Infallible. The C's only failure is a refused allocation, and its buffer
-/// ceiling of `clen + 1` cannot be crossed because the output is never longer
-/// than the input.
 fn dedotdotify(input: &[u8]) -> Option<Vec<u8>> {
     // `if(clen < 2) return 0;` with `*outp` left null.
     if input.len() < 2 {
@@ -2256,15 +1752,9 @@ fn dedotdotify(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-// ---------------------------------------------------------------------------
 // Parsing a whole URL -- `lib/urlapi.c:823-1209`.
-// ---------------------------------------------------------------------------
 
 /// Parses a `file:` URL, answering where its path begins.
-///
-/// Supersedes `parse_file` (`lib/urlapi.c:823-932`). The path runs from the
-/// returned offset to the end of the input, which is the C's
-/// `pathlen = urllen - (ptr - url)` at every one of its exits.
 ///
 /// The rules, from the C's own citation of RFC 8089 at `:842-870`:
 ///
@@ -2277,16 +1767,6 @@ fn dedotdotify(input: &[u8]) -> Option<Vec<u8>> {
 ///   [`CURLUcode::BadFileUrl`].
 /// * The host is **reset to nothing**, which is why `curl_url_get` answers
 ///   [`CURLUcode::NoHost`] for every `file:` URL.
-///
-/// # Only the non-Windows arm exists here
-///
-/// The C has three Windows-conditional blocks -- the UNC fallback at
-/// `:879-897`, the drive-letter exception woven into the authority test at
-/// `:871`, and the drive-prefix strip at `:922-928`. AAP section 0.2.2
-/// excludes Windows, so this reproduces the `#else` at `:898-902` and the
-/// `#if !defined(_WIN32)` at `:914-921`: a drive letter is
-/// [`CURLUcode::BadFileUrl`], and there is no
-/// `STARTS_WITH_URL_DRIVE_PREFIX` anywhere in this module.
 ///
 /// # Errors
 ///
@@ -2360,26 +1840,6 @@ fn parse_file(url: &[u8], u: &mut Url, host: &mut Buf) -> UrlResult<usize> {
 
 /// Stores the scheme and answers where the host begins.
 ///
-/// Supersedes `parse_scheme` (`lib/urlapi.c:935-981`). `scheme` is the folded
-/// name [`is_absolute_url`] produced, or [`None`] when the input carried none.
-///
-/// The order of the three tests is the C's and is observable: the slashes are
-/// **counted first**, then the scheme is looked up, and only then is the count
-/// validated. So an unknown scheme with no slashes at all answers
-/// [`CURLUcode::UnsupportedScheme`] rather than [`CURLUcode::BadSlashes`] --
-/// which is what makes `mailto:infobot@example.com` report an unsupported
-/// scheme.
-///
-/// One to three slashes are accepted and the fourth is fatal:
-/// `(i < 1) || (i > 3)` at `:955`. `docs/libcurl/curl_url_set.md:80-83`
-/// explains why there is a lower bound -- the parser *"only understands and
-/// parses the subset of URLS that are 'hierarchical' and therefore contain a
-/// `://` separator"*.
-///
-/// **The lookup here consults table membership only**, never
-/// [`SchemeInfo::runnable`]. That is the parse half of the asymmetry
-/// documented on that field.
-///
 /// # Errors
 ///
 /// [`CURLUcode::UnsupportedScheme`], [`CURLUcode::BadSlashes`] or
@@ -2437,20 +1897,6 @@ fn parse_scheme(
 }
 
 /// Guesses a scheme from the outermost label of the host name.
-///
-/// Supersedes `guess_scheme` (`lib/urlapi.c:984-1009`), whose comment is
-/// *"legacy curl-style guess based on hostname"*. The prefix table is the C's
-/// exactly, in the C's order, and `docs/libcurl/curl_url_set.md:206-210`
-/// documents it.
-///
-/// **The table is not pruned for this rewrite.** Five of its six entries name
-/// schemes whose transfer implementations are out of scope -- dict, ldap,
-/// imap, smtp and pop3 -- and all five must keep being guessed, because
-/// `tests/libtest/lib1560.c` requires `smtp.example.com` to become
-/// `smtp://smtp.example.com/` and a request for it to fail later, at the
-/// transfer, rather than earlier, at the parse.
-///
-/// Sets `guessed_scheme`, which is the bit [`Url::dup`] does not carry.
 fn guess_scheme(u: &mut Url, host: &Buf) {
     let hostname = host.as_slice();
 
@@ -2475,15 +1921,6 @@ fn guess_scheme(u: &mut Url, host: &Buf) {
 }
 
 /// Stores the fragment, recording that there was one even when it is blank.
-///
-/// Supersedes `handle_fragment` (`lib/urlapi.c:1012-1033`). `fragment`
-/// includes the leading `#`, as the C's pointer does.
-///
-/// `fragment_present` is set **unconditionally**, before the length is even
-/// looked at, and the content is stored only when something follows the `#`.
-/// So `http://x/#` records a present, absent fragment -- which is exactly the
-/// state [`UrlFlags::GET_EMPTY`] exists to expose, and which
-/// `tests/libtest/lib1560.c` checks in both directions.
 ///
 /// # Errors
 ///
@@ -2514,19 +1951,6 @@ fn handle_fragment(
 
 /// Stores the query, recording that there was one even when it is blank.
 ///
-/// Supersedes `handle_query` (`lib/urlapi.c:1036-1063`). `query` includes the
-/// leading `?`.
-///
-/// The blank case differs from the fragment's and the difference is measured:
-/// a bare `?` stores an **empty string** rather than nothing, because the C's
-/// `else` arm at `:1057-1062` is `u->query = curlx_strdup("")`. So
-/// `http://x/?` has `query_present` set *and* a query, and
-/// [`urlget_url`]'s `show_query` has to test the first byte to tell it from a
-/// real one.
-///
-/// Note also that the encode is asked for a **query** part, so a space in it
-/// becomes `+` rather than `%20`.
-///
 /// # Errors
 ///
 /// As [`urlencode_str`], when [`UrlFlags::URLENCODE`] is set.
@@ -2552,17 +1976,6 @@ fn handle_query(u: &mut Url, query: &[u8], flags: UrlFlags) -> UrlResult<()> {
 }
 
 /// Stores the path, encoded and dot-reduced as the flags ask.
-///
-/// Supersedes `handle_path` (`lib/urlapi.c:1066-1107`). `path` is the extent
-/// left after the fragment and the query have been trimmed off.
-///
-/// A path of one byte or less is stored as **nothing**: `:1080-1083`, whose
-/// comment is *"there is no path left or just the slash, unset"*. That is why
-/// `curl_url_get` has to substitute a `/` on the way out, and why a `file:`
-/// URL whose whole path is `/` renders through [`NIL_STRING`].
-///
-/// The encode runs **before** the length test, so a one-byte path that
-/// encodes to three bytes is stored rather than dropped.
 ///
 /// # Errors
 ///
@@ -2602,17 +2015,6 @@ fn handle_path(u: &mut Url, path: &[u8], flags: UrlFlags) -> UrlResult<()> {
 }
 
 /// Parses `url` into a fresh handle.
-///
-/// Supersedes `parseurl` (`lib/urlapi.c:1110-1191`). The order of the five
-/// steps is the C's, and each depends on the last: the input is scanned for
-/// bytes no URL may carry, the scheme is detected, `file:` is diverted before
-/// any authority is looked for, the authority is parsed, and only then are the
-/// fragment, the query and the path split off the remainder -- in that order,
-/// because each is measured from the end of the one before.
-///
-/// `u` is always a fresh handle here, which is what makes the C's `fail:`
-/// arm at `:1188-1191` -- freeing the half-built parts -- unnecessary: the
-/// caller drops the whole thing.
 ///
 /// # Errors
 ///
@@ -2690,12 +2092,6 @@ fn parseurl(url: &[u8], u: &mut Url, flags: UrlFlags) -> UrlResult<()> {
 
 /// Parses `url` and, on success only, replaces everything in `u`.
 ///
-/// Supersedes `parseurl_and_replace` (`lib/urlapi.c:1197-1208`), whose comment
-/// is *"Parse the URL and, if successful, replace everything in the Curl_URL
-/// struct."* The C parses into a zeroed stack temporary and assigns it whole;
-/// this parses into a fresh [`Url`] carrying the same registry and moves it.
-/// Either way a failed parse leaves the handle exactly as it was.
-///
 /// # Errors
 ///
 /// As [`parseurl`].
@@ -2725,28 +2121,6 @@ fn parseurl_and_replace(
 /// * anything else -- a path or a query, so any existing query or fragment
 ///   goes, and unless the input itself starts with `?` the cut moves back to
 ///   just after the **last** slash.
-///
-/// The re-parse drops [`UrlFlags::PATH_AS_IS`] (`:1277`), so a relative merge
-/// always has its dot segments removed even when the original parse kept
-/// them.
-///
-/// # The C reads out of bounds here, and this does not
-///
-/// `protsep = base + strlen(u->scheme) + 3` (`:1225`) assumes `base` begins
-/// with `scheme://`. It need not. `curl_url_get(CURLUPART_URL)` omits the
-/// scheme entirely when [`UrlFlags::NO_GUESS_SCHEME`] is set and the scheme
-/// was guessed (`:1512-1515`), and `set_url` passes the caller's flags
-/// straight through when it fetches the base. Parse `a` with
-/// [`UrlFlags::GUESS_SCHEME`] and then set `b` with
-/// [`UrlFlags::NO_GUESS_SCHEME`]: the base is `a/`, two bytes, and the C
-/// forms a pointer seven bytes past its start.
-///
-/// The offset is therefore clamped to the length of `base`, which is the only
-/// safe expression of it, and the clamp is not observable. Measured against a
-/// real libcurl, that sequence answers `CURLUE_BAD_SCHEME`; clamping makes
-/// `protsep` empty, so no cut is found, so the whole base is kept and `a/b`
-/// is re-parsed -- which fails with `CURLUE_BAD_SCHEME` for want of a scheme.
-/// Same code, no undefined behaviour.
 ///
 /// # Errors
 ///
@@ -2829,16 +2203,9 @@ fn redirect_url(
     parseurl_and_replace(&combined, u, flags.without(UrlFlags::PATH_AS_IS))
 }
 
-// ---------------------------------------------------------------------------
 // Getting a part -- `lib/urlapi.c:1338-1634`.
-// ---------------------------------------------------------------------------
 
 /// The host in its A-label form.
-///
-/// `host_decode` (`lib/urlapi.c:1338-1345`), which wraps `Curl_idn_decode`
-/// and maps its failure: a refused allocation stays
-/// [`CURLUcode::OutOfMemory`], anything else becomes
-/// [`CURLUcode::BadHostname`].
 ///
 /// # Errors
 ///
@@ -2896,13 +2263,6 @@ impl Url {
     ///   distinction is what makes the flags inert everywhere else.
     ///
     /// # One documented divergence, and it is a null pointer
-    ///
-    /// When the part is empty and [`UrlFlags::URLENCODE`] is set, the C's
-    /// encode loop appends nothing, `curlx_dyn_ptr` answers null, and
-    /// `curl_url_get` therefore returns **`CURLUE_OK` with `*part` left
-    /// null** -- measured against a real libcurl for both an empty query and
-    /// an empty fragment under `CURLU_GET_EMPTY | CURLU_URLENCODE`. This
-    /// returns an empty [`Vec`] instead.
     ///
     /// The divergence is deliberate and bounded. It contradicts the C's own
     /// manual page, which promises a part on success
@@ -2968,17 +2328,6 @@ impl Url {
 
     /// Assembles the whole URL.
     ///
-    /// Supersedes `urlget_url` (`lib/urlapi.c:1425-1538`). The assembly at
-    /// `:1517-1532` is a single fifteen-argument format string and it is the
-    /// **wire contract**: what this produces becomes a request line and a
-    /// `Host:` header, and AAP section 0.6.7 measures those byte for byte
-    /// against 1,476 fixtures. The fifteen pieces, in order:
-    ///
-    /// ```text
-    /// scheme://  user  :password  ;options  @  host  :port
-    ///            path  ?query  #fragment
-    /// ```
-    ///
     /// with each separator conditional on the piece it introduces -- and
     /// three of those conditions are not what they look like:
     ///
@@ -2988,47 +2337,6 @@ impl Url {
     ///   present.** So an options-only handle renders `;opt@host`, which is
     ///   reachable because options survive an unknown scheme (below).
     /// * **The path falls back to `/`**, never to nothing.
-    ///
-    /// # The `file` scheme short-circuits everything
-    ///
-    /// `:1440-1447` answers `file://` followed by the path, the query and the
-    /// fragment, and nothing else. No host, no port, no userinfo, no scheme
-    /// lookup, no port defaulting, no options -- and **no host check either**,
-    /// so this is the one arm that cannot fail with
-    /// [`CURLUcode::NoHost`]. It is also where [`NIL_STRING`] comes from.
-    ///
-    /// # The query and the fragment are not symmetric
-    ///
-    /// `show_query` additionally requires a **non-empty first byte**
-    /// (`:1434-1435`) while `show_fragment` does not (`:1432-1433`). The
-    /// asymmetry exists because a bare `?` stores an empty query string while
-    /// a bare `#` stores no fragment at all, so the query needs the extra
-    /// test to tell "present and blank" from "present and real". Its visible
-    /// effect: `http://x/?` renders without the `?` unless
-    /// [`UrlFlags::GET_EMPTY`] is set, and `http://x/#` likewise.
-    ///
-    /// # The options survive a scheme the registry does not know
-    ///
-    /// `if(h && !(h->flags & PROTOPT_URLOPTIONS)) options = NULL;` (`:1477`)
-    /// -- the test is guarded by `h`, so a **null** `h` leaves the options in
-    /// place. Measured: a handle on `custom://h/` with options set renders
-    /// `custom://;opt@h/`. `docs/libcurl/curl_url_get.md:170-173` describes
-    /// this as the API allowing the field *"independently of scheme when not
-    /// parsing full URLs"*.
-    ///
-    /// # The host renders through one of four arms, in order
-    ///
-    /// A bracketed host takes the first arm and the remaining three are then
-    /// **skipped entirely** -- so an IPv6 literal is never percent-encoded
-    /// and never IDN-converted. Within that arm the zone identifier, if
-    /// there is one, is spliced in as `%25`: the trailing `]` is dropped, the
-    /// escape and the identifier are appended, and a `]` closes it again
-    /// (`:1486-1487`). That is the whole of what
-    /// `docs/libcurl/curl_url_get.md:88-89` means by *"even when not asking
-    /// for URL encoding, the '%' (byte 37) is URL encoded"*: a stored host
-    /// can never contain a raw `%` -- [`hostname_check`] refuses one, and a
-    /// bracketed host's `%` becomes the zone identifier -- so this splice is
-    /// the only `%` the renderer can emit.
     ///
     /// # Errors
     ///
@@ -3138,8 +2446,12 @@ impl Url {
                 allochost = Some(built);
             }
         } else if urlencode {
-            // `curl_easy_escape(NULL, u->host, 0)`
-            allochost = Some(escape::escape(host));
+            // `curl_easy_escape(NULL, u->host, 0)`, whose null return is
+            // `CURLUE_OUT_OF_MEMORY` at `lib/urlapi.c:1919-1920`. The output is
+            // three times the host's length, so the allocation is fallible and
+            // the code is reported rather than the process aborting.
+            allochost =
+                Some(escape::escape(host).map_err(|_| CURLUcode::OutOfMemory)?);
         } else if punycode {
             if !idn::is_ascii_name(Some(host)) {
                 allochost = Some(host_decode(host)?);
@@ -3204,13 +2516,6 @@ impl Url {
 
     /// Extracts one part of the URL.
     ///
-    /// Supersedes `curl_url_get` (`lib/urlapi.c:1541-1633`). Its two argument
-    /// checks have no counterpart: a null handle
-    /// ([`CURLUcode::BadHandle`]) and a null out-pointer
-    /// ([`CURLUcode::BadPartpointer`]) are both unrepresentable here, so both
-    /// codes belong to `curl-rs-ffi/src/ffi/url.rs`, which is where a null
-    /// pointer can still arrive.
-    ///
     /// The per-part table, with the flag adjustments each arm makes:
     ///
     /// * [`UrlPart::Url`] delegates to the assembler and never returns a
@@ -3235,15 +2540,6 @@ impl Url {
     ///   [`UrlFlags::URLDECODE`] also turns `+` into a space.
     /// * [`UrlPart::Fragment`] surfaces a blank fragment as an empty string
     ///   when [`UrlFlags::GET_EMPTY`] is set.
-    ///
-    /// Every other part is returned as stored, or its own missing-part code:
-    /// [`CURLUcode::NoUser`], [`CURLUcode::NoPassword`],
-    /// [`CURLUcode::NoOptions`], [`CURLUcode::NoHost`] or
-    /// [`CURLUcode::NoZoneid`].
-    ///
-    /// `docs/libcurl/curl_url_get.md:249` -- *"If this function returns an
-    /// error, no URL part is returned"* -- is structural here: a `Result`
-    /// carries either the part or the code and never both.
     ///
     /// # Errors
     ///
@@ -3353,11 +2649,6 @@ impl Url {
 
     /// [`Self::get`] over a raw `CURLUPart` value.
     ///
-    /// For `curl-rs-ffi/src/ffi/url.rs`, which receives the part as an
-    /// integer from C and cannot narrow it. An unrepresentable value is
-    /// [`CURLUcode::UnknownPart`], which is what the C's `default:` arm at
-    /// `lib/urlapi.c:1626-1628` produces by leaving `ifmissing` untouched.
-    ///
     /// # Errors
     ///
     /// [`CURLUcode::UnknownPart`], or as [`Self::get`].
@@ -3369,29 +2660,9 @@ impl Url {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Setting a part -- `lib/urlapi.c:1636-1997`.
-// ---------------------------------------------------------------------------
 
 /// Whether a byte survives unescaped in a path being encoded.
-///
-/// `allowed_in_path` (`lib/urlapi.c:1779-1802`), transcribed case by case
-/// from the `switch`.
-///
-/// **The switch has eighteen cases and the manual page lists seventeen.** The
-/// missing one is `/`, at `lib/urlapi.c:1799`, absent from the list at
-/// `docs/libcurl/curl_url_set.md:190`. The code is the contract (AAP section
-/// 0.8.1), and this is the single most consequential place in the module to
-/// get wrong by trusting the documentation: an implementation that escapes
-/// `/` turns every `curl_url_set(u, CURLUPART_PATH, "/a/b", CURLU_URLENCODE)`
-/// into `/a%2Fb` and breaks every path-setting fixture.
-/// `tests/libtest/lib1560.c` pins it -- `path=one /$!$&'()*+;=:@{}[]%` under
-/// `CURLU_URLENCODE` must yield `/one%20/$!$&'()*+;=:@{}[]%25`, with both
-/// slashes intact and only the space and the percent escaped.
-///
-/// Note also what is **not** here: this set is consulted in addition to
-/// `ISUNRESERVED` and only when `pathmode` is on, so it widens the path's
-/// accept set rather than defining it.
 const fn allowed_in_path(byte: u8) -> bool {
     matches!(
         byte,
@@ -3416,14 +2687,6 @@ const fn allowed_in_path(byte: u8) -> bool {
 }
 
 /// Which field a set stores into.
-///
-/// The C carries `char **storep` -- a pointer to the struct member -- from
-/// the `switch` at `lib/urlapi.c:1828-1875` down to the assignment at
-/// `:1994-1995`. A borrow cannot be held across the work in between, because
-/// that work also needs `&mut` access to the handle: the host check stores a
-/// zone identifier, and the query append reads the existing query. Naming the
-/// field and resolving it at the end is the same program without the
-/// aliasing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Slot {
     /// `&u->scheme`.
@@ -3483,14 +2746,6 @@ impl Url {
     ///
     /// # The syntax loop does not examine the last byte
     ///
-    /// `while(--plen)` at `:1652` pre-decrements, so the body runs `plen - 1`
-    /// times while the cursor starts at the **first** byte -- so the byte at
-    /// `plen - 1` is never tested. `set(SCHEME, "ab$")` is therefore accepted
-    /// under [`UrlFlags::NON_SUPPORT_SCHEME`], and measured against a real
-    /// libcurl it is. Reproduced under AAP section 0.8.2's minimal-change
-    /// mandate, and `tests::a_trailing_byte_of_a_scheme_is_never_examined`
-    /// is the guard so that nobody "tidies" the loop into checking it.
-    ///
     /// # Errors
     ///
     /// [`CURLUcode::BadScheme`] or [`CURLUcode::UnsupportedScheme`].
@@ -3549,16 +2804,6 @@ impl Url {
 
     /// Stores a port from its decimal text.
     ///
-    /// Supersedes `set_url_port` (`lib/urlapi.c:1666-1682`). The first byte
-    /// must be a digit -- which is what refuses an empty string and a leading
-    /// sign -- the value must fit in sixteen bits, and **the whole string
-    /// must be consumed**, so `56 78` and `123a` are refused rather than
-    /// truncated. The stored text is re-rendered from the number, so
-    /// `01` becomes `1`.
-    ///
-    /// Note what is absent: no flag is consulted, so
-    /// [`UrlFlags::URLENCODE`] has no effect on a port.
-    ///
     /// # Errors
     ///
     /// [`CURLUcode::BadPortNumber`].
@@ -3583,11 +2828,6 @@ impl Url {
 
     /// Replaces the URL, absolutely or relatively.
     ///
-    /// Supersedes `set_url` (`lib/urlapi.c:1685-1729`), whose comment is
-    /// *"Allow a new URL to replace the existing (if any) contents. If the
-    /// existing contents is enough for a URL, allow a relative URL to replace
-    /// it."*
-    ///
     /// Four cases, in the C's order:
     ///
     /// 1. **An empty input** is a redirect that changes nothing, and it is
@@ -3599,11 +2839,6 @@ impl Url {
     /// 3. **An incomplete handle** -- one that cannot render a whole URL --
     ///    also takes the replacement, since there is nothing to merge into.
     /// 4. Otherwise the input is merged as a relative reference.
-    ///
-    /// Note that cases 1 and 3 fetch the base with **the caller's flags**,
-    /// which is how [`UrlFlags::NO_GUESS_SCHEME`] reaches
-    /// [`redirect_url`]'s base and produces the out-of-bounds pointer
-    /// documented there.
     ///
     /// # Errors
     ///
@@ -3639,10 +2874,6 @@ impl Url {
     }
 
     /// Clears one part, as a null `part` asks.
-    ///
-    /// Supersedes `urlset_clear` (`lib/urlapi.c:1732-1776`).
-    /// `docs/libcurl/curl_url_set.md:54-55` states the trigger: *"Passing a
-    /// NULL instead of a part string, clears that part."*
     ///
     /// Three arms do more than release a string, and one does less than a
     /// reader expects:
@@ -3699,18 +2930,6 @@ impl Url {
 
     /// Stores one part of the URL, or clears it when `part` is [`None`].
     ///
-    /// Supersedes `curl_url_set` (`lib/urlapi.c:1805-1997`). `None` is the C's
-    /// null pointer and delegates to [`Self::urlset_clear`]; a null handle is
-    /// unrepresentable, so [`CURLUcode::BadHandle`] belongs to the FFI.
-    ///
-    /// `part` is the byte range the caller resolved. Across the C ABI that is
-    /// `CStr::to_bytes`, which stops at the terminator exactly as the C's own
-    /// `strlen(part)` at `:1823` does, so the two agree for every input a C
-    /// caller can construct. A Rust caller passing an interior zero gets it
-    /// stored rather than truncated, which is a boundary convention rather
-    /// than a behaviour: [`Self::set`] with [`UrlPart::Url`] refuses one
-    /// anyway, through [`junkscan`].
-    ///
     /// The per-part table:
     ///
     /// * [`UrlPart::Scheme`] validates first and then **forces
@@ -3729,14 +2948,6 @@ impl Url {
     ///   `query_present`.
     /// * [`UrlPart::Fragment`] sets `fragment_present`.
     /// * [`UrlPart::Port`] and [`UrlPart::Url`] delegate and return.
-    ///
-    /// # The append inserts a separator only when there is something to
-    /// separate
-    ///
-    /// `&` is inserted only when the existing query is non-empty **and** does
-    /// not already end with one (`:1940-1941`), and the whole append is
-    /// skipped when the existing query is empty -- in which case the new value
-    /// simply replaces it.
     ///
     /// # Percent triplets are lower-cased when not encoding
     ///
@@ -3852,11 +3063,6 @@ impl Url {
             // `while(*p) { if((*p == '%') && ISXDIGIT(p[1]) && ISXDIGIT(p[2])
             //  && (ISUPPER(p[1]) || ISUPPER(p[2]))) { lower; lower; p += 3; }
             //  else p++; }`
-            //
-            // The walk covers the prepended slash too, which is harmless: it
-            // is not a percent sign. Reading `p[1]` and `p[2]` past the end
-            // lands on the C's terminator, which is not a hex digit, so the
-            // guard fails there; `at` answers zero for the same reason.
             let bytes = enc.as_mut_slice();
             let mut index = 0usize;
             while index < bytes.len() {
@@ -3915,14 +3121,6 @@ impl Url {
                     let candidate = newp.as_deref().unwrap_or(&[]);
                     if urlencode {
                         // `else if(hostname_check(u, newp, n)) bad = TRUE;`
-                        //
-                        // The C checks the stored buffer in place, so a
-                        // mutation here would survive. It cannot happen: the
-                        // bracketed arm of hostname_check needs a leading
-                        // '[', and '[' is neither unreserved nor allowed in a
-                        // path, so encoding has already turned it into %5B --
-                        // which the reject set then refuses. The scratch copy
-                        // is therefore equivalent.
                         bad = check_host_candidate(self, candidate);
                     } else {
                         // The C decodes first, because a host set without
@@ -3955,12 +3153,6 @@ impl Url {
 
     /// [`Self::set`] over a raw `CURLUPart` value.
     ///
-    /// For `curl-rs-ffi/src/ffi/url.rs`. An unrepresentable value is
-    /// [`CURLUcode::UnknownPart`], which is both the C's `default:` arm in
-    /// `curl_url_set` (`lib/urlapi.c:1873`) and the one in `urlset_clear`
-    /// (`:1773`) -- so a null `part` with an unknown identifier answers the
-    /// same code, exactly as the C does.
-    ///
     /// # Errors
     ///
     /// [`CURLUcode::UnknownPart`], or as [`Self::set`].
@@ -3978,16 +3170,6 @@ impl Url {
 }
 
 /// Whether `candidate` is a bad host name, keeping any zone identifier.
-///
-/// The `hostname_check` half of `curl_url_set`'s host validation
-/// (`lib/urlapi.c:1974-1986`), which discards the specific code and keeps only
-/// the verdict -- every failure becomes [`CURLUcode::BadHostname`] there,
-/// including the [`CURLUcode::BadIpv6`] that [`ipv6_parse`] would have
-/// reported.
-///
-/// The scratch buffer is sized to hold `candidate` exactly, so it introduces
-/// no ceiling the C does not have: the C validates a plain allocation with no
-/// limit attached.
 fn check_host_candidate(u: &mut Url, candidate: &[u8]) -> bool {
     let mut scratch = Buf::new(candidate.len().saturating_add(1));
     if scratch.addn(candidate).is_err() {
@@ -3996,34 +3178,12 @@ fn check_host_candidate(u: &mut Url, candidate: &[u8]) -> bool {
     hostname_check(u, &mut scratch).is_err()
 }
 
-// ---------------------------------------------------------------------------
 // Tests.
-//
-// AAP section 0.8.7 records the deviation these tests answer: the C programs
-// under `tests/libtest/` and `tests/unit/` link a debug static libcurl and
-// call internal `Curl_*` symbols, and a Rust `pub(crate)` item is genuinely
-// absent from a static library's symbol table -- not merely hidden -- so no
-// quality of implementation makes them link. Re-exporting internals to satisfy
-// them is ruled out, because that encapsulation is what makes the
-// zero-`unsafe` guarantee possible. Their coverage is relocated here instead.
 //
 // Three C tests cover this module and all three are ported:
 //
-// * `tests/libtest/lib1560.c` (2,075 lines) -- the URL API conformance
-//   corpus. All seven tables and all six hand-written drivers.
-// * `tests/unit/unit1395.c` (141 lines) -- 80 `dedotdotify` pairs.
-// * `tests/unit/unit1653.c` (218 lines) -- 11 `Curl_parse_port` cases.
-//
-// The ported tables are mechanical transcriptions with the C preprocessor
-// resolved for this workspace: `USE_IDN` is on, because `idna` is an
-// unconditional dependency and AAP section 0.5.2's fifteen-name feature
-// vocabulary has no `idn` feature; `CURL_DISABLE_WEBSOCKETS` is off; `_WIN32`
-// is off, which drops the four drive-letter rows that AAP section 0.2.2
-// excludes anyway.
-//
 // Every test is Miri-runnable: no network, no filesystem, no clock, no
 // environment access, no threads, no allocation the test itself does not own.
-// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4039,25 +3199,9 @@ mod tests {
     /// Shorthands, so a ported row stays legible next to its C original.
     use crate::error::CURLUcode as E;
 
-    // -----------------------------------------------------------------------
     // The fixture scheme table.
-    // -----------------------------------------------------------------------
 
     /// One row per scheme the ported tests reach for.
-    ///
-    /// `(name, default port, url_options, unconditionally runnable)`.
-    ///
-    /// The names and ports are `lib/urldata.h:29-53` and the handler
-    /// registrations; the four upper-case names are reproduced exactly as the
-    /// C stores them -- `"WS"` (`lib/ws.c:1985`), `"WSS"` (`:2000`),
-    /// `"SFTP"` (`lib/vssh/vssh.c:339`) and `"SCP"` (`:353`) -- so that a
-    /// case-sensitive comparison anywhere in the module would fail a test
-    /// rather than pass unnoticed.
-    ///
-    /// The fourth column separates the nine schemes this workspace implements
-    /// (AAP section 0.2.1) from the nine it stubs. A stubbed scheme's
-    /// `runnable` comes from the fixture's own flag, which is what lets the
-    /// same table serve both registries below.
     const SCHEMES: &[(&str, u16, bool, bool)] = &[
         ("http", 80, false, true),
         ("https", 443, false, true),
@@ -4080,11 +3224,6 @@ mod tests {
     ];
 
     /// A scheme table for the tests, standing in for `protocols/mod.rs`.
-    ///
-    /// This is the injected registry AAP section 0.3.3 pattern P12 calls for,
-    /// and its existence is the point: the parser is testable before the
-    /// transfer engine exists, which is exactly what the dependency inversion
-    /// buys.
     struct Fixture {
         /// Whether the nine stubbed schemes report an implementation.
         stubs_runnable: bool,
@@ -4119,25 +3258,13 @@ mod tests {
     }
 
     /// The registry the ported `lib1560.c` tables run against.
-    ///
-    /// `tests/data/test1560`'s own `<features>` block demands `file`,
-    /// `https`, `http`, `pop3`, `smtp`, `imap`, `ldap`, `dict` and `ftp`, and
-    /// `lib1560.c:24-30` says why: *"Since the URL parser by default only
-    /// accepts schemes that this instance of libcurl supports, make sure that
-    /// the test1560 file lists all the schemes that this test will assume to
-    /// be present!"* So the expectations in those tables were written against
-    /// a build where all of them are implemented, and reproducing them
-    /// requires the same.
     static ENABLED: Fixture = Fixture {
         stubs_runnable: true,
     };
 
     /// The registry that models this workspace's own protocol set.
     ///
-    /// The nine schemes AAP section 0.2.1 implements are runnable; the rest
-    /// are present but not, which is the C's `run = ZERO_NULL` for a protocol
-    /// disabled at build time. This is the registry the parse-versus-set
-    /// asymmetry is tested against.
+    /// This is the registry the parse-versus-set asymmetry is tested against.
     static STUBBED: Fixture = Fixture {
         stubs_runnable: false,
     };
@@ -4152,9 +3279,7 @@ mod tests {
         Url::new(&STUBBED)
     }
 
-    // -----------------------------------------------------------------------
     // Helpers, ported from `lib1560.c`'s own.
-    // -----------------------------------------------------------------------
 
     /// Renders bytes for an assertion message without losing any of them.
     fn show(bytes: &[u8]) -> String {
@@ -4229,16 +3354,6 @@ mod tests {
     }
 
     /// `updateurl` (`tests/libtest/lib1560.c:1181-1215`).
-    ///
-    /// Applies a comma-terminated list of `part=value` commands. Two details
-    /// of the C's `sscanf(buf, "%79[^=]=%79[^,]", part, value)` are
-    /// load-bearing and reproduced: both conversions need at least one byte,
-    /// so an empty name or an empty value makes the whole command a **silent
-    /// no-op**; and each is capped at 79 bytes.
-    ///
-    /// The value `NULL` clears the part and the value `""` -- two literal
-    /// quote bytes -- sets it to the empty string, which is how the corpus
-    /// distinguishes absent from blank.
     fn update_url(
         u: &mut Url,
         cmd: &[u8],
@@ -4277,12 +3392,7 @@ mod tests {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
     // The seven ported tables.
-    //
-    // Flag masks are spelled with `union` rather than `|` because these are
-    // `const` items and `BitOr` is not a `const` trait on the pinned MSRV of
-    // 1.75. The rows are otherwise byte-for-byte their C originals.
     //
     // Some rows run past the eighty-column guide, and deliberately: the
     // overflow is always inside a byte-string literal holding a URL, and
@@ -4291,7 +3401,6 @@ mod tests {
     // these tables auditable -- that each row can be read straight across
     // against its original in `lib1560.c`. `cargo fmt --check` is clean either
     // way, so the readable form wins.
-    // -----------------------------------------------------------------------
 
     /// `struct testcase` (`lib1560.c:117-123`): the input, the nine-part
     /// rendering, the flags for the URL set, the flags for the gets, and the
@@ -4843,9 +3952,7 @@ mod tests {
         (P::Url, None, None, E::Ok),
     ];
 
-    // -----------------------------------------------------------------------
     // The six drivers of `lib1560.c`, ported.
-    // -----------------------------------------------------------------------
 
     /// `get_parts` (`lib1560.c:1576-1608`).
     #[test]
@@ -5082,17 +4189,6 @@ mod tests {
     }
 
     /// `clear_url` (`lib1560.c:1875-1908`).
-    ///
-    /// Each row sets one part, clears the **whole handle** with a null
-    /// `CURLUPART_URL`, and then asks for that part back. Everything must be
-    /// gone -- which is what pins `urlset_clear`'s `CURLUPART_URL` arm to a
-    /// full reset rather than a per-part release.
-    ///
-    /// The table carries eleven rows and the C runs ten: its loop condition is
-    /// `clear_url_list[i].in && !error` (`lib1560.c:1881`), so the eleventh --
-    /// `{ CURLUPART_URL, NULL, NULL, CURLUE_OK }` -- is the sentinel that ends
-    /// it, not a case. The row is kept here because it is part of the C data,
-    /// and the loop stops on it for the same reason the C's does.
     #[test]
     fn clear_url_matches_the_conformance_corpus() {
         assert_eq!(CLEAR_URL_LIST.len(), 11, "row count drifted");
@@ -5151,13 +4247,6 @@ mod tests {
     }
 
     /// `scopeid` (`lib1560.c:1682-1808`).
-    ///
-    /// The C driver checks only return codes. This one additionally pins the
-    /// rendered values, because three measured behaviours live along this path
-    /// and every one of them is invisible to a code-only check: the zone
-    /// identifier survives a host replacement, a host set with a zone
-    /// identifier stores the host **raw**, and the whole-URL rendering then
-    /// emits the zone identifier twice.
     #[test]
     fn scopeid_walks_the_zone_identifier_lifecycle() {
         let mut u = handle();
@@ -5216,24 +4305,12 @@ mod tests {
     }
 
     /// The size `huge` uses for its oversized part.
-    ///
-    /// The C's is 120,000 bytes (`lib1560.c:1911`). Miri interprets every one
-    /// of those bytes through the encode and scan walks, so the interpreted
-    /// run uses a smaller figure. Both are far above every buffer this module
-    /// sizes and both cross `MAX_SCHEME_LEN`, so the branches exercised are
-    /// identical; only the native run keeps the C's number.
     #[cfg(not(miri))]
     const BIGPART: usize = 120_000;
     #[cfg(miri)]
     const BIGPART: usize = 2_000;
 
     /// `huge` (`lib1560.c:1913-1966`).
-    ///
-    /// Each of seven parts is given an absurdly long value in turn, and must
-    /// come back byte for byte -- except the scheme, which
-    /// [`MAX_SCHEME_LEN`] refuses. In C this probes for buffer overflows; here
-    /// it probes that nothing silently truncates, which is the failure mode a
-    /// safe language leaves open.
     #[test]
     fn huge_parts_survive_a_round_trip() {
         // `bigpart[0] = '/'; memset(&bigpart[1], 'a', sizeof - 2);`
@@ -5298,12 +4375,6 @@ mod tests {
     }
 
     /// `urldup` (`lib1560.c:1968-2029`).
-    ///
-    /// A duplicate must render identically to its original. Note the flags:
-    /// the parse uses `CURLU_GUESS_SCHEME` and the two gets use none, so a
-    /// guessed scheme is rendered by both and the omission
-    /// [`Url::dup`] reproduces stays invisible here. Making it visible takes
-    /// `CURLU_NO_GUESS_SCHEME`, which is the next test.
     #[test]
     fn urldup_renders_identically_to_its_original() {
         const URLS: &[&[u8]] = &[
@@ -5572,9 +4643,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The pinned ABI surface.
-    // -----------------------------------------------------------------------
 
     /// Every `CURLUPart` member, with its integer, against
     /// `include/curl/urlapi.h:70-82`.
@@ -5679,9 +4748,7 @@ mod tests {
         assert_eq!(MAX_INPUT_LENGTH, 8_000_000, "lib/urldata.h:131");
     }
 
-    // -----------------------------------------------------------------------
     // Empty versus absent.
-    // -----------------------------------------------------------------------
 
     /// A blank query is not an absent query, and `CURLU_GET_EMPTY` is what
     /// tells them apart.
@@ -5723,12 +4790,6 @@ mod tests {
     /// Setting a part blank stores a blank -- unless the encoder is asked
     /// for, in which case nothing is appended at all and the field is
     /// **cleared**.
-    ///
-    /// The mechanism is `curlx_dyn_ptr` returning null after zero appends
-    /// (`lib/urlapi.c:1934` over a buffer the encode loop at `:1890-1914`
-    /// never touched) where `curlx_dyn_add` at `:1918` materialises
-    /// unconditionally. Measured against a real libcurl, and the reason the
-    /// parts of this module are `Option<Vec<u8>>` rather than `Vec<u8>`.
     #[test]
     fn an_empty_set_stores_a_blank_but_an_empty_encoded_set_clears() {
         let mut u = handle();
@@ -5766,9 +4827,7 @@ mod tests {
         assert_eq!(u.get(P::Path, F::NONE), Ok(b"/here".to_vec()));
     }
 
-    // -----------------------------------------------------------------------
     // Scheme handling.
-    // -----------------------------------------------------------------------
 
     /// The lookup folds case, and the scheme is stored folded.
     ///
@@ -5875,8 +4934,7 @@ mod tests {
         u.set(P::Url, Some(b"http://x/"), F::NONE).expect("parse");
 
         // `while(--plen)` runs `plen - 1` times from index 0, so the byte at
-        // `plen - 1` is never tested (`lib/urlapi.c:1652`). Measured against a
-        // real libcurl; reproduced under AAP section 0.8.2.
+        // `plen - 1` is never tested (`lib/urlapi.c:1652`).
         assert_eq!(
             u.set(P::Scheme, Some(b"ab$"), F::NON_SUPPORT_SCHEME),
             Ok(()),
@@ -6115,18 +5173,10 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Paths, encoding and the three hex casings.
-    // -----------------------------------------------------------------------
 
     /// `allowed_in_path` accepts eighteen bytes and the manual page lists
     /// seventeen -- **the missing one is `/`**.
-    ///
-    /// `lib/urlapi.c:1782-1799` against
-    /// `docs/libcurl/curl_url_set.md:190`. This is the single most
-    /// consequential place in the module to go wrong by trusting the
-    /// documentation: escaping `/` would turn every path set under
-    /// `CURLU_URLENCODE` into one segment.
     #[test]
     fn a_path_keeps_its_slashes_and_the_other_seventeen_bytes() {
         const ALLOWED: &[u8] = b"!$&'(){}[]*+,;=:@/";
@@ -6183,11 +5233,6 @@ mod tests {
 
     /// Three hex casings coexist in this directory and all three are
     /// observable.
-    ///
-    /// `curl_url_set` **lower-cases** percent triplets that were already in
-    /// the input, but only when it is not encoding (`lib/urlapi.c:1922-1932`,
-    /// under the comment *"make sure percent encoded are lower case"*), while
-    /// the encoder itself emits **upper** case.
     #[test]
     fn percent_triplets_are_lowercased_only_when_not_encoding() {
         let mut u = handle();
@@ -6286,12 +5331,6 @@ mod tests {
     }
 
     /// `urlencode_str` in isolation: the space rule and where it flips.
-    ///
-    /// `lib/urlapi.c:130-171`. `left` starts as `!query`, so a space before the
-    /// first `?` becomes `%20` and one after it becomes `+`; a query part
-    /// starts already flipped. And with `relative` false the bytes up to
-    /// `find_host_sep` are emitted **untouched**, because *"URL encoding should
-    /// be skipped for hostnames, otherwise IDN resolution will fail"*.
     #[test]
     fn urlencode_str_flips_the_space_rule_at_the_question_mark() {
         let render = |input: &[u8], relative: bool, query: bool| -> String {
@@ -6314,9 +5353,7 @@ mod tests {
         assert_eq!(render(b"a b/c d", false, false), "a b/c%20d");
     }
 
-    // -----------------------------------------------------------------------
     // The query, and appending to it.
-    // -----------------------------------------------------------------------
 
     /// `CURLU_APPENDQUERY` inserts a separator only when there is something to
     /// separate, and leaves the first `=` alone.
@@ -6379,19 +5416,6 @@ mod tests {
 
     /// `CURLU_URLDECODE` decodes the decodable parts, rejects control bytes,
     /// and never touches the scheme or the port.
-    ///
-    /// `flags &= ~CURLU_URLDECODE` at `lib/urlapi.c:1558` and `:1585`, with
-    /// the C's own comments *"never for schemes"* and *"never for port"*, and
-    /// `docs/libcurl/curl_url_get.md:69-70` says the same. Those two clearings
-    /// are **defensive rather than observable**, and this test records why: a
-    /// scheme cannot hold a percent sign in the first place -- the grammar
-    /// excludes it on the parse path and `set_url_scheme`'s syntax check
-    /// excludes it on the set path -- and a port is re-rendered from a number.
-    /// So there is nothing for either to decode, and the assertions below pin
-    /// that fact rather than a decode that never happens.
-    ///
-    /// The rejection of control bytes is unconditional and is documented API
-    /// behaviour (`lib/urlapi.c:1383-1385`).
     #[test]
     fn url_decoding_skips_the_scheme_and_the_port() {
         let mut u = handle();
@@ -6425,23 +5449,9 @@ mod tests {
         assert_eq!(u.get(P::Path, F::NONE), Ok(b"/%01".to_vec()));
     }
 
-    // -----------------------------------------------------------------------
     // Hosts: names, addresses and zone identifiers.
-    // -----------------------------------------------------------------------
 
     /// Every byte of the reject set makes a bare host name invalid.
-    ///
-    /// The `strcspn` at `lib/urlapi.c:456`, all 31 bytes of it. A bracketed
-    /// host goes to `ipv6_parse` instead and never reaches the set, which is
-    /// why `[`, `]` and `:` can be in it.
-    ///
-    /// **Eight of the 31 cannot be tested in their raw form**, and that is not
-    /// a gap in the check -- it is what the check is for. ` `, `\r`, `\n` and
-    /// `\t` never survive [`junkscan`]; `/`, `:`, `#`, `?` and `@` are
-    /// structural and are consumed as the path, port, fragment, query and
-    /// userinfo separators before any host exists. Percent-encoded, all 31
-    /// arrive at the check by way of `urldecode_host`, which is exactly how
-    /// `lib1560.c:1030-1033` tests `%40`, `%21`, `%3f` and `%23`.
     #[test]
     fn every_byte_of_the_reject_set_invalidates_a_host() {
         const REJECT: &[u8] = b" \r\n\t/:#?!@{}[]\\$'\"^`*<>=;,+&()%";
@@ -6501,12 +5511,6 @@ mod tests {
     }
 
     /// The permissive IPv4 parser, which must not be `inet_pton`.
-    ///
-    /// `ipv4_normalize` (`lib/urlapi.c:483-574`) accepts one to four parts in
-    /// decimal, `0x` hexadecimal or leading-zero octal.
-    /// [`crate::util::inet::pton4`] is the transcription of curl's strict
-    /// `inet_pton` and would refuse every row below but the first, so
-    /// delegating to it would have been wrong.
     #[test]
     fn the_ipv4_parser_is_permissive_where_inet_pton_is_strict() {
         for (input, wanted) in [
@@ -6542,12 +5546,6 @@ mod tests {
     }
 
     /// IPv6 literals normalise, and their zone identifiers are text.
-    ///
-    /// `ipv6_parse` (`lib/urlapi.c:390-441`). The identifier is at most fifteen
-    /// bytes, an optional `25` prefix -- the percent sign, percent-encoded --
-    /// is skipped, and the address itself round-trips through
-    /// [`crate::util::inet`] rather than `std::net`, which is what keeps
-    /// curl's own rendering rules.
     #[test]
     fn ipv6_literals_normalise_and_carry_a_text_zone_identifier() {
         for (input, host, zone) in [
@@ -6657,7 +5655,7 @@ mod tests {
     /// `urlset_clear`'s `CURLUPART_HOST` arm is two lines and neither mentions
     /// it (`lib/urlapi.c:1752-1754`); only the non-null set path clears it, at
     /// `:1848`. Measured against a real libcurl. The agent brief for this file
-    /// asserts the opposite, and the code is the contract (AAP section 0.8.1).
+    /// asserts the opposite, and the code is the contract.
     #[test]
     fn clearing_a_host_does_not_clear_its_zone_identifier() {
         let mut u = handle();
@@ -6733,17 +5731,10 @@ mod tests {
         assert_eq!(u.set(P::Host, Some(b"[::1]"), F::NONE), Ok(()));
     }
 
-    // -----------------------------------------------------------------------
     // Ports.
-    // -----------------------------------------------------------------------
 
     /// Ports are re-rendered from the number, so leading zeroes vanish, and
     /// the whole string must be consumed.
-    ///
-    /// `set_url_port` (`lib/urlapi.c:1666-1682`) and `Curl_parse_port`
-    /// (`:335-388`). `docs/libcurl/curl_url_get.md:190-192` promises the
-    /// result *"is guaranteed to hold a valid port number in ASCII using base
-    /// 10"*.
     #[test]
     fn ports_are_canonical_and_bounded() {
         let mut u = handle();
@@ -6793,7 +5784,6 @@ mod tests {
         u.set(P::Url, Some(b"http://x:/p"), F::NONE).expect("parse");
         assert_eq!(u.get(P::Port, F::NONE), Err(E::NoPort));
         assert_eq!(u.get(P::Port, F::DEFAULT_PORT), Ok(b"80".to_vec()));
-        //
         // The C spells out why it declines to adapt without one: *"Do not do
         // it if the URL has no scheme, to make something that looks like a
         // scheme not work!"* (`lib/urlapi.c:363-366`). Note that `x:/p` is not
@@ -6866,21 +5856,9 @@ mod tests {
         assert_eq!(u.get(P::Url, F::DEFAULT_PORT), Ok(b"custom://x/".to_vec()));
     }
 
-    // -----------------------------------------------------------------------
     // Duplication, and the field it does not copy.
-    // -----------------------------------------------------------------------
 
     /// `curl_url_dup` does **not** copy the guessed-scheme bit.
-    ///
-    /// `lib/urlapi.c:1310-1332` duplicates the ten strings and then copies
-    /// `portnum`, `fragment_present` and `query_present`, and stops. The
-    /// omission is observable through `CURLU_NO_GUESS_SCHEME`, which is what
-    /// this test is: the original withholds its scheme and the duplicate does
-    /// not.
-    ///
-    /// This is the guard on the quirk. Deriving `Clone` would silently "fix" a
-    /// difference the corpus can see, and AAP section 0.8.2's minimal-change
-    /// mandate forbids exactly that.
     #[test]
     fn a_duplicate_forgets_that_its_scheme_was_guessed() {
         let mut original = handle();
@@ -6943,16 +5921,13 @@ mod tests {
         assert_eq!(copy.get(P::Url, F::NONE), Ok(b"https://x:80/p".to_vec()));
     }
 
-    // -----------------------------------------------------------------------
     // `file:` URLs.
-    // -----------------------------------------------------------------------
 
     /// `file:` accepts a blank, `localhost` or `127.0.0.1` authority and
     /// nothing else, and it renders with no host, port or userinfo at all.
     ///
     /// `parse_file` (`lib/urlapi.c:823-931`) and the short-circuit at
-    /// `:1440-1447`. Only the non-Windows arm exists here: AAP section 0.2.2
-    /// excludes Windows, so a drive letter is refused rather than accepted.
+    /// `:1440-1447`.
     #[test]
     fn file_urls_take_only_a_local_authority() {
         for (input, wanted) in [
@@ -7006,15 +5981,6 @@ mod tests {
     }
 
     /// A `file:` URL with no path renders the literal text `(nil)`.
-    ///
-    /// The short-circuit at `lib/urlapi.c:1442` hands `u->path` to `%s`
-    /// without a null guard, and curl's own `printf` prints `(nil)` for a null
-    /// pointer (`lib/mprintf.c:837`). `file:///` reaches it, because
-    /// `handle_path` leaves a one-byte path unset.
-    ///
-    /// Measured against a real libcurl. Reproducing a defect is the point of
-    /// AAP section 0.8.1: a caller that has learned to expect `file://(nil)`
-    /// must keep getting it.
     #[test]
     fn a_file_url_with_no_path_renders_the_null_marker() {
         let mut u = handle();
@@ -7041,9 +6007,7 @@ mod tests {
         assert_eq!(u.get(P::Url, F::NONE), Ok(b"http://x/".to_vec()));
     }
 
-    // -----------------------------------------------------------------------
     // Input hygiene.
-    // -----------------------------------------------------------------------
 
     /// [`junkscan`] rejects control bytes, `0x7f`, and space unless waived.
     ///
@@ -7102,11 +6066,6 @@ mod tests {
 
     /// Eight million bytes is the ceiling on every input, and the length test
     /// comes first.
-    ///
-    /// `CURL_MAX_INPUT_LENGTH` (`lib/urldata.h:131`), checked at
-    /// `lib/urlapi.c:229` on the way in and at `:1824` on every part.
-    /// `docs/libcurl/curl_url_set.md:277-278` promises
-    /// `CURLUE_MALFORMED_INPUT` for anything longer.
     #[cfg_attr(
         miri,
         ignore = "an eight-megabyte buffer is impractical to interpret"
@@ -7145,10 +6104,6 @@ mod tests {
     /// overflows a `dynbuf` whose `toobig` is the same constant: a byte at or
     /// above `0x7f` survives the scan (`:235` rejects `<= 0x20` and `0x7f`
     /// only) and then triples to `%XX` in `urlencode_str` at `:157-161`.
-    ///
-    /// Three million such bytes are 3 MB on the way in and 9 MB encoded, so
-    /// the query append at `:1044` is the site that trips, and its
-    /// `return cc2cu(result)` at `:170` is the line under test.
     #[cfg_attr(
         miri,
         ignore = "a nine-megabyte buffer is impractical to interpret"
@@ -7172,9 +6127,7 @@ mod tests {
         plain.set(P::Url, Some(&url), F::NONE).expect("stored raw");
     }
 
-    // -----------------------------------------------------------------------
     // Userinfo, options and the assembly order.
-    // -----------------------------------------------------------------------
 
     /// `CURLU_DISALLOW_USER` refuses a URL that carries any userinfo -- even a
     /// blank user.
@@ -7215,14 +6168,6 @@ mod tests {
 
     /// The `;options` tail is parsed only for a scheme that asks for it, and
     /// **kept** on rendering when the scheme is unknown.
-    ///
-    /// `PROTOPT_URLOPTIONS` (`lib/urldata.h:545`) is read at
-    /// `lib/urlapi.c:290` when extracting and at `:1477` when rendering, and
-    /// the rendering test is `if(h && !(h->flags & PROTOPT_URLOPTIONS))` -- so
-    /// a null `h` skips it and the options survive.
-    /// `docs/libcurl/curl_url_get.md:170-173` describes that as the URL API
-    /// allowing the field *"independently of scheme when not parsing full
-    /// URLs"*.
     #[test]
     fn options_are_parsed_by_scheme_and_kept_for_an_unknown_one() {
         // imap asks for them, so the tail is split out.
@@ -7319,17 +6264,10 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Internationalised host names.
-    // -----------------------------------------------------------------------
 
     /// `CURLU_URLENCODE` wins over `CURLU_PUNYCODE` and `CURLU_PUNY2IDN`,
     /// because it is the first arm of an else-if chain.
-    ///
-    /// `lib/urlapi.c:1393-1420` on a part and `:1491-1509` on the whole URL.
-    /// Both punycode gates additionally test `u->host` rather than the part
-    /// being converted, and both are computed with `what == CURLUPART_HOST`, so
-    /// neither ever applies to anything else.
     #[test]
     fn url_encoding_beats_both_punycode_conversions() {
         const UNICODE: &[u8] = b"r\xc3\xa4ksm\xc3\xb6rg\xc3\xa5s.se";
@@ -7403,18 +6341,11 @@ mod tests {
         assert_eq!(u.get(P::Scheme, F::PUNY2IDN), Ok(b"https".to_vec()));
     }
 
-    // -----------------------------------------------------------------------
     // The three `pub(crate)` entry points, and the private helpers behind
     // them.
-    // -----------------------------------------------------------------------
 
     /// [`is_absolute_url`] in isolation, including the branch the
     /// `guess_scheme` argument selects.
-    ///
-    /// `Curl_is_absolute_url` (`lib/urlapi.c:182-220`). Its own comment names
-    /// the reason for the branch: without guessing *"the scheme always ends
-    /// with the colon so that this also detects data: URLs"*, whereas in
-    /// guessing mode `data:` could be the host `data` with a port.
     #[test]
     fn absolute_url_detection_depends_on_whether_a_guess_is_allowed() {
         let scheme = |input: &[u8], guess: bool| -> Option<String> {
@@ -7613,17 +6544,6 @@ mod tests {
 
     /// A merge whose base is shorter than `scheme://` reads past its end in C,
     /// and the clamp here reproduces the outcome.
-    ///
-    /// `redirect_url` computes `protsep = base + strlen(u->scheme) + 3`
-    /// (`lib/urlapi.c:1225`) without checking that the base is that long. It
-    /// is reachable: `CURLU_NO_GUESS_SCHEME` makes `curl_url_get` withhold a
-    /// guessed scheme, so the base comes back as `a/` while `u->scheme` is
-    /// still `http` -- and the pointer lands four bytes past the terminator.
-    ///
-    /// Rust cannot read there, so the offset saturates at the end of the base.
-    /// Measured against a real libcurl, the C answers `CURLUE_BAD_SCHEME`, and
-    /// so does this: the clamp leaves no cut-off point, the whole base is kept,
-    /// and `a/b` then fails to parse without a guess.
     #[test]
     fn a_merge_over_a_short_base_answers_what_the_c_answers() {
         let mut u = handle();
@@ -7727,11 +6647,6 @@ mod tests {
     }
 
     /// A fresh handle holds nothing at all.
-    ///
-    /// `curl_url` is a `calloc` (`lib/urlapi.c:1288-1291`), so every field is
-    /// zero. The registry is the one thing a `calloc` cannot supply, and it is
-    /// a constructor argument rather than a global for the reason AAP section
-    /// 0.3.3 pattern P12 gives.
     #[test]
     fn a_fresh_handle_is_empty_and_prints() {
         let u = handle();
@@ -7769,5 +6684,43 @@ mod tests {
         assert_eq!(u.get(P::Port, F::NONE), Ok(b"8080".to_vec()));
         u.set_by_id(P::Port.as_i32(), None, F::NONE).expect("clear");
         assert_eq!(u.get(P::Port, F::NONE), Err(E::NoPort));
+    }
+
+    /// The userinfo cannot appear in a formatted URL.
+    ///
+    /// The assertion is negative on purpose: it names the secrets and demands
+    /// their absence, so a future formatter change that reinstates either fails
+    /// here rather than in somebody's log.
+    #[test]
+    fn the_debug_format_cannot_disclose_a_username_or_a_password() {
+        let mut u = handle();
+        u.set(
+            P::Url,
+            Some(b"https://alice:hunter2@example.com/p?tok=s3cret"),
+            F::NONE,
+        )
+        .expect("this URL parses");
+
+        let text = format!("{u:?}");
+        assert!(!text.contains("alice"), "the username leaked: {text}");
+        assert!(!text.contains("hunter2"), "the password leaked: {text}");
+        assert!(text.contains("<redacted, 5 bytes>"), "{text}");
+        assert!(text.contains("<redacted, 7 bytes>"), "{text}");
+
+        // The host and the path still render, because they are what makes the
+        // format useful and neither authenticates anything.
+        assert!(text.contains("example.com"), "{text}");
+        assert!(text.contains("/p"), "{text}");
+
+        // And the values themselves are untouched: the ABI still returns the
+        // password verbatim to a caller that asks for it.
+        assert_eq!(
+            u.get(P::Password, F::NONE).expect("the password is set"),
+            b"hunter2".to_vec()
+        );
+        assert_eq!(
+            u.get(P::User, F::NONE).expect("the user is set"),
+            b"alice".to_vec()
+        );
     }
 }

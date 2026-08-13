@@ -131,7 +131,9 @@
 # A CONSEQUENCE OF THAT SCOPE, recorded so it is not mistaken for an omission:
 # this file sets no CURL_RS_A4_VARIADIC_DECISION. No workflow in this repository
 # does - specification 0.8.6 escalates A4 to whoever set the requirements, and
-# rust-build.yml's env block enumerates the three options - but this file has a
+# rust-build.yml's env block enumerates the two options that remain, the third
+# having been the release-producing bypass that has since been removed - but
+# this file has a
 # second, independent reason on top of that one. The variable is read by
 # curl-rs-ffi/build.rs, and `-p curl-rs-lib` never builds curl-rs-ffi, so even
 # were a decision on record it would be a declaration here with nothing to read

@@ -22,15 +22,22 @@
 #
 ###########################################################################
 
-# HOW THIS FILE IS RENDERED, NOW THAT THERE IS NO C BUILD
+# HOW THIS FILE IS RENDERED BY THE CARGO PRODUCT BUILD
 #
-# This is the pkg-config template. Autotools substituted it through
-# AC_SUBST and config.status; CMake substitutes it with configure_file()
-# in @ONLY mode at CMakeLists.txt:2326-2328. A Cargo build runs neither,
-# so the renderer is now curl-rs-ffi/build.rs: it reads this file, fills
-# in the fourteen substitution tokens and writes lib/pkgconfig/libcurl.pc,
-# mode 0644, into an install-staging directory under target/ -- or wherever
-# CURL_RS_STAGING_DIR names, and never into the checkout.
+# This is the pkg-config template, and it now has three renderers rather
+# than two. Autotools substitutes it through AC_SUBST and config.status;
+# CMake substitutes it with configure_file() in @ONLY mode at
+# CMakeLists.txt:2326-2328. Both remain in the tree and remain exercised,
+# because the C build is retained as the reference oracle this rewrite is
+# measured against; what changed is that neither of them renders the
+# PRODUCT any more.
+#
+# The product renderer is curl-rs-ffi/build.rs, and a Cargo build runs
+# neither Autotools nor CMake to reach it: the build script reads this
+# file, fills in the fourteen substitution tokens and writes
+# lib/pkgconfig/libcurl.pc, mode 0644, into an install-staging directory
+# under target/ -- or wherever CURL_RS_STAGING_DIR names, and never into
+# the checkout.
 #
 # The token spelling is deliberately unchanged. Both CMake's
 # configure_file() and the new renderer understand it, so a packager
@@ -59,27 +66,56 @@ libdir=@libdir@
 includedir=@includedir@
 # The two variables a consumer reads back with `pkg-config --variable=`.
 #
-# SUPPORT_PROTOCOLS expands to the schemes this implementation really
-# serves, space separated and upper-cased exactly as curl 8.x spells them
-# here: FILE FTP FTPS HTTP HTTPS SCP SFTP WS WSS. Those nine are the whole
-# of it. The twenty-four schemes that remain registered for ABI
-# completeness but are not implemented -- DICT, GOPHER, GOPHERS, IMAP,
-# IMAPS, LDAP, LDAPS, MQTT, POP3, POP3S, RTMP and its variants, RTSP, SMB,
-# SMBS, SMTP, SMTPS, TELNET and TFTP -- are deliberately absent, and that
-# absence is the point rather than an oversight: they are out of scope for
+# SUPPORT_PROTOCOLS expands to the schemes this build really serves, space
+# separated and upper-cased exactly as curl 8.x spells them here. The
+# TARGET SCOPE is nine schemes and no more -- FILE FTP FTPS HTTP HTTPS SCP
+# SFTP WS WSS -- but scope is not the expansion. The expansion is whatever
+# the capability table reports as served, and measured at this checkpoint
+# that is NONE of the nine, because no scheme has a protocol executor yet.
+# So this variable currently expands to the EMPTY string and
+# `pkg-config --variable=supported_protocols libcurl` prints a blank line.
+# That is the truthful report of a library that can parse a URL and cannot
+# fetch it, and it is the same answer the Protocols: line of
+# `curl --version` gives, from the same table. It becomes the nine, without
+# an edit here, as each executor lands.
+#
+# THIS FIELD DESCRIBES THE LIBRARY, SO IPFS AND IPNS ARE NOT IN IT, NOW OR
+# EVER. Those two tokens are the curl TOOL's own
+# (src/tool_libinfo.c:47-48, carried in curl-rs/src/cli/libinfo.rs): the
+# tool inserts them into the Protocols: line of `curl --version` so a
+# gateway URL can be translated on the command line. The engine registers
+# no ipfs and no ipns scheme among its 33 rows, so a libcurl consumer
+# cannot request one, and pkg-config metadata that named them would be
+# advertising a library capability that does not exist. curl-config
+# --protocols is silent about them for the same reason.
+#
+# The twenty-four schemes that remain registered for ABI completeness but
+# are not implemented -- DICT, GOPHER, GOPHERS, IMAP, IMAPS, LDAP, LDAPS,
+# MQTT, MQTTS, POP3, POP3S, RTMP and its variants, RTSP, SMB, SMBS, SMTP,
+# SMTPS, TELNET and TFTP -- are deliberately absent, and that absence is
+# the point rather than an oversight: they are out of scope for
 # implementation but not for the ABI, so their absence has to be reported
-# honestly. The asymmetry decides it. Under-reporting a capability only
-# makes a test fixture skip, while over-reporting makes it run and fail,
-# and 283 fixtures -- 14.8% of the corpus -- depend on this omission to
-# skip cleanly. A request for one of them returns
-# CURLE_UNSUPPORTED_PROTOCOL.
+# honestly. MQTTS is named beside MQTT deliberately; the registry carries
+# both mqtt and mqtts, and listing only one would leave the enumeration
+# short of the twenty-four it counts. 283 fixtures -- 14.8% of the corpus
+# -- depend on this omission to skip cleanly. A request for one of them is
+# specified to return CURLE_UNSUPPORTED_PROTOCOL. These twenty-four are
+# absent permanently, which is what separates them from the nine above:
+# the nine are withheld only until their engine lands.
 #
 # SUPPORT_FEATURES expands to the truthful subset of curl's own feature
 # vocabulary, each name spelled as configure.ac spells it from :5143
 # onward and the list sorted case-insensitively as CMakeLists.txt:2040-2045
 # sorts it: SSL, IPv6, UnixSockets, libz, brotli, zstd, AsynchDNS, IDN,
 # PSL, alt-svc, HSTS, NTLM, HTTP2, HTTP3, Largefile, threadsafe and their
-# neighbours, each one only when this build genuinely has it.
+# neighbours. That is the vocabulary, not a reading: a name is emitted only
+# when this build genuinely has the capability, which at this checkpoint
+# excludes most of them. The rendered value is short today -- IDN,
+# Largefile and threadsafe at the time of writing -- because the engine
+# rows behind SSL, HTTP2, HTTP3, NTLM, alt-svc, HSTS and the rest are still
+# absent. Treat that as a snapshot and ask the rendered file instead, which
+# is the only answer that cannot be stale:
+#   pkg-config --variable=supported_features libcurl
 #
 # Withheld on purpose, because each one would be a claim a test harness
 # then acts on:
@@ -95,84 +131,70 @@ includedir=@includedir@
 #   mbedtls, wolfssl, Schannel, SSPI, TLS-SRP, NTLM_WB, WinIDN, AppleIDN,
 #   libssh, libssh2, c-ares and gsasl.
 #
-#   GSS-API, SPNEGO and Kerberos, which are compiled in only behind the
-#   non-default `negotiate` Cargo feature -- and even then stay out of
-#   this file, because whether a usable mechanism exists on the host is a
-#   runtime property that a file written at build time cannot know. That
-#   question is left to `curl --version`, which can ask.
+#   ...but NOT GSS-API, SPNEGO or Kerberos. Those three are compiled in
+#   only behind the non-default `negotiate` Cargo feature, and when they
+#   are compiled in this file names them -- because the question it
+#   answers is what this libcurl was BUILT to do, and that is the
+#   question the feature gate already decides. C answers it the same way:
+#   configure.ac:5175-5200 appends the three names to SUPPORT_FEATURES
+#   from HAVE_GSSAPI, a build-time fact it never re-examines.
+#
+#   Whether a usable mechanism exists on the HOST is a different question,
+#   and it is genuinely a runtime one that a file written at build time
+#   cannot answer. It is left to `curl --version`, which can ask, and
+#   whose banner conjoins that probe before naming the token. Only the
+#   banner is read by tests/runtests.pl, so the two surfaces answering
+#   two different questions costs no fixture anything.
 #
 # Neither list is maintained here, and neither is maintained in the
 # renderer. Both are projections of the one capability table in
-# curl-rs-lib/src/version.rs that also renders the `curl --version`
-# banner, so this file and that banner cannot describe different products
-# -- which matters because tests/runtests.pl parses the banner's
+# curl-rs-lib/src/version.rs that is also specified to render the `curl
+# --version` banner, so this file and that banner cannot describe different
+# products -- which matters because tests/runtests.pl parses the banner's
 # Protocols: line and derives the -ipv6 and -unix variants, http-proxy and
 # https-mtls from it. A scheme appears here only once the engine module
 # that serves it is present, so the list is never ahead of the code.
+#
+# One half of that shared projection is not observable yet, and saying so
+# is the difference between a contract and a claim: the banner PRINTER
+# (curl-rs/src/cli/help.rs, from src/tool_help.c:311-386) is not on disk,
+# and the executable currently rejects every option including --version, so
+# no banner is emitted at all. This file and curl-config are therefore the
+# only two surfaces reading that table today. They agree with each other,
+# which is checkable now; agreement with the banner becomes checkable when
+# the printer lands.
 supported_protocols="@SUPPORT_PROTOCOLS@"
 supported_features="@SUPPORT_FEATURES@"
 
 Name: libcurl
 URL: https://curl.se/
 Description: Library to transfer files with HTTP, FTP, etc.
-# CURLVERSION expands to 8.19.0-DEV, read from include/curl/curlver.h:35
-# exactly as configure.ac:129 read it, with LIBCURL_VERSION_NUM 0x081300
-# at :61 as its numeric twin. It is NOT bumped: the version is part of the
-# frozen contract, and every parity claim made about this artifact -- 100
-# exported symbols, 103 CURLcode discriminants, 308 CURLoption
-# identifiers -- is a claim against curl 8.19.0-DEV.
+# LIBCURL_VERSION of include/curl/curlver.h, not bumped here: the version is
+# part of the frozen ABI contract.
 Version: @CURLVERSION@
-# Both of the next two fields expand to EMPTY, and empty is the truthful
-# value rather than an omission. Requires: names other pkg-config modules
-# and pkg-config fails outright when one of them cannot be found, so a
-# stale name here would break `pkg-config --cflags libcurl` for every
-# consumer. Every C library curl used to require has become a statically
-# linked Rust crate with no .pc file of its own: OpenSSL, GnuTLS, mbedTLS
-# and wolfSSL became rustls; nghttp2 became h2; ngtcp2, nghttp3 and quiche
-# became quinn, h3 and h3-quinn; libssh2 and libssh became russh; zlib
-# became flate2; the C brotli and zstd libraries became the brotli and
-# zstd crates; c-ares became the system resolver; libidn2 became idna;
-# libpsl became publicsuffix; libuv became tokio. There is nothing left to
-# require. CMakeLists.txt:2144 and :2260 leave both empty as well.
+# Both expand to EMPTY, which is truthful rather than an omission: pkg-config
+# fails outright when a name in Requires cannot be resolved, and every C
+# library curl used to require is now a statically linked Rust crate with no
+# .pc file. CMakeLists.txt:2144 and :2260 leave both empty as well.
 Requires: @LIBCURL_PC_REQUIRES@
 Requires.private: @LIBCURL_PC_REQUIRES_PRIVATE@
-# The link line, and the one literal in this file that must never change:
-# consumers link -lcurl. That is why curl-rs-ffi/Cargo.toml:114-126 builds
-# the cdylib and the staticlib under [lib] name = "curl", so the artifacts
-# really are libcurl.so and libcurl.a rather than libcurl_rs_ffi.so.
-#
-# The shared object carries DT_SONAME = libcurl.so.4. The 4 is derived,
-# never chosen: lib/Makefile.soname sets VERSIONCHANGE=12, VERSIONADD=0
-# and VERSIONDEL=8, giving libtool -version-info 12:0:8, whose soname
-# major is current - age = 12 - 8 = 4. Cargo stamps no soname of its own,
-# and .cargo/config.toml deliberately does not either -- rustflags are not
-# artifact-scoped and were measured to put that soname on the two
-# command-line binaries as well. curl-rs-ffi/build.rs emits the
-# correctly-scoped cdylib-only link argument instead, and an
-# -install_name form of it on macOS.
+# -lcurl must never change, which is why curl-rs-ffi/Cargo.toml builds under
+# [lib] name = "curl": the artifacts really are libcurl.so and libcurl.a. The
+# shared object carries DT_SONAME = libcurl.so.4, derived rather than chosen
+# -- lib/Makefile.soname gives libtool -version-info 12:0:8, and the soname
+# major is current - age = 12 - 8 = 4. build.rs emits it as a cdylib-scoped
+# link argument (an -install_name form on macOS) because rustflags are not
+# artifact-scoped and were measured to stamp it on the two binaries too.
 Libs: -L${libdir} -lcurl @LIBCURL_PC_LIBS@
-# What a consumer must add when it links the static archive instead. On
-# the four mandated targets this is the platform C runtime and nothing
-# exotic: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc on the two
-# unknown-linux-gnu triples, and -lSystem -lm with the Security and
-# CoreFoundation frameworks on the two apple-darwin ones, plus
-# -lgssapi_krb5 or the GSS framework when the `negotiate` feature is on.
-# ring, the pinned cryptographic provider, contributes nothing here: its C
-# and assembly are compiled into the archive, so there is no external
-# library to name. The order is the one a left-to-right static linker
-# needs, which is why -lc is last. The same authority renders
-# `curl-config --static-libs`, so the two cannot disagree.
+# What a consumer adds when linking the static archive: the platform C
+# runtime, plus the GSS library when the `negotiate` feature is on. The order
+# is the one a left-to-right static linker needs, so -lc is last. The same
+# authority renders `curl-config --static-libs`, so the two cannot disagree.
 Libs.private: @LIBCURL_PC_LDFLAGS_PRIVATE@ @LIBCURL_PC_LIBS_PRIVATE@
-# includedir must be the directory that HOLDS the curl subdirectory, not
-# the subdirectory itself, because the public headers are included as
-# <curl/curl.h> -- see include/README.md. The header found there is now
-# generated: curl-rs-ffi/build.rs runs cbindgen over the ABI crate to
-# produce include/curl/curl.h, and include/curl/typecheck-gcc.h ships
-# verbatim beside it as a hand-maintained file, because its 258 curlcheck_
-# macros give curl_easy_setopt compile-time type checking that cbindgen
-# cannot express.
+# includedir must HOLD the curl subdirectory rather than be it, because the
+# public headers are included as <curl/curl.h> -- see include/README.md.
 Cflags: -I${includedir} @LIBCURL_PC_CFLAGS@
-# -DCURL_STATICLIB, exactly as CMakeLists.txt:2255 sets it. A consumer
-# linking the static archive must define it so the public headers do not
-# decorate the API for import from a shared library.
+# -DCURL_STATICLIB, as CMakeLists.txt:2255 sets it: a consumer linking the
+# static archive must define it so the public headers do not decorate the API
+# for import from a shared library.
 Cflags.private: @LIBCURL_PC_CFLAGS_PRIVATE@

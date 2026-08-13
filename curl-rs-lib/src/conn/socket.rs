@@ -25,17 +25,6 @@
 //! The raw transports at the bottom of every filter chain, and the wakeup
 //! primitive the multi handle polls alongside them.
 //!
-//! Supersedes six C files: `lib/cf-socket.h:37-155` and
-//! `lib/cf-socket.c:260-529,531-1182,1239-1698,1740-2233` (2,233 lines),
-//! `lib/socketpair.c:31-373` with `lib/socketpair.h`, and
-//! `lib/curlx/nonblock.c:40-63` with `lib/curlx/nonblock.h`. The AAP section
-//! 0.4.1 row is *"`curl-rs-lib/src/conn/socket.rs` | CREATE |
-//! `lib/cf-socket.c`, `lib/socketpair.c`, `lib/curlx/nonblock.c` | Raw socket
-//! calls become `socket2`"*, and that is the whole of the transformation rule:
-//! every `socket`, `connect`, `bind`, `listen`, `accept`, `setsockopt`,
-//! `getsockopt`, `getsockname`, `getpeername`, `fcntl`, `read`, `write` and
-//! `close` in those files becomes a method on [`socket2::Socket`].
-//!
 //! # What this file owns, and what it deliberately does not
 //!
 //! It owns four safe socket transports -- TCP, UDP, UNIX and TCP-ACCEPT --
@@ -81,18 +70,7 @@
 //!    its own socket still private to it, so it can close exactly once and
 //!    cannot clear a descriptor the winner has since published.
 //!
-//! The check `ctx->sock == cf->conn->sock[cf->sockindex]` before clearing
-//! (`lib/cf-socket.c:1233`) exists for precisely that reason, and
-//! [`SocketFilter::do_close`] reproduces it.
-//!
 //! # Two C mechanisms that disappear rather than being translated
-//!
-//! **The `void *ctx` cast.** `struct Curl_cftype` carries fourteen function
-//! pointers beside an untyped context that every filter casts back to its own
-//! type (`lib/cfilters.h:210-226`). Here the state is [`SocketContext`], an
-//! ordinary typed field beside [`FilterBase`], so there is no cast at any
-//! filter boundary. AAP section 0.6.9 names this the largest single category
-//! of unsound pattern in the C tree.
 //!
 //! **The entire broken-pipe-signal apparatus.** C devotes two whole files to
 //! masking the signal that writing to a closed socket raises, plus a helper at
@@ -105,21 +83,6 @@
 //! [`socket2::Socket::new`] sets the Apple-only option itself. A negative
 //! continuous-integration grep for the signal's name is expected to find
 //! nothing here, so the name is not spelled out even in prose.
-//!
-//! # Everything is injected
-//!
-//! AAP section 0.3.3's pattern P12 requires it and the mandated Miri gate
-//! makes it unavoidable: `cargo +nightly miri test` cannot execute a foreign
-//! function, so a test that reached a real socket, a real clock or a real
-//! resolver could not run at all. The resolver ([`BindResolver`]), the clock
-//! ([`Clock`], reached through [`CallCtx`]), the interface lookup
-//! ([`If2Ip`]), the three user callbacks ([`OpenSocket`], [`CloseSocket`],
-//! [`SockOpt`]), the multi-handle close observer
-//! ([`MultiCloseObserver`]), the connection's socket table
-//! ([`ConnSockets`]), the generic deadline ([`Deadline`]) and even socket
-//! readiness ([`ReadinessProbe`]) are all seams. Nothing in this file reads a
-//! system clock -- [`std::time::Instant`] is never named, let alone sampled --
-//! there is no global resolver state, and no test touches the network.
 
 use core::fmt;
 use core::mem::MaybeUninit;
@@ -127,7 +90,7 @@ use core::time::Duration;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, IntoRawFd};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use socket2::{
     Domain, Protocol as OsProtocol, SockAddr, Socket as OsSocket, TcpKeepalive,
@@ -157,17 +120,9 @@ use crate::util::strparse::str_number;
 use crate::util::timediff::TimeDiff;
 use crate::util::timeval::{timediff_ms, CurlTime};
 
-// =========================================================================
 // The exact C integers this layer carries
-// =========================================================================
 
 /// `TRNSPRT_NONE` (`lib/urldata.h:567`).
-///
-/// The five `TRNSPRT_*` values are restated here as the integers the C header
-/// assigns, beside the checked [`Transport`] that [`crate::conn::filters`]
-/// owns. That is not duplication for its own sake: these constants are what
-/// [`transport_from_c`] validates against, and writing them out is what makes
-/// the gap at 1 and 2 impossible to close by accident.
 #[allow(dead_code)]
 pub(crate) const TRNSPRT_NONE: u8 = 0;
 
@@ -222,14 +177,6 @@ pub(crate) const CURL_SOCKOPT_ERROR: i32 = 1;
 pub(crate) const CURL_SOCKOPT_ALREADY_CONNECTED: i32 = 2;
 
 /// `sizeof(struct Curl_sockaddr_storage)` on all four mandated targets.
-///
-/// The bound `sock_assign_addr` enforces: *"`DEBUGASSERT(dest->addrlen <=
-/// sizeof(dest->curl_sa_addrbuf)); if(dest->addrlen >
-/// sizeof(dest->curl_sa_addrbuf)) return CURLE_TOO_LARGE;`"*
-/// (`lib/cf-socket.c:290-297`). One hundred and twenty-eight bytes is what
-/// `sizeof(struct sockaddr_storage)` is on Linux and on Apple platforms alike,
-/// which `sockaddr_storage_is_the_size_the_platform_reports` verifies against
-/// [`socket2::SockAddrStorage`] rather than taking on trust.
 #[allow(dead_code)]
 pub(crate) const SOCKADDR_STORAGE_LEN: u32 = 128;
 
@@ -250,12 +197,6 @@ pub(crate) const INTERFACE_INPUT_MAX: usize = 512;
 pub(crate) const BINDLOCAL_IFACE_MAX: usize = 255;
 
 /// The service port `bindlocal` resolves a bind HOST with.
-///
-/// `Curl_resolv_blocking(data, host, 80, ip_version, &h)`
-/// (`lib/cf-socket.c:649`). Hard-coded in the C and hard-coded here: the port
-/// plays no part in the bind, which uses `data->set.localport`, so this is
-/// only what the resolver is handed and changing it could change which
-/// addresses a resolver returns.
 pub(crate) const BINDLOCAL_SERVICE_PORT: u16 = 80;
 
 /// `DEFAULT_ACCEPT_TIMEOUT` (`lib/connect.h:47`): sixty seconds in
@@ -274,20 +215,9 @@ pub(crate) const SHUTDOWN_DRAIN_MAX: usize = 1024;
 #[allow(dead_code)]
 pub(crate) const WAKEUP_DRAIN_LEN: usize = 64;
 
-// =========================================================================
 // Protocol capability bits this layer HONOURS and does not redefine
-// =========================================================================
 
 /// `PROTOPT_SSL` (`lib/urldata.h:527`).
-///
-/// # This is not [`CF_TYPE_IP_CONNECT`]
-///
-/// Both are `1 << 0` and the coincidence is worth stating once, because
-/// confusing them would be silent. They live in unrelated bitmaps:
-/// `PROTOPT_*` describes a SCHEME (`struct Curl_protocol::flags`,
-/// `lib/urldata.h:522`) and `CF_TYPE_*` describes a FILTER
-/// (`struct Curl_cftype::flags`, `lib/cfilters.h:212`). No value of one may
-/// ever be tested against the other.
 #[allow(dead_code)]
 pub(crate) const PROTOPT_SSL: u32 = 1 << 0;
 
@@ -305,12 +235,6 @@ pub(crate) const PROTOPT_DUAL: u32 = 1 << 1;
 pub(crate) const PROTOPT_ALPN: u32 = 1 << 8;
 
 /// `1 << 9`, which *"was `PROTOPT_STREAM`, now free"* (`lib/urldata.h:545`).
-///
-/// Named so that its freedom is recorded rather than rediscovered, and
-/// **deliberately not used**. The TFTP exception in
-/// [`SocketFilter::set_local_ip`] is protocol IDENTITY -- carried by
-/// [`ProtocolIdentity::connects_socket`] -- and reusing this bit to encode it
-/// would quietly claim a value the C tree has left available.
 #[allow(dead_code)]
 pub(crate) const PROTOPT_FREE_BIT_9: u32 = 1 << 9;
 
@@ -336,24 +260,12 @@ pub(crate) const PROTOPT_CONN_REUSE: u32 = 1 << 16;
 /// the connection owns the chain, so the chain cannot own the connection --
 /// and it must not build a second scheme registry to compensate. So the two
 /// facts it actually uses travel with it as values.
-///
-/// **This type redefines nothing.** [`Self::flags`] carries the owner's
-/// `PROTOPT_*` bitmap unchanged, including every bit this file never names,
-/// and [`Self::connects_socket`] is a single derived predicate rather than a
-/// new bit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProtocolIdentity {
     /// The scheme's `PROTOPT_*` bitmap, exactly as its owner holds it.
     pub(crate) flags: u32,
 
     /// Whether this scheme's socket is connected, so `getsockname` can answer.
-    ///
-    /// The successor of `!(data->conn->scheme->protocol & CURLPROTO_TFTP)`
-    /// (`lib/cf-socket.c:998`), whose comment is *"TFTP does not connect, so
-    /// it cannot get the IP like this"*. TFTP is out of implementation scope
-    /// (AAP section 0.2.2), so no scheme in this build reports `false` -- but
-    /// the EXCEPTION is reproduced rather than dropped, because it is the
-    /// scheme's identity that decides it and a later scheme may need it.
     pub(crate) connects_socket: bool,
 }
 
@@ -379,16 +291,9 @@ impl ProtocolIdentity {
     }
 }
 
-// =========================================================================
 // Transport, and the socket parameters it selects
-// =========================================================================
 
 /// The checked conversion from a C `TRNSPRT_*` integer.
-///
-/// [`Transport::from_u8`] already rejects an unassigned value; this wraps it
-/// in the crate's error type so a caller can propagate with `?`, and it exists
-/// mainly to give the RESERVED values 1 and 2 a single documented rejection
-/// point.
 ///
 /// # Errors
 ///
@@ -410,12 +315,6 @@ pub(crate) fn transport_from_c(raw: u8) -> CodeResult<Transport> {
 /// TRNSPRT_UNIX  -> SOCK_STREAM, IPPROTO_IP     (the default protocol)
 /// default       -> SOCK_DGRAM,  IPPROTO_UDP    (UDP and QUIC)
 /// ```
-///
-/// The C's `default:` arm is commented *"UDP and QUIC"*, and it is genuinely a
-/// default: [`Transport::None`] reaches it too. That is preserved -- a `file://`
-/// transfer never opens a socket, so the value it would produce is never used,
-/// and inventing a rejection here would be a behaviour change rather than a
-/// tightening.
 #[allow(dead_code)]
 pub(crate) const fn socket_params(
     transport: Transport,
@@ -445,9 +344,7 @@ const fn domain_of(family: AddressFamily) -> Domain {
     }
 }
 
-// =========================================================================
 // The address a socket is opened for -- `struct Curl_sockaddr_ex`
-// =========================================================================
 
 /// Where a socket filter is pointed, with the metadata a callback may rewrite.
 ///
@@ -467,20 +364,6 @@ const fn domain_of(family: AddressFamily) -> Domain {
 /// #define curl_sa_addr    addr.sa
 /// #define curl_sa_addrbuf addr.buf
 /// ```
-///
-/// **The union and the two macros do not survive, deliberately.** They exist
-/// so that C can write a `sockaddr_in6` into the buffer and then read it back
-/// through a `struct sockaddr *` -- the pointer pun AAP section 0.6.9 removes.
-/// [`socket2::SockAddr`] owns storage of exactly the union's size and hands out
-/// a typed view through [`SockAddr::as_socket`] and
-/// [`SockAddr::as_pathname`], so nothing here is ever reinterpreted.
-///
-/// The other three members remain because the header's own comment explains
-/// why: *"The variable declared here will be used to pass / receive data
-/// to/from the `fopensocket` callback if this has been set, before that, it is
-/// initialized from parameters."* The family, socket type and protocol are
-/// what the callback SEES and may CHANGE, so they are stored rather than
-/// derived -- see [`OpenSocket`].
 #[derive(Clone, Debug)]
 pub(crate) struct SockAddrEx {
     /// `family`. `AF_INET`, `AF_INET6` or `AF_UNIX`, named rather than
@@ -509,11 +392,6 @@ pub(crate) struct SockAddrEx {
 impl SockAddrEx {
     /// Assigns an address and a transport -- `sock_assign_addr`
     /// (`lib/cf-socket.c:264-298`).
-    ///
-    /// The C's order is preserved: family first, then the transport switch
-    /// selecting socket type and protocol, then the length, then the size
-    /// check, then the copy. Only the copy differs, because there is no copy:
-    /// the address moves into owned storage.
     ///
     /// # Errors
     ///
@@ -548,11 +426,6 @@ impl SockAddrEx {
 
     /// The size-checked constructor every other entry point funnels through.
     ///
-    /// Separate from [`Self::assign`] so that the `CURLE_TOO_LARGE` branch has
-    /// a reachable test: an address built by [`sockaddr_of`] can never exceed
-    /// the storage, so a test that could only go through `assign` would leave
-    /// the branch uncovered and the C's check unreproduced.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::TooLarge`], as [`Self::assign`].
@@ -572,8 +445,6 @@ impl SockAddrEx {
         // works -- and the assertion adds nothing else, since the test that
         // follows it is what the release build relies on anyway.
         // `oversized_address_is_too_large` is the reachability this buys.
-        //
-        // `if(dest->addrlen > sizeof(...)) return CURLE_TOO_LARGE;`
         if addrlen > SOCKADDR_STORAGE_LEN {
             return Err(CURLcode::TooLarge);
         }
@@ -632,15 +503,6 @@ impl SockAddrEx {
 
 /// Builds owned address storage from a resolved address.
 ///
-/// The successor of the `memcpy(&dest->curl_sa_addrbuf, ai->ai_addr,
-/// dest->addrlen)` at `lib/cf-socket.c:299`, and of the `sockaddr_un`
-/// construction `Curl_unix2addr` performs (`lib/curl_addrinfo.c:447-485`).
-///
-/// The abstract-namespace convention is reproduced exactly: *"an abstract
-/// socket's name occupies `sun_path` from offset one, leaving the leading byte
-/// zero"*, which is what a leading NUL in the path expresses and what
-/// [`SockAddr::unix`] recognises.
-///
 /// # Errors
 ///
 /// [`CURLcode::BadFunctionArgument`] for a Unix path longer than `SUN_LEN`.
@@ -666,38 +528,13 @@ fn sockaddr_of(addr: &ResolvedSockAddr) -> CodeResult<SockAddr> {
 }
 
 /// The C's `dest->addrlen`, in the width `Curl_sockaddr_ex` declares it.
-///
-/// `struct Curl_sockaddr_ex` stores it as `unsigned int`
-/// (`lib/cf-socket.c:41`) and assigns it from `ai->ai_addrlen`, whose type is
-/// `socklen_t`. Named rather than written inline at each of its four call sites
-/// so that the ONE portability fact it rests on is stated once: `socklen_t` is
-/// `u32` on every target of the mandated four-target matrix, so there is no
-/// conversion to perform and no value that could be truncated.
-///
-/// A target where the two widths differed would fail to compile here -- loudly,
-/// at the single place that would have to be revisited -- rather than silently
-/// narrowing an address length, which is the behaviour worth having.
 fn addrlen_of(addr: &SockAddr) -> u32 {
     addr.len()
 }
 
-// =========================================================================
 // The IP quadruple
-// =========================================================================
 
 /// True when address text fits the C's `char[MAX_IPADR_LEN]` with its NUL.
-///
-/// `struct ip_quadruple` stores both addresses as `char[MAX_IPADR_LEN]`
-/// (`lib/urldata.h:574-575`), where [`MAX_IPADR_LEN`] is
-/// `sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")` --
-/// forty-six bytes INCLUDING the terminator (`lib/urldata.h:124`). The Rust
-/// quadruple holds [`String`]s, so nothing truncates here; the bound still
-/// matters because `curl-rs-ffi` must copy these into the fixed arrays that
-/// back `CURLINFO_PRIMARY_IP`, `CURLINFO_LOCAL_IP` and the `%HOSTIP` the test
-/// harness substitutes, and a value that did not fit would be silently cut
-/// there instead.
-///
-/// Hence `<`, not `<=`: forty-five printable bytes is the most that fits.
 pub(crate) fn ip_text_fits(text: &str) -> bool {
     text.len() < MAX_IPADR_LEN
 }
@@ -712,17 +549,9 @@ fn empty_quadruple() -> IpQuadruple {
     IpQuadruple::default()
 }
 
-// =========================================================================
 // Observable text -- every string this layer emits, in one place
-// =========================================================================
 
 /// The messages `lib/cf-socket.c` writes, verbatim.
-///
-/// Collected here for one reason: AAP section 0.8.1 freezes them, and a format
-/// string reachable from a test is a format string that cannot drift. The two
-/// `Trying` lines in particular carry **two leading spaces**, which no
-/// reviewer would notice missing and which
-/// `the_trying_lines_keep_their_two_leading_spaces` pins.
 pub(crate) mod msg {
     use super::AddressFamily;
 
@@ -759,13 +588,6 @@ pub(crate) mod msg {
 
     /// `"connect to %s port %u from %s port %d failed: %s"`
     /// (`lib/cf-socket.c:1314-1317`).
-    ///
-    /// The asymmetry is the C's and is preserved: the REMOTE port is `%u`,
-    /// UNSIGNED, and the LOCAL port is `%d`, SIGNED. Both members of
-    /// `struct ip_quadruple` are `uint16_t` (`lib/urldata.h:576-577`), so
-    /// neither can be negative and the two render identically -- but the
-    /// FORMAT STRING is what AAP section 0.8.1 freezes, and it says `%u` for
-    /// one and `%d` for the other.
     pub(crate) fn connect_failed(
         remote_ip: &str,
         remote_port: u16,
@@ -950,27 +772,12 @@ pub(crate) mod msg {
 
     /// `CURL_TRC_CF(data, cf, "socket_check -> %x", socketstate)`
     /// (`lib/cf-socket.c:2050`).
-    ///
-    /// The value is what `SOCKET_READABLE(ctx->sock, 0)` returned -- `-1` for a
-    /// failed wait, `0` for nothing, and [`CURL_CSELECT_IN`] when the socket is
-    /// readable -- printed in the C's lower-case hexadecimal. `%x` on a
-    /// negative `int` prints its two's-complement bit pattern, `ffffffff`, and
-    /// that is what a reader of a curl trace sees, so the cast is to `u32`
-    /// rather than to a wider type that would print more digits.
-    ///
-    /// This is the ONE trace line here whose argument the C computes and this
-    /// file does not: [`AcceptProbe`] carries the outcome as a typed value
-    /// rather than as a bitmask. The mapping back is total and is performed by
-    /// [`AcceptProbe::socket_state`], so the line is reproduced rather than
-    /// dropped.
     pub(crate) fn socket_check(state: i32) -> String {
         format!("socket_check -> {:x}", state as u32)
     }
 }
 
-// =========================================================================
 // The three user callbacks, as injected seams
-// =========================================================================
 
 /// Why a socket was created -- `curlsocktype`
 /// (`include/curl/curl.h:410-414`).
@@ -1067,14 +874,6 @@ impl SockOptOutcome {
 #[allow(dead_code)]
 pub(crate) enum OpenSocketError {
     /// The callback returned `CURL_SOCKET_BAD`.
-    ///
-    /// *"Depending on this information the callback may opt to abort the
-    /// connection, this is indicated returning `CURL_SOCKET_BAD`"*
-    /// (`lib/cf-socket.c:325-327`). The C then falls into the shared
-    /// `if(*sockfd == CURL_SOCKET_BAD)` arm and reports
-    /// [`CURLcode::CouldntConnect`] (`:348-353`) -- NOT
-    /// [`CURLcode::OutOfMemory`], which only the internal `socket(2)` path can
-    /// produce.
     #[allow(dead_code)]
     Refused,
     /// The callback could not allocate.
@@ -1111,7 +910,18 @@ pub(crate) enum OpenSocketError {
 /// [`SockAddrEx::protocol`] and [`SockAddrEx::addr`], and
 /// [`SocketFilter`] honours what it finds afterwards rather than what it
 /// passed in.
-pub(crate) trait OpenSocket: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait OpenSocket: fmt::Debug + Send + Sync {
     /// Creates a socket for `addr`, which the callback may rewrite.
     ///
     /// # Errors
@@ -1134,7 +944,18 @@ pub(crate) trait OpenSocket: fmt::Debug {
 /// the [`socket2::Socket`] by value states exactly that: this file can no
 /// longer touch it, and a double close is unrepresentable rather than merely
 /// avoided.
-pub(crate) trait CloseSocket: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait CloseSocket: fmt::Debug + Send + Sync {
     /// Closes `socket` and reports what the callback returned.
     ///
     /// The C propagates the callback's `int` out of `Curl_socket_close`
@@ -1148,7 +969,18 @@ pub(crate) trait CloseSocket: fmt::Debug {
 /// Borrows the socket rather than taking it: the callback configures a socket
 /// it does not own, and `CURL_SOCKOPT_ALREADY_CONNECTED` says so explicitly by
 /// handing the socket back for use.
-pub(crate) trait SockOpt: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait SockOpt: fmt::Debug + Send + Sync {
     /// Configures `socket`, told why it was created.
     fn sockopt(
         &self,
@@ -1165,14 +997,23 @@ pub(crate) trait SockOpt: fmt::Debug {
 /// else. `socket_close` calls it on BOTH paths -- before the callback
 /// (`lib/cf-socket.c:420`) and before `sclose` (`:429`) -- and so does
 /// [`close_owned_socket`].
-pub(crate) trait MultiCloseObserver: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait MultiCloseObserver: fmt::Debug + Send + Sync {
     /// Announces that `sock` is about to stop existing.
     fn will_close(&self, sock: Socket);
 }
 
-// =========================================================================
 // The connection and transfer state a socket filter publishes into
-// =========================================================================
 
 /// The connection fields a socket filter reads and writes.
 ///
@@ -1191,10 +1032,21 @@ pub(crate) trait MultiCloseObserver: fmt::Debug {
 /// 5. `data->state.os_errno = error` wherever a failure is reported.
 ///
 /// Every method takes `&self`. That is deliberate: a filter holds this behind
-/// an [`Rc`] alongside the connection that owns the chain, so shared access
+/// an [`Arc`] alongside the connection that owns the chain, so shared access
 /// with interior mutability is the shape the ownership graph permits -- and it
 /// keeps the seam trivial to double in a test.
-pub(crate) trait ConnState: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait ConnState: fmt::Debug + Send + Sync {
     /// `cf->conn->sock[sockindex]`.
     fn socket(&self, sockindex: SocketIndex) -> Socket;
 
@@ -1221,13 +1073,6 @@ pub(crate) trait ConnState: fmt::Debug {
 }
 
 /// A connection that records nothing.
-///
-/// What a filter created for a Happy Eyeballs attempt can be given before any
-/// connection exists to publish into, and what every test that is not
-/// asserting on publication uses. [`Self::socket`] answers
-/// [`CURL_SOCKET_BAD`], so the `ctx->sock == cf->conn->sock[...]` guard in
-/// [`SocketFilter::do_close`] never matches and nothing is ever cleared --
-/// which is the correct outcome for a filter whose socket was never published.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NullConnState;
 
@@ -1253,9 +1098,7 @@ impl ConnState for NullConnState {
     fn set_os_errno(&self, _errno: i32) {}
 }
 
-// =========================================================================
 // Readiness, as a seam -- and why it has to be one
-// =========================================================================
 
 /// What a zero-timeout readiness check found.
 ///
@@ -1273,16 +1116,6 @@ pub(crate) enum ProbeOutcome {
 }
 
 /// How far a non-blocking connect has got.
-///
-/// One value where C has two mechanisms -- `SOCKET_WRITABLE(sock, 0)`
-/// (`lib/cf-socket.c:1285`) followed by `verifyconnect(sock, &ctx->error)`
-/// (`:1291`) -- and combining them is a correctness improvement rather than a
-/// simplification. `verifyconnect` reads `SO_ERROR` with `getsockopt`, and
-/// **reading `SO_ERROR` clears it**: two readings of one failed connect give
-/// the error once and zero the second time, which is exactly how a failure
-/// gets misreported as a success. C avoids that by ordering its calls
-/// carefully. Here the reading happens once and its verdict travels in this
-/// type, so the ordering cannot be got wrong.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnectProgress {
     /// Still in the handshake -- the C's `rc == 0`, *"no connection yet"*.
@@ -1301,13 +1134,6 @@ pub(crate) enum ConnectProgress {
 }
 
 /// What an accept attempt on a listening socket produced.
-///
-/// C splits this across a readability check and an `accept`
-/// (`lib/cf-socket.c:2049-2081`), with FOUR distinguishable outcomes and a
-/// different observable message for each. They are enumerated here rather than
-/// reconstructed, because a probe that only reported readability could not
-/// preserve them: `accept(2)` is the only non-blocking way to learn that a
-/// connection is pending, and learning it consumes it.
 #[derive(Debug)]
 pub(crate) enum AcceptProbe {
     /// Nothing arrived -- the C's `if(!incoming)`, whose trace line is
@@ -1343,10 +1169,6 @@ impl AcceptProbe {
     ///   [`Self::Accepted`] and [`Self::AcceptFailed`] follow from it, because
     ///   the C reaches its `accept` call only down this branch and the accept
     ///   may then still refuse.
-    ///
-    /// Total by construction, so the trace line the C emits before its `switch`
-    /// is reproduced rather than dropped, even though this seam carries the
-    /// outcome as a typed value.
     pub(crate) const fn socket_state(&self) -> i32 {
         match self {
             Self::WaitFailed => -1,
@@ -1364,11 +1186,9 @@ impl AcceptProbe {
 /// all take `&mut self` and return a value, because the C design they succeed
 /// is non-blocking rather than blocking -- a filter makes what progress it can
 /// and reports whether it finished. Everything in [`crate::conn::select`] that
-/// waits, on the other hand, is `async`: `socket_check`, `socket_readable`,
-/// `socket_writable` and `poll_sockets` are all futures over the `tokio`
-/// reactor. The two cannot meet directly, and the join must not be made by
-/// blocking on a future from inside a synchronous method -- doing that inside a
-/// runtime panics.
+/// waits, on the other hand, is `async`, so the two cannot meet directly, and
+/// the join must not be made by blocking on a future from inside a synchronous
+/// method -- doing that inside a runtime panics.
 ///
 /// So the zero-timeout probes -- and ONLY the zero-timeout probes, which is
 /// every probe `lib/cf-socket.c` performs -- are expressed as this trait. The
@@ -1382,7 +1202,18 @@ impl AcceptProbe {
 /// host cannot be made to produce on demand -- a refused connect, a hung-up
 /// peer, an `accept` that fails after readability -- are reachable only through
 /// a double.
-pub(crate) trait ReadinessProbe: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait ReadinessProbe: fmt::Debug + Send + Sync {
     /// `Curl_poll(pfd, 1, 0)` with `POLLRDNORM | POLLIN | POLLRDBAND |
     /// POLLPRI` (`lib/cf-socket.c:1592-1596`).
     fn probe_input(&self, socket: &OsSocket) -> ProbeOutcome;
@@ -1404,12 +1235,6 @@ pub(crate) struct SocketProbe;
 
 impl ReadinessProbe for SocketProbe {
     /// Readability without a `poll`.
-    ///
-    /// `MSG_PEEK` answers the same question `POLLIN` does and answers it
-    /// without consuming: a non-blocking peek returns bytes when bytes are
-    /// waiting, `WouldBlock` when none are, and zero when the peer has closed.
-    /// `SO_ERROR` is consulted first, because `POLLERR` is a condition the C
-    /// tests for and a peek would report as an ordinary failure.
     fn probe_input(&self, socket: &OsSocket) -> ProbeOutcome {
         match socket.take_error() {
             // `POLLERR`: an error is pending on the socket.
@@ -1445,15 +1270,6 @@ impl ReadinessProbe for SocketProbe {
     /// 2. Whether the socket has a peer, which is `POLLOUT`'s meaning for a
     ///    connecting socket: the handshake completing is exactly when a peer
     ///    appears, and one still in progress reports `ENOTCONN`.
-    ///
-    /// The second observation is also how `SOCKEISCONN` is honoured without
-    /// naming a platform errno. `verifyconnect`'s test is `if((err == 0) ||
-    /// (SOCKEISCONN == err))` (`:818`), and `EISCONN` means precisely *already
-    /// connected* -- a socket that has its peer. So a pending error on a socket
-    /// that already has a peer verifies as connected, which is the C's second
-    /// disjunct expressed as the condition it describes rather than as the
-    /// number that names it. `crate::lib`'s `source_policy` gate exists to keep
-    /// those numbers out of the engine.
     fn probe_connect(&self, socket: &OsSocket) -> ConnectProgress {
         let pending = match socket.take_error() {
             Ok(pending) => pending,
@@ -1474,12 +1290,6 @@ impl ReadinessProbe for SocketProbe {
     }
 
     /// A pending connection, accepted non-blocking and close-on-exec.
-    ///
-    /// [`socket2::Socket::accept`] sets the close-on-exec flag itself, exactly
-    /// as [`socket2::Socket::new`] does, so `SOCK_CLOEXEC` needs no separate
-    /// step; `SOCK_NONBLOCK` is applied afterwards, which is the fallback path
-    /// `lib/cf-socket.c:2085-2091` takes when `accept4` is unavailable and
-    /// whose failure message [`msg::set_nonblock_failed`] preserves.
     fn probe_accept(&self, listener: &OsSocket) -> AcceptProbe {
         // A pending error on the LISTENER is the C's `socketstate == -1`.
         match listener.take_error() {
@@ -1501,9 +1311,7 @@ impl ReadinessProbe for SocketProbe {
     }
 }
 
-// =========================================================================
 // The remaining seams: resolver, interfaces, deadline
-// =========================================================================
 
 /// The blocking name lookup `bindlocal` performs.
 ///
@@ -1519,7 +1327,18 @@ impl ReadinessProbe for SocketProbe {
 /// chain has a runtime and can resolve before it hands the filter over. That
 /// keeps `crate::dns`'s asynchronous resolver asynchronous and keeps this file
 /// free of any bridge between the two.
-pub(crate) trait BindResolver: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait BindResolver: fmt::Debug + Send + Sync {
     /// Resolves `host` for `ip_version`, or reports that it could not.
     ///
     /// [`None`] is the C's `if(h)` failing (`lib/cf-socket.c:650`), which sets
@@ -1556,8 +1375,21 @@ impl BindResolver for NoBindResolver {
 /// Both halves of what `bindlocal` does with an interface name, and neither is
 /// reimplemented here: [`Self::if2ip`] delegates to
 /// [`crate::dns::if2ip::if2ip`], which owns interface enumeration, and
-/// [`Self::bind_to_device`] is one `socket2` call.
-pub(crate) trait If2Ip: fmt::Debug {
+/// [`Self::bind_to_device`] is one `socket2` call on the platforms that have
+/// `SO_BINDTODEVICE` and a compiled-out refusal on those that do not, exactly as
+/// `lib/cf-socket.c:577` guards it.
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait If2Ip: fmt::Debug + Send + Sync {
     /// `Curl_if2ip(af, scope, conn->scope_id, iface, myhost, sizeof(myhost))`
     /// (`lib/cf-socket.c:603-608`).
     fn if2ip(
@@ -1574,6 +1406,14 @@ pub(crate) trait If2Ip: fmt::Debug {
     /// Its failure is expected and benign: the C's own comment is *"This is
     /// often 'errno 1, error: Operation not permitted' if you are not running
     /// as root"*, and it carries on regardless.
+    ///
+    /// On a platform without the option it fails with
+    /// [`io::ErrorKind::Unsupported`], which is `lib/cf-socket.c:577`'s
+    /// `#ifdef SO_BINDTODEVICE` reproduced -- see [`SystemIf2Ip`]'s two
+    /// implementations. Callers must therefore treat an error as "fall through
+    /// to interface lookup" and never as "the transfer cannot proceed"; that is
+    /// what the C does, and it is why this returns [`io::Result`] rather than a
+    /// [`CURLcode`](crate::error::CURLcode).
     fn bind_to_device(&self, socket: &OsSocket, iface: &[u8])
         -> io::Result<()>;
 }
@@ -1593,12 +1433,100 @@ impl If2Ip for SystemIf2Ip {
         if2ip(af, remote_scope, local_scope_id, iface)
     }
 
+    /// The platforms that have `SO_BINDTODEVICE`: one `socket2` call.
+    ///
+    /// `socket2` gates `Socket::bind_device` on
+    /// `any(target_os = "android", target_os = "fuchsia", target_os = "linux")`
+    /// (`socket2-0.6.5/src/sys/unix.rs:1964-1967`), which is exactly the set on
+    /// which the socket option exists, so the guard below is that predicate
+    /// rather than an approximation of it.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux"
+    ))]
     fn bind_to_device(
         &self,
         socket: &OsSocket,
         iface: &[u8],
     ) -> io::Result<()> {
-        socket.bind_device(Some(iface))
+        // `#ifdef SO_BINDTODEVICE`, reproduced as a `#[cfg]`.
+        //
+        // The C's whole interface-binding block sits inside that guard
+        // (`lib/cf-socket.c:576-600`), and the macro is a Linux extension --
+        // Darwin does not define it, so on macOS the block is absent from the
+        // translation unit and execution falls straight through to
+        // `Curl_if2ip`. `socket2` draws the same line: `bind_device` is
+        // `#[cfg(any(target_os = "android", target_os = "fuchsia",
+        // target_os = "linux"))]`, so calling it unconditionally is a hard
+        // `E0599: no method named bind_device` on both Apple targets.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        ))]
+        {
+            socket.bind_device(Some(iface))
+        }
+
+        // Not an approximation, and not a silent no-op: `Err` is what
+        // reproduces the C. The caller's test is `if(setsockopt(...) == 0)`, so
+        // only SUCCESS takes the early return, and everything else -- a failed
+        // call, or a platform where the option does not exist -- continues to
+        // the `Curl_if2ip` lookup below it. Returning `Ok(())` here would tell
+        // the caller the socket had been bound to the interface when nothing
+        // had happened at all, and on a `--interface` request with no
+        // `CURLOPT_BINDHOST` it would return `AlreadyBound` and skip the
+        // address lookup that is the only binding this platform can do.
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        )))]
+        {
+            let _ = (socket, iface);
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+    }
+
+    /// The platforms that do not have it -- macOS among them, and therefore two
+    /// of the four mandated targets.
+    ///
+    /// This is not a stub and not a degradation: it is the `#ifdef` the C
+    /// writes. `lib/cf-socket.c:577-601` wraps the whole `SO_BINDTODEVICE`
+    /// attempt in `#ifdef SO_BINDTODEVICE`, so on a platform without the option
+    /// the block is compiled out and control falls straight through to
+    /// `Curl_if2ip` at `:603-608`. The Rust caller in [`bindlocal`] already has
+    /// that shape -- `if hooks.interfaces.bind_to_device(..).is_ok() && ..`
+    /// (see the `#ifdef SO_BINDTODEVICE` comment there) -- so returning an
+    /// error here reproduces the C's control flow exactly, with `--interface`
+    /// resolved by interface lookup instead of by binding to the device.
+    ///
+    /// [`io::ErrorKind::Unsupported`] rather than `PermissionDenied`, because
+    /// the two mean different things to anyone reading a trace: the C's own
+    /// comment on the failing case is *"often 'errno 1, error: Operation not
+    /// permitted' if you are not running as root"*, which is a runtime
+    /// condition on a platform that HAS the option. This is the other case --
+    /// the option does not exist -- and conflating them would misdescribe the
+    /// platform.
+    ///
+    /// Without this arm the crate did not compile for `x86_64-apple-darwin` or
+    /// `aarch64-apple-darwin` at all, which is half of AAP section 0.8.3's
+    /// four-target matrix.
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux"
+    )))]
+    fn bind_to_device(
+        &self,
+        _socket: &OsSocket,
+        _iface: &[u8],
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SO_BINDTODEVICE is a Linux extension that this target lacks",
+        ))
     }
 }
 
@@ -1607,15 +1535,19 @@ impl If2Ip for SystemIf2Ip {
 /// Folded into the accept timeout by `cf_tcp_accept_timeleft`
 /// (`lib/cf-socket.c:1968-1972`), and injected because a deadline belongs to a
 /// transfer rather than to a socket.
-pub(crate) trait Deadline: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait Deadline: fmt::Debug + Send + Sync {
     /// Milliseconds remaining, or zero when no deadline is set.
-    ///
-    /// Zero means NO TIMEOUT and not "expired", which is what
-    /// `Curl_timeleft_ms` returns for a transfer without one and why
-    /// `cf_tcp_accept_timeleft` tests `if(other_ms && ...)` rather than
-    /// comparing against zero. A NEGATIVE value means already elapsed, and the
-    /// C's own comment says the fold *"also works fine for when `other_ms`
-    /// happens to be negative due to it already having elapsed"*.
     fn time_left_ms(&self) -> TimeDiff;
 }
 
@@ -1629,9 +1561,7 @@ impl Deadline for NoDeadline {
     }
 }
 
-// =========================================================================
 // Everything a socket filter is given when it is built
-// =========================================================================
 
 /// The seams a socket filter holds.
 ///
@@ -1642,27 +1572,27 @@ impl Deadline for NoDeadline {
 #[derive(Clone, Debug)]
 pub(crate) struct SocketHooks {
     /// `data->set.fopensocket`, absent when unset.
-    pub(crate) open: Option<Rc<dyn OpenSocket>>,
+    pub(crate) open: Option<Arc<dyn OpenSocket>>,
     /// `conn->fclosesocket`, absent when unset.
-    pub(crate) close: Option<Rc<dyn CloseSocket>>,
+    pub(crate) close: Option<Arc<dyn CloseSocket>>,
     /// `data->set.fsockopt`, absent when unset.
-    pub(crate) sockopt: Option<Rc<dyn SockOpt>>,
+    pub(crate) sockopt: Option<Arc<dyn SockOpt>>,
     /// The multi handle, absent when there is none.
     ///
     /// Absence models the C's `if(conn)` guard around
     /// `Curl_multi_will_close` on the non-callback path
     /// (`lib/cf-socket.c:428-429`): no connection means no map to update.
-    pub(crate) will_close: Option<Rc<dyn MultiCloseObserver>>,
+    pub(crate) will_close: Option<Arc<dyn MultiCloseObserver>>,
     /// The connection and transfer state to publish into.
-    pub(crate) conn: Rc<dyn ConnState>,
+    pub(crate) conn: Arc<dyn ConnState>,
     /// Zero-timeout socket readiness.
-    pub(crate) probe: Rc<dyn ReadinessProbe>,
+    pub(crate) probe: Arc<dyn ReadinessProbe>,
     /// The blocking lookup a bind host needs.
-    pub(crate) resolver: Rc<dyn BindResolver>,
+    pub(crate) resolver: Arc<dyn BindResolver>,
     /// Interface lookup and interface binding.
-    pub(crate) interfaces: Rc<dyn If2Ip>,
+    pub(crate) interfaces: Arc<dyn If2Ip>,
     /// The transfer's generic deadline.
-    pub(crate) deadline: Rc<dyn Deadline>,
+    pub(crate) deadline: Arc<dyn Deadline>,
 }
 
 impl Default for SocketHooks {
@@ -1678,11 +1608,11 @@ impl Default for SocketHooks {
             close: None,
             sockopt: None,
             will_close: None,
-            conn: Rc::new(NullConnState),
-            probe: Rc::new(SocketProbe),
-            resolver: Rc::new(NoBindResolver),
-            interfaces: Rc::new(SystemIf2Ip),
-            deadline: Rc::new(NoDeadline),
+            conn: Arc::new(NullConnState),
+            probe: Arc::new(SocketProbe),
+            resolver: Arc::new(NoBindResolver),
+            interfaces: Arc::new(SystemIf2Ip),
+            deadline: Arc::new(NoDeadline),
         }
     }
 }
@@ -1711,11 +1641,6 @@ pub(crate) struct BindConfig {
 impl BindConfig {
     /// `const char *iface = iface_input ? iface_input : dev;`
     /// (`lib/cf-socket.c:550`).
-    ///
-    /// An EXPLICIT interface wins over the bare device. The precedence is not
-    /// symmetric with a fallback in the other direction, and both halves matter
-    /// -- the C consults `iface_input` on its own several times afterwards to
-    /// decide whether a lookup failure may be retried as a hostname.
     pub(crate) fn iface(&self) -> Option<&[u8]> {
         self.interface.as_deref().or(self.device.as_deref())
     }
@@ -1784,30 +1709,11 @@ pub(crate) struct SocketSettings {
     pub(crate) protocol: ProtocolIdentity,
 }
 
-// =========================================================================
 // Non-blocking mode -- `curlx_nonblock`
-// =========================================================================
 
 /// Puts `socket` into blocking or non-blocking mode.
 ///
-/// The whole of `curlx_nonblock` (`lib/curlx/nonblock.c:40-63` and the five
-/// `#elif` arms after it) collapses to one call. Every one of those arms --
-/// `fcntl` of `F_GETFL` plus `F_SETFL`, `IoctlSocket` and `ioctl` and
-/// `ioctlsocket` of `FIONBIO`, and `setsockopt` of `SO_NONBLOCK` -- is
-/// one platform's way of saying [`socket2::Socket::set_nonblocking`], and
-/// `socket2` picks the right one.
-///
 /// # The read-modify-write disappears, and losing it changes nothing
-///
-/// C fetches the flags first and returns early when the request is already
-/// satisfied: *"Check if the current file status flags have already satisfied
-/// the request, if so, it is no need to call `fcntl` to replicate it"*
-/// (`lib/curlx/nonblock.c:54-56`). That is a call-avoidance optimisation, not a
-/// semantic: setting `O_NONBLOCK` on a socket that already has it is a no-op,
-/// so the OUTCOME is identical and idempotent either way, and performance is
-/// explicitly a non-goal (AAP section 0.1.1). The prompt for this file says so
-/// in as many words -- *"there is no reason to manually fetch flags first"* --
-/// and `nonblocking_mode_is_idempotent` pins the idempotence that matters.
 ///
 /// # Errors
 ///
@@ -1822,19 +1728,9 @@ pub(crate) fn set_nonblocking(
     socket.set_nonblocking(nonblock)
 }
 
-// =========================================================================
 // Interface parsing -- `Curl_parse_interface`
-// =========================================================================
 
 /// The three strings an interface argument can yield.
-///
-/// The out-parameters of `Curl_parse_interface(input, &dev, &iface, &host)`
-/// (`lib/cf-socket.h:59-60`). C hands back three `char **`, of which AT MOST
-/// ONE PAIR is ever written; the shape is preserved rather than tightened into
-/// an enumeration because the three fields map one-to-one onto
-/// `STRING_DEVICE`, `STRING_INTERFACE` and `STRING_BINDHOST`, and
-/// [`BindConfig`] reads them individually with a precedence that depends on
-/// which are present.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct ParsedInterface {
@@ -1871,12 +1767,6 @@ const IF_HOST_PREFIX: &[u8] = b"ifhost!";
 /// ifhost!<iface>!<host> - interface name and hostname.
 /// ```
 ///
-/// The prefixes are tested IN THE C's ORDER and the order is observable:
-/// `if!` is tested before `ifhost!`, and because `"ifhost!x!y"` does not start
-/// with `"if!"` -- the third byte is `h`, not `!` -- the two do not collide.
-/// Testing `ifhost!` first would not change any accepted input either, but the
-/// order is kept so that the two implementations read alike.
-///
 /// # Errors
 ///
 /// [`CURLcode::BadFunctionArgument`] in exactly four cases, all of which the C
@@ -1887,9 +1777,12 @@ const IF_HOST_PREFIX: &[u8] = b"ifhost!";
 /// * `ifhost!` has no second `!`, or nothing after it (`:487-489`).
 /// * The bare form is empty (`:507-508`).
 ///
-/// C also has `CURLE_OUT_OF_MEMORY` returns from `curlx_memdup0`. Those have
-/// no successor: a failure to allocate aborts here rather than returning a
-/// code, which is the same translation [`crate::conn::filters::link`] records.
+/// C also has `CURLE_OUT_OF_MEMORY` returns from `curlx_memdup0`, each copying a
+/// span of the interface string the caller already passed in -- already
+/// resident, no amplification -- so there is nothing here that
+/// [`crate::util::fallible`] would cover, and a duplication has no stable
+/// fallible spelling at the declared minimum Rust version. The same translation
+/// [`crate::conn::filters::link`] records.
 #[allow(dead_code)]
 pub(crate) fn parse_interface(input: &[u8]) -> CodeResult<ParsedInterface> {
     // `len = strlen(input); if(len > 512) return
@@ -1925,13 +1818,6 @@ pub(crate) fn parse_interface(input: &[u8]) -> CodeResult<ParsedInterface> {
     if let Some(rest) = input.strip_prefix(IF_HOST_PREFIX) {
         // `host_part = memchr(input, '!', len); if(!host_part ||
         // !*(host_part + 1)) return CURLE_BAD_FUNCTION_ARGUMENT;`
-        //
-        // Note what the C does NOT check: the INTERFACE half may be empty.
-        // `ifhost!!host` finds the separator at offset zero, duplicates zero
-        // bytes into `*iface`, and succeeds. That is reproduced rather than
-        // tightened -- `bindlocal` then treats an empty interface name as a
-        // name that no interface has, which is a lookup failure and not an
-        // argument error.
         let at = rest.iter().position(|byte| *byte == b'!');
         let Some(at) = at else {
             return Err(CURLcode::BadFunctionArgument);
@@ -1959,17 +1845,9 @@ pub(crate) fn parse_interface(input: &[u8]) -> CodeResult<ParsedInterface> {
     })
 }
 
-// =========================================================================
 // Local binding -- `bindlocal`
-// =========================================================================
 
 /// The OS integer for an address family, as the C prints it with `%i`.
-///
-/// `AF_INET` is 2 everywhere but `AF_INET6` is 10 on Linux and 30 on Apple
-/// platforms, and the messages at `lib/cf-socket.c:625` and `:653` print the
-/// number. Reached through [`socket2::Domain`] so the platform integer is never
-/// spelled out in the engine, which is what `crate::lib`'s `source_policy`
-/// gate requires.
 fn af_number(family: AddressFamily) -> i32 {
     i32::from(domain_of(family))
 }
@@ -1994,12 +1872,6 @@ const fn bind_ip_version(af: AddressFamily) -> IpVersion {
 }
 
 /// How far the local address was determined -- the C's `int done`.
-///
-/// `done` is a THREE-valued integer, not a boolean: `0` is *"not decided"*,
-/// `1` is *"address found"* and `-1` is *"error"*, and the two tests
-/// afterwards are `if(done > 0)` and `if(done < 1)` (`lib/cf-socket.c:672`,
-/// `:704`, `:712`). A boolean would merge the untouched and failed cases,
-/// which is exactly the distinction those two tests draw.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BindLookup {
     /// `done == 0`.
@@ -2101,12 +1973,6 @@ fn resolve_bind_address(
     let mut done = BindLookup::Undecided;
 
     // `#ifdef SO_BINDTODEVICE`: bind to the interface itself first.
-    //
-    // The C's reasoning is worth keeping: *"The interface might be a VRF, eg:
-    // vrf-blue, which means it cannot be converted to an IP address and would
-    // fail Curl_if2ip. Simply try to use it straight away."* And when it works
-    // and no host was ALSO requested, the bind is complete -- note the test is
-    // `host_input`, the explicit `CURLOPT_BINDHOST`, not the derived `host`.
     if let Some(name) = iface {
         if hooks.interfaces.bind_to_device(socket, name).is_ok()
             && bind.bindhost.is_none()
@@ -2144,10 +2010,7 @@ fn resolve_bind_address(
                 let name = iface.unwrap_or_default();
                 let text = String::from_utf8_lossy(name).into_owned();
                 // C reads `SOCKERRNO` here, which after a failed lookup holds
-                // whatever the last system call left. There is no such
-                // ambient value to read safely, so the reported number is the
-                // absence of one -- the message SHAPE is what section 0.8.1
-                // freezes, and it is preserved exactly.
+                // whatever the last system call left.
                 let errno = 0;
                 hooks.conn.set_os_errno(errno);
                 if let Some(tracer) = cx.tracer_mut() {
@@ -2187,12 +2050,6 @@ fn resolve_bind_address(
     }
 
     // `if(!iface_input || host_input)` -- resolve as a hostname or IP number.
-    //
-    // Both halves are reachable, and the second is the surprising one: when an
-    // interface lookup has ALREADY succeeded, C has reassigned `host = myhost`
-    // and now resolves that numeric text as well, purely to compare the
-    // family. The step is preserved rather than optimised away, because
-    // `Curl_resolv_blocking` failing is what turns `done` from `1` to `-1`.
     if bind.interface.is_none() || bind.bindhost.is_some() {
         let target = myhost.clone().unwrap_or_else(|| {
             String::from_utf8_lossy(host.unwrap_or_default()).into_owned()
@@ -2392,7 +2249,7 @@ fn bind_ports(
     // exposes no such option and this file may reach a socket option no other
     // way, so the hint is not applied. It is a scalability hint for outgoing
     // connections with no observable effect on a single transfer, and
-    // performance is a non-goal (AAP section 0.1.1).
+    // performance is a non-goal.
     let mut port = bind.localport;
     let mut portnum = bind.localportrange;
 
@@ -2475,9 +2332,7 @@ fn bind_sockaddr_port(
     }
 }
 
-// =========================================================================
 // Error classification -- the two tables that differ by one value
-// =========================================================================
 
 /// The socket conditions `lib/cf-socket.c` distinguishes.
 ///
@@ -2487,13 +2342,6 @@ fn bind_sockaddr_port(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SocketCondition {
     /// `SOCKEWOULDBLOCK`, and `EAGAIN` where the two differ.
-    ///
-    /// The C writes both with a comment explaining the duplication -- *"errno
-    /// may be EWOULDBLOCK or on some systems EAGAIN when it returned due to its
-    /// inability to send off data without blocking. We therefore treat both
-    /// error codes the same here"* -- and behind an `#if (EAGAIN) !=
-    /// (SOCKEWOULDBLOCK)` where it does not. Rust folds them into one
-    /// [`std::io::ErrorKind::WouldBlock`], which is the same treatment.
     WouldBlock,
     /// `SOCKEINTR`.
     Interrupted,
@@ -2536,17 +2384,6 @@ pub(crate) const fn send_is_again(condition: SocketCondition) -> bool {
 }
 
 /// The RECEIVE table (`lib/cf-socket.c:1508-1517`).
-///
-/// ```c
-/// (SOCKEWOULDBLOCK == sockerr) ||
-/// (EAGAIN == sockerr) || (SOCKEINTR == sockerr)
-/// ```
-/// THREE conditions. [`SocketCondition::InProgress`] is ABSENT, and its absence
-/// is deliberate rather than an oversight in the C: a receive that reports "the
-/// operation is in progress" has not been asked to start an operation, so the
-/// condition means something has gone wrong rather than that nothing has
-/// happened yet. The asymmetry between the two tables is the single difference
-/// between them, and `send_and_receive_tables_differ_only_in_progress` pins it.
 pub(crate) const fn recv_is_again(condition: SocketCondition) -> bool {
     matches!(
         condition,
@@ -2555,14 +2392,6 @@ pub(crate) const fn recv_is_again(condition: SocketCondition) -> bool {
 }
 
 /// The verdict `socket_connect_result` reaches (`lib/cf-socket.c:836-861`).
-///
-/// `CURLE_OK` for the three in-progress conditions -- *"unknown error,
-/// fallthrough and try another address!"* is the comment on the other arm --
-/// and [`CURLcode::CouldntConnect`] for everything else. Note that
-/// [`SocketCondition::Interrupted`] is NOT in the C's in-progress set here even
-/// though it is in the send table: `connect(2)` interrupted by a signal has
-/// still started the handshake on every platform curl supports, but the C does
-/// not say so, and this reproduces what the C says.
 pub(crate) const fn connect_is_in_progress(condition: SocketCondition) -> bool {
     matches!(
         condition,
@@ -2570,28 +2399,13 @@ pub(crate) const fn connect_is_in_progress(condition: SocketCondition) -> bool {
     )
 }
 
-// =========================================================================
 // The typed context -- `struct cf_socket_ctx`
-// =========================================================================
 
 /// One socket attempt's whole state.
 ///
 /// The successor of `struct cf_socket_ctx` (`lib/cf-socket.c:868-892`), field
 /// for field. Two groups from the C are absent and both absences are
 /// deliberate:
-///
-/// * `last_sndbuf_query_at` and `sndbuf_size` are `#ifdef USE_WINSOCK`
-///   (`:876-879`) and exist for `win_update_sndbuf_size`
-///   (`:1363-1380`), a Winsock send-buffer autotuner. Windows is outside the
-///   four-target matrix (AAP section 0.2.2), so they have no successor.
-/// * `wblock_percent`, `wpartial_percent`, `rblock_percent` and `recv_max` are
-///   `#ifdef DEBUGBUILD` (`:881-886`) and inject artificial blocking and
-///   partial transfers from four `CURL_DBG_SOCK_*` environment variables. They
-///   have no successor either: the transports they perturb are reachable
-///   directly in a test here through [`ReadinessProbe`] and an in-memory
-///   filter, so simulating a short write is a matter of writing the test rather
-///   than of asking the production path to misbehave -- and a production build
-///   should not carry the branches at all.
 ///
 /// **This is the type that replaces `void *ctx`.** It sits beside
 /// [`FilterBase`] as an ordinary typed field, so no filter method casts
@@ -2601,12 +2415,6 @@ pub(crate) struct SocketContext {
     /// `transport`.
     transport: Transport,
     /// `addr` -- *"address to connect to"*.
-    ///
-    /// [`Option`] where C has a value, because a listening socket adopted
-    /// through [`tcp_listen_set`] has no address to connect TO: the C leaves
-    /// the whole struct zeroed there (`lib/cf-socket.c:2158-2163` sets only
-    /// `transport`, `sock`, `listening` and `accepted`), and a zeroed
-    /// `sockaddr` has no typed equivalent.
     addr: Option<SockAddrEx>,
     /// `sock` -- *"current attempt socket"*, and its OWNER.
     ///
@@ -2643,11 +2451,6 @@ pub(crate) struct SocketContext {
 #[allow(dead_code)]
 impl SocketContext {
     /// `cf_socket_ctx_init` (`lib/cf-socket.c:894-943`).
-    ///
-    /// The C's `memset(ctx, 0, sizeof(*ctx))` followed by `ctx->sock =
-    /// CURL_SOCKET_BAD` becomes [`Default`]-shaped initialisation with
-    /// [`None`], and the four `CURL_DBG_SOCK_*` environment probes have no
-    /// successor for the reason [`SocketContext`] records.
     ///
     /// # Errors
     ///
@@ -2781,23 +2584,10 @@ impl SocketContext {
     }
 }
 
-// =========================================================================
 // Closing a socket -- and the callback asymmetry
-// =========================================================================
 
 /// `socket_close(data, conn, use_callback, sock)`
 /// (`lib/cf-socket.c:414-434`).
-///
-/// Takes the socket BY VALUE, which is the whole point: after this returns
-/// there is no value left to close a second time, whichever branch ran.
-///
-/// The observer is notified on BOTH paths and BEFORE either close, exactly as
-/// the C does -- `Curl_multi_will_close(data, sock)` at `:420` on the callback
-/// path and at `:429` on the direct one. Its absence models the C's `if(conn)`
-/// guard: no connection means no socket-to-transfer map to keep in step.
-///
-/// Whether the callback runs is decided by whether one was PASSED, not by a
-/// flag. That is what makes [`socket_close`] structurally unable to invoke it.
 fn close_owned_socket(
     socket: OsSocket,
     observer: Option<&dyn MultiCloseObserver>,
@@ -2823,20 +2613,6 @@ fn close_owned_socket(
 }
 
 /// `Curl_socket_close(data, conn, sock)` (`lib/cf-socket.c:441-444`).
-///
-/// # This NEVER invokes the close callback
-///
-/// Its entire body is `return socket_close(data, conn, FALSE, sock);` -- the
-/// `use_callback` argument is the literal `FALSE`. The asymmetry against
-/// `cf_socket_close`, which passes `!ctx->accepted` (`:1235`), is deliberate in
-/// the C and is preserved here **structurally**: this function has no callback
-/// parameter to pass, so no caller can make it call one.
-///
-/// The accept path relies on exactly this. When `accept4` succeeds but the
-/// close-on-exec or non-blocking follow-up fails, C disposes of the accepted
-/// socket with `Curl_socket_close` (`:2083`, `:2090`) rather than with the
-/// filter's own close, so a user callback is never handed a socket it never
-/// created.
 #[allow(dead_code)]
 pub(crate) fn socket_close(
     socket: OsSocket,
@@ -2845,19 +2621,9 @@ pub(crate) fn socket_close(
     close_owned_socket(socket, observer, None)
 }
 
-// =========================================================================
 // Trace emission -- free functions, so no borrow of `self` is held
-// =========================================================================
 
 /// `CURL_TRC_CF(data, cf, ...)` for a socket filter.
-///
-/// A free function rather than a method because every call site already holds a
-/// mutable borrow of the filter's own state, and a `&self` method would
-/// conflict with it. The filter's identity and socket index are [`Copy`], so
-/// passing them costs nothing.
-///
-/// A filter whose name is not in the trace registry emits nothing, which is the
-/// honest outcome: no `--trace-config` keyword could enable it.
 fn trace_line(
     cx: &mut CallCtx<'_, '_>,
     identity: Option<TraceFilter>,
@@ -2886,24 +2652,9 @@ fn fail_line(cx: &mut CallCtx<'_, '_>, line: &str) {
     }
 }
 
-// =========================================================================
 // The four filter identities
-// =========================================================================
 
 /// Which of the four socket filters an instance is.
-///
-/// C registers four `struct Curl_cftype` instances -- `Curl_cft_tcp`
-/// (`lib/cf-socket.c:1682-1698`), `Curl_cft_udp` (`:1848-1864`),
-/// `Curl_cft_unix` (`:1901-1918`) and `Curl_cft_tcp_accept` (`:2132-2148`) --
-/// that differ in **exactly two members**: the name and the connect function.
-/// The other thirteen are the same function pointer in all four.
-///
-/// So this is one implementation with a kind rather than four implementations,
-/// which is not a simplification but a transcription: `Curl_cft_unix` does not
-/// merely resemble `Curl_cft_tcp`, it names `cf_tcp_connect` itself, under the
-/// comment *"this is the TCP filter which can also handle this case"*
-/// (`lib/cf-socket.c:1900`). Writing a second UNIX state machine would create a
-/// divergence the C does not have.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum SocketFilterKind {
@@ -2943,13 +2694,6 @@ impl SocketFilterKind {
     }
 
     /// The `flags` member: [`CF_TYPE_IP_CONNECT`] for ALL FOUR.
-    ///
-    /// Not one of them carries anything else, and none of them carries
-    /// [`crate::conn::filters::CF_TYPE_SSL`] or
-    /// [`crate::conn::filters::CF_TYPE_MULTIPLEX`]. Worth stating because the
-    /// filter that sits directly above these -- `HAPPY-EYEBALLS` -- carries
-    /// `CF_TYPE_NONE` instead, so "is this the IP-connecting layer?" is
-    /// answered by the socket filters alone.
     pub(crate) const fn cf_type(self) -> CfType {
         match self {
             Self::Tcp | Self::Udp | Self::Unix | Self::TcpAccept => {
@@ -2964,20 +2708,9 @@ impl SocketFilterKind {
     }
 }
 
-// =========================================================================
 // Opening a socket -- `socket_open`
-// =========================================================================
 
 /// `socket_open(data, addr, sockfd)` (`lib/cf-socket.c:308-383`).
-///
-/// The C's `#ifdef SOCK_CLOEXEC` prologue and its two `fcntl` fallbacks that
-/// set `F_SETFD` to `FD_CLOEXEC` all disappear into one fact:
-/// [`socket2::Socket::new`] *"sets the close-on-exec flag on the new socket"*
-/// on every Unix platform. The Apple-only broken-pipe-signal step at `:299-306`
-/// disappears the same way -- `Socket::new` sets that option on Apple platforms
-/// itself, as this module's documentation records -- which is why the two
-/// failure messages guarding those fallbacks have no successor: neither fallback
-/// is ever taken, and a message must not be reproduced unless its path is.
 ///
 /// # Errors
 ///
@@ -3076,14 +2809,6 @@ fn apply_nodelay(
 /// Applies `CURLOPT_TCP_KEEPALIVE` and its three timers -- `tcpkeepalive`
 /// (`lib/cf-socket.c:114-227`).
 ///
-/// One hundred and thirteen lines of C become one call, and the collapse is
-/// entirely platform variance: `SO_KEEPALIVE` then `TCP_KEEPIDLE` or
-/// `TCP_KEEPALIVE` or `TCP_KEEPALIVE_THRESHOLD`, then `TCP_KEEPINTVL` or
-/// `TCP_KEEPALIVE_ABORT_THRESHOLD`, then `TCP_KEEPCNT`, each spelling belonging
-/// to a different operating system, plus a `KEEPALIVE_FACTOR` that converts
-/// seconds to milliseconds on the three platforms that want milliseconds.
-/// [`socket2::TcpKeepalive`] picks the spelling and the unit for the target.
-///
 /// Two behaviours are preserved deliberately:
 ///
 /// * The idle and interval times are set ONLY IF `SO_KEEPALIVE` itself
@@ -3091,30 +2816,6 @@ fn apply_nodelay(
 ///   successful"* (`:118`) -- which is why the enable is a separate call whose
 ///   result is tested.
 /// * Every failure is traced and ignored, as with [`apply_nodelay`].
-///
-/// The retry count is passed only where the platform has one:
-/// [`socket2::TcpKeepalive::with_retries`] is unavailable on Apple platforms
-/// other than macOS, and the four mandated targets are Linux and macOS, so it
-/// is set on both.
-///
-/// # The one trace line that is not verbatim, and why
-///
-/// C traces THREE distinct failures -- `"Failed to set TCP_KEEPIDLE on fd
-/// %d: errno %d"`, `"...TCP_KEEPINTVL..."` and `"...TCP_KEEPCNT..."`
-/// (`:150-164`) -- because it issues three separate `setsockopt` calls and can
-/// name the one that failed. [`socket2::TcpKeepalive`] applies all three timers
-/// in a single call, so the option that failed is genuinely not known here, and
-/// a line naming a specific one would be a guess.
-///
-/// The line emitted is therefore `"Failed to set TCP_KEEP* on fd %d: errno
-/// %d"`: the C's own shape and its own `TCP_KEEP*` wildcard, which the C uses
-/// for exactly this purpose in its success line at `:132`, `"Set TCP_KEEP* on
-/// fd=%d"`. `SO_KEEPALIVE` keeps its own verbatim line because it is still a
-/// call of its own.
-///
-/// This is a trace line, reached only under `--trace-config`, and it is the
-/// only text in this file that is a composition rather than a transcription.
-/// It is recorded here rather than left for a reader to notice.
 fn apply_keepalive(
     cx: &mut CallCtx<'_, '_>,
     identity: Option<TraceFilter>,
@@ -3162,9 +2863,7 @@ fn apply_keepalive(
     }
 }
 
-// =========================================================================
 // The socket filter
-// =========================================================================
 
 /// One raw transport at the bottom of a filter chain.
 ///
@@ -3213,16 +2912,6 @@ impl SocketFilter {
 
     /// `Curl_cf_socket_peek(cf, data, psock, paddr, pip)`
     /// (`lib/cf-socket.c:2209-2228`).
-    ///
-    /// C returns `CURLE_FAILED_INIT` for a filter that is not a socket filter,
-    /// having tested `cf_is_socket(cf)` -- a function-pointer comparison against
-    /// the four registered types (`:2202-2207`). Here the type IS the answer:
-    /// only a [`SocketFilter`] has this method, so the error case does not
-    /// exist and the return type is not a `Result`. That is the same
-    /// improvement `CfQueryValue` makes over `void *pres2`.
-    ///
-    /// The C's contract *"The filter owns all returned values"* is what the
-    /// borrows express.
     #[allow(dead_code)]
     pub(crate) fn peek(&self) -> (Socket, Option<&SockAddrEx>, &IpQuadruple) {
         (self.ctx.raw_socket(), self.ctx.addr(), self.ctx.ip())
@@ -3259,11 +2948,6 @@ impl SocketFilter {
     // -- address bookkeeping ---------------------------------------------
 
     /// `set_remote_ip(cf, data)` (`lib/cf-socket.c:1023-1044`).
-    ///
-    /// The transport is stamped BEFORE the conversion -- `ctx->ip.transport =
-    /// ctx->transport;` at `:1029`, ahead of the `Curl_addr2string` call -- so
-    /// a failure leaves the quadruple describing the right transport with no
-    /// address, rather than describing nothing.
     ///
     /// # Errors
     ///
@@ -3352,12 +3036,6 @@ impl SocketFilter {
 
     /// `cf_tcp_set_accepted_remote_ip(cf, data)`
     /// (`lib/cf-socket.c:1983-2012`).
-    ///
-    /// Clears first, exactly as [`Self::set_local_ip`] does, and RETURNS on
-    /// either failure rather than carrying on -- so an accepted connection whose
-    /// peer cannot be named reports no peer at all, which is what the C's two
-    /// bare `return`s produce. Both failures are `failf` here where the local
-    /// equivalents are `infof`; that difference is the C's and is preserved.
     fn set_accepted_remote_ip(&mut self, cx: &mut CallCtx<'_, '_>) {
         self.ctx.ip.remote_ip.clear();
         self.ctx.ip.remote_port = 0;
@@ -3391,10 +3069,6 @@ impl SocketFilter {
     // -- opening ---------------------------------------------------------
 
     /// `cf_socket_open(cf, data)` (`lib/cf-socket.c:1046-1180`).
-    ///
-    /// Returns whether the socket came back ALREADY CONNECTED, which is the
-    /// C's local `isconnected` and happens only when a `CURLOPT_SOCKOPTFUNCTION`
-    /// callback reports `CURL_SOCKOPT_ALREADY_CONNECTED`.
     ///
     /// # Errors
     ///
@@ -3476,10 +3150,7 @@ impl SocketFilter {
         // `result = set_remote_ip(cf, data); if(result) goto out;`
         self.set_remote_ip(cx)?;
 
-        // `infof(data, "  Trying ...")`. The `IPV6_V6ONLY` reset that precedes
-        // it in the C is `#ifdef USE_WINSOCK` (`:1077-1088`) and has no
-        // successor: Windows is outside the four-target matrix, and the two
-        // mandated platforms both default the option off already.
+        // `infof(data, " Trying...")`.
         let family = self
             .ctx
             .addr
@@ -3564,14 +3235,6 @@ impl SocketFilter {
 
         // `error = curlx_nonblock(ctx->sock, TRUE); if(error < 0) { result =
         // CURLE_UNSUPPORTED_PROTOCOL; ctx->error = SOCKERRNO; goto out; }`
-        //
-        // C reaches this two ways -- unconditionally without `SOCK_NONBLOCK`,
-        // and only for a callback-created socket with it (`:1143-1163`) --
-        // because the flag is otherwise folded into `socktype`. `socket2` has
-        // no such fold, so the call is made once here for whichever socket the
-        // filter now holds. Doing it for an internally created socket as well
-        // is not a behaviour change: [`set_nonblocking`] is idempotent, which
-        // is the very property `curlx_nonblock`'s early return relies on.
         {
             let Some(socket) = self.ctx.socket.as_ref() else {
                 return Err(CURLcode::FailedInit);
@@ -3651,17 +3314,6 @@ impl SocketFilter {
     // -- connecting ------------------------------------------------------
 
     /// The `out:` tail of `cf_tcp_connect` (`lib/cf-socket.c:1306-1324`).
-    ///
-    /// Emits [`msg::connect_failed`] **only when an OS error was recorded**, so
-    /// an immediate connect failure -- which reports through
-    /// [`msg::immediate_connect_fail`] and never writes `ctx->error` -- does
-    /// not produce a second message. Then closes with the callback and reports
-    /// the code.
-    ///
-    /// C also performs `SET_SOCKERRNO(ctx->error)` here, restoring the ambient
-    /// `errno` so that a later `curlx_strerror` with no argument sees it. There
-    /// is no ambient `errno` to restore safely and none is read: every message
-    /// above is handed its number explicitly.
     fn connect_failed(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -3686,16 +3338,6 @@ impl SocketFilter {
 
     /// `do_connect(cf, data, is_tcp_fastopen)` plus its result handling
     /// (`lib/cf-socket.c:1265-1275`).
-    ///
-    /// Returns whether to go on and check for completion: `true` when
-    /// `connect(2)` returned success, `false` when it reported that the
-    /// handshake has merely started. The distinction is the C's `goto out` with
-    /// `result == CURLE_OK`, which leaves `*done` false and returns without
-    /// probing.
-    ///
-    /// The three TCP Fast Open variants in `do_connect` -- Darwin's `connectx`,
-    /// Linux's `TCP_FASTOPEN_CONNECT` and old Linux's `MSG_FASTOPEN` -- have no
-    /// successor, for the reason [`SocketSettings::tcp_fastopen`] records.
     ///
     /// # Errors
     ///
@@ -3745,10 +3387,6 @@ impl SocketFilter {
     }
 
     /// `cf_tcp_connect(cf, data, done)` (`lib/cf-socket.c:1229-1324`).
-    ///
-    /// Shared by [`SocketFilterKind::Tcp`] and [`SocketFilterKind::Unix`],
-    /// because `Curl_cft_unix` names this very function
-    /// (`lib/cf-socket.c:1905`).
     ///
     /// # Errors
     ///
@@ -3819,23 +3457,6 @@ impl SocketFilter {
 
     /// `cf_udp_setup_quic(cf, data)` (`lib/cf-socket.c:1778-1810`).
     ///
-    /// *"QUIC needs a connected socket, nonblocking"* -- and it already is
-    /// non-blocking, which the C notes explicitly: *"Currently, `cf->ctx->sock`
-    /// is always non-blocking because the only caller to
-    /// `cf_udp_setup_quic()` is `cf_udp_connect()` that passes the
-    /// non-blocking socket created by `cf_socket_open()` to it. Thus, we do not
-    /// need to call `curlx_nonblock()` in `cf_udp_setup_quic()` anymore."*
-    ///
-    /// # The Linux QUIC tuning has no successor
-    ///
-    /// `linux_quic_mtu` sets `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` to
-    /// `PMTUDISC_DO` (`:1741-1761`) and `linux_quic_gro` sets `UDP_GRO`
-    /// (`:1766-1775`). `socket2` 0.6.5 exposes neither and this file may reach
-    /// a socket option no other way, so neither is applied. Both are
-    /// throughput tuning for a path that is not yet reachable -- `UDP_GRO` is
-    /// compiled in the C only alongside ngtcp2 or quiche, and AAP section
-    /// 0.2.2 drops both -- and performance is explicitly a non-goal.
-    ///
     /// # Errors
     ///
     /// As [`Self::attempt_connect`]'s classification: an immediate failure is
@@ -3886,16 +3507,6 @@ impl SocketFilter {
 
     /// `cf_udp_connect(cf, data, done)` (`lib/cf-socket.c:1812-1846`).
     ///
-    /// # The unreachable branch that is reproduced anyway
-    ///
-    /// C initialises `result = CURLE_COULDNT_CONNECT` and only assigns
-    /// `CURLE_OK` inside `if(ctx->sock == CURL_SOCKET_BAD)`. So a UDP filter
-    /// that already holds a socket and is not yet marked connected returns
-    /// `CURLE_COULDNT_CONNECT` from a call that did nothing. The block always
-    /// sets `cf->connected` on the way out, so nothing reaches it -- and it is
-    /// reproduced rather than tidied, because tidying it would be a behaviour
-    /// change made on an assumption about reachability rather than on evidence.
-    ///
     /// # Errors
     ///
     /// Whatever [`Self::open`] or [`Self::setup_quic`] reported, plus the
@@ -3938,15 +3549,6 @@ impl SocketFilter {
     // -- accepting -------------------------------------------------------
 
     /// `cf_tcp_accept_timeleft(cf, data)` (`lib/cf-socket.c:1955-1981`).
-    ///
-    /// The *"fake zero to minus one"* convention, in the C's own words: *"avoid
-    /// returning 0 as that means no timeout!"* Zero from the subtraction becomes
-    /// `-1`, which the caller reads as expired.
-    ///
-    /// The fold is `if(other_ms && (other_ms < timeout_ms))`, so a transfer with
-    /// NO deadline -- zero -- takes the `else`, which subtracts the elapsed time
-    /// instead. A negative `other_ms`, already elapsed, takes the `if` and is
-    /// returned unchanged; the C's comment says exactly that.
     fn accept_timeleft(&self, cx: &CallCtx<'_, '_>) -> TimeDiff {
         // `timediff_t timeout_ms = DEFAULT_ACCEPT_TIMEOUT;`
         let mut timeout_ms = DEFAULT_ACCEPT_TIMEOUT;
@@ -4079,15 +3681,6 @@ impl SocketFilter {
     // -- activation ------------------------------------------------------
 
     /// `cf_socket_active(cf, data)` (`lib/cf-socket.c:1545-1557`).
-    ///
-    /// The second phase of the two-phase contract, and the ONLY place a socket
-    /// reaches connection state. Four steps, in the C's order: publish the
-    /// descriptor, refresh the local address, record the family on the primary
-    /// socket only, and mark the filter active.
-    ///
-    /// The `bits.ipv6` stamp is guarded by `if(cf->sockindex == FIRSTSOCKET)`,
-    /// so a secondary connection -- FTP's data channel -- does not overwrite
-    /// what the control channel established.
     fn activate(&mut self, cx: &mut CallCtx<'_, '_>) {
         let index = self.base.sockindex();
         // `cf->conn->sock[cf->sockindex] = ctx->sock;` -- *"use this socket
@@ -4106,16 +3699,6 @@ impl SocketFilter {
     }
 
     /// `cf_socket_update_data(cf, data)` (`lib/cf-socket.c:1533-1543`).
-    ///
-    /// *"Update the IP info held in the transfer, if we have that."* Both
-    /// guards are load-bearing: the quadruple is published only for a
-    /// CONNECTED filter on the PRIMARY socket, so an unconnected attempt and a
-    /// secondary channel both leave `CURLINFO_PRIMARY_IP` alone.
-    ///
-    /// The C's second assignment carries its own hedge -- *"not sure if this is
-    /// redundant..."* -- and is copied across with it, because a redundant
-    /// write is still an observable one if anything else ever changes the
-    /// field.
     fn update_data(&mut self) {
         if self.base.is_connected()
             && self.base.sockindex() == SocketIndex::First
@@ -4145,10 +3728,9 @@ impl ConnFilter for SocketFilter {
 
     /// `cf_socket_destroy` (`lib/cf-socket.c:1180-1188`).
     ///
-    /// Closes first, then traces, then releases the context -- and the release
-    /// has no successor, because `curlx_free(ctx)` is what [`Drop`] does. This
-    /// hook exists for the effects a `Drop` cannot have, which here is the
-    /// close: it may invoke a user callback and must notify the multi handle.
+    /// This hook exists for the effects a `Drop` cannot have, which here is
+    /// the close: it may invoke a user callback and must notify the multi
+    /// handle.
     fn destroy(&mut self, cx: &mut CallCtx<'_, '_>) {
         self.do_close(cx);
         let identity = self.identity();
@@ -4182,20 +3764,6 @@ impl ConnFilter for SocketFilter {
     }
 
     /// `cf_socket_shutdown` (`lib/cf-socket.c:958-978`).
-    ///
-    /// A best-effort drain and nothing more: *"On TCP, and when the socket looks
-    /// well and non-blocking mode can be enabled, receive dangling bytes before
-    /// close to avoid entering RST states unnecessarily."*
-    ///
-    /// Four conditions gate it and all four are preserved -- the filter must be
-    /// connected, the socket must exist, the transport must be exactly
-    /// [`Transport::Tcp`], and non-blocking mode must be establishable. The read
-    /// is performed AT MOST ONCE, of at most [`SHUTDOWN_DRAIN_MAX`] bytes, and
-    /// its result is discarded: the C writes `(void)sread(...)`, because bytes
-    /// arriving during a shutdown are bytes nobody asked for.
-    ///
-    /// Reports done unconditionally. `*done = TRUE` sits outside the `if`, so a
-    /// filter that drained nothing has still finished shutting down.
     fn shutdown(&mut self, cx: &mut CallCtx<'_, '_>) -> CurlResult<bool> {
         if self.base.is_connected() {
             let identity = self.identity();
@@ -4234,9 +3802,6 @@ impl ConnFilter for SocketFilter {
     ///    attempt still learns about a peer that hangs up.
     /// 4. **Active** -- nothing. The layer above owns the interest from here.
     ///
-    /// Does NOT chain: [`crate::conn::filters::FilterChain::adjust_pollset`]
-    /// walks the chain itself, and a socket filter is the bottom in any case.
-    ///
     /// # Errors
     ///
     /// Whatever [`EasyPollset`] reports, which is
@@ -4270,26 +3835,6 @@ impl ConnFilter for SocketFilter {
     }
 
     /// `cf_socket_send` (`lib/cf-socket.c:1382-1468`).
-    ///
-    /// # `eos` is ignored, and that is the C's own `(void)eos`
-    ///
-    /// A socket has no end-of-stream marker to write. The flag matters to the
-    /// layers above -- chunked framing closes its stream, HTTP/2 sets
-    /// END_STREAM -- and by the time bytes reach a socket the framing is
-    /// already in them.
-    ///
-    /// # The re-entrancy hack disappears
-    ///
-    /// C saves `cf->conn->sock[cf->sockindex]`, overwrites it with `ctx->sock`
-    /// for the duration of the send, and restores it afterwards
-    /// (`:1394-1395`, `:1465`). It does that because the debug simulation and
-    /// the Winsock buffer autotuner reach the socket through the CONNECTION
-    /// rather than through the context. Here the context owns its socket, so
-    /// there is nothing to swap, nothing to restore, and no window in which the
-    /// connection describes the wrong descriptor.
-    ///
-    /// Partial writes are reported exactly: whatever the socket accepted is
-    /// returned, and the caller sends the rest.
     ///
     /// # Errors
     ///
@@ -4391,15 +3936,6 @@ impl ConnFilter for SocketFilter {
     ///
     /// Three events are handled and the other four fall through to success,
     /// which is what the C's `switch` with no `default` does.
-    ///
-    /// [`CfControl::ForgetSocket`] is the interesting one: `ctx->sock =
-    /// CURL_SOCKET_BAD` **without closing**. The descriptor stays open and
-    /// somebody else now owns it -- FTP hands a data connection to the
-    /// application through `CURLOPT_CLOSESOCKETFUNCTION` this way.
-    /// [`std::os::fd::IntoRawFd::into_raw_fd`] is the safe expression of that:
-    /// it consumes the owned socket and yields the number WITHOUT closing it,
-    /// which is precisely a relinquished ownership. Dropping the socket instead
-    /// would close it and break the caller.
     fn cntrl(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -4434,15 +3970,6 @@ impl ConnFilter for SocketFilter {
     }
 
     /// `cf_socket_conn_is_alive` (`lib/cf-socket.c:1582-1617`).
-    ///
-    /// The mapping, verbatim: no socket is dead, a failed probe is dead, a
-    /// timeout is alive with nothing waiting, `POLLERR | POLLHUP | POLLPRI |
-    /// POLLNVAL` is dead, and anything else is alive with input pending.
-    ///
-    /// [`PollEvents::PRI`] counting as DEAD is not a slip. Out-of-band data on a
-    /// pooled connection means the peer is doing something this transfer did not
-    /// ask for, and the C treats that as a reason to reconnect rather than to
-    /// read.
     fn is_alive(&mut self, cx: &mut CallCtx<'_, '_>) -> Liveness {
         let identity = self.identity();
         let sockindex = self.sockindex_i32();
@@ -4497,10 +4024,6 @@ impl ConnFilter for SocketFilter {
     }
 
     /// `cf_socket_query` (`lib/cf-socket.c:1619-1680`).
-    ///
-    /// Six questions answered and the rest delegated, which is the C's
-    /// `default: break;` followed by `return cf->next ? cf->next->cft->query(...)
-    /// : CURLE_UNKNOWN_OPTION;`.
     ///
     /// # Errors
     ///
@@ -4593,9 +4116,7 @@ impl ConnFilter for SocketFilter {
     }
 }
 
-// =========================================================================
 // The four factories
-// =========================================================================
 
 /// `Curl_cf_tcp_create` (`lib/cf-socket.c:1700-1738`).
 ///
@@ -4611,7 +4132,7 @@ impl ConnFilter for SocketFilter {
 /// so the C's `if(!ai)` branch has no expressible caller.
 ///
 /// The C's `Curl_cf_create` step and its `CURLE_OUT_OF_MEMORY` have no
-/// successor: a failure to allocate aborts, exactly as
+/// successor: the filter box is a FIXED-SIZE allocation, whose size this module chooses rather than a caller, and which has no stable fallible spelling at the declared minimum Rust version, exactly as
 /// [`crate::conn::filters::link`] records. So the only error left is the
 /// address-size check.
 ///
@@ -4625,9 +4146,6 @@ pub(crate) fn cf_tcp_create(
     settings: SocketSettings,
     sockindex: SocketIndex,
 ) -> CodeResult<SocketFilter> {
-    // C's `DEBUGASSERT(transport == TRNSPRT_TCP)` (`:1714`) has no successor
-    // to assert: the transport is not a parameter here, so a caller cannot pass
-    // the wrong one and there is no run-time condition left to check.
     let ctx = SocketContext::init(ai, Transport::Tcp)?;
     Ok(SocketFilter::new(
         SocketFilterKind::Tcp,
@@ -4639,13 +4157,6 @@ pub(crate) fn cf_tcp_create(
 }
 
 /// `Curl_cf_udp_create` (`lib/cf-socket.c:1866-1898`).
-///
-/// The one factory that takes the transport as an argument, because two values
-/// are valid: `DEBUGASSERT(transport == TRNSPRT_UDP || transport ==
-/// TRNSPRT_QUIC)` (`:1876`). The distinction is behaviour --
-/// [`Transport::Quic`] additionally runs [`SocketFilter::setup_quic`], and
-/// `CF_QUERY_TIMER_CONNECT` reports the first-byte time for both -- so it is
-/// checked rather than assumed.
 ///
 /// # Errors
 ///
@@ -4678,11 +4189,6 @@ pub(crate) fn cf_udp_create(
 
 /// `Curl_cf_unix_create` (`lib/cf-socket.c:1920-1953`).
 ///
-/// A `UNIX`-named filter running the TCP algorithm, which is what the C does:
-/// `Curl_cft_unix` names `cf_tcp_connect` under the comment *"this is the TCP
-/// filter which can also handle this case"* (`:1900`). No parallel UNIX state
-/// machine exists here for the same reason it does not exist there.
-///
 /// # Errors
 ///
 /// [`CURLcode::TooLarge`] from [`SockAddrEx::assign`], and
@@ -4706,20 +4212,6 @@ pub(crate) fn cf_unix_create(
 }
 
 /// `Curl_conn_tcp_listen_set` (`lib/cf-socket.c:2150-2196`).
-///
-/// Adopts an already-created listening socket and installs a `TCP-ACCEPT`
-/// filter over it. FTP's active mode is the only caller: it creates and binds
-/// the listener itself and then hands it over.
-///
-/// **The existing chain is discarded FIRST** -- `Curl_conn_cf_discard_all(data,
-/// conn, sockindex)` at `:2160`, before anything is built -- and the C then
-/// asserts the connection's descriptor is `CURL_SOCKET_BAD`, which is what that
-/// discard leaves behind. Getting the order wrong would install a filter over a
-/// socket the previous chain still believed it owned.
-///
-/// The listener MOVES in, so this function is the point at which its ownership
-/// transfers: the filter closes it exactly once, either when the accept replaces
-/// it or when the chain is torn down.
 #[allow(dead_code)]
 pub(crate) fn tcp_listen_set(
     cx: &mut CallCtx<'_, '_>,
@@ -4766,11 +4258,6 @@ pub(crate) fn tcp_listen_set(
 
 /// `Curl_conn_is_tcp_listen(data, sockindex)`
 /// (`lib/cf-socket.c:2198-2207`).
-///
-/// C walks the chain comparing each `cf->cft` against `&Curl_cft_tcp_accept`.
-/// Here the walk asks each filter for its name, because a trait object's
-/// concrete type is not comparable and its NAME is exactly the identity the C's
-/// pointer comparison was standing in for.
 #[allow(dead_code)]
 pub(crate) fn conn_is_tcp_listen(chain: &FilterChain) -> bool {
     chain.iter().any(|filter| {
@@ -4778,19 +4265,9 @@ pub(crate) fn conn_is_tcp_listen(chain: &FilterChain) -> bool {
     })
 }
 
-// =========================================================================
 // The wakeup primitive -- `lib/socketpair.c`
-// =========================================================================
 
 /// How a [`Wakeup`] is backed.
-///
-/// `lib/socketpair.c` chooses between four implementations at compile time --
-/// `wakeup_eventfd`, `wakeup_pipe`, `wakeup_socketpair` and `wakeup_inet`
-/// (`:283-294`) -- and the choice is observable in exactly one way, which
-/// [`Wakeup::destroy`] depends on: an `eventfd` is ONE descriptor used for both
-/// reading and writing, and `Curl_wakeup_destroy` closes `socks[1]` only
-/// `#ifndef USE_EVENTFD` (`:363-369`) precisely so that the single descriptor is
-/// not closed twice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum WakeupBacking {
@@ -4802,25 +4279,6 @@ pub(crate) enum WakeupBacking {
 }
 
 /// The multi handle's *"make the poll return"* mechanism.
-///
-/// The successor of `Curl_wakeup_init`, `Curl_wakeup_signal`,
-/// `Curl_wakeup_consume` and `Curl_wakeup_destroy`
-/// (`lib/socketpair.c:283-373`), which back `curl_multi_wakeup`.
-///
-/// # Why a descriptor rather than a `tokio` notification
-///
-/// A [`tokio::sync::Notify`] would be the natural shape if the only requirement
-/// were to wake a task. It is not: the multi handle's wait is
-/// [`crate::conn::select::poll_sockets`] over a set of DESCRIPTORS, because the
-/// sockets it is waiting on are descriptors and the application may be waiting
-/// on its own alongside them. A notification cannot appear in that set. So the
-/// wakeup is descriptor-backed, and the contract is the C's: writing one byte
-/// makes a pending poll return.
-///
-/// The socket pair comes from [`socket2::Socket::pair`], which is a safe RAII
-/// wrapper -- the `socketpair` system call belongs to `socket2`, not to this
-/// file,
-/// and each end is owned by an [`OsSocket`] that closes it exactly once.
 ///
 /// # It is INTERNAL and must never be shown to the application
 ///
@@ -4874,12 +4332,6 @@ impl Wakeup {
     }
 
     /// A wakeup over one descriptor used for both directions.
-    ///
-    /// The shape a Linux `eventfd` arrives in. The socket is expected to be
-    /// non-blocking already, as `wakeup_eventfd` creates it with `EFD_NONBLOCK`
-    /// (`lib/socketpair.c:64-72`); it is set again here because
-    /// [`set_nonblocking`] is idempotent and a caller should not have to
-    /// remember.
     ///
     /// # Errors
     ///
@@ -4946,13 +4398,6 @@ impl Wakeup {
     ///   consumed yet, and one token is all a wakeup needs. This is where
     ///   signal COALESCING comes from, and it is the reason
     ///   [`Self::signal`] can be called from any thread as often as it likes.
-    ///
-    /// Returns the C's `int err`: zero for success and an `errno` otherwise.
-    ///
-    /// The token differs by backend -- `const uint64_t buf[1] = { 1 }` for
-    /// `eventfd`, which requires an eight-byte write, and `const char buf[1] =
-    /// { 1 }` otherwise. Eight bytes are written for the shared backing for
-    /// exactly that reason; a shorter write to an `eventfd` fails with `EINVAL`.
     #[allow(dead_code)]
     pub(crate) fn signal(&self) -> i32 {
         let shared = self.writer.is_none();
@@ -5020,15 +4465,6 @@ impl Wakeup {
     }
 
     /// `Curl_wakeup_destroy(socks)` (`lib/socketpair.c:363-373`).
-    ///
-    /// Explicit as well as automatic. [`Drop`] does the same thing, so a
-    /// [`Wakeup`] that simply goes out of scope is destroyed correctly; this
-    /// exists because the C has a named teardown that `curl_multi_cleanup`
-    /// calls, and a reader looking for its successor should find one.
-    ///
-    /// Consumes `self`, which is what makes the C's `socks[0] = socks[1] =
-    /// CURL_SOCKET_BAD` unnecessary: there is nothing left to hold a stale
-    /// descriptor.
     #[allow(dead_code)]
     pub(crate) fn destroy(self) {
         drop(self);
@@ -5036,54 +4472,37 @@ impl Wakeup {
 }
 
 // TESTS
-//
-// `tests/unit/*.c` (59 files) and `tests/libtest/*.c` (235) link a debug static
-// build of the C library and call internal `Curl_*` symbols, which a Rust static
-// library does not export. Their coverage therefore relocates into `#[cfg(test)]`
-// modules inside the files under test (AAP section 0.8.7), and this is this
-// file's share of that relocation.
-//
-// Every test below is DETERMINISTIC and touches no network. The clock is
-// `crate::util::timeval::TestClock`, readiness is a canned `FakeProbe`, the
-// resolver and the interface lookup are fakes, and the only real descriptors
-// used come from `socket2::Socket::pair` -- a local, connected pair that needs
-// no address, no name resolution and no peer. The handful of tests that do use
-// one are marked `#[cfg_attr(miri, ignore = ...)]`, because `cargo +nightly miri
-// test` is a mandated gate (AAP section 0.8.4) and Miri cannot execute a foreign
-// function; everything else, including all of the classification, parsing,
-// message and ownership coverage, runs under Miri unchanged.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::conn::filters::CURL_LOG_LVL_NONE;
     use crate::conn::select::WaitFds;
     use crate::conn::Addr2StringError;
+    use crate::util::sync_cell::SyncCell;
     use crate::util::timeval::TestClock;
-    use std::cell::{Cell, RefCell};
     use std::net::IpAddr;
+    use std::sync::Arc;
 
-    // ---------------------------------------------------------------
     // Test doubles
-    // ---------------------------------------------------------------
 
     /// A [`ConnState`] that records every publication.
     #[derive(Debug, Default)]
     struct FakeConn {
-        sockets: RefCell<[Socket; 2]>,
-        published: Cell<usize>,
-        cleared: Cell<usize>,
-        ipv6: Cell<Option<bool>>,
-        bound: Cell<Option<bool>>,
-        remote_port: Cell<u16>,
-        primary: RefCell<Option<IpQuadruple>>,
-        primary_port: Cell<u16>,
-        os_errno: Cell<i32>,
+        sockets: SyncCell<[Socket; 2]>,
+        published: SyncCell<usize>,
+        cleared: SyncCell<usize>,
+        ipv6: SyncCell<Option<bool>>,
+        bound: SyncCell<Option<bool>>,
+        remote_port: SyncCell<u16>,
+        primary: SyncCell<Option<IpQuadruple>>,
+        primary_port: SyncCell<u16>,
+        os_errno: SyncCell<i32>,
     }
 
     impl FakeConn {
         fn new() -> Self {
             Self {
-                sockets: RefCell::new([CURL_SOCKET_BAD; 2]),
+                sockets: SyncCell::new([CURL_SOCKET_BAD; 2]),
                 ..Self::default()
             }
         }
@@ -5132,21 +4551,21 @@ mod tests {
     /// that fails after readability reachable without a network.
     #[derive(Debug)]
     struct FakeProbe {
-        input: Cell<ProbeOutcome>,
-        connect: Cell<ConnectProgress>,
-        accept: RefCell<Vec<AcceptProbe>>,
-        input_calls: Cell<usize>,
-        connect_calls: Cell<usize>,
+        input: SyncCell<ProbeOutcome>,
+        connect: SyncCell<ConnectProgress>,
+        accept: SyncCell<Vec<AcceptProbe>>,
+        input_calls: SyncCell<usize>,
+        connect_calls: SyncCell<usize>,
     }
 
     impl FakeProbe {
         fn new() -> Self {
             Self {
-                input: Cell::new(ProbeOutcome::Timeout),
-                connect: Cell::new(ConnectProgress::Connected),
-                accept: RefCell::new(Vec::new()),
-                input_calls: Cell::new(0),
-                connect_calls: Cell::new(0),
+                input: SyncCell::new(ProbeOutcome::Timeout),
+                connect: SyncCell::new(ConnectProgress::Connected),
+                accept: SyncCell::new(Vec::new()),
+                input_calls: SyncCell::new(0),
+                connect_calls: SyncCell::new(0),
             }
         }
 
@@ -5188,8 +4607,8 @@ mod tests {
     /// A [`CloseSocket`] that records what it was handed.
     #[derive(Debug, Default)]
     struct FakeClose {
-        closed: RefCell<Vec<Socket>>,
-        result: Cell<i32>,
+        closed: SyncCell<Vec<Socket>>,
+        result: SyncCell<i32>,
     }
 
     impl CloseSocket for FakeClose {
@@ -5204,7 +4623,7 @@ mod tests {
     /// A [`MultiCloseObserver`] that records every notification.
     #[derive(Debug, Default)]
     struct FakeObserver {
-        seen: RefCell<Vec<Socket>>,
+        seen: SyncCell<Vec<Socket>>,
     }
 
     impl MultiCloseObserver for FakeObserver {
@@ -5217,14 +4636,14 @@ mod tests {
     #[derive(Debug)]
     struct FakeSockOpt {
         verdict: SockOptOutcome,
-        purposes: RefCell<Vec<SockPurpose>>,
+        purposes: SyncCell<Vec<SockPurpose>>,
     }
 
     impl FakeSockOpt {
         fn new(verdict: SockOptOutcome) -> Self {
             Self {
                 verdict,
-                purposes: RefCell::new(Vec::new()),
+                purposes: SyncCell::new(Vec::new()),
             }
         }
     }
@@ -5243,17 +4662,17 @@ mod tests {
     /// An [`If2Ip`] with a canned verdict, recording every bind-to-device call.
     #[derive(Debug)]
     struct FakeIf2Ip {
-        verdict: RefCell<If2IpResult>,
-        device_ok: Cell<bool>,
-        devices: RefCell<Vec<Vec<u8>>>,
+        verdict: SyncCell<If2IpResult>,
+        device_ok: SyncCell<bool>,
+        devices: SyncCell<Vec<Vec<u8>>>,
     }
 
     impl FakeIf2Ip {
         fn new(verdict: If2IpResult) -> Self {
             Self {
-                verdict: RefCell::new(verdict),
-                device_ok: Cell::new(false),
-                devices: RefCell::new(Vec::new()),
+                verdict: SyncCell::new(verdict),
+                device_ok: SyncCell::new(false),
+                devices: SyncCell::new(Vec::new()),
             }
         }
 
@@ -5291,13 +4710,15 @@ mod tests {
     /// A [`BindResolver`] with a canned answer.
     #[derive(Debug, Default)]
     struct FakeResolver {
-        answer: RefCell<Option<Vec<ResolvedAddr>>>,
+        answer: SyncCell<Option<Vec<ResolvedAddr>>>,
     }
 
     impl FakeResolver {
         fn resolving_to(addr: SocketAddr) -> Self {
             Self {
-                answer: RefCell::new(Some(vec![ResolvedAddr::tcp(addr, None)])),
+                answer: SyncCell::new(Some(vec![ResolvedAddr::tcp(
+                    addr, None,
+                )])),
             }
         }
     }
@@ -5323,9 +4744,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // Fixtures
-    // ---------------------------------------------------------------
 
     fn clock_at(secs: i64) -> TestClock {
         TestClock::new(CurlTime::new(secs, 0))
@@ -5345,9 +4764,9 @@ mod tests {
     fn filter_over(
         kind: SocketFilterKind,
         socket: OsSocket,
-        conn: Rc<FakeConn>,
-        close: Option<Rc<FakeClose>>,
-        observer: Option<Rc<FakeObserver>>,
+        conn: Arc<FakeConn>,
+        close: Option<Arc<FakeClose>>,
+        observer: Option<Arc<FakeObserver>>,
     ) -> SocketFilter {
         let mut hooks = SocketHooks {
             conn,
@@ -5372,9 +4791,7 @@ mod tests {
         )
     }
 
-    // ---------------------------------------------------------------
     // 1. Transport conversion, including the reserved values
-    // ---------------------------------------------------------------
 
     /// Required test 1.
     #[test]
@@ -5427,9 +4844,7 @@ mod tests {
         assert_eq!(SocketIndex::Secondary.as_i32(), SECONDARYSOCKET);
     }
 
-    // ---------------------------------------------------------------
     // 2. The transport-to-socket parameter mapping
-    // ---------------------------------------------------------------
 
     /// Required test 2.
     #[test]
@@ -5475,9 +4890,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // 3. The address-size failure
-    // ---------------------------------------------------------------
 
     /// Required test 3.
     #[test]
@@ -5510,14 +4923,6 @@ mod tests {
     }
 
     /// The address-text bound the fixed C buffers impose.
-    ///
-    /// `struct ip_quadruple` holds both addresses as `char[MAX_IPADR_LEN]`
-    /// (`lib/urldata.h:574-575`) and [`MAX_IPADR_LEN`] is
-    /// `sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")`
-    /// (`lib/urldata.h:124`) -- forty-five printable bytes plus the terminator.
-    /// Nothing truncates in this file, because the quadruple holds `String`s;
-    /// the bound matters because `curl-rs-ffi` copies these into those fixed
-    /// arrays for `CURLINFO_PRIMARY_IP` and `CURLINFO_LOCAL_IP`.
     #[test]
     fn the_address_text_bound_is_the_c_buffer_size() {
         assert_eq!(
@@ -5573,9 +4978,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // 4. The interface parser
-    // ---------------------------------------------------------------
 
     /// Required test 4 -- the four accepted forms.
     #[test]
@@ -5657,9 +5060,7 @@ mod tests {
         assert!(parsed.dev.is_none(), "the ifhost arm claimed it, not if!");
     }
 
-    // ---------------------------------------------------------------
     // 5. Callback purpose and verdict mapping
-    // ---------------------------------------------------------------
 
     /// Required test 5.
     #[test]
@@ -5703,9 +5104,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // 6. The callback-created already-connected path
-    // ---------------------------------------------------------------
 
     /// An [`OpenSocket`] that hands over one end of a local pair.
     ///
@@ -5715,8 +5114,8 @@ mod tests {
     /// [`callback_address_rewrites_are_honoured`] can observe it.
     #[derive(Debug)]
     struct FakeOpen {
-        socket: RefCell<Option<OsSocket>>,
-        purposes: RefCell<Vec<SockPurpose>>,
+        socket: SyncCell<Option<OsSocket>>,
+        purposes: SyncCell<Vec<SockPurpose>>,
         rewrite_to: Option<SocketAddr>,
         refuse: Option<OpenSocketError>,
     }
@@ -5724,8 +5123,8 @@ mod tests {
     impl FakeOpen {
         fn handing_over(socket: OsSocket) -> Self {
             Self {
-                socket: RefCell::new(Some(socket)),
-                purposes: RefCell::new(Vec::new()),
+                socket: SyncCell::new(Some(socket)),
+                purposes: SyncCell::new(Vec::new()),
                 rewrite_to: None,
                 refuse: None,
             }
@@ -5733,8 +5132,8 @@ mod tests {
 
         fn refusing(error: OpenSocketError) -> Self {
             Self {
-                socket: RefCell::new(None),
-                purposes: RefCell::new(Vec::new()),
+                socket: SyncCell::new(None),
+                purposes: SyncCell::new(Vec::new()),
                 rewrite_to: None,
                 refuse: Some(error),
             }
@@ -5773,10 +5172,10 @@ mod tests {
 
     /// Builds a filter whose socket comes from an injected opener.
     fn filter_with_open(
-        open: Rc<FakeOpen>,
-        sockopt: Option<Rc<FakeSockOpt>>,
-        conn: Rc<FakeConn>,
-        probe: Rc<FakeProbe>,
+        open: Arc<FakeOpen>,
+        sockopt: Option<Arc<FakeSockOpt>>,
+        conn: Arc<FakeConn>,
+        probe: Arc<FakeProbe>,
     ) -> SocketFilter {
         let mut hooks = SocketHooks {
             open: Some(open),
@@ -5806,15 +5205,15 @@ mod tests {
         let (theirs, _keepalive) = socket_pair();
         let clock = clock_at(1_000);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let sockopt =
-            Rc::new(FakeSockOpt::new(SockOptOutcome::AlreadyConnected));
-        let probe = Rc::new(FakeProbe::new());
+            Arc::new(FakeSockOpt::new(SockOptOutcome::AlreadyConnected));
+        let probe = Arc::new(FakeProbe::new());
         let mut filter = filter_with_open(
-            Rc::new(FakeOpen::handing_over(theirs)),
-            Some(Rc::clone(&sockopt)),
-            Rc::clone(&conn),
-            Rc::clone(&probe),
+            Arc::new(FakeOpen::handing_over(theirs)),
+            Some(Arc::clone(&sockopt)),
+            Arc::clone(&conn),
+            Arc::clone(&probe),
         );
 
         assert!(
@@ -5843,12 +5242,12 @@ mod tests {
         let (theirs, _keepalive) = socket_pair();
         let clock = clock_at(1_000);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let mut filter = filter_with_open(
-            Rc::new(FakeOpen::handing_over(theirs)),
-            Some(Rc::new(FakeSockOpt::new(SockOptOutcome::Error))),
-            Rc::clone(&conn),
-            Rc::new(FakeProbe::new()),
+            Arc::new(FakeOpen::handing_over(theirs)),
+            Some(Arc::new(FakeSockOpt::new(SockOptOutcome::Error))),
+            Arc::clone(&conn),
+            Arc::new(FakeProbe::new()),
         );
         let error = filter.connect(&mut cx).expect_err("the callback refused");
         assert_eq!(error.code(), CURLcode::AbortedByCallback);
@@ -5865,10 +5264,10 @@ mod tests {
         let rewritten: SocketAddr =
             "198.51.100.7:8443".parse().expect("an endpoint");
         let mut filter = filter_with_open(
-            Rc::new(FakeOpen::handing_over(theirs).rewriting(rewritten)),
+            Arc::new(FakeOpen::handing_over(theirs).rewriting(rewritten)),
             None,
-            Rc::new(FakeConn::new()),
-            Rc::new(FakeProbe::new()),
+            Arc::new(FakeConn::new()),
+            Arc::new(FakeProbe::new()),
         );
         let _ = filter.connect(&mut cx);
         assert_eq!(
@@ -5889,10 +5288,10 @@ mod tests {
             (OpenSocketError::OutOfMemory, CURLcode::OutOfMemory),
         ] {
             let mut filter = filter_with_open(
-                Rc::new(FakeOpen::refusing(refusal)),
+                Arc::new(FakeOpen::refusing(refusal)),
                 None,
-                Rc::new(FakeConn::new()),
-                Rc::new(FakeProbe::new()),
+                Arc::new(FakeConn::new()),
+                Arc::new(FakeProbe::new()),
             );
             let error =
                 filter.connect(&mut cx).expect_err("the opener refused");
@@ -5900,9 +5299,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // 7, 8, 9, 29. The close-callback asymmetry, and closing exactly once
-    // ---------------------------------------------------------------
 
     /// Required test 7 -- the public path NEVER invokes the callback.
     #[test]
@@ -5910,7 +5307,7 @@ mod tests {
     fn the_public_close_bypasses_the_callback() {
         let (ours, _theirs) = socket_pair();
         let raw = ours.as_raw_fd();
-        let observer = Rc::new(FakeObserver::default());
+        let observer = Arc::new(FakeObserver::default());
         let rc = socket_close(ours, Some(observer.as_ref()));
         assert_eq!(rc, 0, "Curl_socket_close reports zero");
         assert_eq!(
@@ -5932,7 +5329,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "uses a real socket pair")]
     fn the_public_close_has_no_callback_parameter() {
         let (ours, _theirs) = socket_pair();
-        let callback = Rc::new(FakeClose::default());
+        let callback = Arc::new(FakeClose::default());
         let _ = socket_close(ours, None);
         assert!(
             callback.closed.borrow().is_empty(),
@@ -5948,15 +5345,15 @@ mod tests {
         let raw = ours.as_raw_fd();
         let clock = clock_at(5);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
-        let close = Rc::new(FakeClose::default());
-        let observer = Rc::new(FakeObserver::default());
+        let conn = Arc::new(FakeConn::new());
+        let close = Arc::new(FakeClose::default());
+        let observer = Arc::new(FakeObserver::default());
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::clone(&conn),
-            Some(Rc::clone(&close)),
-            Some(Rc::clone(&observer)),
+            Arc::clone(&conn),
+            Some(Arc::clone(&close)),
+            Some(Arc::clone(&observer)),
         );
         assert!(!filter.context().is_accepted());
 
@@ -5983,14 +5380,14 @@ mod tests {
         let raw = ours.as_raw_fd();
         let clock = clock_at(5);
         let mut cx = CallCtx::new(&clock);
-        let close = Rc::new(FakeClose::default());
-        let observer = Rc::new(FakeObserver::default());
+        let close = Arc::new(FakeClose::default());
+        let observer = Arc::new(FakeObserver::default());
         let mut filter = filter_over(
             SocketFilterKind::TcpAccept,
             ours,
-            Rc::new(FakeConn::new()),
-            Some(Rc::clone(&close)),
-            Some(Rc::clone(&observer)),
+            Arc::new(FakeConn::new()),
+            Some(Arc::clone(&close)),
+            Some(Arc::clone(&observer)),
         );
         // `ctx->accepted = TRUE` is what the accept path sets.
         filter.ctx.accepted = true;
@@ -6022,12 +5419,12 @@ mod tests {
         // Path 1: close, then close again.
         let (ours, _theirs) = socket_pair();
         let mut cx = CallCtx::new(&clock);
-        let close = Rc::new(FakeClose::default());
+        let close = Arc::new(FakeClose::default());
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
-            Some(Rc::clone(&close)),
+            Arc::new(FakeConn::new()),
+            Some(Arc::clone(&close)),
             None,
         );
         filter.close(&mut cx);
@@ -6036,12 +5433,12 @@ mod tests {
 
         // Path 2: close, then destroy.
         let (ours, _theirs) = socket_pair();
-        let close = Rc::new(FakeClose::default());
+        let close = Arc::new(FakeClose::default());
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
-            Some(Rc::clone(&close)),
+            Arc::new(FakeConn::new()),
+            Some(Arc::clone(&close)),
             None,
         );
         filter.close(&mut cx);
@@ -6050,12 +5447,12 @@ mod tests {
 
         // Path 3: destroy alone still closes once.
         let (ours, _theirs) = socket_pair();
-        let close = Rc::new(FakeClose::default());
+        let close = Arc::new(FakeClose::default());
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
-            Some(Rc::clone(&close)),
+            Arc::new(FakeConn::new()),
+            Some(Arc::clone(&close)),
             None,
         );
         filter.destroy(&mut cx);
@@ -6063,12 +5460,12 @@ mod tests {
 
         // Path 4: forget, then close -- the callback must NOT see it.
         let (ours, _theirs) = socket_pair();
-        let close = Rc::new(FakeClose::default());
+        let close = Arc::new(FakeClose::default());
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
-            Some(Rc::clone(&close)),
+            Arc::new(FakeConn::new()),
+            Some(Arc::clone(&close)),
             None,
         );
         filter
@@ -6091,7 +5488,7 @@ mod tests {
         let (loser, _keep_loser) = socket_pair();
         let clock = clock_at(5);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         // The winner published a DIFFERENT descriptor.
         let winner_fd = loser.as_raw_fd() + 4242;
         conn.publish_socket(SocketIndex::First, winner_fd);
@@ -6099,7 +5496,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             loser,
-            Rc::clone(&conn),
+            Arc::clone(&conn),
             None,
             None,
         );
@@ -6121,12 +5518,12 @@ mod tests {
         let raw = ours.as_raw_fd();
         let clock = clock_at(5);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         conn.publish_socket(SocketIndex::First, raw);
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::clone(&conn),
+            Arc::clone(&conn),
             None,
             None,
         );
@@ -6135,9 +5532,7 @@ mod tests {
         assert_eq!(conn.cleared.get(), 1);
     }
 
-    // ---------------------------------------------------------------
     // 10. Non-blocking mode is idempotent
-    // ---------------------------------------------------------------
 
     /// Required test 10.
     ///
@@ -6162,9 +5557,7 @@ mod tests {
         assert!(!socket.nonblocking().expect("still blocking"));
     }
 
-    // ---------------------------------------------------------------
     // 11, 21, 22. The two-phase contract and the control events
-    // ---------------------------------------------------------------
 
     /// Required test 11 -- creating and connecting publishes NOTHING.
     #[test]
@@ -6173,13 +5566,13 @@ mod tests {
         let (theirs, _keepalive) = socket_pair();
         let clock = clock_at(2_000);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let probe =
-            Rc::new(FakeProbe::new().with_connect(ConnectProgress::Connected));
+            Arc::new(FakeProbe::new().with_connect(ConnectProgress::Connected));
         let mut filter = filter_with_open(
-            Rc::new(FakeOpen::handing_over(theirs)),
+            Arc::new(FakeOpen::handing_over(theirs)),
             None,
-            Rc::clone(&conn),
+            Arc::clone(&conn),
             probe,
         );
 
@@ -6223,11 +5616,11 @@ mod tests {
         // Not connected: nothing is published.
         let (ours, _theirs) = socket_pair();
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::clone(&conn),
+            Arc::clone(&conn),
             None,
             None,
         );
@@ -6250,7 +5643,7 @@ mod tests {
 
         // Connected on SECONDARYSOCKET: not published.
         let (ours, _theirs) = socket_pair();
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let mut hooks = SocketHooks {
             conn: conn.clone(),
             ..SocketHooks::default()
@@ -6284,7 +5677,7 @@ mod tests {
         let clock = clock_at(7);
         let mut cx = CallCtx::new(&clock);
         let (ours, _theirs) = socket_pair();
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let hooks = SocketHooks {
             conn: conn.clone(),
             ..SocketHooks::default()
@@ -6319,14 +5712,14 @@ mod tests {
         let raw = ours.as_raw_fd();
         let clock = clock_at(9);
         let mut cx = CallCtx::new(&clock);
-        let close = Rc::new(FakeClose::default());
-        let observer = Rc::new(FakeObserver::default());
+        let close = Arc::new(FakeClose::default());
+        let observer = Arc::new(FakeObserver::default());
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
-            Some(Rc::clone(&close)),
-            Some(Rc::clone(&observer)),
+            Arc::new(FakeConn::new()),
+            Some(Arc::clone(&close)),
+            Some(Arc::clone(&observer)),
         );
 
         filter
@@ -6359,9 +5752,7 @@ mod tests {
         let _ = raw;
     }
 
-    // ---------------------------------------------------------------
     // 12. The `Trying` lines keep their two leading spaces
-    // ---------------------------------------------------------------
 
     /// Required test 12.
     #[test]
@@ -6505,16 +5896,14 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // 13, 14, 15. `bindlocal`
-    // ---------------------------------------------------------------
 
     /// Builds the pieces `bindlocal` needs, over a real socket.
     fn bind_fixture(
         bind: BindConfig,
-        interfaces: Rc<FakeIf2Ip>,
-        resolver: Rc<FakeResolver>,
-        conn: Rc<FakeConn>,
+        interfaces: Arc<FakeIf2Ip>,
+        resolver: Arc<FakeResolver>,
+        conn: Arc<FakeConn>,
     ) -> (SocketHooks, SocketSettings) {
         let hooks = SocketHooks {
             conn,
@@ -6536,12 +5925,12 @@ mod tests {
         let (socket, _theirs) = socket_pair();
         let clock = clock_at(1);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let (hooks, settings) = bind_fixture(
             BindConfig::default(),
-            Rc::new(FakeIf2Ip::new(If2IpResult::NotFound)),
-            Rc::new(FakeResolver::default()),
-            Rc::clone(&conn),
+            Arc::new(FakeIf2Ip::new(If2IpResult::NotFound)),
+            Arc::new(FakeResolver::default()),
+            Arc::clone(&conn),
         );
         assert_eq!(
             bindlocal(
@@ -6575,9 +5964,9 @@ mod tests {
             };
             let (hooks, settings) = bind_fixture(
                 bind,
-                Rc::new(FakeIf2Ip::new(If2IpResult::AfNotSupported)),
-                Rc::new(FakeResolver::default()),
-                Rc::new(FakeConn::new()),
+                Arc::new(FakeIf2Ip::new(If2IpResult::AfNotSupported)),
+                Arc::new(FakeResolver::default()),
+                Arc::new(FakeConn::new()),
             );
             let outcome = bindlocal(
                 &mut cx,
@@ -6611,15 +6000,15 @@ mod tests {
 
         // NOT FOUND with an EXPLICIT interface and no host: do not fall back.
         let (socket, _a) = socket_pair();
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let (hooks, settings) = bind_fixture(
             BindConfig {
                 interface: Some(b"vrf-blue".to_vec()),
                 ..BindConfig::default()
             },
-            Rc::new(FakeIf2Ip::new(If2IpResult::NotFound)),
-            Rc::new(FakeResolver::default()),
-            Rc::clone(&conn),
+            Arc::new(FakeIf2Ip::new(If2IpResult::NotFound)),
+            Arc::new(FakeResolver::default()),
+            Arc::clone(&conn),
         );
         assert_eq!(
             bindlocal(
@@ -6641,9 +6030,9 @@ mod tests {
                 interface: Some(b"eth0".to_vec()),
                 ..BindConfig::default()
             },
-            Rc::new(FakeIf2Ip::new(If2IpResult::AfNotSupported)),
-            Rc::new(FakeResolver::default()),
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeIf2Ip::new(If2IpResult::AfNotSupported)),
+            Arc::new(FakeResolver::default()),
+            Arc::new(FakeConn::new()),
         );
         assert_eq!(
             bindlocal(
@@ -6663,15 +6052,17 @@ mod tests {
         // that an Internet address IS bound.
         let socket = OsSocket::new(Domain::IPV4, OsType::STREAM, None)
             .expect("a TCP socket");
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let (hooks, settings) = bind_fixture(
             BindConfig {
                 interface: Some(b"lo".to_vec()),
                 ..BindConfig::default()
             },
-            Rc::new(FakeIf2Ip::new(If2IpResult::Found("127.0.0.1".to_owned()))),
-            Rc::new(FakeResolver::default()),
-            Rc::clone(&conn),
+            Arc::new(FakeIf2Ip::new(If2IpResult::Found(
+                "127.0.0.1".to_owned(),
+            ))),
+            Arc::new(FakeResolver::default()),
+            Arc::clone(&conn),
         );
         assert_eq!(
             bindlocal(
@@ -6710,15 +6101,15 @@ mod tests {
         let clock = clock_at(1);
         let mut cx = CallCtx::new(&clock);
         let interfaces =
-            Rc::new(FakeIf2Ip::new(If2IpResult::NotFound).with_device_ok());
+            Arc::new(FakeIf2Ip::new(If2IpResult::NotFound).with_device_ok());
         let (hooks, settings) = bind_fixture(
             BindConfig {
                 interface: Some(b"eth0".to_vec()),
                 ..BindConfig::default()
             },
-            Rc::clone(&interfaces),
-            Rc::new(FakeResolver::default()),
-            Rc::new(FakeConn::new()),
+            Arc::clone(&interfaces),
+            Arc::new(FakeResolver::default()),
+            Arc::new(FakeConn::new()),
         );
         assert_eq!(
             bindlocal(
@@ -6735,6 +6126,56 @@ mod tests {
         assert_eq!(interfaces.devices.borrow().as_slice(), &[b"eth0".to_vec()]);
     }
 
+    /// The REAL [`SystemIf2Ip`] reaches the right arm for the target it is
+    /// compiled for.
+    ///
+    /// `SO_BINDTODEVICE` is a Linux extension, so [`If2Ip::bind_to_device`]
+    /// has two implementations and exactly one of them compiles per target.
+    /// The tests above all drive [`FakeIf2Ip`], which would pass either way,
+    /// so this is the only place the platform split itself is checked.
+    ///
+    /// The interface name is deliberately one that cannot exist. On Linux that
+    /// makes the real `setsockopt` fail on its own terms -- `ENODEV`, or
+    /// `EPERM` when unprivileged -- and the assertion is that the failure is
+    /// NOT [`io::ErrorKind::Unsupported`], which is what distinguishes having
+    /// reached the syscall from having been answered by the other arm. On a
+    /// target without the option the assertion is the exact opposite, so
+    /// neither arm can be mistaken for the other.
+    #[test]
+    #[cfg_attr(miri, ignore = "uses a real socket pair")]
+    fn device_binding_reports_unsupported_only_where_the_option_is_absent() {
+        let (socket, _theirs) = socket_pair();
+        let outcome =
+            SystemIf2Ip.bind_to_device(&socket, b"curl-rs-no-such-iface");
+        let kind = outcome
+            .expect_err("no such interface exists, so this cannot succeed")
+            .kind();
+
+        #[cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        ))]
+        assert_ne!(
+            kind,
+            io::ErrorKind::Unsupported,
+            "this target HAS SO_BINDTODEVICE, so the failure must come from \
+             the syscall rather than from the unsupported-target arm"
+        );
+
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        )))]
+        assert_eq!(
+            kind,
+            io::ErrorKind::Unsupported,
+            "this target has no SO_BINDTODEVICE, so the call must report \
+             Unsupported rather than attempting anything"
+        );
+    }
+
     /// A resolved bind host of the WRONG family signals the caller.
     #[test]
     #[cfg_attr(miri, ignore = "uses a real socket pair")]
@@ -6747,12 +6188,12 @@ mod tests {
                 bindhost: Some(b"example.test".to_vec()),
                 ..BindConfig::default()
             },
-            Rc::new(FakeIf2Ip::new(If2IpResult::NotFound)),
+            Arc::new(FakeIf2Ip::new(If2IpResult::NotFound)),
             // An IPv6 answer for an IPv4 connection.
-            Rc::new(FakeResolver::resolving_to(
+            Arc::new(FakeResolver::resolving_to(
                 "[::1]:80".parse().expect("an endpoint"),
             )),
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
         );
         assert_eq!(
             bindlocal(
@@ -6774,15 +6215,15 @@ mod tests {
         let (socket, _theirs) = socket_pair();
         let clock = clock_at(1);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let (hooks, settings) = bind_fixture(
             BindConfig {
                 bindhost: Some(b"nowhere.invalid".to_vec()),
                 ..BindConfig::default()
             },
-            Rc::new(FakeIf2Ip::new(If2IpResult::NotFound)),
-            Rc::new(FakeResolver::default()),
-            Rc::clone(&conn),
+            Arc::new(FakeIf2Ip::new(If2IpResult::NotFound)),
+            Arc::new(FakeResolver::default()),
+            Arc::clone(&conn),
         );
         assert_eq!(
             bindlocal(
@@ -6919,21 +6360,13 @@ mod tests {
     }
 
     /// Required test 14 -- the range walks upward and STOPS on the wrap.
-    ///
-    /// Driven through the real loop over a real socket. A `SOCK_STREAM` socket
-    /// in the `AF_UNIX` domain cannot be bound to an Internet address, so every
-    /// attempt fails and the loop runs to exhaustion -- which is exactly the
-    /// path being measured. The retry messages are what count the attempts, and
-    /// they are checked through the port arithmetic instead: starting at
-    /// `u16::MAX` with a range of four, the very first increment wraps to zero
-    /// and the loop must stop rather than try port zero.
     #[test]
     #[cfg_attr(miri, ignore = "uses a real socket pair")]
     fn the_bind_port_range_stops_on_the_wrap() {
         let clock = clock_at(1);
         let mut cx = CallCtx::new(&clock);
         let (socket, _theirs) = socket_pair();
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let hooks = SocketHooks {
             conn: conn.clone(),
             ..SocketHooks::default()
@@ -6968,7 +6401,7 @@ mod tests {
         let clock = clock_at(1);
         let mut cx = CallCtx::new(&clock);
         let (socket, _theirs) = socket_pair();
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let hooks = SocketHooks {
             conn: conn.clone(),
             ..SocketHooks::default()
@@ -7001,7 +6434,7 @@ mod tests {
         let mut cx = CallCtx::new(&clock);
         let socket = OsSocket::new(Domain::IPV4, OsType::STREAM, None)
             .expect("a TCP socket");
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let hooks = SocketHooks {
             conn: conn.clone(),
             ..SocketHooks::default()
@@ -7037,14 +6470,14 @@ mod tests {
         let (theirs, _keepalive) = socket_pair();
         let clock = clock_at(1);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let hooks = SocketHooks {
-            open: Some(Rc::new(FakeOpen::handing_over(theirs))),
+            open: Some(Arc::new(FakeOpen::handing_over(theirs))),
             conn: conn.clone(),
-            probe: Rc::new(FakeProbe::new()),
+            probe: Arc::new(FakeProbe::new()),
             // The interface exists but has no address of this family, which is
             // the verdict `bindlocal` turns into CURLE_UNSUPPORTED_PROTOCOL.
-            interfaces: Rc::new(FakeIf2Ip::new(If2IpResult::AfNotSupported)),
+            interfaces: Arc::new(FakeIf2Ip::new(If2IpResult::AfNotSupported)),
             ..SocketHooks::default()
         };
         let settings = SocketSettings {
@@ -7072,10 +6505,8 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
     // 16, 17. The two classification tables, and the one value that
     //         separates them
-    // ---------------------------------------------------------------
 
     /// Builds the OS error for a condition, the way a socket would report it.
     fn os_error(condition: SocketCondition) -> io::Error {
@@ -7118,14 +6549,6 @@ mod tests {
     }
 
     /// The would-block classification, driven by a REAL would-block.
-    ///
-    /// The C writes `(SOCKEWOULDBLOCK == sockerr) || (EAGAIN == sockerr)`
-    /// because the two macros differ on some platforms. Neither number can be
-    /// named here -- `libc` is reachable only from `crate::ffi::sys`, which
-    /// exports the one value [`std::io::ErrorKind`] cannot supply and no more --
-    /// so the evidence is produced instead of asserted: an empty non-blocking
-    /// socket reports exactly this condition, whichever number its platform
-    /// chose, and [`classify`] must recognise it.
     #[test]
     #[cfg_attr(miri, ignore = "uses a real socket pair")]
     fn a_real_would_block_is_classified_as_would_block() {
@@ -7217,7 +6640,7 @@ mod tests {
         let clock = clock_at(5);
         let mut cx = CallCtx::new(&clock);
         let (ours, theirs) = socket_pair();
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let mut filter =
             filter_over(SocketFilterKind::Tcp, ours, conn.clone(), None, None);
         // A short send over a live pair succeeds and reports the exact count.
@@ -7287,9 +6710,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
     // 18. The first-byte timestamp
-    // ---------------------------------------------------------------
 
     /// Required test 18 -- recorded on the first success and never again.
     #[test]
@@ -7301,7 +6722,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -7349,7 +6770,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -7363,9 +6784,7 @@ mod tests {
         assert_eq!(filter.ctx.first_byte_at(), CurlTime::new(7, 0));
     }
 
-    // ---------------------------------------------------------------
     // 19. The shutdown drain
-    // ---------------------------------------------------------------
 
     /// Required test 19 -- at most one read of at most 1024 bytes, always done.
     #[test]
@@ -7387,7 +6806,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -7429,7 +6848,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -7453,7 +6872,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Udp,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -7469,9 +6888,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
     // 20. The query answers
-    // ---------------------------------------------------------------
 
     /// Required test 20 -- UDP and QUIC time from the first byte, others from
     /// the connect.
@@ -7491,7 +6908,7 @@ mod tests {
         ] {
             let (ours, _theirs) = socket_pair();
             let mut filter =
-                filter_over(kind, ours, Rc::new(FakeConn::new()), None, None);
+                filter_over(kind, ours, Arc::new(FakeConn::new()), None, None);
             filter.ctx.transport = transport;
             filter.ctx.connected_at = connected;
             filter.ctx.first_byte_at = first_byte;
@@ -7521,7 +6938,7 @@ mod tests {
             let mut filter = filter_over(
                 SocketFilterKind::Udp,
                 ours,
-                Rc::new(FakeConn::new()),
+                Arc::new(FakeConn::new()),
                 None,
                 None,
             );
@@ -7554,7 +6971,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -7607,7 +7024,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -7708,7 +7125,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -7734,9 +7151,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // 23. Liveness
-    // ---------------------------------------------------------------
 
     /// Required test 23 -- the whole liveness mapping.
     #[test]
@@ -7790,7 +7205,7 @@ mod tests {
 
         for (outcome, expected, why) in cases {
             let (ours, _theirs) = socket_pair();
-            let probe = Rc::new(FakeProbe::new().with_input(outcome));
+            let probe = Arc::new(FakeProbe::new().with_input(outcome));
             let hooks = SocketHooks {
                 probe,
                 ..SocketHooks::default()
@@ -7815,7 +7230,7 @@ mod tests {
     fn a_filter_without_a_socket_is_dead() {
         let clock = clock_at(1);
         let mut cx = CallCtx::new(&clock);
-        let probe = Rc::new(FakeProbe::new());
+        let probe = Arc::new(FakeProbe::new());
         let hooks = SocketHooks {
             probe: probe.clone(),
             ..SocketHooks::default()
@@ -7834,9 +7249,7 @@ mod tests {
         assert_eq!(probe.input_calls.get(), 0, "there was nothing to probe");
     }
 
-    // ---------------------------------------------------------------
     // The four filter identities
-    // ---------------------------------------------------------------
 
     /// All four carry `CF_TYPE_IP_CONNECT`, trace level NONE, and their names.
     #[test]
@@ -7951,7 +7364,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::TcpAccept,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -7966,7 +7379,7 @@ mod tests {
         let mut filter = filter_over(
             SocketFilterKind::Tcp,
             ours,
-            Rc::new(FakeConn::new()),
+            Arc::new(FakeConn::new()),
             None,
             None,
         );
@@ -8014,9 +7427,7 @@ mod tests {
         assert!(ps.is_empty());
     }
 
-    // ---------------------------------------------------------------
     // 24. TCP-ACCEPT
-    // ---------------------------------------------------------------
 
     /// The accept deadline folds the generic one in, with the C's fake zero.
     #[test]
@@ -8027,7 +7438,7 @@ mod tests {
         let mut filter = {
             let (listener, _peer) = socket_pair();
             let hooks = SocketHooks {
-                deadline: Rc::new(FakeDeadline(0)),
+                deadline: Arc::new(FakeDeadline(0)),
                 ..SocketHooks::default()
             };
             SocketFilter::new(
@@ -8071,7 +7482,7 @@ mod tests {
         let mut filter = {
             let (listener, _peer) = socket_pair();
             let hooks = SocketHooks {
-                deadline: Rc::new(FakeDeadline(250)),
+                deadline: Arc::new(FakeDeadline(250)),
                 ..SocketHooks::default()
             };
             SocketFilter::new(
@@ -8132,8 +7543,8 @@ mod tests {
         let clock = clock_at(0);
         let (listener, _peer) = socket_pair();
         let hooks = SocketHooks {
-            deadline: Rc::new(FakeDeadline(0)),
-            probe: Rc::new(FakeProbe::new()),
+            deadline: Arc::new(FakeDeadline(0)),
+            probe: Arc::new(FakeProbe::new()),
             ..SocketHooks::default()
         };
         let mut filter = SocketFilter::new(
@@ -8169,11 +7580,11 @@ mod tests {
         let listener_fd = listener.as_raw_fd();
         let accepted_fd = accepted.as_raw_fd();
 
-        let conn = Rc::new(FakeConn::new());
-        let close = Rc::new(FakeClose::default());
-        let observer = Rc::new(FakeObserver::default());
-        let sockopt = Rc::new(FakeSockOpt::new(SockOptOutcome::Ok));
-        let probe = Rc::new(
+        let conn = Arc::new(FakeConn::new());
+        let close = Arc::new(FakeClose::default());
+        let observer = Arc::new(FakeObserver::default());
+        let sockopt = Arc::new(FakeSockOpt::new(SockOptOutcome::Ok));
+        let probe = Arc::new(
             FakeProbe::new().with_accept(AcceptProbe::Accepted(accepted)),
         );
         let hooks = SocketHooks {
@@ -8182,7 +7593,7 @@ mod tests {
             will_close: Some(observer.clone()),
             sockopt: Some(sockopt.clone()),
             probe,
-            deadline: Rc::new(FakeDeadline(0)),
+            deadline: Arc::new(FakeDeadline(0)),
             ..SocketHooks::default()
         };
         let mut filter = SocketFilter::new(
@@ -8264,13 +7675,13 @@ mod tests {
             let (listener, _lpeer) = socket_pair();
             let (accepted, _apeer) = socket_pair();
             let hooks = SocketHooks {
-                conn: Rc::new(FakeConn::new()),
-                sockopt: Some(Rc::new(FakeSockOpt::new(verdict))),
-                probe: Rc::new(
+                conn: Arc::new(FakeConn::new()),
+                sockopt: Some(Arc::new(FakeSockOpt::new(verdict))),
+                probe: Arc::new(
                     FakeProbe::new()
                         .with_accept(AcceptProbe::Accepted(accepted)),
                 ),
-                deadline: Rc::new(FakeDeadline(0)),
+                deadline: Arc::new(FakeDeadline(0)),
                 ..SocketHooks::default()
             };
             let mut filter = SocketFilter::new(
@@ -8299,9 +7710,9 @@ mod tests {
         let build = |probe: FakeProbe| {
             let (listener, peer) = socket_pair();
             let hooks = SocketHooks {
-                conn: Rc::new(FakeConn::new()),
-                probe: Rc::new(probe),
-                deadline: Rc::new(FakeDeadline(0)),
+                conn: Arc::new(FakeConn::new()),
+                probe: Arc::new(probe),
+                deadline: Arc::new(FakeDeadline(0)),
                 ..SocketHooks::default()
             };
             let mut filter = SocketFilter::new(
@@ -8351,7 +7762,7 @@ mod tests {
     fn setting_a_listener_discards_the_existing_chain_first() {
         let clock = clock_at(11);
         let mut cx = CallCtx::new(&clock);
-        let conn = Rc::new(FakeConn::new());
+        let conn = Arc::new(FakeConn::new());
         let mut chain = FilterChain::new(None, SocketIndex::Secondary);
 
         // An existing filter over its own socket, which must be gone before the
@@ -8393,9 +7804,7 @@ mod tests {
         assert_eq!(head.trace_name(), "TCP-ACCEPT");
     }
 
-    // ---------------------------------------------------------------
     // 25, 26, 27, 28. The wakeup primitive
-    // ---------------------------------------------------------------
 
     /// Required test 25 -- a signal coalesces, and never blocks or fails.
     #[test]
@@ -8496,12 +7905,6 @@ mod tests {
     }
 
     /// Required test 27 -- a single-descriptor wakeup is closed exactly once.
-    ///
-    /// The `#ifndef USE_EVENTFD` guard around `sclose(socks[1])`
-    /// (`lib/socketpair.c:363-369`) exists for exactly this: an `eventfd` is
-    /// one descriptor used for both directions, and closing it twice would
-    /// close whatever the number was next handed to. Here the second owner is
-    /// ABSENT rather than equal, so the double close is unrepresentable.
     #[test]
     #[cfg_attr(miri, ignore = "uses a real socket pair")]
     fn a_shared_descriptor_wakeup_is_destroyed_exactly_once() {
@@ -8602,17 +8005,9 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
     // 30. The `addr2string` contract with `conn/mod.rs`
-    // ---------------------------------------------------------------
 
     /// Required test 30 -- the parent's helper is CONSUMED, not duplicated.
-    ///
-    /// Two halves. The first is semantic: the address text a filter records is
-    /// byte-identical to what [`crate::conn::addr2string`] returns for the same
-    /// address, which cannot be true of two independent implementations for
-    /// long. The second is structural, and reads the two source files, because
-    /// the requirement is about WHERE the function lives.
     #[test]
     #[cfg_attr(miri, ignore = "uses a real socket pair")]
     fn the_parent_addr2string_helper_is_consumed_rather_than_duplicated() {

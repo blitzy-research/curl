@@ -43,51 +43,6 @@
 //! seventeen entries long for the same reason: `Curl_trc_mstate_names[]`
 //! (`lib/curl_trc.c:334`) carries no `"LAST"` string.
 //!
-//! # Declaration order is semantics, not aesthetics
-//!
-//! `lib/multi.c` orders states with `<` and `>` rather than testing for
-//! equality, so `Ord` is part of this type's contract and the discriminants
-//! below are written out rather than inferred. The four sites that fix the
-//! order:
-//!
-//! - `Curl_is_connecting()`, which is exactly `data->mstate < MSTATE_DO`
-//!   (`lib/multi.c:359-361`);
-//! - the `premature` flag of `curl_multi_remove_handle()`, which is
-//!   `data->mstate < MSTATE_COMPLETED` (`lib/multi.c:786`);
-//! - the partial-response guard `MSTATE_DO < mstate < MSTATE_COMPLETED`,
-//!   which closes the stream with "Removed with partial response"
-//!   (`lib/multi.c:791-795`);
-//! - the `oldstate < MSTATE_DONE` gate deciding whether entering `COMPLETED`
-//!   still owes the application a done notification (`lib/multi.c:178`).
-//!
-//! # One exhaustive `match` replaces a hand-maintained parallel array
-//!
-//! `lib/multihandle.h:48-49` makes keeping the names in step a manual
-//! obligation: "if you add a state here, add the name to the statenames[]
-//! array in curl_trc.c as well!". That note has itself drifted, which is the
-//! whole argument for deriving the names here. No `statenames[]` exists in
-//! `lib/curl_trc.c` -- the real array is `Curl_trc_mstate_names[]` at
-//! `lib/curl_trc.c:334` -- and the identifier the note gives survives in the
-//! tree only at `lib/mqtt.c:628`, an unrelated MQTT array, the SOCKS one
-//! being spelled `cf_socks_statename[]` (`lib/socks.c:71`). A maintainer
-//! following the comment literally searches for a symbol that is not in the
-//! file it names. [`CurlMstate::name`] ends that class of drift: the emitted
-//! strings are unchanged, byte for byte and in the same order, but a state
-//! added without a name no longer compiles.
-//!
-//! # Exhaustiveness is a crate-wide contract
-//!
-//! No `match` on this type anywhere in the crate may carry a `_` arm.
-//! Exhaustiveness checking is what turns an unhandled state from a runtime
-//! fall-through into a compile error, and the C tree shows the exact
-//! fall-through it replaces: `Curl_multi_pollset()` already lists all
-//! seventeen states and still needs a `default:` arm that logs "unexpected
-//! multi state" and asserts (`lib/multi.c:1113-1160`, the arm at
-//! `lib/multi.c:1157-1160`). The two full-coverage matches this rule governs
-//! are that pollset switch, which becomes `crate::multi::events`, and
-//! `multi_runsingle()`'s switch (`lib/multi.c:2427-2751`), which becomes
-//! `crate::multi`.
-//!
 //! # Scope, and the two fallbacks that must never be unified
 //!
 //! This module owns the enumeration, its names and its ordering predicates,
@@ -105,13 +60,6 @@
 //! `unsafe_code` lint. (The root denies rather than forbids: `forbid` cannot be
 //! relaxed later, so it would reject the one exemption `mod ffi` requires.)
 
-// WHY A HANDFUL OF ITEMS BELOW CARRY `#[allow(dead_code)]`. Every production
-// consumer of this state machine lives in a module that has not landed yet --
-// the multi handle itself drives the transitions, `multi/mod.rs` re-exports
-// the type, and `crate::transfer` reads it -- so those accessors are
-// legitimately unreferenced in a non-test build even though this module's own
-// tests exercise every one of them.
-//
 // The allowance is per item and never on this module's root, which the crate's
 // own policy test enforces (`lib.rs`, `no_lint_level_for_dead_code_is_set_on_
 // a_crate_or_module_root`): a root-level level would also hide the next
@@ -126,12 +74,6 @@
 /// rather than merely compact: the values run from 0 to 16 and this type
 /// never crosses the C ABI, unlike `CURLMcode`, which is `repr(i32)` and
 /// lives in `crate::error`.
-///
-/// There is deliberately no `Default`. C has none either -- the initial state
-/// is set explicitly by `multistate(data, MSTATE_INIT)` when a handle joins a
-/// multi handle (`lib/multi.c:489`) -- and inventing one would hide that
-/// step. The type is likewise not `non_exhaustive`, because callers inside
-/// this crate are required to match it exhaustively.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(dead_code)]
@@ -204,22 +146,12 @@ impl CurlMstate {
 
     /// The state's trace name.
     ///
-    /// One exhaustive `match` in place of `Curl_trc_mstate_names[]`
-    /// (`lib/curl_trc.c:334`) and of the stale maintenance note paired with
-    /// it (`lib/multihandle.h:48-49`). Carrying no `_` arm is what makes a
-    /// state added without a name a compile error.
-    ///
     /// The strings are frozen output rather than an implementation detail:
     /// `mstate()` emits them as `CURL_TRC_M(data, "-> [%s]", ...)`
     /// (`lib/multi.c:166`) by way of `CURL_MSTATE_NAME()`
     /// (`lib/curl_trc.h:321`), so they reach `--trace` logs verbatim. They
     /// keep the C spelling exactly: no `MSTATE_` prefix, and `"DOING_MORE"`
     /// keeps its underscore even though the variant is `DoingMore`.
-    ///
-    /// Built without verbose strings, `CURL_MSTATE_NAME()` degrades to the
-    /// literal `"-"` (`lib/curl_trc.h:333`). Whether to reproduce that is
-    /// `crate::trace`'s decision, since it decides whether to ask for a name
-    /// at all; this function only supplies one.
     #[allow(dead_code)]
     pub(crate) fn name(self) -> &'static str {
         match self {
@@ -314,12 +246,6 @@ impl CurlMstate {
 
     /// Whether a request is in flight, so abandoning it would leave the
     /// connection holding a partial response.
-    ///
-    /// The guard at `lib/multi.c:791-792`,
-    /// `MSTATE_DO < mstate && mstate < MSTATE_COMPLETED`, which is what makes
-    /// `curl_multi_remove_handle()` close the stream with "Removed with
-    /// partial response" (`lib/multi.c:795`). The lower bound is strict, so
-    /// `Do` itself is excluded.
     #[allow(dead_code)]
     pub(crate) fn is_in_transfer(self) -> bool {
         Self::Do < self && self < Self::Completed

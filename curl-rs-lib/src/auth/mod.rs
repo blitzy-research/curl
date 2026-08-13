@@ -27,10 +27,10 @@
 
 //! Authentication mechanism selection, vocabulary and shared plumbing.
 //!
-//! Supersedes all of `lib/vauth/vauth.c` (249 lines) with
-//! `lib/vauth/vauth.h` (349 lines) as its declaration contract, the
-//! mechanism-arbitration logic of `lib/http.c`, and the HTTP-relevant slice
-//! -- and only that slice -- of `lib/curl_sasl.c` (934 lines). The six
+//! Supersedes all of `lib/vauth/vauth.c` with `lib/vauth/vauth.h` as its
+//! declaration contract, the mechanism-arbitration logic of `lib/http.c`, and
+//! the HTTP-relevant slice -- and only that slice -- of
+//! `lib/curl_sasl.c`. The six
 //! sibling modules of this directory build the messages; this file decides
 //! *which* message, *in what order*, and *whether at all*.
 //!
@@ -73,9 +73,6 @@
 //! challenge      Negotiate  NTLM  Digest  Basic  Bearer
 //! ```
 //!
-//! [`PREFERENCE_ORDER`] carries the first, [`EMISSION_ORDER`] the second and
-//! [`CHALLENGE_ORDER`] the third, each as its own table.
-//!
 //! What the relationship between the three actually is, measured against the
 //! C rather than assumed, because the assumption is easy to state wrongly in
 //! either direction:
@@ -95,11 +92,6 @@
 //!   is a match sequence tested with a case-insensitive prefix predicate. A
 //!   later change to one must not silently move the other.
 //!
-//! So the count of *tables* is three and the count of distinct *orders* is
-//! two. Unifying preference with either of the others changes which mechanism
-//! a server sees; collapsing emission into challenge changes nothing today
-//! and removes the place a divergence would be recorded.
-//!
 //! Two details of the preference order are worth stating separately because
 //! they read like mistakes and are not:
 //!
@@ -109,24 +101,6 @@
 //!   modifier on Digest -- `struct auth`'s `iestyle` bit -- and never a
 //!   mechanism in its own right, which is also why
 //!   [`AuthMask::ANY`] masks it out.
-//!
-//! # The `->picked` protocol
-//!
-//! `lib/http.c:1047-1052` states it, and the statement is carried here
-//! rather than paraphrased because it is the clearest description of the
-//! two-phase life of the field:
-//!
-//! > `->picked` is first set to the `want` value (one or more bits) before
-//! > the request is sent, and then it is again set *after* all response
-//! > 401/407 headers have been received but then only to a single preferred
-//! > method (bit).
-//!
-//! So `picked` is a *set* before the first round trip and a *single bit*
-//! after arbitration. Both phases are reproduced: the first by
-//! [`seed_picked_from_want`], the second by [`pick_one_auth`]. Code that
-//! reads `picked` must therefore test membership, not equality -- except
-//! where C itself tests equality, which [`select_emitter`] does, deliberately
-//! and for the reason recorded there.
 //!
 //! # Two independent instances, always
 //!
@@ -152,12 +126,6 @@
 //! **split** rather than migrated or dropped wholesale, and the split is
 //! written down here so that a later reader does not "finish" it.
 //!
-//! Ported: the mechanism-name vocabulary ([`SaslMech`]), the name table and
-//! its prefix matcher ([`MECHTABLE`], [`decode_mech`]), and the
-//! `CURLAUTH_*` to `SASL_MECH_*` translation of `lib/curl_sasl.c:157-175`
-//! ([`curlauth_to_sasl_mechs`]) -- which is the one genuine cross-boundary
-//! piece, because it is HTTP option state deciding a SASL default.
-//!
 //! Deliberately absent: the SASL **command sequencing**. The 18-state
 //! `saslstate` enumeration, the `saslprogress` enumeration, the
 //! `struct SASLproto` vtable, `struct SASL`, `Curl_sasl_start`,
@@ -167,12 +135,6 @@
 //! exchanges, and all three of those protocols are stubs that return
 //! `CURLE_UNSUPPORTED_PROTOCOL`. A state machine with nothing to sequence
 //! would be unreachable code, and unreachable code cannot be validated.
-//!
-//! `CRAM-MD5`, `SCRAM-SHA-1` and `SCRAM-SHA-256` keep their **bits** for
-//! vocabulary completeness and have no implementation anywhere: the first
-//! is `lib/vauth/cram.c`, which is excluded, and the other two came from
-//! libgsasl, which is dropped. `decode_mech` still resolves all three
-//! names, exactly as the C table does, because the table is the vocabulary.
 //!
 //! # Where mechanism state lives, and why the distinction matters
 //!
@@ -199,22 +161,7 @@
 //! | Digest    | per-TRANSFER    | `data->state.digest`, `data->state.proxydigest` |
 //! | Basic, Bearer, AWS SigV4 | none | recomputed per request |
 //!
-//! That is why `Curl_http_auth_cleanup_digest()` clears two easy-handle
-//! fields while `Curl_auth_ntlm_remove()` removes connection metadata.
-//! [`state_scope`] is the machine-readable form of the table, so the
-//! distinction is testable rather than merely documented.
-//!
 //! # Credentials gain no new path to a log
-//!
-//! curl has **no** redaction mechanism -- `grep -rn REDACTED lib/ src/`
-//! finds nothing -- and `lib/http.c:2888-2895` inserts the fully formed
-//! `Authorization:` header straight into the request buffer, from where it
-//! reaches `Curl_debug(data, CURLINFO_HEADER_OUT, ...)` verbatim under
-//! `--verbose`. 168 fixtures contain a literal `Authorization: ` line
-//! inside a byte-exact `<protocol>` comparison block, so suppressing or
-//! masking it would fail those fixtures and would itself be a prohibited
-//! behaviour change. curl's existing diagnostics are therefore reproduced
-//! exactly, including the five `infof()` strings of [`input_auth`].
 //!
 //! What is prohibited is *adding* a path curl does not have. No secret is
 //! ever formatted into a trace record by this directory, and
@@ -237,11 +184,9 @@
 //! makes any that appeared a hard error: the single exemption that root
 //! grants is on `mod ffi`, and this is not it.
 
-// Items whose only consumers are modules that have not landed yet carry
-// `#[allow(dead_code)]` individually. The allowance is never set on this
-// module's root, because that would also hide the next unreferenced item
-// somebody adds -- and because the crate's own policy test in `lib.rs`
-// (`mod source_policy`) fails the build if it is.
+// The allowance is never set on this module's root, because that would also
+// hide the next unreferenced item somebody adds -- and because the crate's own
+// policy test in `lib.rs` (`mod source_policy`) fails the build if it is.
 
 // EACH SIBLING MODULE IS DECLARED WITH THE FILE IT NAMES, AND NOT BEFORE.
 //
@@ -252,14 +197,6 @@
 // an absent file is `error[E0583]: file not found for module`, which would
 // take the whole crate down rather than leave one capability missing, so no
 // declaration is written ahead of the file it names.
-//
-// So the convention this crate already applies elsewhere applies here: a
-// module root declares exactly the children present on disk, and each child's
-// declaration lands with the child. `curl-rs-lib/src/tls/mod.rs` declares
-// `cipher_suite` and `keylog` and not the three planned modules absent beside
-// them; `curl-rs-lib/src/url/mod.rs` says so in as many words. Nothing is
-// outstanding here: the six declarations below are the complete set the target
-// design asks for.
 //
 // `negotiate` is the only gated one, and its declaration carries the
 // `#[cfg(feature = "negotiate")]` that keeps the default build free of any C
@@ -275,15 +212,6 @@
 // from `Features:`. That is under-reporting, which is the safe direction: a
 // withheld capability makes a fixture skip, while a claimed one makes it run
 // and fail.
-//
-// The asymmetry is the reason, not an oversight. A capability marker answers
-// "can this build do the thing", and composing a header is not doing the
-// thing: `crate::protocols::http1` is what puts one into a request, and it has
-// not landed. `ENGINE_AUTH_DISPATCH` names this very file and stayed absent
-// for the same reason when it landed. Claiming `basic-auth`, `NTLM` or the
-// Negotiate family early would make fixtures run that cannot pass; withholding
-// them makes those fixtures skip. The markers move with the driver that
-// executes the mechanism, not with the mechanism.
 
 /// HTTP Basic authentication: supersedes `http_output_basic()`
 /// (`lib/http.c:243-297`).
@@ -309,24 +237,14 @@ pub(crate) mod digest;
 
 /// NTLM, `lib/vauth/ntlm.c` with `lib/curl_ntlm_core.c` and
 /// `lib/http_ntlm.c`.
-///
-/// Declared here, unconditionally, per the convention recorded above: a
-/// module root declares exactly the children present on disk, and each
-/// child's declaration arrives with the child.
-///
-/// NTLM is unconditional because its cryptography is: `des`, `md4`, `md-5`
-/// and `hmac` are unqualified dependencies of this crate, so `USE_NTLM` --
-/// which in C required an SSL library for DES and MD4 -- has no successor
-/// and [`is_ntlm_supported`] is a `const fn` returning `true`. Only
-/// `negotiate` is feature-gated.
 pub(crate) mod ntlm;
 
-// AWS SigV4 has landed, so its declaration lands with it -- see the note
-// above, which asks for exactly this line and nothing else. `aws_sigv4.rs`
-// supersedes `lib/http_aws_sigv4.c` and is reached from the `AWS_SIGV4` arm of
-// `select_emitter`; it implements no `HttpAuthMechanism`, because AWS SigV4
-// answers no challenge and its signature covers a request description this
-// file's `AuthContext` does not carry.
+/// AWS SigV4 request signing, `lib/http_aws_sigv4.c`.
+///
+/// Reached from the `AWS_SIGV4` arm of `select_emitter`. It implements no
+/// [`HttpAuthMechanism`], because AWS SigV4 answers no challenge and its
+/// signature covers a request description this file's `AuthContext` does not
+/// carry.
 pub(crate) mod aws_sigv4;
 
 use core::fmt;
@@ -339,18 +257,11 @@ use crate::util::strparse::{is_alnum, str_passblanks};
 
 /// SPNEGO (Negotiate) over GSS-API -- `lib/vauth/spnego_gssapi.c`,
 /// `lib/http_negotiate.c` and the HTTP half of `lib/curl_gssapi.c`.
-///
-/// The only gated child of this module. AAP 0.8.5 conflict C2 makes
-/// `negotiate` non-default so that the default build links no C security
-/// library at all, and the binding it reaches is confined to
-/// `crate::ffi::gss`.
 #[cfg(feature = "negotiate")]
 pub(crate) mod negotiate;
 
-// ---------------------------------------------------------------------------
 // The `CURLAUTH_*` bit vocabulary. Public ABI, integer-exact.
 // `include/curl/curl.h:828-848`, plus `CURLAUTH_PICKNONE` from `lib/http.h:135`.
-// ---------------------------------------------------------------------------
 
 /// A set of HTTP authentication methods: the `CURLAUTH_*` bitmask.
 ///
@@ -360,24 +271,6 @@ pub(crate) mod negotiate;
 /// `CURLINFO_PROXYAUTH_AVAIL` all carry these integers across the C boundary,
 /// and a program compiled against curl 8.19.0-DEV holds them in its
 /// instruction stream. They are therefore literals here, never inferred.
-///
-/// # Why a bitmask newtype and not an enumeration
-///
-/// The values are OR-able and routinely combined -- `--anyauth` sets
-/// [`Self::ANY`], and `CURLOPT_HTTPAUTH` accepts any union -- so an
-/// enumeration would be the wrong shape. The newtype exists so that a
-/// [`SaslMech`] cannot be passed where an `AuthMask` is expected: the two
-/// vocabularies overlap numerically (both give bit 6 a meaning) and
-/// [`curlauth_to_sasl_mechs`] is the only sanctioned way to cross between
-/// them.
-///
-/// # The representation is `u32`, matching C's `struct auth`
-///
-/// `include/curl/curl.h` declares the constants as `unsigned long`, but the
-/// fields that hold them are `uint32_t` (`lib/urldata.h:849-861`), and the
-/// two composite masks are explicitly `& ((unsigned long)0xffffffff)`. So 32
-/// bits is the width the values actually live in, and [`Self::complement`]
-/// reproduces C's masked `~` exactly rather than approximately.
 #[derive(Clone, Copy, Default, Eq, Hash, PartialEq)]
 pub(crate) struct AuthMask(u32);
 
@@ -399,21 +292,9 @@ impl AuthMask {
 
     /// `CURLAUTH_DIGEST_IE` = `1 << 4`: Digest with the
     /// Internet-Explorer-compatible quirk.
-    ///
-    /// This is a **modifier on Digest**, not a mechanism, which is why it
-    /// appears in none of [`PREFERENCE_ORDER`], [`EMISSION_ORDER`] or
-    /// [`CHALLENGE_ORDER`], and why both [`Self::ANY`] and [`Self::ANYSAFE`]
-    /// mask it out. Its effect is carried by [`AuthState::iestyle`].
     pub(crate) const DIGEST_IE: Self = Self(1 << 4);
 
     /// `CURLAUTH_NTLM_WB` = `1 << 5`. **Vocabulary only.**
-    ///
-    /// The constant lives inside `#ifndef CURL_NO_OLDIES` and the header
-    /// annotates it "functionality removed since 8.8.0". It is defined here
-    /// so that the bit stays occupied -- an application may still name it and
-    /// must still get 32 -- and nothing whatsoever is implemented behind it.
-    /// `NTLM_WB` is one of the 52 names `tests/runtests.pl` recognises in the
-    /// `Features:` banner and it is never advertised there.
     pub(crate) const NTLM_WB: Self = Self(1 << 5);
 
     /// `CURLAUTH_BEARER` = `1 << 6`. RFC 6749 OAuth 2.0 bearer tokens.
@@ -458,12 +339,7 @@ impl AuthMask {
 
     /// `CURLAUTH_PICKNONE` = `1 << 30`. **Internal, not public ABI.**
     ///
-    /// `lib/http.h:135`, whose comment is the definition: "If only the
-    /// PICKNONE bit is set, there has been a round-trip and we selected to
-    /// use no auth at all. Ie, we actively select no auth, as opposed to not
-    /// having one selected."
-    ///
-    /// It is deliberately absent from `include/curl/curl.h`, so it is
+    /// The bit is deliberately absent from `include/curl/curl.h`, so it is
     /// `pub(crate)` like everything else here and never reaches the ABI
     /// shim. It occupies bit 30, which no public constant claims.
     pub(crate) const PICKNONE: Self = Self(1 << 30);
@@ -476,12 +352,6 @@ impl AuthMask {
     }
 
     /// Adopt a raw integer, unknown bits and all.
-    ///
-    /// Unknown bits are preserved rather than rejected because C preserves
-    /// them: `CURLOPT_HTTPAUTH` stores whatever it is given and the
-    /// arbitration masks decide what is reachable. Rejecting them would make
-    /// an application that sets a bit from a newer header fail where curl
-    /// silently ignores it.
     #[must_use]
     pub(crate) const fn from_bits(bits: u32) -> Self {
         Self(bits)
@@ -591,12 +461,6 @@ impl Not for AuthMask {
 impl fmt::Debug for AuthMask {
     /// Renders the set as its C constant names, so a failing assertion names
     /// methods rather than a hexadecimal integer.
-    ///
-    /// Hand-written rather than derived for legibility only -- there is no
-    /// secret in a bitmask. The residue of bits that no constant claims is
-    /// printed in hexadecimal so that nothing is silently dropped, which
-    /// matters for [`Self::ANY`], whose 22 undefined bits are part of its
-    /// value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0 == 0 {
             return f.write_str("CURLAUTH_NONE");
@@ -627,12 +491,6 @@ impl fmt::Debug for AuthMask {
 }
 
 /// Every named bit, in ascending bit order, for [`AuthMask`]'s formatter.
-///
-/// `NTLM_WB` is listed because the bit exists and must be *named* if an
-/// application sets it -- printing `0x20` instead would hide which bit it
-/// was. Listing it here advertises nothing: the `Features:` banner is built
-/// in `crate::version` and never consults this table. `PICKNONE` is listed
-/// for the same reason and is marked so, since it is not a public constant.
 #[rustfmt::skip]
 const NAMED_BITS: [(AuthMask, &str); 10] = [
     (AuthMask::BASIC,     "CURLAUTH_BASIC"),
@@ -688,20 +546,10 @@ pub(crate) const CURLGSSAPI_DELEGATION_POLICY_FLAG: i64 = 1 << 0;
 #[allow(dead_code)] // Consumer is `crate::auth::negotiate`, not yet landed.
 pub(crate) const CURLGSSAPI_DELEGATION_FLAG: i64 = 1 << 1;
 
-// ---------------------------------------------------------------------------
 // The scheme vocabulary: one enumeration, three orderings.
 // `lib/http.c:336-372`, `:627-740` and `:1012-1096`.
-// ---------------------------------------------------------------------------
 
 /// One HTTP authentication mechanism, as a single choice rather than a set.
-///
-/// [`AuthMask`] answers "which methods are in play"; this answers "which one
-/// is running". C conflates the two -- `authstatus->picked` is a bitmask that
-/// arbitration narrows to one bit -- and the narrowing is exactly where a
-/// mistake becomes invisible, so the narrowed form gets its own type.
-///
-/// `DIGEST_IE` and `NTLM_WB` have no variant: the first is a modifier on
-/// [`Self::Digest`] and the second has no implementation at all.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum AuthScheme {
     /// Basic, `lib/http.c:238-297`.
@@ -733,12 +581,6 @@ impl AuthScheme {
     }
 
     /// The label `output_auth_headers()` records for the trailing diagnostic.
-    ///
-    /// `lib/http.c:645`, `:654`, `:663`, `:672`, `:692` and `:708`, verbatim.
-    /// These reach the user through `--verbose`, so they are frozen output
-    /// and **not** the same strings as [`Self::header_scheme`]: note
-    /// `"AWS_SIGV4"` here, in upper case with an underscore, where no header
-    /// scheme token is ever spelled that way.
     #[must_use]
     pub(crate) const fn label(self) -> &'static str {
         match self {
@@ -753,12 +595,6 @@ impl AuthScheme {
 
     /// The `auth-scheme` token this mechanism writes into, and matches in,
     /// an authentication header.
-    ///
-    /// Both directions use the same spelling. Outbound it is the token after
-    /// the colon in `"%sAuthorization: Digest %s\r\n"`
-    /// (`lib/http_digest.c:161`) and its three siblings; inbound it is the
-    /// argument `Curl_http_input_auth()` hands [`authcmp`]
-    /// (`lib/http.c:1057-1074`).
     ///
     /// AWS SigV4 has no token because it emits no `Authorization:` scheme of
     /// its own name and answers no challenge -- it signs the request instead
@@ -778,12 +614,6 @@ impl AuthScheme {
     }
 
     /// Whether this mechanism's emitter needs the request method and target.
-    ///
-    /// True for [`Self::Digest`] alone. `lib/http.c:673-676` passes `request`
-    /// and `path` to `Curl_output_digest()` and to nothing else, because the
-    /// Digest response digests both. Modelling that honestly -- one predicate
-    /// and one context field -- is preferred over giving every emitter two
-    /// parameters it ignores.
     #[must_use]
     #[allow(dead_code)] // Consumers are the six sibling modules, not yet landed.
     pub(crate) const fn needs_request_target(self) -> bool {
@@ -798,11 +628,6 @@ impl AuthScheme {
 ///
 /// > The order of these checks is highly relevant, as this will be the order
 /// > of preference in case of the existence of multiple accepted types.
-///
-/// [`pick_one_auth`] does **not** iterate this table -- it is an explicit
-/// if/else-if chain, for the reason recorded there -- so the table's job is
-/// to make the order assertable and to keep it in one place. A test compares
-/// the chain against it for all 64 subsets.
 #[allow(dead_code)] // Reached only by this file's tests until a consumer lands.
 #[rustfmt::skip]
 pub(crate) const PREFERENCE_ORDER: [AuthScheme; 6] = [
@@ -815,10 +640,6 @@ pub(crate) const PREFERENCE_ORDER: [AuthScheme; 6] = [
 ];
 
 /// EMISSION order: the arm sequence of `output_auth_headers()`.
-///
-/// `lib/http.c:642-718`. Different from [`PREFERENCE_ORDER`] in the position
-/// of all but one entry; the same as [`CHALLENGE_ORDER`] on the five
-/// mechanisms the two share, which is recorded there.
 ///
 /// Since arbitration has already narrowed `picked` to one bit by the time
 /// this runs, the order is not a preference -- it is the order in which the
@@ -837,24 +658,6 @@ pub(crate) const EMISSION_ORDER: [AuthScheme; 6] = [
 
 /// CHALLENGE-PARSING order: the sequence `Curl_http_input_auth()` tests a
 /// `WWW-Authenticate:` or `Proxy-Authenticate:` line against.
-///
-/// `lib/http.c:1056-1075`. Five entries, not six: AWS SigV4 answers no
-/// challenge, so it has no entry here at all.
-///
-/// On its five shared mechanisms this is the same relative order as
-/// [`EMISSION_ORDER`] -- measured, and asserted by the tests rather than
-/// assumed either way. It is nonetheless a separate table, because the two are
-/// separate contracts: an emission arm is selected by equality against a
-/// single bit, a challenge is matched by [`authcmp`]'s case-insensitive prefix
-/// predicate, and only one of the two admits `AWS_SIGV4`. Keeping them apart
-/// is what gives a future divergence somewhere to be recorded.
-///
-/// The order is observable in a subtler way than the other two. A single
-/// header line may name several schemes, and the loop tests all five against
-/// the same offset before advancing to the next comma
-/// (`lib/http.c:1080-1086`), so for a line naming two schemes the order
-/// decides which is decoded first -- and Digest's duplicate-header rule
-/// (`lib/http.c:944-945`) makes "first" visible in the trace log.
 #[allow(dead_code)] // Reached only by this file's tests until a consumer lands.
 #[rustfmt::skip]
 pub(crate) const CHALLENGE_ORDER: [AuthScheme; 5] = [
@@ -865,14 +668,9 @@ pub(crate) const CHALLENGE_ORDER: [AuthScheme; 5] = [
     AuthScheme::Bearer,
 ];
 
-// ---------------------------------------------------------------------------
 // `struct auth` -- `lib/urldata.h:849-861`.
-// ---------------------------------------------------------------------------
 
 /// The authentication state of one endpoint: C's `struct auth`.
-///
-/// `lib/urldata.h:849-861`. Two of these exist per transfer and never share a
-/// value -- see [`AuthStatePair`].
 ///
 /// # The `picked` field has two phases
 ///
@@ -883,21 +681,6 @@ pub(crate) const CHALLENGE_ORDER: [AuthScheme; 5] = [
 /// > the request is sent, and then it is again set *after* all response
 /// > 401/407 headers have been received but then only to a single preferred
 /// > method (bit).
-///
-/// A third value is possible and is neither of those: [`AuthMask::PICKNONE`]
-/// alone, which [`pick_one_auth`] writes when nothing in `avail & want &
-/// mask` is usable. It means "a round trip happened and we actively chose no
-/// authentication", which is not the same as "nothing chosen yet"
-/// ([`AuthMask::NONE`]).
-///
-/// # Fields are private
-///
-/// C reads and writes these members directly from `lib/http.c`,
-/// `lib/http_ntlm.c`, `lib/http_digest.c`, `lib/http_negotiate.c` and
-/// `lib/transfer.c`. Here the sibling modules of this directory reach them as
-/// descendants of the defining module, and everything further out goes
-/// through the accessors -- so the two-phase `picked` rule above has one
-/// place to be enforced rather than five.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AuthState {
     /// Bits the application asked for, through `CURLOPT_HTTPAUTH` or
@@ -1075,9 +858,7 @@ impl AuthStatePair {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ORDERING 1 of 3 -- PREFERENCE. `pickoneauth()`, `lib/http.c:336-372`.
-// ---------------------------------------------------------------------------
 
 /// Selects the most favourable method from the ones available and the ones
 /// wanted, narrowing `picked` to a single bit.
@@ -1087,10 +868,6 @@ impl AuthStatePair {
 ///
 /// > The order of these checks is highly relevant, as this will be the order
 /// > of preference in case of the existence of multiple accepted types.
-///
-/// Returns `true` when a method was picked. On `false`, `pick.picked` is
-/// [`AuthMask::PICKNONE`] -- "we select to use nothing" -- and the caller
-/// sets `authproblem`.
 ///
 /// # Three things here are easy to get wrong, and all three are observable
 ///
@@ -1111,9 +888,6 @@ impl AuthStatePair {
 ///    outside the chain: `pick->avail = CURLAUTH_NONE; /* clear it here */`.
 ///    A server's offer is consumed by being considered, so the next 401 on
 ///    the same handle starts from an empty offer.
-///
-/// `DIGEST_IE` is absent from the chain, exactly as in C. It reaches Digest
-/// through [`AuthState::iestyle`] instead.
 #[allow(dead_code)] // Consumer is `crate::transfer`, not yet landed.
 pub(crate) fn pick_one_auth(pick: &mut AuthState, mask: AuthMask) -> bool {
     // Only deal with authentication we want. `lib/http.c:340`.
@@ -1167,22 +941,9 @@ pub(crate) const fn proxy_auth_mask(base: AuthMask) -> AuthMask {
     base.difference(AuthMask::BEARER)
 }
 
-// ---------------------------------------------------------------------------
 // ORDERING 2 of 3 -- EMISSION. `output_auth_headers()`, `lib/http.c:627-740`.
-// ---------------------------------------------------------------------------
 
 /// The header line one mechanism produced, and whether it finished.
-///
-/// This is where C's `bool *done` out-parameter goes. `Curl_output_ntlm()`,
-/// `Curl_output_negotiate()`, `Curl_output_digest()` and
-/// `Curl_output_aws_sigv4()` each write `authp->done` through a pointer they
-/// were handed (`lib/http_ntlm.c:167,232,246`,
-/// `lib/http_negotiate.c:178,204,254`, `lib/http_digest.c:124,167`,
-/// `lib/http_aws_sigv4.c:1111`); readiness is expressed by the returned value
-/// here instead, so it cannot be forgotten and cannot be written twice.
-///
-/// [`finish_emission`] applies it, and the mapping is exact:
-/// `done = !matches!(self, Self::Continuing(_))`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // Consumers are the six sibling modules, not yet landed.
 pub(crate) enum AuthEmission {
@@ -1198,12 +959,6 @@ pub(crate) enum AuthEmission {
     /// `multipass = !done` as true.
     Continuing(String),
     /// No header this round, and the mechanism considers itself finished.
-    ///
-    /// The Basic and Bearer arms reach this when the application has supplied
-    /// its own `Authorization:` header: `lib/http.c:685-701` skips the
-    /// emitter but still sets `done` unconditionally, with the comment "this
-    /// function should set 'done' TRUE, as the other auth functions work
-    /// that way".
     Nothing,
 }
 
@@ -1227,12 +982,6 @@ impl AuthEmission {
 }
 
 /// The guard inputs `output_auth_headers()` tests before running an arm.
-///
-/// Each field is one term of a condition in `lib/http.c:642-712`, named after
-/// the C expression it stands for so that the call site reads as the C does.
-/// They are gathered into a structure rather than passed as five bare
-/// booleans because five positional booleans at one call site is a defect
-/// waiting to happen.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct EmissionGuards {
     /// `conn->bits.proxy_user_passwd` -- proxy credentials were supplied.
@@ -1246,14 +995,6 @@ pub(crate) struct EmissionGuards {
     pub(crate) authorization_overridden: bool,
     /// `Curl_checkProxyheaders(data, conn, "Proxy-authorization")` -- the
     /// application supplied its own proxy authorization header.
-    ///
-    /// The C literal is spelled with a lower-case `a` in `authorization`
-    /// (`lib/http.c:688`) where the origin-side literal at `:691` is
-    /// `"Authorization"`. The comparison is case-insensitive so the
-    /// difference cannot change behaviour, and the literal is preserved
-    /// verbatim in [`PROXY_AUTHORIZATION_HEADER`] regardless, because a
-    /// transcription that "corrects" the source is a transcription a reader
-    /// can no longer check.
     pub(crate) proxy_authorization_overridden: bool,
 }
 
@@ -1270,14 +1011,6 @@ pub(crate) const AUTHORIZATION_HEADER: &str = "Authorization";
 
 /// Chooses which mechanism emits this request's authorization header, and
 /// applies the two `done` assignments the arms themselves make.
-///
-/// Supersedes the arm-selection half of `output_auth_headers()`
-/// (`lib/http.c:642-718`). The other half -- calling the chosen mechanism --
-/// belongs to the sibling modules, and the bookkeeping that follows it is
-/// [`finish_emission`].
-///
-/// Returns the scheme whose emitter must run, or `None` when no arm applies,
-/// which is C's `auth == NULL`.
 ///
 /// # The structure is reproduced, including one inert asymmetry
 ///
@@ -1352,11 +1085,6 @@ pub(crate) fn select_emitter(
 
 /// Applies the trailing bookkeeping of `output_auth_headers()`: the
 /// diagnostic and `multipass`.
-///
-/// `lib/http.c:720-737`. Call it once per `output_auth_headers()`
-/// equivalent, after the chosen mechanism has emitted, with `emitted` as
-/// [`select_emitter`] returned it and `emission` as the mechanism produced
-/// it -- or both `None` when no arm ran.
 ///
 /// Three effects, in C's order:
 ///
@@ -1434,11 +1162,6 @@ pub(crate) const fn header_prefix(proxy: bool) -> &'static str {
 /// forms produce identical bytes. Passing `proxy = false` for Bearer is
 /// therefore not a special case but the only reachable one, and a test
 /// asserts the mask makes it so.
-///
-/// These bytes are compared literally: 168 fixtures carry an
-/// `Authorization: ` line inside a byte-exact `<protocol>` block, joined and
-/// compared as one string with no normalisation. A second space, a lower-case
-/// scheme token or an `\n` line ending would fail them.
 #[must_use]
 #[allow(dead_code)] // Consumers are the six sibling modules, not yet landed.
 pub(crate) fn authorization_header(
@@ -1454,27 +1177,15 @@ pub(crate) fn authorization_header(
     )
 }
 
-// ---------------------------------------------------------------------------
 // ORDERING 3 of 3 -- CHALLENGE PARSING.
 // `authcmp()` and the five input handlers, `lib/http.c:867-1096`.
-// ---------------------------------------------------------------------------
 
 /// Whether `line` begins with the authentication scheme `scheme`.
-///
-/// Supersedes `authcmp()` (`lib/http.c:867-872`), whose body is two
-/// conditions and whose comment names the second: "the auth string must not
-/// have an alnum following".
 ///
 /// ```c
 /// size_t n = strlen(auth);
 /// return curl_strnequal(auth, line, n) && !ISALNUM(line[n]);
 /// ```
-///
-/// So: a **case-insensitive prefix match** that must **not** be followed by
-/// an alphanumeric byte. The second condition is not a whitespace test and
-/// must not be replaced by one -- the C admits every non-alphanumeric byte,
-/// which includes the comma that separates two schemes on one header line and
-/// the end of the line itself.
 ///
 /// | `line`         | Matches `"Negotiate"` | Why |
 /// |----------------|-----------------------|-----|
@@ -1485,13 +1196,6 @@ pub(crate) fn authorization_header(
 /// | `Negotiate2`   | no  | `2` is alphanumeric |
 /// | `NegotiateX`   | no  | `X` is alphanumeric |
 /// | `Negotiat`     | no  | shorter than the prefix |
-///
-/// The fourth row is why the byte past the end is treated as zero here: C
-/// indexes `line[n]` on a NUL-terminated string, and reading its terminator
-/// is well-defined and returns a byte that `ISALNUM` rejects. A Rust slice
-/// has no terminator, so `line.get(n)` standing in for it must map absence to
-/// the same answer, which `unwrap_or(0)` does -- and 0 is not alphanumeric,
-/// so a line that is exactly the scheme name matches, as it must.
 #[must_use]
 pub(crate) fn authcmp(scheme: &str, line: &[u8]) -> bool {
     // `curl_strnequal(auth, line, strlen(auth))`: `checkprefix` is that
@@ -1505,13 +1209,6 @@ pub(crate) fn authcmp(scheme: &str, line: &[u8]) -> bool {
 
 /// Decodes the challenge body of one mechanism: C's `Curl_input_*` family.
 ///
-/// The three mechanisms that carry challenge data implement this --
-/// `Curl_input_negotiate()`, `Curl_input_ntlm()` and `Curl_input_digest()` --
-/// and [`input_auth`] calls it exactly where C calls them. Basic and Bearer
-/// have no challenge body to decode: `auth_basic()` and `auth_bearer()`
-/// (`lib/http.c:969-1002`) only set bits, so `decode` is never called for
-/// them and an implementation may treat those schemes as unreachable.
-///
 /// The trait exists so that this file owns the *scan* -- the ordering, the
 /// availability bookkeeping, the five diagnostics, the comma walk -- while
 /// the siblings own the *decoding*, and so that the scan is testable without
@@ -1520,10 +1217,6 @@ pub(crate) trait ChallengeDecoder {
     /// Decode `challenge`, which starts at the scheme token exactly as C's
     /// `auth` pointer does -- the handlers are passed the same pointer
     /// `authcmp` matched, not the text after the token.
-    ///
-    /// `Err(CURLcode::OutOfMemory)` is propagated to the caller unchanged and
-    /// aborts the scan; every other error is reported through the mechanism's
-    /// own diagnostic and sets `authproblem`, exactly as in C.
     fn decode(
         &mut self,
         scheme: AuthScheme,
@@ -1596,28 +1289,10 @@ pub(crate) struct ChallengeOutcome {
     /// The per-connection Negotiate state advances to `GSS_AUTHRECV`:
     /// "we received a GSS auth token and we dealt with it fine"
     /// (`lib/http.c:897-898`).
-    ///
-    /// Which of `conn->http_negotiate_state` and
-    /// `conn->proxy_negotiate_state` is meant follows from the `proxy`
-    /// argument the scan was called with.
     pub(crate) negotiate_received: bool,
 }
 
 /// The mutable state one challenge scan touches, gathered in one place.
-///
-/// C reaches four separate places: `data->state.authhost` or
-/// `authproxy`, `data->info.httpauthavail` or `proxyauthavail`,
-/// `data->state.authproblem`, and `data->req.newurl` with the connection's
-/// Negotiate state. Passing four `&mut` arguments plus a decoder plus a
-/// tracer to one function is how a positional-argument mistake happens, so
-/// they travel together.
-///
-/// The [`ChallengeOutcome`] is held **inside** the sink rather than returned,
-/// and that is a fidelity requirement rather than a convenience: C applies
-/// each handler's side effects as it goes, so a `CURLE_OUT_OF_MEMORY` raised
-/// by a later mechanism on the same header line does not undo what an earlier
-/// one already did. Returning the outcome would discard it on exactly that
-/// path.
 #[derive(Debug)]
 pub(crate) struct ChallengeSink<'a> {
     /// The endpoint's `struct auth`.
@@ -1655,12 +1330,6 @@ impl<'a> ChallengeSink<'a> {
 
 /// Parses one `WWW-Authenticate:` or `Proxy-Authenticate:` header line.
 ///
-/// Supersedes `Curl_http_input_auth()` (`lib/http.c:1012-1096`) together with
-/// all five of its per-mechanism handlers (`:876-1002`). `line` is the first
-/// non-space byte of the header value and, as C's comment at `:1010` says,
-/// "ends with a null byte without CR or LF present" -- here it is simply a
-/// slice with no terminator and no line ending.
-///
 /// # The scan is not uniform, and the differences are all deliberate
 ///
 /// * **The order is [`CHALLENGE_ORDER`]**, which is neither the preference
@@ -1685,12 +1354,6 @@ impl<'a> ChallengeSink<'a> {
 /// * **`CURLE_OUT_OF_MEMORY` is the one error that propagates.** Every
 ///   handler returns it directly and every other failure becomes a
 ///   diagnostic plus `authproblem` (`lib/http.c:926-929`, `:958-961`).
-///
-/// # Multiple schemes on one line
-///
-/// `lib/http.c:1080-1086`: after testing all five at the current offset, the
-/// walk advances past the next comma and skips blanks. A line with no further
-/// comma ends the loop.
 ///
 /// # Errors
 ///
@@ -1752,16 +1415,6 @@ pub(crate) fn input_auth<D: ChallengeDecoder + ?Sized>(
 }
 
 /// `auth_spnego()` -- `lib/http.c:876-905`.
-///
-/// The gate is `(authp->avail & CURLAUTH_NEGOTIATE) ||
-/// Curl_auth_is_spnego_supported()`: an offer already recorded keeps the
-/// mechanism live even where the runtime probe says no, which matters because
-/// the probe is cached and the offer is per-response.
-///
-/// This handler has no diagnostic of its own. On success it clears
-/// `authproblem` -- the only handler that clears it -- and records the two
-/// side effects in [`ChallengeOutcome`]; on failure it sets it. Neither path
-/// emits text.
 fn scan_negotiate<D: ChallengeDecoder + ?Sized>(
     challenge: &[u8],
     proxy: bool,
@@ -1795,13 +1448,6 @@ fn scan_negotiate<D: ChallengeDecoder + ?Sized>(
 }
 
 /// `auth_ntlm()` -- `lib/http.c:909-934`.
-///
-/// C's comment at `:915` reads "NTLM support requires the SSL crypto libs".
-/// It does not any more, and the reason is worth recording because it changes
-/// what the gate means: NTLM here is pure Rust over `des`, `md4`, `md-5` and
-/// `hmac`, all of them unconditional dependencies of this crate, so
-/// [`is_ntlm_supported`] has no library to be unavailable and returns `true`
-/// exactly as the C function does.
 fn scan_ntlm<D: ChallengeDecoder + ?Sized>(
     challenge: &[u8],
     proxy: bool,
@@ -1833,17 +1479,6 @@ fn scan_ntlm<D: ChallengeDecoder + ?Sized>(
 }
 
 /// `auth_digest()` -- `lib/http.c:938-965`.
-///
-/// Carries C's comment at `:952-955` because it explains why the decoder runs
-/// even when Digest is not the picked mechanism: "We call this function on
-/// input Digest headers even if Digest authentication is not activated yet,
-/// as we need to store the incoming data from this header in case we are
-/// going to use Digest". The nonce and realm of a challenge that arrives
-/// before arbitration are still the ones a later Digest response must quote.
-///
-/// Note what the duplicate branch does *not* do: it is an `else if`, so on a
-/// second Digest header the bit is not re-set, the decoder is not called, and
-/// the only effect is the diagnostic.
 fn scan_digest<D: ChallengeDecoder + ?Sized>(
     challenge: &[u8],
     proxy: bool,
@@ -1870,19 +1505,6 @@ fn scan_digest<D: ChallengeDecoder + ?Sized>(
 }
 
 /// `auth_basic()` and `auth_bearer()` -- `lib/http.c:969-1002`.
-///
-/// The two functions are byte-for-byte identical apart from the bit and the
-/// diagnostic, so they are one function here with both as parameters. Neither
-/// decodes anything: there is no challenge body to read, which is why
-/// [`ChallengeDecoder::decode`] is never called for these two schemes.
-///
-/// The bit is ORed in unconditionally. Then, if this mechanism was already
-/// the picked one, C's comment states the inference: "We asked for Basic
-/// authentication but got a 40X back anyway, which basically means our
-/// name+password is not valid" -- so `avail` is cleared *entirely*, not just
-/// of this bit, the diagnostic is emitted and `authproblem` is set. Clearing
-/// all of `avail` is what stops [`pick_one_auth`] from falling back to
-/// another mechanism the same response offered.
 fn scan_bit_only(
     scheme: AuthScheme,
     sink: &mut ChallengeSink<'_>,
@@ -1900,10 +1522,8 @@ fn scan_bit_only(
     }
 }
 
-// ---------------------------------------------------------------------------
 // ARBITRATION. `Curl_http_auth_act()`, `lib/http.c:536-620`, and the outer
 // driver `Curl_http_output_auth()`, `lib/http.c:756-842`.
-// ---------------------------------------------------------------------------
 
 /// The response facts arbitration reads.
 ///
@@ -1935,12 +1555,6 @@ pub(crate) struct AuthActInput {
     /// branch at `lib/http.c:597-599`.
     pub(crate) host_done: bool,
     /// Whether `data->state.httpreq` is `HTTPREQ_GET` or `HTTPREQ_HEAD`.
-    ///
-    /// C compares against the two enumerators directly
-    /// (`lib/http.c:604-605`); the distinction auth makes is only "can this
-    /// request be replaced by a zero-length probe", so the predicate is
-    /// carried rather than a copy of `Curl_HttpReq`, which belongs to the
-    /// transfer layer.
     pub(crate) is_get_or_head: bool,
 }
 
@@ -1978,11 +1592,6 @@ pub(crate) const NTLM_FORCE_HTTP11: &str = "Forcing HTTP/1.1 for NTLM";
 
 /// `"Force HTTP/1.1 connection"` -- `lib/http.c:565`, the reason string
 /// `connclose()` records.
-///
-/// Reasons reach the trace log through the connection-shutdown path rather
-/// than through `infof()` directly, which is why it is a separate constant
-/// from [`NTLM_FORCE_HTTP11`] even though the two are always emitted
-/// together.
 #[allow(dead_code)] // Consumer is `crate::conn::pool`, not yet landed.
 pub(crate) const NTLM_FORCE_CLOSE_REASON: &str = "Force HTTP/1.1 connection";
 
@@ -1992,10 +1601,6 @@ pub(crate) const HTTP_VERSION_1_1: u32 = 11;
 
 /// Decides which authentication methods to use once every response header has
 /// been received.
-///
-/// Supersedes `Curl_http_auth_act()` (`lib/http.c:536-620`). It runs after
-/// the headers are parsed, arbitrates the origin and the proxy independently,
-/// and reports what the caller must then do to the request.
 ///
 /// # Errors
 ///
@@ -2013,19 +1618,6 @@ pub(crate) const HTTP_VERSION_1_1: u32 = 11;
 /// `CURLcode::OutOfMemory` is *not* raised here even though C can return it
 /// at `:594` and `:608`: both come from the URL clone, which this function
 /// requests through [`AuthActOutcome`] rather than performing.
-///
-/// # The mask is narrowed twice, and the second narrowing is the invariant
-///
-/// `authmask` starts as every bit set and loses `BEARER` when no token was
-/// configured (`lib/http.c:542-545`). The proxy arbitration then loses it
-/// again, unconditionally, through [`proxy_auth_mask`]. Bearer is therefore
-/// unreachable for a proxy whatever the application asked for.
-///
-/// # 1xx responses are not authentication events
-///
-/// `lib/http.c:547-549` returns early for 100 through 199, commented "this is
-/// a transient response code, ignore". An `Expect: 100-continue` handshake
-/// must not consume the server's offer or clear `avail`.
 #[allow(dead_code)] // Consumer is `crate::transfer`, not yet landed.
 pub(crate) fn auth_act(
     pair: &mut AuthStatePair,
@@ -2141,20 +1733,6 @@ pub(crate) fn credentials_offered(
 }
 
 /// Seeds `picked` from `want` before the first round trip.
-///
-/// `lib/http.c:791-801`, whose comment is the whole rule: "The app has
-/// selected one or more methods, but none has been picked so far by a server
-/// round-trip. Then we set the picked one to the want one, and if this is one
-/// single bit it will be used instantly."
-///
-/// So a single-bit `want` skips negotiation entirely -- the request carries
-/// the credentials on its first attempt -- while a multi-bit `want` produces
-/// a `picked` that matches no emission arm, sends nothing, and waits for the
-/// 401 that drives [`pick_one_auth`]. [`AuthMask::is_single`] is that test.
-///
-/// The guard is `want && !picked`: an already-picked state is never
-/// re-seeded, which is what stops a completed arbitration from being undone
-/// on the next request over the same handle.
 #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not yet landed.
 pub(crate) fn seed_picked_from_want(pair: &mut AuthStatePair) {
     for state in [&mut pair.host, &mut pair.proxy] {
@@ -2166,12 +1744,6 @@ pub(crate) fn seed_picked_from_want(pair: &mut AuthStatePair) {
 
 /// Whether the next request must be a zero-length probe: C's
 /// `data->req.authneg`.
-///
-/// `lib/http.c:830-839`. When a multi-pass negotiation is in progress on
-/// either endpoint and the request would otherwise carry a body, curl sends
-/// "a PUT or POST with content-length zero as a 'probe'" instead, so that the
-/// body is not uploaded once per negotiation round. `GET` and `HEAD` never
-/// need it because they carry no body to repeat.
 #[must_use]
 #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not yet landed.
 pub(crate) fn negotiation_probe_wanted(
@@ -2183,9 +1755,7 @@ pub(crate) fn negotiation_probe_wanted(
     (host_pending || proxy_pending) && !is_get_or_head
 }
 
-// ---------------------------------------------------------------------------
 // SHARED PLUMBING. `lib/vauth/vauth.c` in full.
-// ---------------------------------------------------------------------------
 
 /// The endpoint the transfer *started* at: C's `data->state.first_*` fields.
 ///
@@ -2220,11 +1790,6 @@ pub(crate) struct CurrentEndpoint<'a> {
 /// Whether authentication, cookies or other sensitive data may (still) be sent
 /// to this host.
 ///
-/// Supersedes `Curl_auth_allowed_to_host()` (`lib/vauth/vauth.c:138-147`),
-/// whose own summary is carried because it states the scope precisely: it
-/// "tells if authentication, cookies or other 'sensitive data' can (still) be
-/// sent to this host".
-///
 /// ```text
 /// !this_is_a_follow
 ///   || allow_auth_to_other_hosts
@@ -2241,14 +1806,6 @@ pub(crate) struct CurrentEndpoint<'a> {
 /// and port would otherwise put the `Authorization:` header on the wire in
 /// clear. Dropping any one of the three comparisons is a credential leak and a
 /// behaviour change, and the tests assert each of the three independently.
-///
-/// The host comparison is case-insensitive (`curl_strequal`, which is
-/// `crate::util::strcase::casecompare`) because DNS names are; the port and
-/// protocol comparisons are exact.
-///
-/// A `first_host` of `None` makes the third term false. That is C's
-/// short-circuit on a NULL pointer and it is the conservative answer: with no
-/// recorded origin there is nothing to prove the current host is the same one.
 #[must_use]
 #[allow(dead_code)] // Consumers are `crate::protocols::http1` and the cookie
                     // engine, neither landed.
@@ -2294,21 +1851,11 @@ pub(crate) fn allowed_to_host(
 /// lib/vauth/krb5_gssapi.c:100     Curl_auth_build_spn(service, NULL, host)
 /// ```
 ///
-/// so the *third* branch fires and the SPN is `"<service>@<host>"`, which is
-/// then imported with `GSS_C_NT_HOSTBASED_SERVICE` -- the name type that
-/// expects exactly that spelling. Digest and the SSPI backends pass the host
-/// in the host slot instead (`lib/vauth/digest.c:420` and friends) and get
-/// `"<service>/<host>"`.
-///
 /// A reader who "corrects" either call site, or who folds the three branches
 /// into a single `service/host` form, breaks Kerberos against every real KDC
 /// -- and breaks it at the point of ticket acquisition, far from this
 /// function. The three-branch shape and the odd call order are therefore both
 /// preserved, and `negotiate.rs` is to repeat the reason at its call site.
-///
-/// The `USE_WINDOWS_SSPI` arm (`lib/vauth/vauth.c:65-90`), which formulates a
-/// UTF-8 SPN and converts it to `TCHAR`, is out of scope: SSPI is a Windows
-/// mechanism and no mandated target is Windows.
 #[must_use]
 #[allow(dead_code)] // Consumer is `crate::auth::negotiate`, not yet landed.
 pub(crate) fn build_spn(
@@ -2340,9 +1887,6 @@ const DOMAIN_SEPARATORS: [u8; 3] = *b"\\/@";
 
 /// Whether `user` carries a Windows domain name or a user principal name.
 ///
-/// Supersedes `Curl_auth_user_contains_domain()`
-/// (`lib/vauth/vauth.c:114-132`).
-///
 /// A separator from [`DOMAIN_SEPARATORS`] must be present and must be
 /// **neither the first nor the last byte**. C spells the bound as pointer
 /// arithmetic:
@@ -2351,25 +1895,6 @@ const DOMAIN_SEPARATORS: [u8; 3] = *b"\\/@";
 /// const char *p = strpbrk(user, "\\/@");
 /// valid = (p != NULL && p > user && p < user + strlen(user) - 1);
 /// ```
-///
-/// `p > user` excludes a leading separator -- there would be no domain before
-/// it -- and `p < user + strlen(user) - 1` excludes a trailing one, which
-/// would leave no user after it. Only the **first** separator is examined,
-/// because that is what `strpbrk` returns.
-///
-/// # An absent or empty username is valid under `negotiate`
-///
-/// C's `#if defined(HAVE_GSSAPI) || defined(USE_WINDOWS_SSPI)` arm returns
-/// `TRUE` for an empty username, and its comment gives the reason: "User and
-/// domain are obtained from the GSS-API credentials cache or the currently
-/// logged in user from Windows". So with a Kerberos credentials cache present
-/// there is nothing for the caller to supply, and demanding a domain in a
-/// username that will not be used would refuse a working configuration.
-///
-/// `HAVE_GSSAPI` becomes the default-off `negotiate` feature; the Windows SSPI
-/// half of the same condition has no target. Without the feature the answer
-/// for an absent username is `false`, which is C's behaviour in a build with
-/// neither.
 #[must_use]
 #[allow(dead_code)] // Consumer is `crate::auth::ntlm`, not yet landed.
 pub(crate) fn user_contains_domain(user: Option<&[u8]>) -> bool {
@@ -2401,12 +1926,6 @@ pub(crate) fn user_contains_domain(user: Option<&[u8]>) -> bool {
 #[allow(dead_code)] // Consumers are the six sibling modules, not yet landed.
 pub(crate) enum StateScope {
     /// Per CONNECTION, with separate origin and proxy instances.
-    ///
-    /// NTLM and Negotiate. Both bind their handshake to the TCP connection --
-    /// NTLM's three-message exchange and SPNEGO's token sequence are
-    /// meaningless across a new one -- which is why C stores them under two
-    /// connection metadata keys each and why NTLM forces HTTP/1.1
-    /// ([`NTLM_FORCE_HTTP11`]).
     Connection,
     /// Per TRANSFER, with separate origin and proxy instances.
     ///
@@ -2435,11 +1954,6 @@ pub(crate) const fn state_scope(scheme: AuthScheme) -> Option<StateScope> {
 
 /// The origin and proxy instances of one mechanism's negotiation state.
 ///
-/// Supersedes the string-keyed metadata map of `lib/vauth/vauth.c`:
-/// `Curl_auth_ntlm_get()` and `Curl_auth_ntlm_remove()` (`:160-176`) and
-/// `Curl_auth_nego_get()` (`:238-248`), each selecting between two keys on a
-/// `bool proxy` argument.
-///
 /// # The keys are deliberately not reproduced
 ///
 /// Six exist, and two carry an upstream typo -- `"meta:auth:ntml:conn"` and
@@ -2455,11 +1969,6 @@ pub(crate) const fn state_scope(scheme: AuthScheme) -> Option<StateScope> {
 /// aspirational, and it removes the four file-private destructors with it:
 /// `ntlm_conn_dtor`, `krb5_conn_dtor`, `gsasl_conn_dtor` and `nego_conn_dtor`
 /// all become ordinary Rust ownership, running when the owner is dropped.
-///
-/// Kerberos-5 and GSASL have one key each and no proxy instance
-/// (`lib/vauth/vauth.h:126,237`); both are out of scope -- GSASL was dropped
-/// with libgsasl and Kerberos-5 serves the SASL protocols -- so this type is
-/// deliberately a pair rather than a map keyed by scope.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)] // Consumers are `crate::auth::ntlm` and `::negotiate`, not yet landed.
 pub(crate) struct MechanismSlots<T> {
@@ -2495,12 +2004,6 @@ impl<T> MechanismSlots<T> {
     }
 
     /// Discards one side's instance: `Curl_auth_ntlm_remove()`.
-    ///
-    /// Returns it rather than dropping it in place so that a caller which
-    /// needs to observe the discarded state can, and so that the drop happens
-    /// at the call site where its timing is visible. C's
-    /// `Curl_conn_meta_remove()` runs the destructor immediately; dropping the
-    /// returned value does the same thing at the same point.
     #[allow(dead_code)] // Consumers are the six sibling modules, not yet landed.
     pub(crate) fn remove(&mut self, proxy: bool) -> Option<T> {
         if proxy {
@@ -2532,40 +2035,18 @@ impl<T> MechanismSlots<T> {
 }
 
 /// Whether Digest authentication is usable.
-///
-/// `Curl_auth_is_digest_supported()` (`lib/vauth/digest.c:311-314`) returns
-/// `TRUE` unconditionally, and so does this. Digest here is MD5 and
-/// SHA-256/512-256 over RustCrypto crates that are unconditional dependencies
-/// of this crate, so there is nothing to be unavailable.
-///
-/// `lib/vauth/vauth.h:120` collapses the declaration to `#define ... FALSE`
-/// under `CURL_DISABLE_DIGEST_AUTH`. **That is not translated into a Cargo
-/// feature.** The crate's feature vocabulary is fixed at fifteen names and
-/// none of them is `digest`; inventing one would add a build configuration
-/// nothing tests and a `Features:` banner row nothing earns.
 #[must_use]
 pub(crate) const fn is_digest_supported() -> bool {
     true
 }
 
 /// Whether NTLM authentication is usable.
-///
-/// `Curl_auth_is_ntlm_supported()` (`lib/vauth/ntlm.c:315-318`) returns `TRUE`
-/// unconditionally. The C build reaches that function only under `USE_NTLM`,
-/// which required an SSL library for DES and MD4; here those come from the
-/// `des`, `md4`, `md-5` and `hmac` crates, which are unconditional, so the
-/// predicate is unconditionally true and `USE_NTLM` has no successor.
 #[must_use]
 pub(crate) const fn is_ntlm_supported() -> bool {
     true
 }
 
 /// Whether SPNEGO (Negotiate) authentication is usable **in this process**.
-///
-/// `Curl_auth_is_spnego_supported()` (`lib/vauth/spnego_gssapi.c:49-52`)
-/// returns `TRUE` unconditionally, but that answer is only as good as the
-/// build's `#ifdef USE_SPNEGO`: the C function does not exist at all without
-/// it. Two things must hold here, and neither is sufficient alone.
 ///
 /// 1. The default-off `negotiate` feature is enabled. Without it there is no
 ///    GSS-API binding compiled in.
@@ -2591,11 +2072,9 @@ pub(crate) fn is_spnego_supported() -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE `lib/curl_sasl.c` SPLIT BOUNDARY.
 // Vocabulary, name matching and the CURLAUTH translation only. The command
 // state machine is deliberately absent -- see the module documentation.
-// ---------------------------------------------------------------------------
 
 /// A set of SASL authentication mechanisms: the `SASL_MECH_*` bitmask.
 ///
@@ -2604,12 +2083,6 @@ pub(crate) fn is_spnego_supported() -> bool {
 /// `SASL_MECH_NTLM` here and `CURLAUTH_BEARER` there -- so passing one where
 /// the other belongs must not compile. [`curlauth_to_sasl_mechs`] is the only
 /// crossing.
-///
-/// The representation is `u16` because C's is: `struct SASL`'s `authmechs`,
-/// `prefmech` and `authused` are `unsigned short`
-/// (`lib/curl_sasl.h:122-124`), `Curl_sasl_decode_mech()` returns
-/// `unsigned short`, and `SASL_AUTH_ANY` is `0xffff`, which fills the type
-/// exactly. Eleven of the sixteen bits are named.
 #[derive(Clone, Copy, Default, Eq, Hash, PartialEq)]
 pub(crate) struct SaslMech(u16);
 
@@ -2736,12 +2209,6 @@ impl fmt::Debug for SaslMech {
 }
 
 /// One row of C's `mechtable[]`.
-///
-/// The `len` field is redundant with `name.len()` and is kept because C keeps
-/// it: `Curl_sasl_decode_mech()` uses it as the comparison bound and as the
-/// index of the byte it inspects afterwards, so removing it would move a
-/// decision out of the table and into the code. A test asserts the redundancy
-/// is consistent for all eleven rows, which is the check C cannot make.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SaslMechRow {
     /// The wire spelling, from the `SASL_MECH_STRING_*` macros
@@ -2754,21 +2221,6 @@ pub(crate) struct SaslMechRow {
 }
 
 /// The supported mechanisms, in C's declaration order.
-///
-/// `lib/curl_sasl.c:53-66`, transcribed row for row. C's trailing
-/// `{ ZERO_NULL, 0, 0 }` sentinel is dropped: it terminates a `for` loop over
-/// a bare array, and a Rust slice carries its own length.
-///
-/// # `LOGIN` and `PLAIN` are both five bytes long
-///
-/// So a dispatch keyed on length is ambiguous, and [`decode_mech`] therefore
-/// matches the **name** first and uses `len` only as a bound -- exactly as the
-/// C does. The two names collide in nothing but their length, which is why
-/// this is a trap only for an implementation that reorders the table or
-/// indexes it by size.
-///
-/// `#[rustfmt::skip]` because the rows are data: the names are wire bytes and
-/// the column alignment makes a transcription error visible.
 #[rustfmt::skip]
 pub(crate) const MECHTABLE: [SaslMechRow; 11] = [
     SaslMechRow { name: "LOGIN",         len: 5,  bit: SaslMech::LOGIN },
@@ -2787,18 +2239,6 @@ pub(crate) const MECHTABLE: [SaslMechRow; 11] = [
 /// Converts a SASL mechanism name into its bit, with the effective name
 /// length.
 ///
-/// Supersedes `Curl_sasl_decode_mech()` (`lib/curl_sasl.c:81-103`). `span` is
-/// C's `ptr` bounded by its `maxlen`: the C function never reads past
-/// `maxlen`, so a slice of exactly that length is the same input, and
-/// `span.len()` plays the role of `maxlen` throughout. The returned length is
-/// C's `*len` out-parameter, which callers compare against their own token
-/// length -- `lib/curl_sasl.c:128` accepts a mechanism only when
-/// `mechlen == len`.
-///
-/// Returns `None` where C returns `0`, which it can do for two different
-/// reasons: no name matched, or a name matched but the byte after it says the
-/// token continues.
-///
 /// # The delimiter test is NOT `ISALNUM`
 ///
 /// This is the one place where a reader who has just written [`authcmp`] will
@@ -2808,16 +2248,6 @@ pub(crate) const MECHTABLE: [SaslMechRow; 11] = [
 /// if(!ISUPPER(c) && !ISDIGIT(c) && c != '-' && c != '_')
 ///   return mechtable[i].bit;
 /// ```
-///
-/// The set that *continues* a mechanism name is upper case, digits, hyphen and
-/// underscore -- so a **lower-case** letter terminates it. `"LOGINx"` decodes
-/// as `LOGIN`, where the corresponding HTTP scheme test would reject
-/// `"Basicx"`. The two grammars genuinely differ: SASL mechanism names are
-/// upper case by registration (RFC 4422), so a lower-case byte cannot be part
-/// of one, while an HTTP `auth-scheme` token is case-insensitive.
-///
-/// The exact-length case returns before reading anything further
-/// (`lib/curl_sasl.c:93-94`), which is what makes a bare `"LOGIN"` decode.
 #[must_use]
 #[allow(dead_code)] // Consumer would be a SASL protocol; all three are stubs.
 pub(crate) fn decode_mech(span: &[u8]) -> Option<(SaslMech, usize)> {
@@ -2851,11 +2281,6 @@ pub(crate) fn decode_mech(span: &[u8]) -> Option<(SaslMech, usize)> {
 
 /// Translates HTTP authentication options into SASL mechanisms.
 ///
-/// The `CURLAUTH_*` to `SASL_MECH_*` mapping of `Curl_sasl_init()`
-/// (`lib/curl_sasl.c:162-171`) -- the one genuinely cross-boundary piece of
-/// `lib/curl_sasl.c`, and the reason that file is split rather than dropped:
-/// it is HTTP option state (`data->set.httpauth`) deciding a SASL default.
-///
 /// ```text
 /// CURLAUTH_BASIC   ->  SASL_MECH_PLAIN | SASL_MECH_LOGIN
 /// CURLAUTH_DIGEST  ->  SASL_MECH_DIGEST_MD5
@@ -2870,10 +2295,6 @@ pub(crate) fn decode_mech(span: &[u8]) -> Option<(SaslMech, usize)> {
 /// the registered `OAUTHBEARER` and curl offers both. `CURLAUTH_GSSAPI` is
 /// [`AuthMask::NEGOTIATE`] under its other name -- the same bit, 4 -- which is
 /// why the SOCKS5 spelling of the constant is the one C uses here.
-///
-/// Four `CURLAUTH_*` bits map to nothing: `DIGEST_IE` is a Digest modifier
-/// rather than a mechanism, `AWS_SIGV4` signs an HTTP request and has no SASL
-/// analogue, `NTLM_WB` has no implementation, and `ONLY` is a modifier.
 #[must_use]
 #[allow(dead_code)] // Consumer would be a SASL protocol; all three are stubs.
 pub(crate) fn curlauth_to_sasl_mechs(auth: AuthMask) -> SaslMech {
@@ -2915,12 +2336,6 @@ pub(crate) fn curlauth_to_sasl_mechs(auth: AuthMask) -> SaslMech {
 ///    the application set to nothing at all (`AWS_SIGV4` alone, say), and an
 ///    empty override would leave the transfer with no mechanism to offer. C
 ///    keeps the default in that case rather than producing an unusable state.
-///
-/// `defaults` is `params->defmechs`, the `SASLproto` vtable member each of
-/// SMTP, IMAP and POP3 fills in. All three are stubs here, which is why this
-/// function has no caller in-tree; it is ported because the mapping is the
-/// documented bridge between the two vocabularies and because reconstructing
-/// it later from a stub protocol would mean reconstructing it from nothing.
 #[must_use]
 #[allow(dead_code)] // Consumer would be a SASL protocol; all three are stubs.
 pub(crate) fn sasl_preferred_mechs(
@@ -2939,12 +2354,10 @@ pub(crate) fn sasl_preferred_mechs(
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE MECHANISM ABSTRACTION.
 // C has no vtable for HTTP authentication -- the dispatch is the `switch` of
 // `output_auth_headers()` -- so the trait is defined here and the six sibling
 // modules implement it.
-// ---------------------------------------------------------------------------
 
 /// A username and the secret that goes with it.
 ///
@@ -2969,11 +2382,6 @@ pub(crate) fn sasl_preferred_mechs(
 /// verbatim, and 168 fixtures compare that line byte for byte. The rule this
 /// type enforces is narrower and is the one that actually binds: **no secret
 /// gains a path to a log that curl does not already have.**
-///
-/// Memory is not scrubbed on drop. curl does not scrub these either, doing so
-/// would need a dependency this workspace does not carry, and the guarantee
-/// would be nominal in any case -- the credential is copied into a base64
-/// encoding, a header line and a request buffer, none of which this type owns.
 #[derive(Clone, Default, Eq, PartialEq)]
 #[allow(dead_code)] // Consumers are the six sibling modules, not yet landed.
 pub(crate) struct Credentials {
@@ -3028,13 +2436,6 @@ impl Credentials {
 
     /// The username as C's `%s` argument renders it: the text, or `""` when
     /// absent.
-    ///
-    /// `lib/http.c:722-732` prints the username in the
-    /// `"%s auth using %s with user '%s'"` diagnostic, so the username is not
-    /// a secret in curl's terms and this accessor exists to feed exactly that
-    /// line. Lossy conversion is correct here for the same reason the C is
-    /// safe: the byte string goes to a diagnostic, so a non-UTF-8 byte must
-    /// become a replacement character rather than an error or a panic.
     #[must_use]
     #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not yet landed.
     pub(crate) fn user_for_diagnostic(&self) -> String {
@@ -3070,25 +2471,6 @@ impl fmt::Debug for Credentials {
 pub(crate) const REDACTED_PLACEHOLDER: &str = "<redacted>";
 
 /// Everything a mechanism's emitter needs that is not its own state.
-///
-/// `output_auth_headers()` passes `request` and `path` to every arm and only
-/// Digest reads them (`lib/http.c:673-676`); the clock and the random source
-/// are C globals reached through `curlx_now()` and `Curl_rand()`. All four
-/// arrive here as fields instead, for two different reasons.
-///
-/// `request` and `path` are fields rather than extra parameters on
-/// [`HttpAuthMechanism::output`] because only one of six implementors reads
-/// them -- [`AuthScheme::needs_request_target`] is the predicate -- and giving
-/// the other five two parameters to ignore is how an argument gets passed in
-/// the wrong order.
-///
-/// The clock and the random source are injected because a global is untestable
-/// and this crate forbids reaching for one: `crate::util::timeval` documents
-/// that it offers no global default, no `static` and no `thread_local`, and
-/// `crate::crypto::rand` the same. Digest needs both -- a client nonce from
-/// the random source, and `nc`/timestamp material -- and NTLM needs the random
-/// source for its type-3 challenge. A mechanism that needs neither simply does
-/// not read them.
 #[allow(dead_code)] // Consumers are the six sibling modules, not yet landed.
 pub(crate) struct AuthContext<'a> {
     /// Whether this header is for the proxy: C's `bool proxy`, which selects
@@ -3136,12 +2518,6 @@ impl fmt::Debug for AuthContext<'_> {
 
 /// One HTTP authentication mechanism.
 ///
-/// The trait C does not have. `lib/vauth/` has no vtable for HTTP
-/// authentication -- the dispatch is the equality chain of
-/// `output_auth_headers()` and the `authcmp` chain of
-/// `Curl_http_input_auth()` -- so this is the trait those two chains imply,
-/// and the six sibling modules implement it.
-///
 /// Two directions, matching C's two families:
 ///
 /// * [`Self::input`] is `Curl_input_negotiate()`, `Curl_input_ntlm()` and
@@ -3176,8 +2552,6 @@ pub(crate) trait HttpAuthMechanism {
 
     /// Consume a challenge from a `WWW-Authenticate:` or
     /// `Proxy-Authenticate:` header.
-    ///
-    /// `challenge` starts at the scheme token, as C's `auth` pointer does.
     ///
     /// # Errors
     ///
@@ -3315,12 +2689,6 @@ mod tests {
     }
 
     /// A decoder that overrides nothing but [`ChallengeDecoder::decode`].
-    ///
-    /// [`FakeDecoder`] replaces all three support predicates so that a test can
-    /// drive both answers; this one leaves them at their defaults, which is how
-    /// the six sibling modules will implement the trait. Without it the default
-    /// bodies -- the production wiring to [`is_ntlm_supported`],
-    /// [`is_digest_supported`] and [`is_spnego_supported`] -- would never run.
     #[derive(Default)]
     struct DefaultDecoder {
         seen: Vec<AuthScheme>,
@@ -3588,12 +2956,6 @@ mod tests {
         // measurement went: `output_auth_headers()`'s arm order and
         // `Curl_http_input_auth()`'s match order are the same sequence once
         // AWS SigV4 -- which answers no challenge -- is removed.
-        //
-        // They remain two tables because they are two contracts: emission is
-        // tested with equality against a single bit and includes AWS SigV4,
-        // challenge is tested with `authcmp` and does not. This assertion is
-        // what would fail, loudly and in one place, if a later change moved
-        // one of them.
         assert_eq!(CHALLENGE_ORDER.len(), 5);
         assert!(!CHALLENGE_ORDER.contains(&AuthScheme::AwsSigv4));
 
@@ -4485,11 +3847,6 @@ mod tests {
         // preceding arms are `if(!result && authcmp(...))`. Two consequences,
         // both asserted: Bearer is still tested after an earlier failure, and
         // because `auth_bearer()` returns CURLE_OK it DISCARDS that failure.
-        //
-        // The line puts Bearer at the same offset as the failing Digest is
-        // not possible, so the failure and the Bearer match are on successive
-        // offsets: Digest fails on the first, Bearer matches on the second,
-        // and the scan continues rather than stopping.
         let mut scan = ScanState::with(AuthMask::DIGEST, AuthMask::NONE);
         let mut decoder =
             FakeDecoder::failing(AuthScheme::Digest, CURLcode::AuthError);
@@ -5726,13 +5083,6 @@ mod tests {
         // The method and the target both go on the wire in the request line,
         // so printing them adds nothing; the random source has no `Debug`
         // bound at all, which is why this formatter is hand-written.
-        //
-        // Both sources are the INJECTED test implementations, not the host's.
-        // That is the point of the injection rather than an accommodation of
-        // it: a deterministic clock and a seeded generator make the assertions
-        // below exact, and they keep this test runnable under Miri, which
-        // cannot call `clock_gettime` with isolation enabled and whose gate
-        // deliberately passes no flags to relax that.
         let clock =
             crate::util::timeval::TestClock::new(CurlTime::new(1_000, 0));
         clock.set_epoch_secs(1_700_000_000);

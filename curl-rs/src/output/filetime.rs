@@ -5,9 +5,9 @@
 //! Local file timestamps: the `-R, --remote-time` writer and the
 //! `-z, --time-cond` reader.
 //!
-//! This module supersedes one C translation unit, `src/tool_filetime.c`
-//! (152 lines), which provides `-R` timestamp preservation. It carries both
-//! of that file's functions:
+//! This module supersedes one C translation unit, `src/tool_filetime.c`,
+//! which provides `-R` timestamp preservation. It carries both of that
+//! file's functions:
 //!
 //! | Item | C origin | Purpose |
 //! |---|---|---|
@@ -137,7 +137,7 @@
 //!
 //! The suffix is therefore removed by `curl_rs_lib::os_error_message`, the
 //! engine's single renderer, and **not** by anything in this file. That is the
-//! same conclusion AAP section 0.4.2 reaches for `curlx`: the CLI depends on
+//! same conclusion the `curlx` shims reach: the CLI depends on
 //! the library crate. It also fixes a real divergence rather than merely
 //! tidying one up -- this file once carried its own fixed-point stripper while
 //! `output/formparse.rs` carried a single-pass one, so the same kind of error
@@ -192,7 +192,7 @@ pub(crate) const FILETIME_FAILURE: i32 = 1;
 /// `tv_sec == 0`, so offsetting it by `i64::unsigned_abs` can never overflow
 /// the `i64` seconds field, and both `i64::MIN` and `i64::MAX` were measured to
 /// yield `Some`. It exists so that [`filetime_to_times`] has no panicking path,
-/// as AAP section 0.7 requires of this crate.
+/// as this crate's safety invariant requires.
 #[allow(dead_code)]
 const EINVAL: i32 = 22;
 
@@ -236,7 +236,6 @@ const EINVAL: i32 = 22;
 ///
 /// The Windows arm at `:42-69` is out of scope; see the
 /// module documentation.
-#[allow(dead_code)]
 pub(crate) fn getfiletime(
     sink: &mut dyn DiagnosticSink,
     config: &MsgConfig,

@@ -37,42 +37,16 @@
 
 //! HTTP Digest authentication, RFC 2617 and RFC 7616.
 //!
-//! Supersedes three C files, together 1,260 lines: `lib/vauth/digest.c`
-//! (1,043), `lib/vauth/digest.h` (39) and `lib/http_digest.c` (178). The
-//! transformation row for it reads *"Digest; message construction
-//! byte-exact"*, and that is meant literally -- every directive name, the
-//! order the directives appear in, which of them are quoted, and the case of
-//! every hexadecimal digit are compared as literal bytes by the fixture
-//! corpus. `tests/getpart.pm:351+`'s `compareparts` joins both sides into one
-//! string and compares them whole: no per-line matching, no normalisation and
-//! no reordering, so one wrong byte fails the fixture outright. 76 fixtures
-//! gate on the `digest` label and 98 on `crypto`.
-//!
-//! Every claim below carries a `path:line` citation into the C tree, because
-//! the behaviour being reproduced is defined by those lines and not by this
-//! description.
-//!
-//! # Map of the C, and what this file does with each part
-//!
-//! ```text
-//!   lib/vauth/digest.h:30-31    the two length caps          -> reproduced
-//!   lib/vauth/digest.c:41-57    algorithm and qop constants  -> reproduced
-//!   lib/vauth/digest.c:59-129   Curl_auth_digest_get_pair    -> reproduced
-//!   lib/vauth/digest.c:133-150  the two hex renderers        -> reproduced
-//!   lib/vauth/digest.c:153-173  auth_digest_string_quoted    -> reproduced
-//!   lib/vauth/digest.c:178-229  auth_digest_get_key_value    -> OUT OF SCOPE
-//!   lib/vauth/digest.c:231-247  auth_digest_get_qop_values   -> OUT OF SCOPE
-//!   lib/vauth/digest.c:269-300  auth_decode_digest_md5_...   -> OUT OF SCOPE
-//!   lib/vauth/digest.c:311-314  Curl_auth_is_digest_...      -> in auth/mod
-//!   lib/vauth/digest.c:333-493  ..._create_digest_md5_...    -> OUT OF SCOPE
-//!   lib/vauth/digest.c:508-655  ..._decode_digest_http_...   -> reproduced
-//!   lib/vauth/digest.c:677-961  auth_create_digest_http_...  -> reproduced
-//!   lib/vauth/digest.c:983-1015 ..._create_digest_http_...   -> reproduced
-//!   lib/vauth/digest.c:1027-40  Curl_auth_digest_cleanup     -> reproduced
-//!   lib/http_digest.c:41-63     Curl_input_digest            -> reproduced
-//!   lib/http_digest.c:65-170    Curl_output_digest           -> reproduced
-//!   lib/http_digest.c:172-176   Curl_http_auth_cleanup_...   -> reproduced
-//! ```
+//! Supersedes three C files, together 1,260 lines: `lib/vauth/digest.c`,
+//! `lib/vauth/digest.h` and `lib/http_digest.c`. The transformation row for it
+//! reads *"Digest; message construction byte-exact"*, and that is meant
+//! literally -- every directive name, the order the directives appear in,
+//! which of them are quoted, and the case of every hexadecimal digit are
+//! compared as literal bytes by the fixture corpus. `tests/getpart.pm:351+`'s
+//! `compareparts` joins both sides into one string and compares them whole: no
+//! per-line matching, no normalisation and no reordering, so one wrong byte
+//! fails the fixture outright. 76 fixtures gate on the `digest` label and 98
+//! on `crypto`.
 //!
 //! # There are TWO challenge parsers in `lib/vauth/digest.c`. Only one is here
 //!
@@ -104,19 +78,6 @@
 //!   call (`:760`, `:774`, `:825`, `:842`), so nothing here streams and
 //!   [`crate::crypto::Md5Context`] is deliberately unused.
 //!
-//! # Quoting policy, from `lib/vauth/digest.c:852-861`
-//!
-//! The C states its own rule where the header is composed, and it explains
-//! every decision in [`compose_response`]:
-//!
-//! > Digest parameters are all quoted strings. Username which is provided by
-//! > the user will need double quotes and backslashes within it escaped.
-//! > realm, nonce, and opaque will need backslashes as well as they were
-//! > de-escaped when copied from request header. cnonce is generated with
-//! > web-safe characters. uri is already percent encoded. nc is 8 hex
-//! > characters. algorithm and qop with standard values only contain web-safe
-//! > characters.
-//!
 //! # State lives on the transfer, not on the connection
 //!
 //! `Curl_http_auth_cleanup_digest` (`lib/http_digest.c:172-176`) clears
@@ -128,32 +89,6 @@
 //! type system: [`DigestStates`] holds the two instances and is owned by
 //! [`DigestAuth`], and [`crate::auth::state_scope`] answers
 //! [`crate::auth::StateScope::Transfer`] for this scheme.
-//!
-//! # There is no clock here, and that is measured
-//!
-//! `grep -in "time\|now\|clock" lib/vauth/digest.c lib/http_digest.c` returns
-//! nothing: curl's Digest implementation reads no clock, has no nonce
-//! lifetime and does no freshness arithmetic. Staleness is driven entirely by
-//! the server, through the `stale=true` directive that
-//! [`decode_digest_http_message`] handles. [`crate::auth::AuthContext`]
-//! carries an injected clock because other mechanisms need one; this one does
-//! not read it, and reading it would invent behaviour the C does not have.
-//!
-//! The injected **random** source is another matter: the client nonce needs
-//! it, [`generate_cnonce`] takes it as a `&mut dyn Rng` parameter, and that
-//! injection is what makes every emitted header in this file's tests
-//! deterministic and assertable byte for byte.
-//!
-//! # No feature gates
-//!
-//! The C guards all three files with `CURL_DISABLE_DIGEST_AUTH`, guards the
-//! proxy arm of `Curl_output_digest` with `CURL_DISABLE_PROXY`, and guards
-//! two algorithm arms with `CURL_HAVE_SHA512_256`. None of the three becomes
-//! a Cargo feature. The crate's feature vocabulary is fifteen names and none
-//! of them is `digest`, `proxy` or `sha512-256`; `CURL_HAVE_SHA512_256` is
-//! defined unconditionally at `lib/curl_sha512_256.h:32` in any case, so all
-//! six algorithm spellings are always available and no `#[cfg]` may guard
-//! them.
 
 use core::fmt;
 
@@ -174,15 +109,7 @@ use crate::util::strparse::{
     is_blank, str_casecompare, str_passblanks, str_single, str_until,
 };
 
-// ---------------------------------------------------------------------------
 // LENGTH CAPS. `lib/vauth/digest.h:30-31`.
-//
-// Both are buffer sizes in the C, and both are attacker-controlled bounds:
-// the challenge arrives from the network. `value[DIGEST_MAX_VALUE_LENGTH]`
-// and `content[DIGEST_MAX_CONTENT_LENGTH]` are stack arrays declared at
-// `lib/vauth/digest.c:521-522`, and the parser's two counters are seeded at
-// one less than each so that the terminating NUL always fits.
-// ---------------------------------------------------------------------------
 
 /// `#define DIGEST_MAX_VALUE_LENGTH 256` -- `lib/vauth/digest.h:30`.
 ///
@@ -226,7 +153,6 @@ const CNONCE_RAW_LEN: usize = 12;
 #[allow(dead_code)] // Reached only by this file's tests, which is the point.
 const CNONCE_BASE64_LEN: usize = 16;
 
-// ---------------------------------------------------------------------------
 // ALGORITHM IDENTIFIERS. `lib/vauth/digest.c:41-48`.
 //
 // These six values are BIT-COMPOSED, not a sequential enumeration, and the
@@ -248,11 +174,6 @@ const CNONCE_BASE64_LEN: usize = 16;
 //  * Hash selection is a cascade of `<=` comparisons (`:991`, `:998`,
 //    `:1005`), so each pair of values must be adjacent and the pairs must be
 //    ordered MD5, SHA-256, SHA-512/256.
-//
-// Renumbering silently breaks both: session detection would answer for the
-// wrong algorithms, and the cascade would route a challenge to the wrong hash
-// function and produce a well-formed response that no server accepts.
-// ---------------------------------------------------------------------------
 
 /// `#define SESSION_ALGO 1` -- `lib/vauth/digest.c:41`, whose comment reads
 /// "for algos with this bit set".
@@ -260,15 +181,6 @@ const SESSION_ALGO: u8 = 1;
 
 /// The algorithm a challenge selected: the `uint8_t algo` field of
 /// `struct digestdata` (`lib/urldata.h:305`).
-///
-/// `#[repr(u8)]` with every discriminant written explicitly, for the reason
-/// the block above gives: these are not ordinals that happen to differ, they
-/// are a bit composition two behaviours read arithmetically. [`Self::bits`]
-/// recovers the integer and [`Self::is_session`] performs the C's
-/// `& SESSION_ALGO` test on it.
-///
-/// The derived ordering follows the discriminants, which is what lets
-/// [`hash_for`] transcribe the C's `<=` cascade rather than re-express it.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub(crate) enum DigestAlgo {
@@ -304,12 +216,6 @@ impl DigestAlgo {
     /// Whether this is a `-sess` variant: C's
     /// `(digest->algo & SESSION_ALGO)` at `lib/vauth/digest.c:651` and
     /// `:766`.
-    ///
-    /// Written as the bitwise test rather than as a `matches!` over the three
-    /// session variants, deliberately. The bitwise form is the C's, it cannot
-    /// disagree with the discriminants, and a seventh algorithm added later
-    /// on an odd number is session-typed automatically -- exactly as it would
-    /// be in the C.
     #[must_use]
     pub(crate) const fn is_session(self) -> bool {
         self.bits() & SESSION_ALGO != 0
@@ -343,9 +249,6 @@ const _: () = assert!(DigestAlgo::Sha512_256Sess.is_session());
 /// all three SHA forms are written `-SESS` in **upper case** at `:600`,
 /// `:602` and `:609`. Preserving it is what lets a reader diff this table
 /// against the C and get no hits.
-///
-/// `#[rustfmt::skip]` because these are wire-bearing literals in a table,
-/// and a formatter that reflows the table makes that diff harder to read.
 #[rustfmt::skip]
 const ALGORITHM_TABLE: [(&[u8], DigestAlgo); 6] = [
     (b"MD5-sess",         DigestAlgo::Md5Sess),
@@ -356,19 +259,9 @@ const ALGORITHM_TABLE: [(&[u8], DigestAlgo); 6] = [
     (b"SHA-512-256-SESS", DigestAlgo::Sha512_256Sess),
 ];
 
-// ---------------------------------------------------------------------------
 // QUALITY OF PROTECTION. `lib/vauth/digest.c:50-56`.
-// ---------------------------------------------------------------------------
 
 /// `DIGEST_QOP_VALUE_AUTH (1 << 0)` -- `lib/vauth/digest.c:50`.
-///
-/// The three bit values and [`DIGEST_QOP_VALUE_STRING_AUTH_CONF`] are read by
-/// `auth_digest_get_qop_values` (`:231-247`), which is the **SASL**
-/// tokeniser and is out of scope. They are transcribed for completeness of
-/// the constant block, and pinned by test, so that a reader porting the SASL
-/// path later finds the values already measured rather than guessing them.
-/// The HTTP tokeniser in [`select_qop`] uses booleans instead, exactly as
-/// `lib/vauth/digest.c:557-586` does.
 #[allow(dead_code)] // Consumer would be the SASL path; all three are stubs.
 pub(crate) const DIGEST_QOP_VALUE_AUTH: u8 = 1 << 0;
 
@@ -381,12 +274,6 @@ pub(crate) const DIGEST_QOP_VALUE_AUTH_INT: u8 = 1 << 1;
 pub(crate) const DIGEST_QOP_VALUE_AUTH_CONF: u8 = 1 << 2;
 
 /// `DIGEST_QOP_VALUE_STRING_AUTH "auth"` -- `lib/vauth/digest.c:54`.
-///
-/// This literal reaches the wire twice: it is what the tokeniser matches, and
-/// it is what [`compose_response`] emits as `qop=auth`. What gets stored is
-/// this canonical lower-case literal and **never** the server's own spelling
-/// (`lib/vauth/digest.c:577`), which is the one place Digest does not echo
-/// what it was sent.
 const DIGEST_QOP_VALUE_STRING_AUTH: &[u8] = b"auth";
 
 /// `DIGEST_QOP_VALUE_STRING_AUTH_INT "auth-int"` --
@@ -395,13 +282,6 @@ const DIGEST_QOP_VALUE_STRING_AUTH_INT: &[u8] = b"auth-int";
 
 /// `DIGEST_QOP_VALUE_STRING_AUTH_CONF "auth-conf"` --
 /// `lib/vauth/digest.c:56`.
-///
-/// Recognised by the SASL tokeniser at `:242` and **never** by the HTTP one:
-/// `lib/vauth/digest.c:557-586` tests `auth` and `auth-int` and nothing else,
-/// so an `auth-conf`-only challenge stores no qop at all and the response
-/// takes the no-qop formula. The literal is transcribed so that the
-/// difference between the two tokenisers is visible here rather than only in
-/// the C.
 #[allow(dead_code)] // Consumer would be the SASL path; it is a stub.
 pub(crate) const DIGEST_QOP_VALUE_STRING_AUTH_CONF: &[u8] = b"auth-conf";
 
@@ -410,58 +290,19 @@ pub(crate) const DIGEST_QOP_VALUE_STRING_AUTH_CONF: &[u8] = b"auth-conf";
 /// matches.
 const DIGEST_TRUE: &[u8] = b"true";
 
-// ---------------------------------------------------------------------------
 // DIGEST TO ASCII. `lib/vauth/digest.c:133-150`.
 //
 // LOWERCASE. Both renderers are a loop of `curl_msnprintf(dest, 3, "%02x")`,
 // and `%02x` is lower case. Get this wrong and all 76 digest-gated fixtures
 // fail at once, because the hexadecimal appears inside the `response=` value
 // that a byte-exact `<protocol>` block compares.
-//
-// The trap is one file away: `lib/escape.c:218-227`'s `Curl_hexbyte` is
-// documented as emitting "a two-digit UPPERCASE hex number" and indexes
-// `Curl_udigits`. `lib/escape.c:195-216`'s `Curl_hexencode` is the lowercase
-// one, but the Digest path does not call it either -- it has these two
-// dedicated helpers, so these are what is reproduced.
-// ---------------------------------------------------------------------------
 
 /// `auth_digest_md5_to_ascii` -- `lib/vauth/digest.c:133-140`.
-///
-/// Sixteen source bytes become thirty-two lowercase hexadecimal characters.
-///
-/// # The C signature, and why this one returns a `String`
-///
-/// The C is `void auth_digest_md5_to_ascii(const unsigned char *source /* 16
-/// bytes */, unsigned char *dest /* 33 bytes */)`: thirty-two characters plus
-/// the terminating NUL, into a caller-supplied array. A Rust string carries
-/// its own length and needs no terminator, so the thirty-third byte has
-/// nothing to represent. The C buffer size is not lost -- it is
-/// [`MD5_HEX_BUF_LEN`], and a test asserts this function returns exactly
-/// `MD5_HEX_BUF_LEN - 1` characters, which is the same fact stated where a
-/// reader can check it.
-///
-/// Every value this produces is concatenated with `':'` separators and
-/// re-hashed, or formatted into the header, so text is the shape every one of
-/// its five call sites wants.
 fn md5_to_ascii(source: &[u8; MD5_DIGEST_LEN]) -> String {
     hex_lower(source)
 }
 
 /// `auth_digest_sha256_to_ascii` -- `lib/vauth/digest.c:142-150`.
-///
-/// Thirty-two source bytes become sixty-four lowercase hexadecimal
-/// characters. The C's destination is 65 bytes ([`SHA256_HEX_BUF_LEN`]).
-///
-/// # This renders SHA-512/256 as well, and that is deliberate
-///
-/// `Curl_auth_create_digest_http_message` pairs the SHA-512/256 arm with
-/// **this** renderer, not with a third one (`lib/vauth/digest.c:1009`),
-/// because SHA-512/256 also produces thirty-two bytes. That coincidence is
-/// exactly why the pairing is dangerous to get wrong: choosing the wrong
-/// *hash function* still produces a correctly shaped 64-character value, and
-/// the only symptom is a server that rejects the response. [`HashKind`] is
-/// the answer to that -- it makes the hash and its rendering one choice
-/// rather than two.
 fn sha256_to_ascii(source: &[u8; SHA256_DIGEST_LEN]) -> String {
     hex_lower(source)
 }
@@ -485,14 +326,6 @@ const _: () = assert!(SHA512_256_DIGEST_LEN == SHA256_DIGEST_LEN);
 /// void (*convert_to_ascii)(const unsigned char *, unsigned char *),
 /// CURLcode (*hash)(unsigned char *, const unsigned char *, const size_t)
 /// ```
-///
-/// and every one of the five call sites inside that function invokes them as
-/// a pair, hash immediately followed by render (`:735-739`, `:760-764`,
-/// `:774-778`, `:811-814`, `:825-829`, `:842-846`). Two parameters that are
-/// only ever used together, one of which cannot be checked against the other,
-/// is a mispairing waiting to happen -- and the mispairing is silent, per
-/// [`sha256_to_ascii`]. One enumeration with one method removes the
-/// possibility rather than documenting it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HashKind {
     /// `Curl_md5it` with `auth_digest_md5_to_ascii` --
@@ -510,24 +343,6 @@ impl HashKind {
     /// Hash `input` and render the result as lowercase hexadecimal: the C's
     /// `hash(hashbuf, input, len)` immediately followed by
     /// `convert_to_ascii(hashbuf, dest)`.
-    ///
-    /// # One-shot, because the HTTP path is one-shot
-    ///
-    /// Every hash in `auth_create_digest_http_message` is computed from a
-    /// single already-assembled string: `curl_maprintf` builds `hashthis` and
-    /// `hash(hashbuf, hashthis, strlen(hashthis))` consumes it whole. The four
-    /// streaming MD5 contexts elsewhere in the file (`:388`, `:402`, `:425`,
-    /// `:443`) belong to `Curl_auth_create_digest_md5_message`, the SASL
-    /// DIGEST-MD5 path, which is out of scope. So there is nothing to stream
-    /// here and [`crate::crypto::Md5Context`] is correctly unused.
-    ///
-    /// # The C's `CURLcode` return has nothing to report
-    ///
-    /// `Curl_md5it` and its siblings return `CURLcode` because they could
-    /// reach a TLS backend that failed to deliver a digest. These hashes come
-    /// from RustCrypto crates that are unconditional dependencies and cannot
-    /// fail, so the five `if(result) goto oom` checks around them have no
-    /// counterpart.
     fn digest_hex(self, input: &[u8]) -> String {
         match self {
             Self::Md5 => md5_to_ascii(&md5(input)),
@@ -542,25 +357,6 @@ impl HashKind {
 
 /// The hash `algo` selects: `Curl_auth_create_digest_http_message`'s dispatch,
 /// `lib/vauth/digest.c:983-1015`.
-///
-/// # Cascading `<=`, not equality
-///
-/// The C's three tests are `digest->algo <= ALGO_MD5SESS`,
-/// `<= ALGO_SHA256SESS` and `<= ALGO_SHA512_256SESS` (`:991`, `:998`,
-/// `:1005`). Each bucket therefore covers a value and its `-sess` companion,
-/// which is the whole reason the six identifiers are numbered as they are.
-/// The form is transcribed rather than rewritten as a `match`, so that a
-/// reader comparing the two sees three comparisons against three constants in
-/// both.
-///
-/// # The unreachable arm is kept
-///
-/// The C ends with `return CURLE_BAD_CONTENT_ENCODING;` under the comment
-/// "Should be unreachable" (`:1013-1014`). It is genuinely unreachable here --
-/// [`DigestAlgo`] cannot hold a seventh value, where the C's `uint8_t` can --
-/// but it is preserved because it is the C's answer to the condition and
-/// because a seventh variant added later without a bucket must fail loudly
-/// rather than be routed to MD5 by accident.
 ///
 /// # Errors
 ///
@@ -582,29 +378,11 @@ fn hash_for(algo: DigestAlgo) -> Result<HashKind, CURLcode> {
     Err(CURLcode::BadContentEncoding)
 }
 
-// ---------------------------------------------------------------------------
 // QUOTED-STRING ESCAPING. `lib/vauth/digest.c:152-173`.
-// ---------------------------------------------------------------------------
 
 /// `auth_digest_string_quoted` -- `lib/vauth/digest.c:153-173`, whose own
 /// comment reads "Perform quoted-string escaping as described in RFC2616 and
 /// its errata".
-///
-/// # Exactly two characters are escaped
-///
-/// `'"'` and `'\\'`, each given one preceding backslash (`:161-165`).
-/// **Nothing else**: not CR, not LF, not any other control byte, not a
-/// character outside ASCII. That is not an oversight to harden -- the escaped
-/// string goes on the wire inside a byte-exact comparison, so adding an
-/// escape changes the emitted bytes and breaks fixtures that pass today.
-///
-/// # The empty input takes an early return
-///
-/// `if(!*s) return curlx_strdup("")` at `:157-158` runs **after**
-/// `curlx_dyn_init` but before any append, so a zero-length input never
-/// touches the buffer. The early return is preserved: it is what the code
-/// does, it is observable through allocation behaviour, and it is also the
-/// path that produces the `realm=""` of a challenge with no realm.
 ///
 /// # Errors
 ///
@@ -635,9 +413,7 @@ fn string_quoted(source: &[u8]) -> Result<Vec<u8>, CURLcode> {
     Ok(out.take())
 }
 
-// ---------------------------------------------------------------------------
 // STATE. The non-SSPI arm of `struct digestdata`, `lib/urldata.h:297-308`.
-// ---------------------------------------------------------------------------
 
 /// One side's Digest negotiation state: `data->state.digest` or
 /// `data->state.proxydigest`.
@@ -652,31 +428,6 @@ fn string_quoted(source: &[u8]) -> Result<Vec<u8>, CURLcode> {
 /// BIT(stale);             /* set true for re-negotiation */
 /// BIT(userhash);
 /// ```
-///
-/// The `USE_WINDOWS_SSPI` arm (`:289-296`: `input_token`, `input_token_len`,
-/// `http_context`, and copies of the user and password) has no counterpart.
-/// SSPI is Windows-only and Windows is outside the four-target matrix, and the
-/// two credential copies in particular are a field this file is glad not to
-/// have.
-///
-/// # The six values are bytes, not text
-///
-/// C stores `char *` and copies straight out of the challenge. A challenge
-/// arrives from the network, so its bytes are not guaranteed to be anything in
-/// particular, and every use of them inside this file -- concatenating them
-/// with `':'` and hashing the result -- is a byte operation. Holding them as
-/// `Vec<u8>` keeps that byte-exact. Text is required at exactly one point,
-/// where the finished header line becomes a `String`, and
-/// [`compose_response`] documents that boundary.
-///
-/// # `Default` is the C's cleanup, not a coincidence
-///
-/// `Curl_auth_digest_cleanup` (`lib/vauth/digest.c:1027-1040`) frees the six
-/// strings and then assigns `nc = 0`, `algo = ALGO_MD5`, `stale = FALSE`,
-/// `userhash = FALSE`. Those are precisely the derived `Default` -- `None` for
-/// each string, zero for `nc`, [`DigestAlgo::Md5`] because it carries
-/// `#[default]`, and `false` for both flags -- so [`Self::cleanup`] is
-/// `*self = Self::default()` and cannot drift from the reset list.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct DigestData {
     /// `char *nonce` -- the server nonce. Required: a challenge without one
@@ -719,10 +470,6 @@ impl fmt::Debug for DigestData {
     /// never retained -- and a formatter
     /// written by hand is what keeps a later field addition from quietly
     /// printing one.
-    ///
-    /// The values are printed lossily because they are bytes from the network
-    /// and this is a diagnostic; a non-UTF-8 byte must become a replacement
-    /// character rather than an error.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fn text(value: &Option<Vec<u8>>) -> Option<String> {
             value
@@ -747,13 +494,6 @@ impl fmt::Debug for DigestData {
 
 impl DigestData {
     /// `Curl_auth_digest_cleanup` -- `lib/vauth/digest.c:1027-1040`.
-    ///
-    /// Frees the six strings, then resets `nc` to zero, `algo` to
-    /// **[`DigestAlgo::Md5`]** -- the C's comment calls it the "default
-    /// algorithm", so the reset is to MD5 and not to an absent value -- and
-    /// both flags to false. Rust ownership performs the six frees, and
-    /// [`Self::default`] is the reset list; see the type's documentation for
-    /// why the two cannot disagree.
     pub(crate) fn cleanup(&mut self) {
         *self = Self::default();
     }
@@ -772,7 +512,6 @@ impl DigestData {
     /// private field.
     #[must_use]
     #[allow(dead_code)] // Consumers are this file's tests and `CURLINFO`
-                        // reporting, which has not landed.
     pub(crate) fn nonce_count(&self) -> i32 {
         self.nc
     }
@@ -780,7 +519,6 @@ impl DigestData {
     /// The algorithm the last challenge selected.
     #[must_use]
     #[allow(dead_code)] // Consumers are this file's tests and `CURLINFO`
-                        // reporting, which has not landed.
     pub(crate) fn algorithm(&self) -> DigestAlgo {
         self.algo
     }
@@ -788,25 +526,15 @@ impl DigestData {
     /// Whether the last challenge carried `stale=true`.
     #[must_use]
     #[allow(dead_code)] // Consumers are this file's tests and `CURLINFO`
-                        // reporting, which has not landed.
     pub(crate) fn is_stale(&self) -> bool {
         self.stale
     }
 }
 
-// ---------------------------------------------------------------------------
 // CHALLENGE PAIR EXTRACTION. `Curl_auth_digest_get_pair`,
 // `lib/vauth/digest.c:59-129`.
-// ---------------------------------------------------------------------------
 
 /// One `key=value` pair lifted out of a challenge, and where the scan stopped.
-///
-/// The C writes three results through pointers -- `char *value`, `char
-/// *content` and `const char **endptr` -- into buffers the caller sized at
-/// [`DIGEST_MAX_VALUE_LENGTH`] and [`DIGEST_MAX_CONTENT_LENGTH`]. The two
-/// buffers become owned vectors and the `endptr` write-back becomes
-/// [`Self::rest`], which is the remaining slice: the same information, but the
-/// caller cannot forget to advance and cannot advance twice.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DigestPair<'a> {
     /// The C's `value` buffer -- the key, at most
@@ -821,10 +549,6 @@ pub(crate) struct DigestPair<'a> {
 }
 
 /// `Curl_auth_digest_get_pair` -- `lib/vauth/digest.c:59-129`.
-///
-/// Extracts one `key=value` pair. `None` is the C's `FALSE`, which is also how
-/// [`decode_digest_http_message`]'s loop terminates: an empty or exhausted
-/// input has no `'='`, so the walk stops.
 ///
 /// # The sloppiness is the specification
 ///
@@ -848,29 +572,6 @@ pub(crate) struct DigestPair<'a> {
 /// * A trailing dangling backslash **fails**, because the escape flag is still
 ///   set when the loop ends (`:122-123`, the C's reason: "No character after
 ///   backslash").
-///
-/// # The terminating byte is consumed
-///
-/// The three `c = 0; continue;` arms look like they stop before the byte they
-/// matched, and they do not: `continue` in a C `for` runs the increment
-/// expression first, so `str++` happens and only then does the loop condition
-/// see the zeroed counter. `rest` therefore begins **after** the comma, the CR
-/// or the closing quote -- which is what makes the caller's subsequent
-/// `if(',' == *chlg) chlg++` (`:636-637`) idempotent rather than a
-/// double-advance.
-///
-/// # The two caps
-///
-/// The key is bounded at `DIGEST_MAX_VALUE_LENGTH - 1` = 255 bytes and the
-/// content loop at `DIGEST_MAX_CONTENT_LENGTH - 1` = 1023 iterations. They are
-/// not stylistic: the challenge is attacker-controlled, and an escaped pair
-/// spends two of the content budget rather than one, so the bound is on work
-/// done and not merely on bytes kept.
-///
-/// An over-long key fails, because the walk stops with the cursor on the 256th
-/// byte and that byte is then required to be `'='`. A challenge whose 256th
-/// key byte happens to be `'='` yields a 255-byte key and succeeds, exactly as
-/// the C does.
 pub(crate) fn get_pair(input: &[u8]) -> Option<DigestPair<'_>> {
     let mut cursor = input;
 
@@ -980,36 +681,10 @@ pub(crate) fn get_pair(input: &[u8]) -> Option<DigestPair<'_>> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // CHALLENGE DECODE. `Curl_auth_decode_digest_http_message`,
 // `lib/vauth/digest.c:508-655`.
-// ---------------------------------------------------------------------------
 
 /// The `qop` arm of the challenge walk -- `lib/vauth/digest.c:554-586`.
-///
-/// Tokenises the directive's value on commas, skipping blanks around each
-/// token, with each token bounded at [`DIGEST_QOP_TOKEN_MAX`] bytes and
-/// compared case-insensitively.
-///
-/// # The selection rule, and what it does not do
-///
-/// `auth` wins if it was offered at all; otherwise `auth-int`; otherwise
-/// nothing is stored and the response takes the no-qop formula. What gets
-/// stored is the canonical lower-case literal
-/// ([`DIGEST_QOP_VALUE_STRING_AUTH`] or
-/// [`DIGEST_QOP_VALUE_STRING_AUTH_INT`]) and **not** the server's spelling --
-/// the one directive Digest does not echo verbatim.
-///
-/// `auth-conf` is **not** recognised here. `lib/vauth/digest.c:563-567` tests
-/// two literals and stops; the third test lives in
-/// `auth_digest_get_qop_values` (`:242`), the SASL tokeniser, which is out of
-/// scope. So a challenge offering only `auth-conf` yields `None`, and if its
-/// algorithm was a `-sess` form the terminal validation then rejects the whole
-/// challenge.
-///
-/// Returning `None` for "nothing to select" is exactly the C's behaviour of
-/// leaving `digest->qop` untouched: the field was already cleared by the
-/// cleanup at the top of the decode.
 fn select_qop(content: &[u8]) -> Option<&'static [u8]> {
     let mut token = content;
     let mut found_auth = false;
@@ -1048,11 +723,6 @@ fn select_qop(content: &[u8]) -> Option<&'static [u8]> {
 
 /// `Curl_auth_decode_digest_http_message` -- `lib/vauth/digest.c:508-655`.
 ///
-/// Decodes one `WWW-Authenticate:` or `Proxy-Authenticate:` Digest challenge
-/// body into `digest`. `challenge` starts at the first directive, past the
-/// `Digest` token and the blanks after it, which is where
-/// [`input_digest`] leaves it.
-///
 /// # The order of the first two statements is load-bearing
 ///
 /// ```c
@@ -1060,21 +730,6 @@ fn select_qop(content: &[u8]) -> Option<&'static [u8]> {
 /// if(digest->nonce) before = TRUE;
 /// Curl_auth_digest_cleanup(digest);
 /// ```
-///
-/// The flag is captured **before** the cleanup wipes every field, and the
-/// third-from-last validation below is the only reader of it. Cleaning first
-/// would lose the one fact that distinguishes a fresh challenge from a
-/// rejected credential, and the loss would be silent: authentication would
-/// simply retry for ever against a server that keeps saying no.
-///
-/// # The walk
-///
-/// Skip blanks, take one pair, dispatch on the key case-insensitively
-/// (`curl_strequal`), skip blanks again, and step over one optional comma
-/// (`:631-637`). An unrecognised key is ignored outright -- the C's comment is
-/// "Unknown specifier, ignore it!" (`:624-626`) -- which is what lets a
-/// challenge carry `domain`, `charset` or anything else a future revision adds
-/// without breaking.
 ///
 /// # The three terminal validations, in this order
 ///
@@ -1091,9 +746,13 @@ fn select_qop(content: &[u8]) -> Option<&'static [u8]> {
 ///
 /// `CURLcode::BadContentEncoding` for an unknown `algorithm` value and for
 /// each of the three validations above -- the same code the C returns in all
-/// four places. The C's `CURLE_OUT_OF_MEMORY` arms guarded `curlx_strdup`
-/// failures and have no counterpart: an allocation failure aborts in Rust
-/// rather than returning a null pointer.
+/// four places. The C's `CURLE_OUT_OF_MEMORY` arms guarded `curlx_strdup` of a
+/// challenge field, which is a copy of bytes already in memory -- the same
+/// order of magnitude as the input, with no amplification -- so it is not among
+/// the externally sized allocations `crate::util::fallible` covers, and
+/// `Box`/`String` duplication has no stable fallible spelling at the declared
+/// minimum Rust version. A failure there aborts, and that is stated rather than
+/// papered over.
 ///
 /// The two `CURLE_NOT_BUILT_IN` arms at `:606` and `:613` are also absent, and
 /// deliberately: they sit under `#else /* !CURL_HAVE_SHA512_256 */`, and
@@ -1204,20 +863,10 @@ pub(crate) fn decode_digest_http_message(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // RESPONSE COMPUTATION. `auth_create_digest_http_message`,
 // `lib/vauth/digest.c:677-961`.
-// ---------------------------------------------------------------------------
 
 /// The C's `curl_maprintf("%s:%s"...)` over byte strings, in one place.
-///
-/// Every hash input in `auth_create_digest_http_message` is a colon-joined
-/// concatenation assembled by `curl_maprintf`: `"%s:%s:%s"` for HA1 (`:753`),
-/// `"%s:%s:%s"` for the session HA1 (`:768`), `"%s:%s"` for HA2 (`:800`) and
-/// six fields for the response with qop (`:832`). Writing the join once means
-/// a stray or missing separator is a single-site defect rather than a
-/// six-site one, and it keeps the operation on bytes -- these values come from
-/// the network and from user options and are not required to be text.
 fn join_colon(parts: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     for (index, part) in parts.iter().enumerate() {
@@ -1238,18 +887,6 @@ fn join_colon(parts: &[&[u8]]) -> Vec<u8> {
 ///   result = curlx_base64_encode(cnoncebuf, sizeof(cnoncebuf),
 ///                                &cnonce, &cnonce_sz);
 /// ```
-///
-/// Twelve raw bytes, base64 encoded. Because `12 % 3 == 0` the encoding is
-/// exactly [`CNONCE_BASE64_LEN`] characters with **no** padding, and that is
-/// what appears in a fixture's `cnonce=` value.
-///
-/// # Not the 32-character hexadecimal form
-///
-/// `lib/vauth/digest.c:352` declares `char cnonce[33]` and `:383` fills it
-/// with `Curl_rand_hex`. That is `Curl_auth_create_digest_md5_message`, the
-/// SASL DIGEST-MD5 path, and it is out of scope. Using it here would emit a
-/// 32-character hexadecimal client nonce where the corpus expects a
-/// 16-character base64 one.
 ///
 /// # The random source is injected
 ///
@@ -1277,44 +914,12 @@ fn generate_cnonce(rng: &mut dyn Rng) -> Result<Vec<u8>, CURLcode> {
 /// -- the text that follows `Authorization: Digest `. [`output_digest`] wraps
 /// it in the header line.
 ///
-/// `user` and `password` are already the C's post-substitution values -- see
-/// [`output_digest`], which turns a missing credential into an empty string
-/// before this is reached, because the C does so at
-/// `lib/http_digest.c:110-115`.
-///
-/// # HA1
-///
-/// `H(user ":" realm ":" password)`, with an absent realm contributing the
-/// empty string (`:753-754`, the C's `digest->realm ? digest->realm : ""`).
-/// Then, **only** for a `-sess` algorithm, it is recomputed as
-/// `H(HA1 ":" nonce ":" cnonce)` and the first value is discarded (`:766-779`).
-/// The C's note at `:767` -- "nonce and cnonce are OUTSIDE the hash" -- means
-/// outside the *first* hash: they are folded in by the second.
-///
-/// # HA2, and the one substitution that must not happen
-///
-/// `H(method ":" target)`. The `uri_quoted` value that
-/// [`compose_response`] emits is computed from the same `uripath`, but it is
-/// **not** what goes into this hash: `:800` hashes the **raw** `uripath` while
-/// `:794` escapes a separate copy for the header. Hashing the escaped form
-/// instead produces a response the server rejects whenever the target contains
-/// a quote or a backslash, with nothing in the exchange to say why.
-///
-/// For `qop=auth-int` a third component is appended: `H("")`, the hash of the
-/// **empty** input, rendered as hexadecimal (`:806-823`). The body is never
-/// actually hashed, and the C says why -- "We do not support auth-int for PUT
-/// or POST" (`:807`).
-///
 /// # The response, in exactly two forms
 ///
 /// ```text
 ///   with qop:  H(HA1 ":" nonce ":" nc ":" cnonce ":" qop ":" HA2)   /* :832 */
 ///   no qop:    H(HA1 ":" nonce ":" HA2)                            /* :835 */
 /// ```
-///
-/// `auth` and `auth-int` share the first form and differ **only** in HA2.
-/// There is no third formula. `nc` is `%08x`: eight lowercase, zero-padded
-/// hexadecimal digits.
 ///
 /// # Errors
 ///
@@ -1455,21 +1060,9 @@ fn create_digest_http_message(
     )
 }
 
-// ---------------------------------------------------------------------------
 // EMISSION. `lib/vauth/digest.c:884-946`.
-// ---------------------------------------------------------------------------
 
 /// The six values the emission interpolates, in emission order.
-///
-/// Gathered into a structure rather than passed as six positional byte slices,
-/// for the reason [`crate::auth::EmissionGuards`] gives about five positional
-/// booleans: six same-typed parameters at one call site, in an order that is
-/// itself the wire contract, is a defect waiting to happen. Naming them makes
-/// a transposition a compile error instead of a wrong `response=` value.
-///
-/// Every field except [`Self::request_digest`] is already in its final wire
-/// form -- escaped where the C escapes it, raw where the C does not -- so the
-/// emission does no transformation at all beyond interleaving the literals.
 struct ResponseFields<'a> {
     /// `userp_quoted` (`lib/vauth/digest.c:861`): the escaped username, or the
     /// escaped userhash value when `userhash` is set.
@@ -1535,25 +1128,7 @@ struct ResponseFields<'a> {
 ///   directive and the next. No trailing comma, and no space on either side of
 ///   an `=`.
 ///
-/// # `nc` is incremented after the emission, not before
-///
-/// `digest->nc++` sits inside the qop branch at `:902-903`, after the append.
-/// So the first request carries `nc=00000001` and the second `nc=00000002`,
-/// and the no-qop branch never increments at all because it never emits the
-/// field. The C's counter is a plain `int`; `wrapping_add` reproduces its
-/// observable behaviour at the top of the range without introducing an error
-/// path the C does not have.
-///
 /// # Bytes throughout, text once
-///
-/// The C composes into a `struct dynbuf` of bytes and hands the caller a
-/// `char *`. This composes into a [`DynBuf`] the same way -- so every literal
-/// above is compared against the C as a byte string -- and converts once, at
-/// the end. That conversion is the one place this file requires its inputs to
-/// be text, and it is required because the crate's emission contract is
-/// text: [`crate::auth::AuthEmission`] carries a `String` and
-/// [`authorization_header`] takes a `&str`, which is how 168 fixtures compare
-/// an `Authorization:` line.
 ///
 /// A challenge value or username that is not valid UTF-8 therefore becomes
 /// `CURLcode::BadContentEncoding` rather than reaching the wire. That is the
@@ -1647,24 +1222,17 @@ fn compose_response(
     String::from_utf8(response.take()).map_err(|_| CURLcode::BadContentEncoding)
 }
 
-// ---------------------------------------------------------------------------
 // HTTP GLUE. `lib/http_digest.c`.
 //
 // Test example headers, verbatim from `lib/http_digest.c:34-39`:
 //
 //     WWW-Authenticate: Digest realm="testrealm", nonce="1053604598"
 //     Proxy-Authenticate: Digest realm="testrealm", nonce="1053604598"
-// ---------------------------------------------------------------------------
 
 /// The scheme token `Curl_input_digest` requires, `lib/http_digest.c:56`.
 const DIGEST_SCHEME: &str = "Digest";
 
 /// `Curl_input_digest` -- `lib/http_digest.c:41-63`.
-///
-/// Consumes one Digest challenge from a `WWW-Authenticate:` or
-/// `Proxy-Authenticate:` header. `header` starts at the scheme token, which is
-/// the same pointer `authcmp` matched -- see
-/// [`crate::auth::ChallengeDecoder::decode`].
 ///
 /// # The prefix test has two halves
 ///
@@ -1686,17 +1254,6 @@ const DIGEST_SCHEME: &str = "Digest";
 /// | `Digest` | no | index 6 is past the end, which is not a blank |
 /// | `DigestX realm="x"` | no | index 6 is `X` |
 /// | `Digest,` | no | a comma is not a blank, though `authcmp` admits it |
-///
-/// The C indexes `header[6]` on a NUL-terminated string, so a bare `"Digest"`
-/// tests its terminator and `ISBLANK` rejects it. A slice has no terminator,
-/// so an absent byte must give the same answer, which is what
-/// `unwrap_or(0)` provides: zero is not blank.
-///
-/// # Then advance and decode
-///
-/// `header += strlen("Digest")` -- six bytes, not seven: the blank that was
-/// just required is skipped by `curlx_str_passblanks` along with any that
-/// follow it.
 ///
 /// # Errors
 ///
@@ -1721,9 +1278,6 @@ pub(crate) fn input_digest(
 
 /// `Curl_output_digest` -- `lib/http_digest.c:65-170`.
 ///
-/// Produces this request's `Authorization: Digest ...` line, or
-/// [`AuthEmission::Nothing`] when no challenge has been received yet.
-///
 /// # No challenge is not an error
 ///
 /// ```c
@@ -1743,13 +1297,6 @@ pub(crate) fn input_digest(
 /// [`DigestAuth::output`], which is the only caller and which reports the
 /// no-challenge case as `Continuing` with an empty line rather than losing it.
 ///
-/// # Missing credentials mean empty ones
-///
-/// `if(!userp) userp = ""` and the same for the password (`:110-115`), under
-/// the C's comment "not set means empty". An empty username and password still
-/// produce a well-formed response; they simply produce one the server will
-/// reject.
-///
 /// # IE-style URI truncation
 ///
 /// The C's own explanation, from `lib/http_digest.c:128-139`:
@@ -1766,12 +1313,6 @@ pub(crate) fn input_digest(
 /// > Further details on Digest implementation differences:
 /// > <https://web.archive.org/web/2009/fngtps.com/2006/09/http-authentication>
 ///
-/// `iestyle` arrives from `CURLOPT_HTTPAUTH`: `lib/setopt.c:243-247` sets it
-/// from `auth & CURLAUTH_DIGEST_IE` and then folds that bit into plain
-/// `CURLAUTH_DIGEST`, which is why [`crate::auth::AuthMask::DIGEST_IE`] never
-/// appears in the preference chain -- it is a modifier, not a selectable
-/// mechanism.
-///
 /// The control flow is subtle and is transcribed rather than tidied:
 ///
 /// ```c
@@ -1785,32 +1326,6 @@ pub(crate) fn input_digest(
 /// if(!tmp)
 ///   path = strdup(uripath);
 /// ```
-///
-/// The second test is on **`tmp`**, not on `path`. `tmp` is non-NULL only when
-/// `iestyle` was set *and* a `'?'` was found, so the truncated copy survives in
-/// exactly that case and the full target is copied in every other -- including
-/// when `iestyle` is set and there is no query. Testing `path` instead would
-/// read identically and behave identically here, which is precisely why the
-/// distinction is worth recording: it is a difference a reader must be able to
-/// check against the C rather than infer.
-///
-/// The truncation feeds **both** the hash and the emitted `uri=` directive,
-/// because it happens to `path` before
-/// [`create_digest_http_message`] ever sees it.
-///
-/// # The line
-///
-/// `"%sAuthorization: Digest %s\r\n"` (`:161-162`), with `"Proxy-"` or the
-/// empty string. Composed by [`authorization_header`], which owns that shape
-/// for all six mechanisms.
-///
-/// # The proxy arm's `CURLE_NOT_BUILT_IN` is unreachable here
-///
-/// `:90-91` returns `CURLE_NOT_BUILT_IN` for a proxy request under
-/// `CURL_DISABLE_PROXY`. There is no `proxy` Cargo feature -- the crate's
-/// vocabulary is fifteen fixed names -- so the condition cannot arise and the
-/// arm has no counterpart. It is recorded rather than dropped silently so that
-/// a reader diffing against the C finds the account of it here.
 ///
 /// # Errors
 ///
@@ -1895,11 +1410,6 @@ impl DigestStates {
     /// Curl_auth_digest_cleanup(&data->state.digest);
     /// Curl_auth_digest_cleanup(&data->state.proxydigest);
     /// ```
-    ///
-    /// **Both** sides, unconditionally. There is no `bool proxy` here, which is
-    /// the shape of the observation this module's documentation makes about
-    /// scope: the C is cleaning two fields of the easy handle, not connection
-    /// metadata, and it does not need to know which side a caller cared about.
     #[allow(dead_code)] // Consumer is `crate::transfer`, not yet landed;
                         // reached by this file's tests meanwhile.
     pub(crate) fn cleanup(&mut self) {
@@ -1930,15 +1440,6 @@ impl DigestStates {
 ///   [`crate::auth::AuthMask::DIGEST_IE`] by
 ///   [`Self::set_iestyle`]. It is a field of `struct auth` in C, and
 ///   [`crate::auth::AuthState::iestyle`] is where the driver reads it from.
-///
-/// # State scope
-///
-/// Per **transfer**, with separate origin and proxy instances --
-/// [`crate::auth::state_scope`] answers
-/// [`crate::auth::StateScope::Transfer`] for this scheme, and it is the only
-/// scheme it answers that for. One `DigestAuth` therefore belongs to one easy
-/// handle and must not outlive it, and it must survive a new connection: the
-/// challenge is a nonce and a realm, not a handshake bound to a socket.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct DigestAuth {
     /// The two per-side negotiation states.
@@ -1955,14 +1456,6 @@ pub(crate) struct DigestAuth {
 
 impl fmt::Debug for DigestAuth {
     /// Hand-written even though a derive would be safe today.
-    ///
-    /// A derive would be safe *because* [`Credentials`] and [`DigestData`] each
-    /// write their own formatter, and it would stay safe only for as long as
-    /// every field of this structure keeps doing so. Writing it here is what
-    /// makes a future field's addition a decision rather than an inheritance:
-    /// the password reaches this type through [`Self::set_credentials`], and
-    /// nothing that touches it may acquire a path to a log that curl does not
-    /// already have.
     ///
     /// This adds no redaction to curl's output and removes none.
     /// `lib/http.c:2888-2895` puts the fully formed `Authorization:` header
@@ -2048,28 +1541,6 @@ impl HttpAuthMechanism for DigestAuth {
     }
 
     /// `Curl_output_digest` -- see [`output_digest`].
-    ///
-    /// # The no-challenge case maps to `Continuing`, not `Nothing`
-    ///
-    /// C leaves `authp->done` **false** and emits nothing
-    /// (`lib/http_digest.c:123-126`).
-    /// [`AuthEmission::Nothing`] reports [`AuthEmission::is_done`] true, which
-    /// is right for the Basic and Bearer arms it was written for and wrong
-    /// here, so this returns [`AuthEmission::Continuing`] carrying an empty
-    /// line. The two properties that matter are then both exact: `is_done()`
-    /// is false, matching `authp->done = FALSE`, and the header contributes
-    /// zero bytes, matching "emit nothing" -- an empty line appended to a
-    /// request buffer writes nothing at all.
-    ///
-    /// [`crate::auth::finish_emission`] then computes `multipass = !done` as
-    /// true, which is exactly what `output_auth_headers()` computes at
-    /// `lib/http.c:734-737` after a Digest arm that ran without finishing.
-    ///
-    /// # The clock is not read
-    ///
-    /// `ctx.clock` is deliberately untouched: curl's Digest implementation
-    /// reads no clock at all. See this module's documentation for the
-    /// measurement.
     fn output(
         &mut self,
         ctx: &mut AuthContext<'_>,
@@ -2140,15 +1611,6 @@ impl ChallengeDecoder for DigestAuth {
     /// decoder over all of its mechanisms and routes by scheme, and reporting
     /// a failure for a scheme this object does not own would set
     /// `authproblem` for a challenge that was handled correctly elsewhere.
-    ///
-    /// `spnego_supported`, `ntlm_supported` and `digest_supported` are left at
-    /// their trait defaults. The third is
-    /// [`crate::auth::is_digest_supported`], which returns `true`
-    /// unconditionally exactly as `Curl_auth_is_digest_supported()` does
-    /// (`lib/vauth/digest.c:311-314`); it is consulted at `lib/http.c:946`,
-    /// inside the scan, which is where the default keeps it. Overriding the
-    /// other two would misreport the build's capabilities rather than this
-    /// object's responsibilities.
     fn decode(
         &mut self,
         scheme: AuthScheme,
@@ -2170,13 +1632,6 @@ impl ChallengeDecoder for DigestAuth {
 
 // Tests
 //
-// `tests/unit/*.c` and `tests/libtest/*.c` cannot link against this crate --
-// they call internal `Curl_*` symbols, and a Rust static library does not
-// export `pub(crate)` items, so they are genuinely absent from the symbol
-// table rather than merely hidden. Their coverage is relocated here, inside
-// the module under test, which is also where a private field is reachable
-// without widening its visibility to accommodate a test.
-//
 // Every expectation that crosses the wire is written as a LITERAL. Deriving
 // one from the implementation would make the test agree with whatever the code
 // does, which is the one thing a parity test must not do. The literals come
@@ -2190,12 +1645,6 @@ impl ChallengeDecoder for DigestAuth {
 //      specifications' own known-answer vectors.
 //   4. Values computed with an independent implementation of the RFC formula,
 //      for the algorithm and qop combinations no published vector covers.
-//
-// The client nonce is deterministic because the random source is injected: a
-// `TestRng` seeded from the four bytes of `"curl"` produces draws
-// 0x6375726c, 0x6375726d and 0x6375726e, which `rand_bytes` lays down low byte
-// first as `6c 72 75 63 6d 72 75 63 6e 72 75 63`, whose base64 form is
-// `bHJ1Y21ydWNucnVj` -- sixteen characters, no padding.
 
 #[cfg(test)]
 mod tests {
@@ -2385,11 +1834,6 @@ mod tests {
 
     /// `lib/vauth/digest.c:133-150`: LOWERCASE, and the lengths the C's
     /// destination buffers are sized for.
-    ///
-    /// The three expectations are the published empty-input digests, so this
-    /// checks the case, the length and the algorithm at once -- and would fail
-    /// if `Curl_hexbyte`'s uppercase table (`lib/escape.c:218-227`) ever crept
-    /// in.
     #[test]
     fn every_digest_is_rendered_in_lowercase_hexadecimal() {
         let md5 = HashKind::Md5.digest_hex(b"");
@@ -2736,18 +2180,6 @@ mod tests {
     }
 
     /// A blank BEFORE a token is skipped; a blank AFTER one is not.
-    ///
-    /// Measured, not assumed, and surprising enough to be worth pinning.
-    /// `curlx_str_until` stops at the delimiter and returns everything before
-    /// it -- trailing blanks included -- and `curlx_str_casecompare` requires
-    /// equal lengths (`lib/curlx/strparse.c:239-245`). So a token spelled
-    /// `"auth "` matches neither literal, and only the explicit
-    /// `while(*token && ISBLANK(*token)) token++` at `:559-561` and `:570-571`
-    /// removes a blank -- both of which run before a token, never after.
-    ///
-    /// The middle row is the consequence a reader would not predict: because
-    /// the trailing blank defeats `auth`, the SECOND token wins and the
-    /// selection is `auth-int`.
     #[test]
     fn a_blank_before_a_qop_token_is_skipped_but_one_after_it_is_not() {
         assert_eq!(
@@ -2998,17 +2430,6 @@ mod tests {
 
     /// All six algorithm spellings against all three qop forms: eighteen
     /// complete headers, asserted byte for byte.
-    ///
-    /// Three of the eighteen -- a `-sess` algorithm with no qop -- cannot be
-    /// reached through [`decode_digest_http_message`], which rejects them at
-    /// validation 3. They are constructed directly so that the formula and the
-    /// emission are covered for every algorithm regardless of how a challenge
-    /// could arrive at them.
-    ///
-    /// The MD5 no-qop row is the worked example in the C source itself:
-    /// `lib/vauth/digest.c:848-851` records
-    /// `response="c55f7f30d83d774a3d2dcacf725abaca"` for exactly this
-    /// username, realm, nonce and target.
     #[test]
     fn every_algorithm_and_qop_combination_emits_the_expected_header() {
         #[rustfmt::skip]
@@ -3914,12 +3335,6 @@ mod tests {
     }
 
     /// No credential reaches a log this file wrote.
-    ///
-    /// curl prints the finished `Authorization:` header itself and 168
-    /// fixtures compare it, so the header is not the subject here. What is
-    /// asserted is narrower and is the property that actually binds: the
-    /// password, HA1, HA2 and the intermediate session HA1 gain no path to a
-    /// sink, and no formatter on any type in this file prints a secret.
     #[test]
     fn no_credential_reaches_a_log() {
         const SECRET: &str = "correct-horse-battery-staple";

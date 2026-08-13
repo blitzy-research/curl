@@ -57,9 +57,10 @@
 //!   and `build.rs`'s `undefined_abi_exports` computed from `lib/libcurl.def` --
 //!   and `build.rs` prints the live figure as a `cargo:warning` on every build,
 //!   which is the authority to consult rather than this sentence. The
-//!   declarations below are therefore NINE symbol-family modules, not twelve:
-//!   `easy`, `escape`, `form`, `global`, `mime`, `misc`, `slist`, `strerror`
-//!   and `url`.
+//!   declarations below are therefore TEN symbol-family modules, not twelve:
+//!   `easy`, `escape`, `form`, `global`, `mime`, `misc`, `printf`, `slist`,
+//!   `strerror` and `url` -- `printf` declared apart from the other nine, for
+//!   the two reasons recorded at its declaration, but a family all the same.
 //!   `escape` does
 //!   not appear in the twelve-name list above because it is not a family of its
 //!   own -- it now holds only `curl_easy_escape` and `curl_easy_unescape`, which
@@ -84,22 +85,25 @@
 //!   headers remain the ABI contract rather than being replaced by a truncated
 //!   one.
 //! * One caveat that belongs with the export figure rather than buried in it,
-//!   and it now covers SIX symbols rather than five: the five plain-variadic
-//!   `curl_m*printf` forms in `printf` AND `curl_formadd` in `form` are defined
-//!   by `core::arch::global_asm!`, because `extern "C" fn f(x: T, ...)` is
-//!   `error[E0658]` on stable at the declared minimum. A `global_asm!` symbol
-//!   reaches the STATICLIB but not the CDYLIB, because rustc's cdylib export
-//!   list covers only the `#[no_mangle] pub extern` items it knows of and the
-//!   section is then collected. Measured over both artifacts at this commit, the
-//!   staticlib-only set is exactly `curl_formadd`, `curl_maprintf`,
-//!   `curl_mfprintf`, `curl_mprintf`, `curl_msnprintf` and `curl_msprintf`, so
-//!   `build.rs`'s source-scanning count reads 59 where `nm -D --defined-only`
-//!   over the shared object reads 53. The two numbers reconcile exactly --
-//!   59 - 6 = 53 -- and are not a discrepancy in this partition. The five
-//!   `va_list` forms `curl_mv*printf` are ordinary Rust items and DO reach the
-//!   cdylib, which is why the gap is six and not eleven. Closing it needs a
-//!   toolchain newer than the declared minimum, which is a user decision
-//!   (escalation A4); `printf` and `form` each record it at their own site.
+//!   and it is now CLOSED on ELF and open only on Mach-O. Six symbols -- the
+//!   five plain-variadic `curl_m*printf` forms in `printf` and `curl_formadd`
+//!   in `form` -- are defined by `core::arch::global_asm!`, because
+//!   `extern "C" fn f(x: T, ...)` is `error[E0658]` on stable at the declared
+//!   minimum. A `global_asm!` symbol reaches the STATICLIB unaided but not the
+//!   CDYLIB, because rustc's cdylib export list covers only the
+//!   `#[no_mangle] pub extern` items it knows of and hands the linker a version
+//!   script that localises everything else. Measured, that made
+//!   `build.rs`'s source-scanning count read 59 where `nm -D --defined-only`
+//!   over the shared object read 53, the difference being exactly those six.
+//!   `build.rs`'s `promote_assembled_exports` closes it on ELF by merging a
+//!   second version script naming the six, with LLD selected explicitly from
+//!   the invoking toolchain's own sysroot; measured after the change, both
+//!   artifacts export the identical 59 and nothing leaks, at the 1.75 floor and
+//!   on the aarch64 cross leg alike. On Mach-O the six are still absent,
+//!   because ld64's export list is replaced rather than extended. What that
+//!   leaves for escalation A4 is only the four option-identifier setters on
+//!   Apple arm64, which is an argument-passing question and not an export one;
+//!   `printf` and `form` each record their half at their own site.
 //!
 //! What holds unconditionally, now and at completion, is the partition's SHAPE:
 //! it is disjoint, and every name defined has exactly one `#[no_mangle] pub
@@ -130,9 +134,11 @@ pub(crate) mod types;
 //
 // The counts below were measured over the built artifacts, not accumulated from
 // the previous value of this sentence. The nine carry 49 definitions between
-// them; with `printf`'s ten that is the 59 `build.rs` scans from source, of
-// which 53 reach the cdylib -- the six assembled symbols named in the module
-// documentation above account for the difference exactly.
+// them; with `printf`'s ten that is the 59 `build.rs` scans from source, and on
+// ELF all 59 reach the cdylib as well, because `promote_assembled_exports`
+// merges a second version script naming the six symbols `global_asm!` defines.
+// On Mach-O those six are still absent and the cdylib carries 53; the module
+// documentation above records the measurement and why ld64 differs.
 //
 // `form` is the newest of the nine and the smallest: three names, all deprecated
 // in the headers since 7.56.0 and all still exported, because the symbol-parity

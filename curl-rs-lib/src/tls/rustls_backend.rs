@@ -26,14 +26,6 @@
 
 //! The one TLS backend: native rustls 0.23.42.
 //!
-//! The successor of `lib/vtls/rustls.c`, the 1,429-line translation unit that
-//! drives curl 8.19.0-DEV's rustls support through the rustls-ffi C API. That
-//! file is this module's executable specification, and every non-obvious
-//! decision below carries the line range it came from. The mapping it already
-//! established -- curl's TLS semantics expressed in rustls concepts -- is
-//! *followed* rather than reinvented, because it is the part of the C tree
-//! that was already written against this library.
-//!
 //! Three things change, and nothing else does.
 //!
 //! * **The C API becomes the Rust API.** `rustls_connection`,
@@ -55,19 +47,6 @@
 //!   log and the session store all arrive as values, so two transfers in one
 //!   process cannot disagree about them and no test can be perturbed by the
 //!   order it ran in.
-//!
-//! # What is *not* negotiable here
-//!
-//! The bytes. 1,476 of the 1,914 fixtures in `tests/data` carry a
-//! `<protocol>` block, and `tests/getpart.pm:351-357` joins both sides with
-//! `join("")` and compares them as one string -- so a TLS flight is compared
-//! exactly, not loosely. Everything that reaches the `ClientHello` is
-//! therefore pinned rather than defaulted: the provider's cipher-suite order,
-//! the ALPN entries byte for byte and in order, the protocol-version list, SNI
-//! and the absence of any extension curl 8.19.0-DEV does not send. In
-//! particular [`rustls::ClientConfig::enable_early_data`] stays `false`
-//! ([`configure`]), because `rustls.c` never enables 0-RTT and an `early_data`
-//! extension on a resumption would change those bytes.
 //!
 //! # Provider: `ring`, injected, never installed
 //!
@@ -99,41 +78,6 @@
 //! * There is no `ring`-side HPKE feature. `rustls`'s manifest offers
 //!   `aws_lc_rs`, `fips = ["aws_lc_rs", ...]` and
 //!   `prefer-post-quantum = ["aws_lc_rs"]`, all of which are forbidden here.
-//!
-//! So [`RUSTLS_SUPPORTS`] carries **six** bits, not seven, and
-//! `curl --version` will not claim ECH. That is the safe direction: the test
-//! harness parses the `Features:` line to decide which fixtures to run, and
-//! under-reporting turns a fixture into a clean skip while over-reporting
-//! turns it into a hard failure.
-//!
-//! The ECH *code path* is nonetheless real and is exercised by tests. HPKE
-//! suites are injected ([`RustlsBackend::with_hpke_suites`]), GREASE and a
-//! raw TLS-encoded `ECHConfigList` from either decoded command-line input or
-//! a caller-supplied DNS record are all built through
-//! [`rustls::client::EchMode`], an outer name is refused exactly as
-//! `rustls.c:925-929` refuses it, and a request with no usable suite fails
-//! with the C's code. Nothing here enables a second provider to obtain ECH.
-//!
-//! # Measured deviation 2: `vtls_spack` session bytes cannot be bridged
-//!
-//! Resumption itself is fully supported through an injected
-//! [`rustls::client::ClientSessionStore`] ([`RustlsSessionStore`]), which
-//! delivers TLS 1.2 session reuse, TLS 1.3 tickets consumed **at most once**
-//! per RFC 8446 appendix C.4, key-exchange hints and the peer's advertised
-//! early-data ceiling.
-//!
-//! What cannot be bridged is the *serialised* form. `curl_easy_ssls_import`
-//! and `curl_easy_ssls_export` move `crate::tls::session_cache`'s
-//! `vtls_spack` bytes across process boundaries, and reconstructing a rustls
-//! session value from those bytes is impossible with a stable API:
-//! `Tls13ClientSessionValue::new` and `Tls12ClientSessionValue::new` are
-//! `pub(crate)` in rustls 0.23.42 (`src/msgs/persist.rs:82`, `:163`), and the
-//! ticket bytes live behind the equally private `common.ticket`. A store can
-//! therefore hold and return only values rustls itself produced.
-//! [`RustlsSessionStore::pack_bridge_available`] reports that as a blocked
-//! capability. Fabricating bytes to make the path *look* supported would
-//! corrupt a session file that curl 8.19.0-DEV wrote, which is worse than
-//! saying no.
 //!
 //! # Safety and visibility
 //!
@@ -183,22 +127,12 @@ use crate::trace::{failf, infof, trc_cf, TraceFilter};
 use crate::util::base64;
 use crate::version::SSL_VERSION;
 
-// =========================================================================
 // Identity and capability -- `Curl_ssl_rustls` (`lib/vtls/rustls.c:1397-1426`)
-// =========================================================================
 
 /// This backend's identity: `{ CURLSSLBACKEND_RUSTLS, "rustls" }`.
-///
-/// The first member of the descriptor, and contractually first:
-/// `lib/vtls/vtls_int.h:142-145` says it "*must* be the first entry to allow
-/// returning the list of available backends in `curl_global_sslset()`". The
-/// integer 14 already exists in the public `curl_sslbackend` enumeration, so
-/// nothing is invented and nothing is renumbered.
 const RUSTLS_INFO: SslBackendInfo = SslBackendInfo::RUSTLS;
 
 /// What this backend truthfully answers yes to.
-///
-/// `rustls.c:1399-1405` reads
 ///
 /// ```text
 /// SSLSUPP_CAINFO_BLOB | SSLSUPP_HTTPS_PROXY | SSLSUPP_CIPHER_LIST |
@@ -222,12 +156,6 @@ const RUSTLS_INFO: SslBackendInfo = SslBackendInfo::RUSTLS;
 /// offers no HPKE suite, so advertising it would be a lie the fixture harness
 /// would convert into hard failures. The module documentation carries the
 /// file-level evidence.
-///
-/// The eight bits the C leaves clear stay clear, and one of them is load
-/// bearing: `PINNEDPUBKEY` must remain absent because the `sha256sum` slot is
-/// [`None`], and `vtls.c:776-779` abandons public-key pinning for a backend
-/// with no digest rather than comparing a wrong one. Nothing in this file
-/// computes a SHA-256 of a public key by another route.
 const RUSTLS_SUPPORTS: SslSupport = SslSupport::CAINFO_BLOB
     .union(SslSupport::HTTPS_PROXY)
     .union(SslSupport::CIPHER_LIST)
@@ -283,39 +211,18 @@ const CURL_SSLVERSION_MAX_TLSV1_3: i64 = (CURL_SSLVERSION_TLSV1_3 as i64) << 16;
 
 /// How many bytes `cr_shutdown` drains looking for the peer's `close_notify`,
 /// and how many attempts it makes.
-///
-/// `rustls.c:1275-1279`: `for(i = 0; i < 10; ++i) { char buf[1024]; ... }`.
-/// Both numbers are the C's and neither is a tuning choice -- the attempt
-/// count bounds how long a teardown will spin on a peer that keeps sending,
-/// and the buffer size is what that loop reads into.
 const SHUTDOWN_DRAIN_ATTEMPTS: usize = 10;
 
 /// The buffer `cr_shutdown`'s drain loop reads into (`rustls.c:1276`).
 const SHUTDOWN_DRAIN_BUFFER: usize = 1024;
 
 /// How many peers [`RustlsSessionStore`] remembers.
-///
-/// A session store with no ceiling is a memory leak a hostile server can
-/// drive by redirecting to unlimited hostnames, which is the same reasoning
-/// `Curl_ssl_scache_create` applies when it allocates exactly `max_peers`
-/// slots and never grows them. rustls's own `ClientSessionMemoryCache` is
-/// constructed with a bound for the same reason; this is that bound, chosen to
-/// match the `MAX_PEERS` the command-line tool asks
-/// `crate::tls::session_cache` for.
 const STORE_MAX_PEERS: usize = 8;
 
 /// How many unspent TLS 1.3 tickets one peer may accumulate.
-///
-/// rustls's `ClientSessionStore::insert_tls13_ticket` documentation states the
-/// obligation: "The number of times this is called is controlled by the
-/// server, so implementations of this trait should apply a reasonable bound of
-/// how many items are stored simultaneously." A server that streams tickets
-/// must not be able to grow this without limit.
 const STORE_MAX_TICKETS_PER_PEER: usize = 8;
 
-// =========================================================================
 // Error mapping -- `map_error` and `rustls_failf` (`rustls.c:52-75`)
-// =========================================================================
 
 /// `map_error` (`lib/vtls/rustls.c:52-66`): the best-matching [`CURLcode`] for
 /// a rustls failure.
@@ -329,10 +236,6 @@ const STORE_MAX_TICKETS_PER_PEER: usize = 8;
 /// default:                           return CURLE_RECV_ERROR;
 /// }
 /// ```
-///
-/// The three arms survive with their C order and their C precedence, which is
-/// what makes the certificate test first rather than one arm of the `switch`:
-/// a certificate failure is a certificate failure whatever else it also is.
 ///
 /// * **Certificate errors** are the whole of rustls's `InvalidCertificate`
 ///   family, plus the two peer-identity failures that rustls reports
@@ -350,10 +253,6 @@ const STORE_MAX_TICKETS_PER_PEER: usize = 8;
 ///   which reports [`CURLcode::SslConnectError`], and the plaintext writer,
 ///   which reports [`CURLcode::WriteError`] -- substitute it themselves, and
 ///   they are the only places that know which phase failed.
-///
-/// There is no `RUSTLS_RESULT_OK` arm because a `rustls::Error` value cannot
-/// represent success; success is `Ok(_)` in the Rust signature and never
-/// reaches this function.
 fn map_rustls_error(error: &rustls::Error) -> CURLcode {
     // `rustls_result_is_cert_error` first, and its answer wins.
     if is_certificate_error(error) {
@@ -373,13 +272,6 @@ fn map_rustls_error(error: &rustls::Error) -> CURLcode {
 
 /// `rustls_result_is_cert_error`: is this failure about the peer's
 /// certificate?
-///
-/// Written as a `match` over rustls's own variants rather than a string test,
-/// so a future rustls variant is a compile-time decision here instead of a
-/// silent reclassification. `InvalidCertRevocationList` is included because a
-/// revocation list that cannot be applied leaves the chain unverified, which
-/// is a verification failure and not a receive failure; `NoCertificatesPresented`
-/// is included for the same reason.
 fn is_certificate_error(error: &rustls::Error) -> bool {
     matches!(
         error,
@@ -391,16 +283,6 @@ fn is_certificate_error(error: &rustls::Error) -> bool {
 
 /// `rustls_failf` (`lib/vtls/rustls.c:68-75`): `failf(data, "%s: %.*s", msg,
 /// error text)`.
-///
-/// The C renders the `rustls_result` into a `STRERROR_LEN` buffer with
-/// `rustls_error()` and then prints `"<msg>: <text>"`. [`rustls::Error`]
-/// implements [`fmt::Display`], so the rendering is the library's own and no
-/// buffer is sized, truncated or reused.
-///
-/// Takes the transport rather than a tracer because that is what a backend
-/// method has in hand, and because tracing has to reach the same destination
-/// as the filter's own tracing -- [`TlsTransport::ctx`] is the seam that
-/// guarantees it does.
 fn rustls_failf(
     io: &mut TlsTransport<'_, '_, '_>,
     error: &rustls::Error,
@@ -437,18 +319,9 @@ fn fail(io: &mut TlsTransport<'_, '_, '_>, args: fmt::Arguments<'_>) {
     }
 }
 
-// =========================================================================
 // Encrypted Client Hello -- `init_config_builder_ech` (`rustls.c:907-1006`)
-// =========================================================================
 
 /// Where an `ECHConfigList` comes from, and how hard a failure is.
-///
-/// The successor of the four `data->set.tls_ech` bits the C tests --
-/// `CURLECH_DISABLE`, `CURLECH_GREASE`, `CURLECH_ENABLE`, `CURLECH_HARD` and
-/// `CURLECH_CLA_CFG` (`lib/urldata.h:57-61`) -- turned from a bitmask into the
-/// three states that are actually reachable. A bitmask permits
-/// `GREASE | DISABLE`, which `ECH_ENABLED()` (`lib/vtls/vtls.h:52-56`) then
-/// has to filter out; an enumeration cannot express it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) enum EchPolicy {
     /// No ECH: the variable is unset or carries `CURLECH_DISABLE`.
@@ -468,8 +341,6 @@ pub(crate) enum EchPolicy {
     /// in [`EchPolicy::config_list`], as `rustls.c:948-957` decodes it with
     /// `curlx_base64_decode`, because "rustls-ffi expects the raw TLS encoded
     /// ECHConfigList bytes" (`rustls.c:952`).
-    // Constructed by `crate::config`'s `--ech ecl:<base64>` handling and by
-    // this file's tests; that consumer has not landed.
     #[allow(dead_code)]
     CommandLine(String),
     /// `CURLECH_ENABLE` resolved from the peer's HTTPS resource record.
@@ -479,8 +350,6 @@ pub(crate) enum EchPolicy {
     /// here: `Curl_dnscache_get` needs the easy handle and the connection,
     /// which is exactly the reach a backend must not have. The DNS module owns
     /// the lookup and hands over the bytes.
-    // Constructed by `crate::dns::httpsrr`, which has not landed, and by this
-    // file's tests.
     #[allow(dead_code)]
     Dns(Vec<u8>),
 }
@@ -492,9 +361,6 @@ impl EchPolicy {
     }
 
     /// The raw TLS-encoded `ECHConfigList` this policy names, if any.
-    ///
-    /// [`None`] for [`Self::Disabled`] and [`Self::Grease`], neither of which
-    /// reads a configuration.
     ///
     /// # Errors
     ///
@@ -544,20 +410,9 @@ impl EchPolicy {
     }
 }
 
-// =========================================================================
 // Options -- `ssl_primary_config` and `ssl_config_data` as one injected value
-// =========================================================================
 
 /// Everything a `ClientConfig` is built from, other than the provider.
-///
-/// The C reads these out of two structures it reaches through the filter:
-/// `Curl_ssl_cf_get_primary_config(cf)` and `Curl_ssl_cf_get_config(cf, data)`
-/// (`rustls.c:1017-1019`). Reaching them requires the easy handle, which is
-/// exactly the reach [`TlsTransport`] removes, so they arrive here as one
-/// injected value instead.
-///
-/// Every member names the curl option it carries, so the correspondence is
-/// checkable line by line against `rustls.c`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TlsOptions {
     /// `conn_config->version` and `->version_max`, validated by
@@ -575,20 +430,8 @@ pub(crate) struct TlsOptions {
     /// `CURLOPT_CAINFO` / `--cacert`.
     pub(crate) ca_file: Option<PathBuf>,
     /// `CURLOPT_CAPATH` / `--capath`.
-    ///
-    /// Carried so that a request for it can be *refused* rather than ignored:
-    /// `SSLSUPP_CA_PATH` is absent from [`RUSTLS_SUPPORTS`], and
-    /// [`crate::tls::verify`] answers a set value with
-    /// [`CURLcode::NotBuiltIn`]. Silently trusting less than the user asked
-    /// for is the failure mode that refusal exists to prevent.
     pub(crate) ca_path: Option<PathBuf>,
     /// `ssl_config->native_ca_store` (`rustls.c:1037`).
-    ///
-    /// Consulted only when neither a blob nor a file was given, and it selects
-    /// an ordinary [`rustls::RootCertStore`] loaded from the platform --
-    /// never `platform-verifier`, which would hand the trust decision to the
-    /// operating system and stop `--cacert`, `--capath` and `--insecure` from
-    /// being authoritative.
     pub(crate) native_ca_store: bool,
     /// `conn_config->CRLfile` / `--crlfile` (`rustls.c:660-690`).
     pub(crate) crl_file: Option<PathBuf>,
@@ -668,14 +511,6 @@ impl TlsOptions {
     }
 
     /// `--insecure`: turn peer *and* host verification off together.
-    ///
-    /// Both, and never one: comparing a name on a certificate whose issuer was
-    /// never established establishes nothing, because any name at all can
-    /// appear in a certificate the peer signed itself. curl clears
-    /// `verifyhost` alongside `verifypeer` for that reason, and
-    /// [`ServerVerification::build`] does the same on its side.
-    // Consumer is `crate::config::to_setopts`' `--insecure` handling, not yet
-    // landed; this file's tests use it throughout.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn insecure(mut self) -> Self {
@@ -721,17 +556,9 @@ impl TlsOptions {
     }
 }
 
-// =========================================================================
 // The session store -- resumption without a process-global rustls cache
-// =========================================================================
 
 /// Which peer and which credentials a [`RustlsSessionStore`] serves.
-///
-/// The successor of the peer-key plus client-auth pairing that
-/// `lib/vtls/vtls_scache.c` keys its slab on. A store is scoped so that it
-/// cannot serve a peer it was not built for: `Curl_ssl_peer_key_make` builds a
-/// key from the host, the port, the transport and the TLS configuration, and
-/// [`SslPeer::scache_key`] carries the result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionScope {
     /// `peer->ssl_peer_key`: the whole configuration, as one string.
@@ -743,8 +570,6 @@ pub(crate) struct SessionScope {
 
 impl SessionScope {
     /// A scope over `peer_key` with `auth`'s credentials.
-    // Consumer is the share-lock seam in `crate::tls`'s filter wiring, not yet
-    // landed; this file's tests build scopes directly.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn new(peer_key: String, auth: ScacheClientAuth) -> Self {
@@ -781,13 +606,6 @@ impl SessionScope {
 }
 
 /// What a store has been asked to do, in numbers a caller may assert on.
-///
-/// The observable half of resumption. rustls's `ClientSessionStore` is a sink:
-/// nothing it is told comes back out through its own interface, so a caller
-/// that wants to know whether a ticket was stored, whether one was spent, or
-/// how much early data the peer offered has to be told separately. These are
-/// those facts, and they are the ones `crate::tls::session_cache` would
-/// otherwise have recorded.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StoreStats {
     /// How many TLS 1.2 sessions were remembered.
@@ -795,12 +613,6 @@ pub(crate) struct StoreStats {
     /// How many TLS 1.3 tickets were remembered.
     pub(crate) tls13_stored: u64,
     /// How many TLS 1.3 tickets were spent.
-    ///
-    /// Never larger than [`Self::tls13_stored`], because rustls's own contract
-    /// on `take_tls13_ticket` is that each value is returned "at most once" --
-    /// which is also RFC 8446 appendix C.4's rule, and the same rule
-    /// `Curl_ssl_scache_return` applies when it drops a spent 1.3 ticket
-    /// instead of re-caching it.
     pub(crate) tls13_taken: u64,
     /// How many key-exchange hints were remembered.
     pub(crate) kx_hints_stored: u64,
@@ -875,17 +687,6 @@ struct StoreInner {
 ///
 /// # Interior mutability, and why the lock is here
 ///
-/// rustls's trait takes `&self` for its mutating operations and says so:
-/// "`set_`, `insert_`, `remove_` and `take_` operations are mutating; this
-/// isn't expressed in the type system to allow implementations freedom in how
-/// to achieve interior mutability. `Mutex` is a common choice." One
-/// [`std::sync::Mutex`] is held for the duration of a single operation and
-/// never across a call back into rustls, so no lock ordering exists to get
-/// wrong. A poisoned lock is recovered with [`PoisonError::into_inner`], the
-/// pattern `crate::tls::keylog` already uses: a resumption cache that stopped
-/// working because an unrelated task panicked would be a worse outcome than
-/// one that keeps caching.
-///
 /// Note the contrast with `crate::tls::session_cache::SessionCache`, which is
 /// deliberately lock-free plain data with `&mut self` mutators because *its*
 /// lock belongs to the sharing decision and arrives from
@@ -899,13 +700,6 @@ pub(crate) struct RustlsSessionStore {
 }
 
 /// Prints shape and counts, never material.
-///
-/// Hand-written, and for a security reason rather than a formatting one.
-/// [`Tls13ClientSessionValue`] derives [`fmt::Debug`] and its private
-/// `ClientSessionCommon` carries the resumption secret, so a derived
-/// implementation here would print key material into any failed assertion, any
-/// `{:?}` in a trace line and any panic message that happened to include a
-/// store.
 impl fmt::Debug for RustlsSessionStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.locked();
@@ -919,8 +713,6 @@ impl fmt::Debug for RustlsSessionStore {
 
 impl RustlsSessionStore {
     /// An empty store scoped to `scope`.
-    // Consumer is the share-lock seam in `crate::tls`'s filter wiring, which
-    // owns one store per scope; not yet landed.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn new(scope: SessionScope) -> Arc<Self> {
@@ -940,8 +732,6 @@ impl RustlsSessionStore {
     }
 
     /// What has happened to this store.
-    // Consumers are `CURLINFO_SSL_VERIFYRESULT`-adjacent reporting in
-    // `crate::easy::getinfo`, not yet landed, and this file's tests.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn stats(&self) -> StoreStats {
@@ -950,24 +740,6 @@ impl RustlsSessionStore {
 
     /// Whether `vtls_spack` bytes can be imported into, or exported from, this
     /// store.
-    ///
-    /// Always `false`, and the reason is an API boundary rather than an
-    /// omission. `curl_easy_ssls_import` and `curl_easy_ssls_export` move the
-    /// serialised sessions `crate::tls::session_cache` packs, and rebuilding a
-    /// rustls session value from those bytes needs
-    /// `Tls13ClientSessionValue::new` or `Tls12ClientSessionValue::new`, both
-    /// `pub(crate)` in rustls 0.23.42 (`src/msgs/persist.rs:82`, `:163`); the
-    /// ticket bytes needed for the reverse direction live behind the equally
-    /// private `common.ticket`. A store can therefore hold and hand back only
-    /// values rustls itself produced.
-    ///
-    /// Reported rather than faked. Writing plausible bytes would corrupt a
-    /// session file curl 8.19.0-DEV wrote and would make a broken import look
-    /// successful, so the honest answer is a blocked capability the caller can
-    /// see.
-    // Consumers are `curl_easy_ssls_import`/`_export` in `curl-rs-ffi` and
-    // `crate::config::ssls`, neither of which has landed; asked by this file's
-    // tests so the blocked capability is asserted rather than merely stated.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn pack_bridge_available(&self) -> bool {
@@ -987,12 +759,6 @@ impl StoreInner {
     }
 
     /// The slot for `name`, creating or reclaiming one if necessary.
-    ///
-    /// Reclaims an empty slot before it displaces a populated one, and
-    /// displaces the oldest -- slot zero, since new peers are appended -- when
-    /// every slot is in use. That is the eviction `Curl_ssl_scache_create`'s
-    /// fixed slab forces: a new peer displaces an existing one rather than the
-    /// slab growing.
     fn slot(&mut self, name: ServerName<'static>) -> usize {
         if let Some(index) = self.find(&name) {
             return index;
@@ -1101,9 +867,7 @@ impl ClientSessionStore for RustlsSessionStore {
     }
 }
 
-// =========================================================================
 // The backend -- `Curl_ssl_rustls`'s data half, injected instead of global
-// =========================================================================
 
 /// Key logs installed into a `ClientConfig` during this process's life.
 ///
@@ -1113,18 +877,6 @@ impl ClientSessionStore for RustlsSessionStore {
 /// `void (*cleanup)(void)` -- no context at all -- so the descriptor slot
 /// cannot reach a backend instance, and reporting the slot as [`None`] would
 /// claim this backend has no cleanup step, which is false.
-///
-/// This is the *only* piece of process-scoped state in this file, and it is
-/// deliberately the narrowest kind: a list of handles to already-open logs. It
-/// is not a cryptographic provider, not a random-number generator and not a
-/// session cache -- all three of those are injected, precisely so that two
-/// transfers cannot disagree about them. A handle lands here only when a key
-/// log actually opened, which is the same condition under which C assigns its
-/// global (`keylog.c:44-58`).
-///
-/// [`cleanup`] drains it, so a second call has nothing to close and the whole
-/// mechanism is idempotent. Poisoning is recovered rather than propagated, for
-/// the reason `crate::tls::keylog` gives.
 static PROCESS_KEYLOGS: Mutex<Vec<Arc<KeyLogFile>>> = Mutex::new(Vec::new());
 
 /// `cr_version` (`lib/vtls/rustls.c:1377-1381`): what `curl --version` prints
@@ -1134,30 +886,11 @@ static PROCESS_KEYLOGS: Mutex<Vec<Arc<KeyLogFile>>> = Mutex::new(Vec::new());
 /// caller's buffer. Here the token is read from [`crate::version`], which
 /// `curl-rs-ffi` already reads for `curl_version` and `curl_version_info`, so
 /// one ABI answer has exactly one source and the two cannot drift.
-///
-/// It is `rustls/0.23.42`, and it is emphatically **not** `rustls-ffi`:
-/// `tests/runtests.pl:585-586` matches the token `rustls-ffi` specifically --
-/// `elsif($libcurl =~ /\srustls-ffi\b/i) { $feature{"rustls"} = 1; }` -- and
-/// that token names the old C FFI backend. Emitting it would unlock the
-/// rustls-gated fixtures by misdescribing the implementation. A truthful token
-/// leaves them to skip, which is the safe direction: under-reporting a
-/// capability makes a fixture skip, over-reporting makes it run and fail.
 fn version() -> &'static str {
     SSL_VERSION
 }
 
 /// `cr_cleanup` (`lib/vtls/rustls.c:1392-1395`): `Curl_tls_keylog_close()`.
-///
-/// Reached from `curl_global_cleanup` through `Curl_ssl_cleanup`
-/// (`lib/vtls/vtls.c:1043-1049`), whose contract is that no TLS resource is
-/// held at process scope once it returns. Closing a key log flushes it, so a
-/// capture taken during the run is complete on disk afterwards.
-///
-/// Idempotent by construction: the registry is drained, so a second call finds
-/// nothing. Each log's own `close` is idempotent as well
-/// (`keylog.c:64-70` is guarded by `if(keylog_file_fp)`), and so is
-/// [`KeyLogFile`]'s [`Drop`], so a log may be closed here, again by
-/// [`RustlsBackend::cleanup`], and again when the last handle drops.
 fn cleanup() {
     let drained: Vec<Arc<KeyLogFile>> = {
         let mut registry = PROCESS_KEYLOGS
@@ -1197,7 +930,7 @@ fn register_keylog(keylog: &Arc<KeyLogFile>) {
 ///
 /// One backend serves every filter on a connection --
 /// `crate::tls::BackendFilterFactory` holds it as an
-/// [`std::rc::Rc`] -- so the options here are the connection's options. Two
+/// [`std::rc::Arc`] -- so the options here are the connection's options. Two
 /// configurations in one process are two backends, which is what makes them
 /// unable to disagree with each other and what lets a test stand one beside
 /// the real thing.
@@ -1214,13 +947,6 @@ pub(crate) struct RustlsBackend {
     /// `SSLKEYLOGFILE`, already opened or deliberately disabled.
     keylog: Arc<KeyLogFile>,
     /// The HPKE suites available for Encrypted Client Hello.
-    ///
-    /// Empty under the pinned `ring` provider, which is why
-    /// [`RUSTLS_SUPPORTS`] omits `SSLSUPP_ECH`. Injected as a `&'static` slice
-    /// rather than read from the provider because rustls 0.23.42 offers no
-    /// provider-neutral accessor for HPKE: the suites live in
-    /// `rustls::crypto::aws_lc_rs::hpke`, and nothing under
-    /// `rustls::crypto::ring` provides them.
     hpke_suites: &'static [&'static dyn Hpke],
     /// The session store, or [`None`] for a build that resumes nothing.
     ///
@@ -1250,13 +976,8 @@ impl fmt::Debug for RustlsBackend {
     }
 }
 
-// Every constructor and accessor below carries its own `#[allow(dead_code)]`,
-// and the reason is the same one each time: the modules that build a backend
-// and read it back -- `crate::tls`'s filter wiring, `crate::easy::setopt`,
-// `crate::easy::getinfo` and `crate::config` -- have not landed, so today's
-// only non-test caller is this file's own `TlsBackend` implementation. The
-// allowance is per item rather than on this `impl` or on the module, which is
-// the convention `tls/cipher_suite.rs:125-130` states and `lib.rs`'s
+// The allowance is per item rather than on this `impl` or on the module, which
+// is the convention `tls/cipher_suite.rs:125-130` states and `lib.rs`'s
 // `source_policy` gate enforces: a broader allowance would also hide the next
 // unreferenced item somebody adds here.
 impl RustlsBackend {
@@ -1350,13 +1071,6 @@ impl RustlsBackend {
 
     /// The `crate::crypto::rand::Rng` adapter over this backend's provider.
     ///
-    /// `crate::crypto::rand` cannot import `crate::tls` -- the digests are
-    /// below TLS in the module graph and one of its dependencies -- so a caller
-    /// that wants provider entropy is handed one of these as a
-    /// `&mut dyn Rng`. That is the relationship `cr_random`
-    /// (`rustls.c:1383-1390`) expresses in C, where the TLS backend is one of
-    /// curl's entropy sources, with the global removed.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::FailedInit`] when the provider cannot produce entropy, or
@@ -1368,20 +1082,6 @@ impl RustlsBackend {
     }
 
     /// `cr_get_internals` (`rustls.c:1217-1225`), engine-neutrally.
-    ///
-    /// The C returns `backend->conn` as a `void *` for the application to cast
-    /// to whatever its TLS library calls a session. There is no such pointer to
-    /// give here and there must not be one: handing out a
-    /// `*mut ClientConnection` would put the session back behind an untyped
-    /// pointer that the caller would have to cast, which is the whole of what
-    /// this translation removes. What survives is the part that is
-    /// engine-neutral and answerable -- which backend, and which of its two
-    /// handles -- carried by [`TlsSessionInfo`].
-    ///
-    /// `distinguishes_context` is `false`, which is `lib/cfilters.h:156-158`'s
-    /// "does not differentiate" case: rustls has no `SSL_CTX` distinct from a
-    /// session, so `CF_QUERY_SSL_INFO` and `CF_QUERY_SSL_CTX_INFO` describe the
-    /// same thing.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn session_info(kind: TlsHandleKind) -> TlsSessionInfo {
@@ -1393,13 +1093,9 @@ impl RustlsBackend {
     }
 }
 
-// =========================================================================
 // Session state -- `struct rustls_ssl_backend_data` (`rustls.c:44-50`)
-// =========================================================================
 
 /// What one TLS session holds.
-///
-/// The successor of
 ///
 /// ```c
 /// struct rustls_ssl_backend_data {
@@ -1410,23 +1106,6 @@ impl RustlsBackend {
 ///   BIT(sent_shutdown);
 /// };
 /// ```
-///
-/// member for member, with three additions that the C keeps elsewhere and one
-/// removal.
-///
-/// The removal is `rustls_connection_set_userdata(rconn, backend)`
-/// (`rustls.c:1100`), which exists so that the C's I/O callbacks can find their
-/// way back to this struct through a `void *`. Nothing here needs it: the
-/// adapters are values built at the call site with the borrows they need.
-///
-/// The additions are `connssl->peer_closed`, which the C writes through the
-/// filter's context from inside `read_cb` (`rustls.c:107`), and the negotiated
-/// parameters and certificate chain, which the C writes into the easy handle.
-/// A backend here cannot reach either, so it records them and the caller reads
-/// them back through the accessors below. [`Self::io_need`] is recorded for the
-/// same reason: `cr_shutdown` writes `connssl->io_need` directly
-/// (`rustls.c:1250`, `:1264`, `:1281`), and [`TlsBackend::shut_down`]'s
-/// signature has no return channel for it.
 pub(crate) struct RustlsSession {
     /// Who this session talks to. Supplies SNI, the name verification is
     /// performed against, and the session-cache key.
@@ -1438,12 +1117,6 @@ pub(crate) struct RustlsSession {
     /// `count == 0`.
     alpn: Option<AlpnSpec>,
     /// `const struct rustls_client_config *config`.
-    ///
-    /// [`None`] until the first handshake step builds it, which is the C's own
-    /// laziness: `cr_connect` tests `if(!backend->conn)` and calls
-    /// `cr_init_backend` (`rustls.c:1142-1150`). Shared rather than owned
-    /// because a `ClientConfig` is immutable once built and rustls takes it as
-    /// an [`Arc`].
     config: Option<Arc<ClientConfig>>,
     /// `struct rustls_connection *conn`.
     conn: Option<ClientConnection>,
@@ -1480,18 +1153,6 @@ pub(crate) struct RustlsSession {
 }
 
 /// What the handshake agreed on.
-///
-/// The four facts `rustls.c:1170-1187` prints, kept as typed values rather than
-/// as the formatted line the C builds: the version, the cipher suite, the
-/// key-exchange group and the selected protocol. `CURLINFO` consumers want the
-/// values and a trace reader wants the line, so the values are stored and the
-/// line is composed from them.
-///
-/// Nothing here exposes a rustls handle. [`NamedGroup`] and
-/// [`EchStatus`] are plain enumerations; the suite is its IANA identifier plus
-/// the spelling `crate::tls::cipher_suite` maps it to, which is the same
-/// spelling `CURLINFO_TLS_SSL_PTR`'s consumers and the `--write-out` variables
-/// use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NegotiatedParams {
     /// The protocol version, as the IETF numbers it.
@@ -1542,10 +1203,6 @@ impl fmt::Debug for RustlsSession {
     }
 }
 
-// The read-only accessors below carry per-item `#[allow(dead_code)]` for the
-// reason given above `impl RustlsBackend`: they exist so the not-yet-landed
-// `CURLINFO` and filter-wiring modules can observe a session without reaching
-// into it, and this file's tests are what keep them honest in the meantime.
 impl RustlsSession {
     /// A session for `peer` that will offer `alpn`, with nothing built yet.
     ///
@@ -1572,12 +1229,6 @@ impl RustlsSession {
     }
 
     /// `connssl->io_need`: what this session last needed from the socket.
-    ///
-    /// Read by the caller so that `Curl_ssl_adjust_pollset`
-    /// (`crate::tls::tls_adjust_pollset`) can wait for the right event. Both
-    /// the handshake and the shutdown record it here; the handshake also
-    /// returns it in [`HandshakeProgress::io_need`], which is the channel
-    /// `crate::tls::TlsConnFilter` reads for that path.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) const fn io_need(&self) -> SslIoNeed {
@@ -1643,18 +1294,6 @@ impl RustlsSession {
     /// if(backend->conn)   { rustls_connection_free(backend->conn); backend->conn = NULL; }
     /// if(backend->config) { rustls_client_config_free(backend->config); backend->config = NULL; }
     /// ```
-    ///
-    /// Two independent tests, which is what makes a partially initialised
-    /// session safe to close: `cr_init_backend` can fail after building the
-    /// configuration and before building the connection (`rustls.c:1089-1097`
-    /// frees the configuration on exactly that path), and this must cope with
-    /// either one being absent. Both are [`Option::take`] here, so the second
-    /// close finds nothing and does nothing.
-    ///
-    /// The counters are cleared with them. A session that is closed and
-    /// connected again must not believe it still owes a flush of plaintext
-    /// that no longer exists, and must not believe it has already sent a
-    /// `close_notify` on a connection that no longer exists.
     fn close(&mut self) {
         self.conn = None;
         self.config = None;
@@ -1665,24 +1304,14 @@ impl RustlsSession {
     }
 }
 
-// =========================================================================
 // The two I/O adapters -- `read_cb` and `write_cb` (`rustls.c:90-152`)
-// =========================================================================
 
 /// Ciphertext arriving from the filter below, as [`std::io::Read`].
-///
-/// The successor of
 ///
 /// ```c
 /// static int read_cb(void *userdata, uint8_t *buf, uintptr_t len,
 ///                    uintptr_t *out_n)
 /// ```
-///
-/// (`rustls.c:96-112`), which curl hands to `rustls_connection_read_tls`
-/// together with a `void *userdata` holding `{cf, data}`. rustls's Rust API
-/// takes a `&mut dyn Read` instead, so the callback and its untyped context
-/// both disappear and what remains is a value holding the two borrows the C
-/// smuggled through the pointer.
 ///
 /// Three behaviours are the C's, exactly:
 ///
@@ -1697,9 +1326,6 @@ impl RustlsSession {
 ///   `connssl->peer_closed = TRUE` at `rustls.c:107`. Zero is end of stream and
 ///   not "try again": a layer with nothing available yet reports
 ///   [`CURLcode::Again`].
-///
-/// Only the next filter is called. Nothing here touches a socket, which is what
-/// makes every path above testable against a fake transport.
 struct BelowReader<'a, 'f, 'ctx, 'trc> {
     /// The seam onto the filter below.
     io: &'a mut TlsTransport<'f, 'ctx, 'trc>,
@@ -1727,18 +1353,6 @@ impl Read for BelowReader<'_, '_, '_, '_> {
 }
 
 /// Ciphertext leaving for the filter below, as [`std::io::Write`].
-///
-/// The successor of `write_cb` (`rustls.c:114-134`), and it carries that
-/// function's one non-obvious argument: the send is issued with
-/// `eos = FALSE`, always. `rustls.c:106` passes `FALSE` unconditionally, and it
-/// has to -- a TLS record boundary is not a stream boundary, so telling the
-/// layer below that the stream has ended because rustls finished a record would
-/// close a connection that still owes a `close_notify`. The end of a TLS stream
-/// is signalled *inside* TLS, by that alert, and never by this flag.
-///
-/// [`Write::flush`] is a no-op because there is nothing here to flush: the
-/// filter below took the bytes, and whether it has passed them on is its own
-/// business. The C has no flush at all.
 struct BelowWriter<'a, 'f, 'ctx, 'trc> {
     /// The seam onto the filter below.
     io: &'a mut TlsTransport<'f, 'ctx, 'trc>,
@@ -1773,9 +1387,7 @@ fn would_block(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock
 }
 
-// =========================================================================
 // Encrypted flush -- `cr_flush_out` (`rustls.c:222-260`)
-// =========================================================================
 
 /// Drains every TLS byte rustls has queued into the filter below.
 ///
@@ -1791,16 +1403,6 @@ fn would_block(error: &io::Error) -> bool {
 /// }
 /// return CURLE_OK;
 /// ```
-///
-/// The `while` rather than a single call is load bearing: `write_tls` writes
-/// what the transport accepts and no more, so a partially drained queue needs
-/// another turn. Each of the three exits is preserved, and so is the trace line
-/// that reports how much had gone out before a block -- which is the number a
-/// reader needs to tell a stalled transport from a slow one.
-///
-/// The zero-write arm is not redundant with the error arms. A transport that
-/// accepts nothing while reporting success would spin this loop forever, so it
-/// is treated as end of stream, exactly as the C treats it.
 ///
 /// # Errors
 ///
@@ -1852,9 +1454,7 @@ fn flush_out(
     }
 }
 
-// =========================================================================
 // Encrypted ingest -- `tls_recv_more` (`rustls.c:113-153`)
-// =========================================================================
 
 /// Pulls TLS records from the filter below and lets rustls process them.
 ///
@@ -1866,17 +1466,6 @@ fn flush_out(
 ///   `"reading from socket: %s"`;
 /// * rustls refused the records -- [`map_rustls_error`]'s code, with the C's
 ///   `"rustls_connection_process_new_packets"` prefix.
-///
-/// On success `data_in_pending` is set, which is the flag `cr_recv` reads to
-/// decide whether it may call `read` without touching the socket again, and the
-/// flag `cr_data_pending` reports to the filter above.
-///
-/// A zero-byte read is *not* an error here and does not short-circuit: the
-/// adapter records `peer_closed`, rustls is still given the chance to process
-/// whatever it already had, and the missing `close_notify` surfaces later as
-/// [`io::ErrorKind::UnexpectedEof`] from the plaintext reader. That is the C's
-/// sequence too, and it is what makes a truncation attack detectable rather
-/// than indistinguishable from a clean close.
 ///
 /// # Errors
 ///
@@ -1930,9 +1519,7 @@ fn tls_recv_more(
     Ok(ingested)
 }
 
-// =========================================================================
 // Decrypted receive -- `cr_recv` (`rustls.c:155-220`)
-// =========================================================================
 
 /// Fills `plain` with decrypted bytes, fetching records only when it must.
 ///
@@ -1947,22 +1534,11 @@ fn tls_recv_more(
 /// | any other failure | any other [`io::Error`] | [`CURLcode::RecvError`] |
 /// | `OK` with `n == 0` | `Ok(0)` | clean end of stream; stop and report what was read |
 ///
-/// That correspondence is not an approximation. `rustls::Reader::read`
-/// documents exactly these three error cases and exactly this meaning for
-/// `Ok(0)` (`rustls-0.23.42/src/conn.rs:180-245`), which is why this is a
-/// translation rather than a reimplementation.
-///
 /// The final test is the C's and is easy to get wrong:
 ///
 /// ```c
 /// if(!eof && !*pnread) result = CURLE_AGAIN;
 /// ```
-///
-/// So [`CURLcode::Again`] is reported **only** when nothing was decrypted *and*
-/// the stream has not ended. Zero bytes with `eof` set is a successful
-/// end-of-stream report, and any bytes at all is success even if the stream
-/// ended in the same call -- because those bytes must be delivered before the
-/// end is.
 ///
 /// # Errors
 ///
@@ -2068,9 +1644,7 @@ fn recv_plain(
     result
 }
 
-// =========================================================================
 // Plaintext send -- `cr_send` (`rustls.c:262-375`)
-// =========================================================================
 
 /// Hands `plain` to rustls and drains the resulting TLS bytes.
 ///
@@ -2088,16 +1662,7 @@ fn recv_plain(
 /// It will only drain Rustls' plaintext output buffer into the socket.
 /// ```
 ///
-/// The handshake and the shutdown both rely on that: they call this with an
-/// empty slice purely to push queued records out.
-///
 /// # The retry protocol, which is the whole difficulty
-///
-/// rustls accepts plaintext and queues TLS bytes in two separate steps, and
-/// only the second can block. So a send may end with the plaintext **already
-/// accepted** and its records only partly written. Re-adding those bytes on the
-/// next call would duplicate them in the stream, and the corruption would be
-/// silent -- the receiver would simply see the payload twice.
 ///
 /// `plain_out_buffered` is how the C avoids it (`rustls.c:290-375`), and every
 /// step of that dance is reproduced:
@@ -2229,9 +1794,7 @@ fn send_plain(
     result
 }
 
-// =========================================================================
 // Configuration -- `init_config_builder` and friends (`rustls.c:517-1104`)
-// =========================================================================
 
 /// The protocol versions to offer, in the C's order.
 ///
@@ -2243,31 +1806,6 @@ fn send_plain(
 /// uint16_t tls_versions[2] = { RUSTLS_TLS_VERSION_TLSV1_2,
 ///                              RUSTLS_TLS_VERSION_TLSV1_3 };
 /// ```
-///
-/// The array order is the C's and is preserved: it reaches the `ClientHello`,
-/// and nothing in this file may sort or reverse it.
-///
-/// The minimum accepts `CURL_SSLVERSION_TLSv1`, `_TLSv1_0`, `_TLSv1_1` and
-/// `_TLSv1_2` as the same thing -- TLS 1.2 is the floor rustls offers, so
-/// asking for TLS 1.0 gets TLS 1.2 rather than an error, which is what the C's
-/// fall-through `break` does. `CURL_SSLVERSION_TLSv1_3` narrows the list to one
-/// entry. Anything else, `CURL_SSLVERSION_DEFAULT` included, is refused:
-/// `lib/setopt.c:347-348` has already rewritten `DEFAULT` to TLS 1.2, which is
-/// why `rustls.c:536` asserts it cannot arrive and why interpreting it here
-/// would paper over a caller that skipped the option layer.
-///
-/// The maximum has one accepting case that is easy to misread.
-/// `CURL_SSLVERSION_MAX_TLSv1_2` is honoured **only** when TLS 1.2 is still the
-/// first entry; combined with a TLS 1.3 minimum the C falls through to the
-/// error arm, because a maximum below the minimum describes an empty range.
-/// `MAX_NONE`, `MAX_DEFAULT` and `MAX_TLSv1_3` all leave the list alone, and
-/// `MAX_TLSv1_0` and `MAX_TLSv1_1` are refused because rustls offers neither.
-///
-/// `ech_requested` forces a single TLS 1.3 entry and emits the C's line
-/// (`rustls.c:570-577`). It follows *requesting* ECH rather than succeeding at
-/// it, which is the C's behaviour: `init_config_builder` narrows the list before
-/// `init_config_builder_ech` ever runs, so a soft-mode ECH failure still leaves
-/// a TLS-1.3-only offer.
 ///
 /// # Errors
 ///
@@ -2452,10 +1990,6 @@ fn build_ech_mode(
 ///   registration -- so the C's `map_error(rr)` return has no analogue and is
 ///   not written as unreachable code. Closing a disabled log is a documented
 ///   no-op, so the call is safe and keeps the C's shape visible.
-///
-/// The handle is also registered with [`register_keylog`] so that [`cleanup`]
-/// can close it from `curl_global_cleanup`, which is where C's global
-/// `keylog_file_fp` is closed.
 fn install_keylog(config: &mut ClientConfig, keylog: &Arc<KeyLogFile>) {
     keylog.open();
     if keylog.enabled() {
@@ -2468,12 +2002,6 @@ fn install_keylog(config: &mut ClientConfig, keylog: &Arc<KeyLogFile>) {
 
 /// Builds the `ClientConfig` and the `ClientConnection`.
 ///
-/// `cr_init_backend` (`rustls.c:1008-1104`) together with the four
-/// `init_config_builder*` helpers it calls, in the C's order, because the order
-/// is observable: the cipher-suite selection decides which provider is built,
-/// the provider decides which verifier can be built over it, and the ALPN list
-/// and the version list both reach the `ClientHello`.
-///
 /// | step | C |
 /// |------|---|
 /// | cipher suites, then a provider carrying them | `:517-641` |
@@ -2485,13 +2013,6 @@ fn install_keylog(config: &mut ClientConfig, keylog: &Arc<KeyLogFile>) {
 /// | key log | `:1076-1080` |
 /// | build the configuration | `:1082-1087` |
 /// | build the connection | `:1089-1101` |
-///
-/// Everything fallible is delegated to the module that owns it:
-/// [`crate::tls::cipher_suite`] parses the two cipher lists,
-/// [`crate::tls::verify`] builds the trust decision -- including the single
-/// route to an unverified connection -- and [`crate::tls::keylog`] owns the
-/// key log. Nothing here constructs a second `dangerous()` verifier, and
-/// nothing here decides trust.
 ///
 /// # Errors
 ///
@@ -2617,12 +2138,6 @@ fn configure(
     let mut config = install_client_auth(builder, client_auth.as_ref());
 
     // --- ALPN: exact bytes, exact order, at most three --------------------
-    //
-    // `init_config_builder_alpn` (`:643-658`) copies `connssl->alpn->entries`
-    // into a `rustls_slice_bytes` array of `ALPN_ENTRIES_MAX` and passes
-    // `connssl->alpn->count`. `take` reproduces that bound without an
-    // arithmetic check: `AlpnSpec` cannot hold more, and the explicit bound
-    // says so at the point it matters.
     if let Some(alpn) = state.alpn.as_ref() {
         config.alpn_protocols = alpn
             .iter()
@@ -2640,12 +2155,6 @@ fn configure(
     }
 
     // --- SNI --------------------------------------------------------------
-    //
-    // RFC 6066 section 3 forbids a literal address in `server_name`, and
-    // `SslPeer::sni` is already [`None`] for an address and for a name at or
-    // above the length the C will build. rustls omits SNI for an
-    // `ServerName::IpAddress` on its own, so this only has to carry the second
-    // case -- a name too long to send -- which rustls would otherwise send.
     config.enable_sni = state.peer.sni().is_some();
 
     // --- resumption -------------------------------------------------------
@@ -2655,10 +2164,6 @@ fn configure(
     // here -- the injected store is the first, `options.caching` the second --
     // and a store scoped to a different peer or different credentials is
     // refused, which is `cf_ssl_scache_match_auth` (`:598-618`).
-    //
-    // `Resumption::disabled()` rather than `Resumption::in_memory_sessions(n)`
-    // on the negative path: rustls's own cache would resume sessions curl never
-    // agreed to cache, which is precisely the bypass this design forbids.
     let scache_auth = options.scache_auth();
     config.resumption = match backend.store.as_ref() {
         Some(store)
@@ -2673,13 +2178,6 @@ fn configure(
     };
 
     // --- early data -------------------------------------------------------
-    //
-    // Off, explicitly rather than by default. `rustls.c` never enables 0-RTT,
-    // and an `early_data` extension on a resumed handshake would change the
-    // `ClientHello` bytes that 1,476 fixtures compare as one string. The peer's
-    // advertised ceiling is still recorded, by
-    // `RustlsSessionStore::insert_tls13_ticket`, so it is reportable without
-    // being acted on.
     config.enable_early_data = false;
 
     // --- key log ----------------------------------------------------------
@@ -2715,12 +2213,6 @@ fn configure(
 }
 
 /// Turns a receive-shaped code into a handshake-shaped one.
-///
-/// The handshake's own substitution, and the C makes it explicitly:
-/// `else if(tmperr == CURLE_RECV_ERROR) return CURLE_SSL_CONNECT_ERROR;`
-/// (`rustls.c:1206-1208`). [`map_rustls_error`]'s `default:` arm is
-/// [`CURLcode::RecvError`] because that is right for the receive path, and only
-/// a caller knows which phase it is in.
 trait ConnectErrorCode {
     /// [`CURLcode::SslConnectError`] for a receive failure, unchanged
     /// otherwise.
@@ -2737,9 +2229,7 @@ impl ConnectErrorCode for CURLcode {
     }
 }
 
-// =========================================================================
 // The handshake -- `cr_connect` (`rustls.c:1118-1215`)
-// =========================================================================
 
 /// Records what the finished handshake agreed on, and emits the C's line.
 ///
@@ -2747,14 +2237,6 @@ impl ConnectErrorCode for CURLcode {
 /// because reading them costs a call each; here they are read unconditionally
 /// because `CURLINFO` consumers need them whether or not anybody is watching,
 /// and the *line* is still gated by the tracer.
-///
-/// The four readings are `rustls_connection_get_protocol_version`,
-/// `..._get_negotiated_ciphersuite_name`,
-/// `..._get_negotiated_key_exchange_group_name` and
-/// `..._get_alpn_protocol`. The suite's *name* comes from
-/// [`crate::tls::cipher_suite::get_str`] rather than from rustls, so that one
-/// spelling reaches the trace line, `CURLINFO_TLS_SSL_PTR`'s consumers and
-/// `--write-out` alike.
 fn record_negotiated(
     state: &mut RustlsSession,
     io: &mut TlsTransport<'_, '_, '_>,
@@ -2827,18 +2309,6 @@ fn record_negotiated(
 /// }
 /// ```
 ///
-/// The cap is applied **before** anything is parsed, so a hostile chain cannot
-/// make this do work proportional to its length. It is checked here as well as
-/// inside [`crate::tls::verify::extract_certinfo_chain`] -- deliberately, and
-/// not redundantly: the ceiling is this backend's contract, so it is visible
-/// where the C states it, and the delegate keeps its own check for callers that
-/// did not come through here.
-///
-/// Extraction itself is entirely `crate::tls::verify`'s: `Curl_extract_certinfo`
-/// (`rustls.c:1229-1234`) is that module's, and any DER or extraction failure
-/// aborts the handshake with the mapped code exactly as the C's
-/// `if(result) return result;` does.
-///
 /// # Errors
 ///
 /// [`CURLcode::SslConnectError`] for a chain above
@@ -2894,14 +2364,38 @@ fn capture_certinfo(
 /// the chain verifier and leaves the name comparison to "the caller ... once
 /// the peer certificate is available", which is here.
 ///
-/// rustls has already compared the name for any verifying configuration -- it
-/// is stricter than curl in one respect, requiring a subjectAltName where curl
-/// will fall back to the commonName -- so this cannot turn an accepted
-/// certificate into a rejected one in practice. It is run anyway, for two
-/// reasons that are worth stating: the diagnostic a mismatch produces is
-/// curl's, word for word, which is what `CURLOPT_ERRORBUFFER` consumers read;
-/// and the check is `verify.rs`'s to own, so skipping it would leave the
-/// module's contract half-honoured.
+/// # What the oracle actually is, measured rather than assumed
+///
+/// rustls has already compared the name for any verifying configuration, and it
+/// requires a subjectAltName: a certificate carrying only a commonName fails
+/// the handshake before this function is reached. **That is not a tightening
+/// relative to curl 8.19.0-DEV**, and the earlier claim here that "curl will
+/// fall back to the commonName" was wrong about the backend being reproduced:
+///
+/// * `Curl_verifyhost` occurs exactly ONCE in the whole of `lib/` -- a
+///   declaration at `lib/vtls/x509asn1.h:76`. It has no definition and no
+///   caller.
+/// * `lib/vtls/rustls.c` therefore contains no hostname check of its own; it
+///   hands the name to rustls at `:1091` and takes rustls's answer, SAN
+///   requirement included.
+/// * The commonName fallback exists only in `lib/vtls/openssl.c:2176-2246`, a
+///   backend the specification's section 0.2.2 drops. So a
+///   commonName-only certificate is refused by curl-with-rustls too, and
+///   refusing it here is parity, not a security decision taken unilaterally.
+///
+/// The consequence for `crate::tls::verify`'s own commonName arm is worth
+/// stating rather than leaving to be discovered: it is written, it is tested
+/// against the openssl oracle it was ported from, and it is **unreachable for a
+/// SAN-less certificate through this backend**, because rustls has already
+/// failed the handshake by the time this runs. It is retained because
+/// `verify.rs` owns the whole of `lib/vtls/openssl.c:2053-2250`'s shape and
+/// because it also feeds the certificate introspection `CURLINFO_CERTINFO`
+/// exposes.
+///
+/// This check is run even though rustls has already answered, for two reasons:
+/// the diagnostic a mismatch produces is curl's, word for word, which is what
+/// `CURLOPT_ERRORBUFFER` consumers read; and the check is `verify.rs`'s to own,
+/// so skipping it would leave the module's contract half-honoured.
 ///
 /// Reached only when peer verification is on, because
 /// `host_verification_enabled` is always `false` when it is off -- comparing a
@@ -2954,11 +2448,6 @@ fn verify_peer_hostname(
 
 /// One step of the handshake.
 ///
-/// `cr_connect` (`rustls.c:1118-1215`), including the loop that the C's own
-/// closing comment describes: "We should never fall through the loop. We should
-/// return either because the handshake is done or because we cannot read/write
-/// without blocking."
-///
 /// The structure, and each part's reason:
 ///
 /// 1. **Build lazily.** `if(!backend->conn) { cr_init_backend(...); connssl->state
@@ -2982,11 +2471,6 @@ fn verify_peer_hostname(
 ///    accepted still owes a flush even when rustls itself has nothing queued.
 /// 5. **A receive failure during the handshake is a connect failure.**
 ///    `else if(tmperr == CURLE_RECV_ERROR) return CURLE_SSL_CONNECT_ERROR;`
-///
-/// Only after the final flush *and* the certificate work succeed is the session
-/// reported [`SslConnectionState::Complete`]. The handshake timestamp is not
-/// taken here: `crate::tls::TlsConnFilter` reads it from its injected clock
-/// when this step reports `done`, which keeps time out of the backend.
 ///
 /// # Errors
 ///
@@ -3097,24 +2581,6 @@ fn handshake(
                 // A successful ingest of *nothing* with the transport at end of
                 // stream means the handshake can never finish, and this is the
                 // one place this file terminates where `cr_connect` does not.
-                //
-                // The C loop is unconditional: `read_cb` reports a zero-byte
-                // read as success with `ret = 0` (`rustls.c:107-108`),
-                // `rustls_connection_read_tls` returns `Ok(0)`,
-                // `process_new_packets` succeeds, `tls_recv_more` returns a
-                // non-negative count, and `rustls_connection_wants_read` stays
-                // true -- rustls's own `wants_read`
-                // (`rustls-0.23.42/src/common_state.rs:674-684`) does not
-                // consider end of stream. So the C spins until the transfer's
-                // own timeout fires and reports `CURLE_OPERATION_TIMEDOUT`.
-                //
-                // Spinning inside `curl_easy_perform` is not an acceptable
-                // outcome, and the code reported here is not invented: every
-                // other curl backend answers a mid-handshake close with
-                // `CURLE_SSL_CONNECT_ERROR` -- it is what OpenSSL's
-                // "SSL_connect: ... EOF was observed" path returns. So the
-                // divergence is a defect fix that lands on curl's own
-                // cross-backend answer rather than a behaviour change.
                 Ok(0) if state.peer_closed => {
                     fail(
                         io,
@@ -3161,9 +2627,7 @@ fn handshake(
     }
 }
 
-// =========================================================================
 // Shutdown -- `cr_shutdown` (`rustls.c:1227-1291`)
-// =========================================================================
 
 /// Closes the session cleanly, at most one `close_notify` per session.
 ///
@@ -3185,14 +2649,6 @@ fn handshake(
 /// 4. **Report.** [`CURLcode::Again`] becomes `RECV` and not done; any other
 ///    error is traced and propagated; zero bytes read means the `close_notify`
 ///    arrived.
-///
-/// The C's `cf->shutdown = (result || *done)` is not applied here because it is
-/// the filter's field: `crate::tls::TlsConnFilter::shutdown` performs exactly
-/// that assignment, marking the filter shut down on completion **and** on
-/// error.
-///
-/// [`RustlsSession::io_need`] is where `connssl->io_need` is recorded, because
-/// [`TlsBackend::shut_down`]'s signature returns only the C's `*done`.
 ///
 /// # Errors
 ///
@@ -3260,10 +2716,8 @@ fn shut_down(
     }
 }
 
-// =========================================================================
 // The descriptor -- `const struct Curl_ssl Curl_ssl_rustls`
 // (`rustls.c:1397-1426`)
-// =========================================================================
 
 /// `Curl_ssl_rustls`, slot for slot.
 ///
@@ -3284,17 +2738,6 @@ fn shut_down(
 ///   `tls-server-end-point` channel binding are all absent from the C rustls
 ///   backend too. `sha256sum` being [`None`] is what keeps
 ///   `SSLSUPP_PINNEDPUBKEY` out of [`RUSTLS_SUPPORTS`].
-///
-/// `adjust_pollset` is `Curl_ssl_adjust_pollset` in the C -- the *generic*
-/// helper, not a `cr_`-prefixed one -- and it is
-/// [`crate::tls::tls_adjust_pollset`] here, dispatched by
-/// `crate::tls::TlsConnFilter::adjust_pollset`. Nothing in this file
-/// reimplements it.
-///
-/// `sizeof_ssl_backend_data` is [`RustlsSession`]'s size, taken with
-/// [`core::mem::size_of`] so that it describes the type it claims to describe.
-/// Informational here -- nothing is allocated from it, because the state is a
-/// typed field rather than a `calloc`ed area.
 static RUSTLS_DESCRIPTOR: CurlSslDescriptor = CurlSslDescriptor {
     // `{ CURLSSLBACKEND_RUSTLS, "rustls" }` -- first, and contractually so.
     info: RUSTLS_INFO,
@@ -3345,13 +2788,6 @@ impl TlsBackend for RustlsBackend {
 
     /// The successor of `connssl->backend = calloc(1,
     /// sizeof(struct rustls_ssl_backend_data))`.
-    ///
-    /// Infallible in practice and fallible in signature, which is the right way
-    /// round: nothing is built here, because `cr_connect` builds the
-    /// configuration and the connection on its first step
-    /// (`rustls.c:1142-1150`). A filter that is created and never driven
-    /// therefore reads no file, opens no key log and touches no environment
-    /// variable.
     fn new_state(
         &self,
         peer: &SslPeer,
@@ -3395,24 +2831,12 @@ impl TlsBackend for RustlsBackend {
     }
 
     /// `cr_cleanup` (`rustls.c:1392-1395`): `Curl_tls_keylog_close()`.
-    ///
-    /// Closes this backend's own key log and then drains the process registry,
-    /// so both the instance-scoped obligation and the process-scoped one that
-    /// `void (*cleanup)(void)` cannot express are discharged. Every step is
-    /// idempotent, and [`KeyLogFile`]'s [`Drop`] closes it again for free if
-    /// nobody ever calls this.
     fn cleanup(&self) {
         self.keylog.close();
         cleanup();
     }
 
     /// `cr_data_pending` (`rustls.c:77-88`): `return (bool)backend->data_in_pending;`
-    ///
-    /// The flag is set by [`tls_recv_more`] once records have been processed and
-    /// cleared by [`recv_plain`] the moment rustls reports no plaintext, so it
-    /// is not merely a hint -- it is exactly "decrypted bytes may be readable
-    /// without touching the socket", which is what
-    /// `lib/vtls/vtls_int.h:157-159` asks the member to answer.
     fn data_pending(&self, state: &Self::State) -> bool {
         state.data_in_pending
     }
@@ -3423,11 +2847,6 @@ impl TlsBackend for RustlsBackend {
     /// rresult = rustls_default_crypto_provider_random(entropy, length);
     /// return map_error(rresult);
     /// ```
-    ///
-    /// The *injected* provider's generator, never a default one and never a
-    /// global. [`RustlsBackend::rng`] supplies the same entropy through the
-    /// `crate::crypto::rand::Rng` adapter, for callers that want a generator
-    /// rather than a fill.
     ///
     /// # Errors
     ///
@@ -3462,33 +2881,6 @@ impl TlsBackend for RustlsBackend {
 }
 
 // WHAT MIRI REACHES HERE, STATED AS A MEASUREMENT RATHER THAN A CLAIM.
-//
-// Thirty-one of the eighty tests below carry
-// `#[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]`, the
-// wording `tls/verify.rs` already uses for the same cause. The membership was
-// determined by running `cargo miri test --lib -p curl-rs-lib
-// tls::rustls_backend` and growing a `--skip` list until the run came back
-// green, not by inspection: the remaining FORTY-NINE pass under Miri, so the
-// boundary is exact in both directions.
-//
-// The cause is one symbol. Miri interprets Rust and cannot call a foreign
-// function, and the first use of any `ring` primitive runs
-// `ring_core_0_17_14__OPENSSL_cpuid_setup`, which aborts the interpreter
-// outright rather than failing one test. Every ignored test performs real
-// cryptography -- it builds a `ClientConnection` (whose ClientHello generates a
-// key-exchange keypair), completes a handshake against an in-process
-// `ServerConnection`, parses the fixture private key, or draws from the
-// provider's secure random. Constructing the provider itself does not, which is
-// why the descriptor, identity, support-set, error-mapping, adapter,
-// version-selection, ECH-policy, scope and store tests all still run.
-//
-// No relaxation was reached for instead. `-Zmiri-disable-isolation` would not
-// help -- the obstacle is a foreign call, not isolation -- and
-// `.github/workflows/rust-miri.yml` deliberately passes no `-Zmiri-` flag, so
-// adding one here would weaken the gate for the whole crate to serve one
-// module. A pure-Rust stand-in provider was rejected for a stronger reason:
-// the shipped path is `ring`, and a test that exercised different primitives
-// would report on code this build does not run.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3498,16 +2890,14 @@ mod tests {
     };
     use crate::crypto::rand::Rng;
     use crate::tls::TlsSlot;
+    use crate::util::sync_cell::SyncCell;
     use crate::util::timeval::{CurlTime, TestClock};
     use rustls::CertificateError;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
-    // ------------------------------------------------------------------
     // Test doubles. Nothing here touches a socket, a file or the network:
     // every seam this module has is injected, so the whole backend is
     // reachable against a scripted transport.
-    // ------------------------------------------------------------------
 
     /// What one scripted read or write does.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3556,18 +2946,18 @@ mod tests {
     #[derive(Debug)]
     struct Below {
         base: FilterBase,
-        shared: Rc<RefCell<BelowState>>,
+        shared: Arc<SyncCell<BelowState>>,
     }
 
     impl Below {
-        fn new() -> (Self, Rc<RefCell<BelowState>>) {
-            let shared = Rc::new(RefCell::new(BelowState::default()));
+        fn new() -> (Self, Arc<SyncCell<BelowState>>) {
+            let shared = Arc::new(SyncCell::new(BelowState::default()));
             let mut base = FilterBase::new(SocketIndex::First);
             base.set_connected(true);
             (
                 Self {
                     base,
-                    shared: Rc::clone(&shared),
+                    shared: Arc::clone(&shared),
                 },
                 shared,
             )
@@ -3670,7 +3060,7 @@ mod tests {
     ///
     /// Returns the base and the shared state, so a test scripts the transport
     /// through the second and drives the session through the first.
-    fn stack() -> (FilterBase, Rc<RefCell<BelowState>>) {
+    fn stack() -> (FilterBase, Arc<SyncCell<BelowState>>) {
         let (below, shared) = Below::new();
         let mut base = FilterBase::new(SocketIndex::First);
         base.set_next(Some(link(below)));
@@ -3697,9 +3087,7 @@ mod tests {
         result.map_err(Error::into_code)
     }
 
-    // ------------------------------------------------------------------
     // Identity, capability and the descriptor
-    // ------------------------------------------------------------------
 
     /// `{ CURLSSLBACKEND_RUSTLS, "rustls" }` (`rustls.c:1398`), and the
     /// integer is the one already in the public header.
@@ -3771,13 +3159,6 @@ mod tests {
 
     /// Eight slots are [`None`]; seven of them are unsupported capabilities and
     /// one is "nothing to do".
-    ///
-    /// The distinction is not pedantry. `init` is [`None`] because
-    /// `Curl_ssl_init` treats a null pointer as success (`vtls.c:465-475`), so
-    /// a backend needing no initialisation is indistinguishable from one that
-    /// initialised fine. The other seven are genuine absences, and one of them
-    /// -- `sha256sum` -- is what keeps public-key pinning out of the
-    /// capability set.
     #[test]
     fn seven_slots_are_unsupported_and_one_needs_nothing() {
         let backend = insecure_backend();
@@ -3934,9 +3315,7 @@ mod tests {
         assert!(!context.distinguishes_context);
     }
 
-    // ------------------------------------------------------------------
     // Error mapping -- `map_error` (`rustls.c:52-66`)
-    // ------------------------------------------------------------------
 
     /// The certificate test comes first and its answer wins.
     #[test]
@@ -3999,9 +3378,7 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
     // The I/O adapters -- `read_cb` and `write_cb` (`rustls.c:90-152`)
-    // ------------------------------------------------------------------
 
     /// A zero-byte encrypted read is end of stream and sets `peer_closed`,
     /// which is `connssl->peer_closed = TRUE` at `rustls.c:107`.
@@ -4089,9 +3466,7 @@ mod tests {
         assert!(!would_block(&io::Error::from(io::ErrorKind::UnexpectedEof)));
     }
 
-    // ------------------------------------------------------------------
     // Version selection -- `init_config_builder` (`rustls.c:534-577`)
-    // ------------------------------------------------------------------
 
     /// Runs [`protocol_versions`] against a scripted stack and returns the
     /// wire versions in the order they would reach the `ClientHello`.
@@ -4221,9 +3596,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
     // ECH -- `init_config_builder_ech` (`rustls.c:907-1006`)
-    // ------------------------------------------------------------------
 
     /// `ECH_ENABLED(data)` (`lib/vtls/vtls.h:52-56`), as an enumeration that
     /// cannot express `GREASE | DISABLE`.
@@ -4371,17 +3744,10 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
     // Configuration -- `cr_init_backend` (`rustls.c:1008-1104`)
-    // ------------------------------------------------------------------
 
     /// A `ClientHello` reaches the transport, and it is a TLS record: content
     /// type 22 (handshake), then the two version bytes 0x0301, then a length.
-    ///
-    /// This is the closest a unit test gets to the byte-exactness gate -- the
-    /// full comparison against curl 8.19.0-DEV needs both binaries on one
-    /// wire -- and it is enough to catch a configuration that stopped
-    /// producing a TLS 1.2-compatible record layer.
     #[test]
     #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
     fn the_first_step_writes_a_client_hello() {
@@ -4684,9 +4050,7 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
     // The handshake -- `cr_connect` (`rustls.c:1118-1215`)
-    // ------------------------------------------------------------------
 
     /// A blocked write during the handshake reports `SEND` and not done, and
     /// the session records the same need for the pollset.
@@ -4779,11 +4143,6 @@ mod tests {
 
     /// Two peers talking to each other complete a handshake, and the completed
     /// step reports everything `crate::tls::TlsConnFilter` needs.
-    ///
-    /// The server half is a rustls `ServerConnection` over a self-signed
-    /// certificate held only in memory, so this exercises the whole of
-    /// [`handshake`] -- the final FINISHED flush, the negotiated parameters,
-    /// the ALPN capture -- without a network, a file or an external peer.
     #[test]
     #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
     fn a_full_handshake_completes_and_reports_its_parameters() {
@@ -4989,11 +4348,6 @@ mod tests {
 
     /// The `plain_out_buffered` retry protocol: bytes rustls already accepted
     /// are flushed first, counted as progress, and **never re-added**.
-    ///
-    /// This is the defect the C comment at `rustls.c:286-289` exists to
-    /// prevent, and it is silent when it happens -- the receiver simply sees
-    /// the payload twice. The assertion here is therefore on the decrypted
-    /// stream the server observes, not merely on the counters.
     #[test]
     #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
     fn a_blocked_flush_never_duplicates_accepted_plaintext() {
@@ -5242,9 +4596,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
     // Shutdown -- `cr_shutdown` (`rustls.c:1227-1291`)
-    // ------------------------------------------------------------------
 
     /// A session that never connected is already shut down, which is the C's
     /// `if(!backend->conn || cf->shutdown) { *done = TRUE; goto out; }`.
@@ -5441,9 +4793,7 @@ mod tests {
         backend.close(&mut state);
     }
 
-    // ------------------------------------------------------------------
     // Certinfo -- `rustls.c:1194-1236`
-    // ------------------------------------------------------------------
 
     /// With `CURLOPT_CERTINFO` off, no records are collected at all.
     #[test]
@@ -5524,9 +4874,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
     // Randomness -- `cr_random` (`rustls.c:1383-1390`)
-    // ------------------------------------------------------------------
 
     /// The provider fills the buffer, and the failure code is the C's.
     #[test]
@@ -5562,9 +4910,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
     // Key log -- `init_config_builder_keylog` (`rustls.c:809-829`)
-    // ------------------------------------------------------------------
 
     /// A disabled log is not installed and does not fail the handshake, which
     /// is `rustls.c:816-818` returning `CURLE_OK`.
@@ -5657,9 +5003,7 @@ mod tests {
         backend.cleanup();
     }
 
-    // ------------------------------------------------------------------
     // The session store
-    // ------------------------------------------------------------------
 
     /// The scope admits its own peer and credentials and refuses anything else,
     /// which is `cf_ssl_scache_match_auth` (`vtls_scache.c:598-618`).
@@ -5917,12 +5261,6 @@ mod tests {
 
     /// The `adjust_pollset` slot is the *generic* helper, and the need this
     /// backend records is what it acts on.
-    ///
-    /// `rustls.c:1415` fills the slot with `Curl_ssl_adjust_pollset`, not with a
-    /// `cr_`-prefixed function, so nothing in this file reimplements it. The
-    /// behavioural check is that the two agree: the session records `SEND` or
-    /// `RECV`, and `crate::tls::tls_adjust_pollset` turns that into `POLLOUT`
-    /// only or `POLLIN` only.
     #[test]
     #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
     fn the_generic_pollset_helper_acts_on_the_recorded_need() {
@@ -6024,9 +5362,7 @@ mod tests {
         assert!(rendered.contains("provider_suites"));
     }
 
-    // ------------------------------------------------------------------
     // Helpers that need a real peer: an in-memory rustls server
-    // ------------------------------------------------------------------
 
     /// An accept-anything verifier, for a client that is deliberately
     /// `--insecure` in a test.
@@ -6107,11 +5443,6 @@ mod tests {
     /// graph, and the manifests are frozen -- and `tests/certs/` is generated by
     /// `genserv.pl` at suite-run time rather than committed, so there is nothing
     /// there to read either.
-    ///
-    /// Its validity window is irrelevant: the only client that ever sees it is
-    /// the one in these tests, configured `--insecure`, so no date and no chain
-    /// is checked. It secures nothing, it is reachable from nowhere outside
-    /// `#[cfg(test)]`, and replacing it changes no behaviour.
     const TEST_SERVER_CERT_DER: &[u8] = &[
         0x30, 0x82, 0x01, 0xB9, 0x30, 0x82, 0x01, 0x5F, 0xA0, 0x03, 0x02, 0x01,
         0x02, 0x02, 0x14, 0x2B, 0x89, 0xD8, 0xC6, 0xDC, 0x10, 0x0D, 0x3C, 0x21,
@@ -6209,7 +5540,7 @@ mod tests {
     /// server queues becomes the client's next delivery. No socket, no thread
     /// and no timing: the exchange is a function call.
     fn pump(
-        shared: &Rc<RefCell<BelowState>>,
+        shared: &Arc<SyncCell<BelowState>>,
         server: &mut rustls::ServerConnection,
     ) {
         let outbound = {
@@ -6248,7 +5579,7 @@ mod tests {
         state: &mut RustlsSession,
         base: &mut FilterBase,
         cx: &mut CallCtx<'_, '_>,
-        shared: &Rc<RefCell<BelowState>>,
+        shared: &Arc<SyncCell<BelowState>>,
         server: &mut rustls::ServerConnection,
     ) {
         for _ in 0..16 {

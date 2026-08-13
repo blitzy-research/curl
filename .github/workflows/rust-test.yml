@@ -284,13 +284,23 @@ jobs:
           # list can add the flag locally. No filter argument, no --exclude, no
           # `--` separator passing anything to the harness: every test in the
           # workspace runs, which is what "passing in full" means.
+          #
+          # STREAMED THROUGH tee, WITH THE STATUS TAKEN FROM PIPESTATUS RATHER
+          # THAN FROM THE PIPELINE. The log is kept because the vacuity step
+          # below parses it for `test result:` lines and ignored-test names. That
+          # puts `tee` last in the pipeline, and the shell GitHub uses for a
+          # `run:` body without a `shell:` key is `bash -e` WITHOUT `pipefail`,
+          # so the PIPELINE's status is `tee`'s - effectively always 0. Capturing
+          # it with `|| status=$?` would therefore record `tee` and silently
+          # discard cargo's, and `-e` would not fire either, so a red suite would
+          # report green. `PIPESTATUS[0]` is cargo's own status and is read on
+          # the very next line, before any other command can overwrite the
+          # array. Same spelling as rust-build.yml and rust-miri.yml.
           log="${RUNNER_TEMP}/cargo-test-default.log"
           status=0
-          cargo test --locked --workspace 2>&1 | tee "${log}" || status=$?
+          cargo test --locked --workspace 2>&1 | tee "${log}"
+          status="${PIPESTATUS[0]}"
 
-          # `tee` in a pipeline hides the exit status of cargo behind its own on
-          # some shells; the pipeline status is what matters here, so it is read
-          # explicitly rather than trusted.
           if [ "${status}" -ne 0 ]; then
             echo "FAIL: cargo test --workspace exited ${status}."
             echo 'This is the gate itself. The failing test names are above, in the suite output.'
@@ -349,9 +359,15 @@ jobs:
           # the two configurations are not comparable: `--all-features` also
           # cfg's OUT the assertions that check the default-off features really
           # are off. Neither run subsumes the other, so both must be green.
+          #
+          # tee plus PIPESTATUS for the same reason as the default leg: the log
+          # is parsed by the vacuity step below, and `tee` being the last command
+          # of the pipeline would otherwise hand this check `tee`'s status
+          # instead of cargo's under `bash -e` without `pipefail`.
           log="${RUNNER_TEMP}/cargo-test-all-features.log"
           status=0
-          cargo test --locked --workspace --all-features 2>&1 | tee "${log}" || status=$?
+          cargo test --locked --workspace --all-features 2>&1 | tee "${log}"
+          status="${PIPESTATUS[0]}"
 
           if [ "${status}" -ne 0 ]; then
             echo "FAIL: cargo test --workspace --all-features exited ${status}."

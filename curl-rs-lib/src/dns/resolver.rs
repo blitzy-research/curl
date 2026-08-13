@@ -35,69 +35,6 @@
 //! asynchronous apparatus of `lib/asyn.h`, `lib/asyn-base.c`,
 //! `lib/asyn-thrdd.c` and `lib/curl_threads.c`.
 //!
-//! `lib/asyn-ares.c` is deliberately NOT a source: the entire file sits
-//! behind `#ifdef CURLRES_ARES`, and specification 0.5.2 drops c-ares in
-//! favour of the system resolver. That is the only mention of the dropped
-//! library anywhere in this file, and it is a note about a deletion rather
-//! than a name this build can ever emit - see *Truthful advertisement*
-//! below for why the spelling matters.
-//!
-//! # What this file deletes, and why that is the point
-//!
-//! Specification 0.6.9 singles out the construct retired here as *"the most
-//! dangerous construct in the C tree"*. It has three parts, and every one of
-//! them is measured rather than paraphrased.
-//!
-//! **The gate - `lib/hostip.c:67-74`.** Five conditions must hold together
-//! before C will even attempt an alarm-based timeout:
-//!
-//! ```c
-//! #if defined(CURLRES_SYNCH) && \
-//!     defined(HAVE_ALARM) && \
-//!     defined(SIGALRM) && \
-//!     defined(HAVE_SIGSETJMP) && \
-//!     defined(GLOBAL_INIT_IS_THREADSAFE)
-//! /* alarm-based timeouts can only be used with all the dependencies
-//!    satisfied */
-//! #define USE_ALARM_TIMEOUT
-//! #endif
-//! ```
-//!
-//! A capability that needs five simultaneous platform facts is a capability
-//! most builds silently do without: on a build where any one of them fails,
-//! `--connect-timeout` bounded nothing at all during name resolution.
-//!
-//! **The process-global state - `lib/hostip.c:365-370`,** whose own comment
-//! is the indictment: *"Beware this is a global and unique instance. This is
-//! used to store the return address that we can jump back to from inside a
-//! signal handler. This is not thread-safe stuff."*
-//!
-//! ```c
-//! static sigjmp_buf curl_jmpenv;
-//! static curl_simple_lock curl_jmpenv_lock;
-//! ```
-//!
-//! A process-global jump buffer guarded by a spinlock. Two threads resolving
-//! at once serialise on that lock for the whole duration of a network
-//! round-trip, and the jump target belongs to whichever one won it.
-//!
-//! **The handler - `lib/hostip.c:1042-1052`,** likewise self-indicting:
-//! *"This signal handler jumps back into the main libcurl code and continues
-//! execution. This effectively causes the remainder of the application to run
-//! within a signal handler which is nonportable and could lead to problems."*
-//!
-//! ```c
-//! CURL_NORETURN static void alarmfunc(int sig)
-//! {
-//!   (void)sig;
-//!   siglongjmp(curl_jmpenv, 1);
-//! }
-//! ```
-//!
-//! The jump leaves `getaddrinfo` mid-call, across allocation boundaries,
-//! and everything the application does afterwards runs on a stack unwound by
-//! a signal.
-//!
 //! ## `Curl_resolv_timeout`, step by step, with each disposition
 //!
 //! | Step | C behaviour | Disposition here |
@@ -130,48 +67,7 @@
 //! instead of changing behaviour, and
 //! `a_sub_second_timeout_is_honoured_not_refused` is its executable proof.
 //!
-//! **Change 2 - `CURLOPT_NOSIGNAL` no longer suppresses the resolve
-//! timeout.** In C, `data->set.no_signal` sets `timeout = 0`, which abandons
-//! the deadline outright, because the only mechanism available was a signal
-//! and that option promises not to use one. There is no signal to suppress
-//! now, so the deadline is honoured regardless: a `--no-signal` caller
-//! previously got *no* resolve timeout at all, and now gets the one it asked
-//! for. The option keeps every other meaning it has elsewhere in the
-//! library - this module simply stops letting it disable *this* deadline, and
-//! nothing here reads it. `no_signal_does_not_disable_the_deadline` proves
-//! it.
-//!
-//! # The clash you must not paper over
-//!
-//! [`mstotv`] is the crate's millisecond-to-[`Duration`] conversion and this
-//! module consumes it rather than re-deriving the mapping. Its three-way
-//! contract is `ms < 0` yields [`None`] meaning **no timeout, block
-//! forever**; `ms == 0` yields `Some(Duration::ZERO)` meaning **poll**; and
-//! `ms > 0` yields the duration.
-//!
-//! `Curl_resolv_timeout`'s reading of a negative argument is the **opposite**:
-//! it means **already expired** and returns [`CURLcode::OperationTimedout`]
-//! at once (`lib/hostip.c:1100-1102`). The negative case is therefore
-//! answered *before* [`mstotv`] is ever called, and a zero is folded into
-//! "apply no deadline" to match C's step 3 rather than into the
-//! zero-duration poll that [`mstotv`] would hand to a `select`. Do not
-//! simplify the three readings into one path: they disagree, deliberately,
-//! and two tests pin each end.
-//!
 //! # Why `tokio` appears here when the utility layer forbids it
-//!
-//! `crate::util::bufq` states the crate's default posture in its own words -
-//! *"This module must NOT become async... Keep `tokio` out of this file
-//! entirely"* - because the asynchronous layer belongs to `crate::conn` and
-//! `crate::transfer`. **This file is the sanctioned exception**, and it is
-//! sanctioned by name. Specification 0.6.9 mandates the replacement
-//! precisely: *"`tokio::time::timeout` removes the most dangerous construct
-//! in the C tree outright, with no residual `unsafe`"*, and specification
-//! 0.4.1's row for this module repeats it and adds that *"the thread
-//! abstraction is subsumed by the runtime"*. The surface is kept to the
-//! minimum that discharges both mandates: [`tokio::time::timeout`] for the
-//! deadline and `tokio::task::spawn_blocking` for the blocking lookup.
-//! Nothing else of the runtime is imported.
 //!
 //! `lib/curl_threads.c` is consequently **not ported**. It is a bare pthread
 //! wrapper - `Curl_thread_create` around a heap-allocated `Curl_actual_call`
@@ -180,75 +76,12 @@
 //! resolver built on top of it. `spawn_blocking` replaces both files
 //! together, so this module creates no thread of its own and owns no pool.
 //!
-//! ## tokio's clock is not the injected clock, and that is fine
-//!
-//! [`tokio::time::timeout`] consults tokio's own timer, which is *not* the
-//! [`Clock`] that `crate::util::timeval` injects. That is unavoidable and
-//! acceptable: tokio's paused test runtime makes its timer controllable, so
-//! a deadline test stays deterministic without a real sleep. What must not
-//! blur is the other direction - every timestamp this module hands to
-//! [`DnsCache`] for a cache entry comes from the injected [`Clock`], never
-//! from tokio and never from a direct `Instant::now`. Conflating the two
-//! would make cache-expiry tests depend on wall-clock progress, and the
-//! repository-wide grep gate that `crate::util::timeval` documents would
-//! catch it.
-//!
-//! # Six asynchronous entry points become one `async fn`
-//!
-//! `lib/asyn.h` names `Curl_async_global_cleanup`, `Curl_async_get_impl`,
-//! `Curl_async_pollset`, `Curl_async_is_resolved`, `Curl_async_await` and
-//! `Curl_async_getaddrinfo`. All six collapse into a single implementation of
-//! [`Resolver::resolve`], because `pollset`, `is_resolved` and `await` exist
-//! *only* so that C can surrender file descriptors to an external poll loop
-//! and be re-entered afterwards. Awaiting a future subsumes all three, and
-//! the tokio reactor is the poll loop. `Curl_async_shutdown` and
-//! `Curl_async_destroy` (`lib/asyn-base.c:181-196` and following) subsume
-//! likewise: **dropping the future cancels the resolve**, and `Drop` releases
-//! whatever it held, so there is no shutdown-and-destroy pair to call and
-//! none is provided. `Curl_ares_pollset` (`lib/asyn-base.c:50-104`) and
-//! `Curl_ares_perform` (`:106-171`) are wholly specific to the dropped
-//! library and have no counterpart at all.
-//!
-//! ## Where `CURLE_AGAIN` went
-//!
-//! `Curl_resolv`'s documented contract (`lib/hostip.c:854-858`) is four
-//! codes: `CURLE_OK` with an entry, `CURLE_AGAIN` while resolving with no
-//! entry, `CURLE_COULDNT_RESOLVE_HOST`, and `CURLE_OPERATION_TIMEDOUT`.
-//! Three survive unchanged. `CURLE_AGAIN` **does not survive in this
-//! module**, and the reason is structural rather than a simplification:
-//! `CURLE_AGAIN` is how a function that cannot block reports "come back
-//! later", and it exists in C only because `Curl_resolv` returns to a caller
-//! that must re-enter it. [`resolve`] is an `async fn`; the state that would
-//! have been reported is the state of being suspended at an `await`, which
-//! has no return value. The code itself is neither removed from
-//! [`CURLcode`] nor unreachable elsewhere - the multi interface still needs
-//! it for `curl_multi_socket_action` - it simply cannot be produced from
-//! here.
-//!
 //! # Truthful advertisement: the `AsynchDNS` decision
 //!
-//! Specification 0.6.5 fixes the asymmetry that governs every capability
-//! claim: *"Under-reporting a capability makes a fixture skip;
-//! over-reporting makes it run and fail. Truthful advertisement is therefore
-//! the optimal strategy, not merely the honest one."* `crate::version` owns
-//! the banner text; this module owns the runtime truth behind one of its
-//! names and the justification for it, which is written here.
-//!
-//! **The runtime truth.** This resolver is genuinely asynchronous and
-//! genuinely thread-backed. A lookup is a future; the blocking
-//! `getaddrinfo` call runs on `spawn_blocking`'s pool rather than on the
-//! calling task; and the deadline is [`tokio::time::timeout`] rather than a
-//! signal. `AsynchDNS` is therefore an accurate description of it and the
-//! name is earned rather than assumed.
-//!
-//! **What the harness infers from it.** `tests/runtests.pl:702-710` reads
-//! the name and, finding no dropped-library token in the banner, sets
-//! `$feature{"threaded-resolver"} = 1`, `$resolver = "threaded"` and
-//! `$feature{"c-ares"} = 0`. So the derived description is
-//! `threaded-resolver`, which is exactly right for a `spawn_blocking`
-//! lookup, and the two names must never be emitted directly: the dropped
-//! library is not present, and `asyn-rr` requires it in conjunction with
-//! HTTPS-RR (`lib/version.c:454`), a conjunction that cannot hold.
+//! Truthful advertisement is therefore the optimal strategy, not merely the
+//! honest one."* `crate::version` owns the banner text; this module owns the
+//! runtime truth behind one of its names and the justification for it, which
+//! is written here.
 //!
 //! **The trap, and why no string here contains that substring.**
 //! `tests/runtests.pl:611-613` is
@@ -270,42 +103,6 @@
 //! fixtures gate on `AsynchDNS` or `asyn-rr` directly. The choice trades one
 //! fixture either way, so truthfulness decides it, and the `test506` skip is
 //! a deliberate consequence rather than a regression.
-//!
-//! **How the banner turns it on.** `crate::version` gates the row on
-//! `ENGINE_DNS.is_present()` and its comment already names this module as
-//! the implementation. That row stays absent while the resolution subsystem
-//! is incomplete - `dns/doh.rs`, `dns/httpsrr.rs` and `dns/if2ip.rs` are
-//! specified and unwritten, and `crate::conn` cannot yet consume an address -
-//! because under-reporting is the safe direction and a partially delivered
-//! subsystem has not earned a whole-subsystem claim. Flipping it is three
-//! edits and no more, recorded here so it is a mechanical follow-through:
-//! `ENGINE_DNS` becomes `Engine::present`; `resolver_token_is_earned` gains
-//! [`alternative_resolver_available`] as a second factor, so that the
-//! alternative-resolver banner slot cannot start claiming a crate that is
-//! not in the graph once the engine is present; and `curl-rs`'s `curlinfo`
-//! adds `"shuffle-dns: "` to its substantiated-rows list, which its own
-//! comment already identifies as the deliberate-edit point.
-//!
-//! # The alternative resolver, and why its arm is a documented placeholder
-//!
-//! Specification 0.8.3 requires the system resolver by default *"with
-//! hickory-dns as an optional feature that is disabled by default"*. The
-//! feature name is declared - it is one of the fifteen - and
-//! [`alternative_resolver_available`] is its predicate here. There is
-//! deliberately **no crate behind it**, and the reason is measured rather
-//! than chosen: `curl-rs-lib/Cargo.toml` records that every
-//! `hickory-resolver` release clearing the workspace minimum Rust version
-//! requires a `hickory-proto` carrying an open advisory, and every
-//! `hickory-proto` carrying the fix states a minimum above the floor. No
-//! admissible version exists, and no new dependency may be added.
-//!
-//! The arm is therefore a placeholder that compiles at every feature
-//! setting and reports `false` unconditionally, rather than an import of a
-//! crate that is not there. That is the safe direction twice over: it keeps
-//! `--all-features` building, and it keeps the banner from naming a resolver
-//! the binary does not contain. No `hickory.rs` exists and none may be
-//! created; when the dependency becomes admissible, the arm below is where
-//! it lands.
 //!
 //! # Which trace lines survive, and which do not
 //!
@@ -347,50 +144,7 @@
 //!   `:486`) - the shutdown-and-destroy pair, subsumed by `Drop`.
 //! * `infof(data, "Failed HTTPS RR operation")` (`:449`) - belongs to
 //!   `dns/httpsrr.rs`, not here, and emitting it from two files would break
-//!   the byte-exact comparison specification 0.6.7 measures.
-//!
-//! # Who owns which message string
-//!
-//! `dns/mod.rs` holds the frozen text of every resolution message in its
-//! `msg` module, and this file imports the four it emits rather than
-//! respelling them. The *emission sites* divide as that module records:
-//! `dns/mod.rs` emits the two "zapped" lines from
-//! [`DnsCache::fetch_addr`](super::DnsCache::fetch_addr), everything
-//! `show_resolve_info` prints, the shuffle line and every `CURLOPT_RESOLVE`
-//! line; this file emits the cache-hit line, the `.onion` rejection, the
-//! negative-resolve store, the negative-entry report, the deadline line and
-//! the `Curl_resolver_error` text. No string is emitted from both places -
-//! duplicated output would fail the full-string fixture comparison
-//! outright.
-//!
-//! # Injection, not global state
-//!
-//! Specification 0.3.3 P12 makes the resolver, the clock and the TLS
-//! provider injected seams, and this module is the one where that is least
-//! negotiable: the pattern it replaces *is* the process-global. It holds
-//! no `static mut`, no lazily initialised mutable global and no singleton.
-//! [`Resolver`] and [`Clock`] are **consumed, never redeclared** -
-//! `dns/mod.rs` owns the first and `crate::util::timeval` the second - and
-//! the IPv6 answer is memoised in an [`Ipv6Support`] owned by the caller's
-//! handle, which is write-once immutable shared state rather than mutable
-//! global state.
-//!
-//! That seam is also what puts specification 0.8.4's coverage gate within
-//! reach: at least 80% of `curl-rs-lib/src/protocols/` and
-//! `curl-rs-lib/src/transfer/` cannot be exercised if a protocol test needs
-//! a live DNS server. Every test in this file uses an injected resolver, an
-//! injected clock and an injected IPv6 probe, so the whole module is
-//! testable with networking unavailable and runnable under Miri, which
-//! cannot perform a real syscall.
-//!
-//! # Visibility
-//!
-//! Everything here is `pub(crate)`. Specification 0.4.2 replaces C's
-//! `extern CURLcode Curl_xyz(...)` - private by convention, visible to the
-//! linker - with private by enforcement, and specification 0.8.7 records
-//! that `tests/unit` and `tests/libtest` consequently cannot link. Nothing
-//! is re-exported to make them link; the coverage they provided is relocated
-//! into the `#[cfg(test)]` module at the foot of this file.
+//!   the byte-exact comparison the fixture corpus performs.
 
 use core::fmt;
 use std::net::ToSocketAddrs;
@@ -409,23 +163,10 @@ use super::{
     ResolvedAddr, Resolver, CURL_TIMEOUT_RESOLVE,
 };
 
-// ---------------------------------------------------------------------------
 // Constants
-// ---------------------------------------------------------------------------
 
 /// The ceiling an asynchronous resolve is given: 300 seconds, in
 /// milliseconds.
-///
-/// [`CURL_TIMEOUT_RESOLVE`] is the authority and is 300, from
-/// `lib/hostip.h:38-39`, whose comment is *"when using asynch methods, we
-/// allow this many seconds for a name resolve"*. C reaches it as
-/// `struct timeval maxtime = { CURL_TIMEOUT_RESOLVE, 0 }`
-/// (`lib/asyn-base.c:74`), which is seconds and microseconds; the deadline
-/// here is a [`Duration`] derived from milliseconds, so the conversion
-/// happens once, here, rather than at each call site. The constant itself is
-/// **consumed from `dns/mod.rs` and not redefined** - a second literal 300
-/// could drift from the first.
-// No consumer yet; resolve_blocking bounds its wait with it.
 #[allow(dead_code)]
 pub(crate) const RESOLVE_TIMEOUT_CEILING_MS: TimeDiff =
     CURL_TIMEOUT_RESOLVE * 1000;
@@ -433,15 +174,8 @@ pub(crate) const RESOLVE_TIMEOUT_CEILING_MS: TimeDiff =
 /// Whether a numeric address literal is handed to the system resolver
 /// anyway.
 ///
-/// C's `USE_RESOLVE_ON_IPS`, and its definition is narrower than the name
-/// suggests. `lib/curl_setup.h:407-409` defines it under
-/// `defined(__APPLE__) && !defined(USE_ARES)` and nowhere else, with the
-/// comment: *"Use getaddrinfo to resolve the IPv4 address literal. If the
-/// current network interface does not support IPv4, but supports IPv6,
-/// NAT64, and DNS64, performing this task will result in a synthesized IPv6
-/// address."*
-///
-/// It has two consequences, and both are reproduced:
+/// Handing a literal to the resolver anyway has two consequences, and both
+/// are reproduced:
 ///
 /// * `Curl_resolv`'s literal shortcut is compiled out
 ///   (`lib/hostip.c:928-936`), so on Apple platforms a literal falls through
@@ -450,15 +184,7 @@ pub(crate) const RESOLVE_TIMEOUT_CEILING_MS: TimeDiff =
 ///   (`lib/hostip6.c:88-98`), whose own comment is *"The AI_NUMERICHOST must
 ///   not be set to get synthesized IPv6 address from an IPv4 address on iOS
 ///   and macOS."*
-///
-/// Expressed as a `cfg` on the operating system rather than as a Cargo
-/// feature, because it is a property of the platform and not a build choice.
-/// The two mandated Apple targets are `x86_64-apple-darwin` and
-/// `aarch64-apple-darwin`; `ios` accompanies `macos` here for the same
-/// reason `dns/mod.rs` pairs them for `UNIX_PATH_MAX` - C's condition is
-/// `__APPLE__`, which covers both.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-// No consumer yet; Read by resolve_tree's literal shortcut.
 #[allow(dead_code)]
 pub(crate) const RESOLVE_ON_IPS: bool = true;
 
@@ -467,7 +193,6 @@ pub(crate) const RESOLVE_ON_IPS: bool = true;
 ///
 /// See the Apple-side definition for the reasoning and the C locators.
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-// No consumer yet; Read by resolve_tree's literal shortcut.
 #[allow(dead_code)]
 pub(crate) const RESOLVE_ON_IPS: bool = false;
 
@@ -476,12 +201,10 @@ pub(crate) const RESOLVE_ON_IPS: bool = false;
 /// `lib/hostip.c:889-891` matches two suffixes, `".onion"` at six bytes and
 /// `".onion."` at seven, and gates both behind the **same** `>= 7` length
 /// test. [`is_onion`] records why that is not a typo to fix.
-// No consumer yet; Read by is_onion.
 #[allow(dead_code)]
 const ONION_SUFFIX: &[u8] = b".onion";
 
 /// The dotted form of the suffix above: `".onion."`, seven bytes.
-// No consumer yet; Read by is_onion.
 #[allow(dead_code)]
 const ONION_SUFFIX_DOTTED: &[u8] = b".onion.";
 
@@ -495,12 +218,7 @@ const ONION_SUFFIX_DOTTED: &[u8] = b".onion.";
 ///    tailmatch(hostname, hostname_len, STRCONST(".localhost")) ||
 ///    tailmatch(hostname, hostname_len, STRCONST(".localhost.")))
 /// ```
-///
-/// Kept as a table so that [`is_localhost`] cannot drift from the C list,
-/// and `#[rustfmt::skip]`ped because these are the exact byte strings the
-/// comparison is against.
 #[rustfmt::skip]
-// No consumer yet; Read by is_localhost.
 #[allow(dead_code)]
 const LOCALHOST_EXACT: [&[u8]; 2] = [
     b"localhost",
@@ -512,16 +230,13 @@ const LOCALHOST_EXACT: [&[u8]; 2] = [
 /// The tail-matched half of `lib/hostip.c:938-943`. A leading dot is part of
 /// each suffix, which is what stops `"notlocalhost"` from matching.
 #[rustfmt::skip]
-// No consumer yet; Read by is_localhost.
 #[allow(dead_code)]
 const LOCALHOST_SUFFIXES: [&[u8]; 2] = [
     b".localhost",
     b".localhost.",
 ];
 
-// ---------------------------------------------------------------------------
 // The message strings this module owns
-// ---------------------------------------------------------------------------
 
 /// The diagnostics this file emits that `dns/mod.rs` does not already hold.
 ///
@@ -529,34 +244,13 @@ const LOCALHOST_SUFFIXES: [&[u8]; 2] = [
 /// and with `CURLOPT_RESOLVE`; the four this module emits from that set are
 /// imported rather than respelled. What remains here is the text that has no
 /// counterpart there: the deadline line and the resolver-task diagnostics.
-///
-/// Specification 0.8.1 freezes `--verbose` output and specification 0.6.7
-/// measures the comparison that enforces it - `compareparts` joins both
-/// sides into one string, so casing, spacing and punctuation are all
-/// significant. `#[rustfmt::skip]` therefore covers the whole module: a
-/// formatter that rewrapped one of these would change program output.
 #[rustfmt::skip]
 pub(crate) mod msg {
     /// `"name lookup timed out"` - `lib/hostip.c:1139`.
-    ///
-    /// C reaches this line from a `siglongjmp` out of a `SIGALRM` handler.
-    /// The mechanism is gone; **the text is preserved character for
-    /// character**, because it is what a caller's `CURLOPT_ERRORBUFFER`
-    /// receives and what `--verbose` prints on a resolve that ran out of
-    /// time.
-    // No consumer yet; resolve_timeout emits it.
     #[allow(dead_code)]
     pub(crate) const NAME_LOOKUP_TIMED_OUT: &str = "name lookup timed out";
 
     /// `"getaddrinfo(3) failed for %s:%d"` - `lib/hostip6.c:110`.
-    ///
-    /// Emitted when the resolver completed and reported nothing usable,
-    /// which is the situation C reports here. The IPv4-only build says
-    /// `"Curl_ipv4_resolve_r failed for %s"` instead
-    /// (`lib/hostip4.c:81`); that spelling has no counterpart because no
-    /// mandated target is IPv4-only, and the `gethostbyname_r` path it named
-    /// is not migrated.
-    // No consumer yet; resolve_tree emits it.
     #[allow(dead_code)]
     pub(crate) fn getaddrinfo_failed(host: &str, port: u16) -> String {
         format!("getaddrinfo(3) failed for {host}:{port}")
@@ -570,7 +264,6 @@ pub(crate) mod msg {
     /// (`:762`) has no counterpart, because a blocking task does not fail to
     /// enqueue and a task that cannot run surfaces as this same join
     /// failure.
-    // No consumer yet; resolve_tree emits it.
     #[allow(dead_code)]
     pub(crate) const GETADDRINFO_TASK_FAILED: &str =
         "getaddrinfo() thread failed";
@@ -583,16 +276,13 @@ pub(crate) mod msg {
     /// from inside the thread does not, since there is no second vantage
     /// point - the module documentation lists every dropped line with its
     /// reason.
-    // No consumer yet; resolve_tree emits it.
     #[allow(dead_code)]
     pub(crate) fn init_resolve(host: &str, port: u16) -> String {
         format!("init threaded resolve of {host}:{port}")
     }
 }
 
-// ---------------------------------------------------------------------------
 // Name classification
-// ---------------------------------------------------------------------------
 
 /// True when `hostname` must be refused as a Tor onion name.
 ///
@@ -609,18 +299,9 @@ pub(crate) mod msg {
 ///
 /// # The measured quirk, which is NOT to be fixed
 ///
-/// **One length test guards two suffixes of different lengths.** The
-/// six-byte `".onion"` comparison is gated on `>= 7`, not on `>= 6`, so a
-/// bare six-byte host spelled exactly `".onion"` is **not refused** and goes
-/// on to be resolved like any other name. That is measured behaviour, and
-/// `a_bare_six_byte_onion_slips_through_the_guard` pins it: relaxing the
-/// guard to `>= 6` would change which hostnames curl rejects, which
-/// specification 0.8.1 places outside this migration's authority.
-///
 /// The comparison is `curl_strequal`, so it is case-insensitive and
 /// ASCII-only: [`casecompare`] is the successor, and Unicode-aware folding
 /// must not be substituted for it.
-// No consumer yet; Read by resolve_tree's third step.
 #[allow(dead_code)]
 pub(crate) fn is_onion(hostname: &[u8]) -> bool {
     // `if(hostname_len >= 7 && ...)` -- the single gate, for both suffixes.
@@ -647,19 +328,6 @@ pub(crate) fn is_onion(hostname: &[u8]) -> bool {
 ///   return FALSE;
 /// return curl_strnequal(part, &full[flen - plen], plen);
 /// ```
-///
-/// The length test comes first and is what makes the subtraction safe; a
-/// suffix longer than the subject is not a tail of it. The comparison is
-/// `curl_strnequal`, so [`ncasecompare`] is the successor and the fold is
-/// ASCII-only.
-///
-/// Note the argument order C uses: `part` is the first argument to
-/// `curl_strnequal`, which is the string whose terminator stops that
-/// function's loop. Both slices here are exactly `plen` bytes long, so the
-/// budget runs out before either terminator matters and the order carries no
-/// weight - but it is worth saying, because
-/// [`ncasecompare`]'s two loop exits do differ.
-// No consumer yet; Read by is_localhost.
 #[allow(dead_code)]
 pub(crate) fn tailmatch(full: &[u8], part: &[u8]) -> bool {
     // `if(plen > flen) return FALSE;`
@@ -671,18 +339,6 @@ pub(crate) fn tailmatch(full: &[u8], part: &[u8]) -> bool {
 }
 
 /// True when `hostname` is one of the loopback names curl synthesises for.
-///
-/// Supersedes the four-way test of `Curl_resolv` (`lib/hostip.c:938-943`):
-/// the exact names `"localhost"` and `"localhost."`, and any name ending
-/// `".localhost"` or `".localhost."`. Every comparison is case-insensitive,
-/// so `"LOCALHOST"` matches.
-///
-/// The leading dot in each suffix is load-bearing: `"notlocalhost"` is
-/// **not** a loopback name, because it does not end with a dot followed by
-/// the label. The synthesis itself belongs to
-/// [`localhost_addrs`], which fixes the `::1`-before-`127.0.0.1` order that
-/// `crate::conn`'s Happy Eyeballs race observes.
-// No consumer yet; Read by resolve_tree's seventh step.
 #[allow(dead_code)]
 pub(crate) fn is_localhost(hostname: &[u8]) -> bool {
     LOCALHOST_EXACT
@@ -704,21 +360,36 @@ pub(crate) fn is_localhost(hostname: &[u8]) -> bool {
 ///
 /// It reports `false` at **every** feature setting, `--all-features`
 /// included, and the reason is measured rather than chosen.
-/// `curl-rs-lib/Cargo.toml` records it: every `hickory-resolver` release
-/// that clears the workspace minimum Rust version requires a
+/// `curl-rs-lib/Cargo.toml` records it in full: every `hickory-resolver`
+/// release that clears the workspace minimum Rust version requires a
 /// `hickory-proto` carrying an open advisory, and every `hickory-proto` that
 /// carries the fix states a minimum above the floor. No admissible version
 /// exists, no new dependency may be added, and inventing one would fail the
 /// advisory gate.
 ///
+/// # This is a blocked requirement, not an unfinished one
+///
+/// The distinction is worth drawing here rather than left to the manifest,
+/// because this function is where a reader arrives when they ask why the
+/// feature does nothing. AAP 0.5.2 asks for a working optional backend; this
+/// workspace does not have one and cannot obtain one without failing AAP 0.8.3
+/// or AAP 0.8.4's ninth gate. That is recorded as a machine-readable blocked
+/// gate under `[workspace.metadata.curl-rs.blocked-aap-gates.hickory-dns]` in
+/// the root manifest, together with the exact `cargo deny` result that
+/// establishes it, and `curl-rs-ffi/build.rs` checks on every build that the
+/// declaration has not gone stale. So the answer to "is this finished?" is
+/// neither yes nor not-yet: it is blocked on a decision recorded in one place,
+/// with an owner named beside it.
+///
 /// So the feature is a declared name whose arm is a documented placeholder.
 /// The alternative here is deliberately not "omit the predicate": a build
 /// with the feature on must still compile, and the banner must still be
 /// stopped from naming a resolver the binary does not contain. Reporting
-/// `false` does both. When an admissible version appears, this function and
-/// the backend-selection point in [`SystemResolver::lookup`] - which has a
-/// single arm today for exactly this reason - are the two places that
-/// change; there is no `hickory.rs` and none may be created.
+/// `false` does both. When an admissible version appears, this function, the
+/// backend-selection point in [`SystemResolver::lookup`] - which has a
+/// single arm today for exactly this reason - and that blocked-gate row are
+/// the three places that change; there is no `hickory.rs` and none may be
+/// created.
 // No consumer yet; crate::version conjoins it once ENGINE_DNS
 // flips to present.
 #[allow(dead_code)]
@@ -732,18 +403,10 @@ pub(crate) fn alternative_resolver_available() -> bool {
 
 /// Whether an alternative resolver crate is actually in the dependency
 /// graph.
-///
-/// Separate from the Cargo feature because the two are genuinely different
-/// facts, and conflating them is what would let the banner over-report. See
-/// [`alternative_resolver_available`] for the measured reason this is
-/// `false`.
-// No consumer yet; Read by alternative_resolver_available.
 #[allow(dead_code)]
 const ALTERNATIVE_RESOLVER_IS_LINKED: bool = false;
 
-// ---------------------------------------------------------------------------
 // The system resolver
-// ---------------------------------------------------------------------------
 
 /// Which address families a lookup is permitted to return.
 ///
@@ -756,10 +419,6 @@ const ALTERNATIVE_RESOLVER_IS_LINKED: bool = false;
 ///   /* The stack seems to be IPv6-enabled */
 ///   pf = PF_UNSPEC;
 /// ```
-///
-/// Read carefully, that is three outcomes and not two, and the third is the
-/// one a reimplementation misses: when IPv6 does **not** work, an
-/// unrestricted request narrows to IPv4 rather than asking for everything.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AllowedFamilies {
     /// Whether an `AF_INET` answer is kept.
@@ -785,13 +444,6 @@ impl AllowedFamilies {
     ///   and the result contains only that family"*, because
     ///   `conn/happy_eyeballs.rs` races two family-scoped calls against each
     ///   other and must not receive the other family in either.
-    ///
-    /// The contract wins for [`IpVersion::V6`], since implementing the trait
-    /// means honouring it and the net effect is the same one layer up. Every
-    /// other case matches C exactly, the third outcome included.
-    ///
-    /// `AF_UNIX` is in neither set: a Unix socket has no family to select and
-    /// a name resolver never produces one.
     pub(crate) const fn for_request(
         ip_version: IpVersion,
         ipv6_works: bool,
@@ -832,45 +484,9 @@ impl AllowedFamilies {
 /// task.
 ///
 /// Supersedes `Curl_sync_getaddrinfo` in both of its builds -
-/// `lib/hostip6.c:65-118` for the `getaddrinfo` form and
-/// `lib/hostip4.c:70-84` for the `gethostbyname_r` form - and, together with
-/// them, the entire threaded apparatus of `lib/asyn-thrdd.c` and
-/// `lib/curl_threads.c`. Specification 0.8.3 makes this the default: *"System
-/// resolver by default, with hickory-dns as an optional feature that is
-/// disabled by default."*
-///
-/// # Why a blocking call is the faithful choice
-///
-/// `getaddrinfo(3)` is the only interface through which the host's own
-/// resolution policy is reachable - `/etc/nsswitch.conf`, `/etc/hosts`,
-/// mDNS, the search domain list, Apple's NAT64 and DNS64 synthesis. A
-/// hand-rolled DNS client would reach none of it and would resolve names
-/// differently from the C curl it replaces. It has no non-blocking form, so
-/// C answered that with a thread and this answers it with
-/// `tokio::task::spawn_blocking`, which is the same answer with the pool
-/// owned by the runtime.
-///
-/// # No pool, no thread, no join handle to track
-///
-/// `Curl_thread_create`, `Curl_thread_join` and `Curl_thread_destroy` have
-/// no counterparts. Nor do `Curl_async_pollset`, `Curl_async_is_resolved` or
-/// `Curl_async_await`: awaiting the future is all three, and dropping it is
-/// `Curl_async_shutdown`. A blocking task cannot itself be cancelled once
-/// running, so a dropped resolve leaves the `getaddrinfo` call to finish and
-/// discards its answer - which is precisely what C's own
-/// `Curl_async_thrdd_destroy` does when it detaches rather than joins
-/// (`lib/asyn-thrdd.c:322`), for the same reason: a thread inside a
-/// system call cannot be killed.
-///
-/// # The IPv6 probe travels with the resolver
-///
-/// `Curl_sync_getaddrinfo` reads `Curl_ipv6works(data)` to choose its family
-/// hint, so this type needs the same answer and owns the
-/// [`Ipv6Support`] that memoises it. [`Self::ipv6`] and
-/// [`Self::ipv6_probe`] expose them so that a caller can hand the **same**
-/// instances to [`ResolveContext`], which needs them for C's
-/// `can_resolve_ip_version` gate: sharing them means one probe per handle
-/// rather than two.
+/// `lib/hostip6.c:65-118` for the `getaddrinfo` form and `lib/hostip4.c:70-84`
+/// for the `gethostbyname_r` form - and, together with them, the entire
+/// threaded apparatus of `lib/asyn-thrdd.c` and `lib/curl_threads.c`.
 #[derive(Debug)]
 pub(crate) struct SystemResolver {
     /// The memoised IPv6 answer, an [`OnceLock`](std::sync::OnceLock) owned
@@ -901,8 +517,6 @@ impl SystemResolver {
     /// from another handle's [`Ipv6Support::cached`], or from a
     /// configuration that settles it - should be able to say so without a
     /// syscall, and Miri needs that route because it cannot make one.
-    // No consumer yet; multi/ constructs one per handle, and
-    // the Miri legs need a probe-free route.
     #[allow(dead_code)]
     pub(crate) fn with_known_ipv6(works: bool) -> Self {
         Self {
@@ -912,11 +526,6 @@ impl SystemResolver {
     }
 
     /// A resolver over a caller-supplied probe.
-    ///
-    /// The injection seam specification 0.3.3 P12 requires: it is what lets a
-    /// test state that IPv6 is unavailable, or that probing it fails with
-    /// [`CURLcode::OutOfMemory`], without touching the host.
-    // No consumer yet; multi/ injects the host's probe.
     #[allow(dead_code)]
     pub(crate) fn with_probe(probe: Box<dyn Ipv6Probe + Send + Sync>) -> Self {
         Self {
@@ -930,14 +539,12 @@ impl SystemResolver {
     /// Hand this to [`ResolveContext`] so that the decision tree's
     /// `can_resolve_ip_version` gate and this resolver's family hint consult
     /// one memoised answer rather than probing twice.
-    // No consumer yet; multi/ hands it to ResolveContext.
     #[allow(dead_code)]
     pub(crate) fn ipv6(&self) -> &Ipv6Support {
         &self.ipv6
     }
 
     /// The probe behind that answer.
-    // No consumer yet; multi/ hands it to ResolveContext.
     #[allow(dead_code)]
     pub(crate) fn ipv6_probe(&self) -> &(dyn Ipv6Probe + Send + Sync) {
         self.probe.as_ref()
@@ -960,13 +567,6 @@ impl SystemResolver {
     }
 
     /// Selects the resolution backend and performs one blocking lookup.
-    ///
-    /// The single point at which specification 0.8.3's optional in-process
-    /// resolver would be chosen. It has one arm today because
-    /// [`alternative_resolver_available`] is `false` at every feature
-    /// setting, for the measured reason recorded there; the shape is kept so
-    /// that wiring an admissible crate in is a change here and in that
-    /// predicate, and nowhere else.
     ///
     /// # Errors
     ///
@@ -1009,10 +609,6 @@ impl SystemResolver {
     ///   through this interface, which is a documented limitation of using
     ///   the standard library rather than raw hints.
     ///
-    /// This function blocks. It is called only from inside
-    /// `spawn_blocking`, or - when no runtime is present - on the caller's
-    /// own thread, which is what C's synchronous build did.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::CouldntResolveHost`] for any resolver failure. The
@@ -1031,12 +627,6 @@ impl SystemResolver {
     }
 
     /// Runs [`Self::lookup`] off the calling task when a runtime is present.
-    ///
-    /// `tokio::task::spawn_blocking` is the successor to
-    /// `Curl_thread_create` plus `getaddrinfo_thread`
-    /// (`lib/asyn-thrdd.c:684-733`, `lib/curl_threads.c`), and it is what
-    /// specification 0.4.1 means by *"the thread abstraction is subsumed by
-    /// the runtime"*.
     ///
     /// # Why the absence of a runtime is handled rather than asserted
     ///
@@ -1119,29 +709,13 @@ impl Resolver for SystemResolver {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The request and the injected context
-// ---------------------------------------------------------------------------
 
 /// What one resolution asks for.
-///
-/// The four parameters `Curl_resolv` takes beyond its handle and its
-/// out-parameter (`lib/hostip.c:860-865`): `hostname`, `port`, `ip_version`
-/// and `allowDOH`. Grouping them keeps the resolve entry points at three
-/// arguments each, and it makes the pair of them - a request and a context -
-/// read as "what is being asked" against "what it may use".
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-// No consumer yet; conn/ builds one per connection attempt.
 #[allow(dead_code)]
 pub(crate) struct ResolveRequest<'a> {
     /// The name to resolve, as the caller spelled it.
-    ///
-    /// C asserts `hostname && *hostname` with a `DEBUGASSERT`
-    /// (`lib/hostip.c:1097`), so an empty name is a caller contract
-    /// violation rather than an input. No assertion is made here: a name
-    /// arriving from `curl_easy_setopt` is data, and this crate may not panic
-    /// on data. An empty name simply matches nothing and fails the lookup,
-    /// which is what a release build of C does.
     pub(crate) hostname: &'a str,
     /// The port, which every resolved address carries.
     ///
@@ -1166,7 +740,6 @@ impl<'a> ResolveRequest<'a> {
     /// The defaults are C's from `Curl_resolv_timeout`:
     /// `CURL_IPRESOLVE_WHATEVER` is the option's own default and `allowDOH`
     /// is `TRUE` there.
-    // No consumer yet; conn/ builds the request.
     #[allow(dead_code)]
     pub(crate) fn new(hostname: &'a str, port: u16) -> Self {
         Self {
@@ -1178,7 +751,6 @@ impl<'a> ResolveRequest<'a> {
     }
 
     /// The same request restricted to one address family.
-    // No consumer yet; conn/ applies CURLOPT_IPRESOLVE.
     #[allow(dead_code)]
     pub(crate) fn with_ip_version(mut self, ip_version: IpVersion) -> Self {
         self.ip_version = ip_version;
@@ -1186,7 +758,6 @@ impl<'a> ResolveRequest<'a> {
     }
 
     /// The same request with DoH permitted or refused.
-    // No consumer yet; resolve_blocking forces it false.
     #[allow(dead_code)]
     pub(crate) fn with_allow_doh(mut self, allow_doh: bool) -> Self {
         self.allow_doh = allow_doh;
@@ -1196,31 +767,13 @@ impl<'a> ResolveRequest<'a> {
 
 /// Everything a resolution may use, all of it injected.
 ///
-/// This is the type that replaces `struct Curl_easy *data`. C reaches the
-/// cache, the clock, the resolver implementation, the IPv6 answer, the
-/// entropy source, the `CURLOPT_RESOLVER_START_FUNCTION` callback and the
-/// trace sink through one god-struct pointer (`lib/urldata.h`), and reaches
-/// the resolve deadline through a process-global jump buffer. Specification
-/// 0.3.3 P12 replaces the first with explicit injection and specification
-/// 0.6.9 deletes the second, so what a resolution may touch is exactly what
-/// its caller handed it and nothing else.
-///
 /// The trace sink is **not** a member: it travels as its own argument,
 /// because [`Tracer`] borrows both a configuration and a sink and nesting
 /// those borrows inside another borrowed structure buys nothing and costs
 /// clarity.
-// No consumer yet; conn/ assembles the injected seams.
 #[allow(dead_code)]
 pub(crate) struct ResolveContext<'a> {
     /// The cache to consult and to populate.
-    ///
-    /// [`Option`] because C's `dnscache_get(data)` can return NULL - the
-    /// share has no cache and the multi handle has none either - and
-    /// `Curl_resolv` answers that with [`CURLcode::BadFunctionArgument`]
-    /// (`lib/hostip.c:882-885`). `dns/mod.rs` records that the caller which
-    /// selects between the two caches is the one that discovers the absence;
-    /// this is that discovery expressed in the type, so the code is
-    /// reachable and testable rather than notional.
     cache: Option<&'a mut DnsCache>,
 
     /// The injected clock. Every entry timestamp comes from here.
@@ -1234,21 +787,6 @@ pub(crate) struct ResolveContext<'a> {
     resolver: &'a dyn Resolver,
 
     /// The DNS-over-HTTPS resolver, when `CURLOPT_DOH_URL` selected one.
-    ///
-    /// Injected as a [`Resolver`] rather than reached for as
-    /// `crate::dns::doh`, and that is deliberate twice over. A
-    /// `dns -> protocols -> dns` import cycle is exactly what
-    /// specification 0.3.3 P12's injection avoids, and the cycle is real: a
-    /// DoH request is an HTTPS transfer whose own hostname must be resolved.
-    /// And DoH *is* a resolver - it answers the same question by another
-    /// route - so it needs no second abstraction.
-    ///
-    /// **Its presence is the request.** C tests `data->set.doh`, which is set
-    /// when the option carries a URL; here, handing over a DoH resolver is
-    /// what saying "use DoH" means. `dns/mod.rs` uses the same idiom for the
-    /// address shuffle - *"the shuffle is requested by passing an entropy
-    /// source, which is the same condition expressed as the presence of what
-    /// it needs"*.
     #[cfg(feature = "doh")]
     doh: Option<&'a dyn Resolver>,
 
@@ -1267,16 +805,6 @@ pub(crate) struct ResolveContext<'a> {
     max_age_ms: TimeDiff,
 
     /// `CURLOPT_RESOLVER_START_FUNCTION`, if the application set one.
-    ///
-    /// C's signature is
-    /// `int (*)(void *resolver_state, void *reserved, void *userdata)`, and
-    /// all three arguments disappear rather than being translated. The first
-    /// is the c-ares channel, obtained through `Curl_async_get_impl`, which
-    /// the non-c-ares build defines as `(*(y) = NULL, CURLE_OK)` - so it is
-    /// always NULL here and always was on such builds. The second is
-    /// documented reserved and is always NULL. The third is the user pointer,
-    /// which a Rust closure captures instead. What survives is the return
-    /// value, and only its zero-ness: non-zero aborts.
     resolver_start: Option<&'a mut dyn FnMut() -> i32>,
 
     /// The entropy source for `CURLOPT_DNS_SHUFFLE_ADDRESSES`.
@@ -1298,11 +826,6 @@ pub(crate) struct ResolveContext<'a> {
 
 /// Written by hand rather than derived, because two members are closures and
 /// `dyn FnMut` carries no [`fmt::Debug`].
-///
-/// The closures are reported as presence flags, which is the only thing about
-/// them a diagnostic can honestly say and also the only thing the resolution
-/// tree tests: a callback is installed or it is not. `crate::trace`'s own
-/// [`Tracer`] is written the same way and for the same reason.
 impl fmt::Debug for ResolveContext<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = formatter.debug_struct("ResolveContext");
@@ -1328,7 +851,6 @@ impl<'a> ResolveContext<'a> {
     /// default for any of them that would not amount to reaching for global
     /// state. The optional four - the DoH resolver, the start callback, the
     /// entropy source and the DoH flag - have builders below.
-    // No consumer yet; conn/ assembles the injected seams.
     #[allow(dead_code)]
     pub(crate) fn new(
         cache: &'a mut DnsCache,
@@ -1359,7 +881,6 @@ impl<'a> ResolveContext<'a> {
     /// [`CURLcode::BadFunctionArgument`] from `Curl_resolv`
     /// (`lib/hostip.c:882-885`), and a path that cannot be reached cannot be
     /// tested.
-    // No consumer yet; the cacheless path's only route.
     #[allow(dead_code)]
     pub(crate) fn without_cache(
         clock: &'a dyn Clock,
@@ -1385,7 +906,6 @@ impl<'a> ResolveContext<'a> {
 
     /// Selects DNS-over-HTTPS by handing over the resolver that performs it.
     #[cfg(feature = "doh")]
-    // No consumer yet; easy/ wires CURLOPT_DOH_URL to it.
     #[allow(dead_code)]
     pub(crate) fn with_doh(mut self, doh: &'a dyn Resolver) -> Self {
         self.doh = Some(doh);
@@ -1393,7 +913,6 @@ impl<'a> ResolveContext<'a> {
     }
 
     /// Installs `CURLOPT_RESOLVER_START_FUNCTION`.
-    // No consumer yet; easy/ wires the start callback to it.
     #[allow(dead_code)]
     pub(crate) fn with_resolver_start(
         mut self,
@@ -1404,7 +923,6 @@ impl<'a> ResolveContext<'a> {
     }
 
     /// Enables `CURLOPT_DNS_SHUFFLE_ADDRESSES` by supplying its entropy.
-    // No consumer yet; easy/ wires the shuffle entropy to it.
     #[allow(dead_code)]
     pub(crate) fn with_shuffle(
         mut self,
@@ -1415,7 +933,6 @@ impl<'a> ResolveContext<'a> {
     }
 
     /// Whether the last resolution used DoH - C's `conn->bits.doh`.
-    // No consumer yet; getinfo/ reports conn->bits.doh from it.
     #[allow(dead_code)]
     pub(crate) fn doh_used(&self) -> bool {
         self.doh_used
@@ -1423,19 +940,7 @@ impl<'a> ResolveContext<'a> {
 }
 
 /// Which of `Curl_resolv`'s two failure exits a failure took.
-///
-/// The distinction is measured, not stylistic, and getting it wrong changes
-/// what ends up in the cache. `Curl_resolv` has a `goto error` label that
-/// releases the entry, cancels any outstanding asynchronous work and - only
-/// when the code is `CURLE_COULDNT_RESOLVE_HOST` - stores a negative
-/// resolve (`lib/hostip.c:1004-1011`). But one failure does **not** go
-/// through it: a cache hit carrying no addresses `return`s straight out of
-/// the `out:` block at `:974-979`, so no negative resolve is stored for it.
-/// That is right - the negative entry it would store is the entry it just
-/// read - and it is the sort of thing a reimplementation flattens by
-/// accident.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-// No consumer yet; Read by resolve and resolve_tree.
 #[allow(dead_code)]
 enum Exit {
     /// C's `goto error`: the centralised path, which may store a negative
@@ -1447,7 +952,6 @@ enum Exit {
 
 impl Exit {
     /// The code this exit carries.
-    // No consumer yet; Read by resolve.
     #[allow(dead_code)]
     const fn code(self) -> CURLcode {
         match self {
@@ -1456,25 +960,9 @@ impl Exit {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The resolution decision tree
-// ---------------------------------------------------------------------------
 
 /// Resolves a name, consulting and populating the cache.
-///
-/// Supersedes `Curl_resolv` (`lib/hostip.c:860-1012`) and, with it, all six
-/// asynchronous entry points of `lib/asyn.h` - the module preamble records
-/// why they collapse into one call.
-///
-/// # C's documented return codes, and what became of them
-///
-/// `lib/hostip.c:854-858` lists four. `CURLE_OK` becomes [`Ok`] carrying the
-/// entry, so the out-parameter and its "set to non-NULL" clause disappear -
-/// a [`Result`] cannot be successful and empty.
-/// `CURLE_COULDNT_RESOLVE_HOST` and `CURLE_OPERATION_TIMEDOUT` are
-/// unchanged. `CURLE_AGAIN` **cannot be produced here**, for the structural
-/// reason the module preamble sets out: it is how a function that cannot
-/// block says "come back later", and an `async fn` suspends instead.
 ///
 /// # The twelve steps, in C's order
 ///
@@ -1493,7 +981,6 @@ impl Exit {
 /// [`CURLcode::OutOfMemory`] when the entry cannot be built,
 /// [`CURLcode::CouldntResolveHost`] for a refused or failed lookup, and
 /// whatever an injected resolver reported.
-// No consumer yet; conn/ resolves through it.
 #[allow(dead_code)]
 pub(crate) async fn resolve(
     request: &ResolveRequest<'_>,
@@ -1520,9 +1007,6 @@ pub(crate) async fn resolve(
             //
             //   if(result == CURLE_COULDNT_RESOLVE_HOST)
             //     store_negative_resolve(data, hostname, port);
-            //
-            // The `Exit::Direct` variant bypasses all of this, which is the
-            // measured difference recorded on that type.
             if matches!(exit, Exit::Error(_))
                 && code == CURLcode::CouldntResolveHost
             {
@@ -1546,7 +1030,6 @@ pub(crate) async fn resolve(
 /// Split out so that the `error:` label exists once, in the caller, rather
 /// than at each of the six places C reaches it with a `goto`.
 #[allow(clippy::too_many_lines)] // One C function, kept as one function.
-// No consumer yet; Read by resolve.
 #[allow(dead_code)]
 async fn resolve_tree(
     request: &ResolveRequest<'_>,
@@ -1576,10 +1059,6 @@ async fn resolve_tree(
     // *"We should intentionally error and not resolve .onion TLDs"*. It is
     // BEFORE the cache lookup, so an onion name is refused even if some
     // earlier path had cached it.
-    //
-    // C reaches `goto error` with `result` still at its initial
-    // CURLE_COULDNT_RESOLVE_HOST (`:868`), so the error path DOES store a
-    // negative resolve for an onion name. That is reproduced.
     if is_onion(hostname.as_bytes()) {
         failf!(tracer, "{}", NO_ONION);
         return Err(Exit::Error(CURLcode::CouldntResolveHost));
@@ -1767,10 +1246,6 @@ async fn resolve_tree(
 /// * **That code is not `CURLE_COULDNT_RESOLVE_HOST`, so no negative resolve
 ///   is stored** - which is precisely what C's comment insists on. The
 ///   condition lives in [`resolve`], so this happens by construction.
-///
-/// `show_resolve_info` runs BEFORE the entry is handed back, and it is
-/// `dns/mod.rs`'s to emit.
-// No consumer yet; Read by resolve_tree.
 #[allow(dead_code)]
 fn install(
     ctx: &mut ResolveContext<'_>,
@@ -1840,16 +1315,6 @@ fn install(
 /// return CURLE_OUT_OF_MEMORY;
 /// ```
 ///
-/// # Why a failure is worth caching
-///
-/// A negative entry holds no addresses, and `dns/mod.rs` records the
-/// consequence: `if(!dns->addr) age *= 2;` (`lib/hostip.c:267-268`), so it
-/// **ages twice as fast** as a successful one. That halving is what governs
-/// how soon a failed lookup is retried, and it is the reason this function
-/// and the cache have to agree - a test spanning both pins it.
-///
-/// The message is emitted AFTER the insertion, which is C's order.
-///
 /// # Errors
 ///
 /// [`CURLcode::FailedInit`] with no cache, which is C's own answer to its
@@ -1857,7 +1322,6 @@ fn install(
 /// [`CURLcode::BadFunctionArgument`] `Curl_resolv` gives for the same
 /// absence, and both are reproduced as measured.
 /// [`CURLcode::OutOfMemory`] if the entry cannot be built.
-// No consumer yet; resolve calls it on the error path.
 #[allow(dead_code)]
 pub(crate) fn store_negative_resolve(
     ctx: &mut ResolveContext<'_>,
@@ -1906,25 +1370,10 @@ pub(crate) fn store_negative_resolve(
 ///   `lib/hostip.h:38-39` sets aside for this exact purpose: *"when using
 ///   asynch methods, we allow this many seconds for a name resolve"*.
 ///
-/// That second point is a change, and it is recorded as one - but it is a
-/// hang removed rather than behaviour altered: no caller that received an
-/// answer within 300 seconds sees anything different, and a caller that did
-/// not now receives [`CURLcode::OperationTimedout`] instead of never
-/// returning. It is deliberately NOT a cap on a caller-supplied deadline;
-/// [`resolve_timeout`] honours those exactly.
-///
-/// C's remaining statement has no counterpart: on failure it calls
-/// `connclose(data->conn, "async resolve failed")` because *"we cannot
-/// return failure here without cleaning up this connection properly"*. That
-/// belongs to `crate::conn`, which owns the connection, and reaching into it
-/// from here would be the layer violation specification 0.4.2 exists to
-/// prevent.
-///
 /// # Errors
 ///
 /// Whatever [`resolve`] reports, plus [`CURLcode::OperationTimedout`] if the
 /// ceiling is reached.
-// No consumer yet; conn/ and dns/doh.rs resolve through it.
 #[allow(dead_code)]
 pub(crate) async fn resolve_blocking(
     request: &ResolveRequest<'_>,
@@ -1937,10 +1386,6 @@ pub(crate) async fn resolve_blocking(
 }
 
 /// Resolves a name under a deadline.
-///
-/// Supersedes `Curl_resolv_timeout` (`lib/hostip.c:1077-1233`). The module
-/// preamble carries the step-by-step table of what each of its eight stages
-/// became; this is the three lines that remain.
 ///
 /// # The three readings of `timeout_ms`, which are not two
 ///
@@ -1957,23 +1402,10 @@ pub(crate) async fn resolve_blocking(
 ///   counts in whole seconds; that refusal is **not reproduced**, and the
 ///   module preamble records it as Change 1.
 ///
-/// [`mstotv`] performs the conversion so that the millisecond mapping exists
-/// once in the crate, and the negative case is answered **before** it is
-/// called - the two readings of a negative value are opposite, and the
-/// preamble sets out why they must not be merged.
-///
-/// # What is not here
-///
-/// No jump buffer, no spinlock, no signal handler, no `alarm()`, no handler
-/// to restore and no foreign alarm to re-arm. `data->set.no_signal` is not
-/// read either: there is no signal for `CURLOPT_NOSIGNAL` to suppress, which
-/// the preamble records as Change 2.
-///
 /// # Errors
 ///
 /// [`CURLcode::OperationTimedout`] for an expired or elapsed deadline, and
 /// otherwise whatever [`resolve`] reports.
-// No consumer yet; conn/ applies --connect-timeout through it.
 #[allow(dead_code)]
 pub(crate) async fn resolve_timeout(
     request: &ResolveRequest<'_>,
@@ -2034,17 +1466,6 @@ pub(crate) async fn resolve_timeout(
 /// empty parentheses. [`resolver_error_message`] in `dns/mod.rs` is the
 /// shared formatter, so that conditional parenthesisation exists exactly
 /// once; the emission is here, with the failure paths.
-///
-/// C selects between `"host"` with `CURLE_COULDNT_RESOLVE_HOST` and
-/// `"proxy"` with `CURLE_COULDNT_RESOLVE_PROXY` by reading
-/// `conn->bits.proxy`, and reads the display name out of the connection too.
-/// Both arrive as arguments here: this module knows nothing about
-/// connections, and [`ResolveTarget`] pairs the literal with its code so that
-/// one cannot be reported with the other's.
-///
-/// The return value is a [`CURLcode`] rather than a [`CodeResult`] because C
-/// returns the code unconditionally - this function has no success case.
-// No consumer yet; conn/ reports a failed resolve with it.
 #[allow(dead_code)]
 pub(crate) fn resolver_error(
     target: ResolveTarget,
@@ -2057,23 +1478,6 @@ pub(crate) fn resolver_error(
 }
 
 // TESTS
-//
-// `tests/unit/*.c` (59 files) and `tests/libtest/*.c` (235) link a debug
-// static build of the C library and call internal `Curl_*` symbols, which a
-// Rust static library does not export. Specification 0.8.7 therefore
-// relocates their coverage into `#[cfg(test)]` modules inside the files under
-// test, and this is this file's share of that relocation.
-//
-// EVERY test here runs without a network. The resolver, the clock, the IPv6
-// probe, the entropy source and the trace sink are all injected, which is
-// what specification 0.3.3 P12's seams are for and what puts specification
-// 0.8.4's coverage gate within reach: no protocol test needs a live DNS
-// server. Deadlines are driven by tokio's paused timer rather than by
-// sleeping, so no test spends real time either.
-//
-// Three tests exercise `SystemResolver` and are excluded from the Miri gate
-// with their reason at the point of use; every other test is Miri-clean
-// because the seam above each syscall is injectable.
 
 #[cfg(test)]
 mod tests {
@@ -2255,12 +1659,6 @@ mod tests {
     }
 
     /// The measured quirk: ONE `>= 7` gate for a six-byte suffix.
-    ///
-    /// `".onion"` is six bytes, so the guard rejects it before either
-    /// comparison runs and the name is resolved like any other. Relaxing the
-    /// guard to `>= 6` would change which hostnames curl refuses, which
-    /// specification 0.8.1 places outside this migration's authority - so
-    /// this test exists to make that "fix" fail.
     #[test]
     fn a_bare_six_byte_onion_slips_through_the_guard() {
         assert_eq!(".onion".len(), 6);
@@ -2337,12 +1735,6 @@ mod tests {
     }
 
     /// The optional resolver is unavailable at every feature setting.
-    ///
-    /// Including `--all-features`, which turns `hickory-dns` on. The measured
-    /// reason is on [`alternative_resolver_available`]: no admissible crate
-    /// version exists. This test is what keeps `crate::version`'s
-    /// alternative-resolver banner slot honest once `ENGINE_DNS` flips to
-    /// present, because that slot is meant to conjoin this predicate.
     #[test]
     fn the_alternative_resolver_is_unavailable_at_every_feature_setting() {
         assert!(!alternative_resolver_available());
@@ -2982,12 +2374,6 @@ mod tests {
 
     /// A resolver error that is not a resolve failure is reported unchanged
     /// and remembers nothing.
-    ///
-    /// C's condition is `result == CURLE_COULDNT_RESOLVE_HOST` and nothing
-    /// else, so an aborted or out-of-memory lookup leaves the cache alone.
-    /// This is also the executable form of "an injected resolver's error
-    /// becomes a `CURLcode` rather than a panic": nothing in this module
-    /// unwraps, expects or panics on a value it was handed.
     #[tokio::test(start_paused = true)]
     async fn an_error_that_is_not_a_resolve_failure_stores_nothing() {
         for code in [
@@ -3067,12 +2453,6 @@ mod tests {
     }
 
     /// A failure to BUILD the entry is out of memory, and caches nothing.
-    ///
-    /// C's comment is explicit: *"this is OOM or similar, do not store such
-    /// negative resolves"* (`lib/hostip.c:987`). The reachable cause here is a
-    /// failing entropy source for `CURLOPT_DNS_SHUFFLE_ADDRESSES`, which is
-    /// what makes C's `!dns` arm reachable too - and it needs more than one
-    /// address, because the shuffle does not run for a single one.
     #[tokio::test(start_paused = true)]
     async fn a_failure_to_build_the_entry_is_out_of_memory_and_caches_nothing()
     {
@@ -3106,12 +2486,6 @@ mod tests {
     }
 
     /// Negative entries age at DOUBLE rate, which gates the retry.
-    ///
-    /// `lib/hostip.c:267-268`: `if(!dns->addr) age *= 2;`, commented
-    /// *"negative entries age twice as fast"*. With a one-second lifetime a
-    /// negative entry is therefore stale after 500 milliseconds, not 1,000.
-    /// This test spans `dns/mod.rs`'s ageing rule and this file's storing of
-    /// the entry, which is why the two files have to agree.
     #[tokio::test(start_paused = true)]
     async fn a_negative_entry_ages_twice_as_fast_and_gates_the_retry() {
         let resolver = MockResolver::empty();
@@ -3487,18 +2861,6 @@ mod tests {
 
     /// `CURLOPT_NOSIGNAL` cannot disable this deadline, because there is no
     /// signal to suppress.
-    ///
-    /// The executable proof of Change 2. In C, `data->set.no_signal` sets
-    /// `timeout = 0` at `lib/hostip.c:1105-1107` and the lookup then runs
-    /// unbounded, so the scenario below - a caller that wants no signals and
-    /// a lookup that never answers in time - returned the resolver's answer
-    /// there and returns [`CURLcode::OperationTimedout`] here.
-    ///
-    /// The assertion is structural as well as behavioural: neither
-    /// [`ResolveRequest`] nor [`ResolveContext`] carries a `no_signal`
-    /// member, so there is no input that could switch the deadline off. That
-    /// is the guarantee, and it is why the option is not read anywhere in
-    /// this file.
     #[tokio::test(start_paused = true)]
     async fn no_signal_does_not_disable_the_deadline() {
         let resolver = MockResolver::answering(vec![v4(1, 80)])
@@ -3574,12 +2936,6 @@ mod tests {
     }
 
     /// `resolve_blocking` replaces an unbounded join with curl's own ceiling.
-    ///
-    /// `asyn_thrdd_await` (`lib/asyn-thrdd.c:495-520`) waits with a plain
-    /// `Curl_thread_join` and no deadline whatsoever, so a system resolver
-    /// that never returned hung the transfer. The bound applied instead is
-    /// [`RESOLVE_TIMEOUT_CEILING_MS`], from the constant
-    /// `lib/hostip.h:38-39` sets aside for this exact purpose.
     #[tokio::test(start_paused = true)]
     async fn resolve_blocking_bounds_its_wait_by_the_curl_ceiling() {
         let resolver = MockResolver::answering(vec![v4(1, 80)])
@@ -3609,13 +2965,6 @@ mod tests {
     }
 
     /// Dropping the resolve future cancels the lookup and leaves nothing.
-    ///
-    /// The executable form of `Curl_async_shutdown` being subsumed
-    /// (`lib/asyn-base.c:181-196`): there is no shutdown call, and there does
-    /// not need to be. The lookup was entered, the future was dropped
-    /// mid-flight, and no entry - positive or negative - reached the cache,
-    /// because the code the deadline reports is not
-    /// `CURLE_COULDNT_RESOLVE_HOST`.
     #[tokio::test(start_paused = true)]
     async fn dropping_the_resolve_future_leaves_nothing_behind() {
         let resolver = MockResolver::answering(vec![v4(1, 80)])
@@ -3708,12 +3057,6 @@ mod tests {
     }
 
     /// A failing IPv6 probe propagates, and it does so before any lookup.
-    ///
-    /// C sets `multi->ipv6_works = FALSE` before testing the socket and
-    /// returns `CURLE_OUT_OF_MEMORY` without clearing that assignment
-    /// (`lib/hostip.c:752-766`), so the memoised answer becomes false and the
-    /// error still propagates. Runs under Miri: the probe is injected, so no
-    /// socket is created and no blocking task is spawned.
     #[tokio::test]
     async fn a_failing_ipv6_probe_propagates_from_the_system_resolver() {
         let resolver = SystemResolver::with_probe(Box::new(FixedIpv6Probe(
@@ -3786,14 +3129,6 @@ mod tests {
     // -- cross-cutting ------------------------------------------------------
 
     /// No message this module can emit carries the dropped resolver's name.
-    ///
-    /// `tests/runtests.pl:611-613` matches that token
-    /// **case-insensitively, anywhere in the banner**, and a match switches
-    /// the harness into a mode written for a resolver this build does not
-    /// contain - the over-reporting failure specification 0.6.5 calls fatal
-    /// where under-reporting is a mere skip. Nothing here writes banner text,
-    /// but the check is cheap and the consequence is not, so every string
-    /// this module can produce is examined.
     #[test]
     fn no_message_this_module_emits_carries_the_dropped_resolver_token() {
         // Assembled from its own letters so that this test does not itself
@@ -3827,12 +3162,6 @@ mod tests {
 
     /// The frozen text of every message this file emits, transcribed from the
     /// C.
-    ///
-    /// Specification 0.6.7 measures the comparison that enforces it:
-    /// `compareparts` joins both sides into one string, so casing, spacing and
-    /// punctuation are all significant. A formatter or an editor that
-    /// "improved" one of these would change program output, and this test is
-    /// what stops it.
     #[test]
     fn the_frozen_message_table_matches_the_c_text() {
         // `lib/hostip.c:1139`.

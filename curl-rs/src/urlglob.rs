@@ -4,87 +4,18 @@
 
 //! Brace and range globbing for URLs and output file names.
 //!
-//! Supersedes `src/tool_urlglob.c` (715 lines) and `src/tool_urlglob.h` (82
-//! lines): the `{a,b,c}` / `[1-100]` / `[a-z:2]` expansion that turns one
-//! command-line URL into many transfers, and the `#1` / `#2` back-reference
-//! substitution that lets an `-o` file name track the glob that produced it.
+//! Supersedes `src/tool_urlglob.c` and `src/tool_urlglob.h`: the `{a,b,c}` /
+//! `[1-100]` / `[a-z:2]` expansion that turns one command-line URL into many
+//! transfers, and the `#1` / `#2` back-reference substitution that lets an
+//! `-o` file name track the glob that produced it.
 //!
 //! # This is frozen surface
 //!
-//! The module parses user input and emits diagnostics, and AAP section 0.8.1
-//! freezes both: the acceptance rules and the diagnostic text are part of the
-//! command-line contract. Nothing here may be reworded, re-cased, re-punctuated
-//! or made "more sensible". Where a faithful translation and a tidier one
-//! disagree, faithfulness wins (AAP section 0.1.1: performance and elegance are
-//! non-goals), which is why the odometer stays lazy -- `[1-1000000]` must never
-//! materialise a million strings -- and why several C quirks below are
-//! reproduced deliberately rather than corrected.
-//!
-//! # The C original, function by function
-//!
-//! | C | `src/tool_urlglob.c` | Here |
-//! |---|---|---|
-//! | `globerror` | `:31-37` | [`GlobFailure`] |
-//! | `glob_fixed` | `:39-59` | the literal commit inside [`Parser::run`] |
-//! | `multiply` | `:66-88` | [`multiply`] |
-//! | `glob_set` | `:90-209` | [`Parser::glob_set`] |
-//! | `glob_range` | `:211-341` | [`Parser::glob_range`] |
-//! | `peek_ipv6` | `:343-384` | [`Parser::peek_ipv6`] |
-//! | `add_glob` | `:386-404` | [`Parser::add_glob`] |
-//! | `glob_parse` | `:406-484` | [`Parser::run`] |
-//! | `glob_inuse` | `:486-489` | absent -- see below |
-//! | `glob_url` | `:491-530` | [`UrlGlob::parse`] |
-//! | `glob_cleanup` | `:532-551` | absent -- `Drop` |
-//! | `glob_next_url` | `:553-634` | [`UrlGlob::next_url`] |
-//! | `glob_match_url` | `:636-715` | [`UrlGlob::match_url`] |
-//!
-//! The model is `src/tool_urlglob.h:28-59`: a `globtype` tag plus a three-arm
-//! `union`, which is exactly a Rust enum ([`PatternKind`]), so the C's three
-//! `default: DEBUGASSERT(0); return CURLE_FAILED_INIT;` arms (`:592-594`,
-//! `:622-624`, `:681-684`) are unreachable by construction and are deleted
-//! rather than translated into a panic. `globindex` (`:36-37`) is `-1` for a
-//! fixed literal and a 0-based counter for a real glob, which is
-//! [`UrlPattern::globindex`] as an [`Option`].
-//!
-//! # Two limits, and which one is real
-//!
-//! `GLOB_PATTERN_NUM 30` (`src/tool_urlglob.h:62`) is documented as "the total
-//! number of globs supported" and is **dead code**: `grep -rn GLOB_PATTERN_NUM
-//! src/` returns only its own definition. The enforced limit is `add_glob`'s
-//! `glob->pnum < 255` (`src/tool_urlglob.c:393`), so [`PATTERN_LIMIT`] is 255
-//! and not 30. Both lines are cited so that the next reader does not "correct"
-//! it back.
-//!
-//! # What is deliberately absent
-//!
-//! * The `_WIN32 || MSDOS` branch of `glob_match_url` (`:700-710`), which calls
-//!   `sanitize_file_name` and is the sole reason the C signature carries a
-//!   `SANITIZEcode *` out-parameter (`src/tool_urlglob.h:78`, set once at
-//!   `:643` and never touched again on the POSIX path). Windows and MS-DOS are
-//!   out of scope (AAP section 0.2.2) and all four mandated targets take the
-//!   `#else` at `:711-713`, so the parameter is dropped entirely. This is a
-//!   deliberate omission, not an oversight.
-//! * `glob_cleanup` (`:532-551`), which is `free()`. Ownership is in the types.
-//! * `glob_inuse` (`:486-489`), which is `return glob->palloc ? TRUE : FALSE;`
-//!   -- "has this glob been initialised?". It collapses into the *existence* of
-//!   the value: the caller holds `Option<UrlGlob>` (two of them, per the note
-//!   below) and asks `.is_some()`. No method is provided because no caller
-//!   needs one. The one C asymmetry this loses is that C's failed `glob_url`
-//!   still leaves `palloc == 2`, so `glob_inuse` reports true after a failure;
-//!   that is unobservable, because `src/tool_operate.c:1213-1214` and `:1238`
-//!   return the error immediately and reach `glob_cleanup` only later.
-//!
-//! # Who calls this, and what belongs to them
-//!
-//! Every consumer in the C tree is `src/tool_operate.c`, that is
-//! `curl-rs/src/operate/`. Two facts belong to that caller and not here:
-//!
-//! * There are **two independent glob states** per operation -- `urlglob` for
-//!   the URL (`:1238`) and `inglob` for `-T` / `--upload-file` (`:1213`) -- so
-//!   the surface below is a plain value the caller can hold twice.
-//! * Globbing is gated by `if(!config->globoff ...)` (`:1210`, `:1235`), the
-//!   `-g` / `--globoff` flag. Skipping the parse is the caller's decision;
-//!   nothing here reads a configuration.
+//! Nothing here may be reworded, re-cased, re-punctuated or made "more
+//! sensible". Where a faithful translation and a tidier one disagree,
+//! faithfulness wins, which is why the odometer stays lazy -- `[1-1000000]`
+//! must never materialise a million strings -- and why several C quirks below
+//! are reproduced deliberately rather than corrected.
 //!
 //! # The registry this module has to be handed, and the gap that remains
 //!
@@ -98,28 +29,9 @@
 //! URL crate, no regular expression.
 //!
 //! That parser takes its scheme table as a constructor argument by design:
-//! `curl-rs-lib/src/url/mod.rs` states there is "deliberately no global here to
-//! reach for instead: no `static mut`, no lazily-initialised singleton, no
-//! registration side effect. The registry is a constructor argument and `Url`
-//! holds the borrow." So [`UrlGlob::parse`] takes one too, which is also AAP
-//! section 0.3.3 pattern P12 (dependency injection) and is what lets this
-//! module be tested without a live engine.
-//!
-//! **Reported gap.** `curl-rs-lib` does not yet expose a registry *value*. Its
-//! own documentation records the intended wiring -- `protocols/mod.rs`, which
-//! supersedes `lib/url.c`'s 33-entry `all_schemes[]`, implements
-//! `url::SchemeRegistry` and exposes `pub fn scheme_registry() -> &'static dyn
-//! crate::url::SchemeRegistry`, re-exported from the crate root -- and
-//! `curl-rs-lib/src/protocols/mod.rs` currently declares only its `ftp` child.
-//! Until that re-export lands, `curl-rs/src/operate/` has nothing to pass here.
-//! The missing addition is exactly that one function and its `pub use`. Nothing
-//! was substituted for it: no other parser, no new dependency, no `unsafe`, and
-//! the feature is not dropped. Measured mitigation, so the scope of the gap is
-//! not overstated: every string this probe passes begins with `[`, so
-//! `is_absolute_url` finds no scheme (`url/mod.rs:1321-1357`), `parse_scheme`
-//! returns before its lookup (`:2389-2412`) and `guess_scheme` stores `http`
-//! without consulting the table (`:2454-2475`) -- the registry is never read on
-//! this path, whatever it contains.
+//! `curl-rs-lib/src/url/mod.rs` states there is "deliberately no global here
+//! to reach for instead: no `static mut`, no lazily-initialised singleton, no
+//! registration side effect.
 //!
 //! # Bytes, not text
 //!
@@ -178,7 +90,12 @@
 //!    (`:183`, `:430`, `:451`, `:608`, `:614`, `:620`).
 //! 4. **Allocation failure is absent.** The six `globerror(glob, NULL, ...)`
 //!    sites (`:49`, `:54`, `:143`, `:151`, `:158`, `:397`) report a failed
-//!    `malloc`; Rust aborts instead, so only the ceiling checks above survive.
+//!    `malloc` of a fixed-size glob node or a duplication of the pattern the
+//!    caller already passed in; neither is an externally sized allocation and
+//!    neither has a stable fallible spelling, so only the ceiling checks above
+//!    survive. The one caller-sized growth on this path is the output buffer,
+//!    which is a `curl_rs_lib::util::dynbuf::DynBuf` and DOES report
+//!    `CURLE_OUT_OF_MEMORY` when its `try_reserve_exact` is refused.
 //!    They print nothing, which is why [`GlobFailure::message`] is optional.
 
 use std::io::Write;
@@ -191,16 +108,6 @@ use curl_rs_lib::url::{SchemeRegistry, Url, UrlFlags, UrlPart};
 use crate::output::msgs::ERROR_PREFIX;
 
 /// The greatest number of patterns one URL may hold.
-///
-/// `add_glob` reallocates only `if(glob->pnum < 255)` and otherwise reports
-/// `too many {} sets` (`src/tool_urlglob.c:393`, `:400`). The check runs only
-/// when `pnum` reaches `palloc`, and `palloc` starts at 2 (`:506`) and doubles
-/// (`:392`), giving 2, 4, 8 ... 256; the first size at which both conditions
-/// hold is 256. So 255 patterns are accepted and the 256th is refused, which is
-/// what the comparison below reproduces.
-///
-/// **Patterns, not globs.** Each run of literal text between two expressions is
-/// a pattern too (`:454-461`), so `http://x/{a}{b}` holds three.
 const PATTERN_LIMIT: usize = 255;
 
 /// The greatest number of elements one `{...}` set may hold.
@@ -339,12 +246,6 @@ enum PatternKind {
 struct UrlPattern {
     /// `int globindex`, "the number of this particular glob or -1 if not used
     /// within {} or []" (`src/tool_urlglob.h:36-37`).
-    ///
-    /// [`None`] is the C's `-1`, that is a fixed literal. The counter is
-    /// separate from the pattern index because literals do not consume one
-    /// (`src/tool_urlglob.c:469`, `:477`), which is exactly why
-    /// [`UrlGlob::match_url`] resolves `#N` against this field rather than
-    /// against a position in the vector.
     globindex: Option<u32>,
 
     /// The expression itself.
@@ -354,22 +255,10 @@ struct UrlPattern {
 /// The one failure a bounded buffer can report: `CURLE_TOO_LARGE` from
 /// `dyn_nappend` when `len + idx + 1` would exceed the ceiling
 /// (`lib/curlx/dynbuf.c`).
-///
-/// Kept distinct from [`CURLcode`] because the two call sites map it
-/// differently, and the difference is C's: the parse and odometer paths spell
-/// `CURLE_OUT_OF_MEMORY` (`src/tool_urlglob.c:183`, `:430`, `:451`, `:608`,
-/// `:614`, `:620`) while `glob_match_url` propagates the buffer's own code
-/// (`:693-694`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DynTooLarge;
 
 /// `curlx_dyn_addn`: append `bytes`, or refuse because the ceiling is reached.
-///
-/// `dyn_nappend` computes `fit = len + idx + 1` -- the new bytes, the old bytes
-/// and a terminator -- and fails when `fit > s->toobig`, so the greatest length
-/// a buffer of ceiling `cap` can hold is `cap - 1`. Rust needs no terminator,
-/// but the arithmetic is reproduced because the ceiling is observable: it is
-/// what turns an over-long output file name into an error.
 ///
 /// # Errors
 ///
@@ -391,14 +280,6 @@ fn dyn_addn(
 
 /// `multiply` (`src/tool_urlglob.c:66-88`): accumulate the URL count, reporting
 /// overflow.
-///
-/// Returns `true` when the product cannot be represented, which is the C's
-/// `return 1`. The two C code paths -- `__builtin_mul_overflow` when the
-/// compiler has it, otherwise `sum / with != *amount` -- exist only because C
-/// has no portable checked multiply; [`i64::checked_mul`] is both.
-///
-/// The non-positive short-circuit at `:71-73` is reproduced exactly: a zero
-/// operand makes the count zero and is *not* an error.
 fn multiply(amount: &mut i64, with: i64) -> bool {
     // `DEBUGASSERT(*amount >= 0); DEBUGASSERT(with >= 0);` (`:69-70`). Debug
     // assertions, as in C: an overflowing range is user input and must produce
@@ -421,15 +302,6 @@ fn multiply(amount: &mut i64, with: i64) -> bool {
 
 impl PatternKind {
     /// Advance this pattern one place, reporting whether it wrapped.
-    ///
-    /// The three arms of `glob_next_url`'s counter
-    /// (`src/tool_urlglob.c:571-591`).
-    /// `true` is the C's `carry = TRUE`: the pattern went back to its minimum
-    /// and the pattern to its left must move.
-    ///
-    /// All three compare with `>` (or `==`, for a set) *after* adding the step,
-    /// so a step that would overshoot never produces the overshot value:
-    /// `[1-10:4]` yields 1, 5 and 9, never 13.
     fn advance(&mut self) -> bool {
         match self {
             // `if((pat->c.set.elem) && (++pat->c.set.idx == pat->c.set.size))`
@@ -493,11 +365,6 @@ impl PatternKind {
 
     /// Append this pattern's current value to `out`.
     ///
-    /// The single renderer behind both `glob_next_url` (`:602-626`) and
-    /// `glob_match_url` (`:666-686`), which spell the same three cases twice in
-    /// C. Sharing it is what keeps them from drifting, and the zero padding is
-    /// the reason it matters.
-    ///
     /// # Errors
     ///
     /// [`DynTooLarge`] when `out` would cross `cap`.
@@ -529,13 +396,6 @@ impl PatternKind {
 }
 
 /// A buffer that stops accepting bytes at its ceiling instead of growing.
-///
-/// `glob_url` formats its diagnostic into a `char text[512]` with
-/// `curl_msnprintf` (`src/tool_urlglob.c:511`, `:514-516`), which clips rather
-/// than failing. This reproduces that, and reproduces it *while* formatting
-/// rather than afterwards, because the caret run is `pos - 1` bytes wide and
-/// `pos` can be millions: C never materialises those spaces and neither does
-/// this.
 struct Clipped {
     /// What has been kept.
     text: Vec<u8>,
@@ -633,17 +493,6 @@ impl GlobFailure {
     }
 
     /// Write the diagnostic exactly as `glob_url` writes it (`:509-524`).
-    ///
-    /// `if(error && glob->error)`: a failure with no message prints nothing at
-    /// all, which is why this can be a no-op.
-    ///
-    /// The prefix is `curl: `, taken from the crate's single owner. It is not
-    /// derived from `CARGO_BIN_NAME`, `CARGO_PKG_NAME` or `argv[0]`: the Cargo
-    /// binary is named for this crate, and every self-reported string stays
-    /// `curl` (`src/tool_urlglob.c:523`, `src/tool_msgs.c:32`,
-    /// `src/tool_version.h:28`). Emitting the crate's own name with a colon
-    /// would break parity with the fixtures, so nobody should "fix" this into
-    /// doing so.
     fn emit(&self, sink: &mut dyn Write, url: &[u8]) {
         let Some(message) = self.message else {
             return;
@@ -673,13 +522,6 @@ impl GlobFailure {
 /// clipped to [`DIAG_TEXT_CAPACITY`]. Without one -- `pos == 0`, which the two
 /// set-overflow sites pass deliberately (`:127`, `:134`) -- the bare message,
 /// with no URL echo and no caret.
-///
-/// The caret run is C's `%*s` with width `pos - 1` and the argument `" "`.
-/// `formatf` subtracts the argument's length from the width and pads on the
-/// left (`lib/mprintf.c`), so the run is `max(pos - 1, 1)` spaces: the caret
-/// lands under column `pos` for every `pos >= 2`, and under column 2 when
-/// `pos == 1` because a width of 0 still emits the one-byte argument. The
-/// off-by-one at `pos == 1` is C's and is reproduced, not corrected.
 fn render_diagnostic(message: &str, pos: usize, url: &[u8]) -> Vec<u8> {
     if pos == 0 {
         return message.as_bytes().to_vec();
@@ -699,11 +541,6 @@ fn render_diagnostic(message: &str, pos: usize, url: &[u8]) -> Vec<u8> {
 
 /// A parsed URL pattern and the odometer standing on it: `struct URLGlob`
 /// (`src/tool_urlglob.h:64-72`).
-///
-/// Three of the C's six fields survive. `buf` was a scratch buffer shared by
-/// the parser and the odometer and is an implementation detail of each;
-/// `pnum` / `palloc` are [`Vec::len`]; `error` / `pos` moved to
-/// [`GlobFailure`], because a glob only exists once parsing has succeeded.
 ///
 /// # Examples
 ///
@@ -739,20 +576,6 @@ impl UrlGlob {
     /// `glob_url` (`src/tool_urlglob.c:491-530`): parse `url` and count the
     /// transfers it expands to.
     ///
-    /// On success the count is the C's `*urlnum`, which is 1 for a URL holding
-    /// no expression at all. On failure the diagnostic has already been written
-    /// to `error` -- exactly as C writes it to its `FILE *` -- and
-    /// [`GlobFailure::urlnum`] carries the count C would have stored.
-    ///
-    /// `error` is [`Option`] because the C parameter is nullable and is tested
-    /// for null at `:510`; both call sites pass the tool's error stream, or
-    /// `NULL` when `--silent` is in force without `--show-error`
-    /// (`src/tool_operate.c:1198`). A [`Write`] rather than a `FILE *` keeps
-    /// the emitted bytes assertable.
-    ///
-    /// `schemes` is the URL API's scheme table, needed only to resolve the
-    /// `[` ambiguity; see the module documentation.
-    ///
     /// # Errors
     ///
     /// [`GlobFailure`] for a malformed pattern, or for a literal, set element
@@ -784,15 +607,6 @@ impl UrlGlob {
 
     /// `glob_next_url` (`src/tool_urlglob.c:553-634`): the next URL, or
     /// [`None`] when the pattern is spent.
-    ///
-    /// [`None`] is the C's "success with a null output" (`:597-599`) and is not
-    /// a failure. It is distinct from `Some(Ok(vec![]))`, which is the C's
-    /// `strdup("")` at `:628-629` -- an empty *URL*, which is what a URL
-    /// holding no pattern at all expands to.
-    ///
-    /// The first call hands out the all-minimums combination without advancing
-    /// (`:561-562`); every later call advances first, right to left, with the
-    /// carry propagating leftward (`:566-596`).
     ///
     /// # Errors
     ///
@@ -830,14 +644,6 @@ impl UrlGlob {
     }
 
     /// Move the odometer one place, reporting whether a combination remains.
-    ///
-    /// `for(i = 0; carry && (i < glob->pnum); i++)` over
-    /// `glob->pattern[glob->pnum - 1 - i]` (`:566-596`): rightmost first, and a
-    /// carry that survives the leftmost pattern means the sequence is spent.
-    ///
-    /// A glob with no patterns -- which an empty URL produces -- never enters
-    /// the loop, so the carry survives and the single empty combination is all
-    /// there is. That is C's behaviour too.
     fn advance(&mut self) -> bool {
         let mut carry = true;
 
@@ -854,20 +660,10 @@ impl UrlGlob {
     /// `glob_match_url` (`src/tool_urlglob.c:636-715`): substitute `#N`
     /// back-references in an output file name.
     ///
-    /// `#` is a substitution only when a digit follows it (`:649`); any other
-    /// `#` is literal. The number is parsed with the pattern count as its
-    /// ceiling and must be non-zero (`:654`), then decremented to a 0-based
-    /// index (`:656`), then matched against [`UrlPattern::globindex`] rather
-    /// than used as a position (`:658-663`) -- which is what makes `#1` mean
-    /// "the first real glob" even when literal text occupies earlier slots.
-    ///
     /// A `#N` that resolves to nothing -- out of range, zero, or naming a slot
     /// no glob claims -- is echoed **verbatim**, source bytes and all
     /// (`:687-689`, whose comment reads "use the #\[num\] in the output").
     /// That is user-visible and must not become an error.
-    ///
-    /// The `SANITIZEcode` out-parameter of the C signature is absent; see the
-    /// module documentation.
     ///
     /// # Errors
     ///
@@ -1040,12 +836,6 @@ fn pass_blanks(input: &[u8], cursor: &mut usize) {
 }
 
 /// Why the literal scanner stopped.
-///
-/// C expresses this with the byte the cursor stands on after its inner
-/// `while(*pattern && *pattern != '{')` loop (`src/tool_urlglob.c:418-453`),
-/// which can only be a NUL, a `{`, or the `[` that broke out at `:434`. Naming
-/// the three makes the outer loop's `match` exhaustive, so no arm has to guess
-/// at a case that cannot arise.
 enum LiteralStop {
     /// The URL ended.
     End,
@@ -1128,11 +918,6 @@ impl<'input> Parser<'input> {
 
     /// `glob_parse` (`src/tool_urlglob.c:406-484`): the driver.
     ///
-    /// Literal text is accumulated until an expression opens, committed as a
-    /// single-element set, and then the expression is parsed on the next turn
-    /// of the loop -- the shape of C's outer `while`, where the literal commit
-    /// and the expression are handled in different iterations.
-    ///
     /// # Errors
     ///
     /// Whatever the step that failed reported.
@@ -1193,15 +978,6 @@ impl<'input> Parser<'input> {
 
     /// The literal scanner: C's inner `while(*pattern && *pattern != '{')`
     /// (`src/tool_urlglob.c:418-453`).
-    ///
-    /// # The escape rule here is narrow, and deliberately unlike the one inside
-    /// a set
-    ///
-    /// A backslash escapes only `{`, `[`, `}` and `]` (`:441-443`, whose
-    /// comment reads "only allow \ to escape known 'special letters'"); before
-    /// anything else it is an ordinary byte and is copied. Inside a set the
-    /// rule is broad -- a backslash escapes whatever follows it (`:175`).
-    /// Unifying the two would silently change which inputs are accepted.
     ///
     /// # Errors
     ///
@@ -1293,17 +1069,6 @@ impl<'input> Parser<'input> {
     /// `peek_ipv6` (`src/tool_urlglob.c:343-384`): is the bracketed text an
     /// IPv6 literal?
     ///
-    /// Returns the number of bytes to copy through when it is -- the C's
-    /// `*skip`, which counts both brackets -- and [`None`] when it is not. The
-    /// C's reasoning, verbatim at `:348-350`: "Valid globs contain a hyphen and
-    /// <= 1 colon. IPv6 literals contain no hyphens and >= 2 colons."
-    ///
-    /// The decision is the engine's, taken by parsing the bracketed text with
-    /// [`UrlFlags::GUESS_SCHEME`] so that it works without a `https://` prefix
-    /// (`:374-375`). Any refusal other than an allocation failure means "not an
-    /// IPv6 literal" rather than a failure (`:377-382`), and that asymmetry is
-    /// preserved.
-    ///
     /// # Errors
     ///
     /// [`GlobFailure::out_of_memory`] only, mirroring `if(rc ==
@@ -1342,18 +1107,6 @@ impl<'input> Parser<'input> {
 
     /// `glob_set` (`src/tool_urlglob.c:90-209`): a `{a,b,c}` set, entered just
     /// after the opening brace.
-    ///
-    /// C's own summary is at `:94-96`: "processes a set expression with the
-    /// point behind the opening '{'. ','-separated elements are collected until
-    /// the next closing '}'".
-    ///
-    /// # The closing brace is a comma too
-    ///
-    /// `case '}'` sets `done` and then *falls through* into `case ','`
-    /// (`:130-131`), so the final element is appended by exactly the code that
-    /// appends a comma-separated one. A translation that handled the brace
-    /// separately would drop the last element, which is why the two share one
-    /// arm below rather than being spelled twice.
     ///
     /// # Errors
     ///
@@ -1484,20 +1237,6 @@ impl<'input> Parser<'input> {
 
     /// `glob_range` (`src/tool_urlglob.c:211-341`): a `[...]` range, entered
     /// just after the opening bracket.
-    ///
-    /// The accepted forms are C's own list at `:215-219`: a character range
-    /// such as `a-z]` or `B-Q]`, a numeric range such as `0-9]` or `17-2000]`,
-    /// and a numeric range with leading zeroes such as `001-999]`. Either may
-    /// carry a `:step`.
-    ///
-    /// # ASCII, and only ASCII
-    ///
-    /// The arm is chosen by `ISALPHA` then `ISDIGIT` (`:228`, `:279`), which
-    /// are locale-independent ASCII macros admitting `A-Z`, `a-z` and `0-9`
-    /// and nothing else (`lib/curl_ctype.h:38-44`).
-    /// [`u8::is_ascii_alphabetic`] and [`u8::is_ascii_digit`] are those macros;
-    /// `char::is_alphabetic` would accept letters curl refuses and would be a
-    /// real change to the accepted input set.
     ///
     /// # Errors
     ///
@@ -1731,12 +1470,6 @@ impl<'input> Parser<'input> {
 /// signed reading is reproduced here because the oracle this implementation is
 /// measured against is curl 8.19.0-DEV built for x86_64 Linux, which refuses
 /// `[z-\x80]` through the `min_c > max_c` conjunct.
-///
-/// Only `max_c` is affected: `min_c` reaches the comparison solely through
-/// `ISALPHA`, which admits no byte at or above 0x80. The other two conjuncts
-/// agree with C either way, because a negative span makes C's
-/// `step > (unsigned)(max_c - min_c)` false while its `min_c > max_c` has
-/// already refused the range.
 fn as_signed_char(byte: u8) -> i32 {
     if byte >= 0x80 {
         i32::from(byte) - 256
@@ -1752,15 +1485,6 @@ mod tests {
     use super::*;
 
     /// A test double for the scheme table [`UrlGlob::parse`] is handed.
-    ///
-    /// Deliberately tiny rather than a copy of the engine's 33-entry table,
-    /// which would be a second source of truth. It can be tiny because the
-    /// probe never reads it: every string it parses begins with `[`, so the
-    /// engine finds no scheme to look up and guesses one without consulting a
-    /// registry. The two entries exist only so the double is honest about the
-    /// contract it implements, and they are the shape
-    /// `curl-rs-lib/src/url/mod.rs` documents for an out-of-crate
-    /// implementation.
     struct Schemes;
 
     impl SchemeRegistry for Schemes {
@@ -2013,11 +1737,6 @@ mod tests {
     fn a_signed_char_reading_refuses_a_high_maximum() {
         // `[z-\x80]` has a span of 6 read unsigned and a reversed order read
         // signed, so the two readings disagree; see `as_signed_char`.
-        //
-        // Measured against the oracle rather than reasoned about: curl on
-        // x86_64 Linux answers `bad range in URL position 6` for this input,
-        // which is the signed reading, and both the text and the column are
-        // asserted here.
         assert_eq!(
             refusal(b"[z-\x80]"),
             Some((ERR_BAD_RANGE, 6, CURLcode::UrlMalformat))
@@ -2098,10 +1817,6 @@ mod tests {
         // is neither a character range nor a numeric one and reaches the
         // `bad range specification` arm. `char::is_alphabetic` would accept it
         // and widen the input set.
-        //
-        // The letter is written as its two UTF-8 bytes rather than as itself
-        // because `scripts/spacecheck.pl` refuses a byte at or above 0x80 in
-        // any tracked file. These are U+00E9, LATIN SMALL LETTER E WITH ACUTE.
         assert_eq!(
             refusal(b"[\xc3\xa9-z]").map(|(message, _, _)| message),
             Some(ERR_BAD_RANGE_SPEC)

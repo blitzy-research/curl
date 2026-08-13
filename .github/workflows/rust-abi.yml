@@ -560,19 +560,85 @@ jobs:
       - name: 'leg B: compile the example corpus against the generated headers'
         run: |
           set -eu
-          # The build step above rewrote include/curl/. Prove that it did, because
-          # a differential against an unchanged tree compares a file with itself
-          # and reports success no matter how broken the generator is.
-          if [ -z "$(git status --porcelain include/ 2>/dev/null)" ]; then
-            echo 'FAIL: include/ is unchanged after building curl-rs-ffi, so the'
-            echo 'headers were not generated and leg B would compare the committed'
-            echo 'headers against themselves. AAP 0.4.1 makes include/curl/*.h an'
-            echo 'output of curl-rs-ffi/build.rs; if nothing was written, the'
-            echo 'generator did not run.'
+          # WHICH REGIME THIS LEG IS IN, read from the build script rather than
+          # guessed from the working tree.
+          #
+          # This check used to be one-sided: it required include/ to have changed
+          # after building curl-rs-ffi, on the reasoning that a differential
+          # against an unchanged tree compares a file with itself. That reasoning
+          # is right, and the requirement was nonetheless DETERMINISTICALLY
+          # UNSATISFIABLE - curl-rs-ffi/build.rs deliberately writes no header
+          # while any of the 100 exports in lib/libcurl.def is undefined, because
+          # a header rendered from a partial crate is short by exactly what is
+          # missing and a header declaring an export nothing provides is an
+          # undefined reference in every program that calls it. So the gate
+          # demanded the one thing the build guarantees will not happen, and was
+          # red for a reason unrelated to anything it was measuring.
+          #
+          # The fix is not to drop the requirement but to condition it on the
+          # regime, and to assert something strict in BOTH. The authority is the
+          # inventory the build script publishes - a `cargo:warning` cannot serve
+          # here, because nothing can branch on one.
+          #
+          #   headers-generated=1  require include/ to have CHANGED, exactly as
+          #                        before, and require 100 of 100 exports.
+          #   headers-generated=0  require include/ to be UNTOUCHED. That is the
+          #                        real invariant in this regime and it is worth
+          #                        asserting: the frozen curl 8.19.0-DEV headers
+          #                        remain the ABI contract, and a build script
+          #                        that quietly truncated them would be a serious
+          #                        defect that nothing else here would catch.
+          #
+          # Leg B then compares the corpus against those same committed headers,
+          # which makes it a repeat of leg B's baseline rather than a differential
+          # - and that is reported as such rather than presented as a comparison
+          # it is not. The moment generation resumes, the differential becomes
+          # real with no edit here.
+          inventory="$(find target/release/build -maxdepth 3 -type f \
+            -path '*curl-rs-ffi-*/out/abi-inventory.txt' 2>/dev/null | head -1)"
+          if [ -z "${inventory}" ]; then
+            echo 'FAIL: curl-rs-ffi published no ABI export inventory, so this leg cannot tell'
+            echo 'whether the headers were generated or deliberately withheld. build.rs must write'
+            echo 'OUT_DIR/abi-inventory.txt on every build.'
             exit 1
           fi
-          echo 'headers regenerated:'
-          git status --porcelain include/ | sed 's/^/  /'
+          echo '::group::ABI export inventory'
+          grep -v '^missing-export=' "${inventory}"
+          echo '::endgroup::'
+          generated="$(sed -n 's/^headers-generated=//p' "${inventory}")"
+          required="$(sed -n 's/^required=//p' "${inventory}")"
+          defined="$(sed -n 's/^defined=//p' "${inventory}")"
+          changed="$(git status --porcelain include/ 2>/dev/null || true)"
+
+          if [ "${generated}" = '1' ]; then
+            if [ "${defined}" != "${required}" ]; then
+              echo "FAIL: the inventory claims headers were generated while only ${defined} of"
+              echo "${required} exports are defined. Those two cannot both be true."
+              exit 1
+            fi
+            if [ -z "${changed}" ]; then
+              echo 'FAIL: include/ is unchanged after building curl-rs-ffi, yet the inventory says the'
+              echo 'headers were generated. AAP 0.4.1 makes include/curl/*.h an output of'
+              echo 'curl-rs-ffi/build.rs; if nothing was written, the generator did not run and leg B'
+              echo 'would compare the committed headers against themselves.'
+              exit 1
+            fi
+            echo 'headers regenerated:'
+            printf '%s\n' "${changed}" | sed 's/^/  /'
+          else
+            if [ -n "${changed}" ]; then
+              echo 'FAIL: include/ CHANGED even though the inventory says generation was withheld at'
+              echo "${defined} of ${required} exports. While the surface is incomplete the frozen curl"
+              echo '8.19.0-DEV headers are the ABI contract and must not be touched, so something wrote'
+              echo 'to them anyway. Find it; a truncated public header is worse than no new one.'
+              printf '%s\n' "${changed}" | sed 's/^/  /'
+              exit 1
+            fi
+            echo "generation withheld at ${defined} of ${required} exports, and include/ is untouched"
+            echo 'as required. Leg B therefore recompiles the corpus against the SAME committed headers'
+            echo 'as the baseline, so the differential below is expected to be empty in both'
+            echo 'directions. It becomes a real comparison the moment generation resumes.'
+          fi
           echo "generated curl.h: $(wc -l < include/curl/curl.h | tr -d ' ') lines, baseline $(wc -l < "${RUNNER_TEMP}/baseline/include/curl/curl.h" | tr -d ' ')"
           echo ''
           : > "${RUNNER_TEMP}/generated-failures.txt"
@@ -702,6 +768,92 @@ jobs:
             exit 1
           fi
           echo 'typecheck-gcc.h is live against both header sets'
+
+      - name: 'assert: the strict-export gate agrees with leg A'
+        run: |
+          set -eu
+          # WHY THIS STEP EXISTS. curl-rs-ffi/build.rs announces an incomplete
+          # export surface with two `cargo:warning=` advisories. A cargo
+          # diagnostic does not change an exit status, and `-D warnings` reaches
+          # rustc lints only, so on its own that announcement cannot fail any
+          # gate - a build carrying it exits 0. The build script therefore also
+          # accepts CURL_RS_REQUIRE_COMPLETE_EXPORTS, which converts the same
+          # condition into a hard error that names every missing symbol. This
+          # step is what keeps that mechanism honest: an enforcement path that
+          # nothing exercises is indistinguishable from one that is broken.
+          #
+          # WHAT IS ACTUALLY ASSERTED. Not "the strict build fails" - that would
+          # bake today's incompleteness into the gate and turn green into red on
+          # the day the surface completes. The assertion is AGREEMENT between two
+          # mechanisms that measure the same property by different means:
+          #
+          #   leg A            reads the built libcurl.so with nm and diffs the
+          #                    export set against lib/libcurl.def
+          #   the strict gate  counts, inside the build script, the symbols it
+          #                    can render against the same authority
+          #
+          # They must reach the same verdict. If leg A found missing symbols the
+          # strict build must refuse; if leg A found none it must succeed. A
+          # disagreement means one of the two is measuring the wrong thing, and
+          # that is a defect in the gate rather than in the export surface - the
+          # failure mode a reader of a green ABI report would never suspect.
+          #
+          # The env flip alone is enough to re-run the script: the variable is
+          # registered in the build script's TRACKED_ENV, so it emits a matching
+          # `cargo:rerun-if-env-changed`. Verified from a warm tree with nothing
+          # touched - unset exits 0, set exits 101, unset again exits 0.
+          missing="${RUNNER_TEMP}/abi-missing.txt"
+          if [ ! -f "${missing}" ]; then
+            echo "FAIL: ${missing} is absent, so leg A's measurement cannot be"
+            echo 'compared against anything. This step must run after leg A.'
+            exit 1
+          fi
+          nmiss="$(wc -l < "${missing}" | tr -d ' ')"
+          echo "leg A measured ${nmiss} missing symbol(s)"
+
+          log="${RUNNER_TEMP}/strict-abi.log"
+          status=0
+          CURL_RS_REQUIRE_COMPLETE_EXPORTS='1' \
+            cargo build --locked --release -p curl-rs-ffi < /dev/null \
+            > "${log}" 2>&1 || status=$?
+          echo "the strict-export build exited ${status}"
+          echo '::group::strict-export build output'
+          cat "${log}"
+          echo '::endgroup::'
+
+          if [ "${nmiss}" -ne 0 ]; then
+            # Leg A says the surface is incomplete, so the strict gate must
+            # refuse, and it must refuse FOR THAT REASON. A refusal carrying
+            # some other message would mean this step is passing on an
+            # unrelated failure.
+            if [ "${status}" -eq 0 ]; then
+              echo 'FAIL: leg A found missing exports, yet the strict-export build'
+              echo 'succeeded. The enforcement path in curl-rs-ffi/build.rs is not'
+              echo 'firing, which means the missing-export advisory is unenforceable'
+              echo 'and an incomplete ABI can pass every gate in this repository.'
+              exit 1
+            fi
+            if ! grep -q -F 'CURL_RS_REQUIRE_COMPLETE_EXPORTS is set and the export surface is incomplete' "${log}"; then
+              echo 'FAIL: the strict-export build failed for a reason OTHER than the'
+              echo 'incomplete export surface. Whatever that reason is, it is masking'
+              echo 'the check this step exists to make.'
+              exit 1
+            fi
+            echo 'the strict-export gate refuses the incomplete surface leg A measured:'
+            echo 'the two mechanisms agree, and the missing-export advisory is enforceable'
+            exit 0
+          fi
+
+          # Leg A says the surface is complete. Then the strict build must
+          # succeed - and if it does not, the strict gate has become a
+          # permanent, unsatisfiable block rather than a gate.
+          if [ "${status}" -ne 0 ]; then
+            echo 'FAIL: leg A found a complete export set, yet the strict-export build'
+            echo 'still refused. The strict gate is now blocking a surface that'
+            echo 'satisfies the authority, so its own condition is wrong.'
+            exit 1
+          fi
+          echo 'export surface complete and the strict-export gate accepts it: the two mechanisms agree'
 
       - name: 'restore the committed public headers'
         if: always()

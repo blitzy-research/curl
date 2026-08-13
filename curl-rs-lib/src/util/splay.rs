@@ -22,26 +22,10 @@
 //
 //***************************************************************************
 
-// THE LICENCE BANNER ABOVE -- 23 lines, byte-identical to `util/mod.rs:1-23`
+// THE LICENCE BANNER ABOVE, byte-identical to `util/mod.rs`'s
 // and measured from `lib/llist.c:1-23`.
-//
-// One spelling constraint, measured and explained at `util/mod.rs:33-42`:
-// `reuse` reads any line bearing the licence-identifier tag in its
-// colon-suffixed form as a licence expression to parse, so a second, prose
-// mention becomes a parse error rather than prose. The tag therefore appears
-// exactly once in this file, on line 21, and every reference to it below
-// names it without that punctuation.
 
 // CONVENTIONS THIS FILE HOLDS ITSELF TO, and where each one comes from.
-//
-// `dead_code` is allowed PER ITEM and never for the file or for the module.
-// Every item below carries its own `#[allow(dead_code)]`, to be removed when
-// its consumer lands. The consumer is known and is exactly one:
-// `crate::multi`, superseding `lib/multi.c`, which is the only file in the C
-// tree that names `Curl_splay` at all. A module- or crate-scoped allowance
-// would instead silence the NEXT unreferenced item somebody adds; the rule
-// and the executable gate that enforces it across the workspace live in
-// `curl-rs-lib/src/lib.rs` (`mod source_policy`).
 //
 // FOUR THINGS THIS FILE MUST NOT NAME, each for its own reason:
 //
@@ -51,39 +35,16 @@
 //     `Curl_splay`'s rotation loop rewires four pointer fields through a
 //     stack-allocated sentinel node, and `Curl_splayremove` splays a subtree
 //     recursively. Neither has a safe hand-written expression.
-//   * a raw pointer, in any spelling -- the C node embeds four of them plus
-//     an untyped payload. Specification 0.6.9 replaces exactly that shape
-//     with an owned collection, and specification 0.3.3's P2 singles out the
-//     untyped context pointer as the largest category of unsound pattern in
-//     the C tree.
+//   * a raw pointer, in any spelling -- the C node embeds four of them plus an
+//     untyped payload.
 //   * `tokio` -- this is a data structure. The reactor that waits until the
 //     earliest instant arrives belongs to `crate::conn` and
 //     `crate::transfer`; this file only answers which entry is earliest.
 //   * a Cargo feature -- the timer tree is unconditional. The vocabulary is
 //     fixed at fifteen names and none of them gates expiry scheduling, so
 //     no `#[cfg(feature = ...)]` appears below and none may be added.
-//
-// LAYERING. `util` is the base of this crate's module graph, so this file
-// imports from `super::timeval` and from the standard library, and from
-// nothing else. It may not name `crate::multi` even though `crate::multi` is
-// its only consumer: the dependency runs one way, and the forward contract
-// is recorded in prose at each item instead.
 
-//! The expiry timer tree -- supersedes `lib/splay.c` (291 lines) and
-//! `lib/splay.h` (59).
-//!
-//! # The answer this file exists to give
-//!
-//! **[`TimerTree`] is what replaced the splay tree, and a [`BTreeMap`] keyed
-//! by [`TimerKey`] is what it holds.** There is no splay tree here, no
-//! rotation, and no node type with links in it.
-//!
-//! The structure answers one question, repeatedly, for the multi handle:
-//! *which transfer's timer is due next, and give me every timer at or before
-//! this instant.* Its only consumer in the C tree is `lib/multi.c` --
-//! `grep -rln 'Curl_splay' lib/` returns exactly `splay.c`, `splay.h` and
-//! `multi.c` -- so the six call-site patterns measured there define the whole
-//! required surface and nothing beyond it is provided.
+//! The expiry timer tree -- supersedes `lib/splay.c` and `lib/splay.h`.
 //!
 //! # The whole C surface, item by item
 //!
@@ -117,161 +78,6 @@
 //!   [`TimerTree::insert`] and comes back out of [`TimerTree::get_best`], so
 //!   there is no window in which an entry exists without one.
 //!
-//! # Why a B-tree, and why that is not a performance decision
-//!
-//! Performance is an explicit non-goal of this work (specification 0.1.1),
-//! and this substitution is not justified on speed. **It is a safety
-//! decision**, and the two functions that force it are worth naming
-//! precisely:
-//!
-//! * `Curl_splay` (`splay.c:41-93`) declares `struct Curl_tree N` on the
-//!   stack, aliases `l` and `r` to it, and then rewires `smaller` and
-//!   `larger` across four cases before assembling the result out of `N`'s own
-//!   fields (`:87-90`). The sentinel is never a tree member and never
-//!   escapes, which is precisely the sort of invariant a reader has to hold
-//!   in their head rather than one a compiler holds for them.
-//! * `Curl_splayremove` (`splay.c:264-273`) calls `Curl_splay` on a subtree
-//!   and then reattaches the old root's `larger` child to the result.
-//!
-//! A hand-written self-adjusting tree in Rust needs either the keyword this
-//! crate denies or an arena with index bookkeeping -- more code than
-//! `lib/splay.c` was, and a new class of defect of its own -- and it buys
-//! nothing observable. Only three properties of the C structure are visible
-//! from outside it: the ordering, the tie-breaking within an instant, and the
-//! exact cut-off [`TimerTree::get_best`] applies. Those three are reproduced
-//! below and asserted by test; the internal shape is free.
-//!
-//! What changes and what does not, stated plainly: the amortized cost of a
-//! lookup moves from a splay tree's to a balanced B-tree's, and the *order in
-//! which timers fire* does not move at all.
-//!
-//! # The four constructs that vanish
-//!
-//! `lib/splay.h:31-38` is an **intrusive** node -- it lives inside the easy
-//! handle it belongs to (`multi.c:3574` passes `&data->state.timenode`), so
-//! insertion and removal never allocate and the tree never owns anything:
-//!
-//! ```c
-//! /* only use function calls to access this struct */
-//! struct Curl_tree {
-//!   struct Curl_tree *smaller; /* smaller node */
-//!   struct Curl_tree *larger;  /* larger node */
-//!   struct Curl_tree *samen;   /* points to the next node with identical key */
-//!   struct Curl_tree *samep;   /* points to the prev node with identical key */
-//!   struct curltime key;       /* this node's "sort" key */
-//!   void *ptr;                 /* data the splay code does not care about */
-//! };
-//! ```
-//!
-//! That header comment -- *only use function calls to access this struct* --
-//! is a warning that the invariants are not local, enforced by naming and by
-//! nothing else. In Rust the module system enforces it: [`TimerTree`]'s
-//! fields are private, and the only way to reach an entry is through the four
-//! ported methods.
-//!
-//! Four constructs disappear outright. Their values are recorded here so that
-//! a search against `lib/splay.c` still lands.
-//!
-//! 1. **The rotations.** `smaller` and `larger` were the splay tree itself.
-//!    A [`BTreeMap`] holds its keys in order without any link this code owns,
-//!    so there is nothing to rotate and no case analysis to get wrong.
-//! 2. **The `samen` and `samep` circular list.** Nodes sharing a key were
-//!    spliced into a doubly-linked circular list threaded through the
-//!    payloads. Specification 0.6.9 is explicit that intrusive lists become
-//!    owned collections, and here the list is not replaced by a collection at
-//!    all: the arrival order enters the *key*, so entries at one instant are
-//!    simply adjacent in the map. See the section on ordering below, because
-//!    the C's splice direction is observable and had to be measured.
-//! 3. **The `SPLAY_SUBNODE` sentinel** `{ ~0, -1 }` (`splay.c:95-97`), where
-//!    `~0` in `time_t` is -1 and the microsecond field is -1 as well. It is a
-//!    key value no real reading can hold, written INTO the sort key to mark a
-//!    node as a member of a same-key list (`splay.c:118`) and read back out
-//!    to detect that membership (`splay.c:219`). An owned collection needs no
-//!    in-band marker, and storing one inside a sort key is exactly the C-ism
-//!    specification 0.6.9 replaces.
-//!
-//!    There is a second, sharper reason it cannot be carried over, and it is
-//!    worth recording because it explains why the C could get away with it.
-//!    The sentinel works only because the C compares two keys by *subtracting
-//!    microseconds*: a negative microsecond field makes that difference
-//!    disagree in sign with a field-by-field comparison, which is what lets
-//!    `{ -1, -1 }` sort as smaller than everything while still being
-//!    recognisable. [`CurlTime`] upholds `0 <= usec < 1_000_000` in every
-//!    constructor, so the disagreement is not representable and the trick has
-//!    no expression here even if one were wanted.
-//! 4. **The untyped payload `void *ptr`.** The value is now owned by the
-//!    collection and typed by a parameter, so no call site casts and no cast
-//!    can be wrong. A raw pointer would additionally have needed the keyword
-//!    this crate denies, which specification 0.8.2 prohibits outside the FFI
-//!    island.
-//!
-//! # The ordering, and the tie-break that is observable
-//!
-//! **Two timers registered for the same instant fire in insertion order.**
-//! That is not a convenience; it is frozen behaviour. Specification 0.8.1
-//! freezes `--trace` output, timer firing order reaches that output, and
-//! specification 0.6.7 establishes that the fixture corpus compares emitted
-//! bytes literally rather than semantically. A tie broken the other way is a
-//! wire difference.
-//!
-//! The C guarantees it through the shape of its circular list, measured
-//! rather than assumed:
-//!
-//! * `Curl_splayinsert` splices a new same-key node in at **`t->samep`**,
-//!   which is the TAIL of the list (`splay.c:118-124`), and returns the old
-//!   root unchanged -- *the root node always stays the same*.
-//! * `Curl_splaygetbest` checks the list **first** (`splay.c:173-188`), takes
-//!   `t` -- the HEAD, the oldest -- as the removed node, and promotes
-//!   `t->samen` to root in its place.
-//!
-//! Tail append plus head-first removal is first-in, first-out. Here the same
-//! order comes out of the key itself: [`TimerKey`] is the instant followed by
-//! a monotonically increasing arrival sequence, its [`Ord`] compares the
-//! instant first and the sequence only to break a tie, and a [`BTreeMap`]
-//! iterates in key order. No list, and no way to get the direction wrong.
-//!
-//! # Removal is by identity, not by key
-//!
-//! `Curl_splayremove` takes a node pointer rather than a key, and the C says
-//! why at `splay.c:244-246`: *"We cannot just compare the keys here as a
-//! double remove in quick succession of a node with key != SPLAY_SUBNODE &&
-//! same != NULL could return the same key but a different node."* Two live
-//! entries can share an instant, so an instant is not an identity.
-//!
-//! [`TimerKey`] is unique per registration, because the arrival sequence
-//! never repeats, so it **is** a node identity -- which is why
-//! [`TimerTree::insert`] returns one. The multi handle stores it where the C
-//! stored `data->state.timenode` and hands it back to
-//! [`TimerTree::remove`].
-//!
-//! # The four `Curl_splayremove` return codes
-//!
-//! All four are reachable in the C, and `lib/multi.c` logs any non-zero one
-//! (`:3576-3577`, `:3640-3641`). Each is accounted for here:
-//!
-//! | Code | C meaning | Site | Disposition |
-//! |---|---|---|---|
-//! | 0 | removed | `:234`, `:277` | `Some(payload)` |
-//! | 1 | the tree was empty | `:214-215` | `None` -- not present |
-//! | 2 | the node is not in this tree | `:248-249` | unreachable |
-//! | 3 | a corrupt subnode marker | `:223-225` | unreachable |
-//!
-//! Codes 2 and 3 are **structurally** unreachable rather than merely unlikely,
-//! and no variant is invented to model them. Code 2 exists because the C
-//! verifies, after splaying, that the node it surfaced is the one it was asked
-//! to remove; a map keyed by identity either holds that key or does not.
-//! Code 3 exists because the sentinel of construct 3 above can be present on
-//! a node whose `samen` points at itself, a state the C calls impossible in
-//! its own comment -- *"A non-subnode should never be set to SPLAY_SUBNODE"*
-//! -- and there is no sentinel here to be inconsistent with. Code 1 is not a
-//! distinct outcome either: an empty collection simply does not hold the key.
-//!
-//! One improvement falls out of the same reasoning. The C protects itself
-//! against a double remove by pointing a removed subnode's `samen` at itself
-//! (`splay.c:230-231`, *"Ensures that double-remove gets caught"*). Here the
-//! second removal of a key finds nothing, which is the same answer without
-//! the bookkeeping.
-//!
 //! # The comparison is at microsecond resolution
 //!
 //! `splay.c:28-35` defines the whole of the C's ordering:
@@ -290,40 +96,15 @@
 //! its result agrees in sign with [`timediff_us`] across a table of pairs
 //! that spans a second boundary.
 //!
-//! [`timediff_us`]: super::timeval::timediff_us
-//!
-//! One honest divergence in that equivalence: [`timediff_us`] saturates at
-//! `TIMEDIFF_T_MAX` while a comparison cannot, so the two agree in sign for
-//! every pair of readings inside roughly 292,000 years of one another and the
-//! difference merely stops growing beyond that. The C has the same ceiling,
-//! from the same arithmetic, and no timer is scheduled anywhere near it.
-//!
-//! # What is deliberately absent
-//!
-//! No iteration, no range query, no bulk clear, and no guarantee about the
-//! order in which a dropped tree disposes of its entries. The minimal-change
-//! mandate of specification 0.8.2 applies, and none of the six measured call
-//! sites in `lib/multi.c` needs any of them. [`TimerTree::len`] and
-//! [`TimerTree::is_empty`] are the one exception and are marked as additions
-//! at their own definitions rather than passed off as ports.
-//!
 //! # Relocated test coverage
 //!
-//! `tests/unit/unit1309.c` (135 lines) is this module's test-relocation
-//! source: the C marks both `Curl_splayinsert` (`splay.c:102`) and
-//! `Curl_splayremove` (`splay.c:206`) `@unittest: 1309`. That file links a
-//! debug static libcurl and calls internal `Curl_*` symbols, which a Rust
-//! static library genuinely does not export, so its coverage relocates into
-//! the `#[cfg(test)]` module below rather than being made to link -- a
-//! documented deviation (specification 0.8.7), not a defect to work around.
-//!
-//! # Platform and toolchain
-//!
-//! Edition 2021, minimum supported Rust version 1.75. The two collection
-//! methods this file leans on, [`BTreeMap::first_key_value`] and
-//! [`BTreeMap::pop_first`], have both been stable since 1.66 and are
-//! therefore inside that floor; nothing newer is used, and nothing here is
-//! platform-dependent.
+//! `tests/unit/unit1309.c` is this module's test-relocation source: the C
+//! marks both `Curl_splayinsert` (`splay.c:102`) and `Curl_splayremove`
+//! (`splay.c:206`) `@unittest: 1309`. That file links a debug static libcurl
+//! and calls internal `Curl_*` symbols, which a Rust static library genuinely
+//! does not export, so its coverage relocates into the `#[cfg(test)]` module
+//! below rather than being made to link -- a documented deviation, not a
+//! defect to work around.
 
 use std::collections::BTreeMap;
 
@@ -332,28 +113,7 @@ use super::timeval::CurlTime;
 /// The identity of one registered timer: the instant it is due, then the
 /// order in which it arrived.
 ///
-/// This is the successor of a `struct Curl_tree *` used as a handle, which is
-/// how `lib/multi.c` treats `&data->state.timenode` (`:3574`, `:3584`,
-/// `:3638`). It is returned by [`TimerTree::insert`] and accepted by
-/// [`TimerTree::remove`], and it is what the multi handle stores where the C
-/// stored the embedded node.
-///
-/// # Why an identity rather than a key
-///
-/// `Curl_splayremove` removes a *node*, not a key, and the C explains the
-/// distinction at `splay.c:244-246`: two live entries can share an instant, so
-/// an instant on its own cannot name one of them. Appending the arrival
-/// sequence makes the pair unique per registration, and uniqueness is what
-/// turns a key into a handle.
-///
 /// # Ordering
-///
-/// [`Ord`] is DERIVED, and the field declaration order is what makes it
-/// correct: [`at`] is compared first and [`seq`] only breaks a tie. The result
-/// is exactly the order of the tuple `(CurlTime, u64)`, which is what the
-/// governing plan specifies, and a test asserts that equivalence rather than
-/// trusting the reading. Deriving is preferred to hand-writing precisely so
-/// that adding a field cannot silently change the comparison.
 ///
 /// Both halves are load-bearing:
 ///
@@ -362,20 +122,6 @@ use super::timeval::CurlTime;
 /// * [`seq`] second reproduces the C's same-key list, whose tail-append and
 ///   head-first removal make firing order first-in, first-out. The module
 ///   documentation records the measurement.
-///
-/// # The fields are readable
-///
-/// [`at`] is `pub(crate)` because the multi handle reads it: `multi.c:3356`
-/// copies `multi->timetree->key` into the caller's expiry time and `:3364`
-/// takes a difference against it to compute a timeout in milliseconds.
-/// [`seq`] is `pub(crate)` for symmetry and so that a diagnostic can print a
-/// whole handle, but ONLY [`TimerTree::insert`] assigns it; a value composed
-/// by hand is not a handle to anything, and [`TimerTree::remove`] answers
-/// "not present" for it, which is the same answer the C's double-remove guard
-/// produces.
-///
-/// [`at`]: TimerKey::at
-/// [`seq`]: TimerKey::seq
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) struct TimerKey {
@@ -393,15 +139,6 @@ pub(crate) struct TimerKey {
 /// `Curl_splayget`. In `lib/multi.c` it is the easy handle
 /// (`multi.c:3583`); here the collection owns whatever it is given, so a
 /// payload cannot outlive its entry and an entry cannot exist without one.
-///
-/// # Representation
-///
-/// A [`BTreeMap`] from [`TimerKey`] to `T`, plus the counter that hands out
-/// the arrival half of the next key. The map supplies the ordering and the
-/// counter supplies the tie-break; between them they reproduce every
-/// externally visible property of the C structure. The module documentation
-/// records why a splay tree is not reimplemented and why that is a safety
-/// decision rather than a performance one.
 ///
 /// # Example
 ///
@@ -422,12 +159,6 @@ pub(crate) struct TimerTree<T> {
     /// The registered timers, held in [`TimerKey`] order.
     entries: BTreeMap<TimerKey, T>,
     /// The arrival number the next registration receives.
-    ///
-    /// Monotonically increasing for the lifetime of the collection and NEVER
-    /// reset, including when the collection empties: resetting it could let a
-    /// stale handle name a live entry, and the whole value of a handle is that
-    /// it cannot. A test asserts that draining the collection does not rewind
-    /// it.
     next_seq: u64,
 }
 
@@ -476,23 +207,6 @@ impl<T> TimerTree<T> {
     ///   first-out**, and it is reproduced by the increasing arrival number
     ///   below rather than by a list. The module documentation records why
     ///   that order is observable.
-    ///
-    /// The returned [`TimerKey`] is the caller's to keep. `lib/multi.c` keeps
-    /// the equivalent in `data->state.timenode` and passes it back to
-    /// [`Self::remove`] when an expiry is updated (`:3574`) or cleared
-    /// (`:3638`).
-    ///
-    /// # Arrival-number exhaustion
-    ///
-    /// The counter is [`u64`], so exhausting it takes 2^64 registrations and
-    /// is unreachable: at one registration per nanosecond it would take over
-    /// five hundred years. The increment is written as
-    /// [`u64::wrapping_add`] so that the arithmetic is identical in every
-    /// build profile -- a plain `+= 1` panics on overflow in a debug build and
-    /// wraps in a release build, and a silent difference between the two is
-    /// worse than either. A debug assertion below states the invariant that
-    /// wrapping would break, so the impossible case is checked rather than
-    /// merely asserted in prose.
     #[allow(dead_code)]
     pub(crate) fn insert(&mut self, at: CurlTime, payload: T) -> TimerKey {
         let key = TimerKey {
@@ -546,15 +260,6 @@ impl<T> TimerTree<T> {
     ///    already the first entry in the map and step 4 needs no code of its
     ///    own.
     /// 5. **Otherwise the root itself is removed** (`:190-194`).
-    ///
-    /// # The tree is untouched when nothing is due
-    ///
-    /// The C returns the tree with `*removed = NULL` (`:169-170`); its shape
-    /// has been changed by the splay, but no node has left it, and shape is
-    /// not observable. Here nothing is touched at all. That non-mutation is
-    /// asserted by a test, because taking the earliest entry out before
-    /// comparing it is an easy transposition to make and a silent one to
-    /// live with.
     #[allow(dead_code)]
     pub(crate) fn get_best(&mut self, key: CurlTime) -> Option<(TimerKey, T)> {
         // Steps 1 and 2: the earliest instant in the collection, or nothing
@@ -575,34 +280,9 @@ impl<T> TimerTree<T> {
     /// Removes the timer named by `key`, returning its payload, or [`None`] if
     /// the collection does not hold it.
     ///
-    /// Supersedes `Curl_splayremove` (`splay.c:208-278`), which is
-    /// `@unittest: 1309`. The C returns an `int` with four values and
-    /// `lib/multi.c` logs any non-zero one as an internal error (`:3576`,
-    /// `:3640`); the module documentation tabulates all four and records that
-    /// codes 2 and 3 are structurally unreachable once a key is an identity.
-    /// The two outcomes that remain are *removed* and *not present*, which is
-    /// what [`Option`] expresses.
-    ///
     /// Returning the payload is more than the C offered -- `Curl_splayremove`
     /// only unlinked, because the caller already held the node -- and it costs
     /// nothing, since the collection has to give up ownership either way.
-    ///
-    /// # A double remove is not an error
-    ///
-    /// The C protects itself against one by pointing a removed subnode's
-    /// `samen` at itself (`splay.c:230-231`, *"Ensures that double-remove gets
-    /// caught"*), and reports code 3 if it ever sees the resulting state.
-    /// Here the second removal simply finds nothing and answers [`None`]. Both
-    /// are asserted by test.
-    ///
-    /// # Same-key siblings are unaffected
-    ///
-    /// The C had a fast path for this (`splay.c:219-235`): unlinking a member
-    /// of a same-key list is a constant-time splice that leaves the list's
-    /// order intact. Removing one entry from the middle of an instant here
-    /// leaves the arrival numbers of the others untouched, so their relative
-    /// firing order is preserved -- which a test asserts, because it is the
-    /// same frozen order [`Self::get_best`] depends on.
     #[allow(dead_code)]
     pub(crate) fn remove(&mut self, key: TimerKey) -> Option<T> {
         self.entries.remove(&key)
@@ -620,15 +300,6 @@ impl<T> TimerTree<T> {
     /// multi->timetree = Curl_splay(&tv_zero, multi->timetree);
     /// *expire_time = multi->timetree ? multi->timetree->key : tv_zero;
     /// ```
-    ///
-    /// -- after which the same block reads the surfaced key again to compute a
-    /// timeout in milliseconds (`:3364`) and reads the payload for trace
-    /// output (`:3365`, `:3372`). Both halves are handed back together for
-    /// that reason: a caller that needed the instant would otherwise have to
-    /// take the entry out and put it back.
-    ///
-    /// Purely a read. Calling it twice yields the same entry, and a subsequent
-    /// [`Self::get_best`] still finds it; a test asserts both.
     #[allow(dead_code)]
     pub(crate) fn peek(&self) -> Option<(&TimerKey, &T)> {
         self.entries.first_key_value()
@@ -659,30 +330,14 @@ impl<T> TimerTree<T> {
 
 // TESTS
 //
-// `tests/unit/unit1309.c` (135 lines) is this module's test-relocation source:
-// the C marks `Curl_splayinsert` (`splay.c:102`) and `Curl_splayremove`
-// (`splay.c:206`) `@unittest: 1309` and that file exercises both, plus
-// `Curl_splaygetbest`, `Curl_splayset` and `Curl_splayget`. It links a debug
-// static libcurl and calls internal `Curl_*` symbols, which a Rust static
-// library does not export, so its coverage relocates here rather than being
-// made to link -- a documented deviation, not a defect to work around.
-//
-// Both of its phases are ported below with their measured constants intact:
-// fifty instants at `(541 * i) % 1023` microseconds removed in `(i + 7) % 50`
-// order, and a rebuild with `i % 3 + 1` entries per instant drained in steps
-// of 100 microseconds up to 1100.
-//
 // Four things the C test could not check are added, each because the
 // migration makes them checkable:
 //
-//   1. THE DRAIN ORDER ITSELF. The C prints `payload / 10` and `payload % 10`
-//      for every extracted node (`unit1309.c:124-126`) and asserts nothing
-//      whatsoever about either. Its only assertions are that the root is null
-//      after each phase (`:101`, `:131`). Yet the order those two numbers
-//      come out in is the one property of this structure that reaches
-//      `--trace` output, which specification 0.8.1 freezes. Six tests below
-//      assert it, including the interleaved case that no amount of printing
-//      would have caught.
+// 1. THE DRAIN ORDER ITSELF. The C prints `payload / 10` and `payload % 10`
+//    for every extracted node (`unit1309.c:124-126`) and asserts nothing
+//    whatsoever about either. Its only assertions are that the root is null
+//    after each phase (`:101`, `:131`). Six tests below assert it, including
+//    the interleaved case that no amount of printing would have caught.
 //   2. THE CUT-OFF DIRECTION. `Curl_splaygetbest`'s comparison is `<` and not
 //      `<=`, so an entry due at exactly the query instant is extracted. The C
 //      test steps its query in hundreds of microseconds past keys that are
@@ -706,12 +361,6 @@ mod tests {
 
     /// The C's key for node `i`: `key.tv_usec = (541 * i) % 1023`
     /// (`unit1309.c:78`, and identically at `:108`).
-    ///
-    /// The remainder is below 1023 and therefore inside [`i32`], so the
-    /// conversion cannot fail. It is written with [`i32::try_from`] rather
-    /// than a cast because this crate admits no narrowing cast, and the
-    /// failure arm panics rather than substituting a value, so a broken
-    /// assumption fails the test instead of silently weakening it.
     fn unit1309_usec(i: usize) -> i32 {
         i32::try_from((541 * i) % 1023).expect("the remainder is below 1023")
     }
@@ -888,13 +537,6 @@ mod tests {
     }
 
     /// The interleaved case, and the reason this module has the shape it has.
-    ///
-    /// Registering at instant 1, instant 0, instant 1, instant 0 must drain as
-    /// the two instant-0 entries in arrival order followed by the two
-    /// instant-1 entries in arrival order. An implementation that ordered by
-    /// arrival alone would yield `a, b, c, d`; one that ordered by instant but
-    /// broke ties in reverse would yield `d, b, c, a`. Both are wire
-    /// differences, because timer firing order reaches `--trace`.
     #[test]
     fn interleaved_instants_drain_by_instant_then_by_arrival() {
         let t0 = CurlTime::new(0, 0);
@@ -914,12 +556,6 @@ mod tests {
     }
 
     /// A microsecond is the resolution, not a millisecond.
-    ///
-    /// The two entries are registered LATER first, so the arrival number alone
-    /// would put the later instant out in front. Extracting the earlier one
-    /// first is therefore only possible if the 1-microsecond difference is
-    /// part of the order -- which is exactly what a millisecond-resolution
-    /// comparison would have discarded.
     #[test]
     fn instants_one_microsecond_apart_are_distinct_and_ordered() {
         let mut timers: TimerTree<&str> = TimerTree::new();
@@ -1168,12 +804,6 @@ mod tests {
     /// `i % 3 + 1` entries at each instant, payload `tv_usec * 10 + j`,
     /// drained by repeated extraction at 0, 100, ... 1100 microseconds until
     /// the tree is empty.
-    ///
-    /// The C prints each extracted payload as `payload / 10` and
-    /// `payload % 10` and asserts nothing about either. Both are asserted
-    /// here: no entry ahead of the query is ever extracted, and the whole
-    /// drain is ascending by instant and then by arrival -- which for these
-    /// payloads is ascending overall.
     #[test]
     fn unit1309_same_instant_siblings_drain_oldest_first() {
         let mut timers: TimerTree<i32> = TimerTree::new();

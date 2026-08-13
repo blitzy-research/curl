@@ -38,8 +38,16 @@ Starting in curl 8.19.0, the maximum size can be specified using a fraction as
 in `2.5M` for two and a half megabytes. It only works with a period (`.`)
 delimiter, independent of what your locale might prefer.
 
-Transfers for `MQTT` and `MQTTS` are not implemented in this build, so
-neither scheme appears in the `Protocols:` line of the --version output and
-a request for either one fails with `CURLE_UNSUPPORTED_PROTOCOL` even though
-the option and its byte value are still parsed. The size limit remains fully
-effective for `FTP`, `FTPS`, `HTTP` and `HTTPS`.
+Transfers for `MQTT` and `MQTTS` are outside the specified scope of this
+rewrite, so the `Protocols:` line of the --version output withholds both
+schemes and a request for either one is specified to fail with
+`CURLE_UNSUPPORTED_PROTOCOL` even though the option and its byte value are
+still accepted and parsed. The size limit is specified to apply to `FTP`,
+`FTPS`, `HTTP` and `HTTPS`.
+
+All of the above states specified behavior, and this build does not reach it
+yet. The executable honours no command-line option, and no FTP or HTTP transfer
+engine exists for a ceiling to act on. Three pieces are in place separately --
+the option's row in the parser, the configuration field that records the byte
+value, and the engine primitive that enforces the limit -- and what is missing
+is the layer that connects them.

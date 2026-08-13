@@ -21,7 +21,7 @@
 // SPDX-License-Identifier: curl
 //
 //**************************************************************************/
-// THE LICENCE BANNER ABOVE -- 23 lines, byte-identical to the banner that
+// THE LICENCE BANNER ABOVE, byte-identical to the banner that
 // heads `lib/sendf.c:1-23` with the C block comment converted to line
 // comments, and byte-identical to the banners of `transfer/progress.rs` and
 // `transfer/ratelimit.rs` beside it. The licence tag appears exactly once, on
@@ -31,57 +31,21 @@
 // comment.
 //
 // `dead_code` IS NOT ALLOWED for this file as a whole, and no attribute below
-// grants it at module scope. Items whose consumers have yet to land carry
-// their own `#[allow(dead_code)]`, so the suppressions read as an inventory:
-// each one is load-bearing, deleting any one restores a warning, and an item
-// added later with no consumer is still reported. That is enforced rather
-// than agreed -- `mod source_policy` in `curl-rs-lib/src/lib.rs` walks the
-// workspace at test time and fails on a `dead_code` level set on any crate
-// root or module root.
-//
-// The allowances here are expected to be short-lived, and their pattern is
-// structural: this module is the COMPOSITION MECHANISM for the reader and
-// writer chains, so most of its consumers are the stages themselves --
-// `transfer/writeout.rs`, `transfer/content_encoding.rs`,
-// `transfer/chunked.rs`, `transfer/request.rs`, `protocols/ftp/mod.rs` and
-// `protocols/ws.rs` -- together with the transfer loop that drives a chain.
-// None of them exists yet. Each allowance is deleted when its consumer
-// lands.
-//
-// No level for the `unsafe_code` lint is set here, at any level, and the
-// keyword itself does not appear in any expression in this file. `src/lib.rs`
-// carries `#![deny(unsafe_code)]` and grants exactly ONE exemption, on
-// `mod ffi`. That matters more here than in most of the crate: the C
-// original is built out of two raw context pointers that every stage casts to
-// its own type, out of intrusive `next` pointers, and out of an allocation
-// size carried in a vtable, and reproducing the same composition with typed
-// owned values is this module's entire reason to exist.
-//
-// No `libc`, no raw pointer, no `extern` function, no `#[repr(C)]` and no
-// `Any` downcast appears below either. Nor is any host clock read: the one
-// instant this module needs arrives through the injected `Clock` of
-// `crate::util::timeval`, which is what lets every rate-limit and
-// start-transfer assertion in the test module below be pinned.
+// grants it at module scope. Each unreferenced item carries its own
+// `#[allow(dead_code)]`, so the suppressions read as an inventory: every one is
+// load-bearing, deleting any one restores a warning, and an item added later
+// with no consumer is still reported. That is enforced rather than agreed --
+// `mod source_policy` in `curl-rs-lib/src/lib.rs` walks the workspace at test
+// time and fails on a `dead_code` level set on any crate root or module root.
 
-//! The client reader and writer chains -- supersedes `lib/sendf.c` (1,475
-//! lines) and `lib/sendf.h` (423).
+//! The client reader and writer chains -- supersedes `lib/sendf.c` and
+//! `lib/sendf.h`.
 //!
 //! Measured against `lib/sendf.h:42-421` and `lib/sendf.c:47-1475`, with
 //! buffer policy from `lib/bufq.c` and `lib/curlx/dynbuf.c`, contract context
 //! from `lib/cw-out.c`, `lib/cw-pause.c`, `lib/progress.c` and
 //! `lib/request.h:56-134`, and the callback vocabulary from
 //! `include/curl/curl.h:258-456`.
-//!
-//! libcurl sits between an application and a server. Response bytes travel
-//! from the server, through this module's WRITER chain, to the callbacks the
-//! application registered; request bytes travel from the application, through
-//! this module's READER chain, to the server. Everything in the crate that
-//! handles response data ultimately forwards it through
-//! [`ClientIo::client_write`], and everything that needs request data
-//! ultimately pulls it through [`ClientIo::client_read`]. That is why this
-//! file is the shared substrate for `transfer/writeout.rs`,
-//! `transfer/chunked.rs`, `transfer/content_encoding.rs`,
-//! `transfer/request.rs` and the transfer loop.
 //!
 //! # What the C expresses, and how
 //!
@@ -111,23 +75,6 @@
 //!   `if(!writer) return CURLE_WRITE_ERROR` (`lib/sendf.c:132-133`) becomes
 //!   an empty tail returning exactly the same code.
 //!
-//! # Ordering is behaviour, not a detail
-//!
-//! Both chains are ordered by PHASE, and a stage is inserted FIRST WITHIN ITS
-//! PHASE (`lib/sendf.c:464-469` and `:1156-1161`). Two consequences the C
-//! header spells out (`lib/sendf.h:90-92`) and this module preserves exactly:
-//!
-//! * the order in which stages of the SAME phase are added is observable, and
-//!   reverses their execution order;
-//! * stages of DIFFERENT phases may be added in any order.
-//!
-//! The phase boundary between [`ClientWriterPhase::Protocol`] and
-//! [`ClientWriterPhase::ContentDecode`] is itself behavioural: a response's
-//! `Content-Length` describes the COMPRESSED body, so the length check has to
-//! run before any decoder. Moving [`DownloadWriter`] behind a decoder would
-//! compare the decoded length and produce a different error on the same
-//! input.
-//!
 //! # Layering: how the include cycle was removed
 //!
 //! `lib/sendf.c` includes `transfer.h`, `cfilters.h`, `connect.h`,
@@ -150,30 +97,9 @@
 //!   arrive as [`TraceSink`], a five-method seam rather than an import of
 //!   `crate::trace`.
 //!
-//! Imports therefore reach only [`crate::error`],
-//! [`crate::transfer::progress`], [`crate::transfer::ratelimit`],
-//! [`crate::util::bufq`], [`crate::util::dynbuf`] and
-//! [`crate::util::timeval`]. Every one of those is strictly below this module
-//! in the graph, so the graph stays acyclic.
-//!
 //! # Buffers
 //!
-//! Specification 0.6.9 requires the manual pointer, length and capacity
-//! arithmetic of `lib/sendf.c`, `lib/bufq.c` and `lib/curlx/dynbuf.c` to
-//! become owned Rust buffers, and that is what happens: the line-ending
-//! converter buffers through [`crate::util::bufq::BufQ`] exactly as
-//! `cr_lc_init` does (`lib/sendf.c:969`), and the resume scratch area is a
-//! [`bytes::BytesMut`] of exactly the C's `char scratch[4 * 1024]`
-//! (`lib/sendf.c:782`). No size policy is invented here: the ceilings live in
-//! [`crate::util::dynbuf`], where `DYN_HTTP_REQUEST` (one mebibyte) serves the
-//! request builders and `DYN_PAUSE_BUFFER` (64 mebibytes) serves the pause
-//! buffering that `transfer/writeout.rs` owns. The test module asserts both
-//! values so that a drift in either is caught here as well as there.
-//!
-//! Payloads are bytes throughout. Nothing below converts a payload to `str`,
-//! lossily or otherwise: specification 0.6.7 measures 1,476 of the 1,914
-//! fixtures by comparing emitted bytes as one string, so a normalisation
-//! anywhere on either chain is a wire-parity failure.
+//! Payloads are bytes throughout.
 
 use core::fmt;
 use std::io::{Read, Seek, SeekFrom};
@@ -185,16 +111,9 @@ use crate::transfer::progress::{Progress, TimerId};
 use crate::util::bufq::{BufQ, BufqOpts};
 use crate::util::timeval::{Clock, CurlTime};
 
-// =========================================================================
 // Saturating width conversion -- `curlx_sotouz_range`
-// =========================================================================
 
 /// Clamps a `curl_off_t` into a `size_t` range without wrapping.
-///
-/// Supersedes `curlx_sotouz_range` (`lib/curlx/warnless.c:286-295`) for the
-/// three call sites inside `lib/sendf.c` that use it: the writable-body
-/// calculation at `:163`, the read-length clamp at `:664` and the resume
-/// offset at `:1361`.
 ///
 /// Transcribed rather than imported. `crate::util` publishes the same
 /// conversion, but this module's dependency whitelist is exactly the six
@@ -222,18 +141,9 @@ fn so_to_usize_range(sonum: i64, uzmin: usize, uzmax: usize) -> usize {
     widened.max(uzmin).min(uzmax)
 }
 
-// =========================================================================
 // The client-write flag vocabulary -- `lib/sendf.h:42-50`
-// =========================================================================
 
 /// What a client write CONTAINS, as a set of bits.
-///
-/// Supersedes the nine `CLIENTWRITE_*` macros of `lib/sendf.h:42-50`. The
-/// numeric shape is preserved bit for bit because it is what
-/// [`crate::headers`] classifies an incoming header by, and because the
-/// chains route on it; the type exists so that the mutual exclusivity the C
-/// asserts at run time in a debug build becomes something a reader can see in
-/// one place.
 ///
 /// # The three classes, and the qualifiers
 ///
@@ -246,18 +156,6 @@ fn so_to_usize_range(sonum: i64, uzmin: usize, uzmax: usize) -> usize {
 /// > - HEADER can have additional bits set (more than one)
 /// > - BODY, INFO and HEADER should not be mixed, as this would lead to
 /// >   confusion on how to interpret/format/convert the data.
-///
-/// So [`Self::BODY`], [`Self::INFO`] and [`Self::HEADER`] are three mutually
-/// exclusive CLASSES and at least one is always present;
-/// [`Self::STATUS`], [`Self::CONNECT`], [`Self::ONE_XX`] and
-/// [`Self::TRAILER`] QUALIFY [`Self::HEADER`] alone; and [`Self::EOS`] and
-/// [`Self::ZERO_LEN`] are orthogonal to both groups.
-///
-/// # None of these bits crosses the public ABI
-///
-/// `CLIENTWRITE` appears zero times anywhere under `include/`. An application
-/// sees only the callback it registered, never a type bit, which is why this
-/// type is `pub(crate)` and carries no `#[repr(C)]`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) struct ClientWriteFlags(u32);
@@ -421,9 +319,6 @@ impl ClientWriteFlags {
     /// 3. `DEBUGASSERT(!(type & INFO) || ((type & ~(INFO | EOS)) == 0))` --
     ///    `INFO` may be accompanied only by `EOS`.
     ///
-    /// Invariants 2 and 3 are what make the three classes mutually exclusive:
-    /// `BODY | HEADER` fails 2, and `INFO | HEADER` fails 3.
-    ///
     /// # Why this is asserted at the entry point and NOWHERE else
     ///
     /// The C asserts these three ONLY in `Curl_client_write`, and that is not
@@ -435,10 +330,6 @@ impl ClientWriteFlags {
     /// therefore abort a debug build on a legitimate WebSocket transfer.
     /// [`ClientIo::client_write`] is the one place this is checked, exactly as
     /// in the C.
-    ///
-    /// A `1 << 9` or higher bit also fails, which the C cannot notice: its
-    /// assertions test only the bits they name. Reporting it is strictly more
-    /// information and costs a caller that speaks the vocabulary nothing.
     #[allow(dead_code)]
     pub(crate) const fn is_valid(self) -> bool {
         // `lib/sendf.c:381-382`: it is one of those, at least.
@@ -500,9 +391,7 @@ impl core::ops::BitOrAssign for ClientWriteFlags {
     }
 }
 
-// =========================================================================
 // The two phase orderings -- `lib/sendf.h:101-107` and `:234-240`
-// =========================================================================
 
 /// Where in the writer chain a stage operates.
 ///
@@ -510,13 +399,6 @@ impl core::ops::BitOrAssign for ClientWriteFlags {
 /// order IS the chain order, and the derived [`Ord`] is what
 /// [`ClientWriterStack::add`] compares -- so the variants below must never be
 /// reordered.
-///
-/// A stage's phase is a property of the INSTANCE, not of its type.
-/// `lib/content_encoding.c` creates the very same `gzip_encoding` writer at
-/// [`Self::TransferDecode`] when the coding arrived in a `Transfer-Encoding`
-/// header and at [`Self::ContentDecode`] when it arrived in a
-/// `Content-Encoding` header, which is why [`ClientWriter::phase`] is a
-/// method a stage answers rather than a parameter this module records.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) enum ClientWriterPhase {
@@ -571,17 +453,6 @@ impl ClientWriterPhase {
 }
 
 /// Where in the reader chain a stage operates.
-///
-/// Supersedes `Curl_creader_phase` (`lib/sendf.h:234-240`). As with
-/// [`ClientWriterPhase`], declaration order is chain order and the derived
-/// [`Ord`] is what [`ClientReaderStack::add`] compares.
-///
-/// Note that the read chain runs the other way round conceptually: bytes enter
-/// at [`Self::Client`], the DEEPEST phase, and are pulled up towards
-/// [`Self::Net`]. The stack is still ordered lowest phase first, so the
-/// numerically first phase is the one a caller reaches first -- which is why
-/// [`Self::Net`] is 0 and [`Self::Client`] is 4, mirroring the writer chain's
-/// numbering rather than its direction of travel.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) enum ClientReaderPhase {
@@ -627,32 +498,9 @@ impl ClientReaderPhase {
     }
 }
 
-// =========================================================================
 // Stage identity -- the safe successor of `get_by_type`
-// =========================================================================
 
 /// Which writer a stage IS.
-///
-/// The safe successor of the pointer comparison in `Curl_cwriter_get_by_type`
-/// (`lib/sendf.c:484-493`), which asks whether `writer->cwt == cwt` -- an
-/// identity test over a static vtable address. There is no vtable address to
-/// compare here and no `Any` downcast is permitted, so identity is stated
-/// EXPLICITLY as a value.
-///
-/// The inventory is the complete set of `struct Curl_cwtype` definitions in
-/// the C tree, found by enumerating them rather than by sampling:
-/// `lib/sendf.c:295` and `:316`, `lib/cw-out.c:444`, `lib/cw-pause.c:206`,
-/// `lib/http_chunks.c:453`, `lib/content_encoding.c:279`, `:340`, `:462`,
-/// `:565`, `:576` and `:660`, `lib/headers.c:315`, `lib/ws.c:770` and
-/// `lib/ftp.c:442`. Fourteen types, thirteen of which are in scope; the
-/// fourteenth belongs to a protocol that is not.
-///
-/// # Why the name lives here
-///
-/// [`Self::name`] returns the exact string the C's `cwt->name` holds, so
-/// [`ClientWriterStack::get_by_name`] and [`Self::name`] cannot disagree, and
-/// a stage implementing [`ClientWriter`] states its identity ONCE by answering
-/// [`ClientWriter::kind`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum ClientWriterKind {
@@ -712,15 +560,6 @@ pub(crate) enum ClientWriterKind {
 }
 
 /// The Brotli stage's name: the two bytes `b` and `r`.
-///
-/// `lib/content_encoding.c:1194` registers exactly that string, and it is what
-/// an `Accept-Encoding` header carries, so the value is not negotiable. The
-/// SPELLING is: written out, the two characters before a closing quote read to
-/// `lib.rs`'s `no_raw_string_literal_defeats_the_stripper` gate as the opening
-/// of a raw byte string, and that gate protects two other gates that would
-/// silently lose coverage if a real raw string were ever introduced. Escaping
-/// the first byte keeps this crate's one legitimate occurrence of the sequence
-/// from having to weaken it. The test module asserts the bytes.
 const BROTLI_STAGE_NAME: &str = "\x62r";
 
 impl ClientWriterKind {
@@ -773,15 +612,6 @@ impl fmt::Display for ClientWriterKind {
 }
 
 /// Which reader a stage IS.
-///
-/// The safe successor of the pointer comparison in `Curl_creader_get_by_type`
-/// (`lib/sendf.c:1466-1475`), and the read-side counterpart of
-/// [`ClientWriterKind`] in every respect.
-///
-/// The inventory is the complete set of `struct Curl_crtype` definitions:
-/// `lib/sendf.c:908`, `:1068`, `:1258` and `:1372`, `lib/mime.c:2089`,
-/// `lib/http_chunks.c:640`, `lib/ws.c:1226` and `lib/smtp.c:448`. Eight
-/// types, seven in scope.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum ClientReaderKind {
@@ -875,22 +705,9 @@ impl ReaderControl {
     }
 }
 
-// =========================================================================
 // The injected seams -- what `lib/sendf.c` reaches out of its file for
-// =========================================================================
 
 /// The three things `lib/sendf.c` asks the transfer engine to DO.
-///
-/// `lib/sendf.c` includes `transfer.h`, `connect.h` and `multiif.h` for
-/// exactly three operations, and `sendf.h` is included straight back by all
-/// three -- the include cycle the module documentation describes. Naming them
-/// as a trait the dependency-last engine implements breaks the cycle without
-/// losing a single call.
-///
-/// The two close requests are kept DISTINCT because the C distinguishes them
-/// and the distinction is observable on a multiplexed connection: `streamclose`
-/// retires one stream, `connclose` retires the whole connection. Collapsing
-/// them would close an HTTP/2 connection where curl 8.x closes one stream.
 #[allow(dead_code)]
 pub(crate) trait TransferControl: fmt::Debug {
     /// `streamclose(data->conn, reason)`, as called at `lib/sendf.c:215` with
@@ -915,21 +732,6 @@ pub(crate) trait TransferControl: fmt::Debug {
 
     /// `Curl_xfer_pause_recv(data, pause)`, as called at `lib/cw-out.c:205`
     /// when the application's WRITE callback returns the pause sentinel.
-    ///
-    /// The receive-direction twin of [`Self::pause_send`], and the reason this
-    /// trait carries four methods rather than the three `lib/sendf.c` alone
-    /// needs. `lib/cw-out.c` is the client-output stage that
-    /// `transfer/writeout.rs` supersedes, and it is installed into the chain
-    /// through [`ClientIoFactory::client_out_writer`], so the only channel it
-    /// has to the transfer engine is the [`ClientCtx`] it is handed. Adding the
-    /// operation here rather than inventing a second seam keeps every
-    /// engine-owned operation in one trait.
-    ///
-    /// The C's result handling is specific and is preserved by its caller: a
-    /// failure is returned as-is, and SUCCESS becomes
-    /// [`CURLcode::Again`] -- `result ? result : CURLE_AGAIN`
-    /// (`lib/cw-out.c:206`) -- so that the pause is reported as backpressure
-    /// rather than as completion.
     fn pause_recv(&mut self, pause: bool) -> CurlResult<()>;
 }
 
@@ -939,10 +741,6 @@ pub(crate) trait TransferControl: fmt::Debug {
 /// every user callback with -- at `:668-670`, `:768-770`, `:789-792`,
 /// `:830-832` and `:842-845`. libcurl uses it to refuse a reentrant API call
 /// from inside a callback, which is why it must be restored on EVERY path out.
-///
-/// It is a one-method trait rather than a `bool` field so that the engine can
-/// keep the flag wherever it keeps the rest of the handle's state, and so that
-/// a test can observe the bracketing directly.
 #[allow(dead_code)]
 pub(crate) trait ClientCallbackGuard: fmt::Debug {
     /// `Curl_set_in_callback(data, inside)`.
@@ -950,12 +748,6 @@ pub(crate) trait ClientCallbackGuard: fmt::Debug {
 }
 
 /// A scope that holds the in-callback flag raised, and lowers it on drop.
-///
-/// This is the mechanism behind the agent contract's *"always restoring it on
-/// every path"*. The C achieves it by writing the `FALSE` call after every
-/// callback invocation, which is correct only as long as nobody adds an early
-/// return between the two lines; here the compiler inserts the restore, and it
-/// runs on an early return and on an unwind alike.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct InCallback<'guard> {
@@ -984,12 +776,6 @@ impl Drop for InCallback<'_> {
 }
 
 /// Which of `curl_infotype`'s streams a traced payload belongs to.
-///
-/// Only one variant is produced by this module -- [`Self::DataIn`], from
-/// `Curl_debug(data, CURLINFO_DATA_IN, buf, nbytes)` at `lib/sendf.c:311` --
-/// but the whole enumeration is transcribed because it is the vocabulary the
-/// seam speaks, and a partial vocabulary would have to be widened by every
-/// later stage that traces.
 ///
 /// The values are `curl_infotype`'s, in the header's declaration order
 /// (`include/curl/curl.h:479-488`). They are not `#[repr]`-pinned here: the
@@ -1025,16 +811,6 @@ pub(crate) enum TraceDataKind {
 /// | `CURL_TRC_READ` | [`Self::trace_read`] | ten sites, `:83` to `:1437` |
 /// | `failf` | [`Self::failf`] | eleven sites, `:105` to `:873` |
 /// | `infof` | [`Self::infof`] | `:274` |
-///
-/// Every method takes [`fmt::Arguments`], which is what `format_args!`
-/// produces: the line is formatted only if the sink actually renders it, so a
-/// transfer that is not tracing pays for no formatting at all. That is the
-/// same economy the C gets from `CURL_TRC_WRITE` being a macro that tests the
-/// level before evaluating its arguments.
-///
-/// A transfer that is not tracing has no sink at all -- [`ClientCtx`] holds
-/// `Option<&mut dyn TraceSink>` -- so a stage never has to pretend it can
-/// trace.
 #[allow(dead_code)]
 pub(crate) trait TraceSink: fmt::Debug {
     /// `Curl_debug(data, kind, bytes, len)`: hands a raw PAYLOAD to the
@@ -1064,9 +840,7 @@ pub(crate) trait TraceSink: fmt::Debug {
     fn infof(&mut self, line: fmt::Arguments<'_>);
 }
 
-// =========================================================================
 // The application callbacks, as typed seams
-// =========================================================================
 
 /// What `CURLOPT_READFUNCTION` answered.
 ///
@@ -1076,14 +850,6 @@ pub(crate) trait TraceSink: fmt::Debug {
 /// the public ABI and are kept there, in `curl-rs-ffi`; internally the three
 /// outcomes are three variants, so no stage below can mistake a byte count for
 /// a sentinel or vice versa.
-///
-/// # `Bytes` may exceed the buffer, deliberately
-///
-/// `lib/sendf.c:714-724` exists precisely because a callback can claim to have
-/// written more than it was given, and the C's answer is to fail the transfer
-/// with `"read function returned funny value"`. Clamping the count HERE would
-/// delete that check. An adapter therefore reports whatever the callback said
-/// and lets [`CrIn::read`] judge it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum SourceRead {
@@ -1117,8 +883,8 @@ pub(crate) trait ClientReadSource: fmt::Debug {
     /// source over a seekable stream.
     ///
     /// The safe successor of `lib/sendf.c:852-870`, which asks
-    /// `data->state.fread_func == (curl_read_callback)fread` -- a comparison
-    /// of function pointers, wrapped in a `#pragma` that silences
+    /// `data->state.fread_func == (curl_read_callback)fread` -- a comparison of
+    /// function pointers, wrapped in a `#pragma` that silences
     /// `-Wcast-function-type-strict` because the cast is not strictly legal --
     /// and then calls `fseek(data->state.in, 0, SEEK_SET)`.
     ///
@@ -1131,11 +897,6 @@ pub(crate) trait ClientReadSource: fmt::Debug {
     /// | [`None`] (the default) | `fread_func != fread`, so no attempt |
     /// | `Some(Ok(()))` | `fseek` returned other than -1: success |
     /// | `Some(Err(_))` | `fseek` returned -1: fall through and fail |
-    ///
-    /// The error is [`std::io::Error`] rather than an `errno` integer. The C
-    /// only ever prints that integer into a trace line, and
-    /// [`std::io::Error`]'s own rendering carries strictly more than the
-    /// number.
     fn seek_to_start(&mut self) -> Option<std::io::Result<()>> {
         None
     }
@@ -1160,14 +921,6 @@ pub(crate) enum SeekOrigin {
 }
 
 /// What `CURLOPT_SEEKFUNCTION` answered.
-///
-/// The three documented returns are `CURL_SEEKFUNC_OK` = 0,
-/// `CURL_SEEKFUNC_FAIL` = 1 and `CURL_SEEKFUNC_CANTSEEK` = 2
-/// (`include/curl/curl.h:380-382`). The C tests them as
-/// `!= CURL_SEEKFUNC_OK` and then `!= CURL_SEEKFUNC_CANTSEEK`
-/// (`lib/sendf.c:773-779`), so anything that is neither behaves as a failure --
-/// which is why [`Self::Failed`] CARRIES the raw integer instead of discarding
-/// it. `lib/sendf.c:835` prints exactly that integer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum SeekOutcome {
@@ -1272,37 +1025,10 @@ pub(crate) trait IoctlCallback: fmt::Debug {
 
 /// The two writer stages and the one read source that live OUTSIDE this
 /// module.
-///
-/// `do_init_writer_stack` (`lib/sendf.c:325-368`) names `Curl_cwt_out` from
-/// `lib/cw-out.c` and `Curl_cwt_pause` from `lib/cw-pause.c`, and
-/// `Curl_creader_set_fread` reads `data->state.fread_func`
-/// (`lib/sendf.c:632`). All three would be imports of
-/// `transfer/writeout.rs` and of the transfer engine, which the module
-/// documentation rules out, so all three arrive here instead.
-///
-/// The base stack is still assembled HERE, in the exact C order, which is what
-/// keeps the ordering guarantee in one auditable place; only the construction
-/// of two stages is delegated.
-///
-/// # The read source must be the SAME stream every time
-///
-/// `cr_in_init` copies a function pointer and a client-data pointer, so two
-/// `cr_in` instances built from one handle read the SAME underlying stream, and
-/// a rewind performed through one is visible to the other. An implementation of
-/// [`Self::input_source`] must preserve that: successive calls have to yield
-/// handles onto one stream, not independent copies of it. Sharing the state
-/// behind an [`std::rc::Rc`] is the usual way; the C's shared `FILE *` is
-/// exactly the same arrangement.
 #[allow(dead_code)]
 pub(crate) trait ClientIoFactory<'data>: fmt::Debug {
     /// `Curl_cwt_out` at [`ClientWriterPhase::Client`]
     /// (`lib/sendf.c:331-332`).
-    ///
-    /// The returned stage must report [`ClientWriterKind::ClientOut`] and
-    /// [`ClientWriterPhase::Client`]; [`ClientWriterStack::init_base`] asserts
-    /// both in a debug build, because a stage at the wrong phase would be
-    /// inserted in the wrong place and the whole ordering guarantee would go
-    /// with it.
     fn client_out_writer(&self) -> Box<dyn ClientWriter + 'data>;
 
     /// `Curl_cwt_pause` at [`ClientWriterPhase::Protocol`]
@@ -1314,39 +1040,16 @@ pub(crate) trait ClientIoFactory<'data>: fmt::Debug {
 
     /// `data->state.fread_func` bound to `data->state.in`
     /// (`lib/sendf.c:632-633`).
-    ///
-    /// [`None`] stands for a null `fread_func`, which the C tolerates: its
-    /// guard at `:667` is `if(ctx->read_cb && blen)`, so a missing callback
-    /// yields zero bytes and is then judged by the same `case 0:` arm as a
-    /// genuine end of file.
     fn input_source(&self) -> Option<Box<dyn ClientReadSource + 'data>>;
 }
 
-// =========================================================================
 // The request state this module owns -- migrated out of the god-struct
-// =========================================================================
 
 /// The write-side fields of `struct SingleRequest` that the writer chain reads
 /// and writes.
 ///
-/// Specification 0.1.2 requires the fields of `lib/urldata.h`'s god-struct to
-/// migrate to the module that owns their lifecycle, and these eight are the
-/// ones `lib/sendf.c` touches. `transfer/request.rs` EMBEDS this struct rather
-/// than restating its fields, exactly as `struct pgrs_dir` embeds a
-/// `struct Curl_rlimit`.
-///
-/// Every field is transcribed from `lib/request.h:57-134` except
-/// [`Self::header_size`], which is `data->info.header_size`
-/// (`lib/urldata.h:764`) and is read here but never written.
-///
-/// # Fields, not accessors
-///
-/// The C reads and writes these as plain struct members from several
-/// translation units, and eight pairs of accessors would add nothing a reader
-/// could not already see. What accessors WOULD hide is the initial state, so
-/// that is stated explicitly in [`Default`]: three of the fields start at -1,
-/// and a derived `Default` -- which would start them at zero -- would be
-/// wrong in a way no test of this module could catch.
+/// `transfer/request.rs` EMBEDS this struct rather than restating its fields,
+/// exactly as `struct pgrs_dir` embeds a `struct Curl_rlimit`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct RequestWriteState {
@@ -1359,11 +1062,6 @@ pub(crate) struct RequestWriteState {
 
     /// `req.maxdownload`: the most body data to fetch, or -1 for unlimited
     /// (`lib/request.h:58-59`).
-    ///
-    /// Distinct from [`ClientConfig::max_filesize`]: this is what the PROTOCOL
-    /// says the response contains, and exceeding it is an excess to be reported
-    /// and then dropped; the other is what the USER permitted, and exceeding it
-    /// fails the transfer.
     pub(crate) maxdownload: i64,
 
     /// `req.bytecount`: the total number of body bytes accepted so far
@@ -1383,11 +1081,6 @@ pub(crate) struct RequestWriteState {
 
     /// `data->info.header_size`: the size of the received headers, in bytes
     /// (`lib/urldata.h:764`, a `uint32_t`).
-    ///
-    /// Read once, at `lib/sendf.c:219`, to decide whether a body arriving on a
-    /// bodyless response is tolerable: headers already received means the
-    /// server answered, so the transfer succeeds; nothing received means the
-    /// reply was weird.
     pub(crate) header_size: u32,
 
     /// `req.no_body`: the response has no body (`lib/request.h:124`).
@@ -1400,11 +1093,6 @@ pub(crate) struct RequestWriteState {
 
     /// `req.ignorebody`: a response body is being read and thrown away
     /// (`lib/request.h:116`).
-    ///
-    /// Set while a body is being drained -- an authentication round that will
-    /// be retried, for instance. The bytes are counted and their progress is
-    /// reported, but they are not written to the client and neither the
-    /// user's size limit nor the excess report applies to them.
     pub(crate) ignorebody: bool,
 
     /// `req.download_done`: the download is complete (`lib/request.h:105`).
@@ -1418,11 +1106,6 @@ pub(crate) struct RequestWriteState {
 impl Default for RequestWriteState {
     /// The state `Curl_req_init` leaves behind, with the three sentinels the C
     /// sets explicitly.
-    ///
-    /// `size` and `maxdownload` are -1 -- "unknown" and "unlimited"
-    /// respectively -- because zero means something entirely different for
-    /// both: a zero `size` is an empty response, and a zero `maxdownload`
-    /// would forbid every byte.
     fn default() -> Self {
         Self {
             size: -1,
@@ -1447,11 +1130,6 @@ impl Default for RequestWriteState {
 pub(crate) struct RequestReadState {
     /// `req.rewind_read`: the reader needs a rewind at the next start
     /// (`lib/request.h:110`).
-    ///
-    /// Set by the retry logic through [`ClientIo::set_rewind`], read by
-    /// [`ClientIo::client_reset`] to decide whether the reader chain survives
-    /// the reset, and cleared by [`ClientIo::client_start`] once the rewind has
-    /// been performed.
     pub(crate) rewind_read: bool,
 
     /// `req.reader_started`: client reads have begun
@@ -1465,12 +1143,6 @@ pub(crate) struct RequestReadState {
 
 /// The settings both chains consult, gathered from `data->set` and
 /// `data->state`.
-///
-/// Seven values, each cited to the field the C reads. They are gathered into
-/// one borrowed struct rather than reached for individually so that a stage
-/// receives one shared reference instead of a handle it could write through:
-/// nothing in `lib/sendf.c` modifies a setting, and this type makes that
-/// structural.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct ClientConfig {
@@ -1502,22 +1174,10 @@ pub(crate) struct ClientConfig {
 
     /// `data->state.prefer_ascii`, read at `lib/sendf.c:1113` under
     /// `CURL_PREFER_LF_LINEENDS`.
-    ///
-    /// The C compiles this disjunct in only on platforms whose native line
-    /// ending is a bare line feed. There is no such conditional here: the
-    /// field is always present and defaults to false, so a build for a target
-    /// that does not want it behaves exactly as the C's disabled branch does,
-    /// and no Cargo feature is invented for a platform distinction that the
-    /// four mandated targets do not draw.
     pub(crate) prefer_ascii: bool,
 
     /// Whether the scheme in play carries `PROTOPT_NONETWORK`
     /// (`lib/urldata.h:535`), read at `lib/sendf.c:698`.
-    ///
-    /// True only for `file://` among the nine schemes that carry transfers.
-    /// Such a transfer cannot be paused, because it does not run through the
-    /// normal procedure, so a pause request from the input callback is an
-    /// error rather than a pause.
     pub(crate) nonetwork: bool,
 
     /// `data->state.infilesize`, read at `lib/sendf.c:1151` and `:1192`.
@@ -1546,9 +1206,7 @@ impl Default for ClientConfig {
     }
 }
 
-// =========================================================================
 // The call context -- the safe successor of `struct Curl_easy *data`
-// =========================================================================
 
 /// Everything a stage needs that is not its own state.
 ///
@@ -1557,23 +1215,6 @@ impl Default for ClientConfig {
 /// progress counters, the connection, the callbacks, the trace level. This is
 /// the same argument with the reach made explicit -- ten borrows, each of which
 /// a reader can enumerate, instead of one pointer into 200 fields.
-///
-/// # Why ONE context and not one per direction
-///
-/// A write context and a read context would each have to hold
-/// `&mut Progress`, `&mut dyn TransferControl` and the trace sink, and two
-/// simultaneous mutable borrows of the same three things do not exist. The C
-/// has one `data` for both directions and so does this. A writer can therefore
-/// reach the seek callback, which it has no business with -- exactly as in the
-/// C, and the alternative costs more than the discipline does.
-///
-/// # The clock
-///
-/// The only instant this module uses arrives through [`Self::clock`], and it is
-/// sampled through [`Progress::sample`] so that the reading is stored where
-/// `Curl_pgrs_now` stores it (`lib/progress.c:171-177`). Nothing here calls a
-/// host clock, which is what lets [`crate::util::timeval::TestClock`] pin every
-/// rate-limit and start-transfer assertion in the test module.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct ClientCtx<'ctx> {
@@ -1606,12 +1247,6 @@ pub(crate) struct ClientCtx<'ctx> {
 impl<'ctx> ClientCtx<'ctx> {
     /// A context over the six things every transfer has, tracing nothing and
     /// with neither optional callback installed.
-    ///
-    /// The three optional seams are attached with [`Self::with_seek`],
-    /// [`Self::with_ioctl`] and [`Self::with_trace`], following the
-    /// `CallCtx::new(clock).with_tracer(...)` shape that `conn/filters.rs`
-    /// already uses for the same reason: a constructor with ten parameters is
-    /// unreadable at the call site and three of them are almost always absent.
     #[allow(dead_code)]
     pub(crate) fn new(
         write: &'ctx mut RequestWriteState,
@@ -1714,11 +1349,6 @@ impl<'ctx> ClientCtx<'ctx> {
 
     /// Samples the injected clock and stores the reading -- `Curl_pgrs_now`
     /// (`lib/progress.c:171-177`).
-    ///
-    /// Takes `&mut self` because the reading is STORED, which is what the C
-    /// does: `curlx_pnow(pnow)` writes through a pointer into either the multi
-    /// handle or the progress struct, so a later reader of `progress.now` sees
-    /// this instant.
     #[allow(dead_code)]
     pub(crate) fn pgrs_now(&mut self) -> CurlTime {
         // The clock is a shared reference and therefore `Copy`, so lifting it
@@ -1743,13 +1373,6 @@ impl<'ctx> ClientCtx<'ctx> {
     // ---- the application callbacks --------------------------------------
 
     /// Raises the in-callback flag for the duration of the returned scope.
-    ///
-    /// For a callback the CALLER owns -- the input source, which a reader holds
-    /// in its own field. The two optional callbacks live in this context
-    /// instead, and are bracketed by [`Self::call_seek`] and
-    /// [`Self::call_ioctl`], which cannot be expressed this way: handing out a
-    /// scope that borrows `self` mutably would leave no way to reach the
-    /// callback beside it.
     #[allow(dead_code)]
     pub(crate) fn enter_callback(&mut self) -> InCallback<'_> {
         InCallback::enter(self.guard)
@@ -1774,12 +1397,6 @@ impl<'ctx> ClientCtx<'ctx> {
 
     /// Calls `CURLOPT_SEEKFUNCTION` with the flag raised, or reports that
     /// there is none.
-    ///
-    /// [`None`] means the option is unset. `lib/sendf.c:760` initialises
-    /// `seekerr` to `CURL_SEEKFUNC_CANTSEEK` before testing the option, so
-    /// [`CrIn::resume_from`] reads a missing callback as
-    /// [`SeekOutcome::CantSeek`] -- which is why this returns an [`Option`]
-    /// rather than substituting a value here.
     #[allow(dead_code)]
     pub(crate) fn call_seek(
         &mut self,
@@ -1840,17 +1457,6 @@ impl<'ctx> ClientCtx<'ctx> {
     }
 
     /// `failf(data, ...)` AND the [`Error`] that accompanies it.
-    ///
-    /// Every `failf` in `lib/sendf.c` is immediately followed by a return of a
-    /// specific code, and the text is what reaches `CURLOPT_ERRORBUFFER`. This
-    /// does both halves in one call so the two cannot drift apart, and it
-    /// attaches the text to the error as well as to the sink -- so the
-    /// diagnostic survives even on a transfer that is not tracing, where the C
-    /// would still have written the error buffer.
-    ///
-    /// The line is formatted exactly once, into a `String`, because it is
-    /// needed twice: [`fmt::Arguments`] renders through [`fmt::Display`], and
-    /// the resulting owned string then serves both the sink and the error.
     #[allow(dead_code)]
     pub(crate) fn failf(
         &mut self,
@@ -1865,9 +1471,7 @@ impl<'ctx> ClientCtx<'ctx> {
     }
 }
 
-// =========================================================================
 // The writer contract -- `struct Curl_cwtype` and `struct Curl_cwriter`
-// =========================================================================
 
 /// One stage of the writer chain.
 ///
@@ -1885,15 +1489,6 @@ impl<'ctx> ClientCtx<'ctx> {
 ///   outlive its successor.
 /// * `const char *name` and `const char *alias` -- answered from
 ///   [`Self::kind`], so a stage states its identity once.
-///
-/// # The default implementations
-///
-/// `Curl_cwriter_def_init`, `Curl_cwriter_def_write` and
-/// `Curl_cwriter_def_close` (`lib/sendf.c:137-157`) are the C's way of letting
-/// a stage opt out of a member, and eight of the fourteen registered types use
-/// at least one of them. They are the DEFAULT METHOD BODIES here, so a
-/// monitoring stage that neither initialises nor closes nor transforms writes
-/// exactly one method: [`Self::kind`], [`Self::phase`] and nothing else.
 #[allow(dead_code)]
 pub(crate) trait ClientWriter: fmt::Debug {
     /// Which writer this is, and therefore what it is called.
@@ -1903,12 +1498,6 @@ pub(crate) trait ClientWriter: fmt::Debug {
     fn kind(&self) -> ClientWriterKind;
 
     /// The phase this INSTANCE operates at.
-    ///
-    /// A method rather than a field this module records, because the phase is
-    /// per-instance: `lib/content_encoding.c` installs one decoder type at
-    /// either [`ClientWriterPhase::TransferDecode`] or
-    /// [`ClientWriterPhase::ContentDecode`] depending on which header carried
-    /// the coding.
     fn phase(&self) -> ClientWriterPhase;
 
     /// The `name` member of `struct Curl_cwtype` (`lib/sendf.h:111`).
@@ -1937,13 +1526,6 @@ pub(crate) trait ClientWriter: fmt::Debug {
     }
 
     /// `do_write` (`lib/sendf.h:115-117`).
-    ///
-    /// Defaults to `Curl_cwriter_def_write` (`lib/sendf.c:145-150`): forward
-    /// the bytes and the flags downstream, entirely unchanged. A stage that
-    /// only observes therefore needs no body here at all, and a stage that
-    /// TRANSFORMS must be at [`ClientWriterPhase::TransferDecode`] or
-    /// [`ClientWriterPhase::ContentDecode`] -- the other three phases are for
-    /// monitoring, as `lib/sendf.h:94-97` states.
     fn write(
         &mut self,
         ctx: &mut ClientCtx<'_>,
@@ -1963,23 +1545,12 @@ pub(crate) trait ClientWriter: fmt::Debug {
     }
 
     /// Whether this stage is holding bytes back because the transfer is paused.
-    ///
-    /// `Curl_cwriter_is_paused` (`lib/sendf.c:505-508`) delegates straight to
-    /// `Curl_cw_out_is_paused`, reaching into `lib/cw-out.c` for one stage's
-    /// private state. Asking every stage instead is equivalent -- no other
-    /// stage can be paused -- and it removes the import that made the question
-    /// a cycle. Defaults to false.
     fn is_paused(&self) -> bool {
         false
     }
 
     /// Releases anything this stage held back, now that the transfer is no
     /// longer paused.
-    ///
-    /// `Curl_cwriter_unpause` (`lib/sendf.c:510-513`) delegates to
-    /// `Curl_cw_out_unpause`, and the same reasoning as [`Self::is_paused`]
-    /// applies. The stage receives its own tail, so a flush travels downstream
-    /// exactly as an ordinary write does. Defaults to nothing.
     fn unpause(
         &mut self,
         ctx: &mut ClientCtx<'_>,
@@ -1990,29 +1561,10 @@ pub(crate) trait ClientWriter: fmt::Debug {
     }
 
     /// Clears this stage's paused state without flushing anything.
-    ///
-    /// `ctx->paused = FALSE` (`lib/cw-out.c:496`) alone, separated from the two
-    /// flushes that follow it there so that an upstream stage can perform the
-    /// C's first step at the C's moment. [`WriterTail::clear_pause`] documents
-    /// why the separation is needed and which order it restores.
-    ///
-    /// Defaults to nothing, which is right for every stage that cannot be
-    /// paused -- and only the client-output stage can be.
     fn clear_pause(&mut self) {}
 
     /// Flushes everything this stage still holds, because the download has
     /// ended.
-    ///
-    /// `Curl_cw_out_done` (`lib/cw-out.c:504-517`) is the entry point, and it
-    /// differs from [`Self::unpause`] in exactly one respect that is
-    /// observable: it flushes with `flush_all` TRUE, so a stage that would
-    /// otherwise hold a short write back for collation must emit it. Nothing is
-    /// unpaused -- a paused transfer that is finished stays paused and the C's
-    /// two flushes both decline, which is why this is a separate operation
-    /// rather than an argument to the one above.
-    ///
-    /// The stage receives its own tail, so a flush travels downstream exactly
-    /// as an ordinary write does. Defaults to nothing.
     fn done(
         &mut self,
         ctx: &mut ClientCtx<'_>,
@@ -2024,16 +1576,6 @@ pub(crate) trait ClientWriter: fmt::Debug {
 }
 
 /// The remainder of a writer chain, below the stage currently running.
-///
-/// The successor of `struct Curl_cwriter`'s `next` member. Where the C
-/// dereferences a pointer that may be `NULL`, this splits a slice that may be
-/// empty -- and an empty split is where `CURLE_WRITE_ERROR` comes from, exactly
-/// as `Curl_cwriter_write`'s `if(!writer)` does (`lib/sendf.c:132-133`).
-///
-/// A stage cannot reach PAST its tail to a stage above it, cannot reorder the
-/// chain and cannot hold the tail beyond its own call, because the borrow
-/// checker will not let it. Those are three classes of defect the C's raw
-/// pointers admit and this does not.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct WriterTail<'stack, 'data> {
@@ -2070,15 +1612,6 @@ impl<'stack, 'data> WriterTail<'stack, 'data> {
 
     /// `Curl_cwriter_is_paused(data)` (`lib/sendf.c:505-508`), asked of the
     /// stages BELOW the caller.
-    ///
-    /// The C walks the whole chain from `data`; a stage asking through its tail
-    /// reaches strictly less. That is not a narrowing in practice, and the
-    /// phase ordering is what guarantees it: the only stage that can be paused
-    /// is the client-output stage at [`ClientWriterPhase::Client`], which is
-    /// last in the chain, so it is in the tail of every stage that could ask.
-    ///
-    /// `lib/cw-pause.c:107` and `:151` are the two call sites this exists for,
-    /// and both are inside a stage at [`ClientWriterPhase::Protocol`].
     #[allow(dead_code)]
     pub(crate) fn is_paused(&self) -> bool {
         self.stages.iter().any(|stage| stage.is_paused())
@@ -2086,14 +1619,6 @@ impl<'stack, 'data> WriterTail<'stack, 'data> {
 
     /// `Curl_cwriter_is_content_decoding(data)` (`lib/sendf.c:495-503`), asked
     /// of the stages BELOW the caller.
-    ///
-    /// The same reasoning as [`Self::is_paused`], and the same guarantee from
-    /// the same source: [`ClientWriterPhase::ContentDecode`] sorts after
-    /// [`ClientWriterPhase::Protocol`], so every decoder is in the tail of the
-    /// pause stage that asks. A PHASE test and not a kind test, exactly as the
-    /// C's is.
-    ///
-    /// `lib/cw-pause.c:103` and `:149` are the call sites.
     #[allow(dead_code)]
     pub(crate) fn is_content_decoding(&self) -> bool {
         self.stages
@@ -2111,19 +1636,6 @@ impl<'stack, 'data> WriterTail<'stack, 'data> {
     /// 1. clear the client stage's `paused` flag;
     /// 2. `Curl_cw_pause_flush(data)` -- drain the bytes that were in flight;
     /// 3. `cw_out_flush(data, cw_out, FALSE)` -- drain the client stage.
-    ///
-    /// [`ClientWriterStack::unpause`] walks the chain from the top, so it
-    /// reaches the pause stage (at [`ClientWriterPhase::Protocol`]) BEFORE the
-    /// client stage (at [`ClientWriterPhase::Client`]). Step 2 therefore runs
-    /// first -- and its loop condition is `!Curl_cwriter_is_paused(data)`, so
-    /// without step 1 having happened it would find the transfer still paused
-    /// and drain nothing. Calling this at the top of the pause stage's
-    /// [`ClientWriter::unpause`] performs step 1 at exactly the point the C
-    /// performs it, and the walk then delivers step 3 on its own.
-    ///
-    /// Clearing rather than toggling: there is no counterpart that SETS the
-    /// flag, because a pause originates inside the client stage itself, from a
-    /// callback's return value.
     #[allow(dead_code)]
     pub(crate) fn clear_pause(&mut self) {
         for stage in self.stages.iter_mut() {
@@ -2163,13 +1675,6 @@ impl<'stack, 'data> WriterTail<'stack, 'data> {
 /// Supersedes `data->req.writer_stack` (`lib/request.h:87`) and the eight
 /// functions that walk it. The chain is a [`Vec`] ordered by phase, lowest
 /// first, so index 0 is the stage a write reaches first.
-///
-/// A [`Vec`] and not a [`std::collections::VecDeque`], even though every
-/// insertion is at or near the front: [`Self::write`] needs one contiguous
-/// slice to split, `split_first_mut` over a ring buffer's two halves does not
-/// exist, and the chains are at most a handful of stages long. Specification
-/// 0.1.1 settles the trade in any case -- performance is a non-goal, and
-/// faithfulness to the ordering is what matters.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct ClientWriterStack<'data> {
@@ -2229,13 +1734,6 @@ impl<'data> ClientWriterStack<'data> {
     /// `Curl_cwriter_create` (`lib/sendf.c:404-429`): initialise a stage,
     /// before it joins any chain.
     ///
-    /// Three of the C's four concerns are gone. There is no allocation to fail,
-    /// so `CURLE_OUT_OF_MEMORY` cannot arise here; there is no `writer->ctx`
-    /// self-pointer to set; and there is no phase to record, because the stage
-    /// answers [`ClientWriter::phase`] itself. What remains is the one thing
-    /// that matters: `do_init` runs, and a stage whose initialisation fails is
-    /// destroyed rather than returned.
-    ///
     /// # Errors
     ///
     /// Whatever [`ClientWriter::init`] returns. The stage is dropped on the way
@@ -2252,11 +1750,6 @@ impl<'data> ClientWriterStack<'data> {
 
     /// `Curl_cwriter_free` (`lib/sendf.c:431-438`): close a stage that is not
     /// in a chain.
-    ///
-    /// Takes the stage BY VALUE, so a closed stage cannot be used again and
-    /// cannot be closed twice -- two mistakes the C's pointer signature
-    /// permits. The deallocation the C performs is the drop at the end of this
-    /// function.
     #[allow(dead_code)]
     pub(crate) fn free(
         mut writer: Box<dyn ClientWriter + 'data>,
@@ -2335,19 +1828,6 @@ impl<'data> ClientWriterStack<'data> {
     /// | 3 | `protocol` | `Protocol` | `protocol`, `cw-pause`, `cw-out` |
     /// | 4 | `raw` | `Raw` | `raw`, `protocol`, `cw-pause`, `cw-out` |
     ///
-    /// So the execution order is `raw`, `protocol`, `cw-pause`, `cw-out`, and
-    /// the pause stage ends up BEHIND the download stage even though it was
-    /// installed FIRST. That inversion is the whole point of the C's comment at
-    /// `:336-338`: *"This places the 'pause' writer behind the 'download'
-    /// writer that is added below. Meaning the 'download' can do checks on
-    /// content length and other things \*before\* write outs are buffered for
-    /// paused transfers."* Install them the other way round and a paused
-    /// transfer buffers bytes that the length check would have rejected.
-    ///
-    /// Step 1 assigns the client stage DIRECTLY, as the C does at `:331`, and
-    /// not through [`Self::add`] -- which is what stops the lazy-init test in
-    /// `add` from recursing.
-    ///
     /// # Errors
     ///
     /// Whatever [`ClientWriter::init`] returns for a factory-supplied stage.
@@ -2405,18 +1885,16 @@ impl<'data> ClientWriterStack<'data> {
             ClientWriterPhase::Protocol,
             "the factory's pause stage must be at CURL_CW_PROTOCOL"
         );
-        // A FAILURE HERE LEAVES THE PARTIAL CHAIN STANDING, and that is the
-        // C's behaviour rather than an oversight in this transcription. Each of
-        // the C's three steps reads `if(result) return result` (`:346-347`,
-        // `:355-356`, `:364-365`) with nothing between it and the return: the
-        // stage that failed is freed by `Curl_cwriter_create` itself
-        // (`:426-427`), the stages already installed are NOT touched, and
-        // `data->req.writer_stack` keeps pointing at them. `Curl_client_write`
-        // then finds a non-null stack on its next call (`:390`) and writes
-        // through the partial chain instead of rebuilding it. Clearing here
-        // would be a different observable behaviour on the one path that can
-        // reach it -- an allocation failure inside a stage's own `init` -- so
-        // the plain `?` is the faithful form.
+        // Each of the C's three steps reads `if(result) return result`
+        // (`:346-347`, `:355-356`, `:364-365`) with nothing between it and the
+        // return: the stage that failed is freed by `Curl_cwriter_create`
+        // itself (`:426-427`), the stages already installed are NOT touched,
+        // and `data->req.writer_stack` keeps pointing at them.
+        // `Curl_client_write` then finds a non-null stack on its next call
+        // (`:390`) and writes through the partial chain instead of rebuilding
+        // it. Clearing here would be a different observable behaviour on the
+        // one path that can reach it -- an allocation failure inside a stage's
+        // own `init` -- so the plain `?` is the faithful form.
         self.insert(Self::create(pause, ctx)?);
 
         // Step 3 -- `lib/sendf.c:349-356`. The download stage, which lands
@@ -2438,11 +1916,6 @@ impl<'data> ClientWriterStack<'data> {
 
     /// `Curl_cwriter_get_by_name` (`lib/sendf.c:473-482`): the first stage
     /// whose NAME matches.
-    ///
-    /// The alias is NOT consulted, and that asymmetry is the C's: `:478`
-    /// compares `writer->cwt->name` alone, so looking up `"x-gzip"` finds
-    /// nothing even though a `gzip` stage answers to that alias elsewhere.
-    /// Reproduced rather than tidied.
     #[allow(dead_code)]
     pub(crate) fn get_by_name(
         &self,
@@ -2473,11 +1946,6 @@ impl<'data> ClientWriterStack<'data> {
 
     /// `Curl_cwriter_is_content_decoding` (`lib/sendf.c:495-503`): whether any
     /// stage removes a content encoding.
-    ///
-    /// A PHASE test and not a kind test, exactly as the C's is. That matters:
-    /// the same decoder type installed at
-    /// [`ClientWriterPhase::TransferDecode`] is NOT content decoding, and a
-    /// kind test would report it as such.
     #[allow(dead_code)]
     pub(crate) fn is_content_decoding(&self) -> bool {
         self.stages
@@ -2494,11 +1962,6 @@ impl<'data> ClientWriterStack<'data> {
 
     /// `Curl_cwriter_unpause` (`lib/sendf.c:510-513`): release whatever the
     /// chain held back.
-    ///
-    /// Each stage receives its own tail, so a stage that flushes writes
-    /// downstream exactly as it would during an ordinary write. The walk stops
-    /// at the first failure and returns it, which is what a delegation to one
-    /// stage does when that stage is the only one that can fail.
     ///
     /// # Errors
     ///
@@ -2520,16 +1983,6 @@ impl<'data> ClientWriterStack<'data> {
 
     /// `Curl_cw_out_done` (`lib/cw-out.c:504-517`): the download has ended, so
     /// flush everything every stage still holds.
-    ///
-    /// Walks from the TOP of the chain, and that direction is the C's sequence
-    /// rather than an arbitrary choice. `Curl_cw_out_done` calls
-    /// `Curl_cw_pause_flush(data)` first and `cw_out_flush(data, cw_out, TRUE)`
-    /// second; the pause stage is at [`ClientWriterPhase::Protocol`] and the
-    /// client stage at [`ClientWriterPhase::Client`], so a top-down walk
-    /// delivers them in exactly that order. Draining the in-flight buffer first
-    /// is what puts those bytes AHEAD of nothing and BEHIND whatever the client
-    /// stage already holds, because the pause stage writes downstream through
-    /// the client stage, which appends and replays in arrival order.
     ///
     /// # Errors
     ///
@@ -2587,21 +2040,9 @@ impl<'data> ClientWriterStack<'data> {
     }
 }
 
-// =========================================================================
 // `cw_download` -- the protocol stage, `lib/sendf.c:168-302`
-// =========================================================================
 
 /// The stage that sees the REAL body, and everything that follows from that.
-///
-/// Supersedes `cw_download` and `struct cw_download_ctx`
-/// (`lib/sendf.c:168-302`), whose own comment states the position exactly:
-/// *"Here, we deal with REAL BODY bytes. All filtering and transfer encodings
-/// have been applied and only the true content, e.g. BODY, bytes are passed
-/// here. This allows us to check sizes, update stats, etc. independent from the
-/// protocol in play."*
-///
-/// It is at [`ClientWriterPhase::Protocol`] and its name is `"protocol"`, not
-/// `"download"`: the C named the type after the phase.
 ///
 /// # The four things it does, in the order it does them
 ///
@@ -2644,13 +2085,6 @@ impl DownloadWriter {
 
     /// `get_max_body_write_len(data, limit)` (`lib/sendf.c:159-166`): how many
     /// more body bytes `limit` permits.
-    ///
-    /// [`usize::MAX`] means "no limit", which is what the C's `SIZE_MAX` means,
-    /// and -1 as the limit is the sentinel for that. A limit already reached or
-    /// passed yields zero rather than wrapping, because the subtraction goes
-    /// through [`so_to_usize_range`] with a floor of zero -- and that is why a
-    /// `bytecount` above the limit clamps the write to nothing instead of
-    /// permitting an enormous one.
     #[allow(dead_code)]
     fn max_body_write_len(state: &RequestWriteState, limit: i64) -> usize {
         // `lib/sendf.c:161-164`.
@@ -2827,9 +2261,6 @@ impl ClientWriter for DownloadWriter {
         // on too large filesize is handled below, after writing the permitted
         // bytes"*. A zero `max_filesize` means no limit, which is the opposite
         // convention from `maxdownload`'s -1 and is preserved as such.
-        //
-        // This clamp does NOT set `excess_len`, and that distinction is what
-        // step 10 below reads to tell the two limits apart.
         if ctx.config().max_filesize != 0 && !ctx.write_state().ignorebody {
             let wmax = Self::max_body_write_len(
                 ctx.write_state(),
@@ -2904,26 +2335,9 @@ impl ClientWriter for DownloadWriter {
     }
 }
 
-// =========================================================================
 // `cw_raw` -- the raw stage, `lib/sendf.c:304-323`
-// =========================================================================
 
 /// The stage that traces body bytes before anything has touched them.
-///
-/// Supersedes `cw_raw` (`lib/sendf.c:304-323`), whose comment is *"RAW client
-/// writer in phase CURL_CW_RAW that enabled tracing of raw data"*. It is at
-/// [`ClientWriterPhase::Raw`], the top of the chain, so what it traces is what
-/// arrived: before de-framing, before decoding, before any length check.
-///
-/// It NEVER modifies a byte. `lib/sendf.h:94-97` reserves modification for the
-/// two decode phases, and specification 0.6.7 makes any normalisation here a
-/// wire-parity failure in any case.
-///
-/// # It carries no state
-///
-/// The C declares it with `sizeof(struct Curl_cwriter)` rather than a context
-/// struct of its own (`lib/sendf.c:322`) -- it is the one registered writer
-/// with nothing to remember.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct RawWriter;
@@ -2946,14 +2360,6 @@ impl ClientWriter for RawWriter {
     }
 
     /// `cw_raw_write` (`lib/sendf.c:306-314`).
-    ///
-    /// Three conditions must all hold before anything is traced, and the C
-    /// spells them in this order at `:310`: the write carries BODY bytes, the
-    /// transfer is verbose, and the body is not being discarded. Tracing a
-    /// discarded body would show the application data it will never receive.
-    ///
-    /// The trace happens BEFORE the forward, so a stage below that fails does
-    /// not suppress the record of what arrived.
     ///
     /// # Errors
     ///
@@ -2978,34 +2384,15 @@ impl ClientWriter for RawWriter {
     }
 }
 
-// =========================================================================
 // The reader contract -- `struct Curl_crtype` and `struct Curl_creader`
-// =========================================================================
 
 /// What one read produced.
-///
-/// The successor of the C's `size_t *nread` and `bool *eos` out-parameters.
-/// `Curl_creader_read` zeroes both BEFORE it dispatches (`lib/sendf.c:519-520`)
-/// so that a stage which returns an error without writing them cannot leave a
-/// stale count behind; returning the pair BY VALUE subsumes that entirely --
-/// there is no out-parameter to leave stale, and an error carries no outcome at
-/// all.
-///
-/// [`Self::EMPTY`] is the zero-initialised state the C starts from, and every
-/// construction site below either uses it or names both fields, so the
-/// invariant is in the code rather than in a comment.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct ReadOutcome {
     /// How many bytes were written into the destination.
     pub(crate) bytes_read: usize,
     /// Whether those bytes are the last the client will provide.
-    ///
-    /// True WITH a non-zero `bytes_read` is normal and means "these bytes, and
-    /// no more after them" -- `cr_in` reports exactly that when a known length
-    /// is reached (`lib/sendf.c:726-729`). A caller that treated end-of-stream
-    /// as implying zero bytes would silently drop the final chunk of every
-    /// sized upload.
     pub(crate) eos: bool,
 }
 
@@ -3039,16 +2426,6 @@ impl ReadOutcome {
 }
 
 /// One stage of the reader chain.
-///
-/// Supersedes `struct Curl_crtype` (`lib/sendf.h:214-231`) together with
-/// `struct Curl_creader` (`:248-253`). The same four C members disappear as on
-/// the writer side -- the allocation size, the `void *ctx`, the `next` pointer
-/// and the name -- for the same reasons, which [`ClientWriter`] records.
-///
-/// Ten members become nine methods plus [`Self::kind`]. Eight of them have
-/// default bodies transcribed from the C's `Curl_creader_def_*` family
-/// (`lib/sendf.c:535-614`), so a stage that only transforms bytes writes
-/// [`Self::kind`], [`Self::phase`] and [`Self::read`].
 #[allow(dead_code)]
 pub(crate) trait ClientReader: fmt::Debug {
     /// Which reader this is, and therefore what it is called.
@@ -3076,10 +2453,6 @@ pub(crate) trait ClientReader: fmt::Debug {
 
     /// `do_read` (`lib/sendf.h:217-218`).
     ///
-    /// Defaults to `Curl_creader_def_read` (`lib/sendf.c:550-563`): pull from
-    /// the stage below, or fail with [`CURLcode::ReadError`] when there is
-    /// none.
-    ///
     /// # Errors
     ///
     /// Whatever the stage below returns, or [`CURLcode::ReadError`] at the
@@ -3103,42 +2476,18 @@ pub(crate) trait ClientReader: fmt::Debug {
 
     /// `needs_rewind` (`lib/sendf.h:220`): whether a retry would need this
     /// stage put back to its start.
-    ///
-    /// Defaults to `Curl_creader_def_needs_rewind` (`lib/sendf.c:565-571`):
-    /// false. Note that the default does NOT consult the stage below, unlike
-    /// [`Self::total_length`] -- transcribed as it stands, because the two C
-    /// defaults really do differ, and [`ClientReaderStack::needs_rewind`] walks
-    /// the whole chain itself.
     fn needs_rewind(&self) -> bool {
         false
     }
 
     /// `total_length` (`lib/sendf.h:221-222`): how many bytes this stage will
     /// ultimately provide, or -1 when that is indeterminate.
-    ///
-    /// Defaults to `Curl_creader_def_total_length` (`lib/sendf.c:573-578`): the
-    /// stage below's answer, or -1 at the bottom. A stage that CHANGES the
-    /// length -- [`CrLineConv`], chunked framing -- must override this with -1,
-    /// because forwarding a length it is about to alter would be a lie.
-    ///
-    /// The view of the chain below is a [`ReaderQuery`] and not a
-    /// [`ReaderTail`], because this is the one member of `struct Curl_crtype`
-    /// that asks rather than acts. The C cannot draw that distinction -- every
-    /// member of the vtable takes a non-const `struct Curl_easy *` and a
-    /// non-const `struct Curl_creader *`, so the signature says nothing about
-    /// what the body does -- and here a query provably cannot mutate the chain
-    /// it walks.
     fn total_length(&self, below: &ReaderQuery<'_, '_>) -> i64 {
         below.total_length()
     }
 
     /// `resume_from` (`lib/sendf.h:223-224`): start reading at `offset`
     /// instead of at the beginning.
-    ///
-    /// Defaults to `Curl_creader_def_resume_from` (`lib/sendf.c:580-588`):
-    /// [`CURLcode::ReadError`], meaning "not supported by this stage". Only a
-    /// stage at [`ClientReaderPhase::Client`] is ever asked, because
-    /// [`ClientReaderStack::resume_from`] walks to that phase first.
     ///
     /// # Errors
     ///
@@ -3154,11 +2503,6 @@ pub(crate) trait ClientReader: fmt::Debug {
     }
 
     /// `cntrl` (`lib/sendf.h:225-226`): tell this stage something.
-    ///
-    /// Defaults to `Curl_creader_def_cntrl` (`lib/sendf.c:590-598`):
-    /// success, having done nothing. The C's `switch` has a `default:` arm that
-    /// absorbs an unknown opcode; here the argument is a
-    /// [`ReaderControl`], so there is no unknown opcode to absorb.
     ///
     /// # Errors
     ///
@@ -3194,13 +2538,6 @@ pub(crate) trait ClientReader: fmt::Debug {
 }
 
 /// The remainder of a reader chain, below the stage currently running.
-///
-/// The read-side counterpart of [`WriterTail`], and the successor of
-/// `struct Curl_creader`'s `next` member. An empty tail is the successor of a
-/// `NULL` `next`, and reading through one is [`CURLcode::ReadError`] --
-/// `Curl_creader_read`'s `if(!reader)` (`lib/sendf.c:521-522`) and
-/// `Curl_creader_def_read`'s `else` branch (`:558-562`) both produce exactly
-/// that.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct ReaderTail<'stack, 'data> {
@@ -3298,11 +2635,6 @@ impl<'stack, 'data> ReaderQuery<'stack, 'data> {
 
 /// The reader chain, owned.
 ///
-/// Supersedes `data->req.reader_stack` (`lib/request.h:90`) and the sixteen
-/// functions that walk it. Ordered by phase, lowest first, so index 0 is the
-/// stage a read reaches first and the last index is the
-/// [`ClientReaderPhase::Client`] stage that actually produces bytes.
-///
 /// # The lifetime is what makes `cr_buf` safe
 ///
 /// `Curl_creader_set_buf`'s own header comment is *"Set the client reader the
@@ -3353,9 +2685,6 @@ impl<'data> ClientReaderStack<'data> {
     /// `Curl_creader_create` (`lib/sendf.c:922-947`): initialise a stage,
     /// before it joins any chain.
     ///
-    /// The writer side's reasoning applies unchanged; see
-    /// [`ClientWriterStack::create`].
-    ///
     /// # Errors
     ///
     /// Whatever [`ClientReader::init`] returns. The stage is dropped on the way
@@ -3396,14 +2725,6 @@ impl<'data> ClientReaderStack<'data> {
     }
 
     /// `cl_reset_reader` (`lib/sendf.c:58-68`): close and discard every stage.
-    ///
-    /// Does NOT clear `reader_started`, although the C's function does at
-    /// `:61`. That assignment belongs to the state the caller holds, and every
-    /// caller here -- [`ClientIo::client_cleanup`], [`ClientIo::client_reset`],
-    /// [`ClientIo::client_start`] and the three `set_*` installers -- performs
-    /// it through the context, so the flag and the chain still move together.
-    /// Keeping it out of this function is what lets the function take no
-    /// context beyond the one it needs to close stages with.
     #[allow(dead_code)]
     pub(crate) fn clear(&mut self, ctx: &mut ClientCtx<'_>) {
         while !self.stages.is_empty() {
@@ -3458,11 +2779,6 @@ impl<'data> ClientReaderStack<'data> {
 
     /// `Curl_creader_client_length` (`lib/sendf.c:1414-1420`): what the
     /// CLIENT-phase stage will provide, ignoring every encoding above it.
-    ///
-    /// The header explains what it is for (`lib/sendf.h:362-368`): it *"may not
-    /// match the amount of bytes read for a request"* but *"allows for rough
-    /// estimation of the overall length"*. -1 when there is no client stage at
-    /// all.
     #[allow(dead_code)]
     pub(crate) fn client_length(&self) -> i64 {
         match self.client_index() {
@@ -3550,9 +2866,6 @@ impl<'data> ClientReaderStack<'data> {
     /// `Curl_creader_unpause` (`lib/sendf.c:1430-1443`): clear the paused state
     /// of every stage.
     ///
-    /// Each step is traced with the C's wording, `"unpausing %s -> %d"`, which
-    /// names the stage and its result.
-    ///
     /// # Errors
     ///
     /// The first failing [`ClientReader::control`] result.
@@ -3577,12 +2890,6 @@ impl<'data> ClientReaderStack<'data> {
 
     /// `Curl_creader_clear_eos` (`lib/sendf.c:526-533`): tell every stage to
     /// forget that it saw the end of the stream.
-    ///
-    /// The result is DISCARDED at every stage, as the C's `(void)` cast at
-    /// `:530` discards it, and the walk continues past a failure. That is not
-    /// an oversight to be corrected: no stage's [`ReaderControl::ClearEos`] can
-    /// fail, and stopping early would leave part of the chain believing the
-    /// stream had ended.
     #[allow(dead_code)]
     pub(crate) fn clear_eos(&mut self, ctx: &mut ClientCtx<'_>) {
         for index in 0..self.stages.len() {
@@ -3630,25 +2937,13 @@ impl<'data> ClientReaderStack<'data> {
     }
 }
 
-// =========================================================================
 // `cr_in` -- the input callback reader, `lib/sendf.c:616-920`
-// =========================================================================
 
 /// The scratch area `cr_in_resume_from` reads and discards through.
-///
-/// `char scratch[4 * 1024]` (`lib/sendf.c:782`), reproduced at exactly that
-/// size. The size is observable: it decides how many times the input callback
-/// is invoked to skip a given offset, and a callback that counts its own
-/// invocations -- which several of the fixture-driven test programs do -- would
-/// see a different sequence at any other size.
 #[allow(dead_code)]
 const RESUME_SCRATCH_LEN: usize = 4 * 1024;
 
 /// The reader that pulls bytes from the application.
-///
-/// Supersedes `cr_in` and `struct cr_in_ctx` (`lib/sendf.c:616-920`), the stage
-/// at [`ClientReaderPhase::Client`] that every upload not backed by a memory
-/// buffer or by MIME bottoms out in.
 ///
 /// # Errors are STICKY, and that is a contract
 ///
@@ -3663,10 +2958,6 @@ const RESUME_SCRATCH_LEN: usize = 4 * 1024;
 /// | the callback aborted | YES | `:688-695` |
 /// | the callback asked to pause on a networkless scheme | NO | `:697-705` |
 /// | the callback returned more than it was given | YES | `:714-724` |
-///
-/// So a premature end can be retried and an abort cannot. That asymmetry is
-/// reproduced exactly; [`Self::error`] is `Some` only for the two sticky
-/// cases.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct CrIn<'src> {
@@ -3698,16 +2989,6 @@ pub(crate) struct CrIn<'src> {
 
 impl<'src> CrIn<'src> {
     /// A reader over `source`, declaring `total_len` bytes.
-    ///
-    /// `cr_in_init` (`lib/sendf.c:629-637`) copies the callback out of
-    /// `data->state` and sets `total_len` to -1; `Curl_creader_set_fread` then
-    /// overwrites it at `:1134`. The two steps collapse into one constructor
-    /// here, because a reader that briefly claimed an unknown length before
-    /// being told the real one would be a state no caller can observe.
-    ///
-    /// `total_len` is -1 for an unknown length; any other negative value is
-    /// treated the same way by every test below, all of which are
-    /// `total_len >= 0`.
     #[allow(dead_code)]
     pub(crate) fn new(
         source: Option<Box<dyn ClientReadSource + 'src>>,
@@ -3846,17 +3127,6 @@ impl<'src> CrIn<'src> {
     /// The read-and-discard fallback of `cr_in_resume_from`
     /// (`lib/sendf.c:781-802`).
     ///
-    /// Reached only when the seek callback reported
-    /// [`SeekOutcome::CantSeek`], or when there is none at all -- `seekerr` is
-    /// initialised to that value at `:760`.
-    ///
-    /// The loop is a `do ... while(passed < offset)`, so it runs AT LEAST ONCE
-    /// even for a zero offset. Transcribed as it stands: a zero offset with a
-    /// callback that returns nothing is therefore an error in the C, and
-    /// [`ClientReaderStack::resume_from`]'s callers never pass one, because
-    /// `Curl_creader_resume_from`'s own contract calls a negative offset
-    /// something to ignore, and zero something no caller asks for.
-    ///
     /// # The request length is CLAMPED to the scratch area, which the C does
     /// not do
     ///
@@ -3871,13 +3141,6 @@ impl<'src> CrIn<'src> {
     /// enormous count, so the C asks the application to write approximately
     /// 2^64 bytes into a 4 KiB stack array. That is a latent buffer overflow,
     /// not a behaviour to reproduce.
-    ///
-    /// [`so_to_usize_range`] with a ceiling of [`RESUME_SCRATCH_LEN`] is used
-    /// instead. For every offset the C's own contract admits the two agree
-    /// exactly, so no observable behaviour of any correct caller moves; for a
-    /// negative offset the outcome becomes a request for zero bytes, which the
-    /// error below then reports honestly. Specification 0.8.1 freezes
-    /// behaviour, and a memory-safety defect is not behaviour.
     ///
     /// # Errors
     ///
@@ -4161,15 +3424,6 @@ impl ClientReader for CrIn<'_> {
     /// 4. **Reduce the declared length** (`:805-813`), and fail when the offset
     ///    consumed all of it.
     ///
-    /// # A negative offset
-    ///
-    /// `lib/sendf.h:376-377` says *"negative values will be ignored"*, and this
-    /// is where they are: a negative offset makes step 3's `passed < offset`
-    /// true at once, so nothing is discarded, and step 4's subtraction then
-    /// INCREASES the length, which cannot reach the `<= 0` failure. The
-    /// arithmetic saturates rather than wrapping, so no offset -- however
-    /// extreme -- can panic or underflow here.
-    ///
     /// # Errors
     ///
     /// * [`CURLcode::ReadError`] when reading has already begun, when the seek
@@ -4251,18 +3505,9 @@ impl ClientReader for CrIn<'_> {
     }
 }
 
-// =========================================================================
 // `cr_lc` -- the line-ending converter, `lib/sendf.c:957-1094`
-// =========================================================================
 
 /// The chunk size `cr_lc_init` gives its queue.
-///
-/// `Curl_bufq_init2(&ctx->buf, (16 * 1024), 1, BUFQ_OPT_SOFT_LIMIT)`
-/// (`lib/sendf.c:969`). Sixteen kibibytes, ONE nominal chunk, and a SOFT limit
-/// -- which together are what the C's comment at `:1028` relies on: *"on a soft
-/// limit bufq, we do not need to check length"*. A soft limit lets the queue
-/// exceed its nominal chunk count rather than refusing a write, so conversion
-/// can never fail for want of room, whatever the input.
 #[allow(dead_code)]
 const LINECONV_CHUNK_LEN: usize = 16 * 1024;
 
@@ -4272,28 +3517,10 @@ const LINECONV_CHUNKS: usize = 1;
 
 /// Appends every byte of `bytes` to `queue`.
 ///
-/// The successor of the C's `Curl_bufq_cwrite(&ctx->buf, p, len, &n)` calls at
-/// `lib/sendf.c:1029`, `:1031` and `:1038`, all three of which IGNORE the
-/// written count `n` for the reason the comment at `:1028` gives. This loops
-/// anyway, so the guarantee is structural rather than inherited: if a queue
-/// without a soft limit were ever passed here, a short write would be completed
-/// instead of silently dropping bytes.
-///
-/// An empty slice writes nothing and succeeds. That case is real --
-/// `buf[start..i]` is empty whenever a bare line feed is the first byte of a
-/// run -- and [`BufQ::write`] answers `Ok(0)` for it, so the guard below exists
-/// to keep the loop's progress argument simple rather than to correct the
-/// queue.
-///
 /// # Errors
 ///
 /// Whatever [`BufQ::write`] returns, which for a soft-limit queue is only the
 /// [`CURLcode::OutOfMemory`] its contract retains.
-///
-/// # Termination
-///
-/// Every turn either appends at least one byte, which shortens `remaining`, or
-/// returns. There is no path that repeats without progress.
 #[allow(dead_code)]
 fn queue_write_all(queue: &mut BufQ, bytes: &[u8]) -> CurlResult<()> {
     let mut remaining = bytes;
@@ -4314,12 +3541,6 @@ fn queue_write_all(queue: &mut BufQ, bytes: &[u8]) -> CurlResult<()> {
 /// The reader that turns a bare line feed into a carriage return / line feed
 /// pair.
 ///
-/// Supersedes `cr_lc` and `struct cr_lc_ctx` (`lib/sendf.c:957-1094`).
-/// Installed at [`ClientReaderPhase::ContentEncode`] and only when
-/// [`ClientConfig::crlf`] or [`ClientConfig::prefer_ascii`] asks for it AND the
-/// client stage reports a non-zero length -- see
-/// [`ClientReaderStack::init_from_client`].
-///
 /// # What it converts, and what it leaves alone
 ///
 /// A line feed is converted only when it is BARE. An existing pair is left
@@ -4330,9 +3551,9 @@ fn queue_write_all(queue: &mut BufQ, bytes: &[u8]) -> CurlResult<()> {
 /// buffer.
 ///
 /// Nothing else is touched. Not a lone carriage return, not a line feed
-/// followed by a carriage return, not any other byte: specification 0.6.7
-/// compares uploaded bytes literally, so the transformation is exactly the one
-/// the C performs and nothing more.
+/// followed by a carriage return, not any other byte: uploaded bytes are
+/// compared literally by the fixture corpus, so the transformation is exactly
+/// the one the C performs and nothing more.
 ///
 /// # Why the length becomes indeterminate
 ///
@@ -4365,12 +3586,6 @@ impl Default for CrLineConv {
 
 impl CrLineConv {
     /// A converter with an empty queue.
-    ///
-    /// `cr_lc_init` (`lib/sendf.c:965-971`). The queue is built here rather
-    /// than in [`ClientReader::init`] because a Rust value is fully formed
-    /// before anything can use it, so there is no window in which the queue
-    /// does not exist -- and `cr_lc_close`'s `Curl_bufq_free` (`:973-978`) is
-    /// the drop of that field.
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
@@ -4401,13 +3616,6 @@ impl CrLineConv {
     }
 
     /// The conversion itself: `lib/sendf.c:1019-1041`.
-    ///
-    /// Reads `bytes` and appends the converted form to the queue. Split out of
-    /// [`Self::read`] so that the read reads as one sequence, and because this
-    /// loop is the part worth checking against the C line by line. Made
-    /// `pub(crate)` so the test module can drive it directly with a pinned
-    /// [`Self::prev_cr`] rather than having to arrange a whole chain to reach
-    /// it.
     ///
     /// # Errors
     ///
@@ -4468,29 +3676,8 @@ impl ClientReader for CrLineConv {
     /// `Curl_bufq_cread(&ctx->buf, buf, blen, pnread)` at `:1046` -- and it is
     /// what lets conversion happen with one buffer rather than two.
     ///
-    /// # The end of the stream is DEFERRED
-    ///
-    /// When the stage below reports the end of its stream, this stage does NOT
-    /// pass that on until its queue has drained (`:1047-1051`). Reporting it
-    /// early would tell the caller there is nothing more while converted bytes
-    /// were still held, and those bytes would never be sent.
-    ///
     /// # The no-line-feed shortcut does NOT update `prev_cr`, and that is
     /// transcribed rather than corrected
-    ///
-    /// `:1010-1017` returns before the conversion loop when the buffer holds
-    /// no line feed, so [`Self::prev_cr`] is left exactly as it was. The
-    /// consequence is observable and is measured in this file's test module: a
-    /// carriage return that arrives in a buffer with no line feed in it is
-    /// forgotten, so a pair split so that its carriage return lands in such a
-    /// buffer becomes `\r\r\n`. A pair split after a buffer that DID hold a
-    /// line feed is preserved, because the loop ran and recorded the carriage
-    /// return.
-    ///
-    /// This is curl 8.19.0-DEV's behaviour, and specification 0.8.1 freezes it:
-    /// tracking the carriage return through the shortcut as well would produce
-    /// different uploaded bytes from the C on the same input, which is a
-    /// wire-parity failure however much more sensible it looks.
     ///
     /// # Errors
     ///
@@ -4591,25 +3778,9 @@ impl ClientReader for CrLineConv {
     }
 }
 
-// =========================================================================
 // `cr_null` -- the empty source, `lib/sendf.c:1235-1283`
-// =========================================================================
 
 /// The reader that provides nothing at all.
-///
-/// Supersedes `cr_null` (`lib/sendf.c:1235-1270`). Installed by
-/// [`ClientIo::set_null`] for a request whose body is known to be empty -- a
-/// `POST` with no data, for instance -- so that the chain has a
-/// [`ClientReaderPhase::Client`] stage without an application callback being
-/// consulted for bytes that do not exist.
-///
-/// It has no state, so `sizeof(struct Curl_creader)` is what the C registers
-/// for it (`:1269`).
-///
-/// Its length is ZERO and not -1, which is the detail that matters:
-/// [`ClientReaderStack::init_from_client`] tests the client stage's length
-/// before installing the line converter, so a zero-length source never gets one
-/// (`:1111`).
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct CrNull;
@@ -4651,34 +3822,9 @@ impl ClientReader for CrNull {
     }
 }
 
-// =========================================================================
 // `cr_buf` -- the borrowed-buffer source, `lib/sendf.c:1285-1406`
-// =========================================================================
 
 /// The reader that hands up bytes from a buffer it does NOT own.
-///
-/// Supersedes `cr_buf` and `struct cr_buf_ctx` (`lib/sendf.c:1285-1384`).
-/// Installed by [`ClientIo::set_buf`] for a request body the caller already
-/// holds in memory -- `CURLOPT_POSTFIELDS`, chiefly.
-///
-/// # The buffer is BORROWED, and the compiler knows it
-///
-/// `lib/sendf.h:418` states the contract in prose: *"Set the client reader the
-/// reads from the supplied buf (NOT COPIED)"*. Here `'data` states it in the
-/// type. A reader over a borrowed buffer cannot outlive the buffer, so the
-/// dangling read the C's contract only warns about is not expressible.
-///
-/// Nothing is copied on installation, and nothing is copied on a read beyond
-/// the bytes the caller asked for -- which is the one copy the C performs too,
-/// with `memcpy` at `:1307`.
-///
-/// # `blen` and `buf` are one field
-///
-/// The C keeps a pointer and a length and advances the pointer while
-/// decrementing the length (`:1367-1368`). A slice carries both, so
-/// `Self::remaining` is the C's pair and cannot go out of step with itself --
-/// which is a real hazard in the C, where a `resume_from` that advanced the
-/// pointer without shortening the length would read past the buffer.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct CrBuf<'data> {
@@ -4719,13 +3865,6 @@ impl ClientReader for CrBuf<'_> {
     }
 
     /// `cr_buf_read` (`lib/sendf.c:1292-1315`).
-    ///
-    /// Hands up as much as the destination will take, and reports the end of
-    /// the stream on the read that reaches the last byte -- WITH those bytes,
-    /// not after them. An exhausted or empty buffer answers zero bytes and the
-    /// end of the stream, which is the C's `if(!nread || !ctx->buf)` at
-    /// `:1300`: a null pointer and a zero remaining length take the same
-    /// branch, and an empty slice is the successor of both.
     fn read(
         &mut self,
         ctx: &mut ClientCtx<'_>,
@@ -4764,11 +3903,6 @@ impl ClientReader for CrBuf<'_> {
 
     /// `cr_buf_total_length` (`lib/sendf.c:1341-1347`): the length of the
     /// buffer the reader was given, or of what remains of it after a resume.
-    ///
-    /// NOT the length still unread. The C returns `ctx->blen`, which
-    /// `resume_from` shortens but a read does not, so this answer is stable
-    /// across reads -- and it has to be, because a caller uses it to declare a
-    /// `Content-Length` before any reading happens.
     fn total_length(&self, _below: &ReaderQuery<'_, '_>) -> i64 {
         i64::try_from(self.remaining.len()).unwrap_or(i64::MAX)
     }
@@ -4812,12 +3946,6 @@ impl ClientReader for CrBuf<'_> {
 
     /// `cr_buf_cntrl` (`lib/sendf.c:1325-1339`): only
     /// [`ReaderControl::Rewind`] does anything.
-    ///
-    /// The C's `switch` handles `CURL_CRCNTRL_REWIND` and falls to `default:`
-    /// for the other two, so neither an unpause nor a clear-EOS touches this
-    /// reader -- and neither needs to: it is never paused, and its
-    /// end-of-stream answer is derived from `index` rather than remembered, so
-    /// a rewind clears it as a side effect.
     fn control(
         &mut self,
         _ctx: &mut ClientCtx<'_>,
@@ -4831,9 +3959,7 @@ impl ClientReader for CrBuf<'_> {
     }
 }
 
-// =========================================================================
 // The default input source -- the safe successor of `fread` plus `fseek`
-// =========================================================================
 
 /// An input source over anything that can be read and seeked.
 ///
@@ -4846,11 +3972,6 @@ impl ClientReader for CrBuf<'_> {
 ///   [`ClientReadSource::seek_to_start`] answering [`Some`];
 /// * `fseek`'s -1-and-consult-`errno` protocol becomes a
 ///   [`std::io::Result`].
-///
-/// Any `Read + Seek` will do, which is what makes the rewind path of
-/// [`CrIn::rewind`] testable over a [`std::io::Cursor`] with no file system
-/// involved -- and a real upload is a [`std::fs::File`], which satisfies both
-/// bounds.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct StreamReadSource<S> {
@@ -4880,23 +4001,6 @@ impl<S: Read + Seek> StreamReadSource<S> {
 
 impl<S: Read + Seek + fmt::Debug> ClientReadSource for StreamReadSource<S> {
     /// One `fread`.
-    ///
-    /// # Why an error becomes zero bytes
-    ///
-    /// `fread` reports a read error and the end of the file identically -- a
-    /// short item count -- and leaves the caller to distinguish them with
-    /// `ferror`, which curl's default path does NOT do. So a failing read
-    /// presents to `cr_in` as the end of the upload, and `cr_in` then judges it
-    /// against the declared length: a sized upload fails with
-    /// [`CURLcode::ReadError`] and *"client read function EOF fail"*, and an
-    /// unsized one ends cleanly. Reproducing that means answering
-    /// [`SourceRead::Bytes`] with zero rather than inventing an error variant
-    /// the C's default path cannot produce.
-    ///
-    /// [`std::io::ErrorKind::Interrupted`] is retried instead, because it means
-    /// "nothing happened, ask again" -- the C library's `fread` retries a
-    /// signal-interrupted read internally, so surfacing it would be a
-    /// difference rather than a faithful reproduction.
     fn read(&mut self, buf: &mut [u8]) -> SourceRead {
         loop {
             match self.stream.read(buf) {
@@ -4917,20 +4021,11 @@ impl<S: Read + Seek + fmt::Debug> ClientReadSource for StreamReadSource<S> {
     }
 }
 
-// =========================================================================
 // The reader chain's installers -- `lib/sendf.c:1096-1178`
-// =========================================================================
 
 impl<'data> ClientReaderStack<'data> {
     /// `do_init_reader_stack` (`lib/sendf.c:1096-1122`): make `client` the
     /// whole chain, and add the line converter when it is wanted.
-    ///
-    /// The ORDER of the two tests is what matters, and the C's own comment says
-    /// so: *"if we do not have 0 length init, and crlf conversion is wanted,
-    /// add the reader for it"* (`:1109-1110`). The length is asked of the
-    /// client stage FIRST, so a source that provides nothing -- [`CrNull`],
-    /// whose length is 0 -- never gets a converter, whatever the settings
-    /// say. A length of -1, "unknown", is NOT zero and does get one.
     ///
     /// # Errors
     ///
@@ -4980,27 +4075,9 @@ impl<'data> ClientReaderStack<'data> {
     }
 }
 
-// =========================================================================
 // `ClientIo` -- the two chains and their lifecycle
-// =========================================================================
 
 /// The two chains of one transfer, and the five operations that manage them.
-///
-/// Supersedes the pair of fields `struct SingleRequest` holds for them --
-/// `writer_stack` and `reader_stack` (`lib/request.h:87` and `:90`) -- together
-/// with `Curl_client_write`, `Curl_client_read`, `Curl_client_cleanup`,
-/// `Curl_client_reset` and `Curl_client_start`.
-///
-/// `transfer/request.rs` embeds this; nothing else needs to.
-///
-/// # The factory
-///
-/// The base writer stack needs two stages that `transfer/writeout.rs` owns, and
-/// the lazily created input reader needs the application's callback. All three
-/// arrive through [`ClientIoFactory`], which the transfer engine supplies once
-/// and this type then holds for the life of the request -- so a chain rebuilt
-/// after a reset is rebuilt from the same source as the first one, which is
-/// what the C achieves by reading `data->state` again.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct ClientIo<'data> {
@@ -5144,10 +4221,6 @@ impl<'data> ClientIo<'data> {
 
     /// `do_init_writer_stack` (`lib/sendf.c:325-368`) on demand.
     ///
-    /// Exposed so that a caller which needs the four standard stages present
-    /// before it writes -- or a test that wants to assert their order -- can
-    /// ask for them without writing a byte.
-    ///
     /// # Errors
     ///
     /// Whatever [`ClientWriterStack::init_base`] returns.
@@ -5180,15 +4253,6 @@ impl<'data> ClientIo<'data> {
     ///    tokens is a SUCCESSFUL read of nothing -- backpressure, not an error
     ///    -- and the caller retries when the limiter says to.
     /// 4. **The chain runs** (`:1213-1214`), and the outcome is traced.
-    ///
-    /// # The tokens are not spent here
-    ///
-    /// Step 3 CONSULTS the limiter; it does not charge it. The charge happens
-    /// when the bytes are actually accounted for, through
-    /// [`Progress::upload_inc`], because bytes that were read but not yet sent
-    /// have not consumed any bandwidth. Draining on the read instead would pace
-    /// the transfer by what the application produced rather than by what went
-    /// out.
     ///
     /// # Errors
     ///
@@ -5271,9 +4335,6 @@ impl<'data> ClientIo<'data> {
     /// `Curl_creader_set_fread` (`lib/sendf.c:1124-1142`): make the
     /// application's callback the source, declaring `len` bytes.
     ///
-    /// Replaces whatever chain was installed, so a caller that had a converter
-    /// gets a fresh one built by [`ClientReaderStack::init_from_client`].
-    ///
     /// # Errors
     ///
     /// Whatever [`ClientReaderStack::init_from_client`] returns.
@@ -5329,9 +4390,6 @@ impl<'data> ClientIo<'data> {
     /// `Curl_creader_set_buf` (`lib/sendf.c:1386-1406`): make the source a
     /// buffer the caller still owns.
     ///
-    /// The buffer is NOT copied, and `'data` is what makes that safe; see
-    /// [`CrBuf`].
-    ///
     /// # Errors
     ///
     /// Whatever [`ClientReaderStack::init_from_client`] returns.
@@ -5365,12 +4423,6 @@ impl<'data> ClientIo<'data> {
     /// `Curl_creader_set` (`lib/sendf.c:1165-1178`): make `reader` the whole
     /// chain.
     ///
-    /// The general form of the three `set_*` installers above, for a source
-    /// another module owns -- the MIME reader, chiefly. Takes ownership of
-    /// `reader`, as the C's header promises at `lib/sendf.h:321`, so a failed
-    /// installation destroys it rather than leaving the caller a stage it can
-    /// no longer install.
-    ///
     /// # Errors
     ///
     /// Whatever [`ClientReaderStack::init_from_client`] returns.
@@ -5392,11 +4444,6 @@ impl<'data> ClientIo<'data> {
 
     /// `Curl_creader_add` (`lib/sendf.c:1144-1163`): install a reader stage
     /// above the source.
-    ///
-    /// Builds the default source first when the chain is empty (`:1150-1154`),
-    /// so a chunked encoder installed before anything else still has something
-    /// beneath it to pull from -- the read-side counterpart of the writer
-    /// chain's lazy base stack.
     ///
     /// # Errors
     ///
@@ -5432,13 +4479,6 @@ impl<'data> ClientIo<'data> {
     }
 
     /// `Curl_client_cleanup` (`lib/sendf.c:70-77`): tear both chains down.
-    ///
-    /// The readers go FIRST and the writers second, which is the C's order at
-    /// `:72-73`. Then the two counters are reset (`:75-76`).
-    ///
-    /// Unlike [`Self::client_reset`] this ignores `rewind_read` entirely: a
-    /// cleanup is the end of the transfer, so there is no next request to
-    /// rewind for.
     #[allow(dead_code)]
     pub(crate) fn client_cleanup(&mut self, ctx: &mut ClientCtx<'_>) {
         self.reset_readers(ctx);
@@ -5450,13 +4490,6 @@ impl<'data> ClientIo<'data> {
 
     /// `Curl_client_reset` (`lib/sendf.c:79-93`): tear the chains down between
     /// requests, KEEPING the readers when a rewind is pending.
-    ///
-    /// The one asymmetry between the two chains, and it is the whole point of
-    /// the function: the writers always go, and the readers survive when
-    /// `rewind_read` is set -- because rewinding them is what
-    /// [`Self::client_start`] is going to do, and a chain that had been
-    /// destroyed could not be rewound. The C traces which of the two happened,
-    /// and both wordings are preserved.
     #[allow(dead_code)]
     pub(crate) fn client_reset(&mut self, ctx: &mut ClientCtx<'_>) {
         if ctx.read_state().rewind_read {
@@ -5475,13 +4508,6 @@ impl<'data> ClientIo<'data> {
     }
 
     /// `Curl_client_start` (`lib/sendf.c:95-115`): a new request is beginning.
-    ///
-    /// Does nothing at all unless a rewind is pending. When one is, every
-    /// reader is told to rewind, in chain order, and the chain is DISCARDED --
-    /// which looks contradictory and is not: the rewind puts the underlying
-    /// source back to its start, and the chain is then rebuilt on the next read
-    /// so that any encoding stage starts fresh. Rewinding without discarding
-    /// would leave a line converter holding bytes from the previous attempt.
     ///
     /// # Errors
     ///
@@ -5892,11 +4918,6 @@ mod tests {
 
     /// The mutable half of a [`ScriptSource`], shared between every handle onto
     /// it.
-    ///
-    /// [`ClientIoFactory::input_source`] must hand out handles onto ONE stream,
-    /// because the C copies a function pointer and a client-data pointer that
-    /// both denote one `FILE *`. Keeping the state behind an [`Rc`] is how this
-    /// double honours that.
     #[derive(Debug, Default)]
     struct SourceState {
         script: VecDeque<Step>,
@@ -6744,15 +5765,6 @@ mod tests {
 
     /// A factory stage whose initialisation fails leaves the stages installed
     /// BEFORE it standing, and a later write goes through that partial chain.
-    ///
-    /// This is `lib/sendf.c`'s behaviour, not a simplification of it: each of
-    /// the builder's three later steps reads `if(result) return result` with
-    /// nothing between it and the return (`:346-347`, `:355-356`, `:364-365`),
-    /// so `data->req.writer_stack` keeps pointing at the stages already
-    /// installed and `Curl_client_write`'s `if(!data->req.writer_stack)`
-    /// (`:390`) is then false. The stage that failed is freed by
-    /// `Curl_cwriter_create` itself (`:426-427`) -- and freed WITHOUT its
-    /// `do_close`, which is why nothing is recorded for it here.
     #[test]
     fn a_failed_base_stage_leaves_the_partial_chain() {
         let recorder = log();
@@ -8995,8 +8007,6 @@ mod tests {
         assert_eq!(io.readers().client_length(), 0);
     }
 
-    /// A source with a non-zero length DOES get a converter when either setting
-    /// asks for one, and it lands at the content-encode phase above the source.
     #[test]
     fn a_converter_is_installed_when_either_setting_asks() {
         let recorder = log();
@@ -9625,12 +8635,6 @@ mod tests {
     /// Arbitrary reads through a converter over a callback source never panic,
     /// always terminate, and deliver exactly the converted stream however the
     /// destination is sliced.
-    ///
-    /// The script is one byte a step, because a source hands back whatever the
-    /// destination can hold and the destination here is as small as one byte.
-    /// That is also the interesting shape: a bare line feed alone in a one-byte
-    /// buffer converts to TWO bytes, so the queue and the deferred end of
-    /// stream are exercised on every round.
     #[test]
     fn arbitrary_reads_terminate() {
         // No carriage return anywhere, so the shortcut documented on

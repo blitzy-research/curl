@@ -28,25 +28,15 @@
 //! what the C answers for a null part. A second definition of any of the
 //! twelve anywhere in the crate is a link error rather than a review finding.
 //!
-//! `curl_mime_free` is declared `void`, so it has **no error channel at all**.
-//! A null handle is a silent no-op, exactly as `lib/mime.c:1086` makes it, and
-//! a contained panic is a silent return. Whatever it learns about a fault, it
-//! keeps to itself -- which also matters because the fixture corpus compares
-//! output byte for byte and a diagnostic on standard error would corrupt it.
-//!
 //! # No wire bytes are produced here
 //!
 //! Boundary generation, part ordering, `Content-Disposition` and
 //! `Content-Type` emission, header casing, CRLF placement and every
 //! transfer-encoding belong to `curl_rs_lib::mime`. This module marshals and
 //! nothing else: it copies bytes across the boundary, resolves handles, and
-//! calls one engine method per entry point. Specification 0.8.1 freezes the
-//! wire form and 0.6.7 measures the consequence -- 1,476 of 1,914 fixtures
-//! compare exact bytes with `compareparts`, which joins both sides into a
-//! single string, so there is no per-line matching, no normalisation and no
-//! reordering, and 48 fixtures gate on the `Mime` feature specifically. The
-//! boundary is randomised (`lib/rand.c`), and it stays randomised: making it
-//! deterministic here would be a behaviour change, which 0.8.2 prohibits.
+//! calls one engine method per entry point. The boundary is randomised
+//! (`lib/rand.c`), and it stays randomised: making it deterministic here would
+//! be a behaviour change, which 0.8.2 prohibits.
 //!
 //! # CORRECTION 21: the handle-typedef inventory is SEVEN, not five
 //!
@@ -65,59 +55,8 @@
 //! as ABI-visible as `CURLU` is. [`super::handle`] owns their Rust
 //! declarations; this module names them and declares neither. `CURL *easy` in
 //! [`curl_mime_init`] is `*mut c_void`, because `typedef void CURL;`
-//! (curl.h:109) and specification 0.6.3 records that consumers assign a
+//! (curl.h:109), and consumers assign a
 //! `CURL *` to a `void *` throughout `docs/examples/`.
-//!
-//! # The three ownership transfers, and which one the caller must not undo
-//!
-//! This is the hardest thing in the file, and each of the three is a leak or a
-//! double free when got wrong.
-//!
-//! 1. **[`curl_mime_init`] to [`curl_mime_free`]** -- specification 0.3.3's
-//!    pattern P8. `Box::into_raw` on the way out, `Box::from_raw` on the way
-//!    back, through [`super::handle`]'s matched helpers. The handle belongs to
-//!    the caller until it is either freed or handed on per (3). **`into_raw`
-//!    happens in `curl_mime_init` alone and `from_raw` in `curl_mime_free`
-//!    alone.**
-//! 2. **[`curl_mime_addpart`] lends, it does not give.** The returned
-//!    `curl_mimepart *` is owned by the `curl_mime` that produced it and dies
-//!    with it. There is deliberately no `curl_mime_freepart` in the 100-symbol
-//!    set, and no code path here reclaims a part pointer. See the section
-//!    below for why that forces a particular backing store.
-//! 3. **[`curl_mime_subparts`] takes ownership, on success only.** A caller
-//!    that also frees the handle it passed causes a double free, so
-//!    `docs/libcurl/curl_mime_subparts.md` tells it not to. On **failure**
-//!    ownership does not move and the caller remains responsible;
-//!    `MimePart::set_subparts` returns the handle inside its error for exactly
-//!    that reason, and this module hands it straight back.
-//!
-//! [`curl_mime_headers`] is a fourth, conditional transfer: `take_ownership`
-//! non-zero makes the `curl_slist` chain the part's, to be released "upon
-//! replacement or mime structure deletion"
-//! (`docs/libcurl/curl_mime_headers.md:38-40`); zero leaves it the caller's,
-//! and the chain must then outlive the part. A retained chain is released with
-//! [`super::slist::curl_slist_free_all`], the same crate-uniform allocator a
-//! consumer would use, because a mismatch between two allocators over one
-//! block is heap corruption rather than a wrong answer.
-//!
-//! # Why a part pointer needs a stable-address backing store
-//!
-//! `Mime` keeps its parts in a `Vec<MimePart>`, so appending can **move** every
-//! part already in it. A `curl_mimepart *` pointing into that vector would be
-//! dangling after the next [`curl_mime_addpart`] -- and
-//! `docs/examples/smtp-mime.c` does exactly that: it calls `curl_mime_addpart`
-//! again and then keeps using an earlier part. **A bare `Vec<MimePart>` is
-//! therefore unusable as the store behind a handed-out pointer**, and the
-//! engine says so itself: `Mime::add_part`'s documentation directs
-//! `curl-rs-ffi` to take the part's *position* from `Mime::len` and reach it
-//! again through `Mime::part_mut`.
-//!
-//! So what C receives is not a pointer into the engine at all. It is a
-//! [`PartBox`] -- one independent `Box` per part, owned by the root handle,
-//! holding the path at which the engine part lives. A `Box`'s pointee never
-//! moves, so every pointer this module has ever handed out stays valid for as
-//! long as the tree does, and each one carries enough information to be
-//! validated against its parent before anything is dereferenced.
 //!
 //! # Panic containment
 //!
@@ -145,9 +84,7 @@ use super::types::{
     curl_free_callback, curl_read_callback, curl_seek_callback,
 };
 
-// ---------------------------------------------------------------------------
 // Constants transcribed from the frozen headers and from `lib/mime.c`.
-// ---------------------------------------------------------------------------
 
 /// `CURL_ZERO_TERMINATED` (curl.h:2420): `((size_t)-1)`.
 ///
@@ -203,17 +140,10 @@ const MIME_MAGIC: u64 = 0x4d49_4d45_5f52_5300;
 /// `PART_RS` followed by a NUL.
 const PART_MAGIC: u64 = 0x5041_5254_5f52_5300;
 
-// ---------------------------------------------------------------------------
 // The representation behind the two opaque handles.
-// ---------------------------------------------------------------------------
 
 /// Where a part lives: the root handle that owns it, and the chain of part
 /// indices that reaches it from that root's tree.
-///
-/// A path of `[2]` is the third part of the root's own multipart; `[2, 0]` is
-/// the first part of the multipart nested inside it. An empty path names the
-/// root's tree itself, which is what a [`MimeBox`] that is still a root
-/// reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Location {
     /// The handle whose `tree` currently holds this part. Never null in a
@@ -232,15 +162,6 @@ struct Location {
 /// `curl_mime_free` on a transferred handle a detectable no-op rather than a
 /// double free.
 /// `#[repr(C)]` so that `magic` is guaranteed to sit at offset 0.
-///
-/// That guarantee is load-bearing rather than cosmetic. A caller can hand any
-/// pointer to an entry point -- most realistically a `curl_mimepart *` where a
-/// `curl_mime *` belongs, which is precisely the confusion the two magic words
-/// exist to catch -- and the record it addresses may be SMALLER than this one.
-/// The magic therefore has to be readable before anything asserts that the rest
-/// of the record exists, and under `repr(Rust)` the compiler is free to place it
-/// anywhere. `repr(C)` costs nothing here: the type never crosses the ABI as a
-/// layout contract, only its address does, as an opaque pointer.
 #[repr(C)]
 struct MimeBox {
     /// [`MIME_MAGIC`] in a live handle. **Must remain the first field**; see the
@@ -276,7 +197,6 @@ struct MimeBox {
     /// `Box` per element, never a flat `Vec<PartBox>`: the addresses of these
     /// records are what C holds, so they must not move when the vector grows.
     /// The vector's own buffer may move freely; only the pointees matter.
-    //
     // `clippy::vec_box` reads this as redundant indirection, and for an
     // ordinary collection it would be right. Here the indirection IS the
     // requirement:
@@ -298,12 +218,6 @@ struct MimeBox {
 }
 
 /// What a `curl_mimepart *` actually addresses.
-///
-/// Never independently freeable: it is owned by the [`MimeBox`] whose `parts`
-/// vector holds its `Box`, and is released when that handle is. There is no
-/// `curl_mime_freepart` in the export set and this module offers no equivalent.
-/// `#[repr(C)]` for the same reason as [`MimeBox`]: the magic must be readable
-/// at a fixed offset before the record's extent is assumed.
 #[repr(C)]
 struct PartBox {
     /// [`PART_MAGIC`] in a live record. **Must remain the first field.**
@@ -313,29 +227,13 @@ struct PartBox {
     at: Location,
 
     /// The `curl_slist` chain this part owns, or null.
-    ///
-    /// Non-null exactly when [`curl_mime_headers`] was last called with a
-    /// non-null chain and a non-zero `take_ownership`. The C keeps the
-    /// caller's pointer and releases it on replacement or on tree deletion
-    /// (`lib/mime.c:1401-1408` and `:1072-1073`), and so does this: the
-    /// pointer is retained here rather than released at the call, because the
-    /// documented contract lets a caller keep reading the chain until the tree
-    /// goes away.
     owned_headers: *mut curl_slist,
 }
 
-// ---------------------------------------------------------------------------
 // The caller's read/seek/free triple, adapted to the engine's reader trait.
-// ---------------------------------------------------------------------------
 
 /// A part whose content comes from the caller's callbacks:
 /// `MIMEKIND_CALLBACK`.
-///
-/// The three function pointers and the `void *arg` are copied verbatim and
-/// never interpreted, which is what `PartReader`'s own documentation asks of
-/// this crate -- including the consequence that a duplicated part shares one
-/// `arg` and therefore reaches `freefunc` once per part, exactly as
-/// `lib/mime.c:1122-1123` shares it.
 struct CallbackReader {
     /// `part->readfunc`. Non-`None` in a constructed reader, because
     /// `lib/mime.c:1424` installs nothing at all when `readfunc` is null.
@@ -370,14 +268,6 @@ impl core::fmt::Debug for CallbackReader {
 impl PartReader for CallbackReader {
     /// `part->readfunc(buffer, 1, bufsize, part->arg)`
     /// (`lib/mime.c:722`).
-    ///
-    /// The C always passes `size = 1` and `nitems = bufsize`, so the product
-    /// is the buffer length and the slice expresses it exactly. The six
-    /// outcomes are the six the C's `switch` at `:731-742` distinguishes, and
-    /// the sentinels are tested **before** the byte count, exactly as that
-    /// `switch` orders them -- which is why a caller that returns
-    /// `0x10000000` bytes is read as an abort in both implementations. The
-    /// ambiguity is the ABI's, not this crate's.
     fn read(&mut self, buf: &mut [u8]) -> ReadStatus {
         let Some(readfunc) = self.readfunc else {
             // Not constructible through `curl_mime_data_cb`, which installs
@@ -439,12 +329,6 @@ impl PartReader for CallbackReader {
     }
 
     /// A second reader over the same source.
-    ///
-    /// `Curl_mime_duppart` copies the three pointers and the `void *arg`
-    /// unchanged (`lib/mime.c:1122-1123`), so the two parts share one context
-    /// and duplication cannot fail. That is reproduced literally, and it
-    /// carries the C's consequence with it: the shared `arg` reaches
-    /// `freefunc` once per part.
     fn duplicate(&self) -> Box<dyn PartReader> {
         Box::new(Self {
             readfunc: self.readfunc,
@@ -458,12 +342,6 @@ impl PartReader for CallbackReader {
 impl Drop for CallbackReader {
     /// `if(part->freefunc) part->freefunc(part->arg);`
     /// (`lib/mime.c:1026-1027`).
-    ///
-    /// `cleanup_part_content` is what runs the caller's release hook, and it
-    /// runs on every route out of a callback part: replacement by another
-    /// `curl_mime_*` setter, and destruction of the tree. Dropping this
-    /// reader is that same moment, expressed once instead of at every site
-    /// that could reach it.
     fn drop(&mut self) {
         let Some(freefunc) = self.freefunc else {
             return;
@@ -479,9 +357,7 @@ impl Drop for CallbackReader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Navigation inside a tree. Both are safe: they take a borrow and return one.
-// ---------------------------------------------------------------------------
 
 /// The nested multipart at `path`, counted in parts from `tree` downwards.
 ///
@@ -505,30 +381,9 @@ fn part_at<'a>(tree: &'a mut Mime, path: &[usize]) -> Option<&'a mut MimePart> {
     mime_at(tree, prefix)?.part_mut(*last)
 }
 
-// ---------------------------------------------------------------------------
 // Handle validation. Each reads a caller's pointer once and copies out what it
 // needs, so that no borrow of a handle is alive when the next one is taken.
-// ---------------------------------------------------------------------------
 
-/// The root a `curl_mime *` currently resolves to, and the path of the part
-/// that holds its tree.
-///
-/// A live root answers `(itself, [])`. A handle whose tree was absorbed
-/// answers the root that absorbed it and the path of the consuming part, which
-/// is what keeps [`curl_mime_addpart`] working on a transferred handle. `None`
-/// covers a null pointer, a pointer that is not a mime handle, and the
-/// transient state in which a tree has been taken out but not yet re-homed --
-/// which is only observable if a panic was contained in between.
-///
-/// # Safety
-///
-/// `handle` must be either null or a pointer that [`curl_mime_init`] returned
-/// and that [`curl_mime_free`] has not reclaimed. The magic word makes the
-/// check best-effort rather than sound: it rejects a pointer from the wrong
-/// opaque family and a freed block whose bytes have since been reused, but a
-/// genuine use-after-free onto still-mapped memory that still holds the word
-/// cannot be distinguished from a live handle by any means available to a
-/// library.
 /// Reads a candidate record's magic word without asserting its extent.
 ///
 /// Both [`MimeBox`] and [`PartBox`] are `repr(C)` with `magic: u64` first, so
@@ -551,6 +406,38 @@ unsafe fn magic_of<T>(record: *const T) -> u64 {
     unsafe { record.cast::<u64>().read_unaligned() }
 }
 
+/// The root a `curl_mime *` belongs to, and the absolute path of the subtree.
+///
+/// `None` for a handle this module cannot vouch for: null, a record whose magic
+/// word does not match, or a handle whose forwarding entry has been cleared.
+/// A `Some` answer carries the *root* handle -- which is the handle itself for
+/// a tree owner, and the owner of the tree it was grafted into for a
+/// subtree -- together with the index path from that root.
+///
+/// # Safety
+///
+/// The caller must guarantee both of the following. Neither can be checked
+/// here, which is why this is an `unsafe fn` rather than a safe one that
+/// returns an error.
+///
+/// * `handle` is either null, or a pointer that [`curl_mime_init`] returned and
+///   [`curl_mime_free`] has not reclaimed. A dangling pointer to freed storage
+///   satisfies no check below: the magic word is read out of memory the
+///   allocator may have reused, so a stale handle can spuriously match.
+/// * If non-null, `handle` addresses at least eight readable, initialised
+///   bytes. Every record either family allocates is larger than a `u64`, so any
+///   live handle of either family satisfies this -- including a
+///   `curl_mimepart *` passed where a `curl_mime *` belongs, which is the case
+///   the magic word exists to reject rather than to trust.
+///
+/// The magic word is a *best-effort* filter and not a validity proof. It turns
+/// the overwhelmingly likely mistakes -- a null handle, a handle of the wrong
+/// family, uninitialised storage -- into a clean `None`, and it cannot detect a
+/// use-after-free. [`part_identity`] carries the identical caveat.
+///
+/// The eight-byte read is deliberately narrower than forming a `&MimeBox`: see
+/// the safety comment inside, which records the AddressSanitizer report that
+/// narrowing it fixed.
 unsafe fn mime_identity(
     handle: *mut curl_mime,
 ) -> Option<(*mut curl_mime, Vec<usize>)> {
@@ -616,14 +503,6 @@ unsafe fn part_identity(
 
 /// Runs `body` against a root handle, under the crate's transactional guard.
 ///
-/// Two things happen that plain containment cannot do: a tree already poisoned
-/// by an earlier contained panic short-circuits to `fallback` without running
-/// `body` at all, and a panic inside `body` poisons the tree before the
-/// fallback is returned, because at that point the mutation's progress is
-/// unknown. [`curl_mime_free`] is the documented exception and does **not**
-/// come through here -- freeing a poisoned tree has to keep working, or a
-/// contained defect becomes a leak.
-///
 /// # Safety
 ///
 /// `root` must be a pointer that [`mime_identity`] or [`part_identity`]
@@ -670,13 +549,6 @@ unsafe fn with_root<R: Copy>(
 
 /// The index in `root.parts` of the record `part` addresses, if the root owns
 /// it.
-///
-/// This is the validation the module documentation promises: a record is
-/// accepted only when the root it names actually holds it, so a pointer from a
-/// tree that has been freed and a pointer forged from thin air are both
-/// rejected with the family-correct error rather than dereferenced. Comparing
-/// addresses never dereferences `part`, so the search is sound even when the
-/// pointer is not.
 fn slot_of(root: &MimeBox, part: *mut curl_mimepart) -> Option<usize> {
     let wanted: *const PartBox = part.cast::<PartBox>().cast_const();
     root.parts
@@ -730,9 +602,7 @@ unsafe fn with_part<R: Copy>(
     unsafe { with_root(root, fallback, resolve) }
 }
 
-// ---------------------------------------------------------------------------
 // 1 of 12: curl_mime_init
-// ---------------------------------------------------------------------------
 
 /// Creates a mime context and returns its handle.
 ///
@@ -740,19 +610,6 @@ unsafe fn with_part<R: Copy>(
 /// frozen at `include/curl/curl.h:2442`. Answers null when the platform cannot
 /// supply the entropy the boundary is built from, which is the C's own bail-out
 /// at `:1194-1197`.
-///
-/// `easy` is accepted and **never dereferenced**. The C passes it only to
-/// `Curl_rand_alnum`, because that is where the C keeps its generator; the
-/// engine's `Mime::with_system_rng` asks the crate's own sanctioned
-/// constructor for a fresh system-seeded generator instead, so there is
-/// nothing here to read out of the handle. The parameter keeps its name
-/// because the frozen prototype spells it `CURL *easy` and the generated
-/// header reproduces the spelling.
-///
-/// The returned handle belongs to the **caller** until it is either released
-/// with [`curl_mime_free`] or handed on with [`curl_mime_subparts`] or
-/// `CURLOPT_MIMEPOST`. Creating it from an easy handle does not make the easy
-/// handle its owner.
 ///
 /// # Safety
 ///
@@ -783,31 +640,12 @@ pub unsafe extern "C" fn curl_mime_init(easy: *mut c_void) -> *mut curl_mime {
     })
 }
 
-// ---------------------------------------------------------------------------
 // 2 of 12: curl_mime_free
-// ---------------------------------------------------------------------------
 
 /// Releases a mime handle and everything below it.
 ///
 /// Supersedes `curl_mime_free` (`lib/mime.c:1081-1095`), frozen at
 /// `include/curl/curl.h:2451`. A null handle is a no-op, as it is in C.
-///
-/// This is the **only** function in this module that reclaims an allocation,
-/// and the counterpart of [`curl_mime_init`]'s `into_raw`. It releases, in
-/// order: every `curl_slist` chain a part was given ownership of, every
-/// tombstone left behind by a subparts transfer, and then the engine tree
-/// itself, whose drop glue performs the recursive release that the C's walk
-/// over `firstpart` performs.
-///
-/// # A transferred handle is a silent no-op, not a double free
-///
-/// Once [`curl_mime_subparts`] has accepted a handle, the tree belongs to the
-/// part and `docs/libcurl/curl_mime_subparts.md` tells the caller not to free
-/// it. A caller that does anyway would double-free in C. Here the handle
-/// survives the transfer as an inert tombstone, so this function recognises it
-/// and returns without touching anything. That is strictly safer than the C
-/// and takes nothing away: there is no defined C behaviour to preserve for a
-/// call the documentation forbids.
 ///
 /// # Safety
 ///
@@ -832,10 +670,6 @@ pub unsafe extern "C" fn curl_mime_free(mime: *mut curl_mime) {
         // SAFETY: non-null by the check above and, by this function's
         // contract, addressing a live `MimeBox`. The shared borrow ends inside
         // this block.
-        //
-        // The magic is read FIRST, through `magic_of`, so that a pointer to a
-        // smaller record of the other family is rejected before anything
-        // asserts this record's extent.
         let (ours, transferred) = unsafe {
             if magic_of(mime) != MIME_MAGIC {
                 (false, false)
@@ -909,11 +743,6 @@ unsafe fn release(mime: *mut curl_mime) {
 
 /// Releases every `curl_slist` chain the handle's parts were given ownership
 /// of, and forgets them.
-///
-/// `Curl_mime_cleanpart` frees `userheaders` when `MIME_USERHEADERS_OWNER` is
-/// set (`lib/mime.c:1072-1073`); this is that, for every part at once. The
-/// records are drained rather than iterated, so a chain cannot be released
-/// twice however many times this runs.
 fn release_owned_chains(boxed: &mut MimeBox) {
     for record in boxed.parts.drain(..) {
         let chain = record.owned_headers;
@@ -930,9 +759,7 @@ fn release_owned_chains(boxed: &mut MimeBox) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // 3 of 12: curl_mime_addpart
-// ---------------------------------------------------------------------------
 
 /// Appends an empty part and returns a handle to it.
 ///
@@ -1002,9 +829,7 @@ pub unsafe extern "C" fn curl_mime_addpart(
     unsafe { with_root(root, null, append) }
 }
 
-// ---------------------------------------------------------------------------
 // The four string setters, which share one shape.
-// ---------------------------------------------------------------------------
 
 /// The one way [`borrowed_str`] can fail: a string this crate cannot decode.
 ///
@@ -1015,10 +840,6 @@ pub unsafe extern "C" fn curl_mime_addpart(
 struct Undecodable;
 
 /// A caller's NUL-terminated string as UTF-8, or the reason it is not usable.
-///
-/// `Ok(None)` is a null pointer, which every string setter here treats as
-/// "clear this field" rather than as an error, exactly as the C's
-/// `Curl_safefree` followed by `if(name)` does.
 ///
 /// `Err(Undecodable)` is a non-null string that is not valid UTF-8. **This is
 /// the one place this module is narrower than the C**, which stores arbitrary
@@ -1100,10 +921,6 @@ pub unsafe extern "C" fn curl_mime_name(
 /// `part` is `CURLE_BAD_FUNCTION_ARGUMENT`, a null `filename` clears and
 /// answers `CURLE_OK`, and the string is copied.
 ///
-/// Clearing is also how a caller withdraws the filename that
-/// [`curl_mime_filedata`] sets as a side effect, which the C documents at
-/// `lib/mime.c:1330-1333`.
-///
 /// # Safety
 ///
 /// As [`curl_mime_name`], with `filename` in place of `name`.
@@ -1136,12 +953,6 @@ pub unsafe extern "C" fn curl_mime_filename(
 ///
 /// Supersedes `curl_mime_type` (`lib/mime.c:1348-1362`), frozen at
 /// `include/curl/curl.h:2489`. The same shape as [`curl_mime_name`].
-///
-/// A type set here is the part's *custom* type: it wins over inference and it
-/// also disables the engine's `text/plain` suppression, so
-/// `curl_mime_type(part, "text/plain")` emits a header that an inferred
-/// `text/plain` would have had removed. That asymmetry is the C's and is
-/// reproduced by the engine; nothing about it is decided here.
 ///
 /// # Safety
 ///
@@ -1217,14 +1028,9 @@ pub unsafe extern "C" fn curl_mime_encoder(
     })
 }
 
-// ---------------------------------------------------------------------------
 // 8 of 12: curl_mime_data
-// ---------------------------------------------------------------------------
 
 /// Sets a mime part's content from bytes held in memory.
-///
-/// Supersedes `curl_mime_data` (`lib/mime.c:1273-1297`), frozen at
-/// `include/curl/curl.h:2508`.
 ///
 /// `datasize` is a `size_t`. **Note the asymmetry with
 /// [`curl_mime_data_cb`], whose `datasize` is a `curl_off_t`** -- the two
@@ -1234,14 +1040,6 @@ pub unsafe extern "C" fn curl_mime_encoder(
 /// genuinely different code path from a real length: with the sentinel the
 /// bytes stop at the first NUL, and with a length they do not, so a buffer
 /// holding an interior NUL is stored differently by each.
-///
-/// The bytes are **copied**, as `curlx_memdup0` copies them, so the caller may
-/// release or reuse its buffer as soon as this returns.
-///
-/// A null `data` clears the content and answers `CURLE_OK`, because the C's
-/// `if(data)` guard runs after `cleanup_part_content`. That is not the same as
-/// a zero length: `curl_mime_data(part, "", 0)` installs a part of length zero,
-/// which still emits its headers and its delimiters.
 ///
 /// # Safety
 ///
@@ -1290,27 +1088,13 @@ pub unsafe extern "C" fn curl_mime_data(
     })
 }
 
-// ---------------------------------------------------------------------------
 // 9 of 12: curl_mime_filedata
-// ---------------------------------------------------------------------------
 
 /// Sets a mime part's content from a named local file.
 ///
 /// Supersedes `curl_mime_filedata` (`lib/mime.c:1300-1344`), frozen at
 /// `include/curl/curl.h:2518`. The file is opened at transfer time, not here;
 /// what happens here is a `stat` and the recording of the path.
-///
-/// The C's order of operations is observable and the engine reproduces it: the
-/// content is cleared first, so a failed call leaves the part with no content
-/// rather than with its previous content; a path that cannot be stat'ed is
-/// `CURLE_READ_ERROR` and nothing is installed; only a regular file gets a
-/// known size, so a FIFO or a device keeps an unknown one and is not seekable;
-/// and the remote filename is set to the path's base name as a side effect,
-/// which a caller withdraws by calling [`curl_mime_filename`] with null
-/// afterwards.
-///
-/// A null `filename` clears the content and answers `CURLE_OK` without
-/// touching the remote filename.
 ///
 /// # Safety
 ///
@@ -1340,29 +1124,12 @@ pub unsafe extern "C" fn curl_mime_filedata(
     })
 }
 
-// ---------------------------------------------------------------------------
 // 10 of 12: curl_mime_data_cb
-// ---------------------------------------------------------------------------
 
 /// Sets a mime part's content from the caller's callbacks.
 ///
 /// Supersedes `curl_mime_data_cb` (`lib/mime.c:1415-1435`), frozen at
 /// `include/curl/curl.h:2528-2533`.
-///
-/// `datasize` is a **`curl_off_t`**, unlike [`curl_mime_data`]'s `size_t`; the
-/// frozen header spells them differently and the difference is preserved. It is
-/// stored verbatim, so `-1` means "length unknown" and propagates all the way
-/// to the downstream `Content-Length`-versus-chunked decision. No length is
-/// inferred from anywhere.
-///
-/// A null `readfunc` is a **reset**, not an error: the C clears the content and
-/// then installs nothing, which means `seekfunc`, `freefunc` and `arg` are
-/// discarded unused and `arg` is never released. Reproduced exactly.
-///
-/// The three pointers and `arg` are copied and never interpreted. If the part
-/// is later duplicated, the copy shares one `arg` and `freefunc` therefore runs
-/// once per part, which is the C's own consequence of copying the pointers at
-/// `lib/mime.c:1122-1123`.
 ///
 /// # Safety
 ///
@@ -1415,9 +1182,7 @@ pub unsafe extern "C" fn curl_mime_data_cb(
     })
 }
 
-// ---------------------------------------------------------------------------
 // 11 of 12: curl_mime_subparts
-// ---------------------------------------------------------------------------
 
 /// Sets a mime part's content from a nested multipart, **taking ownership**.
 ///
@@ -1435,21 +1200,6 @@ pub unsafe extern "C" fn curl_mime_data_cb(
 /// | it is the part's own root | `:1458-1466` | 43 | **the caller** |
 /// | it cannot be rewound | `:1472-1474` | rewind failed | **the caller** |
 /// | otherwise | `:1476-1483` | `CURLE_OK` | the part |
-///
-/// So **on success the caller must not call [`curl_mime_free`] on the handle it
-/// passed**, and on failure it still must. `MimePart::set_subparts` returns the
-/// handle inside its error precisely so that the distinction cannot be
-/// overlooked, and this function hands it straight back into the handle the
-/// caller is holding.
-///
-/// # The statement order is the C's, not the engine's
-///
-/// `Curl_mime_set_subparts` runs its `cleanup_part_content` **before** the
-/// three failure checks, so a failed call leaves the part with no content at
-/// all rather than with what it had. The engine's own method checks first and
-/// cleans up after, which would leave the previous content in place; the
-/// difference is observable, so the content is cleared here, in the C's
-/// position, before the engine is asked to attach anything.
 ///
 /// # Safety
 ///
@@ -1470,11 +1220,6 @@ pub unsafe extern "C" fn curl_mime_subparts(
 }
 
 /// The body of [`curl_mime_subparts`], outside the containment closure.
-///
-/// Separate for one reason: the transfer needs several `unsafe` blocks of its
-/// own, and a closure written inside an `unsafe` block inherits that block, so
-/// nesting them there would make every inner justification a redundant
-/// annotation the zero-warnings gate rejects. Here each one stands on its own.
 ///
 /// # Safety
 ///
@@ -1672,9 +1417,7 @@ fn adopt(
     root.absorbed.push(donor_handle);
 }
 
-// ---------------------------------------------------------------------------
 // 12 of 12: curl_mime_headers
-// ---------------------------------------------------------------------------
 
 /// Sets a mime part's custom headers.
 ///
@@ -1682,36 +1425,7 @@ fn adopt(
 /// `include/curl/curl.h:2551-2553`. Answers `CURLE_OK` for every non-null
 /// `part`, as the C does, and `CURLE_BAD_FUNCTION_ARGUMENT` for a null one.
 ///
-/// `take_ownership` non-zero makes the chain the part's, "to be freed upon
-/// replacement or mime structure deletion", and the caller must then not free
-/// it (`docs/libcurl/curl_mime_headers.md:38-40`). Zero leaves the chain the
-/// caller's, and it must outlive the part. A null `headers` removes whatever
-/// was set. Setting a part's headers more than once is valid and only the last
-/// call's value is retained.
-///
-/// The C's "Allow setting twice the same list" guard at `:1402` is reproduced:
-/// an owned chain is released only when the replacement is a *different*
-/// pointer, so `curl_mime_headers(part, list, 1)` twice with one `list` does
-/// not free it and then keep it.
-///
 /// # Header order is preserved exactly, and nothing is filtered
-///
-/// The chain's order is the order these headers reach the wire, and
-/// specification 0.6.7 measures the corpus comparing whole request bodies as
-/// single strings. Nothing here sorts, folds, deduplicates, re-cases or
-/// validates: the caller's bytes are the caller's bytes, which is also what the
-/// C does.
-///
-/// # What is copied, and the one consequence of copying
-///
-/// The C keeps the caller's pointer and reads the chain when the body is built.
-/// The engine takes an owned list, so the contents are copied here, at the
-/// call. The caller's chain is *also* retained when it was given away, so that
-/// it stays readable for exactly as long as the C keeps it readable. The one
-/// difference is that a caller which mutates a chain **after** handing it over
-/// changes what the C would send and not what this sends -- a case the manual
-/// does not sanction, and one the copy-on-call discipline of every other setter
-/// in this family shares.
 ///
 /// # Safety
 ///
@@ -1880,17 +1594,12 @@ mod tests {
         list
     }
 
-    // -----------------------------------------------------------------------
     // The export inventory
-    // -----------------------------------------------------------------------
 
     #[test]
     fn this_module_defines_exactly_the_twelve_mime_symbols() {
-        // Read from disk rather than from a list kept here, so the assertion is
-        // about the file. `tests-rs/abi/symbol_parity.rs` does not exist
-        // yet, so
-        // this is the immediate enforcement of the family's share of the
-        // 100-symbol export set.
+        // Read from disk rather than from a list kept here, so the assertion
+        // is about the file.
         let source = include_str!("mime.rs");
         let mut found: Vec<&str> = Vec::new();
         for line in source.lines() {
@@ -1936,9 +1645,7 @@ mod tests {
         assert!(!found.iter().any(|name| name.starts_with("curl_form")));
     }
 
-    // -----------------------------------------------------------------------
     // Ownership: init, free, and the null and tombstone no-ops
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_handle_round_trips_through_init_and_free() {
@@ -2047,9 +1754,7 @@ mod tests {
         assert!(part.is_null());
     }
 
-    // -----------------------------------------------------------------------
     // The stable-address requirement, which is the hardest property to keep
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_part_pointer_survives_many_later_appends() {
@@ -2134,9 +1839,7 @@ mod tests {
         free(outer);
     }
 
-    // -----------------------------------------------------------------------
     // The subparts transfer, in both directions
-    // -----------------------------------------------------------------------
 
     #[test]
     fn freeing_a_transferred_handle_is_a_silent_no_op() {
@@ -2363,9 +2066,7 @@ mod tests {
         free(outer);
     }
 
-    // -----------------------------------------------------------------------
     // curl_mime_headers, both ownership directions
-    // -----------------------------------------------------------------------
 
     #[test]
     fn taking_ownership_releases_the_chain_with_the_tree() {
@@ -2472,9 +2173,8 @@ mod tests {
 
     #[test]
     fn header_order_is_preserved_exactly() {
-        // Order is wire-visible, and specification 0.6.7 makes it decisive.
-        // The engine holds the list, so the assertion is that this module hands
-        // the lines over unreordered.
+        // The engine holds the list, so the assertion is that this module
+        // hands the lines over unreordered.
         let mut list = ptr::null_mut::<curl_slist>();
         let lines = ["Z-Last: 3", "A-First: 1", "M-Middle: 2"];
         for line in lines {
@@ -2511,9 +2211,7 @@ mod tests {
         free(mime);
     }
 
-    // -----------------------------------------------------------------------
     // Content: data, the sentinel, filedata, and the encoder table
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_zero_terminated_sentinel_measures_with_strlen() {
@@ -2748,9 +2446,7 @@ mod tests {
         free(mime);
     }
 
-    // -----------------------------------------------------------------------
     // curl_mime_data_cb and the three callback typedefs
-    // -----------------------------------------------------------------------
 
     /// How many times [`counting_free`] has run, process-wide.
     static FREED: AtomicUsize = AtomicUsize::new(0);
@@ -3051,9 +2747,7 @@ mod tests {
         assert!(!shown.contains("deadbeef"), "no address: {shown}");
     }
 
-    // -----------------------------------------------------------------------
     // The two magic words, and the constants transcribed from the headers
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_two_opaque_families_carry_distinct_magic_words() {
@@ -3143,9 +2837,7 @@ mod tests {
         free(second);
     }
 
-    // -----------------------------------------------------------------------
     // Containment
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_clean_run_of_this_family_contains_no_panic() {

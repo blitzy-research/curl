@@ -4,8 +4,8 @@
 
 //! The tool's cached view of the library's self-description.
 //!
-//! This module supersedes `src/tool_libinfo.c` (211 lines) and
-//! `src/tool_libinfo.h` (71 lines). It asks the engine, once, what it can
+//! This module supersedes `src/tool_libinfo.c` and `src/tool_libinfo.h`. It
+//! asks the engine, once, what it can
 //! do; interns the protocol-name tokens the rest of the tool compares
 //! against; and derives the sixteen `feature_*` predicates that the option
 //! parser and the configuration layer branch on.
@@ -772,8 +772,7 @@ impl LibInfo {
     /// `src/tool_setup.h:58-60` shows curl's own fallback for an unconfigured
     /// build is the literal "unknown"; the engine supplies a real triplet, so
     /// that fallback is never needed and is deliberately not reimplemented
-    /// from platform constants, which AAP 0.6.7 rules out as an identity
-    /// source.
+    /// from platform constants, which are not an identity source.
     #[allow(dead_code)]
     pub(crate) fn host(&self) -> &'static str {
         self.curlinfo.host
@@ -900,7 +899,7 @@ impl LibInfo {
     /// `proto_rtsp` -- `src/tool_libinfo.c:42`.
     ///
     /// Always absent in this build: `rtsp` is one of the 24 stubbed schemes
-    /// (AAP 0.2.2), so the engine does not advertise it.
+    ///, so the engine does not advertise it.
     #[allow(dead_code)]
     pub(crate) fn proto_rtsp(&self) -> Option<&'static str> {
         self.protos.rtsp
@@ -1045,8 +1044,7 @@ impl LibInfo {
     /// `feature_spnego` -- read at `src/tool_getparam.c:1869,1925`.
     ///
     /// False unless the non-default `negotiate` Cargo feature is on, because
-    /// the engine withholds the `SPNEGO` name otherwise (AAP 0.8.5
-    /// conflict C2).
+    /// the engine withholds the `SPNEGO` name otherwise.
     #[allow(dead_code)]
     pub(crate) fn feature_spnego(&self) -> bool {
         self.features.spnego
@@ -1062,7 +1060,7 @@ impl LibInfo {
     /// implement that gate, and this accessor is what it will read.
     ///
     /// This module only *reports* that TLS exists. It decides nothing about
-    /// certificate verification, which AAP 0.8.1 freezes as on by default.
+    /// certificate verification, which is frozen as on by default.
     #[allow(dead_code)]
     pub(crate) fn feature_ssl(&self) -> bool {
         self.features.ssl
@@ -1114,7 +1112,7 @@ impl LibInfo {
 /// belongs to that call site rather than here. Turning the null check into a
 /// *new* failure condition, on an empty protocol list for instance, was
 /// rejected: C proceeds happily in that case and returns `CURLE_OK`, so
-/// erroring would be a behaviour change, which AAP 0.8.2 prohibits.
+/// erroring would be a behaviour change, which is prohibited.
 #[allow(dead_code)]
 fn version_info_payload() -> Option<&'static version::VersionInfo> {
     Some(version::version_info())
@@ -1663,7 +1661,7 @@ mod tests {
     /// against the engine's own gating and in the same (already sorted) order.
     ///
     /// A scheme is earned only when BOTH of its preconditions hold. The Cargo
-    /// feature is AAP 0.5.2's feature map: `file`, `http` and `https` are
+    /// feature is the workspace feature map: `file`, `http` and `https` are
     /// unconditional because everything else layers over HTTP, while `ftp`,
     /// `ssh` and `websockets` each carry two schemes. The engine is
     /// `version::ENGINE_PROTOCOLS` for every row plus `version::ENGINE_TLS` for
@@ -1737,7 +1735,7 @@ mod tests {
         );
 
         // With the shipped defaults and both engines present that is all nine,
-        // which is the configuration AAP 0.6.5 measures its 73.8% eligibility
+        // which is the configuration the measured fixture eligibility
         // against. While either engine is absent the same contract says the
         // set is empty, and both branches are asserted so neither reading is
         // left untested.
@@ -1835,8 +1833,8 @@ mod tests {
             );
         }
 
-        // AAP 0.8.5 conflict C2 plus 0.6.5: the three GSS-API-backed names may
-        // be claimed only when the ENGINE says so.
+        // The three GSS-API-backed names may be claimed only when the ENGINE
+        // says so.
         //
         // Asked of the engine, NOT of `cfg!(feature = "negotiate")` here. This
         // crate merely forwards `negotiate = ["curl-rs-lib/negotiate"]`, and
@@ -1885,8 +1883,8 @@ mod tests {
         assert_eq!(info.feature_ssls_export(), advertises("SSLS-EXPORT"));
 
         // The ARG_TLS gate at src/tool_getparam.c:2991 depends on this one.
-        // AAP 0.1.1 goal G4 makes TLS unswitchable, so no Cargo feature may
-        // appear in this claim -- but unswitchable is not the same as present,
+        // TLS is unswitchable, so no Cargo feature may appear in this claim --
+        // but unswitchable is not the same as present,
         // and the claim is withheld until the backend module exists. The
         // predicate therefore tracks version::ENGINE_TLS and nothing else,
         // which is also what makes --proto https and the ARG_TLS options

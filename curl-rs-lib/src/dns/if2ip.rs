@@ -24,11 +24,11 @@
 
 //! `--interface` resolution: an interface name to a local source address.
 //!
-//! Supersedes `lib/if2ip.c` (259 lines) and `lib/if2ip.h` (95 lines). Two
-//! functions, and between them they answer the only question the C file
-//! exists to answer: given the name a user typed after `--interface` (or
-//! `CURLOPT_INTERFACE`, or an FTP `PORT`/`EPRT` interface argument), which
-//! local address should the socket bind to?
+//! Supersedes `lib/if2ip.c` and `lib/if2ip.h`. Two functions, and between them
+//! they answer the only question the C file exists to answer: given the name a
+//! user typed after `--interface` (or `CURLOPT_INTERFACE`, or an FTP
+//! `PORT`/`EPRT` interface argument), which local address should the socket
+//! bind to?
 //!
 //! * [`ipv6_scope`] classifies an address into one of the five scopes of
 //!   `lib/if2ip.h:29-33`. It supersedes `Curl_ipv6_scope`
@@ -51,46 +51,6 @@
 //! | `:176-237` | `#elif defined(HAVE_IOCTL_SIOCGIFADDR)` | **DELIBERATELY NOT PORTED.** A legacy `ioctl(SIOCGIFADDR)` fallback for platforms outside the four-target matrix. Its own comment at `:223-225` concedes that it "cannot tell the difference between an interface that does not exist and an interface that has no address of the correct family" -- so it is not merely redundant here, it is strictly less informative than the branch above. |
 //! | `:239-258` | `#else` | **DELIBERATELY NOT PORTED.** A stub that discards every argument and returns `IF2IP_NOT_FOUND`. |
 //!
-//! `lib/if2ip.h:55-89` additionally defines a private `struct ifreq` and a
-//! `SIOCGIFADDR` value for `__INTERIX` ("Nedelcho Stanev's work-around for
-//! SFU 3.0"). It exists only to make the `ioctl` branch compile on Interix,
-//! which is outside the mandated targets, and it is not ported either.
-//!
-//! # This module is compiled UNCONDITIONALLY, and that is a decision
-//!
-//! `lib/if2ip.c:90` guards everything below `Curl_ipv6_scope` with
-//! `#if !defined(CURL_DISABLE_BINDLOCAL) || !defined(CURL_DISABLE_FTP)` --
-//! that is, it is compiled unless *both* local binding and FTP are disabled.
-//! There is no `bindlocal` capability among this crate's fifteen features, so
-//! the disjunction has no faithful `cfg` expression: `ftp` alone would be
-//! narrower than the C, and a `cfg` naming a feature that does not exist
-//! compiles to nothing at all and would silently delete this file. The module
-//! is therefore unconditional, which is the C's behaviour in every
-//! configuration a Cargo feature can select.
-//!
-//! # The syscall is somebody else's; the decisions are all here
-//!
-//! Enumerating the host's interfaces needs `getifaddrs(3)`, which has no safe
-//! expression. That call -- and only that call -- lives behind
-//! [`crate::ffi`], which is the crate's single `unsafe` island. This file
-//! contains no `libc` type, forms no pointer and performs no foreign call; it
-//! is the policy half of the split, and the seam hands it an owned snapshot.
-//!
-//! Three consequences of the split are worth stating, because each removes a
-//! line of the C that a reader may go looking for:
-//!
-//! * `freeifaddrs(head)` (`:170`) is inside the seam. There is nothing to
-//!   free here.
-//! * The `if(iface->ifa_addr)` guard (`:111`) is inside the seam. A node
-//!   without an address never reaches this file.
-//! * The `if(getifaddrs(&head) >= 0)` test (`:109`) is inside the seam, and
-//!   the seam reports failure as an error rather than as an empty list. C
-//!   tests `>= 0`, and on failure skips the whole walk and falls through to
-//!   `return res` at `:173` with `res` still `IF2IP_NOT_FOUND`. So this file
-//!   maps that error to [`If2IpResult::NotFound`] and never propagates it --
-//!   an enumeration failure is, to a caller, indistinguishable from an absent
-//!   interface, and `bindlocal` then retries the string as a hostname.
-//!
 //! # Deviations from the C, all three of them deliberate
 //!
 //! **1. Two snapshots where C takes one.** C makes a single `getifaddrs`
@@ -104,49 +64,10 @@
 //! same snapshot, provided for this purpose, and this file consults it only
 //! when the address walk has produced no name match at all.
 //!
-//! That second consultation re-enumerates. The window is real but its effect
-//! is bounded: it is entered only when the *first* snapshot held no
-//! representable node under the requested name, which is precisely when C
-//! would already have decided `IF2IP_NOT_FOUND`. So a list that changed
-//! underneath can only turn that `NOT_FOUND` into `AF_NOT_SUPPORTED`, never
-//! into a `FOUND` with an address C would not have chosen; and if the second
-//! call fails outright the verdict stays `NOT_FOUND`. No test fixture
-//! reconfigures an interface mid-call.
-//!
-//! **2. The rendered address cannot be truncated.** C renders into
-//! `char ipstr[64]` and `char scope[12]` (`:116-117`) and concatenates them
-//! into the caller's `buf` with `curl_msnprintf` (`:159`), so all three
-//! widths could in principle clip the answer. Here every one of them is a
-//! [`String`]: `scope` cannot clip a scope id of any magnitude, and the
-//! result cannot clip at all. This is a strict improvement and is recorded as
-//! a deviation only because it is one.
-//!
 //! **3. `af` is an enumeration, not an integer.** C threads `int af` and
 //! compares it against `sa_family`. `AF_INET6` is 10 on Linux and 30 on
 //! Darwin, so carrying the integer would put a platform constant in an engine
 //! signature; [`AddressFamily`] carries the same information without one.
-//!
-//! # Two names that differ from their C counterparts
-//!
-//! Both are reconciliations rather than substitutions -- the same function
-//! under the name this crate gives it:
-//!
-//! * `curl_strequal(iface->ifa_name, interf)` (`:113`, `:164`) becomes
-//!   [`casecompare`]. `util::strcase`'s `strequal` is the *public* entry
-//!   point and takes `Option<&CStr>` because it backs the exported
-//!   `curl_strequal` and owns its NULL-pointer rule; `casecompare` is the
-//!   byte-native comparator it delegates to for two non-NULL strings, and it
-//!   is the one the engine is meant to call. The fold is identical and
-//!   ASCII-only, which is the whole point of the C function
-//!   (`lib/strequal.c:28-33`).
-//! * `curlx_inet_ntop(af, addr, ipstr, sizeof(ipstr))` (`:158`) becomes
-//!   [`ntop4`] or [`ntop6`], selected by the arm that has already
-//!   discriminated on the family -- the fusion `util::inet`'s own
-//!   documentation prescribes for this call site. It is **not**
-//!   `Ipv4Addr::to_string` or `Ipv6Addr::to_string`: `util::inet` is the
-//!   transcription of `lib/curlx/inet_ntop.c` and diverges from
-//!   [`std::net`]'s formatter on IPv4-compatible addresses, and the text
-//!   reaches the user through `--interface` diagnostics and `--trace`.
 //!
 //! # This module is silent
 //!
@@ -164,9 +85,7 @@ use crate::ffi::{
 use crate::util::inet::{ntop4, ntop6};
 use crate::util::strcase::casecompare;
 
-// ---------------------------------------------------------------------------
 // IPv6 address scopes. `lib/if2ip.h:28-33`.
-// ---------------------------------------------------------------------------
 
 // The five values are C's own, and they are pinned rather than merely
 // reproduced: a caller passes one of them to `if2ip` as `remote_scope`, which
@@ -177,10 +96,6 @@ use crate::util::strcase::casecompare;
 // the comparison at `:125` is between two `unsigned int`s, one of which
 // arrives from outside, and an enumeration would have to describe what an
 // out-of-range integer means when C simply never matches it.
-//
-// `#[rustfmt::skip]` keeps the table aligned as a table. The values are
-// observable, so the shape that makes an error visible at a glance is worth
-// more here than the formatter's default.
 #[rustfmt::skip]
 mod scope {
     /// `IPV6_SCOPE_GLOBAL 0` -- *"Global scope."*
@@ -200,11 +115,11 @@ mod scope {
 /// Also the answer for every non-IPv6 address, and the answer the whole
 /// function collapses to in a build without IPv6: `lib/if2ip.h:38` reads
 /// `#define Curl_ipv6_scope(x) 0`.
-#[allow(dead_code)] // No consumer yet; conn/ and protocols/ftp/ pass these.
+#[allow(dead_code)] // consumers: conn/ and protocols/ftp/
 pub(crate) const IPV6_SCOPE_GLOBAL: u32 = scope::GLOBAL;
 
 /// `IPV6_SCOPE_LINKLOCAL 1` -- *"Link-local scope."* (`lib/if2ip.h:30`)
-#[allow(dead_code)] // No consumer yet; conn/ and protocols/ftp/ pass these.
+#[allow(dead_code)] // consumers: conn/ and protocols/ftp/
 pub(crate) const IPV6_SCOPE_LINKLOCAL: u32 = scope::LINKLOCAL;
 
 /// `IPV6_SCOPE_SITELOCAL 2` -- *"Site-local scope (deprecated)."*
@@ -213,20 +128,18 @@ pub(crate) const IPV6_SCOPE_LINKLOCAL: u32 = scope::LINKLOCAL;
 /// Deprecated by RFC 3879 and kept because the classifier still reports it:
 /// `fec0::/10` is matched at `lib/if2ip.c:74-75`, so an address in that range
 /// binds only to a site-local source address and never to a global one.
-#[allow(dead_code)] // No consumer yet; conn/ and protocols/ftp/ pass these.
+#[allow(dead_code)] // consumers: conn/ and protocols/ftp/
 pub(crate) const IPV6_SCOPE_SITELOCAL: u32 = scope::SITELOCAL;
 
 /// `IPV6_SCOPE_UNIQUELOCAL 3` -- *"Unique local"* (`lib/if2ip.h:32`)
-#[allow(dead_code)] // No consumer yet; conn/ and protocols/ftp/ pass these.
+#[allow(dead_code)] // consumers: conn/ and protocols/ftp/
 pub(crate) const IPV6_SCOPE_UNIQUELOCAL: u32 = scope::UNIQUELOCAL;
 
 /// `IPV6_SCOPE_NODELOCAL 4` -- *"Loopback."* (`lib/if2ip.h:33`)
-#[allow(dead_code)] // No consumer yet; conn/ and protocols/ftp/ pass these.
+#[allow(dead_code)] // consumers: conn/ and protocols/ftp/
 pub(crate) const IPV6_SCOPE_NODELOCAL: u32 = scope::NODELOCAL;
 
-// ---------------------------------------------------------------------------
 // The verdict. `lib/if2ip.h:41-45`.
-// ---------------------------------------------------------------------------
 
 /// The three outcomes of an interface lookup -- supersedes `if2ip_result_t`.
 ///
@@ -253,20 +166,8 @@ pub(crate) const IPV6_SCOPE_NODELOCAL: u32 = scope::NODELOCAL;
 /// * The FTP `PORT`/`EPRT` path uses the string as a hostname on
 ///   `IF2IP_NOT_FOUND` and abandons the transfer on
 ///   `IF2IP_AF_NOT_SUPPORTED` (`lib/ftp.c:1003-1008`).
-///
-/// Collapsing the two into a single "no" would turn that family retry into
-/// either a hard failure or a hostname lookup of an interface name.
-///
-/// # The out-parameter
-///
-/// C writes the rendered address into the caller's `char *buf` and reports
-/// only the verdict; the buffer is meaningful exactly when the verdict is
-/// `IF2IP_FOUND`, which its own comment states. Here the address travels
-/// inside [`If2IpResult::Found`], so the type makes that coupling
-/// unstateable rather than merely documented. [`If2IpResult::verdict`]
-/// recovers the C integer when one is needed.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)] // No consumer yet; conn/socket.rs and protocols/ftp/.
+#[allow(dead_code)] // consumers: conn/socket.rs and protocols/ftp/
 pub(crate) enum If2IpResult {
     /// `IF2IP_NOT_FOUND` -- *"Interface not found"*.
     ///
@@ -276,12 +177,6 @@ pub(crate) enum If2IpResult {
 
     /// `IF2IP_AF_NOT_SUPPORTED` -- *"Int. exists but has no address for this
     /// af"*.
-    ///
-    /// Reached three ways, all of which C spells out separately: a node whose
-    /// name matches but whose family does not (`lib/if2ip.c:163-166`), an
-    /// IPv6 address whose scope differs from the remote scope (`:125-132`),
-    /// and an IPv6 address whose scope id differs from a non-zero
-    /// `local_scope_id` (`:142-147`).
     AfNotSupported,
 
     /// `IF2IP_FOUND` -- *"The address has been stored in `buf`"*.
@@ -294,15 +189,7 @@ pub(crate) enum If2IpResult {
 
 impl If2IpResult {
     /// The `if2ip_result_t` integer this verdict corresponds to.
-    ///
-    /// `0`, `1` and `2`, written out rather than derived, because they are
-    /// `lib/if2ip.h:41-45`'s own values and a C consumer that ever sees them
-    /// -- through a future `curl-rs-ffi` surface, or through a test asserting
-    /// against the header -- holds the numbers and not the names. A
-    /// `#[repr(u32)]` enumeration cannot carry the [`String`] of
-    /// [`If2IpResult::Found`], so the mapping is stated as a function
-    /// instead; `tests::the_verdict_integers_are_the_headers_own` pins it.
-    #[allow(dead_code)] // No consumer yet; the ABI shim will convert through it.
+    #[allow(dead_code)] // consumer: the ABI shim, which converts through it
     pub(crate) const fn verdict(&self) -> u32 {
         match self {
             Self::NotFound => 0,
@@ -312,30 +199,12 @@ impl If2IpResult {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The scope classifier. `lib/if2ip.c:59-88`.
-// ---------------------------------------------------------------------------
 
 /// The scope of an address -- supersedes `Curl_ipv6_scope`
 /// (`lib/if2ip.c:61-87`).
 ///
-/// Returns one of [`IPV6_SCOPE_GLOBAL`], [`IPV6_SCOPE_LINKLOCAL`],
-/// [`IPV6_SCOPE_SITELOCAL`], [`IPV6_SCOPE_UNIQUELOCAL`] or
-/// [`IPV6_SCOPE_NODELOCAL`].
-///
 /// # The transcription is literal, and three details are why
-///
-/// C takes a `const struct sockaddr *` and tests `sa->sa_family == AF_INET6`,
-/// falling through to `return IPV6_SCOPE_GLOBAL` for anything else. An
-/// [`IpAddr::V4`] is that fall-through, so an IPv4 address is
-/// [`IPV6_SCOPE_GLOBAL`] -- which is also the answer
-/// `#define Curl_ipv6_scope(x) 0` (`lib/if2ip.h:38`) gives in a build without
-/// IPv6, so the two agree.
-///
-/// **The unique-local test runs before the `switch` and short-circuits it**
-/// (`:69-70`, comment `/* Handle ULAs */`). `(b[0] & 0xFE) == 0xFC` accepts
-/// `fc00::/7`, so both `fc00::/8` and `fd00::/8` are unique-local whatever
-/// the `switch` below would have said. The order is the behaviour.
 ///
 /// **The loopback test ORs bytes 1 through 14 and tests byte 15 separately**
 /// (`:77-81`):
@@ -347,23 +216,7 @@ impl If2IpResult {
 ///   break;
 /// return IPV6_SCOPE_NODELOCAL;
 /// ```
-///
-/// Byte 0 is absent from the OR because `w & 0xFFC0 == 0x0000` has already
-/// constrained it, and byte 15 is absent because it must equal `0x01` rather
-/// than merely be zero. So `::1` is node-local while `::` and `::2` are
-/// global -- an off-by-one in either bound is invisible until a loopback bind
-/// picks the wrong source address, which is why four tests pin exactly those
-/// cases.
-///
-/// # Why not [`std::net`]'s classifiers
-///
-/// `Ipv6Addr::is_loopback` and its relatives are not this function.
-/// `w & 0xFFC0 == 0xFE80` accepts the whole of `fe80::/10`, whereas Rust's
-/// `is_unicast_link_local` has carried more than one definition across
-/// releases and is not stable; `is_unique_local` is not stable either. Using
-/// them would make the classification depend on the compiler version and
-/// would not build under this crate's minimum supported Rust version.
-#[allow(dead_code)] // No consumer yet; conn/ and protocols/ftp/ call it.
+#[allow(dead_code)] // conn/ and protocols/ftp/ call it.
 #[must_use]
 pub(crate) fn ipv6_scope(addr: IpAddr) -> u32 {
     // `if(sa->sa_family == AF_INET6) { ... }` and the `return
@@ -433,20 +286,9 @@ pub(crate) fn ipv6_scope(addr: IpAddr) -> u32 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The interface walk. `lib/if2ip.c:94-174`, the HAVE_GETIFADDRS body.
-// ---------------------------------------------------------------------------
 
 /// The address family an [`IpAddr`] belongs to.
-///
-/// C compares `iface->ifa_addr->sa_family` against the requested `af`
-/// directly (`lib/if2ip.c:112`). The seam has already decoded the family into
-/// the [`IpAddr`] variant, so the comparison becomes this two-arm projection
-/// and no `AF_INET6` integer -- 10 on Linux, 30 on Darwin -- appears anywhere.
-///
-/// [`AddressFamily::Unix`] is unreachable from an [`IpAddr`], which is exact:
-/// a Unix-domain address has no interface, so C's comparison against
-/// `AF_UNIX` could never succeed either.
 const fn family_of(addr: IpAddr) -> AddressFamily {
     match addr {
         IpAddr::V4(_) => AddressFamily::Inet,
@@ -455,18 +297,6 @@ const fn family_of(addr: IpAddr) -> AddressFamily {
 }
 
 /// Whether any interface at all bears this name, whatever address it has.
-///
-/// The second projection of the seam's snapshot, and the reason it exists.
-/// `lib/if2ip.c:163-166` reaches `IF2IP_AF_NOT_SUPPORTED` through a node
-/// whose name matches while its family does not, and on both mandated
-/// operating systems every interface contributes such a node --
-/// `AF_PACKET` on Linux, `AF_LINK` on Darwin. Those carry no Internet
-/// address, so [`crate::ffi::interface_addrs`] cannot represent them and the
-/// address walk cannot see them; [`crate::ffi::interface_names`] can.
-///
-/// An enumeration failure answers `false`, which leaves the verdict at
-/// [`If2IpResult::NotFound`] -- the same verdict C reaches when `getifaddrs`
-/// fails.
 fn interface_name_exists(sys: &dyn SysCalls, interf: &[u8]) -> bool {
     match interface_names_with(sys) {
         // `curl_strequal(iface->ifa_name, interf)` (`lib/if2ip.c:164`).
@@ -477,12 +307,6 @@ fn interface_name_exists(sys: &dyn SysCalls, interf: &[u8]) -> bool {
 
 /// Resolves an interface name to a local source address -- supersedes
 /// `Curl_if2ip` (`lib/if2ip.c:94-174`).
-///
-/// This is what `--interface`, `CURLOPT_INTERFACE` and the FTP `PORT`/`EPRT`
-/// interface argument reduce to. The host's interface list is walked in the
-/// order the operating system reports it, and **the first address that
-/// matches on every count wins** (`:157-160`); later interfaces are not
-/// examined.
 ///
 /// # Parameters
 ///
@@ -514,18 +338,7 @@ fn interface_name_exists(sys: &dyn SysCalls, interf: &[u8]) -> bool {
 /// * the scope differs from `remote_scope` (`:125-132`);
 /// * `local_scope_id` is non-zero and differs from the address's scope id
 ///   (`:142-147`).
-///
-/// The family-mismatch downgrade (`:163-166`) does not break either, which is
-/// what lets an interface listed with its IPv4 address before its IPv6 one
-/// still resolve for an IPv6 request.
-///
-/// # Enumeration failure is not an error
-///
-/// `getifaddrs(3)` failing yields [`If2IpResult::NotFound`], because C guards
-/// the entire walk with `if(getifaddrs(&head) >= 0)` (`:109`) and otherwise
-/// falls straight through to `return res` (`:173`) with `res` untouched. See
-/// this module's documentation.
-#[allow(dead_code)] // No consumer yet; conn/socket.rs and protocols/ftp/.
+#[allow(dead_code)] // consumers: conn/socket.rs and protocols/ftp/
 #[must_use]
 pub(crate) fn if2ip(
     af: AddressFamily,
@@ -537,14 +350,6 @@ pub(crate) fn if2ip(
 }
 
 /// [`if2ip`] over an injected operating system.
-///
-/// The seam AAP 0.3.3's P12 requires, and it is load-bearing twice over.
-/// `cargo +nightly miri test` is a mandated gate and Miri cannot execute a
-/// foreign function, so every test below one exception drives this entry
-/// point with a pure-Rust fake. It is also the only way to reach the branches
-/// a real host cannot be made to take on demand: an interface carrying a
-/// specific scope id, two addresses of the same family on one name, an
-/// interface with no Internet address at all, and a failing `getifaddrs`.
 #[must_use]
 pub(crate) fn if2ip_with(
     sys: &dyn SysCalls,
@@ -573,12 +378,6 @@ pub(crate) fn if2ip_with(
             // `else if((res == IF2IP_NOT_FOUND) &&
             //          curl_strequal(iface->ifa_name, interf))
             //   res = IF2IP_AF_NOT_SUPPORTED;` (`:163-166`).
-            //
-            // Two properties, and losing either changes behaviour. The guard
-            // means a verdict already reached is never overwritten, and the
-            // absence of a `break` means the walk continues -- so a later
-            // node for this same interface, with the family that was asked
-            // for, can still succeed.
             if res == If2IpResult::NotFound && casecompare(&iface.name, interf)
             {
                 res = If2IpResult::AfNotSupported;
@@ -700,17 +499,6 @@ mod tests {
     // -- the fake operating system -----------------------------------------
 
     /// A pure-Rust [`SysCalls`] whose interface list the test chooses.
-    ///
-    /// Every test but one drives the walk through this rather than through
-    /// [`RealSys`], for two independent reasons. Miri cannot execute a foreign
-    /// function, so a real `getifaddrs(3)` would make the whole module
-    /// unreachable under a mandated gate; and the branches that matter here --
-    /// a specific scope id, two addresses of one family on one name, an
-    /// interface with no Internet address, a failing enumeration -- cannot be
-    /// arranged on a host on demand.
-    ///
-    /// It also counts calls, which is how the two-snapshot deviation this
-    /// module documents is held to its stated bound.
     struct FakeSys {
         /// The snapshot `ifaddrs` reports; [`None`] reports a failure.
         nodes: Option<Vec<IfNode>>,
@@ -977,17 +765,6 @@ mod tests {
 
     /// The unique-local test and every RETURNING arm of the switch are
     /// disjoint, so their relative order cannot be observed.
-    ///
-    /// Recorded because the obvious test of the ordering at `lib/if2ip.c:69-71`
-    /// -- an address that satisfies the unique-local condition *and* would
-    /// match a returning `case` -- cannot be constructed, and asserting that it
-    /// can would be false. `(b[0] & 0xFE) == 0xFC` pins `b[0]` to `0xFC` or
-    /// `0xFD`, which confines `w & 0xFFC0` to eight values, none of them
-    /// `0xFE80`, `0xFEC0` or `0x0000`. The sweep below proves that over all
-    /// 65,536 first-two-byte pairs rather than arguing it.
-    ///
-    /// What the early return therefore buys is precedence over `default`
-    /// alone, which the test above pins.
     #[test]
     fn the_unique_local_test_and_the_switch_arms_are_disjoint() {
         let mut unique_local = 0_usize;
@@ -1329,11 +1106,6 @@ mod tests {
 
     /// An interface with no Internet address at all is
     /// `IF2IP_AF_NOT_SUPPORTED`.
-    ///
-    /// The case the address projection cannot see and
-    /// `crate::ffi::interface_names` exists for -- Linux's `AF_PACKET` node,
-    /// Darwin's `AF_LINK`. It is also where the second enumeration this
-    /// module documents happens, so the call count is asserted.
     #[test]
     fn an_interface_without_an_internet_address_is_af_not_supported() {
         let sys = FakeSys::with(vec![
@@ -1358,11 +1130,6 @@ mod tests {
 
     /// A node whose `ifa_addr` was NULL contributes NOTHING, not even the
     /// downgrade (`lib/if2ip.c:111`).
-    ///
-    /// C's guard wraps both the family test and the mismatch arm, so such a
-    /// node never reaches either. The seam drops it from both projections,
-    /// which is what makes this verdict `NotFound` rather than
-    /// `AfNotSupported`.
     #[test]
     fn an_address_less_node_contributes_nothing() {
         let sys = FakeSys::with(vec![
@@ -1383,12 +1150,6 @@ mod tests {
     }
 
     /// The family-mismatch arm does NOT break, so a later node can still win.
-    ///
-    /// `lib/if2ip.c:163-166` has no `break`, and this is the case that makes
-    /// the difference observable: one interface listed with its IPv4 address
-    /// first and its IPv6 address second, asked for as IPv6. An
-    /// implementation that stopped at the downgrade would answer
-    /// `AF_NOT_SUPPORTED` and `--interface eth0` would fail over IPv6.
     #[test]
     fn a_wrong_family_node_does_not_stop_the_walk() {
         let sys = FakeSys::with(vec![
@@ -1577,12 +1338,6 @@ mod tests {
 
     /// A ten-digit scope id would have overrun C's twelve-byte buffer's
     /// margin; here nothing can clip.
-    ///
-    /// `char scope[12]` holds a per cent, ten digits and a terminator with no
-    /// room to spare, so `u32::MAX` is the exact width C could still render.
-    /// The point of the test is not that C was wrong -- it was not -- but that
-    /// this implementation has no width to get wrong, which is the deviation
-    /// the module documentation records.
     #[test]
     fn the_scope_suffix_has_no_width_limit() {
         let sys = FakeSys::with(vec![v6_node("eth0", "fe80::1", u32::MAX)]);
@@ -1726,17 +1481,6 @@ mod tests {
     // -- if2ip: rendering --------------------------------------------------
 
     /// The address is rendered by `util::inet`, not by `std::net`.
-    ///
-    /// `::192.168.0.1` is the first of the two divergences `util::inet`
-    /// documents and measures: `curlx_inet_ntop`'s condition
-    /// (`lib/curlx/inet_ntop.c:155-156`) covers the deprecated IPv4-COMPATIBLE
-    /// form as well as the mapped one, so it emits a dotted quad, whereas
-    /// current Rust special-cases only the mapped form and renders this one as
-    /// `::c0a8:1`. Asserting curl's spelling here proves the call goes through
-    /// `ntop6`; `util::inet`'s own test pins Rust's answer beside it.
-    ///
-    /// The text is observable: `bindlocal` prints it as *"Local Interface %s
-    /// is ip %s using address family %i"* (`lib/cf-socket.c:629-631`).
     #[test]
     fn rendering_goes_through_the_curl_formatter() {
         let sys = FakeSys::with(vec![v6_node("eth0", "::192.168.0.1", 0)]);
@@ -1792,13 +1536,6 @@ mod tests {
     // -- if2ip: the remaining family -------------------------------------
 
     /// A Unix-domain request can never match, and downgrades instead.
-    ///
-    /// [`AddressFamily::Unix`] is unreachable from an [`IpAddr`], so every
-    /// node fails the family test; a node bearing the requested name
-    /// therefore reaches the `lib/if2ip.c:163-166` downgrade. C behaves
-    /// identically -- `AF_UNIX` never equals the `sa_family` of an interface
-    /// address -- and neither caller passes it, but the arm exists and is
-    /// exercised rather than left to inference.
     #[test]
     fn a_unix_family_request_never_matches() {
         let sys = FakeSys::with(vec![
@@ -1874,18 +1611,6 @@ mod tests {
     // -- the one host-dependent test --------------------------------------
 
     /// The real seam, against the loopback interface only.
-    ///
-    /// Ignored under Miri because `getifaddrs(3)` is a foreign function and
-    /// Miri cannot execute one -- which is the whole reason [`if2ip_with`]
-    /// exists and every other test above uses it. This is the single place a
-    /// real syscall is unavoidable, so it is the single exception.
-    ///
-    /// It asserts a PROPERTY rather than a value, and never fails for a
-    /// missing interface: a container may be built without `lo`, and an
-    /// environment-dependent failure here would be worse than no test at all.
-    /// What it does check is that the real path returns a well-formed verdict
-    /// and, when it finds an address, one that parses back as IPv4 --
-    /// evidence that [`RealSys`] and the safe logic above agree.
     #[test]
     #[cfg_attr(miri, ignore = "getifaddrs(3) is a foreign function")]
     fn the_real_seam_agrees_about_the_loopback_interface() {
@@ -1914,12 +1639,6 @@ mod tests {
     }
 
     /// The real entry point and the injected one agree on the real host.
-    ///
-    /// [`if2ip`] is a one-line delegation to [`if2ip_with`] over
-    /// [`RealSys`], and this is what proves the delegation is what it claims
-    /// -- otherwise every test above would be testing a function the
-    /// production path does not use. Host-independent: it compares two
-    /// answers rather than asserting either.
     #[test]
     #[cfg_attr(miri, ignore = "getifaddrs(3) is a foreign function")]
     fn the_public_entry_point_delegates_to_the_seam() {

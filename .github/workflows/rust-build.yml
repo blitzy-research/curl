@@ -178,25 +178,30 @@ env:
   # named as a Rust `link` attribute and only this one package is needed.
   NATIVE_LINK_PACKAGES: 'libkrb5-dev'
 
-  # A4 IS OPEN, AND THIS FILE DELIBERATELY RECORDS NO DECISION ABOUT IT.
+  # A4 IS OPEN, AND NO WORKFLOW CAN CLOSE IT ANY MORE.
   #
-  # curl-rs-ffi/build.rs REFUSES to build aarch64-apple-darwin unless
-  # CURL_RS_A4_VARIADIC_DECISION is set to exactly `accept-unsupported-varargs`.
-  # That variable is NOT set anywhere in this repository's workflows, and it must
-  # not be: specification 0.8.6 escalates A4 as requiring a decision from
-  # whoever set the requirements, and lists exactly three options -
+  # curl-rs-ffi/build.rs REFUSES to build aarch64-apple-darwin,
+  # UNCONDITIONALLY. It formerly accepted a release-producing opt-in through
+  # CURL_RS_A4_VARIADIC_DECISION, and that bypass has been removed: it could
+  # emit an artifact whose four option-identifier entry points read a register
+  # an Apple arm64 variadic caller never writes, and no build-time variable
+  # makes an uninitialised register read safe. Setting the variable is now
+  # itself refused, on every target, with a message that says so - so an
+  # environment that still carries it fails loudly instead of appearing to be
+  # honoured.
+  #
+  # Specification 0.8.6 escalates A4 as requiring a decision from whoever set
+  # the requirements, and of its three options only two remain available:
   #
   #   1. raise the minimum supported Rust version above 1.75 and implement the
   #      four variadic entry points with c_variadic / VaList::next_arg;
-  #   2. drop aarch64-apple-darwin from the mandated target matrix;
-  #   3. accept that this target's varargs entry points are unsupported.
+  #   2. drop aarch64-apple-darwin from the mandated target matrix.
   #
-  # - none of which a workflow may choose on its own behalf. Setting the variable
-  # here would take option 3 unilaterally AND would then report a leg whose
-  # variadic ABI is known-wrong as a SUCCESSFUL target build, which is the one
-  # outcome specification 0.8.6 calls out as worse than a red gate ("this defect
-  # would not surface in local testing, which makes silent acceptance the worst
-  # option").
+  # Option 3 - accept the unsupported varargs and ship anyway - WAS the bypass,
+  # and it is gone. Both remaining options are edits to this repository, not
+  # settings in this block, which is the point: specification 0.8.6 calls silent
+  # acceptance of this defect "the worst option", and a variable that a workflow
+  # could set is exactly how silent acceptance happens.
   #
   # WHAT HAPPENS INSTEAD. The aarch64-apple-darwin leg of the matrix below runs
   # in full and FAILS at the build step, by design, with the build script's own
@@ -206,12 +211,12 @@ env:
   # is not removed: gate 1 reports three targets green and one blocked on an
   # owner decision, which is the true state of affairs.
   #
-  # THE ONE-LINE CHANGE, for whoever decides. Option 1 lifts the refusal at its
-  # root and needs no variable. Option 2 removes the triple from the matrix.
-  # Option 3 is a `CURL_RS_A4_VARIADIC_DECISION: 'accept-unsupported-varargs'`
-  # line in this block - and if it is ever added, the assertion step below must
-  # be inverted with it, because the build script then emits an advisory instead
-  # of refusing.
+  # FOR WHOEVER DECIDES. Option 1 lifts the refusal at its root: it needs
+  # rust-toolchain.toml's channel, Cargo.toml's rust-version and clippy.toml's
+  # msrv raised together, and a C driver on the target that round-trips every
+  # argument class through the variadic prototype. Option 2 removes the triple
+  # from the matrix below, from rust-toolchain.toml, from .cargo/config.toml and
+  # from deny.toml, and amends specification 0.1.1 goal G8.
 
 jobs:
   # The gate proper: the four-target release build, warnings denied
@@ -526,15 +531,23 @@ jobs:
         # `if: always()`.
         if: ${{ matrix.build.cross_toolchain }}
         run: |
-          # The house apt pattern, taken verbatim from linux.yml and
-          # checksrc.yml: drop the pre-seeded third-party sources first,
-          # because they are the usual cause of an `apt-get update` failure on
-          # a hosted runner, then update, then install without a pseudo-tty so
-          # the log stays readable.
+          # The house apt pattern: drop the pre-seeded third-party sources
+          # first, because they are the usual cause of an `apt-get update`
+          # failure on a hosted runner, then update, then install without a
+          # pseudo-tty so the log stays readable.
+          #
+          # NON-INTERACTIVE IS EXPLICIT, ON BOTH VERBS. `-y` answers apt's own
+          # confirmation and DEBIAN_FRONTEND=noninteractive stops any package's
+          # postinst from opening a dialogue. Neither is implied by
+          # `Dpkg::Use-Pty=0`, which only suppresses the pseudo-tty: a package
+          # that prompted would hang this step until the job timed out, and the
+          # log would show a truncated install rather than a question. That is a
+          # failure mode with no diagnosis attached, so it is closed by
+          # construction rather than relied upon not to occur.
           sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
-          sudo apt-get -o Dpkg::Use-Pty=0 update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Use-Pty=0 update
           echo "installing the ${MATRIX_CROSS_TOOLCHAIN} cross toolchain"
-          sudo apt-get -o Dpkg::Use-Pty=0 install \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Use-Pty=0 install -y \
             ${CROSS_LINUX_PACKAGES}
 
           # Prove the linker Cargo will actually reach is present, and prove it
@@ -699,44 +712,193 @@ jobs:
           # block comment above explains why it cannot see a cargo diagnostic: a
           # `cargo:warning=` from a build script is reported in the log and does
           # not affect the exit status. Calling the deny flag alone a zero-warning
-          # gate would therefore be inaccurate, so the remaining diagnostics are
-          # enumerated here and anything unenumerated fails the leg.
+          # gate would therefore be inaccurate, so cargo's own output is checked
+          # too - and it is checked against ZERO, with no allow-list.
           #
-          # The allow-list is deliberately short, exact and prefix-anchored. Every
-          # entry names a deterministic, reviewed advisory that this checkpoint
-          # cannot remove:
+          # THERE IS NO ALLOW-LIST, AND ITS REMOVAL IS THE POINT. This step used
+          # to enumerate three tolerated diagnostics and pass when only those
+          # appeared. That is a zero-UNAPPROVED-warning gate, not the
+          # zero-warning gate specification 0.8.4 requires, and the distinction
+          # was not academic: the third pattern matched cargo's GENERIC
+          # future-incompatibility sentence rather than a crate name, so a
+          # future-incompatibility arriving in any other dependency would have
+          # been absorbed by it silently.
           #
-          #   * the two include/curl/ advisories from curl-rs-ffi/build.rs, which
-          #     announce that the public headers were NOT regenerated because the
-          #     100-symbol export surface is incomplete. They disappear on their
-          #     own when the last export lands; until then they are the honest
-          #     report that the committed headers remain the ABI contract.
-          #   * cargo's future-incompatibility notice for russh 0.54.5, an
-          #     external crate this workspace pins exactly (specification 0.5.1)
-          #     and cannot patch. Recorded as dependency debt in Cargo.toml.
+          # Both causes were removed at their source instead:
           #
-          # An advisory that is NOT on this list fails the build, which is what
-          # makes the list a gate instead of a comment. Adding to it is a
-          # reviewable one-line change, and that is the point.
-          diagnostics="$(grep -E '^(warning|error)(:|\[)' "${log}" || true)"
-          unapproved="$(printf '%s\n' "${diagnostics}" \
-            | grep -v -F 'include/curl/ NOT regenerated:' \
-            | grep -v -F 'include/curl/ first missing exports:' \
-            | grep -v -F 'the following packages contain code that will be rejected by a future version of Rust' \
+          #   * the two include/curl/ advisories are no longer warning-class.
+          #     curl-rs-ffi/build.rs writes that notice to build-script stderr
+          #     and to OUT_DIR/include-curl-not-regenerated.txt, because it
+          #     reports unwritten work rather than a fault. The next step reads
+          #     the durable copy, so the information is still gated on - just not
+          #     as a warning.
+          #   * cargo's future-incompatibility notice is contained at its source
+          #     by [future-incompat-report] frequency = "never" in
+          #     .cargo/config.toml, which suppresses the per-build re-print
+          #     WITHOUT discarding the report. The step after next asserts the
+          #     report's contents, so the debt is verified rather than ignored.
+          #
+          # What remains here is therefore an absolute check: any warning- or
+          # error-class cargo diagnostic fails the leg.
+          diagnostics="$(grep -E '^(warning|error)(:|\[)' "${log}" \
             | grep -v -E '^[[:space:]]*$' || true)"
 
-          if [ -n "${unapproved}" ]; then
-            echo 'FAIL: the build emitted cargo diagnostics that are not on the reviewed allow-list.'
-            echo 'Gate 1 of specification 0.8.4 is a ZERO-WARNING gate, and a cargo diagnostic is a'
-            echo 'warning even though it does not change the exit status. Fix the cause, or - if the'
-            echo 'advisory is deliberate and reviewed - add it to the allow-list in this step.'
-            echo '::group::unapproved diagnostics'
-            printf '%s\n' "${unapproved}"
+          if [ -n "${diagnostics}" ]; then
+            echo 'FAIL: the build emitted cargo diagnostics. Gate 1 of specification 0.8.4 is a'
+            echo 'ZERO-WARNING gate, and a cargo diagnostic is a warning even though it does not'
+            echo 'change the exit status.'
+            echo
+            echo 'Fix the cause. Do NOT add an allow-list here - one was removed from this step'
+            echo 'precisely because it turned the gate into a zero-unapproved-warning gate and'
+            echo 'because its pattern for cargo output was broad enough to absorb diagnostics it'
+            echo 'was never reviewed for. If a diagnostic is deliberate, move it off the warning'
+            echo 'channel at its source the way the two build-script advisories were moved.'
+            echo '::group::cargo diagnostics'
+            printf '%s\n' "${diagnostics}"
             echo '::endgroup::'
             exit 1
           fi
 
-          echo 'no unapproved cargo diagnostics: the zero-warning gate covers rustc lints AND cargo output'
+          echo 'zero cargo diagnostics: the gate covers rustc lints AND cargo output, with no allow-list'
+
+      - name: 'assert: dependency future-incompatibility is contained, not merely quiet'
+        run: |
+          set -eu
+          # THE COUNTERPART TO SUPPRESSING THE PER-BUILD RE-PRINT.
+          #
+          # .cargo/config.toml sets [future-incompat-report] frequency = "never"
+          # so that cargo's notice does not violate the zero-warning gate above.
+          # Suppressing a notice and containing a problem are different things,
+          # and this step is what makes it the second one: the report itself is
+          # still generated, `cargo report future-incompatibilities` still prints
+          # it in full, and the debt is asserted to be exactly what was reviewed.
+          #
+          # STRICTLY STRONGER THAN THE ALLOW-LIST IT REPLACES. That allow-list
+          # matched cargo's generic sentence, so a future-incompatibility in a
+          # DIFFERENT dependency would have passed unnoticed. This asserts the
+          # crate set, so a new one fails the leg.
+          #
+          # russh 0.54.5 is the one expected entry and cannot be moved off:
+          # 0.54.6 declares a non-optional dependency on libcrux-ml-kem ^0.0.3,
+          # which on a 0.0.x version admits 0.0.3 alone, and 0.0.3 is YANKED, so
+          # the graph does not resolve; russh 0.55.0 and the 0.62 line raise the
+          # minimum Rust version to 1.85, above the 1.75 floor specification
+          # 0.8.3 fixes. Recorded as dependency debt in Cargo.toml.
+          expected='russh'
+
+          # `cargo report` needs the id cargo assigned to this build's report.
+          # No report at all is the BEST outcome and must not fail the leg: it
+          # means nothing in the graph is future-incompatible any more, at which
+          # point the containment in .cargo/config.toml has nothing to contain.
+          report="${RUNNER_TEMP}/future-incompat.txt"
+          if ! cargo report future-incompatibilities --id 1 > "${report}" 2>&1; then
+            echo 'no future-incompatibility report for this build.'
+            echo 'That is the better outcome, not a failure: it means the dependency debt'
+            echo 'recorded in Cargo.toml has cleared. The frequency="never" setting in'
+            echo '.cargo/config.toml is then inert and can be removed on its own schedule.'
+            exit 0
+          fi
+
+          echo '::group::future-incompatibility report'
+          cat "${report}"
+          echo '::endgroup::'
+
+          # Every crate the report names, one per line. The report spells them
+          # `<name> v<version>`; the name alone is compared so a patch bump of
+          # the known crate does not fail the leg for the wrong reason.
+          crates="$(grep -oE '[a-z0-9_-]+ v[0-9]+\.[0-9]+\.[0-9]+' "${report}" \
+            | awk '{ print $1 }' | sort -u || true)"
+          echo "crates reported future-incompatible: ${crates:-none}"
+
+          unexpected="$(printf '%s\n' "${crates}" \
+            | grep -v -x -F "${expected}" \
+            | grep -v -E '^[[:space:]]*$' || true)"
+
+          if [ -n "${unexpected}" ]; then
+            echo "FAIL: a dependency other than ${expected} is future-incompatible."
+            echo 'The suppression in .cargo/config.toml is scoped to reviewed debt. A new'
+            echo 'future-incompatibility must be resolved - or reviewed and recorded - not'
+            echo 'absorbed by a setting that was justified for a different crate.'
+            echo '::group::unexpected crates'
+            printf '%s\n' "${unexpected}"
+            echo '::endgroup::'
+            exit 1
+          fi
+
+          echo "future-incompatibility is confined to ${expected}, exactly the reviewed debt"
+
+      - name: 'assert: the export-surface notice is present and readable while the ABI is incomplete'
+        run: |
+          set -eu
+          # THE OTHER HALF OF MOVING TWO ADVISORIES OFF THE WARNING CHANNEL.
+          #
+          # curl-rs-ffi/build.rs no longer emits `cargo:warning=` when the public
+          # headers are withheld; it writes the notice to build-script stderr and
+          # to a durable file in OUT_DIR. Information that a gate stopped reading
+          # is information that has been lost, so this step reads the durable
+          # copy - which is better than parsing cargo output was, because the
+          # file carries the live figures rather than whatever survived the log.
+          #
+          # The notice's ABSENCE is also meaningful and is the finished state: it
+          # means every one of the 100 exported symbols now has a definition that
+          # reaches the shared library, and the headers were regenerated. Either
+          # way the leg proceeds; what it must not do is fail to look.
+          out="target/${MATRIX_TARGET}/release"
+          notice="$(find "${out}/build" -maxdepth 3 -type f \
+            -path '*curl-rs-ffi-*/out/include-curl-not-regenerated.txt' \
+            2>/dev/null | head -1)"
+
+          if [ -z "${notice}" ]; then
+            echo 'no export-surface notice: curl-rs-ffi reports the 100-symbol surface complete,'
+            echo 'so include/curl/ was regenerated from the crate. The ABI parity gate in'
+            echo 'rust-abi.yml is the authority on whether that regeneration was correct.'
+            exit 0
+          fi
+
+          echo '::group::export-surface notice'
+          cat "${notice}"
+          echo '::endgroup::'
+
+          # The notice is only useful if it carries the numbers. A file that
+          # existed but said nothing would be worse than no file, because it
+          # would look like the check had been performed.
+          if ! grep -q -F 'do not yet have a definition that reaches libcurl.so' "${notice}"; then
+            echo 'FAIL: the export-surface notice does not report the missing-symbol count.'
+            echo 'It exists to tell a reader how far the ABI is from parity; without the figure'
+            echo 'it is a marker rather than a report. See generate_headers in curl-rs-ffi/build.rs.'
+            exit 1
+          fi
+
+          echo 'the export-surface notice is present and carries the live figures'
+
+          # THE ENFORCEMENT PATH BEHIND THE NOTICE MUST STILL EXIST.
+          #
+          # This leg deliberately does NOT fail on an incomplete export surface:
+          # specification 0.3.1 puts one gate per workflow so a failure names its
+          # own cause, and the export surface is gate 7's subject (rust-abi.yml).
+          # But "another gate owns it" is only true while another gate CAN own it.
+          # curl-rs-ffi/build.rs turns the same condition into a hard error under
+          # CURL_RS_REQUIRE_COMPLETE_EXPORTS and rust-abi.yml arms it; delete that
+          # mechanism and nothing in the repository fails on a known-broken ABI.
+          #
+          # The evidence is the build script's own output artifact rather than a
+          # grep of its source. A source grep asserts a spelling and says nothing
+          # about liveness. Cargo records every variable a build script tracks as
+          # a `rerun-if-env-changed` line in that script's output file, so the
+          # presence of the strict variable there is the build itself reporting
+          # that it consulted it.
+          strict_var='CURL_RS_REQUIRE_COMPLETE_EXPORTS'
+          script_out="$(grep -rl "rerun-if-env-changed=${strict_var}" \
+            "${out}/build/" 2>/dev/null | head -n 1 || true)"
+          if [ -z "${script_out}" ]; then
+            echo 'FAIL: the export surface is incomplete, but no build script in this build'
+            echo "declared ${strict_var} as a tracked variable, so the"
+            echo 'strict-export enforcement path is not wired into the artifact under test.'
+            echo 'Nothing would then fail on an incomplete export surface, and a known-broken'
+            echo 'ABI would ship green through every gate in this repository.'
+            exit 1
+          fi
+          echo "${strict_var} is tracked by ${script_out}, so rust-abi.yml can arm it"
 
       - name: 'artifacts'
         run: |
@@ -860,27 +1022,137 @@ jobs:
             fi
           done
 
-          # The consumer metadata, collected out of the build script's staging
-          # tree. Its location is derived from Cargo's own OUT_DIR rather than
-          # guessed, and there is exactly one because OUT_DIR is unique per
+          # THE INSTALL STAGING TREES - PLURAL, WHICH IS THE CORRECTION HERE.
+          #
+          # TWO build scripts stage installable artifacts, and this step used to
+          # collect only one of them. curl-rs-ffi stages the consumer metadata
+          # (curl-config, libcurl.pc); curl-rs stages the shell completions,
+          # which upstream installs from scripts/Makefile.am:54-62. Copying only
+          # the first produced a distribution with no completions in it, and
+          # nothing distinguished that from a build never configured for shells.
+          #
+          # Locations are derived from Cargo's own OUT_DIR rather than guessed,
+          # and there is exactly one tree per crate because OUT_DIR is unique per
           # target and per feature set.
-          staging="$(find "target/${MATRIX_TARGET}/release/build" \
-            -maxdepth 3 -type d -path '*curl-rs-ffi-*/out/staging' 2>/dev/null | head -1)"
-          if [ -z "${staging}" ]; then
+          #
+          # THE GLOB HAZARD IS REAL AND IS WHY THE CLI PATTERN IS ANCHORED.
+          # `curl-rs-*` also matches `curl-rs-ffi-*` and `curl-rs-lib-*`, because
+          # a build-directory suffix is hex and `f` is a hex digit. An unanchored
+          # pattern therefore finds the WRONG crate's tree and then "proves" the
+          # completions missing. `-regex` with an explicit hex hash is used for
+          # the CLI so only curl-rs's own directories can match.
+          build="target/${MATRIX_TARGET}/release/build"
+
+          ffi_staging="$(find "${build}" -maxdepth 3 -type d \
+            -path '*curl-rs-ffi-*/out/staging' 2>/dev/null | head -1)"
+          if [ -z "${ffi_staging}" ]; then
             echo 'FAIL: curl-rs-ffi produced no install staging tree. It must render'
             echo 'curl-config and libcurl.pc into OUT_DIR/staging.'
             exit 1
           fi
+
+          cli_staging="$(find "${build}" -maxdepth 3 -type d \
+            -regex ".*/curl-rs-[0-9a-f]+/out/staging" 2>/dev/null | head -1)"
+          if [ -z "${cli_staging}" ]; then
+            echo 'FAIL: curl-rs produced no install staging tree. Its build script must stage'
+            echo 'the generated shell completions into OUT_DIR/staging, laid out the way'
+            echo 'make install would place them.'
+            exit 1
+          fi
+
+          echo "ffi staging: ${ffi_staging}"
+          echo "cli staging: ${cli_staging}"
+
           for rel in 'bin/curl-config' 'lib/pkgconfig/libcurl.pc'; do
-            if [ ! -f "${staging}/${rel}" ]; then
-              echo "FAIL: ${staging}/${rel} is missing, so consumers of this build"
+            if [ ! -f "${ffi_staging}/${rel}" ]; then
+              echo "FAIL: ${ffi_staging}/${rel} is missing, so consumers of this build"
               echo 'have no way to discover its flags.'
               exit 1
             fi
           done
-          if [ ! -x "${staging}/bin/curl-config" ]; then
+          if [ ! -x "${ffi_staging}/bin/curl-config" ]; then
             echo 'FAIL: the generated curl-config is not executable.'
             exit 1
+          fi
+          # Both completions, by the exact install-relative paths curl-rs/build.rs
+          # stages them under and upstream installs them to. Asserted rather than
+          # copied blindly: a directory copy cannot tell one file from two.
+          for rel in 'share/zsh/site-functions/_curl' \
+                     'share/fish/vendor_completions.d/curl.fish'; do
+            if [ ! -f "${cli_staging}/${rel}" ]; then
+              echo "FAIL: ${cli_staging}/${rel} is missing, so this distribution would"
+              echo 'install no completion for that shell. curl-rs/build.rs generates both'
+              echo 'together and verifies both were staged, so a miss here means the staging'
+              echo 'tree found above is not the one it wrote.'
+              exit 1
+            fi
+          done
+
+          # WHETHER AN SDK MAY BE ASSEMBLED AT ALL, read from the build script
+          # rather than assumed.
+          #
+          # A development kit is a library PLUS the headers a consumer compiles
+          # against, and the two have to describe the same thing. While the
+          # export surface is incomplete they do not: include/curl/ is the frozen
+          # curl 8.19.0-DEV contract declaring all 100 symbols, and the library
+          # beside it defines fewer. Copying both into one tree produces the
+          # worst possible artifact - it compiles, because the declarations are
+          # all there, and then fails at LINK time in the consumer's build with
+          # an undefined reference for every symbol that is missing. A consumer
+          # cannot tell that from a defect in their own code.
+          #
+          # So the headers are not packaged, and no dist/ is produced, until
+          # generation has reached 100 of 100 IN THIS BUILD. That is not a
+          # judgement made here: curl-rs-ffi/build.rs publishes
+          # OUT_DIR/abi-inventory.txt with a `headers-generated` field that is 1
+          # only when it promoted a complete set, and this step reads it. A
+          # `cargo:warning` could not serve, because nothing can branch on it -
+          # which is why the inventory exists.
+          #
+          # It does NOT fail the leg. The missing exports are unwritten work
+          # rather than a defect, and failing gate 1 - "build with zero warnings
+          # on four targets" - for the whole migration would make the workflow
+          # red for a reason that has nothing to do with the build. Everything
+          # above this point still runs and is still asserted: the soname chain
+          # and the consumer metadata are properties of the library alone and
+          # they are correct today.
+          inventory="$(dirname "${staging}")/abi-inventory.txt"
+          if [ ! -f "${inventory}" ]; then
+            echo "FAIL: ${inventory} is missing. curl-rs-ffi/build.rs must publish the ABI export"
+            echo 'inventory on every build; without it this step cannot tell whether the headers it'
+            echo 'would package describe the library it would package them with.'
+            exit 1
+          fi
+          echo '::group::ABI export inventory'
+          grep -v '^missing-export=' "${inventory}"
+          echo '::endgroup::'
+
+          generated="$(sed -n 's/^headers-generated=//p' "${inventory}")"
+          required="$(sed -n 's/^required=//p' "${inventory}")"
+          defined="$(sed -n 's/^defined=//p' "${inventory}")"
+          if [ -z "${generated}" ] || [ -z "${required}" ] || [ -z "${defined}" ]; then
+            echo "FAIL: ${inventory} is missing one of headers-generated, required or defined."
+            exit 1
+          fi
+
+          # The two halves must agree, or the field this step turns on means
+          # nothing. build.rs computes both from one vector, so a disagreement is
+          # a defect in the publisher and not a state to accommodate.
+          if [ "${generated}" = '1' ] && [ "${defined}" != "${required}" ]; then
+            echo "FAIL: ${inventory} claims headers were generated while only ${defined} of"
+            echo "${required} exports are defined. Those two cannot both be true."
+            exit 1
+          fi
+
+          if [ "${generated}" != '1' ]; then
+            echo "NOT PACKAGING an SDK for ${MATRIX_TARGET}: ${defined} of ${required} exports are"
+            echo 'defined, so curl-rs-ffi/build.rs withheld header generation and the headers in'
+            echo 'include/curl/ still describe curl 8.19.0-DEV rather than this library. Shipping the'
+            echo 'two together would give a consumer a tree that compiles and then fails to link.'
+            echo 'The library, its soname chain, curl-config and libcurl.pc were all built and'
+            echo 'asserted above; only the installable set is withheld, and it resumes on its own'
+            echo 'once the export surface is complete.'
+            exit 0
           fi
 
           # Assemble the installable set. Copied, never moved, so nothing above
@@ -888,24 +1160,71 @@ jobs:
           dist="${out}/dist"
           rm -rf "${dist}"
           mkdir -p "${dist}/bin" "${dist}/lib/pkgconfig" "${dist}/include"
-          cp -R "${staging}/bin/." "${dist}/bin/"
-          cp -R "${staging}/lib/pkgconfig/." "${dist}/lib/pkgconfig/"
+          cp -R "${ffi_staging}/bin/." "${dist}/bin/"
+          cp -R "${ffi_staging}/lib/pkgconfig/." "${dist}/lib/pkgconfig/"
+          # The completions, merged in from the second tree under the same
+          # prefix-relative layout, so the whole dist directory remains a single
+          # `make install`-shaped image a packager can copy wholesale.
+          cp -R "${cli_staging}/share" "${dist}/"
           # Headers only. include/curl/ also holds Makefile.am, which belongs to
           # the build system being replaced and has no place in an install set.
           mkdir -p "${dist}/include/curl"
           find include/curl -maxdepth 1 -name '*.h' -exec cp {} "${dist}/include/curl/" \;
-          cp "${out}/curl" "${out}/curlinfo" "${dist}/bin/"
+          # `curl` ONLY. curlinfo is upstream's noinst_PROGRAMS
+          # (src/Makefile.am:51-52, and src/CMakeLists.txt:111 marks it
+          # EXCLUDE_FROM_ALL), and curl-rs/Cargo.toml states the rule beside its
+          # [[bin]] block: the installable set of that package is `curl` and
+          # nothing else. It is still BUILT and still asserted present by the
+          # artifacts step above, because tests/runtests.pl:537-546 runs it - but
+          # shipping it would put a binary in /usr/bin that no curl release has
+          # ever installed.
+          cp "${out}/curl" "${dist}/bin/"
           cp "${out}/libcurl.a" "${dist}/lib/"
           # -P so the symlinks are copied AS symlinks; without it the chain
           # would become three identical 4 MB regular files.
           cp -P "${out}/${LIBCURL_REAL}" "${out}/${LIBCURL_SONAME}" \
                 "${out}/${LIBCURL_DEV}" "${dist}/lib/"
 
+          # The positive half, which is what makes the gate tighten on its own
+          # rather than needing a second edit when generation resumes: an SDK
+          # that got this far MUST carry the headers, and there must be twelve of
+          # them - eight generated and the four carried verbatim.
+          headers="$(find "${dist}/include/curl" -name '*.h' | wc -l)"
+          if [ "${headers}" -ne 12 ]; then
+            echo "FAIL: the packaged SDK carries ${headers} headers; include/curl/ holds twelve."
+            exit 1
+          fi
+
           echo '::group::installable set'
-          find "${dist}" -mindepth 1 -maxdepth 3 \( -type f -o -type l \) \
+          find "${dist}" -mindepth 1 -maxdepth 4 \( -type f -o -type l \) \
             -exec ls -ld {} +
           echo '::endgroup::'
-          echo "packaged ${LIBCURL_REAL} and the consumer metadata for ${MATRIX_TARGET}"
+
+          # The exclusion, asserted rather than assumed. `cp` of a name that is
+          # not there fails loudly, but a `cp -R` of a directory that happened to
+          # contain it would not, and neither would a future edit that restored
+          # the old two-argument copy. Absence is the property, so absence is
+          # what is checked.
+          if [ -e "${dist}/bin/curlinfo" ]; then
+            echo 'FAIL: curlinfo is in the installable set. It is upstream noinst_PROGRAMS'
+            echo '(src/Makefile.am:51-52) and curl-rs/Cargo.toml records that the installable'
+            echo 'set of that package is `curl` alone. Build it, run it, do not ship it.'
+            exit 1
+          fi
+
+          # And the inclusion, for the four files whose absence this step exists
+          # to prevent. Listed by their install-relative paths so the assertion
+          # reads as the install image a packager receives.
+          for rel in 'bin/curl' 'bin/curl-config' 'lib/pkgconfig/libcurl.pc' \
+                     'share/zsh/site-functions/_curl' \
+                     'share/fish/vendor_completions.d/curl.fish'; do
+            if [ ! -e "${dist}/${rel}" ]; then
+              echo "FAIL: ${rel} is absent from the installable set."
+              exit 1
+            fi
+          done
+
+          echo "packaged ${LIBCURL_REAL}, ${headers} headers, the consumer metadata and both shell completions for ${MATRIX_TARGET} at ${defined}/${required} exports"
 
       - name: 'assert: a static C consumer links through both generated interfaces'
         run: |
@@ -956,10 +1275,57 @@ jobs:
               ;;
           esac
 
-          # Cross-compiled legs are built but not linked here: this runner has no
-          # linker for the foreign target, and a host link would silently test
-          # the wrong object. The metadata is still asserted below, so a
-          # cross leg is not skipped outright.
+          # THE COMPILER COMES FROM THE ARTIFACT'S OWN METADATA, WHICH IS WHAT
+          # MAKES A CROSS LEG LINKABLE.
+          #
+          # This step used to skip the link entirely whenever MATRIX_TARGET
+          # differed from the host, on the reasoning that "this runner has no
+          # linker for the foreign target". That was true of the hard-coded `cc`
+          # it was about to use, and not true of the runner: the aarch64 Linux
+          # cross toolchain is installed and named by .cargo/config.toml, and one
+          # Xcode clang links both Apple architectures. So the cross legs were
+          # proving nothing about the very metadata they exist to validate, and
+          # the target-specific native-link sets - the whole reason the step runs
+          # inside the matrix - were compared as strings and never exercised.
+          #
+          # `curl-config --cc` is the fix, and deliberately so rather than a
+          # second table here: curl-rs-ffi/build.rs renders it from ONE
+          # target-compiler authority, and a consumer of this artifact has
+          # exactly that value to follow. Using it means this gate tests what a
+          # consumer will actually do. It also means a wrong `--cc` fails here
+          # instead of failing in a downstream build - which is how
+          # `<triple>-gcc` went unnoticed: derived from the Rust triple, it named
+          # a driver that exists for no target at all, because GNU drops the
+          # vendor field and Apple has no triple-prefixed driver.
+          #
+          # A compiler that is not runnable is reported as such and skips the
+          # link, which is honest, and is NOT the same as skipping every cross
+          # leg on principle: a runner that genuinely lacks a toolchain says so
+          # with the command name in the message.
+          target_cc="$("${staging}/bin/curl-config" --cc)"
+          if [ -z "${target_cc}" ]; then
+            echo 'FAIL: curl-config reports no compiler, so a consumer following it would run'
+            echo 'its next argument as a program. See compiler() in curl-rs-ffi/build.rs.'
+            exit 1
+          fi
+          echo "curl-config --cc          :${target_cc}"
+
+          # Word-split on purpose: the Apple rows are `clang -arch <arch>`, a
+          # command plus a flag, which is how one driver is aimed at one
+          # architecture.
+          # shellcheck disable=SC2086
+          if ! ${target_cc} --version > /dev/null 2>&1; then
+            echo "SKIP: ${target_cc} is not runnable on this runner, so the link for"
+            echo "${MATRIX_TARGET} cannot be performed here. The metadata agreement below is"
+            echo 'still asserted. This is a runner capability gap to be reported, not a'
+            echo 'property of the artifact - and NOT a reason to skip cross legs by default:'
+            echo 'the aarch64 Linux toolchain is installed and Xcode clang targets both Apple'
+            echo 'architectures, so a skip here means this image is missing something.'
+            linkable='no'
+          else
+            linkable='yes'
+          fi
+
           probe="${RUNNER_TEMP}/static_consumer.c"
           printf 'int main(void) { return 0; }\n' > "${probe}"
 
@@ -990,14 +1356,16 @@ jobs:
           fi
           echo 'both interfaces report the same native link set'
 
-          # Read the host triple from the toolchain rather than inferring it from
-          # the runner image, so this stays correct if an image's architecture
-          # changes underneath the matrix.
-          host="$(rustc -vV | awk '/^host: / { print $2 }')"
-          if [ "${MATRIX_TARGET}" != "${host}" ]; then
-            echo "cross leg (host ${host}): metadata asserted, link skipped because"
-            echo "this runner has no ${MATRIX_TARGET} linker and a host link would"
-            echo 'silently test the wrong object.'
+          # THE LINK NOW RUNS ON EVERY BUILDABLE TARGET, CROSS INCLUDED, using
+          # the compiler the artifact's own metadata names. The host triple is no
+          # longer consulted: it was never the right question. What decides
+          # whether this gate can run is whether a compiler for MATRIX_TARGET is
+          # available, and `curl-config --cc` plus the runnability probe above
+          # answer that directly, per target, without assuming a cross leg
+          # cannot.
+          if [ "${linkable}" != 'yes' ]; then
+            echo "link not performed for ${MATRIX_TARGET}: ${target_cc} is unavailable here."
+            echo 'The metadata agreement above was still asserted.'
           else
 
           for interface in 'curl-config' 'pkg-config'; do
@@ -1007,9 +1375,10 @@ jobs:
             esac
             log="${RUNNER_TEMP}/static-${interface}.log"
             # shellcheck disable=SC2086
-            if ! cc -nodefaultlibs "${probe}" ${force_open} ${force_close} ${libs} \
+            if ! ${target_cc} -nodefaultlibs "${probe}" ${force_open} ${force_close} ${libs} \
                  -o "${RUNNER_TEMP}/static_consumer" > "${log}" 2>&1; then
               echo "FAIL: a static consumer following ${interface} does not link on ${MATRIX_TARGET}."
+              echo "compiler          :${target_cc}"
               echo "reported libraries:${libs}"
               grep -E 'undefined (reference|symbol)' "${log}" | head -40
               echo "total: $(grep -cE 'undefined (reference|symbol)' "${log}") undefined symbol(s)"
@@ -1018,20 +1387,53 @@ jobs:
               echo "  cargo rustc -p curl-rs-ffi --release --target ${MATRIX_TARGET} --crate-type staticlib -- --print native-static-libs"
               exit 1
             fi
-            echo "${interface}: a static consumer links on ${MATRIX_TARGET}"
+            echo "${interface}: a static consumer links on ${MATRIX_TARGET} with ${target_cc}"
           done
 
           # Vacuity check, in this run rather than on trust: omitting the
           # reported libraries must fail. If it does not, -nodefaultlibs is not
-          # being honoured and both passes above are meaningless.
+          # being honoured and both passes above are meaningless. Run per target
+          # for the same reason the positive link is: -nodefaultlibs behaviour is
+          # a property of the driver, and the drivers differ.
           # shellcheck disable=SC2086
-          if cc -nodefaultlibs "${probe}" ${force_open} ${force_close} \
+          if ${target_cc} -nodefaultlibs "${probe}" ${force_open} ${force_close} \
                -o "${RUNNER_TEMP}/static_vacuity" > /dev/null 2>&1; then
             echo 'FAIL: linking with NO reported libraries succeeded, so this gate cannot'
             echo 'detect an under-reported native-link set.'
+            echo "compiler: ${target_cc}"
             exit 1
           fi
-          echo 'vacuity check: omitting the reported libraries fails, as required'
+          echo "vacuity check: omitting the reported libraries fails under ${target_cc}, as required"
+
+          # And the object really was built for the requested target. A driver
+          # that silently produced host objects would pass every check above,
+          # which is exactly the failure mode the old host-comparison guard was
+          # worried about - answered by measuring the artifact instead of by
+          # declining to produce one.
+          if command -v file > /dev/null 2>&1; then
+            echo "linked object: $(file -b "${RUNNER_TEMP}/static_consumer")"
+            case "${MATRIX_TARGET}" in
+              aarch64-unknown-linux-gnu)
+                file -b "${RUNNER_TEMP}/static_consumer" | grep -q -E 'ARM aarch64|aarch64' || {
+                  echo 'FAIL: the link produced an object that is not aarch64, so the compiler'
+                  echo 'curl-config names is not targeting what this leg built.'
+                  exit 1
+                }
+                ;;
+              x86_64-unknown-linux-gnu)
+                file -b "${RUNNER_TEMP}/static_consumer" | grep -q -E 'x86-64|x86_64' || {
+                  echo 'FAIL: the link produced an object that is not x86-64.'
+                  exit 1
+                }
+                ;;
+              *-apple-darwin)
+                file -b "${RUNNER_TEMP}/static_consumer" | grep -q 'Mach-O' || {
+                  echo 'FAIL: the link produced an object that is not Mach-O.'
+                  exit 1
+                }
+                ;;
+            esac
+          fi
 
           fi
       - name: 'assert: no target was built under an A4 acceptance'
@@ -1061,20 +1463,30 @@ jobs:
           grep -F 'warning: curl-rs-ffi@' "${log}" || echo '(none)'
           echo '::endgroup::'
 
-          # Anchored on the exact prefix curl-rs-ffi/build.rs emits, not on the
-          # bare token A4, so that the word appearing in a source comment that
-          # rustc happens to quote cannot satisfy this assertion.
-          if grep -q -F 'A4 decision on record (CURL_RS_A4_VARIADIC_DECISION=' "${log}"; then
-            echo "FAIL: ${MATRIX_TARGET} was built under a recorded A4 acceptance."
-            echo 'No workflow in this repository may record that decision: specification 0.8.6 escalates A4'
-            echo 'to whoever set the requirements, and accepting it here would report an artifact whose'
-            echo 'variadic ABI is known-wrong as a successful target build. Remove'
-            echo 'CURL_RS_A4_VARIADIC_DECISION from the environment; see this file env block for the three'
-            echo 'options that are actually available.'
+          # The acceptance path no longer exists in build.rs, so this asserts
+          # on the ENVIRONMENT rather than on a log line the script can no
+          # longer emit. A grep for a removed message would pass vacuously and
+          # would read as a check that still has teeth.
+          if [ -n "${CURL_RS_A4_VARIADIC_DECISION:-}" ]; then
+            echo "FAIL: ${MATRIX_TARGET} was built with CURL_RS_A4_VARIADIC_DECISION set."
+            echo 'That variable no longer releases anything: the aarch64-apple-darwin refusal in'
+            echo 'curl-rs-ffi/build.rs is unconditional, and setting the variable is itself refused.'
+            echo 'Specification 0.8.6 escalates A4 to whoever set the requirements, and the two options'
+            echo 'that remain are edits to this repository rather than environment settings; see this'
+            echo 'file env block. Unset the variable.'
             exit 1
           fi
 
-          echo "${MATRIX_TARGET} was built with no A4 acceptance in force, as every certifiable target must be"
+          # And the removed advisory must stay removed. If it ever reappears in
+          # a log, an acceptance path has been reintroduced somewhere.
+          if grep -q -F 'A4 decision on record (CURL_RS_A4_VARIADIC_DECISION=' "${log}"; then
+            echo "FAIL: ${MATRIX_TARGET} emitted an A4 acceptance advisory."
+            echo 'The acceptance path was removed because it could emit an artifact whose variadic ABI is'
+            echo 'known-wrong; an advisory of this shape means it has been reintroduced. Remove it again.'
+            exit 1
+          fi
+
+          echo "${MATRIX_TARGET} was built with no A4 acceptance in force, and none is reachable"
 
           # aarch64-apple-darwin must remain IN the matrix. A leg that is blocked
           # on an owner decision is information; a leg that has been deleted is
@@ -1190,8 +1602,8 @@ jobs:
         if: ${{ matrix.build.native_link && startsWith(matrix.build.image, 'ubuntu') }}
         run: |
           sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
-          sudo apt-get -o Dpkg::Use-Pty=0 update
-          sudo apt-get -o Dpkg::Use-Pty=0 install \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Use-Pty=0 update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Use-Pty=0 install -y \
             ${NATIVE_LINK_PACKAGES}
 
           # Prove the linker input exists, and prove it by the name the Rust
@@ -1518,6 +1930,51 @@ jobs:
           # library's soname is emitted by exactly such a directive from
           # curl-rs-ffi/build.rs.
           cargo "+${MSRV_TOOLCHAIN}" build --locked --workspace
+
+      - name: 'msrv: cargo check --locked --workspace --all-targets on the floor toolchain'
+        run: |
+          # THE HALF OF THE FLOOR THE BUILD ABOVE CANNOT SEE, and it is not a
+          # thoroughness flourish - it closes a hole that had already let a
+          # defect through.
+          #
+          # `cargo build --workspace` compiles lib and bin targets only. Test
+          # targets, benches and examples are not built, so a library feature
+          # newer than the floor can sit inside a `#[cfg(test)]` module
+          # indefinitely with this job green: measured, `core::mem::offset_of!`
+          # (stable from 1.77) reached a test module in curl-rs-ffi and the
+          # floor build above still exited 0, while
+          # `cargo +1.75.0 check --locked --workspace --all-targets` failed with
+          # `error[E0658]: use of unstable library feature 'offset_of'`. That is
+          # exactly the class of regression this step now catches.
+          #
+          # AND IT MAKES FOUR STANDING CLAIMS ENFORCEABLE RATHER THAN MERELY
+          # WRITTEN DOWN. Cargo.toml's rust-version comment, curl-rs/Cargo.toml,
+          # rust-toolchain.toml and clippy.toml each state that this precise
+          # invocation exits 0 on this tree. Until now nothing checked it, so
+          # the four could drift from the truth without any gate noticing - and
+          # they had. A documented measurement that no job re-takes is a claim,
+          # not a gate.
+          #
+          # `check` rather than `build`, deliberately: the question is whether
+          # the floor toolchain ACCEPTS the source of every target, and type
+          # checking answers it. Code generation and linking for the test
+          # harnesses would answer a question rust-test.yml already owns, on a
+          # toolchain it does not use, and would roughly double this job for
+          # nothing. HOST ONLY and no --release, for the same attribution
+          # reasons as the step above. --locked stays: the lockfile is half of
+          # what is being tested.
+          #
+          # HOW TO READ A FAILURE HERE. If the step above passed and this one
+          # fails, the defect is in a test, bench or example target and it is a
+          # LANGUAGE-VERSION defect, not a dependency one - some construct
+          # stabilised after 1.75. The remedy is to express it in a way the
+          # floor accepts, never to raise the floor: the minimum supported
+          # version is a mandated technology directive (specification 0.8.3)
+          # and changing it is a decision for whoever set it. curl-rs-ffi
+          # already carries the pattern to copy - a test-local `offset!` macro
+          # over `MaybeUninit` and `addr_of!`, in src/ffi/handle.rs,
+          # src/ffi/types.rs and src/ffi/form.rs.
+          cargo "+${MSRV_TOOLCHAIN}" check --locked --workspace --all-targets
 
       - name: 'assert: this gate wrote nothing outside target/'
         run: |

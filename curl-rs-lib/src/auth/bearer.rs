@@ -40,10 +40,9 @@
 //!
 //! # The nominal source is not this mechanism, and the difference is measured
 //!
-//! AAP 0.4.1 gives this module the row *"Bearer tokens"* with the source
-//! `lib/vauth/oauth2.c`. That file is **not** HTTP Bearer authentication,
-//! and the reason is written down here so that a later reader does not
-//! conclude its contents were overlooked.
+//! That file is **not** HTTP Bearer authentication, and the reason is written
+//! down here so that a later reader does not conclude its contents were
+//! overlooked.
 //!
 //! `lib/vauth/oauth2.c:28-30` guards the entire file:
 //!
@@ -53,12 +52,6 @@
 //!   (!defined(CURL_DISABLE_LDAP) && defined(USE_OPENLDAP))
 //! ```
 //!
-//! and closes at `:98` with `#endif /* disabled, no users */`. All four of
-//! IMAP, SMTP, POP3 and LDAP are outside this crate's protocol scope (AAP
-//! 0.2.2) and are registered as stubs returning
-//! `CURLE_UNSUPPORTED_PROTOCOL` in `crate::protocols::stub`, so the file has
-//! no reachable consumer here.
-//!
 //! Its two functions are **SASL** message generators rather than HTTP header
 //! emitters, which the bytes settle beyond argument:
 //!
@@ -67,15 +60,6 @@
 //!   `port=%ld\x01` interposed when the port is neither 0 nor 80.
 //! * `Curl_auth_create_xoauth_bearer_message()` (`:86-97`) emits
 //!   `user=%s\x01auth=Bearer %s\x01\x01`.
-//!
-//! The `\x01` separators are SASL OAUTHBEARER's GS2 framing (RFC 7628) and
-//! the payload is base64-wrapped by the SASL layer before it reaches a
-//! command. Neither is a header line, neither is CRLF-terminated, and
-//! neither is reachable from an HTTP transfer. **SASL OAUTHBEARER and
-//! XOAUTH2 are therefore not ported.** The 25-line banner of that file --
-//! which carries an extra RFC6749 attribution line the plain form does not
-//! -- is likewise not carried, because the mechanism it attributes is not
-//! here.
 //!
 //! HTTP Bearer lives at `lib/http.c:308-325`, inside
 //! `#ifndef CURL_DISABLE_BEARER_AUTH`, and its body is four statements:
@@ -87,8 +71,6 @@
 //!                        data->set.str[STRING_BEARER]);
 //! if(!*userp) { result = CURLE_OUT_OF_MEMORY; goto fail; }
 //! ```
-//!
-//! That is the implementation this module supersedes.
 //!
 //! # The token is emitted verbatim -- there is no encoding step
 //!
@@ -117,16 +99,6 @@
 //!    `authmask & ~CURLAUTH_BEARER`, so the bit cannot even be picked on
 //!    that side -- reproduced by `super::proxy_auth_mask`, which is the only
 //!    constructor of a proxy mask in this crate.
-//!
-//! This module encodes the same impossibility structurally: **no item here
-//! accepts a `proxy` argument.** [`BearerToken::header_line`] cannot be
-//! asked for a proxy form because there is nothing to ask with, and
-//! [`Bearer::output`] never reads `AuthContext::proxy` even though the shared
-//! trait offers it.
-//! The prefix is supplied as [`BEARER_IS_NEVER_A_PROXY_MECHANISM`], a named
-//! constant, so the call site reads as the invariant rather than as an
-//! arbitrary `false`. A signature pin below turns any later widening into a
-//! compile error rather than a review question.
 //!
 //! # What deliberately is *not* here
 //!
@@ -164,7 +136,7 @@
 //! Masking it would fail those fixtures and would itself be a behaviour
 //! change.
 //!
-//! The narrower requirement that *does* bind, and that AAP 0.8.1's
+//! The narrower requirement that *does* bind, and that the
 //! preservation mandate leaves room for, is that no secret gains a path to a
 //! log curl does not already have. Nothing here formats a token into a
 //! trace record -- this module emits no trace output at all -- and
@@ -185,7 +157,7 @@
 //! build serve `--oauth2-bearer`", and serving it end to end additionally
 //! needs the emitter's consumer in `crate::protocols::http1`, which has not
 //! landed. Under-reporting makes a fixture skip while over-reporting makes
-//! it run and fail (AAP 0.6.5), so the honest answer stays `absent` until
+//! it run and fail, so the honest answer stays `absent` until
 //! the consumer exists.
 
 use core::fmt;
@@ -196,22 +168,9 @@ use super::{
 };
 use crate::error::CURLcode;
 
-// ---------------------------------------------------------------------------
 // The three constants this mechanism's bytes and its one error path rest on.
-// ---------------------------------------------------------------------------
 
 /// The `auth-scheme` token Bearer writes into an `Authorization:` header.
-///
-/// `lib/http.c:315` spells it `Bearer` -- capital `B`, the rest lower case --
-/// and `lib/http.c:1073` matches the same spelling on the way in. It is a
-/// named constant rather than an inline literal for the reason
-/// `super::BEARER_PROBLEM` is one: a test can then assert the exact text
-/// without restating it, and it cannot drift from
-/// `AuthScheme::Bearer::header_scheme` by a letter of case.
-///
-/// A receiving server compares the token case-insensitively (RFC 7235 makes
-/// `auth-scheme` case-insensitive), but curl's own fixtures compare the
-/// request bytes literally, so the spelling emitted is frozen regardless.
 pub(crate) const BEARER_SCHEME_TOKEN: &str = "Bearer";
 
 /// The header-prefix selector Bearer passes to
@@ -226,24 +185,6 @@ pub(crate) const BEARER_SCHEME_TOKEN: &str = "Bearer";
 pub(crate) const BEARER_IS_NEVER_A_PROXY_MECHANISM: bool = false;
 
 /// The one failure `http_output_bearer()` can report: `CURLE_OUT_OF_MEMORY`.
-///
-/// `lib/http.c:318-320` is the whole of its error handling --
-/// `if(!*userp) { result = CURLE_OUT_OF_MEMORY; goto fail; }` -- so the C
-/// has exactly one error path and it is the allocation of the header string.
-/// There is no second: the token is copied without inspection, so no input
-/// can be rejected.
-///
-/// # Why nothing in this module ever returns it
-///
-/// The path is unreachable here rather than unimplemented, and the
-/// distinction is worth stating because "it never fails" and "the failure
-/// was forgotten" look identical from outside. Rust's global allocator
-/// aborts the process on exhaustion instead of returning a null pointer, so
-/// the `String` that [`BearerToken::header_line`] builds either exists or
-/// there is no program left to observe that it does not. The constant
-/// records the mapping the C fixes -- and a test pins its integer at 27 --
-/// so that a future allocation-fallible path, should the crate ever gain
-/// one, has the right code already named rather than chosen afresh.
 #[allow(dead_code)] // Reached only by this file's tests, per the note above.
 pub(crate) const ALLOCATION_FAILURE: CURLcode = CURLcode::OutOfMemory;
 
@@ -254,9 +195,6 @@ pub(crate) const ALLOCATION_FAILURE: CURLcode = CURLcode::OutOfMemory;
 // otherwise catch an inversion (`lib/http.c:706`, `:574-575`) live outside
 // this crate, and a runtime test is something somebody can invert along with
 // the code it guards.
-//
-// First, the prefix selector is pinned to the origin side. Changing it to
-// `true` -- the only other value it could take -- fails the build here.
 const _: () = assert!(
     !BEARER_IS_NEVER_A_PROXY_MECHANISM,
     "Bearer has no proxy form: lib/http.c:315 has no \"%s\" prefix"
@@ -268,9 +206,7 @@ const _: () = assert!(
 // argument either.
 const _: fn(&BearerToken) -> String = BearerToken::header_line;
 
-// ---------------------------------------------------------------------------
 // The token: `data->set.str[STRING_BEARER]`.
-// ---------------------------------------------------------------------------
 
 /// An OAuth 2.0 bearer token, as `CURLOPT_XOAUTH2_BEARER` supplied it.
 ///
@@ -296,19 +232,6 @@ const _: fn(&BearerToken) -> String = BearerToken::header_line;
 /// `crate::easy::setopt` copies the option in and where C's
 /// `Curl_setstropt()` copies it too, leaves this module with the C's single
 /// allocation path and nothing else. See [`ALLOCATION_FAILURE`].
-///
-/// Nothing about the *content* is constrained by that choice: the bytes are
-/// never inspected, so non-ASCII text, punctuation, interior spaces and the
-/// empty token all pass through unchanged.
-///
-/// # Formatting
-///
-/// [`core::fmt::Debug`] is hand-written and prints
-/// `super::REDACTED_PLACEHOLDER`; there is deliberately no
-/// [`core::fmt::Display`], because a `Display` implementation is exactly the
-/// accident that puts a credential into a message somebody wrote for another
-/// purpose. Code that genuinely needs the bytes asks for
-/// [`Self::as_str`], which names what it is doing.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct BearerToken {
     /// The token, byte for byte as configured.
@@ -317,12 +240,6 @@ pub(crate) struct BearerToken {
 
 impl BearerToken {
     /// The token `CURLOPT_XOAUTH2_BEARER` or `--oauth2-bearer` supplied.
-    ///
-    /// Accepts every input, including the empty string. C's
-    /// `Curl_setstropt()` performs no validation either, and `--oauth2-bearer
-    /// ""` is accepted by `src/tool_getparam.c:223`'s `ARG_STRG` handling,
-    /// so rejecting anything here would be a behaviour change rather than a
-    /// safeguard.
     #[must_use]
     #[allow(dead_code)] // Consumer is `crate::easy::setopt`, not yet landed.
     pub(crate) fn new(token: &str) -> Self {
@@ -373,16 +290,8 @@ impl BearerToken {
     /// here, because all five C emitters share it and 168 fixtures compare
     /// the result inside a byte-exact `<protocol>` block -- a second space,
     /// a lower-case scheme token or a bare `\n` would fail them.
-    ///
-    /// C's `curlx_free(*userp)` before the assignment has no counterpart:
-    /// the previous line's storage is owned by whoever holds the returned
-    /// `String`, so replacing it is that owner's drop rather than an
-    /// explicit free here.
-    ///
-    /// There is no proxy form. See the module documentation, and the
-    /// signature pin above that keeps it that way.
     #[must_use]
-    #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not landed.
+    #[allow(dead_code)] // Consumer is `crate::protocols::http1`.
     pub(crate) fn header_line(&self) -> String {
         authorization_header(
             BEARER_IS_NEVER_A_PROXY_MECHANISM,
@@ -394,16 +303,6 @@ impl BearerToken {
 
 impl fmt::Debug for BearerToken {
     /// Prints a placeholder, never the token.
-    ///
-    /// Hand-written for the reason `super::Credentials`'s formatter is:
-    /// a derived formatter on *any* enclosing structure would otherwise
-    /// print every field of every field, and a bearer token is a complete
-    /// credential on its own -- no username is needed to use it. Writing the
-    /// formatter on the token makes that impossible for every present and
-    /// future holder at once, which no review convention can.
-    ///
-    /// The token's *length* is not printed either. It is a weak oracle, but
-    /// it is a real one, and nothing needs it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BearerToken")
             .field("token", &REDACTED_PLACEHOLDER)
@@ -438,26 +337,9 @@ pub(crate) fn token_is_configured(token: Option<&BearerToken>) -> bool {
     token.is_some()
 }
 
-// ---------------------------------------------------------------------------
 // The mechanism.
-// ---------------------------------------------------------------------------
 
 /// The Bearer mechanism, ready to emit.
-///
-/// Holding a [`BearerToken`] by value rather than an `Option` of one is the
-/// second structural invariant this module carries. `lib/http.c:706` will
-/// not enter the emission arm without a token, and `lib/http.c:544` removes
-/// the bit from the mask so that arbitration cannot select Bearer without
-/// one -- so a `Bearer` that exists is a `Bearer` that can emit, and
-/// [`Self::output`] has no absent-token branch to get wrong. Construction
-/// from the optional setting goes through [`Self::from_setting`], which is
-/// where the `if(data->set.str[STRING_BEARER])` test lands once and only
-/// once.
-///
-/// `Debug` is derived, and safely: the only field's formatter is the
-/// hand-written redacting one on [`BearerToken`]. A test asserts the derived
-/// output carries the placeholder and not the token, which is what makes the
-/// containment property checked rather than asserted.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Bearer {
     /// The configured token.
@@ -467,7 +349,7 @@ pub(crate) struct Bearer {
 impl Bearer {
     /// A mechanism over `token`.
     #[must_use]
-    #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not landed.
+    #[allow(dead_code)] // Consumer is `crate::protocols::http1`.
     pub(crate) fn new(token: BearerToken) -> Self {
         Self { token }
     }
@@ -479,7 +361,7 @@ impl Bearer {
     /// its answer for [`super::EmissionGuards::have_bearer`] and for
     /// `super::AuthActInput::have_bearer` from the same call.
     #[must_use]
-    #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not landed.
+    #[allow(dead_code)] // Consumer is `crate::protocols::http1`.
     pub(crate) fn from_setting(token: Option<&BearerToken>) -> Option<Self> {
         token.map(|token| Self::new(token.clone()))
     }
@@ -507,13 +389,6 @@ impl HttpAuthMechanism for Bearer {
     /// and sets `data->state.authproblem`, because a 40x answer to a request
     /// that already carried the token means the token itself is not valid.
     ///
-    /// All of that is bookkeeping over state this module does not own, so it
-    /// lives in `super::input_auth` with the diagnostic in
-    /// `super::BEARER_PROBLEM`, and this implementation says so by doing
-    /// nothing. Returning `Ok(())` is not a stub: there is no decoding step
-    /// to implement, and `super::ChallengeDecoder`'s own documentation
-    /// records that `decode` is never called for Basic or Bearer.
-    ///
     /// # Errors
     ///
     /// Never. `auth_bearer()` returns `CURLE_OK` unconditionally, which is
@@ -528,21 +403,6 @@ impl HttpAuthMechanism for Bearer {
     }
 
     /// Emits `Authorization: Bearer <token>\r\n`.
-    ///
-    /// Supersedes `http_output_bearer()` (`lib/http.c:308-325`). The
-    /// emission is [`AuthEmission::Final`] because Bearer is single-pass:
-    /// there is no second message, so `authp->done` is true after it and
-    /// `super::finish_emission` computes `multipass = false`. C reaches the
-    /// same state from the other direction, by setting `done` in the arm
-    /// itself at `lib/http.c:716` whether or not the emitter ran.
-    ///
-    /// `ctx` is **not read**. Its `proxy` field is deliberately ignored --
-    /// see the module documentation -- and its `request_method`,
-    /// `request_target`, `clock` and `rng` are Digest's and NTLM's, not
-    /// Bearer's: `AuthScheme::Bearer::needs_request_target` is false, and a
-    /// bearer token is a fixed string that needs neither a nonce nor a
-    /// timestamp. `lib/http.c:709` passes `http_output_bearer()` nothing but
-    /// the handle for the same reason.
     ///
     /// # Errors
     ///
@@ -598,11 +458,6 @@ mod tests {
 
     /// Runs `body` with a verbose tracer and returns its result together with
     /// everything the sink received, as text.
-    ///
-    /// `WriterSink::new` rather than `new_for_terminal`: the byte-faithful
-    /// form is what an assertion on exact text needs, and it is also what a
-    /// search for a leaked credential needs, since the terminal form would
-    /// escape bytes and could hide a match.
     fn with_tracer<R>(body: impl FnOnce(&mut Tracer<'_>) -> R) -> (R, String) {
         let config = TraceConfig::init().expect("trace config cannot fail");
         let mut sink = WriterSink::new(Vec::new());
@@ -617,11 +472,6 @@ mod tests {
 
     /// Runs `body` with an emission context whose clock and generator are the
     /// injected test implementations.
-    ///
-    /// Bearer reads neither, which is the point: the context is built so that
-    /// the trait's contract is exercised as a real caller would exercise it,
-    /// and so that these tests stay runnable under Miri, which cannot call
-    /// `clock_gettime` with isolation enabled.
     fn with_context<R>(body: impl FnOnce(&mut AuthContext<'_>) -> R) -> R {
         let clock = TestClock::new(CurlTime::new(1_000, 0));
         let mut rng = TestRng::from_seed(7);
@@ -771,13 +621,6 @@ mod tests {
         // are the bytes in. Compared as BYTES rather than as text, because
         // byte equality is what the fixture corpus compares and text
         // equality would tolerate a normalizing transformation.
-        //
-        // The non-ASCII characters are written as escapes rather than as
-        // literal bytes so that this SOURCE FILE stays pure ASCII: the
-        // repository's `scripts/spacecheck.pl` scans every tracked file for
-        // non-ASCII bytes and allows only U+00F6. The string VALUES below are
-        // identical either way -- U+00F6, U+00E9 and U+5B57 -- so nothing
-        // about what is asserted changes.
         let token = "t\u{f6}k\u{e9}n-\u{5b57}";
         let line = emit(token);
         let mut expected = Vec::new();
@@ -889,9 +732,6 @@ mod tests {
         // ~CURLAUTH_BEARER;`. The narrowing lives in `super::auth_act`; this
         // asserts the consequence that makes the emission arm safe -- a pick
         // can never land on Bearer without a token.
-        //
-        // A 401 with Bearer both wanted and offered is the strongest case:
-        // everything except the token is in place.
         let offered_and_wanted = |have_bearer: bool| {
             let mut pair = AuthStatePair::ZERO;
             pair.host.want = AuthMask::BEARER.union(AuthMask::BASIC);
@@ -1041,10 +881,6 @@ mod tests {
         // emit, then run the trailing bookkeeping that DOES write a
         // diagnostic (`lib/http.c:720-733`). The captured sink must contain
         // curl's own line and not one byte of the token.
-        //
-        // This is deliberately not a vacuous test: `finish_emission` writes
-        // `"Server auth using Bearer with user ''"`, so the sink is
-        // non-empty and a search through it is searching something real.
         let guards = EmissionGuards {
             have_bearer: true,
             ..EmissionGuards::default()

@@ -21,29 +21,13 @@
 //  * SPDX-License-Identifier: curl
 //  *
 //  ***************************************************************************/
-//! MD5, RFC 1321. Supersedes `lib/md5.c` (609 lines) and `lib/curl_md5.h`
-//! (67 lines).
+//! MD5, RFC 1321. Supersedes `lib/md5.c` and `lib/curl_md5.h`.
 //!
 //! The primitive itself comes from the **`md-5 0.10.6`** crate, pinned exactly
 //! in the workspace manifest's `[workspace.dependencies]` and inherited here
 //! with `{ workspace = true }`. The crate is published as `md-5` while its
 //! library target is `md5`, so `use ::md5::Md5` is correct despite the hyphen.
 //! Nothing in this file implements a compression function.
-//!
-//! # Two shapes, because the C contract has two
-//!
-//! `lib/curl_md5.h:56-57` declares the one-shot `Curl_md5it`, implemented at
-//! `lib/md5.c:549-561` and carrying the `@unittest: 1601` marker at
-//! `lib/md5.c:546`. `lib/curl_md5.h:59-63` declares the incremental
-//! `Curl_MD5_init` / `Curl_MD5_update` / `Curl_MD5_final` trio, implemented at
-//! `lib/md5.c:563-589`, `:591-597` and `:599-607`.
-//!
-//! Both are reproduced because HTTP Digest needs both. `lib/vauth/digest.c`
-//! composes one Digest response from **four** separate streaming contexts --
-//! `lib/vauth/digest.c:388`, `:402`, `:425` and `:443` -- feeding every `':'`
-//! separator as a one-byte update and, at `lib/vauth/digest.c:406`, feeding a
-//! previous 16-byte digest straight back in as input. A one-shot-only surface
-//! cannot express that, so [`Md5Context`] is not optional convenience.
 //!
 //! # The parameter values are contractual, not chosen
 //!
@@ -56,43 +40,12 @@
 //! so changing either value fails the build beside the citation that explains
 //! why it cannot change.
 //!
-//! # What was deliberately dropped
-//!
-//! The `MD5_params` / `MD5_context` vtable (`lib/curl_md5.h:40-51`) is gone.
-//! It existed only to make the digest pluggable across the C tree's several
-//! TLS backends; there is exactly one implementation now, so the indirection
-//! would be surface with no call site behind it.
-//!
-//! The build guard at `lib/curl_md5.h:27-28` is **not** reproduced as a
-//! feature `cfg`. No workspace feature corresponds to it, and a `cfg` naming
-//! a feature that does not exist compiles the guarded item away silently
-//! rather than failing. MD5 is unconditionally available here.
-//!
-//! # Upstream attribution: recorded, not carried forward
-//!
-//! `lib/md5.c:237-273` carries a second attribution block, separate from and
-//! not covered by the licence banner above. It is a public-domain notice for
-//! the fallback MD5 implementation curl bundled for the case where no crypto
-//! library was linked, together with a credit at `lib/md5.c:273` for the
-//! optimised form of that implementation's round functions.
-//!
-//! That block is **not** reproduced here, and the omission is deliberate
-//! rather than an oversight. Attribution travels with the code it covers, and
-//! that implementation is not ported: `md-5 0.10.6` supplies the primitive, so
-//! none of the attributed code is present in this file and no attribution is
-//! owed for it. The contrasting case one directory over is `util/inet.rs`,
-//! which does carry an ISC/BIND banner precisely because its Rust body *is* a
-//! port of ISC code. The distinguishing test is whether the attributed code is
-//! present, not whether it was read. [`crate::crypto`] records the same fact
-//! at directory level.
-//!
 //! # Scope, and where rendering belongs
 //!
 //! MD5 is present only because curl's wire formats specify it: HTTP Digest
 //! (`lib/vauth/digest.c`) and the NTLMv2 response, whose three HMAC-MD5 call
 //! sites are `lib/curl_ntlm_core.c:524`, `:610` and `:653`. It is never a
-//! security primitive chosen by this implementation. AAP section 0.8.1 freezes
-//! those formats, so the algorithm cannot be substituted for a stronger one.
+//! security primitive chosen by this implementation.
 //!
 //! Turning a digest into text is not this module's job. Every digest curl puts
 //! on the wire is written with `"%02x"` and is therefore **lowercase** --
@@ -111,12 +64,6 @@ pub(crate) const DIGEST_LEN: usize = 16;
 /// MD5's HMAC block size in bytes: the maximum key length `Curl_HMAC_MD5`
 /// declares at `lib/md5.c:533`.
 ///
-/// This constant is documentation and assertion, never arithmetic.
-/// `hmac 0.12.1` derives the block size from `Md5::BlockSize` itself, so
-/// neither this module nor [`crate::crypto::hmac`] computes a key-padding
-/// length from this value. It is published so that [`crate::crypto`] can pin
-/// the C table's number at compile time.
-///
 /// The allowance is required by the MSRV floor and is not redundant, however
 /// much it looks it on a current toolchain. This constant's only consumer is
 /// the `const _: () = assert!(MD5_BLOCK_LEN == 64);` contract in
@@ -129,15 +76,6 @@ pub(crate) const DIGEST_LEN: usize = 16;
 pub(crate) const BLOCK_LEN: usize = 64;
 
 /// The `digest` marker type for MD5.
-///
-/// Published so that [`crate::crypto::hmac`] can instantiate `Hmac<Md5>` --
-/// the keyed form `Curl_HMAC_MD5` provided -- without importing the `md-5`
-/// crate a second time.
-///
-/// It is a plain alias for the crate's own type and deliberately not a
-/// newtype: `Hmac<D>` is bounded on the RustCrypto `CoreProxy` machinery that
-/// only the real type carries, so wrapping it would make the bound
-/// unsatisfiable.
 pub(crate) type Md5 = Md5Hasher;
 
 /// Digest a whole message: `Curl_md5it` (`lib/md5.c:549-561`).
@@ -146,18 +84,8 @@ pub(crate) type Md5 = Md5Hasher;
 /// `Curl_md5it` returns `CURLcode` only because the pluggable backend's `init`
 /// could fail (`lib/md5.c:555`); with a single infallible backend there is no
 /// error left to report, so a `Result` would be a lie the caller must still
-/// handle. Returning the array also retires C's output pointer, as AAP
-/// section 0.1.2 requires: out-parameters do not survive the port.
-///
-/// The shape matches [`crate::crypto::sha256::sha256`] and its SHA-512/256
-/// counterpart on purpose: `lib/vauth/digest.c:991-1010` selects among the
-/// three digests through one function pointer, so the Rust caller must be able
-/// to select among them without special-casing MD5.
-///
-/// The allowance is required by the MSRV floor, for the reason recorded on
-/// [`BLOCK_LEN`]: this function's only consumer today is the `let _ = md5;`
-/// existence check in [`crate::crypto`], which rustc 1.75 does not count as a
-/// use. It is deleted when `auth/digest.rs` calls this for real.
+/// handle. Returning the array also retires C's output pointer: out-parameters
+/// do not survive the port.
 #[allow(dead_code)]
 pub(crate) fn md5(input: &[u8]) -> [u8; DIGEST_LEN] {
     let mut hasher = Md5Hasher::new();
@@ -169,23 +97,10 @@ pub(crate) fn md5(input: &[u8]) -> [u8; DIGEST_LEN] {
 /// `Curl_MD5_final` (`lib/curl_md5.h:59-63`, implemented at
 /// `lib/md5.c:563-589`, `:591-597` and `:599-607`).
 ///
-/// Construct, feed any number of times, finish once -- the sequence each of
-/// the four Digest contexts in `lib/vauth/digest.c` follows, minus the
-/// `MD5_params` vtable that C needed only to reach a build-selected backend.
-///
 /// Finishing consumes the context, which is stricter than the C it replaces.
 /// `Curl_MD5_final` frees the context it is handed (`lib/md5.c:603-604`) and
 /// leaves the caller holding a dangling pointer, so calling it twice is a
 /// use-after-free there. Here it does not compile.
-///
-/// The `#[allow(dead_code)]` attributes below are inventory entries in the
-/// sense the crate root defines: this type's consumer is `auth/digest.rs`,
-/// which has not landed yet, and each attribute is deleted when it does. They
-/// are deliberately per item rather than one blanket allowance on the `impl`,
-/// because a blanket form would also silence the next method somebody adds --
-/// which is the reason the crate forbids a `dead_code` lint level on a module
-/// root at all. The constants, the `Md5` alias and [`md5`] carry no allowance
-/// because [`crate::crypto`] and `crypto/hmac.rs` already consume them.
 #[derive(Clone, Default)]
 pub(crate) struct Md5Context {
     #[allow(dead_code)]
@@ -194,14 +109,6 @@ pub(crate) struct Md5Context {
 
 impl Md5Context {
     /// A fresh context: `Curl_MD5_init` (`lib/md5.c:563-589`).
-    ///
-    /// C could return `NULL` from either of two allocations or from the
-    /// backend's `init` (`lib/md5.c:568`, `:573`, `:582`), which is why every
-    /// call site in `lib/vauth/digest.c` tests the result and maps it to
-    /// `CURLE_OUT_OF_MEMORY`. None of those failure modes survives the port,
-    /// so this cannot fail and callers need no check.
-    ///
-    /// [`Default`] is derived alongside this and agrees with it.
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
@@ -210,11 +117,6 @@ impl Md5Context {
     }
 
     /// Feed the next chunk: `Curl_MD5_update` (`lib/md5.c:591-597`).
-    ///
-    /// Any length is accepted, which the Digest composition depends on twice
-    /// over: `lib/vauth/digest.c:394` feeds a single separator byte, and
-    /// `lib/vauth/digest.c:406` feeds a previous 16-byte digest back in as
-    /// input.
     ///
     /// C narrowed `size_t` to `unsigned int` through `curlx_uztoui` to reach
     /// this call (`lib/md5.c:557`). The Rust length is a `usize` end to end,
@@ -231,14 +133,6 @@ impl Md5Context {
     }
 
     /// [`Md5Context::finalize`] under the name the sibling contexts use.
-    ///
-    /// [`crate::crypto::sha256::Sha256Context`] and the HMAC context both
-    /// spell this operation `finish`, and [`crate::crypto`] records that the
-    /// incremental contexts exist to give a caller one shape across
-    /// algorithms. Both spellings are accepted so that code written against
-    /// either sibling compiles unchanged against this one.
-    ///
-    /// This delegates and adds no behaviour; the two are the same digest.
     #[allow(dead_code)]
     pub(crate) fn finish(self) -> [u8; DIGEST_LEN] {
         self.finalize()
@@ -246,16 +140,6 @@ impl Md5Context {
 }
 
 // Tests
-//
-// `tests/unit/unit1601.c` is the C unit test for this code. It gates on
-// `<features>unittest</features>` through `tests/data/test1601`, which this
-// binary does not advertise, so that fixture skips and its coverage lives
-// here instead -- AAP section 0.8.7 relocates those assertions into the Rust
-// crates rather than re-exporting internals to make the C program link.
-//
-// The vector tables carry `#[rustfmt::skip]` so that the formatter cannot
-// regroup the literals into rows that no longer line up with the published
-// specification or with the C source they were transcribed from.
 
 #[cfg(test)]
 mod tests {
@@ -299,12 +183,6 @@ mod tests {
     }
 
     /// `tests/unit/unit1601.c:40-48`, relocated.
-    ///
-    /// That program asserts with `verify_memory` against raw byte strings, so
-    /// these compare raw bytes rather than hex, preserving both what it
-    /// checked and how it checked it. The second vector is not a published
-    /// specification value; it exists only in the C test, which is why it is
-    /// kept separate from the RFC table above.
     #[rustfmt::skip]
     #[test]
     fn one_shot_matches_the_relocated_unit1601_vectors() {
@@ -322,11 +200,6 @@ mod tests {
 
     /// The specific pattern HTTP Digest depends on, and the reason a
     /// one-shot-only surface would not serve it.
-    ///
-    /// `lib/vauth/digest.c:392-399` feeds text, then `':'` as a **single
-    /// byte**, then more text. A context that mishandled a one-byte update
-    /// would produce a wrong `HA1` and a Digest header that no fixture
-    /// matches.
     #[test]
     fn incremental_feeds_a_one_byte_separator_like_http_digest() {
         let mut ctx = Md5Context::new();
@@ -416,12 +289,6 @@ mod tests {
     }
 
     /// The published marker type must be the `md-5` crate's own type.
-    ///
-    /// `crypto/hmac.rs` instantiates `Hmac<Md5>`, whose bounds only the real
-    /// RustCrypto type satisfies. Driving it through the `Digest` trait here
-    /// proves the alias still names that type and still agrees with the
-    /// one-shot function, so a future newtype would fail this test rather
-    /// than only failing at the HMAC call site.
     #[test]
     fn the_published_marker_type_agrees_with_the_one_shot_form() {
         let mut hasher = Md5::new();

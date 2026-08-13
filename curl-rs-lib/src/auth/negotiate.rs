@@ -27,11 +27,10 @@
 //! SPNEGO (Negotiate) authentication over GSS-API, behind a default-off
 //! feature.
 //!
-//! Supersedes `lib/vauth/spnego_gssapi.c` (295 lines) in full,
-//! `lib/http_negotiate.c` (262 lines) in full, and the HTTP-relevant plumbing
-//! of `lib/curl_gssapi.c` (448 lines). The per-item citations below name the
-//! exact C locators, because every observable string and every branch order in
-//! this file is transcribed rather than derived:
+//! Supersedes `lib/vauth/spnego_gssapi.c` in full, `lib/http_negotiate.c` in
+//! full, and the HTTP-relevant plumbing of `lib/curl_gssapi.c`. The per-item
+//! citations below name the exact C locators, because every observable string
+//! and every branch order in this file is transcribed rather than derived:
 //!
 //! - `lib/urldata.h:312-318`, `curlnegotiate`'s five states ->
 //!   [`NegotiateState`]
@@ -68,86 +67,6 @@
 //! - `lib/http.c:4028-4035`, the `AUTHDONE` to `AUTHSUCC` promotion ->
 //!   [`ConnectionNegotiate::settle_after_response`]
 //!
-//! # Two specification resolutions govern this file
-//!
-//! Both are AAP resolutions of tensions inside the user's own request. Neither
-//! is a user-specified rule: `review_rules` reports that this project supplies
-//! none, and describing an AAP requirement as a rule would misstate where it
-//! came from (AAP 0.7).
-//!
-//! **AAP 0.8.5 conflict C2.** The request asks simultaneously for "no C TLS
-//! linkage at any configuration" and for "Negotiate where OS Kerberos is
-//! available". The AAP resolves it by observing that **GSS-API is neither
-//! libcurl, nor libssl, nor a TLS library -- it is an authentication
-//! mechanism.** Negotiate therefore sits behind the non-default `negotiate`
-//! feature, with the binding confined to `crate::ffi::gss`, **so the default
-//! build links no C security library at all.** This module is the only gated
-//! child of `crate::auth`.
-//!
-//! **AAP 0.8.5 conflict C3.** Everything that needs to reach a C library lives
-//! in `crate::ffi::gss`, whose owning wrappers are the only GSS surface this
-//! file can see. There is nothing here that operates on a raw handle, and
-//! nothing here that could: `crate::ffi` exports no pointer, no `libc` type,
-//! no `OM_uint32` and no GSS handle, so the seal is a property of the module
-//! graph rather than a promise. The crate root's `deny(unsafe_code)` is what
-//! makes it a compiler-checked invariant.
-//!
-//! # Three things this file deliberately does NOT implement
-//!
-//! Each is recorded so that a later reader knows it was decided rather than
-//! forgotten.
-//!
-//! **1. `lib/vauth/krb5_gssapi.c` (327 lines) is out of scope.** It implements
-//! **SASL GSSAPI**, whose consumers are SMTP, IMAP and POP3 -- the same
-//! reasoning that puts `lib/vauth/cleartext.c` and `lib/vauth/oauth2.c`'s SASL
-//! halves out of scope, because all three protocols are stubs in
-//! `crate::protocols::stub` answering `CURLE_UNSUPPORTED_PROTOCOL`. AAP 0.4.1
-//! lists the file among this module's sources because it shares the GSS
-//! plumbing, and only that shared plumbing informs anything here. Neither
-//! `struct kerberos5data` nor `Curl_auth_create_gssapi_user_message` is
-//! ported, and `crate::ffi::Mechanism::Krb5` is not named by this file.
-//!
-//! **2. `CURL_GSS_STUB` is out of scope, with evidence.**
-//! `lib/curl_gssapi.c:32-50` and `:70-311` are wrapped in `#ifdef DEBUGBUILD`
-//! and driven by the `CURL_STUB_GSS_CREDS` environment variable (`:135`,
-//! `:342`, `:378`). Exactly two fixtures use it -- `tests/data/test2056`
-//! (`KRB5_Alice`) and `tests/data/test2057` (`NTLM_Alice`) -- and **both gate
-//! on `<features> GSS-API` AND `Debug`**. AAP 0.6.6 deliberately withholds
-//! `Debug` from the `--version` banner, so both fixtures skip, which is the
-//! correct outcome and not a failure. No stub is implemented, and no
-//! environment variable is read by this file.
-//!
-//! **3. The four Windows SSPI backends are excluded by AAP 0.2.2**:
-//! `lib/vauth/spnego_sspi.c`, `krb5_sspi.c`, `digest_sspi.c` and
-//! `ntlm_sspi.c`. SSPI is a Windows mechanism and no mandated target is
-//! Windows, so the `SEC_E_OK` / `SEC_I_CONTINUE_NEEDED` arm of
-//! `lib/http_negotiate.c:242-247` and the `sslContext` field of
-//! `lib/http_negotiate.c:117-119` have no successor. The banner must **never**
-//! advertise `SSPI`: 114 fixtures gate on `!SSPI` and would break.
-//!
-//! # TLS channel binding is omitted, and the omission is reported honestly
-//!
-//! `lib/vauth/spnego_gssapi.c:152-159` and `lib/http_negotiate.c:121-135`
-//! attach RFC 5929 channel-binding application data to the handshake when the
-//! platform defines `GSS_C_CHANNEL_BOUND_FLAG` **and** the connection is TLS,
-//! reading it out of the TLS layer through `Curl_ssl_get_channel_binding()`
-//! into a dynbuf sized `SSL_CB_MAX_SIZE + 1`.
-//!
-//! `crate::tls` exposes no channel-binding material. rustls's exposure of
-//! `tls-server-end-point` and `tls-unique` is not established by the AAP, and
-//! neither `crate::tls::mod`, `crate::tls::cipher_suite` nor
-//! `crate::tls::keylog` offers it. Rather than invent a value, pass an empty
-//! buffer as though it were real binding data, or silently claim
-//! `GSS_C_CHANNEL_BOUND_FLAG` support, **channel binding is omitted in
-//! full**: every handshake step here passes
-//! `crate::ffi::StepOptions::channel_binding_data` as `None`, which is
-//! precisely `GSS_C_NO_CHANNEL_BINDINGS` and precisely what the C does in a
-//! build where `GSS_C_CHANNEL_BOUND_FLAG` is undefined. Under-reporting a
-//! capability is safe; over-reporting is the failure mode AAP 0.6.5 names
-//! (874 of 1,914 fixtures gate on `<features>`). The plumbing exists in
-//! `crate::ffi::gss` and is tested there, so restoring this is a matter of
-//! `crate::tls` growing an accessor -- not of rewriting anything below.
-//!
 //! # The coupling to `crate::version`, stated so the two cannot drift
 //!
 //! [`is_spnego_supported`] is this module's successor to
@@ -163,12 +82,11 @@
 //! which is correct and is not an oversight. The three banner tokens
 //! `GSS-API`, `Kerberos` and `SPNEGO` are gated on `ENGINE_GSS` **and**
 //! `ENGINE_AUTH` **and** the runtime probe, and a Negotiate exchange needs an
-//! HTTP driver -- `crate::protocols::http1` -- to carry it. Until that lands
-//! the capability cannot execute, so withholding the three names is the safe
-//! direction of AAP 0.6.5's asymmetry. `crate::version::supports_negotiate`
-//! and `crate::version::negotiate_usable` are the two predicates that consume
-//! `ENGINE_GSS`; flipping it is a one-word change in `crate::version` once the
-//! driver exists, and nothing in this file has to move for it.
+//! HTTP driver -- `crate::protocols::http1` -- to carry it.
+//! `crate::version::supports_negotiate` and `crate::version::negotiate_usable`
+//! are the two predicates that consume `ENGINE_GSS`; flipping it is a one-word
+//! change in `crate::version` once the driver exists, and nothing in this file
+//! has to move for it.
 //!
 //! # Credentials come from the CONNECTION, not the transfer
 //!
@@ -211,28 +129,14 @@ use crate::trace::{infof, Tracer};
 use crate::util::base64;
 
 // The compile-time half of every availability answer in this file.
-//
-// `crate::auth` declares this module under `#[cfg(feature = "negotiate")]`, so
-// nothing here can be reached in a build without the feature -- which is the
-// mechanical form of "`is_spnego_supported()` answers `false` when the feature
-// is off": there is no code to answer with, and `crate::auth`'s own
-// `#[cfg(not(feature = "negotiate"))]` arm answers instead.
-//
-// Written as a const rather than as a runtime assertion in a test, because the
-// condition IS a constant: checking it at run time would prove nothing the
-// compiler has not already proved, and would only prove it in a build that
-// already contains the module. `tests::the_three_availability_predicates_agree`
-// covers the other half, which is genuinely dynamic.
 const _: () = assert!(cfg!(feature = "negotiate"));
 
-// ---------------------------------------------------------------------------
 // THE FROZEN OBSERVABLE STRINGS.
 //
 // Every literal below is either wire bytes or `--verbose` output, so all of
 // them are transcribed character for character and none may be reformatted.
 // They are named constants rather than inline literals so that a test can
 // assert the exact text without restating it.
-// ---------------------------------------------------------------------------
 
 /// The `auth-scheme` token, in the spelling curl writes and matches.
 ///
@@ -274,69 +178,25 @@ pub(crate) const EMPTY_CHALLENGE: &str =
 /// that the discard is the only reason they go unused.
 const NOT_SET_MEANS_EMPTY: &[u8] = b"";
 
-// ---------------------------------------------------------------------------
 // CAPABILITY ADVERTISEMENT.
-// ---------------------------------------------------------------------------
 
 /// Whether SPNEGO is usable **in this process, right now**.
-///
-/// Supersedes `Curl_auth_is_spnego_supported()`
-/// (`lib/vauth/spnego_gssapi.c:49-52`), which returns `TRUE` unconditionally.
-/// That answer is only as good as the build's `#ifdef USE_SPNEGO`, because the
-/// C function does not exist at all without it -- so the honest Rust answer is
-/// not a constant. This file is compiled only under the `negotiate` feature, so
-/// the compile-time half is already established here and what remains is
-/// whether a GSS-API library actually resolved: `crate::ffi::gss_available()`
-/// probes that once, caches it, never panics and performs no I/O.
-///
-/// A pure forward with no logic of its own, which is the property that keeps it
-/// from drifting away from `crate::auth::is_spnego_supported` (the crate-wide
-/// entry point, which adds a `false` arm for a build without the feature) and
-/// from `crate::version::gss_present` (the banner's probe). All three reduce to
-/// the same cached call; [`tests::the_three_availability_predicates_agree`]
-/// asserts it rather than assuming it.
 #[must_use]
 #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not yet landed.
 pub(crate) fn is_spnego_supported() -> bool {
     crate::ffi::gss_available()
 }
 
-// ---------------------------------------------------------------------------
 // THE FIVE-STATE MACHINE.
-// ---------------------------------------------------------------------------
 
 /// The Negotiate handshake position, per connection and per endpoint.
 ///
-/// Supersedes `curlnegotiate` (`lib/urldata.h:312-318`). The five variants are
-/// in the C's declaration order, which is also their logical progression, and
-/// the C's spelling is preserved in [`Self::as_c_name`] so a trace or an
-/// assertion can name a state exactly as the C source does.
-///
 /// # Why an enum and not an integer
 ///
-/// AAP 0.3.3 pattern P3: `match` is exhaustive, so a state added here forces
-/// every decision site to acknowledge it. The C's `if(*state == GSS_AUTHRECV)
-/// ... else if(*state == GSS_AUTHSUCC)` chain (`lib/http_negotiate.c:180-189`)
-/// silently falls through for the other three, and a sixth state would join
-/// them unnoticed.
-///
-/// # State is per connection, with separate origin and proxy instances
-///
-/// C keeps two fields on `struct connectdata` --
-/// `conn->http_negotiate_state` and `conn->proxy_negotiate_state` -- and two
-/// separate metadata entries for the data beside them.
-/// [`ConnectionNegotiate`] holds both sides as typed fields rather than
-/// reproducing the string-keyed map.
-/// # The shared `Auth` prefix is the C's, and it stays
-///
-/// `clippy::enum_variant_names` objects that all five variants begin the same
-/// way and suggests removing the prefix. That is refused: the C enumerators are
-/// `GSS_AUTHNONE`, `GSS_AUTHRECV`, `GSS_AUTHSENT`, `GSS_AUTHDONE` and
-/// `GSS_AUTHSUCC`, so the `AUTH` infix is part of each name rather than
-/// decoration on a set of them, and [`Self::as_c_name`] has to be able to hand
-/// back the C spelling for a reader who greps the C tree. Stripping it would
-/// also leave `NegotiateState::None`, which reads as an absent state rather
-/// than as the "no handshake has begun" state it actually is.
+/// `match` is exhaustive, so a state added here forces every decision site to
+/// acknowledge it. The C's `if(*state == GSS_AUTHRECV) ... else if(*state ==
+/// GSS_AUTHSUCC)` chain (`lib/http_negotiate.c:180-189`) silently falls through
+/// for the other three, and a sixth state would join them unnoticed.
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum NegotiateState {
@@ -390,11 +250,6 @@ impl NegotiateState {
 
     /// Whether a header must be withheld from future requests on this
     /// connection.
-    ///
-    /// `*state == GSS_AUTHDONE || *state == GSS_AUTHSUCC`, which
-    /// `lib/http_negotiate.c:192` uses (negated) to decide whether to run the
-    /// emitter at all and `:251` uses to set `authp->done`. One predicate
-    /// rather than two comparisons in two places, because the two must agree.
     #[must_use]
     const fn is_settled(self) -> bool {
         matches!(self, Self::AuthDone | Self::AuthSucc)
@@ -425,18 +280,9 @@ impl fmt::Debug for NegotiateState {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE SUBSTITUTABLE GSS SEAM.
-// ---------------------------------------------------------------------------
 
 /// The GSS-API operations one SPNEGO exchange performs, as a seam.
-///
-/// Every method is safe, every argument and return value is owned or a plain
-/// slice, and no signature names a pointer, a `libc` type, an `OM_uint32` or a
-/// GSS handle -- because none of those is reachable from this module in the
-/// first place. `crate::ffi::mod` re-exports only owning wrappers, so the seal
-/// AAP 0.8.5 conflict C3 describes holds by construction here rather than by
-/// convention.
 ///
 /// # Why the seam exists at all
 ///
@@ -452,19 +298,7 @@ impl fmt::Debug for NegotiateState {
 ///   it against a KDC tests the network.
 /// * `crate::ffi::gss_available()` answers `false` under Miri, which
 ///   interprets rather than links, so a Miri run cannot reach a real
-///   handshake. Without a seam, gate 5 of AAP 0.8.4 would cover none of this
-///   file.
-///
-/// This is AAP 0.3.3 pattern P12 (dependency injection) applied to the one
-/// dependency here that cannot be exercised in a test environment.
-///
-/// # What each method corresponds to
-///
-/// The trait is deliberately narrow: it names the four GSS operations
-/// `lib/vauth/spnego_gssapi.c` actually performs and nothing else. `gss_wrap`,
-/// `gss_unwrap` and `gss_display_name` belong to SOCKS5 and to the SASL path,
-/// and `gss_seal`/`gss_unseal` are not bound at all
-/// (`lib/socks_gssapi.c:343`, `:366-368`).
+///   handshake.
 pub(crate) trait SpnegoEngine {
     /// Whether a service principal has already been imported.
     ///
@@ -496,12 +330,6 @@ pub(crate) trait SpnegoEngine {
     /// (`lib/curl_gssapi.c:313-371`) reached through
     /// `lib/vauth/spnego_gssapi.c:162-171`.
     ///
-    /// `input_token` is `None` for the first step, which is C leaving the
-    /// descriptor as `GSS_C_EMPTY_BUFFER`. Mutual authentication is always
-    /// requested (`:170` passes `TRUE`), `ret_flags` is never asked for
-    /// (`:171` passes `NULL`), and channel bindings are always absent -- see
-    /// the module documentation for why.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::AuthError`] when the library reports `GSS_ERROR`, having
@@ -531,35 +359,15 @@ pub(crate) trait SpnegoEngine {
 
     /// The handshake position the most recent step reported, or `None` when
     /// that step failed.
-    ///
-    /// This is `nego->status`, which `lib/vauth/spnego_gssapi.c:176` assigns
-    /// before its error check and `lib/http_negotiate.c:237-238` reads back as
-    /// `status == GSS_S_COMPLETE || status == GSS_S_CONTINUE_NEEDED`. Returned
-    /// as an [`Option`] of a two-variant enum rather than as an integer so
-    /// that the read site is an exhaustive `match` and the `GSS_S_*` constants
-    /// stay inside `crate::ffi::gss`.
     fn handshake_state(&self) -> Option<HandshakeState>;
 
     /// Delete the context and the imported name, returning to the
     /// pre-handshake state.
-    ///
-    /// The first and third paragraphs of `Curl_auth_cleanup_spnego()`
-    /// (`lib/vauth/spnego_gssapi.c:263-281`): `gss_delete_sec_context` with
-    /// `GSS_C_NO_BUFFER` for the output, then `gss_release_name`, each guarded
-    /// in C by a comparison against its no-value sentinel. Here the sentinel
-    /// comparisons are [`Option::take`] and `Drop`, and the status returns to
-    /// `GSS_S_COMPLETE`, which is C's `nego->status = 0` (`:284`).
     fn reset(&mut self);
 }
 
 /// The production [`SpnegoEngine`]: the real GSS-API library, through
 /// `crate::ffi`.
-///
-/// Two owning wrappers and nothing else. `crate::ffi::SecurityContext` carries
-/// the context handle *and* the status that C keeps beside it as
-/// `nego->status`, which is why [`NegotiateData`] has no status field of its
-/// own: one owner means the two cannot disagree, and `Drop` deletes the handle
-/// exactly once on every path including an early return.
 struct SystemSpnego {
     /// C's `gss_ctx_id_t context` together with its `OM_uint32 status`.
     context: SecurityContext,
@@ -655,16 +463,9 @@ impl SpnegoEngine for SystemSpnego {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `struct negotiatedata`.
-// ---------------------------------------------------------------------------
 
 /// One endpoint's Negotiate state on one connection.
-///
-/// Supersedes the `HAVE_GSSAPI` arm of `struct negotiatedata`
-/// (`lib/vauth/vauth.h:295-324`), whose four typed fields map as follows.
-/// **None** of the C types appears here, and none can: `crate::ffi` exports no
-/// `OM_uint32`, no `gss_ctx_id_t`, no `gss_name_t` and no `gss_buffer_desc`.
 ///
 /// - `OM_uint32 status` and `gss_ctx_id_t context` -> both owned by the
 ///   [`SpnegoEngine`], because `crate::ffi::SecurityContext` already carries
@@ -677,17 +478,8 @@ impl SpnegoEngine for SystemSpnego {
 ///   fields a caller must keep in step.
 /// - `struct dynbuf channel_binding_data` -> omitted; see the module
 ///   documentation.
-///
-/// The four plain booleans carry over unchanged, because they are ordinary
-/// bookkeeping with no C type to shed.
 pub(crate) struct NegotiateData {
     /// The GSS-API operations, behind the seam that makes them testable.
-    ///
-    /// Boxed rather than generic so that neither this type nor
-    /// [`ConnectionNegotiate`] nor [`Negotiate`] carries a type parameter no
-    /// production caller would ever vary. One allocation per endpoint that
-    /// actually attempts Negotiate; performance is a non-goal (AAP 0.1.1) and
-    /// faithfulness of the state machine is what is being bought.
     engine: Box<dyn SpnegoEngine>,
     /// C's `output_token`: the token to base64-encode into the next
     /// `Authorization:` header. Empty means "nothing to send".
@@ -713,12 +505,6 @@ impl Default for NegotiateData {
     /// The `calloc`ed state of `Curl_auth_nego_get()`
     /// (`lib/vauth/vauth.c:243`): no context, no name, no token, and four
     /// false booleans.
-    ///
-    /// The production engine is installed here. Constructing one performs no
-    /// library call, so this is safe to reach on a host with no GSS-API
-    /// implementation at all -- which happens, because
-    /// `crate::auth::MechanismSlots::get_or_default` creates the slot before
-    /// anything has decided a handshake will occur.
     fn default() -> Self {
         Self {
             engine: Box::new(SystemSpnego::new()),
@@ -734,25 +520,10 @@ impl Default for NegotiateData {
 impl fmt::Debug for NegotiateData {
     /// Hand-written, and deliberately not derived.
     ///
-    /// Two reasons, and only the second is about secrecy. First,
-    /// [`SpnegoEngine`] is a trait object with no [`fmt::Debug`] bound -- by
-    /// design, since a GSS context has no printable state -- so the structure
-    /// could not derive one. Second, `output_token` is an attacker-influenced
-    /// SPNEGO token that in a mutual-authentication exchange carries
-    /// Kerberos ticket material, and printing it would create a path to a log
-    /// that curl itself does not have. Its **length** is reported instead,
-    /// which is enough to follow a handshake in a bug report and reveals
-    /// nothing about the credential.
-    ///
-    /// This adds no redaction to curl's own output and removes none. curl
-    /// contains no redaction at all -- `grep -rn "REDACTED" lib/ src/` finds
-    /// nothing -- and `lib/http.c:2888-2895` puts the fully formed
-    /// `Authorization:` header straight into the request buffer, from where
-    /// `--verbose` prints it verbatim and 168 fixtures compare it byte for
-    /// byte. Suppressing that would fail those fixtures and is itself a
-    /// prohibited behaviour change (AAP 0.8.1). The narrower invariant this
-    /// formatter enforces is the one that binds: **no secret gains a path to a
-    /// log that curl does not already have.**
+    /// Suppressing that would fail those fixtures and is itself a prohibited
+    /// behaviour change. The narrower invariant this formatter enforces is the
+    /// one that binds: **no secret gains a path to a log that curl does not
+    /// already have.**
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NegotiateData")
             .field("context_exists", &self.engine.context_exists())
@@ -782,13 +553,6 @@ impl NegotiateData {
     ///    the sentinel back (`:277-281`).
     /// 4. `status = 0`, which is `GSS_S_COMPLETE` (`:284`).
     /// 5. and 6. **All four booleans** to `FALSE` (`:285-288`).
-    ///
-    /// Steps 1, 3 and 4 belong to the engine, because it is the owner of the
-    /// context and the name; the sentinel comparisons collapse into
-    /// [`Option::take`] plus `Drop`, and calling this on an already-clean
-    /// value is a no-op exactly as the C's guarded frees are. Step 2 is the
-    /// vector below. Steps 5 and 6 are easy to lose in a refactor and are
-    /// asserted by [`tests::cleanup_resets_all_four_booleans_and_the_status`].
     pub(crate) fn cleanup_spnego(&mut self) {
         self.engine.reset();
         self.release_output_token();
@@ -800,11 +564,6 @@ impl NegotiateData {
 
     /// `gss_release_buffer(&minor, &nego->output_token)` followed by
     /// `value = NULL; length = 0`.
-    ///
-    /// Three C sites do exactly this and no more:
-    /// `lib/vauth/spnego_gssapi.c:271-275`, `:231-233` and `:239-241`.
-    /// Replacing the vector rather than truncating it releases the allocation,
-    /// which is what `gss_release_buffer` does.
     fn release_output_token(&mut self) {
         self.output_token = Vec::new();
     }
@@ -812,30 +571,6 @@ impl NegotiateData {
     /// Decodes a base64 SPNEGO challenge and produces the response token:
     /// `Curl_auth_decode_spnego_message()`
     /// (`lib/vauth/spnego_gssapi.c:72-201`).
-    ///
-    /// # `user` and `password` are accepted and discarded
-    ///
-    /// `:93-94` is `(void)user; (void)password;`. The identity comes from the
-    /// Kerberos credentials cache, not from the URL, which is why an empty
-    /// username is a working configuration here and nowhere else in this
-    /// directory. Both are still parameters, so the discard is visible at the
-    /// point the C performs it rather than being inferred from an absence.
-    ///
-    /// # THE SPN ARGUMENT ORDER IS A TRAP, AND THE TRAP IS LOAD-BEARING
-    ///
-    /// `:108` calls `Curl_auth_build_spn(service, NULL, host)` -- it passes the
-    /// **host in the realm slot**. `crate::auth::build_spn`'s third branch
-    /// therefore fires and the SPN is **`"<service>@<host>"`**, which is then
-    /// imported with `GSS_C_NT_HOSTBASED_SERVICE`, the name type that expects
-    /// precisely that spelling.
-    ///
-    /// A reader who "corrects" this to the `"<service>/<host>"` form breaks
-    /// Kerberos against every real KDC, and breaks it at the point of ticket
-    /// acquisition -- far from here, and invisible to every test in this file,
-    /// because only a live KDC can tell the two spellings apart. The odd call
-    /// is reproduced verbatim and
-    /// [`tests::the_spn_is_service_at_host_not_service_slash_host`] pins the
-    /// resulting string rather than merely observing that a call happened.
     ///
     /// # Errors
     ///
@@ -963,16 +698,10 @@ impl NegotiateData {
     /// Private, like [`Self::decode_spnego_message`], and deliberately so.
     /// `lib/vauth/vauth.h:331-343` declares both `extern` for one caller each,
     /// and that caller is `lib/http_negotiate.c` -- whose successor is this
-    /// same file. AAP 0.4.2's transformation rule turns an `extern` declared
-    /// for cross-file use into `pub(crate)`; there is no cross-file use here,
-    /// so the narrower visibility is the faithful one, and AAP 0.8.7 forbids
-    /// widening it to accommodate a test. `Curl_auth_cleanup_spnego` is
-    /// different -- `lib/vauth/vauth.c:234` calls it from the connection
-    /// destructor -- which is why [`Self::cleanup_spnego`] is `pub(crate)`
-    /// while these two are not.
-    ///
-    /// Both failure paths release and zero the token before returning, so a
-    /// caller cannot retry with a token the encoder has already rejected.
+    /// same file. `Curl_auth_cleanup_spnego` is different --
+    /// `lib/vauth/vauth.c:234` calls it from the connection destructor --
+    /// which is why [`Self::cleanup_spnego`] is `pub(crate)` while these two
+    /// are not.
     ///
     /// # Errors
     ///
@@ -998,9 +727,7 @@ impl NegotiateData {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE DIAGNOSTICS BRIDGE.
-// ---------------------------------------------------------------------------
 
 /// Routes `crate::ffi::gss`'s messages into this crate's trace machinery.
 ///
@@ -1011,12 +738,6 @@ impl NegotiateData {
 /// its caller for a sink. This is that sink, and it is what makes a GSS-API
 /// failure appear under `--verbose` exactly where and as C's `infof("%s%s",
 /// prefix, buf)` (`lib/curl_gssapi.c:440`) puts it.
-///
-/// The message arrives already assembled, with its verbatim
-/// `"gss_import_name() failed: "` or `"gss_init_sec_context() failed: "`
-/// prefix -- including the trailing space after the colon -- and with each
-/// status part rendered as `"%.*s. "`. Nothing here reformats it, because
-/// those bytes are observable output.
 struct TracerDiagnostics<'a, 'sink> {
     tracer: &'a mut Tracer<'sink>,
 }
@@ -1037,17 +758,9 @@ impl Diagnostics for TracerDiagnostics<'_, '_> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE PER-CONNECTION STATE, ORIGIN AND PROXY.
-// ---------------------------------------------------------------------------
 
 /// Both endpoints' Negotiate state for one connection.
-///
-/// Supersedes three things C keeps separately on `struct connectdata`:
-/// `conn->http_negotiate_state`, `conn->proxy_negotiate_state`, and the two
-/// metadata entries `Curl_auth_nego_get()` selects between
-/// (`lib/vauth/vauth.c:238-248`, keyed `"meta:auth:nego:conn"` and
-/// `"meta:auth:nego-proxy:conn"`).
 ///
 /// The keys are deliberately not reproduced: `crate::auth::MechanismSlots`
 /// exists for exactly this and replaces the `void *` entry value and its cast
@@ -1055,16 +768,6 @@ impl Diagnostics for TracerDiagnostics<'_, '_> {
 /// crate's zero-`unsafe` invariant reachable. It also removes C's
 /// `nego_conn_dtor` -- ownership runs the destructor when the connection is
 /// dropped.
-///
-/// The two `curlnegotiate` fields stay **beside** the slots rather than inside
-/// [`NegotiateData`], because that is where C keeps them: `http_auth_nego_reset`
-/// writes the connection field and the metadata separately
-/// (`lib/http_negotiate.c:41-46`), and the challenge handler at
-/// `lib/http.c:890-898` reaches the state without touching the data at all.
-///
-/// This is where a connection's Negotiate state belongs; `crate::conn` is to
-/// hold one of these per connection, and `crate::auth::state_scope` records the
-/// scope as `Connection` for exactly this reason.
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionNegotiate {
     /// C's `conn->http_negotiate_state`.
@@ -1101,12 +804,6 @@ impl ConnectionNegotiate {
     /// Whether an exchange has begun on either endpoint: C's
     /// `(conn->http_negotiate_state != GSS_AUTHNONE) ||
     /// (conn->proxy_negotiate_state != GSS_AUTHNONE)`.
-    ///
-    /// Two live call shapes in the C, and both want this one answer:
-    /// `lib/http.c:430-431` keeps an upload going because "The
-    /// NEGOTIATE-negotiation has started, keep on sending", and
-    /// `lib/url.c:1226-1228` forces reuse of the very connection the handshake
-    /// is bound to.
     #[must_use]
     #[allow(dead_code)] // Consumers are `crate::protocols::http1` and `crate::conn`.
     pub(crate) fn is_negotiating(&self) -> bool {
@@ -1115,12 +812,6 @@ impl ConnectionNegotiate {
 
     /// Whether either endpoint is waiting to answer a token it has consumed:
     /// C's `state == GSS_AUTHRECV` on either side.
-    ///
-    /// `lib/multi.c:573-574` uses it to keep a connection alive that
-    /// `CURLOPT_FORBID_REUSE` would otherwise close mid-handshake, and
-    /// `lib/http.c:4020-4027` uses it to raise `authproblem` with
-    /// "Connection closure while negotiating auth (HTTP 1.0?)" when the peer
-    /// closes instead of answering.
     #[must_use]
     #[allow(dead_code)] // Consumers are `crate::multi` and `crate::protocols::http1`.
     pub(crate) fn is_awaiting_response(&self) -> bool {
@@ -1131,13 +822,6 @@ impl ConnectionNegotiate {
     /// Records that a challenge token was consumed successfully:
     /// `*negstate = GSS_AUTHRECV` (`lib/http.c:897-898`), whose comment is "we
     /// received a GSS auth token and we dealt with it fine".
-    ///
-    /// This is the transition `crate::auth::ChallengeOutcome::negotiate_received`
-    /// asks its caller to apply. It lives here because the state is this
-    /// module's, and it is separate from [`Negotiate::input_negotiate`] because
-    /// the C applies it in `auth_spnego()` *after* the input path returns --
-    /// the two other effects at the same site, re-cloning `data->req.newurl`
-    /// and clearing `authproblem`, belong to the HTTP driver.
     #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not yet landed.
     pub(crate) fn token_received(&mut self, proxy: bool) {
         *self.state_mut(proxy) = NegotiateState::AuthRecv;
@@ -1155,16 +839,6 @@ impl ConnectionNegotiate {
     ///    (data->req.httpcode != 407))
     ///   conn->proxy_negotiate_state = GSS_AUTHSUCC;
     /// ```
-    ///
-    /// The rejecting status differs per endpoint -- 401 for the origin, 407
-    /// for a proxy -- and that asymmetry is the whole content of the two
-    /// statements, so it is expressed here once rather than restated by the
-    /// caller. Returns whether the promotion happened, so a caller that traces
-    /// the transition does not have to read the state twice.
-    ///
-    /// [`NegotiateState::AuthSucc`] is reachable by no other route, which is
-    /// why this method exists at all rather than the driver assigning the
-    /// state itself.
     #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not yet landed.
     pub(crate) fn settle_after_response(
         &mut self,
@@ -1182,18 +856,6 @@ impl ConnectionNegotiate {
 
     /// Returns one endpoint to the pre-handshake state:
     /// `http_auth_nego_reset()` (`lib/http_negotiate.c:37-47`).
-    ///
-    /// Both halves, in the C's order: the connection's state field goes to
-    /// `GSS_AUTHNONE`, then `Curl_auth_cleanup_spnego()` clears the data.
-    ///
-    /// One inert divergence, recorded so it is not mistaken for a behaviour
-    /// change: C guards the cleanup with `if(neg_ctx)` because
-    /// `Curl_auth_nego_get()` can return `NULL`, whereas
-    /// `MechanismSlots::get_or_default` cannot fail and therefore creates the
-    /// slot if this is the first mention of the endpoint. Cleaning a
-    /// freshly-created slot writes four `false`s over four `false`s and resets
-    /// an empty engine, so nothing observable differs -- only an allocation
-    /// that C would not have made.
     #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not yet landed.
     pub(crate) fn auth_nego_reset(&mut self, proxy: bool) {
         let (state, data) = self.parts(proxy);
@@ -1241,25 +903,13 @@ impl ConnectionNegotiate {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE ENDPOINT INPUTS.
-// ---------------------------------------------------------------------------
 
 /// The credentials, service name and host for one endpoint.
-///
-/// Four `struct connectdata` and `data->set` reads gathered into one value.
-/// For the origin (`lib/http_negotiate.c:78-83`): `conn->user`,
-/// `conn->passwd`, `STRING_SERVICE_NAME` falling back to `"HTTP"`, and
-/// `conn->host.name`. For a proxy (`:67-72`): `conn->http_proxy.user`,
-/// `conn->http_proxy.passwd`, `STRING_PROXY_SERVICE_NAME` falling back to
-/// `"HTTP"`, and `conn->http_proxy.host.name`.
 ///
 /// **The credentials are the CONNECTION's, not the transfer's.** See the module
 /// documentation: this is the one mechanism in this directory that reads them
 /// from there, and it is deliberate.
-///
-/// `Copy`, so reading it out of [`NegotiateEndpoints`] borrows nothing and the
-/// caller stays free to take `&mut` on the state beside it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NegotiateEndpoint<'a> {
     /// The connection-level username and password. Both may be absent, and
@@ -1269,12 +919,6 @@ pub(crate) struct NegotiateEndpoint<'a> {
     /// [`DEFAULT_SERVICE_NAME`].
     pub(crate) service: Option<&'a str>,
     /// The hostname the service principal is built for.
-    ///
-    /// `Option` because the SPN cannot be built without it, and that failure
-    /// is C's `if(!spn) return CURLE_OUT_OF_MEMORY` at
-    /// `lib/vauth/spnego_gssapi.c:109-110`. In the C tree `conn->host.name` is
-    /// always populated, so the path is defensive there; modelling it as
-    /// absent keeps the error reachable and asserted rather than dead.
     pub(crate) host: Option<&'a str>,
 }
 
@@ -1313,19 +957,6 @@ impl<'a> NegotiateEndpoints<'a> {
     /// The endpoint for one side: C's `if(proxy) { ... } else { ... }` prelude,
     /// which both `Curl_input_negotiate()` and `Curl_output_negotiate()` open
     /// with.
-    ///
-    /// # The `CURLE_NOT_BUILT_IN` arm has no successor, and that is recorded
-    /// rather than dropped
-    ///
-    /// C compiles the proxy branch out under `CURL_DISABLE_PROXY` and answers
-    /// `CURLE_NOT_BUILT_IN` instead (`lib/http_negotiate.c:74` and `:167`).
-    /// AAP 0.5.2 fixes this crate's feature vocabulary at fifteen names and
-    /// **none of them is `proxy`**, so there is no configuration in which the
-    /// branch is absent and the mapping is unreachable here. It is documented
-    /// rather than deleted because the code is still part of the contract this
-    /// module reproduces, and
-    /// [`tests::a_proxy_disabled_build_would_answer_not_built_in`] pins the
-    /// code the arm would return.
     #[must_use]
     fn select(self, proxy: bool) -> NegotiateEndpoint<'a> {
         if proxy {
@@ -1336,9 +967,7 @@ impl<'a> NegotiateEndpoints<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE HTTP GLUE.
-// ---------------------------------------------------------------------------
 
 /// The payload of a `Negotiate` challenge: everything after the scheme token
 /// and the blanks that follow it.
@@ -1350,21 +979,6 @@ impl<'a> NegotiateEndpoints<'a> {
 /// curlx_str_passblanks(&header);
 /// len = strlen(header);
 /// ```
-///
-/// Blank means space or tab and nothing else -- `ISBLANK` is
-/// `(((x) == ' ') || ((x) == '\t'))` (`lib/curl_ctype.h:45`), so a CR or an LF
-/// is **not** skipped. `crate::util::strparse::str_passblanks` is the crate's
-/// general form of the same walk; it is reimplemented in these four lines
-/// because `crate::util::strparse` is not among this file's declared
-/// dependencies, and the walk is small enough that duplicating it costs less
-/// than widening the dependency set.
-///
-/// The advance is unconditional in the C, which matters for the re-entrant call
-/// at `:200`: the header is the bare literal `"Negotiate"`, so the advance
-/// lands exactly on the terminator and the payload is empty. A caller that
-/// hands over a shorter string than the scheme token gets an empty payload
-/// rather than a panic, which is the behaviour of C's pointer arithmetic on the
-/// strings `authcmp()` admits.
 fn payload_after_scheme(header: &[u8]) -> &[u8] {
     let after_token = header.get(NEGOTIATE_SCHEME.len()..).unwrap_or(&[]);
     let blanks = after_token
@@ -1377,35 +991,12 @@ fn payload_after_scheme(header: &[u8]) -> &[u8] {
 }
 
 /// The Negotiate mechanism, over one connection and one trace sink.
-///
-/// Supersedes `Curl_input_negotiate()` and `Curl_output_negotiate()`
-/// (`lib/http_negotiate.c:49-149` and `:151-260`). C reaches everything it
-/// needs through `struct Curl_easy *data` and `struct connectdata *conn`;
-/// here each of those reads is a field, so the inputs are visible and the type
-/// is constructible in a test without a session handle.
-///
-/// # `bool *done` and `data->state.aptr.userpwd` are both gone
-///
-/// C writes readiness through `authp->done` and the header into
-/// `data->state.aptr.userpwd` or `.proxyuserpwd`, freeing whatever was there
-/// (`lib/http_negotiate.c:218-227`). Both become the return value:
-/// [`crate::auth::AuthEmission`] carries the header line and distinguishes
-/// `Final` from `Continuing`, so readiness cannot be forgotten, cannot be
-/// written twice and cannot disagree with the header it accompanies.
-/// `crate::auth::finish_emission` is the single place it lands in
-/// `crate::auth::AuthState`, and storing the line is the HTTP driver's job.
 pub(crate) struct Negotiate<'a, 'sink> {
     /// The connection's Negotiate state, both endpoints.
     conn: &'a mut ConnectionNegotiate,
     /// The credentials, service names and hosts.
     endpoints: NegotiateEndpoints<'a>,
     /// `data->set.gssapi_delegation`, the `CURLOPT_GSSAPI_DELEGATION` mask.
-    ///
-    /// Read only by `Curl_gss_init_sec_context()` (`lib/curl_gssapi.c:329`,
-    /// `:338`), so it travels to the engine and nowhere else.
-    /// `crate::auth::CURLGSSAPI_DELEGATION_NONE`, `_POLICY_FLAG` and `_FLAG`
-    /// are the option's three values; `crate::ffi::Delegation::from_option_value`
-    /// converts one.
     delegation: Delegation,
     /// Where `infof()` goes.
     tracer: &'a mut Tracer<'sink>,
@@ -1436,10 +1027,6 @@ impl<'a, 'sink> Negotiate<'a, 'sink> {
 
     /// Consumes a `Negotiate` challenge: `Curl_input_negotiate()`
     /// (`lib/http_negotiate.c:49-149`).
-    ///
-    /// `header` starts at the scheme token, exactly as C's `auth` pointer does
-    /// -- `Curl_http_input_auth()` hands the handlers the same pointer
-    /// `authcmp()` matched, not the text after it.
     ///
     /// # The order of the four steps is the C's, and each one matters
     ///
@@ -1629,12 +1216,8 @@ impl<'a, 'sink> Negotiate<'a, 'sink> {
             };
             emitted =
                 Some(authorization_header(proxy, NEGOTIATE_SCHEME, &encoded));
-            // C's `if(!userp) return CURLE_OUT_OF_MEMORY;` at `:231-233` guards
-            // the `curl_maprintf` above it. `format!` aborts rather than
-            // returning on allocation failure, so the arm has no successor and
-            // `CURLE_OUT_OF_MEMORY` reaches this function only from
-            // `Curl_auth_nego_get()`'s `NULL` (`:175-176`), which
-            // `MechanismSlots::get_or_default` cannot produce either.
+            // C's `if(!userp) return CURLE_OUT_OF_MEMORY;` at `:231-233`
+            // guards the `curl_maprintf` above it.
 
             // `*state = GSS_AUTHSENT;` then the `HAVE_GSSAPI` upgrade
             // (`:235-240`): `GSS_AUTHDONE` when the status is `GSS_S_COMPLETE`
@@ -1723,24 +1306,6 @@ impl fmt::Debug for Negotiate<'_, '_> {
 }
 
 // Tests
-//
-// `tests/libtest/*.c` (235 files) and `tests/unit/*.c` (59 files) cannot link
-// against this crate: they call internal `Curl_*` symbols, and a Rust static
-// library does not export `pub(crate)` items -- they are genuinely absent from
-// the symbol table rather than merely hidden. AAP 0.8.7 records that as a
-// deviation and relocates their coverage into the crate, which is what this
-// module is. It is also the only place a private field is reachable without
-// widening its visibility to accommodate a test.
-//
-// The C oracle is cited for each assertion, and every expectation that crosses
-// the wire or reaches `--verbose` is written as a LITERAL rather than derived
-// from the implementation. Deriving it would make the test agree with whatever
-// the code does, which is the one thing a parity test must not do.
-//
-// `tests/data/test2056` and `test2057` are the only Negotiate fixtures in the
-// corpus and both gate on `<features> GSS-API` AND `Debug`. AAP 0.6.6
-// deliberately withholds `Debug`, so both skip -- correctly, not by failure --
-// which is precisely why the state machine needs the coverage below.
 
 #[cfg(test)]
 mod tests {
@@ -1817,13 +1382,6 @@ mod tests {
     }
 
     /// A [`SpnegoEngine`] that answers from a script and records what it saw.
-    ///
-    /// Stands in for `crate::ffi::SecurityContext`, which is concrete over the
-    /// real library and deliberately not substitutable from outside
-    /// `crate::ffi::gss`. See [`SpnegoEngine`] for why the seam exists; the
-    /// short version is that the state machine below is independent of any
-    /// Kerberos deployment, and `crate::ffi::gss_available()` answers `false`
-    /// under Miri, so without this there would be no coverage at all.
     struct FakeSpnego {
         shared: Rc<RefCell<Script>>,
         target: Option<Vec<u8>>,
@@ -2061,32 +1619,10 @@ mod tests {
         })
     }
 
-    // -----------------------------------------------------------------------
     // Capability advertisement.
-    // -----------------------------------------------------------------------
 
     /// The availability predicates agree, and the one that is deliberately
     /// STRICTER says so.
-    ///
-    /// [`is_spnego_supported`] and `crate::auth::is_spnego_supported` are pure
-    /// forwards to `crate::ffi::gss_available()`, so they are equal to it and
-    /// to each other unconditionally.
-    ///
-    /// `crate::version::negotiate_usable` is not a third forward: it conjoins
-    /// `crate::version::supports_negotiate`, which requires
-    /// `crate::version::ENGINE_GSS` -- the entry that names this very file --
-    /// to report present. It still reports absent, and correctly so: a
-    /// Negotiate exchange needs `crate::protocols::http1` to carry it, and
-    /// until that lands the capability cannot execute. Withholding is the safe
-    /// direction of AAP 0.6.5's asymmetry, and the relationship rather than the
-    /// current value is what is asserted here, so this test keeps passing when
-    /// the engine flips.
-    ///
-    /// This is the only place in this file that reaches into `crate::version`,
-    /// it does so read-only and only under `#[cfg(test)]`, and it exists
-    /// precisely to discharge the anti-drift obligation the module
-    /// documentation states: the coupling between the banner and this module is
-    /// checked here rather than merely described.
     #[test]
     fn the_three_availability_predicates_agree() {
         let probe = crate::ffi::gss_available();
@@ -2109,9 +1645,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // The five states.
-    // -----------------------------------------------------------------------
 
     /// The C enumerator spellings, in the C's declaration order
     /// (`lib/urldata.h:312-318`). Literals, not derived.
@@ -2179,20 +1713,9 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // The service principal name.
-    // -----------------------------------------------------------------------
 
     /// THE ARGUMENT-ORDER TRAP, pinned as a string.
-    ///
-    /// `lib/vauth/spnego_gssapi.c:108` calls
-    /// `Curl_auth_build_spn(service, NULL, host)`, so the host lands in the
-    /// realm slot and the third branch of `crate::auth::build_spn` produces
-    /// `"<service>@<host>"` -- the spelling `GSS_C_NT_HOSTBASED_SERVICE`
-    /// expects. The assertion is on the exact bytes handed to the import, not
-    /// merely on the fact that an import happened, because only the bytes can
-    /// tell the two forms apart and only a live KDC would notice the
-    /// difference at run time.
     #[test]
     fn the_spn_is_service_at_host_not_service_slash_host() {
         let creds = credentials();
@@ -2303,9 +1826,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Challenge decoding.
-    // -----------------------------------------------------------------------
 
     /// The payload walk: `header += strlen("Negotiate")` then
     /// `curlx_str_passblanks` (`lib/http_negotiate.c:98-101`), where blank is
@@ -2536,9 +2057,7 @@ mod tests {
         assert_eq!(ends.origin.password(), b"");
     }
 
-    // -----------------------------------------------------------------------
     // The three no-payload branches, `lib/http_negotiate.c:103-114`.
-    // -----------------------------------------------------------------------
 
     /// `havenegdata = len != 0` is set from the payload length
     /// UNCONDITIONALLY, before any branch (`:102`).
@@ -2660,9 +2179,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Cleanup and reset.
-    // -----------------------------------------------------------------------
 
     /// `Curl_auth_cleanup_spnego()` (`lib/vauth/spnego_gssapi.c:259-289`)
     /// clears the context, the name, the token, the status AND **all four**
@@ -2757,9 +2274,7 @@ mod tests {
         assert_eq!(conn.state(true), NegotiateState::AuthSucc);
     }
 
-    // -----------------------------------------------------------------------
     // Token creation.
-    // -----------------------------------------------------------------------
 
     /// `Curl_auth_create_spnego_message()`
     /// (`lib/vauth/spnego_gssapi.c:219-247`) base64-encodes the stored token,
@@ -2789,22 +2304,9 @@ mod tests {
         assert_eq!(data.output_token, b"abcd".to_vec());
     }
 
-    // -----------------------------------------------------------------------
     // `Curl_output_negotiate()`, `lib/http_negotiate.c:151-260`.
-    // -----------------------------------------------------------------------
 
     /// THE EMITTED HEADER IS BYTE-EXACT, for both endpoints.
-    ///
-    /// `lib/http_negotiate.c:215-216` is
-    /// `"%sAuthorization: Negotiate %s\r\n"` with `proxy ? "Proxy-" : ""`.
-    /// 168 fixtures compare an `Authorization: ` line inside a byte-exact
-    /// `<protocol>` block, joined and compared as one string with no
-    /// normalisation (`tests/getpart.pm:351+`), so a second space, a
-    /// lower-case scheme token or an `\n` line ending would fail them.
-    ///
-    /// The expectations are written out in full rather than composed from the
-    /// constants above, which is the point: a test that rebuilt the string the
-    /// way the code does would agree with a defect.
     #[test]
     fn the_emitted_header_is_byte_exact_for_both_endpoints() {
         for (proxy, expected) in [
@@ -2832,23 +2334,6 @@ mod tests {
     }
 
     /// The full multi-round-trip walk, with every documented transition.
-    ///
-    /// `GSS_AUTHNONE` -> emit -> `GSS_AUTHDONE` -> (challenge) ->
-    /// `GSS_AUTHRECV` -> emit -> `GSS_AUTHDONE` -> (200) -> `GSS_AUTHSUCC` ->
-    /// no further header.
-    ///
-    /// # `GSS_AUTHSENT` is written on every round and immediately overwritten
-    ///
-    /// `:235` assigns it unconditionally and `:236-240` replaces it with
-    /// `GSS_AUTHDONE` whenever the status is `GSS_S_COMPLETE` or
-    /// `GSS_S_CONTINUE_NEEDED`. Those are the only two statuses a successful
-    /// step can report -- `Curl_auth_decode_spnego_message()` returns
-    /// `CURLE_AUTH_ERROR` for anything else (`:177-185`) -- so in a GSS-API
-    /// build `GSS_AUTHSENT` is never a resting state. It IS reachable in the
-    /// out-of-scope SSPI build, whose `SEC_*` statuses are a wider set, and
-    /// [`a_step_with_an_unreadable_status_leaves_the_state_at_authsent`]
-    /// exercises the branch through the seam. This is a property of the C that
-    /// is transcribed rather than tidied away.
     #[test]
     fn the_state_machine_walks_none_recv_done_succ() {
         let creds = credentials();
@@ -2936,12 +2421,6 @@ mod tests {
     }
 
     /// The `GSS_AUTHSENT` branch, reachable only through the seam.
-    ///
-    /// A step that succeeds while leaving the status unreadable is what the
-    /// out-of-scope SSPI arm (`:242-247`) can produce and a GSS-API build
-    /// cannot, so `*state` keeps the `GSS_AUTHSENT` assigned at `:235` and
-    /// `authp->done` stays false -- an emission that is `Continuing`, not
-    /// `Final`.
     #[test]
     fn a_step_with_an_unreadable_status_leaves_the_state_at_authsent() {
         let creds = credentials();
@@ -3037,11 +2516,6 @@ mod tests {
     fn the_persistence_bookkeeping_follows_the_c_exactly() {
         // Arm one: `GSS_AUTHRECV` with `havenegdata` sets
         // `havemultiplerequests`.
-        //
-        // `GSS_AUTHRECV` is only ever reached after a challenge was decoded, so
-        // the realistic setup has a context and a stored token already -- which
-        // is also what makes the output path skip the input re-entry, as it does
-        // in production on the second round.
         for havenegdata in [false, true] {
             let creds = credentials();
             let ends = endpoints(&creds);
@@ -3144,11 +2618,6 @@ mod tests {
 
     /// `neg_ctx->havenegdata = FALSE;` (`:257`) -- UNCONDITIONALLY, on every
     /// path that returns from the output function.
-    ///
-    /// Losing this makes `havemultiplerequests` latch on the first challenge
-    /// and never clear, so all four reachable exits are checked: a header was
-    /// emitted, no header was emitted, the swallowed `CURLE_AUTH_ERROR`, and a
-    /// propagated error.
     #[test]
     fn havenegdata_is_cleared_on_every_output_path() {
         // Exit one: a header was emitted. `GSS_AUTHRECV` with a context and a
@@ -3252,9 +2721,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Delegation, the mechanism trait, and the orderings.
-    // -----------------------------------------------------------------------
 
     /// The `CURLOPT_GSSAPI_DELEGATION` mask reaches the handshake unchanged.
     ///
@@ -3356,13 +2823,6 @@ mod tests {
 
     /// This module's position in the three orderings `crate::auth` defines, and
     /// the `CURLAUTH_NEGOTIATE` integer with its two ABI aliases.
-    ///
-    /// Asserted here rather than duplicated: the tables live in `crate::auth`,
-    /// and what this test pins is that Negotiate occupies the place
-    /// `lib/http.c` gives it -- first in preference (`:343-364`, "the order of
-    /// these checks is highly relevant"), second in emission after AWS SigV4
-    /// (`:642-718`), and first in challenge parsing, before NTLM
-    /// (`:1057-1074`).
     #[test]
     fn negotiate_occupies_its_place_in_the_three_orderings() {
         assert_eq!(PREFERENCE_ORDER[0], AuthScheme::Negotiate);
@@ -3385,14 +2845,6 @@ mod tests {
         assert_eq!(DEFAULT_SERVICE_NAME, "HTTP");
     }
 
-    /// The `CURL_DISABLE_PROXY` arm has no successor, and the code it would
-    /// return is recorded rather than dropped.
-    ///
-    /// `lib/http_negotiate.c:74` and `:167` answer `CURLE_NOT_BUILT_IN` for a
-    /// proxy in a build without proxy support. AAP 0.5.2 fixes this crate's
-    /// feature vocabulary at fifteen names and none is `proxy`, so there is no
-    /// configuration in which the branch is absent -- the proxy path here is
-    /// always live, which the assertions below confirm.
     #[test]
     fn a_proxy_disabled_build_would_answer_not_built_in() {
         // The code itself, so the mapping is written down somewhere executable.
@@ -3410,21 +2862,19 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Secrecy.
-    // -----------------------------------------------------------------------
 
     /// NO CREDENTIAL REACHES THE TRACE SINK.
     ///
-    /// A complete exchange runs with tracing fully on, and the captured sink is
-    /// searched for the password. This adds no redaction to curl's own output
-    /// and removes none: `lib/http.c:2888-2895` puts the fully formed
+    /// A complete exchange runs with tracing fully on, and the captured sink
+    /// is searched for the password. This adds no redaction to curl's own
+    /// output and removes none: `lib/http.c:2888-2895` puts the fully formed
     /// `Authorization:` header into the request buffer, where `--verbose`
     /// prints it verbatim and 168 fixtures compare it byte for byte.
     /// Suppressing that would fail those fixtures and is itself a prohibited
-    /// behaviour change (AAP 0.8.1). What is asserted is the narrower invariant
-    /// that actually binds: **no secret gains a path to a log that curl does
-    /// not already have.** This module never emits the header itself -- it returns
+    /// behaviour change. What is asserted is the narrower invariant that
+    /// actually binds: **no secret gains a path to a log that curl does not
+    /// already have.** This module never emits the header itself -- it returns
     /// it -- so nothing it writes may contain a credential.
     #[test]
     fn no_credential_reaches_the_trace_sink() {

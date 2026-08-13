@@ -4,20 +4,11 @@
 
 //! Locating a per-user dotfile -- `src/tool_findfile.c`.
 //!
-//! AAP section 0.4.1 maps this file from `src/tool_findfile.c`, and section
-//! 0.3.1 places it in the `curl-rs/src/config` subtree. It provides exactly
-//! one operation, [`findfile`] -- the counterpart of `findfile`
-//! (`src/tool_findfile.c:98-150`) -- built from the private [`checkhome`]
-//! helper (`:63-85`). Everything here is `pub(crate)` or private: this crate
-//! exports no C ABI, so nothing in it may perturb the 100-symbol export set
-//! that `nm` grades (AAP section 0.6.4).
-//!
 //! # It locates `.curlrc`, and it does not locate `.netrc`
 //!
-//! AAP section 0.4.1's row reads "Locates `.curlrc` and `.netrc`". The first
-//! half is right and the second is not, and following it would be a defect
-//! rather than a completion. `findfile` has exactly **two** call sites in the
-//! whole C tool, and neither names `.netrc`:
+//! The first half is right and the second is not, and following it would be a
+//! defect rather than a completion. `findfile` has exactly **two** call sites
+//! in the whole C tool, and neither names `.netrc`:
 //!
 //! * `src/tool_parsecfg.c:92` -- `findfile(".curlrc", CURLRC_DOTSCORE)`,
 //!   reached only when `parseconfig` was handed no filename, whose comment at
@@ -27,38 +18,6 @@
 //!   reached only when the transfer is not `--insecure` and no known-hosts
 //!   file was configured. That caller becomes
 //!   `curl-rs/src/config/to_setopts.rs`.
-//!
-//! `.netrc`'s default location is decided in the **library**, not here.
-//! `lib/netrc.c` -- now `curl-rs-lib/src/cookies/netrc.rs` -- resolves it, and
-//! the tool only forwards `CURLOPT_NETRC` and `CURLOPT_NETRC_FILE`
-//! (`src/config2setopts.c:877-884`). So no `.netrc` search path, wrapper or
-//! default location appears below. Adding one would invent user-visible
-//! behaviour the C never had, which AAP section 0.8.1 freezes and section
-//! 0.8.2 forbids. This paragraph exists so that the apparent omission is not
-//! later "fixed".
-//!
-//! Both overrides -- `-K`/`--config` and `--netrc-file` -- bypass the search
-//! entirely, and that logic belongs to the two callers rather than here.
-//!
-//! # The `.ssh/known_hosts` caller makes this security-relevant
-//!
-//! The second caller passes the result to libcurl as
-//! `CURLOPT_SSH_KNOWNHOSTS` (`src/config2setopts.c:210`), so what this file
-//! returns is **trust material** for SSH host-key verification, and a miss is
-//! reported to the user as "Could not find a known_hosts file" (`:220`). The
-//! search set and its order are therefore reproduced exactly: no location is
-//! added, no probe is widened, and no directory the C never consults is
-//! consulted here. A search order that is merely "more helpful" than the C's
-//! would be a security defect in that caller.
-//!
-//! # No error channel, deliberately
-//!
-//! C's `findfile` returns a path or `NULL` (`:149`) and has no way to say
-//! why. [`findfile`] returns `Option<PathBuf>` for the same reason: a failed
-//! open is a miss, not an error. `curl-rs-lib`'s public `error` module is
-//! consequently **not** imported here -- mapping a miss onto a `CURLcode`
-//! would invent a diagnostic the C never produced, and both C callers treat
-//! `NULL` as "carry on without a file" rather than as a failure.
 //!
 //! # The environment is a parameter, not an ambient read
 //!
@@ -94,8 +53,8 @@ use std::path::{Path, PathBuf};
 ///
 /// A single byte rather than the C's one-character string literal, because it
 /// is concatenated rather than interpolated. The Windows spelling `"\\"`
-/// (`lib/curl_setup.h:664`) has no counterpart here: the four mandated
-/// targets are `x86_64` and `aarch64` on Linux and macOS (AAP section 0.2.2).
+/// (`lib/curl_setup.h:664`) has no counterpart here: the four mandated targets
+/// are `x86_64` and `aarch64` on Linux and macOS.
 const DIR_CHAR: u8 = b'/';
 
 /// The `'.'`-then-`'_'` prefixes of `checkhome` -- `src/tool_findfile.c:65`.
@@ -107,23 +66,6 @@ const DIR_CHAR: u8 = b'/';
 const PREF: [u8; 2] = *b"._";
 
 /// `CURLRC_DOTSCORE` -- `src/tool_findfile.h:28-32`.
-///
-/// The header defines it as `2` on `_WIN32` ("look for underscore-prefixed
-/// name too") and `1` otherwise ("regular .curlrc check"). On all four
-/// mandated targets it is **1**, so that is the only value declared here; a
-/// `#[cfg(windows)]` alternative would be scaffolding for a target AAP
-/// section 0.2.2 places out of scope.
-///
-/// It is `i32` because C's `findfile` takes `int dotscore` and performs
-/// arithmetic on it (`src/tool_findfile.c:98`, `:133`). Reducing it to a
-/// `bool` would erase that arithmetic; see [`findfile_with`].
-///
-/// The value is only meaningful to callers looking for `.curlrc`, which is
-/// why `src/config2setopts.c:208` passes `FALSE` instead.
-///
-/// `#[allow(dead_code)]` because its consumer,
-/// `curl-rs/src/config/parseconfig.rs`, has not landed yet; the attribute
-/// goes when that file arrives.
 #[allow(dead_code)]
 pub(crate) const CURLRC_DOTSCORE: i32 = 1;
 
@@ -143,23 +85,6 @@ struct Finder {
 }
 
 /// The search table -- `conf_list`, `src/tool_findfile.c:47-61`.
-///
-/// The order of the variables below is important, as the index number is used
-/// in the `findfile()` function. (That is the C's own comment, `:45-46`, and
-/// it is carried because the ordering is the specification: AAP section 0.8.1
-/// freezes it, and the first entry that yields a readable file wins.)
-///
-/// The three `#ifdef _WIN32` rows at `:51-55` -- `USERPROFILE`, `APPDATA` and
-/// `USERPROFILE` plus `"\\Application Data"` -- are **omitted entirely**
-/// rather than gated, because the four mandated targets are `x86_64` and
-/// `aarch64` on Linux and macOS (AAP section 0.2.2). Omitting them is why
-/// this array has five rows where the C has eight, and why the `:57` and
-/// `:58` rows sit at indices 3 and 4 here.
-///
-/// C terminates the array with a `{ NULL, NULL, FALSE }` sentinel (`:60`) so
-/// that `for(i = 0; conf_list[i].env; i++)` (`:107`) can find the end. A Rust
-/// slice carries its own length, so the sentinel is not reproduced; it is a C
-/// iteration mechanism, not a search location.
 const CONF_LIST: [Finder; 5] = [
     // `{ "CURL_HOME", NULL, FALSE }` -- `:48`.
     Finder {
@@ -205,11 +130,6 @@ const CONF_LIST: [Finder; 5] = [
 /// pushing the `"/.config"` of rows 3 and 4 onto `$HOME` would silently yield
 /// `/.config` instead of `$HOME/.config`. Byte concatenation reproduces
 /// `curl_maprintf` exactly and has no such special case.
-///
-/// Working in bytes also keeps non-UTF-8 input intact. An environment value
-/// and a file name are arbitrary byte strings on the mandated targets, so
-/// nothing here round-trips through `str`, which would either reject or
-/// mangle them.
 fn join_under(home: &OsStr, name: &[u8]) -> PathBuf {
     let mut joined = Vec::with_capacity(
         home.as_bytes()
@@ -224,20 +144,6 @@ fn join_under(home: &OsStr, name: &[u8]) -> PathBuf {
 }
 
 /// Reports whether `path` can be opened for reading.
-///
-/// The C probe is `curlx_open(c, O_RDONLY)` accepted on `fd >= 0`, with an
-/// immediate `curlx_close(fd)` once it succeeds
-/// (`src/tool_findfile.c:74-80`); `curlx_open` and `curlx_close` are plain
-/// `open` and `close` on the mandated targets (`lib/curlx/fopen.h:68-69`).
-///
-/// So this is an **open**, and deliberately not `Path::exists`,
-/// `Path::try_exists` or a metadata query. The difference is observable: a
-/// file that exists but is unreadable, and a symlink whose target is missing,
-/// both fail `open(2)` and must therefore not be treated as hits. An
-/// existence test would accept the first of those and change which file curl
-/// loads.
-///
-/// The handle is dropped as the expression ends, which is the C's `close`.
 fn opens(path: &Path) -> bool {
     File::open(path).is_ok()
 }
@@ -245,17 +151,11 @@ fn opens(path: &Path) -> bool {
 /// Probes `fname` under `home` -- `checkhome`,
 /// `src/tool_findfile.c:63-85`.
 ///
-/// `dotscore` selects between C's two branches, and note that it is a `bool`
-/// here exactly as it is in the C signature (`:63`); the *arithmetic* that
-/// produces it lives in [`findfile_with`].
-///
 /// * `true` -- two candidates, `:67` and `:70`. The first byte of `fname` is
 ///   **replaced** by `'.'` and then by `'_'`, because the C interpolates
 ///   `pref[i]` followed by `&fname[1]`, which skips `fname[0]`. For
 ///   `.curlrc` that is `.curlrc` and then `_curlrc`.
 /// * `false` -- one candidate, `:72`: `fname` verbatim under `home`.
-///
-/// Returns the first candidate that opens, or `None` when none does (`:84`).
 fn checkhome(home: &OsStr, fname: &OsStr, dotscore: bool) -> Option<PathBuf> {
     // `for(i = 0; i < (dotscore ? 2 : 1); i++)` -- `:67`. Iterating the
     // prefix table itself keeps the count and the prefixes in step: taking
@@ -309,9 +209,9 @@ fn checkhome(home: &OsStr, fname: &OsStr, dotscore: bool) -> Option<PathBuf> {
 /// ```
 ///
 /// `getpwuid` and `geteuid` are libc calls. There is no safe `std` API for
-/// either, this crate is covered by `#![forbid(unsafe_code)]`
-/// (`curl-rs/src/main.rs:49`) and has no `mod ffi` to exempt, and `curl-rs`
-/// does not depend on `libc` at all. So the value cannot be produced here.
+/// either, this crate is covered by `#![forbid(unsafe_code)]` and has no
+/// `mod ffi` to exempt, and `curl-rs` does not depend on `libc` at all. So the
+/// value cannot be produced here.
 ///
 /// It cannot be borrowed from the engine either. The lookup belongs in
 /// `curl-rs-lib/src/ffi/sys.rs`, the workspace's single sanctioned `unsafe`
@@ -323,24 +223,7 @@ fn checkhome(home: &OsStr, fname: &OsStr, dotscore: bool) -> Option<PathBuf> {
 /// that crate, and no `getpwuid` wrapper exists anywhere in it. Resolving
 /// this therefore needs a decision in the engine, not a local workaround.
 ///
-/// So this returns `None`, and that is the honest answer rather than a
-/// silently dropped feature. Three sibling gaps are handled the same way:
-/// terminal width and password echo in `curl-rs/src/terminal.rs`, and
-/// local-time conversion in `curl-rs/src/util.rs`. The engine states the
-/// same convention for the same value at
-/// `curl-rs-lib/src/cookies/netrc.rs:521-530`: `Some(path)` is what
-/// `curl-rs-lib/src/ffi/sys.rs` "or the command-line tool produces once it
-/// has queried the password database; `None` is the honest answer for a
-/// caller that cannot query it".
-///
 /// # What is *not* deferred
-///
-/// Only the value is missing. The fallback's position in the cascade and its
-/// two semantic details -- that it receives the **original** `fname` with its
-/// dot intact, and that it passes `FALSE` rather than the caller's `dotscore`
-/// -- are implemented by [`findfile_with`] and verified by the tests below,
-/// which drive them through the injected parameter. When the engine exposes
-/// the lookup, this function body is the only thing that changes.
 ///
 /// Two substitutions are specifically **not** made here, because each would
 /// change behaviour while appearing to fix it:
@@ -348,8 +231,6 @@ fn checkhome(home: &OsStr, fname: &OsStr, dotscore: bool) -> Option<PathBuf> {
 /// * `std::env::var_os("HOME")` -- already `CONF_LIST[2]`, so this would be
 ///   dead code in every case except the one the fallback exists to serve,
 ///   namely `HOME` being unset.
-/// * a home-directory crate -- prohibited by the supply-chain obligation of
-///   AAP section 0.7, and it would answer from the environment anyway.
 fn home_from_password_database() -> Option<OsString> {
     None
 }
@@ -357,13 +238,6 @@ fn home_from_password_database() -> Option<OsString> {
 /// Walks [`CONF_LIST`] with the environment and the password-database home
 /// supplied by the caller -- the body of `findfile`,
 /// `src/tool_findfile.c:98-150`.
-///
-/// `getenv` answers for one variable name, returning `None` when it is unset;
-/// `passwd_home` is the value C obtains from `getpwuid` at `:141`. Injecting
-/// both is what makes every branch reachable from a test without touching the
-/// process environment, and it is the same pattern the engine uses for its own
-/// platform reads (`curl-rs-lib/src/ffi/sys.rs`) and for this very value
-/// (`curl-rs-lib/src/cookies/netrc.rs:516-519`).
 ///
 /// # Preconditions
 ///
@@ -380,15 +254,6 @@ fn home_from_password_database() -> Option<OsString> {
 ///   sole caller that passes `1` passes `".curlrc"`
 ///   (`src/tool_parsecfg.c:92`). Nothing here enforces it; a name that
 ///   violates it simply has its first byte replaced, which is what the C does.
-///
-/// # The `getenv` bound
-///
-/// `getenv` is bound over `&'static str` rather than over any lifetime because
-/// the only names ever looked up are [`CONF_LIST`]'s own, which are `'static`.
-/// That is not a convenience: a higher-ranked `Fn(&str)` bound cannot be
-/// satisfied by `std::env::var_os` itself, since its key type is a generic
-/// parameter that would have to resolve to one specific lifetime, so the entry
-/// point would need a wrapping closure that carries no meaning.
 fn findfile_with<F>(
     fname: &OsStr,
     dotscore: i32,
@@ -407,9 +272,8 @@ where
     // QUIRK A, part one -- `:98` and `:131`. `dotscore` is C's *function
     // parameter*, and `:131` assigns to it from inside the loop, so the
     // assignment survives into every later iteration. Holding it as a mutable
-    // local of an integer type reproduces that; a `bool`, or a value recomputed
-    // per iteration, would not. This is preserved deliberately, not
-    // overlooked: it is user-visible behaviour that AAP section 0.8.1 freezes.
+    // local of an integer type reproduces that; a `bool`, or a value
+    // recomputed per iteration, would not.
     let mut dotscore = dotscore;
 
     // `for(i = 0; conf_list[i].env; i++)` -- `:107`.
@@ -500,9 +364,6 @@ where
     // never the `filename` the loop advanced -- together with `FALSE` rather
     // than the caller's `dotscore`. C returns this result directly at `:145`,
     // so a miss here is the `NULL` of `:149`.
-    //
-    // See [`home_from_password_database`]: today `passwd_home` is always
-    // `None` from the entry point, and that is a reported gap.
     match passwd_home {
         Some(home) if !home.as_bytes().is_empty() => {
             checkhome(home, fname, false)
@@ -514,33 +375,10 @@ where
 /// Returns the full path of `fname` found under one of the user's home
 /// locations, or `None` -- `findfile`, `src/tool_findfile.c:98-150`.
 ///
-/// The C's own summary (`:87-97`) states the contract this preserves: "If
-/// 'dotscore' is TRUE, then check for the file first with a leading dot and
-/// then with a leading underscore. 1. Iterate over the environment variables
-/// in order, and if set, check for the given file to be accessed there, then
-/// it is a match. 2. Non-Windows: try getpwuid".
-///
-/// `fname` is a **relative** name and may contain separators: the two callers
-/// pass `".curlrc"` (`src/tool_parsecfg.c:92`) and `".ssh/known_hosts"`
-/// (`src/config2setopts.c:208`). It is an `&OsStr` rather than a `&str`
-/// because a file name is an arbitrary byte string on the mandated targets.
-///
-/// `dotscore` is [`CURLRC_DOTSCORE`] for the `.curlrc` search and `0` -- C's
-/// `FALSE` -- for anything else. It is `i32` to match C's `int`, and the
-/// arithmetic performed on it is documented in [`findfile_with`].
-///
 /// The returned path is owned. C returns heap memory the caller must release
 /// with `curl_free` (`:88-89`); ownership makes that release automatic, so
 /// neither caller needs the `curl_free` that `src/tool_parsecfg.c:97` and
 /// `src/config2setopts.c:214` perform.
-///
-/// This cannot fail and cannot panic: every miss, including an unreadable
-/// file and an unset environment, is `None`.
-///
-/// `#[allow(dead_code)]` because neither caller has landed yet --
-/// `curl-rs/src/config/parseconfig.rs` and
-/// `curl-rs/src/config/to_setopts.rs`, both specified by AAP section 0.3.1.
-/// The attribute goes when the first of them arrives.
 #[allow(dead_code)]
 pub(crate) fn findfile(fname: &OsStr, dotscore: i32) -> Option<PathBuf> {
     // Read now, not at build time, and never cached: see the module
@@ -561,12 +399,6 @@ mod tests {
 
     /// Builds a `getenv` from explicit pairs; any name absent from `pairs` is
     /// unset.
-    ///
-    /// This is why nothing below calls `std::env::set_var`. The environment is
-    /// process-global, so tests that mutated it would race each other under the
-    /// default multi-threaded harness and would be flaky rather than wrong.
-    /// Every case here is hermetic and order-independent, and the suite gives
-    /// the same result however many threads run it.
     fn lookup(
         pairs: &[(&'static str, &OsStr)],
     ) -> impl Fn(&'static str) -> Option<OsString> {
@@ -593,9 +425,9 @@ mod tests {
 
     #[test]
     fn the_search_table_matches_the_c_declaration_order() {
-        // `conf_list`, `src/tool_findfile.c:47-61`, minus the three
-        // `#ifdef _WIN32` rows at `:51-55` (AAP section 0.2.2). The C line for
-        // each surviving row is named beside it.
+        // `conf_list`, `src/tool_findfile.c:47-61`, minus the three `#ifdef
+        // _WIN32` rows at `:51-55`. The C line for each surviving row is named
+        // beside it.
         let expected: [(&str, Option<&str>, bool); 5] = [
             ("CURL_HOME", None, false),            // :48
             ("XDG_CONFIG_HOME", None, true),       // :49
@@ -698,12 +530,6 @@ mod tests {
         // `:112-115` returns to the top of the loop before `:123` is reached,
         // so an empty value never reaches the `withoutdot` branch and therefore
         // never clears `dotscore`.
-        //
-        // `XDG_CONFIG_HOME` is row 1 and is `withoutdot`. Set but empty, it
-        // must leave `dotscore` at 1 so that row 4 is still reachable. Were the
-        // emptiness test moved after `:123` -- or dropped -- row 1 would clear
-        // `dotscore` and row 4 would be suppressed, and the file below would
-        // not be found.
         let home = TempDir::new()?;
         let target = touch(&home.path().join(".config").join("curlrc"))?;
 

@@ -23,61 +23,22 @@
 //***************************************************************************
 
 // THE BANNER ABOVE -- 23 lines, and the licence tag appears exactly once.
-//
-// Measured with `sed -n '1,23p' lib/netrc.c`: the C block runs from line 1 to
-// line 23, carries its licence tag on line 21 and closes with the rule on
-// line 23. It is reproduced here as Rust line comments in the stripped form
-// the rest of this crate already uses -- `src/lib.rs:1-23`,
-// `src/error.rs:1-23`, `src/util/strcase.rs:1-23` and
-// `src/util/get_line.rs:1-23` are byte-identical to it.
-//
-// The tag spelling occurs on line 21 and nowhere else in this file, and that
-// omission is deliberate rather than stylistic: `reuse` scans every line for
-// the tag's colon form and parses whatever follows as a licence expression,
-// so a second, prose mention becomes a parse error instead of prose.
-// `src/util/get_line.rs:34-41` records the diagnostics that established this.
-// `reuse lint` runs in continuous integration from
-// `.github/workflows/hygiene.yml:48-51`.
 
 // NOT GATED BY ANY CARGO CAPABILITY, AND THAT IS DELIBERATE.
 //
 // The C wraps both `lib/netrc.c` and `lib/netrc.h` in
 // `#ifndef CURL_DISABLE_NETRC` (`lib/netrc.h:28`), so a C build can compile
 // the file out. This module has no such switch and must not acquire one.
-//
-// Two reasons, in order of weight. First, credential lookup serves EVERY
-// protocol -- `lib/url.c:2608` is the sole call site and it runs for any
-// scheme that can carry a user and a password, not only for HTTP -- so
-// gating it on the cookie engine, on HSTS or on Alt-Svc would silently
-// disable `--netrc` for FTP and SFTP. Second, the crate's capability
-// vocabulary is closed at exactly fifteen names in
-// `curl-rs-lib/Cargo.toml`, none of which is a netrc switch, and naming an
-// undeclared capability is itself a build failure under the lint gate:
-// `rustc` emits `unexpected 'cfg' condition value` and
-// `.github/workflows/rust-clippy.yml` turns that into an error. So the
-// module is unconditional, `cookies/mod.rs` declares it without an
-// attribute, and `cargo build -p curl-rs-lib --no-default-features` still
-// compiles and reaches it.
 
 //! `.netrc` credential lookup: the file behind `--netrc`, `--netrc-file`
 //! and `--netrc-optional`.
 //!
-//! Supersedes `lib/netrc.c` (477 lines) and its interface `lib/netrc.h`
-//! (66 lines). It answers exactly one question -- *for this host, and
-//! optionally for this already-known login, what login and password does
-//! the user's `.netrc` supply?* -- and it answers it for every protocol,
-//! which is why it carries no capability gate. The public options it backs
-//! are `CURLOPT_NETRC` (51) and `CURLOPT_NETRC_FILE` (10118).
-//!
-//! # Passwords are secrets, and nothing here logs one
-//!
-//! This module is the only place in the engine that reads a password out
-//! of a file on the user's disk. No password reaches a diagnostic, an
-//! error message, a trace record or a derived formatting implementation:
-//! [`Credentials`] writes its own [`Debug`](core::fmt::Debug) by hand and
-//! substitutes a fixed placeholder for the password. The test named
-//! `the_debug_output_never_carries_the_password` proves that rather than
-//! asserting it. There is no logging call anywhere in the file.
+//! Supersedes `lib/netrc.c` and its interface `lib/netrc.h`. It answers
+//! exactly one question -- *for this host, and optionally for this
+//! already-known login, what login and password does the user's `.netrc`
+//! supply?* -- and it answers it for every protocol, which is why it carries
+//! no capability gate. The public options it backs are `CURLOPT_NETRC` (51)
+//! and `CURLOPT_NETRC_FILE` (10118).
 //!
 //! # What the C looks like, and how the shape changes
 //!
@@ -94,91 +55,17 @@
 //! that login. `lib/netrc.c:128` restates the first half as a debug
 //! assertion, `DEBUGASSERT(!*passwordp)`.
 //!
-//! Both in-out pointers disappear here. The login becomes an
-//! `Option<&[u8]>` parameter, which reproduces the C's
-//! `specific_login = !!login` test EXACTLY -- that test reads a pointer
-//! for nullness, not a string for emptiness, so `Some(b"")` is a
-//! *specific* login that matches only an empty one, and that degenerate
-//! case is preserved rather than tidied. The results become an owned
-//! [`Credentials`]. The distinction between absent and empty is
-//! load-bearing throughout: a matched login with no `password` keyword
-//! yields a BLANK password and a `default` entry with no credentials at
-//! all yields [`NetrcCode::NoMatch`], and collapsing `None` into `""`
-//! would merge those two answers.
-//!
-//! Everything works in `&[u8]` and `Vec<u8>` rather than `str`. A
-//! `.netrc` is untrusted bytes on a user's disk and the C never validates
-//! them as text; a host name, a login or a password may be any byte
-//! sequence the tokeniser admits.
-//!
-//! # The five warts, each preserved on purpose
-//!
-//! Specification 0.8.2 is explicit that a refactor producing
-//! different-but-arguably-better output has failed, and specification
-//! 0.1.1 settles the tie the other way round: where a choice exists
-//! between a nicer design and a more behaviourally faithful one,
-//! faithfulness wins. Five behaviours here look like defects and are
-//! reproduced anyway, each marked at the site with the line it came from:
-//!
-//! 1. `curl2netrc` (`lib/netrc.c:66-69`) maps ONLY `CURLE_OUT_OF_MEMORY`
-//!    to an out-of-memory code; every other failure, including the
-//!    size-limit breach `CURLE_TOO_LARGE`, is reported to the user as a
-//!    *syntax error*. So an over-long line and an over-large file both
-//!    come out as `syntax error`.
-//! 2. Comments die at load time (`lib/netrc.c:87-90`), before the
-//!    tokeniser ever runs, so a `#` that is not the first non-blank byte
-//!    of a line is an ordinary token character and survives into a token.
-//! 3. The bare-token walk is `while(*tok_end > ' ')` on a `char`
-//!    (`lib/netrc.c:164`), which is SIGNED on all four mandated targets,
-//!    so every byte from 0x80 upwards terminates a token just as a space
-//!    does.
-//! 4. `tok = ++tok_end` (`lib/netrc.c:326`) steps over the byte that
-//!    ended the token. That byte is usually the space or the newline, so
-//!    the walk crosses line boundaries by itself -- but after a quoted
-//!    token it is whatever followed the closing quote, so `"abc"def`
-//!    yields `abc` and then `ef`.
-//! 5. A blank line spelled with a carriage return is a syntax error. The
-//!    end-of-line test at `lib/netrc.c:153` looks for a line feed or the
-//!    terminator and nothing else, so the carriage return of a `"\r\n"`
-//!    line falls through into the bare-token branch, where it measures
-//!    zero bytes and `lib/netrc.c:168-171` refuses it.
-//!
 //! # Where the file lives, and the one call this module may not make
 //!
 //! `lib/netrc.c:399-464` locates the file in four steps: the `NETRC`
-//! environment variable used DIRECTLY as a path, else `HOME` with
-//! `/.netrc` appended, else the home directory recorded in the password
-//! database for the effective user, else no file at all. The Windows
-//! `_netrc` fallback at `lib/netrc.c:448-459` is excluded, because
-//! specification 0.2.2 excludes every platform outside the Linux and
-//! macOS matrix.
+//! environment variable used DIRECTLY as a path, else `HOME` with `/.netrc`
+//! appended, else the home directory recorded in the password database for the
+//! effective user, else no file at all.
 //!
-//! The third step is the interesting one. Reading the password database
-//! needs a C library call, and those live only under
-//! `curl-rs-lib/src/ffi/`; this file may not make one. So the step is
-//! INJECTED through [`HomeDirectory`], exactly as specification 0.3.3's
-//! twelfth pattern injects the clock and the resolver, and the caller
-//! that can make the call supplies the answer. The first two steps need
-//! no such help: reading the environment is plain standard library.
-//!
-//! A second consumer is served by the same seam.
-//! `curl-rs/src/config/findfile.rs` locates `.curlrc` and `.netrc` for
-//! the command-line tool, so [`parsenetrc`] takes the file path as an
-//! `Option<&Path>`: pass the path that was already resolved, or pass
-//! `None` and let the cascade run. Nothing here depends on the binary
-//! crate, and nothing here warns about file permissions -- that message
-//! belongs to `curl-rs/src/output/msgs.rs`.
-//!
-//! # Relocated coverage
-//!
-//! `lib/netrc.c:387` names `@unittest: 1304`, and every assertion of
-//! `tests/unit/unit1304.c` is relocated into this file's test module
-//! together with its two-line fixture from `tests/data/test1304`. That
-//! relocation is specification 0.8.7's documented deviation, not a
-//! defect: a C program cannot link a Rust static library and call items
-//! that are crate-private, because those items are genuinely absent from
-//! the symbol table, and re-exporting them to make it link would destroy
-//! the encapsulation the whole design rests on.
+//! The third step is the interesting one. Reading the password database needs
+//! a C library call, and those live only under `curl-rs-lib/src/ffi/`; this
+//! file may not make one. The first two steps need no such help: reading the
+//! environment is plain standard library.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -219,18 +106,6 @@ const FOUND_LOGIN: u8 = 1;
 const FOUND_PASSWORD: u8 = 2;
 
 /// The outcome of a `.netrc` lookup -- `NETRCcode`, `lib/netrc.h:38-45`.
-///
-/// The C declares six tokens; five are here. `NETRC_LAST` is omitted
-/// because its own comment says *"never used"*: it is an upper bound for a
-/// C `enum` with no Rust counterpart, and this is an INTERNAL type rather
-/// than part of the C ABI, so no discriminant carries an integer-pinning
-/// obligation. The declaration order of the five is nonetheless the C's,
-/// so a reader comparing the two files sees the same list.
-///
-/// [`NetrcCode::Ok`] never appears in the error position of a
-/// [`Result`]; it exists so that [`NetrcCode::strerror`] can reproduce the
-/// `default` arm of `Curl_netrc_strerror`, which returns the empty string
-/// for anything that is not a legitimate error.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum NetrcCode {
     /// A matching entry was found. `NETRC_OK`.
@@ -247,31 +122,23 @@ pub(crate) enum NetrcCode {
     ///
     /// Reachable only through [`curl2netrc`]. The C ALSO returns this from
     /// four `curlx_strdup` failures (`lib/netrc.c:278`, `:289`, `:346` and
-    /// the buffer growth beneath them), and those four have no counterpart
-    /// here: Rust aborts the process on allocation failure rather than
-    /// handing back a null pointer, so a `Vec` that comes back has
-    /// succeeded. The variant is kept because the buffer layer can still
-    /// report an allocation failure of its own, and because dropping it
-    /// would lose one of the five messages [`NetrcCode::strerror`] owes the
-    /// user.
+    /// the buffer growth beneath them). Three of those four duplicate a token
+    /// already parsed out of the file -- bytes that are already resident, with
+    /// no amplification -- and `String`/`Vec` duplication has no stable
+    /// fallible spelling at the declared minimum Rust version, so a refusal
+    /// there aborts. The FOURTH, the buffer growth, does report: the line
+    /// buffer beneath this parser is a `crate::util::dynbuf::DynBuf`, whose
+    /// growth goes through `Vec::try_reserve_exact` and answers
+    /// `CURLE_OUT_OF_MEMORY` exactly as the C's `realloc` arm does. The variant
+    /// is therefore live, and dropping it would also lose one of the five
+    /// messages [`NetrcCode::strerror`] owes the user.
     OutOfMemory,
 }
 
-#[allow(dead_code)] // No consumer yet; lib/url.c:2608's successor will call
-                    // strerror when it reports a .netrc failure.
+#[allow(dead_code)] // consumer: the .netrc failure reporter of
+                    // lib/url.c:2608's successor
 impl NetrcCode {
     /// The message the command-line tool prints for this outcome.
-    ///
-    /// Supersedes `Curl_netrc_strerror` (`lib/netrc.c:369-384`). The five
-    /// strings are reproduced character for character because they reach
-    /// the user: `lib/url.c:2621-2623` formats the result as
-    /// `".netrc error: %s"` and fails the transfer with
-    /// `CURLE_READ_ERROR`.
-    ///
-    /// The C's `default` arm covers `NETRC_OK` and `NETRC_LAST` and
-    /// returns `""` with the comment *"not a legit error"*. With
-    /// `NETRC_LAST` gone (see the type documentation) the arm is reachable
-    /// only through [`NetrcCode::Ok`], and it still returns `""`.
     pub(crate) fn strerror(self) -> &'static str {
         match self {
             // `lib/netrc.c:372-373`.
@@ -290,26 +157,10 @@ impl NetrcCode {
 
 /// Narrows a buffer failure to a `.netrc` failure, LOSSILY.
 ///
-/// Supersedes the `curl2netrc` macro (`lib/netrc.c:66-69`), whose whole
-/// body is
-///
 /// ```c
 /// (((result) == CURLE_OUT_OF_MEMORY) ? \
 ///  NETRC_OUT_OF_MEMORY : NETRC_SYNTAX_ERROR)
 /// ```
-///
-/// Only out-of-memory keeps its identity. **Everything else becomes a
-/// syntax error**, and the case that matters in practice is
-/// `CURLE_TOO_LARGE`: the buffer ceilings of `MAX_NETRC_LINE`,
-/// `MAX_NETRC_FILE` and `MAX_NETRC_TOKEN` are all reported to the user as
-/// `syntax error` rather than as anything about size. That is surprising,
-/// it is wart 1 of the module documentation, and it is the behaviour.
-///
-/// A read failure travels the same road. This crate's [`get_line`] reports
-/// `CURLcode::ReadError` for a hard input error where the C would spin
-/// (`lib/curl_get_line.c:44-46` recomputes end-of-file from a stream that
-/// is not at end of file), and that code is not out-of-memory, so it
-/// arrives as a syntax error too.
 fn curl2netrc(result: CURLcode) -> NetrcCode {
     if result == CURLcode::OutOfMemory {
         NetrcCode::OutOfMemory
@@ -320,29 +171,6 @@ fn curl2netrc(result: CURLcode) -> NetrcCode {
 
 /// The parsed file, cached across lookups -- `struct store_netrc`,
 /// `lib/netrc.h:32-36`.
-///
-/// A single transfer can consult the file more than once, so the C reads it
-/// ONCE, strips its comments, and keeps the remainder in a buffer guarded by
-/// a `loaded` flag. `lib/urldata.h:1047` holds one of these per easy handle.
-///
-/// # One C field is not carried, and the omission was measured
-///
-/// The C struct has three members: `filebuf`, `filename` and the `loaded`
-/// bit. `filename` is **never read anywhere in the C tree** -- a `grep` over
-/// `lib/`, `src/` and `tests/` finds the declaration at `lib/netrc.h:34` and
-/// the containing field at `lib/urldata.h:1047`, and no load of it at all.
-/// It is vestigial, so carrying it here would add a field that nothing may
-/// read and would need a lint allowance to say so. The path is a parameter
-/// of [`parsenetrc`] instead, which is where every caller already has it.
-///
-/// # The buffer is dropped on ANY failure
-///
-/// `lib/netrc.c:358-364` frees the buffer and clears the flag for every
-/// non-success outcome, and that includes [`NetrcCode::NoMatch`] -- a
-/// perfectly ordinary "this host is not in the file" answer. The next
-/// lookup therefore re-reads the file from disk. It is not obviously
-/// intentional, it is observable through the number of times the file is
-/// opened, and it is reproduced.
 pub(crate) struct StoreNetrc {
     /// The file with its comments and leading blanks already gone.
     filebuf: DynBuf,
@@ -350,8 +178,8 @@ pub(crate) struct StoreNetrc {
     loaded: bool,
 }
 
-#[allow(dead_code)] // No consumer yet; the easy handle owns one of these once
-                    // lib/urldata.h's successor lands.
+#[allow(dead_code)] // consumer: the easy handle, which owns one of
+                    // these (lib/urldata.h's successor)
 impl StoreNetrc {
     /// An empty store, ready for its first lookup.
     ///
@@ -409,20 +237,6 @@ impl fmt::Debug for StoreNetrc {
 
 /// What the file supplied for one host.
 ///
-/// The two fields are the C's `*loginp` and `*passwordp` after
-/// `lib/netrc.c:352-357` writes them back, and `Option` carries the same
-/// information the C's null pointer did.
-///
-/// # Why the login can be absent even on success
-///
-/// `lib/netrc.c:354-355` assigns `*loginp` **only** when the search did not
-/// fix a login: `if(!specific_login) *loginp = login;`. A caller that
-/// supplied a login already has it and the C leaves that caller's own
-/// pointer untouched, so [`Self::found_login`] reports `None` for a
-/// specific-login search however well it went. It is named `found_login`
-/// rather than `login` for exactly that reason -- it reports what the FILE
-/// supplied, and a caller who fixed the login must keep the one it passed.
-///
 /// # Why the password can be present and empty
 ///
 /// `lib/netrc.c:342-347` turns a matched login with no `password` keyword
@@ -437,7 +251,7 @@ pub(crate) struct Credentials {
     password: Option<Vec<u8>>,
 }
 
-#[allow(dead_code)] // No consumer yet; lib/url.c:2608's successor reads both.
+#[allow(dead_code)] // consumer: lib/url.c:2608's successor, which reads both
 impl Credentials {
     /// The login the file supplied.
     ///
@@ -467,12 +281,6 @@ impl Credentials {
 }
 
 /// Reports whether a password was found and never what it was.
-///
-/// Written by hand, and the reason is the whole point of the type: a
-/// derived implementation would print the password. The login is rendered
-/// because it is not a secret -- curl accepts it on the command line and
-/// puts it in a URL -- while the password becomes a fixed placeholder that
-/// leaks neither its bytes nor its length.
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Credentials")
@@ -499,20 +307,10 @@ impl fmt::Debug for Secret {
 
 /// Supplies the home directory that the environment did not.
 ///
-/// The third step of the C's cascade (`lib/netrc.c:410-425`) reads the home
-/// directory out of the password database for the effective user. That is a
-/// C library call, and this crate confines those to
-/// `curl-rs-lib/src/ffi/`, so the step is injected here instead of
-/// performed -- specification 0.3.3's twelfth pattern, the same one that
-/// injects the clock and the resolver.
-///
 /// The method returns an owned path and takes `&self`, so an implementation
 /// may compute the answer lazily. That matters: the C reaches the password
 /// database only when both environment variables are absent, and
 /// [`netrc_path`] preserves that ordering by not calling this until then.
-///
-/// `Option<PathBuf>` implements this trait, which covers both the caller
-/// that already has an answer and the caller that has none.
 pub(crate) trait HomeDirectory {
     /// The effective user's home directory, or `None` if it is unknown.
     fn home_directory(&self) -> Option<PathBuf>;
@@ -532,12 +330,6 @@ impl HomeDirectory for Option<PathBuf> {
 
 /// Reads the whole file into `filebuf`, dropping comment lines.
 ///
-/// Supersedes the body of `file2memory` (`lib/netrc.c:71-104`) with the
-/// `fopen` lifted out: this takes an already-open reader, which is what
-/// makes the parser exercisable entirely in memory and therefore runnable
-/// under Miri. The open, and the `NETRC_FILE_MISSING` that a failed open
-/// means, belong to [`parse_path`].
-///
 /// # Three properties of [`get_line`] this is built around
 ///
 /// All three were measured in `src/util/get_line.rs` rather than assumed,
@@ -554,19 +346,6 @@ impl HomeDirectory for Option<PathBuf> {
 ///    `lib/netrc.c:149` tests for one when ending a macro definition, and
 ///    wart 5 of the module documentation is the consequence of the
 ///    end-of-line test not doing so.
-///
-/// # Two things happen to every surviving line
-///
-/// `lib/netrc.c:88` advances the line pointer over leading blanks and
-/// `lib/netrc.c:91` then appends **from the advanced pointer**, so the
-/// stored file has its leading blanks stripped as well as its comments.
-/// That is not cosmetic: an indentation-only line becomes exactly `"\n"`,
-/// which is what ends a macro definition in `tests/data/test479`,
-/// `tests/data/test486` and `tests/data/test494`.
-///
-/// A `#` is a comment marker only at the first non-blank position
-/// (`lib/netrc.c:89-90`). The tokeniser never sees one, so a `#` anywhere
-/// else is an ordinary token byte -- wart 2 of the module documentation.
 ///
 /// # Errors
 ///
@@ -623,24 +402,11 @@ fn file2memory<R: BufRead>(
 }
 
 /// Whether a byte continues a bare token -- `lib/netrc.c:164`.
-///
-/// The C walk is `while(*tok_end > ' ')` and `char` is SIGNED on all four
-/// mandated targets, so the comparison sign-extends: 0x80 reads as -128 and
-/// the test fails. The admitted set is therefore 0x21 through 0x7F, which
-/// this predicate spells out directly. **Every byte from 0x80 upwards ends
-/// a bare token exactly as a space does**, so a machine name outside ASCII
-/// tokenises into pieces -- wart 3 of the module documentation.
 const fn continues_bare_token(byte: u8) -> bool {
     matches!(byte, 0x21..=0x7F)
 }
 
 /// The byte at `at`, or the C string terminator past the end.
-///
-/// The C walks a `const char *` over a zero-terminated buffer and reads the
-/// terminator itself in three places -- `lib/netrc.c:153`, `:164` and
-/// `:182`. This crate's buffer carries no terminator, so the read past the
-/// end synthesises one. That is what makes every walk below total: no index
-/// can be out of range, because being out of range is a defined answer.
 fn byte_at(buf: &[u8], at: usize) -> u8 {
     buf.get(at).copied().unwrap_or(0)
 }
@@ -664,10 +430,6 @@ fn pass_blanks(buf: &[u8], at: usize) -> usize {
 }
 
 /// Reads one bare token into `token` and returns the index that ended it.
-///
-/// Supersedes `lib/netrc.c:161-177`. The returned index is the C's
-/// `tok_end` -- the position of the byte that ENDED the token, which the
-/// caller then steps over; see wart 4 of the module documentation.
 ///
 /// # Errors
 ///
@@ -701,12 +463,6 @@ fn read_bare(
 
 /// Reads one quoted token into `token` and returns the index past its
 /// closing quote.
-///
-/// Supersedes `lib/netrc.c:178-221`. **The escape set is three letters
-/// wide and nothing else is special**: `n`, `r` and `t` become their
-/// control characters, and any other escaped byte passes through
-/// unchanged, so `\"` yields a quote and `\\` yields a backslash. The
-/// backslash itself is never stored.
 ///
 /// # Errors
 ///
@@ -772,10 +528,6 @@ fn read_quoted(
 
 /// Where the walk stands with respect to the host it is looking for --
 /// `enum host_lookup_state`, `lib/netrc.c:46-51`.
-///
-/// Kept as an explicit enumeration with an exhaustive `match`, which is
-/// specification 0.3.3's third pattern: exhaustiveness turns an unhandled
-/// state from a runtime fall-through into a compile error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostLookupState {
     /// Outside any entry. `NOTHING`.
@@ -802,10 +554,10 @@ enum FoundState {
 
 /// The mutable state of the switch at `lib/netrc.c:230-325`.
 ///
-/// The C keeps these as eleven locals of `parsenetrc` and threads them
-/// through one 95-line `switch`. Gathering them into a value keeps the
-/// switch's three arms independently readable and independently testable
-/// while changing nothing about what they do.
+/// The C keeps these as eleven locals of `parsenetrc` and threads them through
+/// one `switch`. Gathering them into a value keeps the switch's three arms
+/// independently readable and independently testable while changing nothing
+/// about what they do.
 struct Machine<'a> {
     /// The host being looked for. Compared case-INsensitively.
     host: &'a [u8],
@@ -858,12 +610,6 @@ impl<'a> Machine<'a> {
     }
 
     /// Forgets the credentials at an entry boundary.
-    ///
-    /// `lib/netrc.c:245-247`, `:309-311` and `:316-318` are the same two
-    /// statements three times over: the password always goes, and the login
-    /// goes **only when the caller did not fix one**. Suppressing the login
-    /// free under a fixed login is what keeps that login alive for the
-    /// comparison at `lib/netrc.c:272`, so it is not an optimisation.
     fn forget_credentials(&mut self) {
         self.password = None;
         if !self.specific_login() {
@@ -1053,20 +799,6 @@ impl<'a> Machine<'a> {
 
 /// Walks the loaded file and returns what it found.
 ///
-/// Supersedes `lib/netrc.c:138-366` -- the two nested loops, the tokeniser
-/// and the switch -- with the loading and the store's bookkeeping lifted
-/// into [`after_load`].
-///
-/// # The inner loop crosses lines, and that is not a bug
-///
-/// `lib/netrc.c:326` advances past the byte that ended the token, and after
-/// the last token of a line that byte is the line feed. So the inner walk
-/// carries straight on into the next line and only stops at a blank line or
-/// at the end of the buffer. The OUTER loop then exists for exactly one
-/// job: after a blank line, find the next line feed and restart from just
-/// past it (`lib/netrc.c:328-336`). A buffer with no further line feed ends
-/// the walk.
-///
 /// # Errors
 ///
 /// [`NetrcCode::SyntaxError`] from either tokeniser, [`NetrcCode::NoMatch`]
@@ -1155,11 +887,6 @@ fn search(
 
 /// Searches an already-loaded store and resets it on failure.
 ///
-/// Supersedes `lib/netrc.c:339-366`, the part after the exit label. The
-/// reset is the wart described on [`StoreNetrc`]: **every** non-success
-/// outcome empties the buffer and clears the flag, [`NetrcCode::NoMatch`]
-/// included, so the next lookup opens the file again.
-///
 /// # Errors
 ///
 /// Whatever [`search`] returned.
@@ -1180,22 +907,12 @@ fn after_load(
 
 /// Looks credentials up in a `.netrc` supplied as an open reader.
 ///
-/// The injected-input form of [`parsenetrc`]: the caller has the file
-/// already, so nothing here opens anything and nothing consults the
-/// environment. It is the seam that makes the whole parser exercisable in
-/// memory and therefore runnable under Miri, and it is a first-class entry
-/// point rather than a test hook -- a caller holding a `.netrc` from any
-/// source can use it.
-///
-/// `input` is read only on the first call for a given store; afterwards the
-/// cached buffer answers, exactly as `lib/netrc.c:131-136` arranges.
-///
 /// # Errors
 ///
 /// As [`parsenetrc`], except that [`NetrcCode::FileMissing`] cannot arise
 /// because no file is opened.
-#[allow(dead_code)] // No consumer yet; a caller holding a .netrc from a
-                    // source that is not a path will call this.
+#[allow(dead_code)] // consumer: a caller holding a .netrc from a
+                    // source that is not a path
 pub(crate) fn parse_reader<R: BufRead>(
     store: &mut StoreNetrc,
     host: &[u8],
@@ -1213,19 +930,6 @@ pub(crate) fn parse_reader<R: BufRead>(
 }
 
 /// Looks credentials up in a `.netrc` at a known path.
-///
-/// Carries the half of `file2memory` that [`file2memory`] does not: the
-/// open, and the mapping of a failed open onto
-/// [`NetrcCode::FileMissing`]. `lib/netrc.c:73` seeds its return value with
-/// that code precisely so that a failed `fopen` falls out with it, so an
-/// unreadable file, a missing file and a directory all report the same
-/// thing -- there is no separate input-error outcome at this boundary.
-///
-/// The C opens with `curlx_fopen(filename, FOPEN_READTEXT)`, and
-/// `lib/curlx/fopen.h:64` resolves that to plain `fopen` outside Windows
-/// while `lib/curl_setup.h` defines the mode as `"r"`. On the four mandated
-/// targets that is byte-for-byte identical to a binary read, which is what
-/// [`File::open`] gives.
 ///
 /// # Errors
 ///
@@ -1256,12 +960,6 @@ fn parse_path(
 /// ```c
 /// return (env && env[0]) ? curlx_strdup(env) : NULL;
 /// ```
-///
-/// **An EMPTY variable therefore reads as ABSENT**, which is not what
-/// `std::env::var_os` reports and is not a detail that can be skipped:
-/// `NETRC=""` must fall through to the home directory rather than name the
-/// empty path, and `HOME=""` must fall through to the password database
-/// rather than build `"/.netrc"`.
 fn nonempty(value: &OsString) -> bool {
     !value.is_empty()
 }
@@ -1272,11 +970,6 @@ fn getenv(name: &str) -> Option<OsString> {
 }
 
 /// Builds the default `.netrc` path from already-read environment values.
-///
-/// The cascade of `lib/netrc.c:399-445`, with the two environment reads
-/// hoisted into parameters so that all four outcomes are reachable from a
-/// test without mutating process-wide state -- which would be unsound
-/// beside other threads and is not something a test may do here.
 ///
 /// The order is the C's and it matters:
 ///
@@ -1289,16 +982,6 @@ fn getenv(name: &str) -> Option<OsString> {
 ///    password-database lookup of `lib/netrc.c:410-425`. It is consulted
 ///    **only** at this point, so an implementation may do real work in it.
 /// 4. Otherwise there is no file (`lib/netrc.c:436-438`).
-///
-/// # The concatenation is a byte concatenation
-///
-/// The C builds the path with `curl_maprintf("%s%s.netrc", home, DIR_CHAR)`
-/// and `DIR_CHAR` is `"/"` (`lib/curl_setup.h:684`). That is a plain join
-/// of three byte strings with no normalisation, so a home of `"/"` gives
-/// `"//.netrc"` and a home of `""` gives `"/.netrc"`. [`PathBuf::push`]
-/// would answer differently in both cases -- it drops the separator before
-/// a relative component and replaces the whole path for an absolute one --
-/// so the bytes are assembled directly instead.
 ///
 /// # Errors
 ///
@@ -1343,9 +1026,6 @@ fn netrc_path(home: &dyn HomeDirectory) -> Result<PathBuf, NetrcCode> {
 
 /// Looks credentials up in the user's `.netrc`.
 ///
-/// Supersedes `Curl_parsenetrc` (`lib/netrc.c:392-465`), the entry point
-/// `lib/url.c:2608` calls once per connection setup.
-///
 /// # Arguments
 ///
 /// * `store` -- the per-handle cache. The file is read on the first call
@@ -1378,8 +1058,7 @@ fn netrc_path(home: &dyn HomeDirectory) -> Result<PathBuf, NetrcCode> {
 /// * [`NetrcCode::SyntaxError`] -- the file does not parse, OR a ceiling
 ///   was crossed, OR the read failed. See [`curl2netrc`].
 /// * [`NetrcCode::OutOfMemory`] -- a genuine allocation failure.
-#[allow(dead_code)] // No consumer yet; lib/url.c:2608's successor calls this
-                    // once the connection setup path lands.
+#[allow(dead_code)] // consumer: lib/url.c:2608's successor
 pub(crate) fn parsenetrc(
     store: &mut StoreNetrc,
     host: &[u8],
@@ -1505,12 +1184,6 @@ mod tests {
     }
 
     /// The five messages reach the user, so they are compared literally.
-    ///
-    /// `lib/url.c:2621-2623` prints the result as `".netrc error: %s"`, so
-    /// a changed string is a changed user-visible diagnostic.
-    /// `lib/netrc.c:372-373`'s `default` arm returns the empty string with
-    /// the comment "not a legit error", and with `NETRC_LAST` gone that arm
-    /// belongs to the success code alone.
     #[test]
     fn strerror_returns_the_five_exact_strings() {
         assert_eq!(NetrcCode::Ok.strerror(), "");
@@ -1544,12 +1217,6 @@ mod tests {
     }
 
     /// A login that is not in the file -- `tests/unit/unit1304.c:56-65`.
-    ///
-    /// The host IS found, so the outcome is success, and yet the password
-    /// comes back absent. Both halves matter: `lib/netrc.c:262` sets the
-    /// success code the moment the machine name matches, and the second
-    /// `machine` line then clears the password that the first entry had
-    /// stored for the wrong login.
     #[test]
     fn unit1304_a_missing_login() {
         assert_eq!(shape(UNIT1304, b"example.com", Some(b"me")), "ok|@|@");
@@ -1777,15 +1444,6 @@ mod tests {
 
     /// A MISMATCHED login still yields a password at end of file.
     ///
-    /// This is not an oversight in the test, it is the C's behaviour and it
-    /// is worth naming so that a later reader does not mistake it for a
-    /// defect introduced here. `lib/netrc.c:286-287` stores the password
-    /// UNCONDITIONALLY and only the found bit at `:292-293` is guarded, so
-    /// the wrong login's password sits in the local until the next
-    /// `machine` or `default` clears it (`:309`, `:316`). With a
-    /// single-entry file there is no next keyword, so it survives to
-    /// `lib/netrc.c:356`.
-    ///
     /// `tests/unit/unit1304.c:56-65` passes only because its fixture has a
     /// SECOND `machine` line, which is what clears the password there.
     #[test]
@@ -1858,22 +1516,6 @@ mod tests {
     }
 
     /// A carriage-return line is a SYNTAX ERROR, macro or not.
-    ///
-    /// `lib/netrc.c:149` tests for a carriage return when ending a macro
-    /// definition, and the state really does change -- but the change is
-    /// immediately overtaken, and this test is where that is recorded.
-    /// Control falls through rather than continuing, the end-of-line test
-    /// at `:153` accepts only a line feed and the terminator, so the
-    /// carriage return reaches the bare-token walk at `:164`, measures zero
-    /// bytes because `'\r' > ' '` is false, and `:168-171` refuses the whole
-    /// file.
-    ///
-    /// The consequence is worth stating plainly: **a `.netrc` written with
-    /// carriage-return line endings parses only while it contains no blank
-    /// line at all.** The carriage-return half of the macro terminator has
-    /// no reachable effect. This is wart 5 of the module documentation, it
-    /// is confirmed against the C by the differential transcript below, and
-    /// it is not repaired here.
     #[test]
     fn a_carriage_return_line_is_a_syntax_error() {
         // As the terminator of a macro definition.
@@ -1978,12 +1620,6 @@ mod tests {
     // ---- the signed-char token terminator, wart 3 -----------------------
 
     /// A byte from 0x80 upwards ends a bare token, exactly as a space does.
-    ///
-    /// `lib/netrc.c:164` walks with `while(*tok_end > ' ')` over a `char`,
-    /// and `char` is SIGNED on all four mandated targets, so 0x80 reads as
-    /// -128 and the test fails. The machine name in the file below is
-    /// `h<0xff>`; the TOKEN is `h`, and it is `h` that the host is compared
-    /// against.
     #[test]
     fn a_byte_above_ascii_terminates_a_bare_token() {
         let text = b"machine h\xff login lena password pass\n";
@@ -1994,12 +1630,6 @@ mod tests {
     }
 
     /// Two adjacent high bytes make the whole file refuse to parse.
-    ///
-    /// The first ends the token and `lib/netrc.c:326` steps over it, which
-    /// leaves the cursor on the second. That is not an end of line and not
-    /// a quote, so the bare walk runs again, measures zero bytes and
-    /// `:168-171` refuses the file. A name spelled in UTF-8 outside ASCII
-    /// therefore does not merely fail to match -- it is a syntax error.
     #[test]
     fn two_adjacent_high_bytes_are_a_syntax_error() {
         let text = b"machine h\xc3\xa9 login lena password pass\n";
@@ -2187,12 +1817,6 @@ mod tests {
     }
 
     /// An embedded zero byte truncates its line -- [`get_line`]'s own wart.
-    ///
-    /// The C reads each chunk with `strlen` (`lib/curl_get_line.c:46`), so
-    /// the bytes after a zero are dropped even though they were consumed.
-    /// Nothing here compensates for that, and this test records the
-    /// consequence for a `.netrc`: the remainder of the line is spliced
-    /// onto the next one.
     #[test]
     fn an_embedded_zero_byte_truncates_its_line() {
         let text = b"machine h login le\0na\npassword pass\n";
@@ -2509,12 +2133,6 @@ mod tests {
     }
 
     /// The loader appends one synthesised line feed at end of input.
-    ///
-    /// Stated on its own so that the byte count above is not the only
-    /// record of it. `lib/curl_get_line.c:59-61` appends a line feed when
-    /// the stream ended without one, and a stream that ended EXACTLY at a
-    /// line feed still yields one further call that reads nothing and
-    /// returns a line holding only the synthesised byte.
     #[test]
     fn the_loader_appends_one_synthesised_line_feed() {
         let mut buf = DynBuf::new(MAX_NETRC_FILE);
@@ -2539,12 +2157,6 @@ mod tests {
 
     /// Leading blanks are stripped from every stored line, not only from
     /// comments.
-    ///
-    /// `lib/netrc.c:88` advances the pointer and `:91` appends from the
-    /// ADVANCED pointer. It is easy to read that pair as skipping comments
-    /// alone; it also rewrites every other line, and that is what turns an
-    /// indentation-only line into a bare line feed and so ends a macro
-    /// definition.
     #[test]
     fn the_loader_strips_leading_blanks_from_every_line() {
         let mut buf = DynBuf::new(MAX_NETRC_FILE);
@@ -2556,16 +2168,6 @@ mod tests {
     }
 
     /// This module makes no logging call at all.
-    ///
-    /// Redacting a formatting implementation is not enough on its own: a
-    /// single diagnostic taking the password would defeat it. The rule is
-    /// therefore enforced over the source text, in the same style as the
-    /// gates of `curl-rs-lib/src/lib.rs`, so that adding one fails a test
-    /// rather than shipping.
-    ///
-    /// The needles are assembled at run time rather than written as
-    /// literals, which is what keeps this gate from matching its own
-    /// implementation.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn this_module_makes_no_logging_call() {
@@ -2847,15 +2449,6 @@ mod tests {
     }
 
     /// A directory where a file was expected does not hang.
-    ///
-    /// Worth recording because the C behaves worse than this. `fopen` on a
-    /// directory SUCCEEDS on the mandated targets, and `fgets` then fails
-    /// without setting the end-of-file indicator, so `lib/curl_get_line.c`'s
-    /// `while(1)` never terminates. This crate's [`get_line`] reports
-    /// `CURLcode::ReadError` instead -- a decision recorded in its own
-    /// module, not taken here -- which arrives as a syntax error through
-    /// [`curl2netrc`]. Either outcome is accepted below, because whether the
-    /// open or the read is what fails belongs to the platform.
     #[test]
     #[cfg_attr(miri, ignore = "this touches the filesystem")]
     fn a_directory_in_place_of_a_file_terminates() {
@@ -2876,13 +2469,6 @@ mod tests {
     }
 
     /// The cascade branch feeds the same parser the explicit branch does.
-    ///
-    /// `lib/netrc.c:446` and `:463` call the same function, one with a
-    /// computed path and one with the caller's. Asserting that the two
-    /// agree exercises the computed branch whatever this process's
-    /// environment happens to hold, without mutating it -- which no test
-    /// here may do, because the variables are process-wide and every other
-    /// test in this binary shares them.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the environment and the filesystem")]
     fn the_cascade_branch_agrees_with_the_explicit_branch() {
@@ -2905,12 +2491,6 @@ mod tests {
     }
 
     // ---- the differential oracle ----------------------------------------
-    //
-    // The strongest check available for this module, and the one the
-    // specification's cross-check gate asks for: 559 answers compared
-    // against curl 8.19.0-DEV's own code rather than against a reading of
-    // it. Every behaviour the tests above assert individually is asserted
-    // again here jointly, and a divergence in any of them fails.
     //
     // HOW THE TRANSCRIPT WAS PRODUCED, so the numbers are auditable rather
     // than magical. A C driver was built whose only content besides a shim
@@ -2937,16 +2517,6 @@ mod tests {
     // file, so only the `lib/netrc.c:462-463` branch is reachable and that
     // branch is byte-identical. The cascade is covered separately and
     // purely by the four tests around `netrc_path_from`.
-    //
-    // The driver wrote each corpus entry to a file with an explicit length
-    // -- so that the entry carrying a zero byte really carries one -- and
-    // printed one record per call in the format `render` produces. It was
-    // compiled with `gcc -O2 -Wall -Wextra`, produced no diagnostic, and was
-    // deleted afterwards; only its output is kept. Both sides' corpora were
-    // emitted from the SAME bytes, and
-    // `the_oracle_corpus_is_the_one_the_c_driver_read` checks that with a
-    // length and a checksum, so a transcription slip cannot pass as
-    // agreement.
 
     const ORACLE_CORPUS: [&[u8]; 43] = [
         b"",

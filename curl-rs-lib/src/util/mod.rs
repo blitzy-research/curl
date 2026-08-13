@@ -22,13 +22,7 @@
 //
 //***************************************************************************
 
-// THE LICENCE BANNER ABOVE -- 23 lines, and why it is spelled this way.
-//
-// `REUSE.toml` annotates only the files that "cannot be annotated directly",
-// so every source file in this workspace carries its licence in-file, and
-// `reuse lint` runs in continuous integration alongside the spellcheck and
-// linter job. The requirement it enforces is an SPDX licence-identifier
-// tag naming `curl`, which appears above verbatim.
+// THE LICENCE BANNER ABOVE, and why it is spelled this way.
 //
 // One deliberate spelling choice inside THIS comment block: the tag is never
 // written out here with its trailing colon. `reuse` scans every line of a
@@ -40,73 +34,18 @@
 // command reports nothing. The tag itself, on line 21, is untouched and
 // verbatim: it is the only place in this file where that spelling appears,
 // which is exactly what `reuse` needs.
-//
-// The 23 lines are the banner measured at `lib/llist.c:1-23`, rendered as
-// Rust line comments. Two renderings are possible: keep the C block
-// comment's `/*`, ` * ` and `*/` decorations inside `//`, or strip them. The
-// stripped form is used here because it is what the rest of this crate
-// already does -- `src/lib.rs:1-23`, `src/error.rs:1-23`, `src/ffi/mod.rs`,
-// `src/ffi/sys.rs` and `src/multi/state.rs` are byte-identical to the block
-// above -- and a reviewer reading two files side by side checks consistency,
-// not a transcription of C punctuation. The ASCII art itself is reproduced
-// exactly, and the longest line is 77 columns, inside the 80-column limit
-// that `rustfmt.toml` sets.
-//
-// Every one of the 23 files in this directory carries this same block, with
-// ONE deliberate exception recorded here so that nobody applies the banner
-// blindly across the directory: `inet.rs`. Its C originals,
-// `lib/curlx/inet_ntop.c` and `lib/curlx/inet_pton.c`, are ISC/BIND-licensed
-// rather than curl-licensed and carry an SPDX tag naming `ISC` rather than
-// `curl`. That file keeps the ISC notice of its origin. Re-licensing it to
-// `curl` would be a licence violation, not a tidy-up.
 
-// `dead_code` is NOT allowed for this module as a whole. Every item below that
-// has no consumer yet carries its own `#[allow(dead_code)]`, written at the
-// item, so the suppression reads as an inventory rather than a blanket: each
-// one is load-bearing, deleting any one of them restores a warning, and an
-// item added later with no consumer is still reported. Each is removed when
-// its consumer lands. A module- or crate-scoped `#![allow(dead_code)]` would
-// instead silence the NEXT item somebody adds, which hides incomplete
-// scaffolding rather than recording it; the rule and the executable gate that
-// enforces it across the workspace live in `curl-rs-lib/src/lib.rs`
-// (`mod source_policy`).
-//
 // `util` is the BASE of this crate's module graph: every other module
 // depends on it and it depends on nothing. The corollary is that its
 // consumers are the LAST code to exist, so until they land every helper here
 // is legitimately unreferenced -- and the zero-warnings gate would otherwise
 // fail on code that is correct.
 //
-// Measured on the pinned toolchain (rustc 1.97.1) rather than assumed: a
-// `pub(crate)` item inside a `pub(crate)` module IS subject to `dead_code`,
-// and so is a `pub` item, because neither is reachable from outside the
-// crate until `src/lib.rs` re-exports it -- and its re-export list covers
-// `error` and `version` only. A `#[cfg(test)]` use does not count: the lint
-// is evaluated for the non-test build, which is also why these are `allow`
-// and not `expect`.
-//
-// The breadth a root attribute would have had is worth stating plainly,
-// because it is the reason none is written: a lint level on a module root
-// propagates into the modules declared inside it, so ONE attribute here
-// would have covered all 22 children and the six absorbed shims below.
-//
-// No level for the `unsafe_code` lint is set here, at any level, by design.
-// `src/lib.rs` carries `#![deny(unsafe_code)]` and grants exactly ONE
-// exemption, on `mod ffi`. This directory has no exemption, contains no
-// `unsafe` block and contains no `#[allow(unsafe_code)]` -- which matters
-// most precisely here, because `util` supersedes the C files where the
-// hand-rolled pointer arithmetic lived.
-//
 // HOW TO CHECK THAT CLAIM, because an unanchored search reports a false
 // failure against this file itself: the paragraph above legitimately NAMES
 // both the keyword and the attribute, so `grep -rn 'unsafe' ...` matches the
 // prose. `src/lib.rs` settled this at the crate root and its anchored
 // expressions are the authority; applied to this directory they are
-//
-//   grep -rnE '^[[:space:]]*#!?\[allow\(unsafe_code\)\]' \
-//     --include='*.rs' curl-rs-lib/src/util     -> must print NOTHING
-//   grep -rnE '^[^/]*\bunsafe\b' \
-//     --include='*.rs' curl-rs-lib/src/util     -> must print NOTHING
 //
 // Anchoring past leading whitespace only, and requiring the keyword before
 // any slash on the line, is what excludes every `//`, `///` and `//!` line: a
@@ -117,42 +56,14 @@
 
 //! The portability and utility layer: the base of the crate's module graph.
 //!
-//! This directory supersedes the **4,733 measured lines** of `lib/curlx/` --
-//! 18 translation units totalling 3,670 lines of `.c`, plus their headers --
+//! This directory supersedes `lib/curlx/` -- its translation units and their
+//! headers --
 //! together with the general-purpose containers and parsers scattered
 //! through `lib/*.c`: `llist.c`, `splay.c`, `hash.c`, the four integer-keyed
 //! containers (`uint-bset.c`, `uint-spbset.c`, `uint-hash.c`,
 //! `uint-table.c`), `parsedate.c`, `curl_fnmatch.c`, `curl_range.c`,
 //! `curl_get_line.c`, `curl_memrchr.c`, `bufq.c`, `bufref.c`, `slist.c`,
 //! `strcase.c` with `strequal.c`, `curl_fopen.c` and `curl_endian.c`.
-//!
-//! # The layering rule
-//!
-//! **`util` depends on nothing inside this crate except [`crate::error`].**
-//! It is the base of the internal dependency graph, which is what lets every
-//! other module import from here without a cycle, and it is the one
-//! architectural property of this directory that must never be traded away.
-//! No file here may name `crate::conn`, `crate::transfer`,
-//! `crate::protocols`, `crate::multi`, `crate::easy`, `crate::tls`,
-//! `crate::dns`, `crate::auth`, `crate::proxy`, `crate::cookies`,
-//! `crate::mime`, `crate::headers`, `crate::share`, `crate::crypto`,
-//! `crate::url` or `crate::ffi`.
-//!
-//! When a helper appears to need one of those types, the helper is in the
-//! wrong layer: take the value as a parameter instead. Two instances are
-//! designed in rather than discovered, and both are resolved by
-//! parameterization:
-//!
-//! - [`range`] is a **pure parse function**. Its C original,
-//!   `lib/curl_range.c`, writes its results into `struct Curl_easy`; here it
-//!   returns them and the caller stores them.
-//! - `fopen` takes its **randomness by injection**. Its C original,
-//!   `lib/curl_fopen.c`, calls `Curl_rand_alnum` from what is now the
-//!   sibling `crate::crypto`; here the random suffix arrives as an argument.
-//!
-//! This file itself compiles with **zero `use` statements**, so the rule
-//! holds by construction and cannot regress here. It needs no error type
-//! because all six absorbed shims are total functions over primitives.
 //!
 //! # What this file does
 //!
@@ -172,24 +83,10 @@
 //!
 //! # The measured `lib/curlx/` disposition
 //!
-//! Recorded because it resolves an inconsistency between two sections of the
-//! plan that governs this work: one says 13 of the 18 files in `lib/curlx/`
-//! "exist solely as Windows shims", the other's per-file table implies three.
-//! **The per-file table governs, and measurement agrees with it.** Of the 18
-//! `.c` files, exactly three are genuinely Windows-only and are excluded by
-//! the four-target boundary -- Linux and macOS on x86_64 and aarch64:
-//! `multibyte.c` (78 lines), `winapi.c` (106) and `version_win32.c` (237).
-//! Two more belong to a different directory: `nonblock.c` (92) becomes part
-//! of `crate::conn::socket` and `wait.c` (94) part of `crate::conn::select`,
-//! because a non-blocking flag and a millisecond wait are properties of a
-//! socket and of the reactor, not of a utility layer. The remaining 13 land
-//! here.
-//!
-//! One nuance in that count is worth recording, because a line total read
-//! without it is misleading: `lib/curlx/fopen.c` is 508 lines, and its
-//! Windows guard opens at `:41` and runs to the end. Only `curlx_fseek`
-//! (`:28`) is cross-platform, so `fopen` absorbs a small residue of that
-//! file and roughly 467 lines are excluded rather than migrated.
+//! One nuance is worth recording: `lib/curlx/fopen.c`'s Windows guard opens at
+//! `:41` and runs to the end of the file. Only `curlx_fseek` (`:28`) is
+//! cross-platform, so `fopen` absorbs a small residue of that file and the
+//! remainder is excluded rather than migrated.
 //!
 //! # Platform and toolchain assumptions
 //!
@@ -266,46 +163,19 @@
 //   `strcase`    ->  curl_strequal, curl_strnequal
 //   `slist`      ->  curl_slist_append, curl_slist_free_all
 //
-// `base64` was listed here as a fourth while it was still prose, on the
-// reasoning that the authentication and MIME paths need its output. It is
-// NOT one, and the correction is recorded rather than quietly applied:
-// `grep -i base64 lib/libcurl.def` finds nothing, so no exported symbol is
-// backed from that file and every consumer of it -- `auth/`,
-// `protocols/ws`, `mime`, `tls/session_cache`, `cookies/{altsvc,hsts}` --
-// is inside this crate. "The auth path needs it" is a reason to make an
-// item `pub(crate)`, which is already the default here; only an exported
-// symbol or a crate-root re-export justifies `pub`.
-//
-// Those `pub` markers live in the four files themselves, next to the items
-// they widen, where the justification can name the consumer. THIS file adds
-// no `pub` item and no `pub use` of any kind. That is a decision, not an
-// omission: a re-export here would create a second canonical path to an item
-// that already has one, widen the audit surface with no consumer asking for
-// it, and -- for anything reachable from `curl-rs-ffi` -- move the
-// justification away from the item it applies to.
-//
 // And internals stay internal. `tests/libtest/*.c` (235 files) and
-// `tests/unit/*.c` (59) link a debug static libcurl and call internal
-// `Curl_*` symbols; a Rust static library genuinely does not export
-// `pub(crate)` items, so no quality of implementation makes them link. That
-// is a documented deviation, not a defect to work around, and re-exporting
-// internals to satisfy it would defeat the encapsulation that makes the
-// zero-`unsafe` guarantee possible. Their coverage relocates into
-// `#[cfg(test)]` modules inside these files.
+// `tests/unit/*.c` link a debug static libcurl and call internal `Curl_*`
+// symbols; a Rust static library genuinely does not export `pub(crate)` items,
+// so no quality of implementation makes them link. That is a documented
+// deviation, not a defect to work around, and re-exporting internals to
+// satisfy it would defeat the encapsulation that makes the zero-`unsafe`
+// guarantee possible. Their coverage relocates into `#[cfg(test)]` modules
+// inside these files.
 
-// THE TWENTY-TWO CHILD MODULES -- THOSE DECLARED, AND THOSE DESCRIBED
+// THE CHILD MODULES -- THOSE DECLARED, AND THOSE DESCRIBED
 //
-// The AAP's transformation map gives this layer twenty-two children. The ones
-// that exist are declared further down, each arriving in the unit of work
-// that creates it; the rest are each a separate unit of work and are
-// DESCRIBED here rather than declared. The declarations below are the
-// authoritative inventory of what has landed, and this paragraph
-// deliberately states the rule instead of a tally: a running count here
-// would be wrong again the moment the next child arrives, and it would put
-// every unit of work that adds one in conflict with every other over the
-// same line.
-//
-// That distinction is load-bearing rather than stylistic.
+// A described module is one this root names without declaring, and the
+// distinction is load-bearing rather than stylistic.
 // `pub(crate) mod base64;` without `util/base64.rs` on disk is E0583, "file not
 // found for module" -- a hard error, not a warning. One such line stops the
 // whole crate compiling, and one for every child still absent stops it that
@@ -314,143 +184,111 @@
 // arrives WITH its file, in the unit of work that creates it, and until then
 // the provenance lives in prose where it costs nothing.
 //
-// Each entry is the module and the C translation unit it supersedes, with that
-// unit's line count, so this list stands in for the LIB_CURLX_CFILES and
-// LIB_CFILES groups of `lib/Makefile.inc` for the utility half of the tree.
-// Order is alphabetical, matching `reorder_modules = true` in `rustfmt.toml`.
-//
-// The base64 and base64url codecs -- supersedes `lib/curlx/base64.c` (267).
-//   LANDED, and declared below. "base32hex" appeared in an earlier draft of
-//   this line and is struck from it: `grep -rni base32 lib/ include/ src/`
-//   finds nothing anywhere in the C tree, so there is no such codec to
-//   supersede. The file carries base64 and base64url and nothing else.
-// The chunked buffer queue -- supersedes `lib/bufq.c` (619).
-//   LANDED, and declared below. It is the largest single module in this
-//   directory and the substrate the whole connection-filter chain buffers on,
-//   so the layers that consume it cannot be written against a placeholder.
-// The borrowed-or-owned buffer reference -- supersedes `lib/bufref.c` (138).
-//   LANDED, and declared below. Named "reference-counted" in an earlier
-//   reading of this list, which the measurement corrects: `struct bufref`
-//   holds no count. Its `dtor` field is a single owned-versus-borrowed
-//   discriminator, which is `std::borrow::Cow<'_, [u8]>`.
-// The growable dynamic buffer -- supersedes `lib/curlx/dynbuf.c` (292).
-//   LANDED, and declared below. It is the third of the 22 to exist because
-//   its nineteen size limits gate `CURLE_TOO_LARGE` across the DoH, HTTP,
-//   chunked, FTP, IMAP, MQTT, RTSP, HAProxy, proxy-CONNECT, paused-writer,
-//   `aprintf` and TLS file-loading paths, so the modules that supersede any
-//   of those cannot be written without it.
-// Wildcard pattern matching -- supersedes `lib/curl_fnmatch.c` (385).
-//   LANDED, and declared below rather than only listed here. Its contents are
-//   gated on the `ftp` feature, because the whole of the C sits inside
-//   `#ifndef CURL_DISABLE_FTP`; the declaration is unconditional and the gate
-//   lives in the file.
-// Atomic file creation and seeking -- supersedes `lib/curl_fopen.c` (158)
-// and the cross-platform residue of `lib/curlx/fopen.c` (`curlx_fseek`).
-//   LANDED, and declared below rather than only listed here. The second child
-//   whose contents are conditional, and the first whose gate is written PER
-//   ITEM rather than as an inner attribute: the two C files it supersedes
-//   carry different guards, and an inner `#![cfg]` would hide the seek helper
-//   from `crate::mime`. It is also the second place the layering rule above
-//   is honoured by parameterization -- the random component of the temporary
-//   name is injected, because `Curl_rand_alnum` is now in `crate::crypto`.
-// Line reading from a stream -- supersedes `lib/curl_get_line.c` (67).
-//   LANDED, and declared below rather than only listed here. It carries no
-//   `pub` item: nothing in it is reachable from `curl-rs-ffi`, and its four
-//   consumers -- the cookie jar, the Alt-Svc cache, `.netrc` and the HSTS
-//   cache -- are all inside this crate. Declared unconditionally even though
-//   the C guards the whole file on four `CURL_DISABLE_*` names, because one of
-//   the four has no feature counterpart and the disjunction is therefore
-//   always true.
-// The string-keyed hash table -- supersedes `lib/hash.c` (388).
-//   LANDED, and declared below. It differs from the other two that have
-//   arrived in carrying no `pub` item at all: `lib/hash.h` is an internal
-//   header, and the two helpers it does export, `Curl_hash_str` and
-//   `curlx_str_key_compare`, are `Curl_`- and `curlx_`-prefixed rather than
-//   members of the 100-symbol export set, so nothing there is reachable from
-//   `curl-rs-ffi` and nothing there needs widening.
-// Address presentation and parsing -- supersedes `lib/curlx/inet_ntop.c`
-// (222) and `lib/curlx/inet_pton.c` (221). ISC-licensed, NOT curl-licensed --
-// a distinction that must survive into the file superseding them.
-//   LANDED, and declared below. It is the ONE file in this directory whose
-//   licence banner differs from every other, and the exception recorded at
-//   the head of this file is the reason: the banner it carries is the ISC
-//   notice of its two C originals, and `reuse lint-file` on it is silent.
-//   Both formatters are infallible where the C can fail twice, because the
-//   family collapses into the type system and the caller's buffer becomes an
-//   owned `String`; both parsers return `Option`, so the C's promise to
-//   leave `dst` untouched on failure becomes structural.
-// The general-purpose ordered collection -- supersedes `lib/llist.c` (268).
-//   LANDED, and declared below. It holds no list type: `VecDeque<T>` is the
-//   successor, per AAP 0.6.9, and the module holds the three helpers that
-//   container lacks plus the documentation of the substitution. It is the
-//   first of the 22 with no `pub` item, because no exported C symbol is
-//   backed from it.
-// Reverse byte search -- supersedes `lib/curl_memrchr.c` (53).
-//   LANDED, and declared below. The only one of the three that backs no
-//   exported symbol: it is declared because the transformation map names it,
-//   and it carries no `pub` item at all.
-// Date parsing -- supersedes `lib/parsedate.c` (585). Backs `curl_getdate`.
-//   LANDED, and declared below rather than only listed here. It is the first
-//   of the 22 to exist because `curl_getdate` is an exported symbol and
-//   `curl-rs-ffi` cannot be written without it.
-// Byte-range parsing -- supersedes `lib/curl_range.c` (91).
-//   LANDED, and declared below rather than only listed here. It backs no
-//   exported symbol, and it exists at this point because it is the first of
-//   the two children the layering rule above bites on: its C original writes
-//   into `struct Curl_easy`, so it becomes a pure parse function whose answer
-//   the caller stores. Its two consumers are `crate::protocols::file` and
-//   `crate::protocols::ftp`, and HTTP is deliberately not among them -- that
-//   path forwards the range string in a `Range:` header instead.
-// The `curl_slist` chain -- supersedes `lib/slist.c` (139). Backs the exported
-// `curl_slist_append` and `curl_slist_free_all`.
-//   LANDED, and declared below rather than only listed here, for the same
-//   reason as `parsedate` and `strcase`: both of the symbols it backs are
-//   exported, so `curl-rs-ffi` reaches it. The chain itself does not come with
-//   it -- the C-shaped struct stays at the ABI boundary and this module holds
-//   an owned, ordered sequence instead.
-// The splay tree behind expiry timers -- supersedes `lib/splay.c` (291).
-//   LANDED, and declared below. It backs no exported symbol, so it carries no
-//   `pub` item, and it is the second child in this directory whose NAME no
-//   longer describes its contents: like `llist`, it holds an owned collection
-//   rather than the pointer structure it supersedes. The path is the one the
-//   transformation map gives it, and the type inside says what it is.
-// Case-insensitive comparison -- supersedes `lib/strcase.c` (146) and
-// `lib/strequal.c` (95). Backs `curl_strequal` and `curl_strnequal`.
-//   LANDED, and declared below, for the same reason as `parsedate`: both
-//   comparators are reached from `curl-rs-ffi`.
-// The bounded string parser -- supersedes `lib/curlx/strparse.c` (304).
-// Time differences and the millisecond conversions -- supersedes
-// `lib/curlx/timediff.c` (85).
-//   LANDED, and declared below. Third of the 22 to exist, and for a different
-//   reason from the first two: it backs no exported symbol, but `timeval` and
-//   `splay` cannot be written before the type every timeout is carried in.
-// The monotonic clock -- supersedes `lib/curlx/timeval.c` (272).
-//   LANDED, and declared below. It backs no exported symbol, so it carries
-//   no `pub` item, and it arrives directly after `timediff` because it is
-//   written in terms of the type that file defines. It is also the one child
-//   with an architectural obligation of its own: it owns the crate's CLOCK
-//   SEAM, so no other module -- here or anywhere in `curl-rs-lib` -- may
-//   read a monotonic or a wall clock directly. AAP 0.3.3's P12 requires the
-//   injection, and the coverage gate of AAP 0.8.4 over the time-driven
-//   `protocols/` and `transfer/` modules is unreachable without it.
-// Integer-keyed bitsets -- supersedes `lib/uint-bset.c` (231) and
-// `lib/uint-spbset.c` (251).
-//   LANDED, and declared below. The third to exist, and the first that backs
-//   no exported symbol: it is here because `struct Curl_multi` holds four of
-//   the dense sets beside its transfer table, so the multi handle cannot be
-//   written until they do. Two types in the one file, because the AAP maps
-//   both C translation units onto it.
-// The integer-keyed hash -- supersedes `lib/uint-hash.c` (240).
-//   LANDED, and declared below. It is the transfer-identifier to
-//   per-stream-state map for the multiplexed protocols: all three C call
-//   sites construct it with 63 slots and key it on `data->mid`.
-// The integer-keyed table -- supersedes `lib/uint-table.c` (200).
-//
-// The three `pub`-item consumers named in the preamble above -- `parsedate`,
-// `strcase` and `slist` -- all appear in that list, and all three have now
-// landed. The preamble's rule governed each of them: the `pub` marker
-// lives in the child file next to the item it widens, and THIS file adds
-// no `pub` item and no `pub use` of any kind.
+// The base64 and base64url codecs -- supersedes `lib/curlx/base64.c`. LANDED,
+// and declared below. The file carries base64 and base64url and nothing else.
+// The chunked buffer queue -- supersedes `lib/bufq.c`. LANDED, and declared
+// below. It is the largest single module in this directory and the substrate
+// the whole connection-filter chain buffers on, so the layers that consume it
+// cannot be written against a placeholder. The borrowed-or-owned buffer
+// reference -- supersedes `lib/bufref.c`. LANDED, and declared below. Named
+// "reference-counted" in an earlier reading of this list, which the
+// measurement corrects: `struct bufref` holds no count. Its `dtor` field is a
+// single owned-versus-borrowed discriminator, which is `std::borrow::Cow<'_,
+// [u8]>`. The growable dynamic buffer -- supersedes `lib/curlx/dynbuf.c`.
+// LANDED, and declared below. It is the third of the 22 to exist because its
+// nineteen size limits gate `CURLE_TOO_LARGE` across the DoH, HTTP, chunked,
+// FTP, IMAP, MQTT, RTSP, HAProxy, proxy-CONNECT, paused-writer, `aprintf` and
+// TLS file-loading paths, so the modules that supersede any of those cannot be
+// written without it. Wildcard pattern matching -- supersedes
+// `lib/curl_fnmatch.c`. LANDED, and declared below rather than only listed
+// here. Its contents are gated on the `ftp` feature, because the whole of the
+// C sits inside `#ifndef CURL_DISABLE_FTP`; the declaration is unconditional
+// and the gate lives in the file. Atomic file creation and seeking --
+// supersedes `lib/curl_fopen.c` and the cross-platform residue of
+// `lib/curlx/fopen.c` (`curlx_fseek`). LANDED, and declared below rather than
+// only listed here. The second child whose contents are conditional, and the
+// first whose gate is written PER ITEM rather than as an inner attribute: the
+// two C files it supersedes carry different guards, and an inner `#![cfg]`
+// would hide the seek helper from `crate::mime`. It is also the second place
+// the layering rule above is honoured by parameterization -- the random
+// component of the temporary name is injected, because `Curl_rand_alnum` is
+// now in `crate::crypto`. Line reading from a stream -- supersedes
+// `lib/curl_get_line.c`. LANDED, and declared below rather than only listed
+// here. It carries no `pub` item: nothing in it is reachable from
+// `curl-rs-ffi`, and its four consumers -- the cookie jar, the Alt-Svc cache,
+// `.netrc` and the HSTS cache -- are all inside this crate. Declared
+// unconditionally even though the C guards the whole file on four
+// `CURL_DISABLE_*` names, because one of the four has no feature counterpart
+// and the disjunction is therefore always true. The string-keyed hash table --
+// supersedes `lib/hash.c`. LANDED, and declared below. It differs from the
+// other two that have arrived in carrying no `pub` item at all: `lib/hash.h`
+// is an internal header, and the two helpers it does export, `Curl_hash_str`
+// and `curlx_str_key_compare`, are `Curl_`- and `curlx_`-prefixed rather than
+// members of the 100-symbol export set, so nothing there is reachable from
+// `curl-rs-ffi` and nothing there needs widening. Address presentation and
+// parsing -- supersedes `lib/curlx/inet_ntop.c` and `lib/curlx/inet_pton.c`.
+// ISC-licensed, NOT curl-licensed -- a distinction that must survive into the
+// file superseding them. LANDED, and declared below. It is the ONE file in
+// this directory whose licence banner differs from every other, and the
+// exception recorded at the head of this file is the reason: the banner it
+// carries is the ISC notice of its two C originals, and `reuse lint-file` on
+// it is silent. Both formatters are infallible where the C can fail twice,
+// because the family collapses into the type system and the caller's buffer
+// becomes an owned `String`; both parsers return `Option`, so the C's promise
+// to leave `dst` untouched on failure becomes structural. The general-purpose
+// ordered collection -- supersedes `lib/llist.c`. LANDED, and declared below.
+// It is the first of the 22 with no `pub` item, because no exported C symbol
+// is backed from it. Reverse byte search -- supersedes `lib/curl_memrchr.c`.
+// LANDED, and declared below. The only one of the three that backs no exported
+// symbol: it is declared because the transformation map names it, and it
+// carries no `pub` item at all. Date parsing -- supersedes `lib/parsedate.c`.
+// Backs `curl_getdate`. LANDED, and declared below rather than only listed
+// here. It is the first of the 22 to exist because `curl_getdate` is an
+// exported symbol and `curl-rs-ffi` cannot be written without it. Byte-range
+// parsing -- supersedes `lib/curl_range.c`. LANDED, and declared below rather
+// than only listed here. It backs no exported symbol, and it exists at this
+// point because it is the first of the two children the layering rule above
+// bites on: its C original writes into `struct Curl_easy`, so it becomes a
+// pure parse function whose answer the caller stores. Its two consumers are
+// `crate::protocols::file` and `crate::protocols::ftp`, and HTTP is
+// deliberately not among them -- that path forwards the range string in a
+// `Range:` header instead. The `curl_slist` chain -- supersedes `lib/slist.c`.
+// Backs the exported `curl_slist_append` and `curl_slist_free_all`. LANDED,
+// and declared below rather than only listed here, for the same reason as
+// `parsedate` and `strcase`: both of the symbols it backs are exported, so
+// `curl-rs-ffi` reaches it. The chain itself does not come with it -- the
+// C-shaped struct stays at the ABI boundary and this module holds an owned,
+// ordered sequence instead. The splay tree behind expiry timers -- supersedes
+// `lib/splay.c`. LANDED, and declared below. It backs no exported symbol, so
+// it carries no `pub` item, and it is the second child in this directory whose
+// NAME no longer describes its contents: like `llist`, it holds an owned
+// collection rather than the pointer structure it supersedes. The path is the
+// one the transformation map gives it, and the type inside says what it is.
+// Case-insensitive comparison -- supersedes `lib/strcase.c` and
+// `lib/strequal.c`. Backs `curl_strequal` and `curl_strnequal`. LANDED, and
+// declared below, for the same reason as `parsedate`: both comparators are
+// reached from `curl-rs-ffi`. The bounded string parser -- supersedes
+// `lib/curlx/strparse.c`. Time differences and the millisecond conversions --
+// supersedes `lib/curlx/timediff.c`. LANDED, and declared below. Third of the
+// 22 to exist, and for a different reason from the first two: it backs no
+// exported symbol, but `timeval` and `splay` cannot be written before the type
+// every timeout is carried in. The monotonic clock -- supersedes
+// `lib/curlx/timeval.c`. LANDED, and declared below. It backs no exported
+// symbol, so it carries no `pub` item, and it arrives directly after
+// `timediff` because it is written in terms of the type that file defines. It
+// is also the one child with an architectural obligation of its own: it owns
+// the crate's CLOCK SEAM, so no other module -- here or anywhere in
+// `curl-rs-lib` -- may read a monotonic or a wall clock directly.
+// Integer-keyed bitsets -- supersedes `lib/uint-bset.c` and
+// `lib/uint-spbset.c`. LANDED, and declared below. The third to exist, and the
+// first that backs no exported symbol: it is here because `struct Curl_multi`
+// holds four of the dense sets beside its transfer table, so the multi handle
+// cannot be written until they do. Two types in the one file, because the AAP
+// maps both C translation units onto it. The integer-keyed hash -- supersedes
+// `lib/uint-hash.c`. LANDED, and declared below. It is the transfer-identifier
+// to per-stream-state map for the multiplexed protocols: all three C call
+// sites construct it with 63 slots and key it on `data->mid`. The
+// integer-keyed table -- supersedes `lib/uint-table.c`.
 
 // ABSORBED SHIM 1 of 6 -- byte order.  `lib/curl_endian.c:24-83`
 //
@@ -468,39 +306,8 @@
 // length, which turns an undetected out-of-bounds read into a detected
 // caller bug; correct callers never reach it, exactly as in C, because they
 // check the length of the incoming message first.
-//
-// A `&[u8; 2]` / `&[u8; 4]` parameter would move that check to the type
-// system, and it was rejected on call-site evidence: every C caller passes
-// an interior pointer into a larger message buffer -- `&type2[40]`,
-// `&type2[44]`, `&type2[20]` at `lib/vauth/ntlm.c:266-371` -- which becomes
-// `&type2[40..42]`, a slice. The array form would force a
-// `try_into().unwrap()` at each of those sites, which panics on the same
-// input the slice form panics on, so it buys no safety and costs
-// readability.
-//
-// CONSUMERS. `crate::auth::ntlm`, which is in scope, and `lib/smb.c`, which
-// is not: SMB is one of the 24 unimplemented schemes. All three functions
-// are kept because NTLM uses all three shapes of read across its type-2
-// message parsing.
 
 /// The base64 codec -- supersedes `lib/curlx/base64.c`.
-///
-/// `pub(crate)` with no `pub` item inside it, which is a departure from what
-/// the preamble above anticipated for this child and is recorded here rather
-/// than left as a silent difference. The preamble grouped `base64` with
-/// `parsedate`, `strcase` and `slist` as a candidate for widening; on
-/// measurement it is not one. `grep -i base64 lib/libcurl.def` finds
-/// nothing, so no exported symbol is backed from that file and no
-/// `curl-rs-ffi` consumer can reach for it. The entry belongs where it now
-/// is: the codec is needed by `auth/`, `protocols/ws`, `mime`,
-/// `tls/session_cache` and `cookies/{altsvc,hsts}`, and every one of those
-/// is inside this crate.
-///
-/// AAP 0.8.7 settles the remaining temptation. `tests/unit/unit1302.c` is
-/// the C unit test for this codec and it calls the internal functions
-/// directly, so widening the surface would make it link -- and that is
-/// exactly the re-export the specification forbids. Its coverage is
-/// relocated into the file's own `#[cfg(test)]` module instead.
 pub(crate) mod base64;
 
 /// The chunked byte queue -- supersedes `lib/bufq.c` and `lib/bufq.h`.
@@ -550,33 +357,9 @@ pub(crate) mod dynbuf;
 pub(crate) mod fnmatch;
 
 /// Atomic-replace file creation and stream seeking -- supersedes
-/// `lib/curl_fopen.c` (159 lines) with `lib/curl_fopen.h` (32), and the
-/// cross-platform residue of `lib/curlx/fopen.c` (`curlx_fseek`, `:28-39`)
-/// with the non-Windows half of `lib/curlx/fopen.h` (88).
-///
-/// Declared here rather than only listed above because the file now exists,
-/// which is the rule stated in the twenty-two-children note: a declaration
-/// arrives WITH its file, in the unit of work that creates it.
-///
-/// `pub(crate)` with no `pub` item, like every child except [`parsedate`],
-/// [`strcase`] and [`slist`]: `grep -i fopen lib/libcurl.def` finds nothing,
-/// so no exported symbol is backed from here and nothing in `curl-rs-ffi`
-/// reaches it. Its consumers are the three state-file savers --
-/// `lib/cookie.c:1483`, `lib/altsvc.c:371` and `lib/hsts.c:349` -- all of
-/// which are inside this crate.
-///
-/// It is the SECOND child whose contents are conditional, and unlike
-/// [`fnmatch`] it does NOT carry an inner `#![cfg]`, because the two C
-/// translation units it supersedes carry DIFFERENT guards:
-/// `lib/curl_fopen.c:26-27` is wrapped in
-/// `#if !defined(CURL_DISABLE_COOKIES) || !defined(CURL_DISABLE_ALTSVC) ||
-/// !defined(CURL_DISABLE_HSTS)`, all three of which map onto real names in
-/// the fifteen-name vocabulary, while `lib/curlx/fopen.c` is guarded by
-/// nothing at all. An inner attribute would delete `curlx_fseek`'s successor
-/// along with everything else and hide it from `crate::mime`, which is
-/// unconditional. So the gate is written per item, on exactly the items that
-/// came from the guarded file. The declaration itself stays unconditional
-/// either way, as the policy above requires.
+/// `lib/curl_fopen.c` with `lib/curl_fopen.h`, and the cross-platform residue
+/// of `lib/curlx/fopen.c` (`curlx_fseek`, `:28-39`) with the non-Windows half
+/// of `lib/curlx/fopen.h`.
 ///
 /// The one thing a reader of THIS file should carry away is the layering
 /// consequence recorded in the preamble: the C reaches `Curl_rand_alnum` in
@@ -592,24 +375,6 @@ pub(crate) mod fopen;
 /// Whole-line reading from a stream -- supersedes `lib/curl_get_line.c` and
 /// `lib/curl_get_line.h`.
 ///
-/// `pub(crate)` with no `pub` item at all, unlike [`parsedate`], [`strcase`]
-/// and [`slist`]: `grep -i get_line lib/libcurl.def` finds nothing, so no
-/// exported symbol is backed from here and no `curl-rs-ffi` consumer can
-/// reach it. Its four consumers -- the Netscape cookie jar, the Alt-Svc
-/// cache, `.netrc` and the HSTS cache -- are all inside this crate, under
-/// `src/cookies/`.
-///
-/// Declared unconditionally, and that is a measured decision rather than an
-/// oversight. The C wraps the whole file in
-/// `#if !defined(CURL_DISABLE_COOKIES) || !defined(CURL_DISABLE_ALTSVC) ||
-/// !defined(CURL_DISABLE_HSTS) || !defined(CURL_DISABLE_NETRC)`
-/// (`lib/curl_get_line.c:26-27`). Three of those four names map to features in
-/// the fifteen-name vocabulary and the fourth does not -- there is no `netrc`
-/// feature, because `.netrc` support is unconditional -- so the disjunction is
-/// always true and the guard has nothing to express. Neither this line nor the
-/// file carries a `cfg`, because a condition naming a feature that does not
-/// exist compiles the code away in silence.
-///
 /// The one thing a reader of THIS file should carry away: **every successful
 /// return ends in a newline, and at end of input the function synthesises a
 /// line consisting solely of one.** `lib/hsts.c:517-520` documents its
@@ -620,23 +385,6 @@ pub(crate) mod fopen;
 pub(crate) mod get_line;
 
 /// The string-keyed hash table -- supersedes `lib/hash.c` and `lib/hash.h`.
-///
-/// Declared here rather than only listed above because the file now exists,
-/// which is the rule stated in the twenty-two-children note: a declaration
-/// arrives WITH its file, in the unit of work that creates it.
-///
-/// It carries no `pub` item. Nothing in `lib/hash.h` is reachable from
-/// `curl-rs-ffi` -- the C header is internal, and the two helpers it
-/// exports, `Curl_hash_str` and `curlx_str_key_compare`, are `Curl_`- and
-/// `curlx_`-prefixed rather than members of the 100-symbol export set -- so
-/// this child stays entirely `pub(crate)`, unlike [`parsedate`] and
-/// [`strcase`].
-///
-/// The one thing a reader of THIS file should carry away: `HashMap`
-/// iteration order is randomised per process where the C's chained table
-/// walked buckets deterministically. The child documents the per-call-site
-/// audit of that difference, and the conclusion matters to two modules that
-/// have yet to land -- `conn/pool.rs` inherits it, `dns/` does not.
 pub(crate) mod hash;
 
 /// Address presentation and parsing -- supersedes `lib/curlx/inet_ntop.c`
@@ -652,24 +400,11 @@ pub(crate) mod hash;
 /// `pub(crate)` with no `pub` item: neither `curlx_inet_ntop` nor
 /// `curlx_inet_pton` appears in `lib/libcurl.def`, so nothing in
 /// `curl-rs-ffi` reaches it and the crate root adds no re-export.
-///
-/// The one thing a reader of THIS file should carry away: the strings that
-/// module produces are wire-visible. They reach `Host:` headers, FTP `EPRT`
-/// and `PORT` arguments, SOCKS requests, the Alt-Svc cache file and
-/// `--write-out`, so its rendering is transcribed from the C rather than
-/// delegated to `std::net`, whose answers differ in two measured places --
-/// the deprecated IPv4-compatible form, and a trailing colon on parse. Both
-/// are established by running the two against each other, not by reading
-/// either one's documentation, and both are pinned by a test.
 pub(crate) mod inet;
 
 /// The general-purpose ordered collection -- supersedes `lib/llist.c`.
 ///
-/// `pub(crate)` and, unlike [`parsedate`] and [`strcase`], carrying no `pub`
-/// item at all: no exported C symbol is backed from here, so nothing needs to
-/// become reachable through the crate root.
-///
-/// It declares no list type either. `std::collections::VecDeque<T>` is what
+/// This module declares no list type. `std::collections::VecDeque<T>` is what
 /// replaced `Curl_llist`, and the module holds the three helpers that
 /// container genuinely lacks plus the documentation recording the substitution
 /// -- including the one divergence, that `Curl_llist_destroy` disposes of
@@ -697,29 +432,31 @@ pub(crate) mod parsedate;
 /// Byte-range parsing -- supersedes `lib/curl_range.c` and
 /// `lib/curl_range.h`.
 ///
-/// Declared here rather than only listed above because the file now exists,
-/// which is the rule stated in the twenty-two-children note: a declaration
-/// arrives WITH its file, in the unit of work that creates it.
-///
-/// `pub(crate)` with no `pub` item, unlike [`parsedate`] and [`strcase`]:
-/// `grep -i range lib/libcurl.def` finds nothing, so no exported symbol is
-/// backed from here and nothing in `curl-rs-ffi` reaches it. `CURLOPT_RANGE`
-/// is set through `curl_easy_setopt`, and the string it stores arrives here
-/// later as a slice.
-///
-/// It is the FIRST of the two places the layering rule at the head of this
+/// Range parsing is the FIRST of the two places the layering rule at the head of this
 /// file is honoured by parameterization, and the more consequential of them:
 /// the C's `Curl_range(struct Curl_easy *data)` writes its two results into
 /// the handle, and `lib/curl_range.h` includes `urldata.h` to make that
 /// signature expressible. Here it is a pure parse function returning a
 /// `RangeSpec`, because reproducing the C's shape would place `crate::easy`
 /// and `crate::transfer` below the base of the module graph.
-///
-/// Declared unconditionally even though the C guards the whole file on
-/// `#if !defined(CURL_DISABLE_FTP) || !defined(CURL_DISABLE_FILE)`, for the
-/// reason recorded on [`get_line`]: the disjunction is always true here,
-/// because the `file` scheme has no feature to switch it off.
 pub(crate) mod range;
+
+/// Redaction adaptors for [`fmt::Debug`](core::fmt::Debug), so that a
+/// diagnostic cannot become a credential disclosure.
+///
+/// The one child of this module with **no C counterpart at all**, and the
+/// reason is recorded here rather than only in the file: C has no derived
+/// formatter, so every diagnostic in `lib/` names the field it prints and no
+/// `struct` can leak a secret merely by existing. `#[derive(Debug)]` renders
+/// every field, which makes it easy to attach a formatter to a secret-bearing
+/// type without noticing -- and once attached, any `{:?}` anywhere writes the
+/// secret out. This child restores that property explicitly, and its scope is
+/// strictly the *formatting* of a value: nothing in it changes a byte that
+/// reaches the wire, a file or a callback.
+///
+/// `pub(crate)` with no `pub` item: `grep -i redact lib/libcurl.def` finds
+/// nothing, so no exported symbol is backed from here.
+pub(crate) mod redact;
 
 /// The `curl_slist` string list -- supersedes `lib/slist.c` and
 /// `lib/slist.h`.
@@ -734,25 +471,6 @@ pub(crate) mod range;
 pub(crate) mod slist;
 
 /// The expiry timer tree -- supersedes `lib/splay.c` and `lib/splay.h`.
-///
-/// `pub(crate)` with no `pub` item inside it, unlike [`parsedate`],
-/// [`strcase`] and [`slist`]: `grep -i splay lib/libcurl.def` finds nothing,
-/// so no exported symbol is backed from here and nothing in `curl-rs-ffi`
-/// reaches it. Its only consumer is `crate::multi`, mirroring the C tree,
-/// where `grep -rln 'Curl_splay' lib/` returns exactly `splay.c`, `splay.h`
-/// and `multi.c`.
-///
-/// It declares no tree type and contains no rotation. A `BTreeMap` keyed by
-/// the instant paired with an arrival number is the successor, and that
-/// substitution is a SAFETY decision rather than a performance one:
-/// `Curl_splay` rewires four pointer fields through a stack-allocated
-/// sentinel node, which has no safe hand-written expression. The file records
-/// the measurement, including the one property that had to be preserved
-/// exactly -- two timers registered for the same instant fire in insertion
-/// order, and that order reaches `--trace` output.
-///
-/// The `tests/unit/unit1309.c` coverage relocates into the file as a
-/// `#[cfg(test)]` module, per the policy recorded above.
 pub(crate) mod splay;
 
 /// Locale-independent ASCII case comparison -- supersedes the public half of
@@ -775,99 +493,32 @@ pub(crate) mod strcase;
 /// it. The `tests/unit` coverage that would have called these functions
 /// through a debug static library relocates into the file's own
 /// `#[cfg(test)]` module, per the policy at the head of this file.
-///
-/// It carries a third C translation unit that the inventory above does not
-/// list, and the reason is recorded here so that its absence from the list
-/// is not read as an oversight. `lib/curl_ctype.h` has no module of its own
-/// anywhere in this layer, yet [`fnmatch`], [`parsedate`], `range` and
-/// [`base64`] all classify bytes curl's way rather than the C library's.
-/// The twenty ASCII-only predicates live here, once, because the
-/// classification decides which byte ends a header value and that decision
-/// is visible in the request bytes the fixture corpus compares.
 pub(crate) mod strparse;
 
 /// Time differences and the millisecond conversions -- supersedes
 /// `lib/curlx/timediff.c` and `lib/curlx/timediff.h`.
-///
-/// The third child to land, and the first that carries NO `pub` item: unlike
-/// [`parsedate`] and [`strcase`], nothing in it backs an exported symbol, so
-/// every item is `pub(crate)` and none is re-exported by the crate root. It
-/// is nevertheless the base of the time half of this layer -- the monotonic
-/// clock (`timeval`) and the expiry splay tree (`splay`) both take their
-/// `TimeDiff` from here -- which is why it exists before either of them.
-///
-/// No `#[allow(dead_code)]` appears on this declaration, deliberately: the
-/// visibility policy above places that allowance on the ITEM whose consumer
-/// has yet to land, never on a module, so that an item added later with no
-/// consumer is still reported.
 pub(crate) mod timediff;
 
 /// The monotonic clock, the instant type and the UTC calendar conversion --
 /// supersedes `lib/curlx/timeval.c` and `lib/curlx/timeval.h`.
 ///
-/// `pub(crate)` with no `pub` item, for the same reason as [`timediff`]:
-/// nothing in it backs an exported symbol, so none of it is reachable from
-/// `curl-rs-ffi` and none is re-exported by the crate root. It follows
-/// [`timediff`] immediately because every difference it returns is carried in
-/// that module's `TimeDiff`.
-///
 /// It is the one child of this directory with an obligation beyond its own
 /// correctness: **it owns the clock seam.** No other module in this crate may
-/// call a monotonic or a wall-clock primitive; each one receives a `Clock`
-/// and asks it. That is AAP 0.3.3's P12 applied to time, and it is what makes
-/// the AAP 0.8.4 coverage gate over the time-driven `protocols/` and
-/// `transfer/` modules reachable at all, since every timeout, retry, expiry
-/// and rate limit in them is driven by a clock that a test has to be able to
-/// move. The `TestClock` it exports is deliberately NOT `#[cfg(test)]`, so
+/// call a monotonic or a wall-clock primitive; each one receives a `Clock` and
+/// asks it. The `TestClock` it exports is deliberately NOT `#[cfg(test)]`, so
 /// that those modules' own tests can inject it.
-///
-/// No `#[allow(dead_code)]` on this declaration, for the reason recorded on
-/// [`timediff`]: the allowances belong on the items, so that an item added
-/// later with no consumer is still reported.
 pub(crate) mod timeval;
 
 /// Integer-keyed bitsets -- supersedes `lib/uint-bset.c` and
 /// `lib/uint-spbset.c`, the pair the inventory above lists together.
-///
-/// The third child to land, and unlike [`parsedate`] and [`strcase`] it backs
-/// no exported symbol: it carries no `pub` item and nothing in it is reachable
-/// from `curl-rs-ffi`. It exists this early because the multi handle cannot be
-/// written without it -- `struct Curl_multi` holds four of these bitsets beside
-/// its transfer table (`lib/multihandle.h:90-95`), and the state machine keys
-/// all of them by transfer identifier.
-///
-/// Two types rather than one, because the C has two whose guarantees genuinely
-/// differ: the dense set has a capacity that `add` enforces and that a
-/// downward resize truncates, while the sparse set holds any `u32`. The file
-/// records which representation each one uses and why the answers differ.
 pub(crate) mod uint_bset;
 
-/// The integer-keyed hash -- supersedes `lib/uint-hash.c` (240 lines) and
-/// `lib/uint-hash.h` (61).
-///
-/// `pub(crate)` with no `pub` item inside it, unlike [`parsedate`] and
-/// [`strcase`]: no exported symbol is backed from here. Its consumers are
-/// `crate::protocols::http2` and `crate::protocols::http3`, for which it is
-/// the transfer-identifier to per-stream-state map -- all three C call sites
-/// construct it with 63 slots and key it on `data->mid`. The C's own unit
-/// test, `tests/unit/unit1616.c`, relocates into the file as a
-/// `#[cfg(test)]` module, per the policy recorded above.
+/// The integer-keyed hash -- supersedes `lib/uint-hash.c` and
+/// `lib/uint-hash.h`.
 pub(crate) mod uint_hash;
 
 /// The integer-keyed table that assigns `mid` -- supersedes
 /// `lib/uint-table.c` and `lib/uint-table.h`.
-///
-/// The third child to land, and `pub(crate)` with no `pub` item at all: the
-/// table backs no exported symbol, so nothing in it is reachable from
-/// `curl-rs-ffi` and none of it is re-exported by the crate root.
-///
-/// It is the one module in this layer whose OUTPUT is frozen behaviour rather
-/// than merely its behaviour. The key it hands out is the transfer identifier
-/// `mid`, and `mid` is printed in trace output -- `lib/multi.c:529`, `:887`
-/// and five further sites the file enumerates -- so the round-robin key
-/// assignment of `lib/uint-table.c:116-150` is transcribed rather than
-/// improved, and `tests/unit/unit3212.c` is ported into it assertion by
-/// assertion.
 ///
 /// Carries no `#[allow(dead_code)]` on this declaration by design: an
 /// attribute on a `mod` covers the module's whole contents, which
@@ -877,10 +528,304 @@ pub(crate) mod uint_hash;
 /// the items instead.
 pub(crate) mod uint_table;
 
-/// Reads a 16-bit unsigned integer in little-endian order.
+/// Allocation that reports failure instead of aborting the process.
 ///
-/// Supersedes `Curl_read16_le` (`lib/curl_endian.c:41-45`), whose body is
-/// `buf[0] | (buf[1] << 8)`.
+/// # Why this module exists
+///
+/// C's allocation wrappers return null and every caller has a code for it:
+/// `CURLE_OUT_OF_MEMORY`, `CURLSHE_NOMEM`, `CURLUE_OUT_OF_MEMORY`,
+/// `CURLHE_OUT_OF_MEMORY`. Rust's infallible allocation calls
+/// `alloc::alloc::handle_alloc_error` instead, which **aborts the process**.
+/// For a library reached through a C ABI that is a strictly worse contract than
+/// the one it replaces: an embedding application that is prepared to handle
+/// `CURLE_OUT_OF_MEMORY` is killed instead of being told, and the panic
+/// boundary in `curl-rs-ffi` cannot help, because an allocator abort is not an
+/// unwind and `catch_unwind` never sees it.
+///
+/// The exposure that matters is **externally sized** allocation: a capacity
+/// derived from a length the caller chose. `curl_easy_escape` with a 700 MB
+/// string, a `CURLOPT_POSTFIELDSIZE` the application picked, a header a server
+/// sent -- each is a number this library did not choose, and multiplying it by
+/// three for percent-encoding is how a large-but-legal input becomes a failed
+/// allocation. Those are the sites routed through this module.
+///
+/// # What is deliberately NOT routed through it
+///
+/// A fixed-size allocation -- `Box::new` of a handle, a `Vec` of a compile-time
+/// count -- has no stable fallible spelling at the declared minimum Rust
+/// version: `Box::try_new` is unstable. Those sites keep their acknowledgement
+/// comment, narrowed to say that the size is fixed, so a reader can tell the
+/// two cases apart. A fixed-size allocation failing means the process could not
+/// obtain a few dozen bytes, which is a different situation from a caller
+/// asking for a gigabyte.
+///
+/// # The two failure routes, and why both are tested
+///
+/// [`TryReserveError`] carries either `CapacityOverflow` -- the requested
+/// capacity cannot be expressed as a [`std::alloc::Layout`] at all -- or
+/// `AllocError`, the allocator declining. Both arrive here as the same
+/// `Err`, and both must map to the same curl code, which is why the tests
+/// exercise each route rather than assuming the variants are interchangeable.
+///
+/// [`TryReserveError`]: std::collections::TryReserveError
+pub(crate) mod fallible {
+    use std::collections::TryReserveError;
+
+    use crate::error::CURLcode;
+
+    /// `CURLE_OUT_OF_MEMORY`, for `.map_err(oom)`.
+    ///
+    /// A function rather than a closure at every site so that the mapping is
+    /// stated once and a site cannot quietly choose a different code.
+    pub(crate) fn oom(_: TryReserveError) -> CURLcode {
+        CURLcode::OutOfMemory
+    }
+
+    /// `Vec::with_capacity`, reporting failure.
+    ///
+    /// Written as `Vec::new` plus `try_reserve_exact` because that is the only
+    /// stable spelling: `Vec::with_capacity` itself has no fallible form. The
+    /// `exact` variant is used because the caller has already computed the
+    /// figure it wants -- `try_reserve` may round up, which turns a request the
+    /// allocator would have served into one it declines.
+    pub(crate) fn vec_with_capacity<T>(
+        capacity: usize,
+    ) -> Result<Vec<T>, TryReserveError> {
+        let mut vec = Vec::new();
+        vec.try_reserve_exact(capacity)?;
+        Ok(vec)
+    }
+
+    /// `String::with_capacity`, reporting failure.
+    pub(crate) fn string_with_capacity(
+        capacity: usize,
+    ) -> Result<String, TryReserveError> {
+        let mut string = String::new();
+        string.try_reserve_exact(capacity)?;
+        Ok(string)
+    }
+
+    /// `Vec::push`, reporting failure.
+    ///
+    /// The reservation is the growth-doubling `try_reserve`, not the exact
+    /// form: a push in a loop that reserved exactly one byte at a time would
+    /// reallocate on every iteration.
+    pub(crate) fn push<T>(
+        vec: &mut Vec<T>,
+        value: T,
+    ) -> Result<(), TryReserveError> {
+        vec.try_reserve(1)?;
+        vec.push(value);
+        Ok(())
+    }
+
+    /// `Vec::reserve`, reporting failure.
+    #[allow(dead_code)] // used by some growth sites and not others
+    pub(crate) fn reserve<T>(
+        vec: &mut Vec<T>,
+        additional: usize,
+    ) -> Result<(), TryReserveError> {
+        vec.try_reserve(additional)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{oom, push, string_with_capacity, vec_with_capacity};
+        use crate::error::CURLcode;
+
+        /// One past the largest expressible allocation, for `u8`.
+        ///
+        /// `std::alloc::Layout` refuses a size above `isize::MAX`, so a request
+        /// of `isize::MAX + 1` bytes fails **inside `Layout::array`** and the
+        /// allocator is never called. That distinction is the whole point of
+        /// this constant, and it is not a stylistic preference:
+        ///
+        /// * Asking for exactly `isize::MAX` is a LEGAL layout, so the request
+        ///   reaches the allocator. Natively glibc declines and the `Err` looks
+        ///   the same, but under Miri the interpreter answers
+        ///   `error: resource exhaustion: tried to allocate more memory than
+        ///   available to compiler` -- a hard interpreter error that no
+        ///   `Result` can carry and that fails the Miri gate outright.
+        /// * It also made the assertion depend on the host allocator declining
+        ///   rather than on anything in this crate, which is not a property
+        ///   worth testing.
+        ///
+        /// The wrong first attempt is recorded here rather than silently
+        /// replaced, because the failure mode is invisible until the Miri leg
+        /// runs.
+        const PAST_LAYOUT_LIMIT: usize = (isize::MAX as usize) + 1;
+
+        #[test]
+        fn a_capacity_past_the_layout_limit_is_reported_not_fatal() {
+            let refused = vec_with_capacity::<u8>(PAST_LAYOUT_LIMIT);
+            assert!(
+                refused.is_err(),
+                "isize::MAX + 1 bytes cannot be a Layout"
+            );
+            assert_eq!(refused.map_err(oom), Err(CURLcode::OutOfMemory));
+
+            let refused = string_with_capacity(PAST_LAYOUT_LIMIT);
+            assert!(refused.is_err());
+            assert_eq!(refused.map_err(oom), Err(CURLcode::OutOfMemory));
+        }
+
+        /// The other `TryReserveError` route: the element size multiplies out.
+        ///
+        /// `usize::MAX / 4` `u64`s is eight times that many bytes, so the
+        /// failure comes from the multiplication in `Layout::array` rather than
+        /// from the count itself. Both routes must map to the same code, which
+        /// is why they are asserted separately instead of being assumed
+        /// interchangeable.
+        #[test]
+        fn an_element_size_that_overflows_the_layout_is_reported_too() {
+            let refused = vec_with_capacity::<u64>(usize::MAX / 4);
+            assert!(refused.is_err());
+            assert_eq!(refused.map_err(oom), Err(CURLcode::OutOfMemory));
+        }
+
+        /// A refused reservation leaves the container exactly as it was.
+        #[test]
+        fn a_refused_reservation_changes_nothing() {
+            let mut vec: Vec<u8> = Vec::new();
+            assert!(super::reserve(&mut vec, PAST_LAYOUT_LIMIT).is_err());
+            assert_eq!(vec.capacity(), 0, "no capacity was taken");
+            assert!(vec.is_empty(), "and no element appeared");
+
+            let mut text = String::from("kept");
+            assert!(text.try_reserve(PAST_LAYOUT_LIMIT).is_err());
+            assert_eq!(text, "kept", "the contents survive a refusal");
+        }
+
+        /// The served path is ordinary: these wrappers are not a slow lane.
+        #[test]
+        fn a_servable_request_behaves_as_the_infallible_form_does() {
+            let mut vec: Vec<u8> =
+                vec_with_capacity(8).expect("eight bytes are servable");
+            assert!(vec.capacity() >= 8);
+            for byte in b"abcdefgh" {
+                push(&mut vec, *byte).expect("within the reservation");
+            }
+            assert_eq!(vec, b"abcdefgh");
+
+            let mut text =
+                string_with_capacity(4).expect("four bytes are servable");
+            text.push_str("ok");
+            assert_eq!(text, "ok", "within the reservation, so no growth");
+        }
+    }
+}
+
+/// A `RefCell`-shaped cell that is `Sync`, for test doubles behind an [`Arc`].
+///
+/// [`Arc`]: std::sync::Arc
+///
+/// # Why this exists
+///
+/// The connection layer's injected seams are shared, not owned: a test
+/// installs one double and then inspects what it recorded, so the double is
+/// held twice. `std::rc::Rc<std::cell::RefCell<T>>` is the single-threaded
+/// spelling of that, and it is what these tests used before the connection
+/// pool had to become [`Send`] -- `crate::share::Share` holds a
+/// `Mutex<Option<ConnectionPool>>`, and `Mutex<T>: Send + Sync` requires
+/// `T: Send`, which requires every injected seam behind the pool to be
+/// `Send + Sync`. `Arc<T>: Send` requires `T: Send + Sync`, and `RefCell` is
+/// not `Sync`, so the cell itself had to change with the pointer.
+///
+/// # Why it is `RwLock` and not `Mutex`
+///
+/// [`RefCell`] permits any number of simultaneous shared borrows and exactly
+/// one exclusive borrow. [`std::sync::RwLock`] has the same rule, so a test
+/// that holds two `borrow()`s at once keeps working; a [`std::sync::Mutex`]
+/// would deadlock where the original merely worked. The method names are
+/// [`RefCell`]'s so that converting a double is a change of type name and
+/// nothing else.
+///
+/// [`RefCell`]: std::cell::RefCell
+///
+/// # Poisoning
+///
+/// A panic while a guard is held poisons the lock. `crate::share` explains at
+/// length why poisoning must never convert a transient fault into a permanent
+/// one, and the same reasoning applies here for a different reason: a test
+/// that panics inside a guard should report *its own* assertion failure, not a
+/// second panic from the recovery path. Both accessors therefore recover with
+/// `unwrap_or_else(PoisonError::into_inner)`.
+///
+/// This is `#[cfg(test)]` because it has no production caller: production code
+/// that needs shared mutable state names its lock directly, and a shim that
+/// hid the choice there would be the wrong trade.
+#[cfg(test)]
+pub(crate) mod sync_cell {
+    use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    /// Interior mutability with `RefCell`'s API and `RwLock`'s bounds.
+    #[derive(Debug, Default)]
+    pub(crate) struct SyncCell<T>(RwLock<T>);
+
+    impl<T> SyncCell<T> {
+        /// `RefCell::new`.
+        pub(crate) fn new(value: T) -> Self {
+            Self(RwLock::new(value))
+        }
+
+        /// `RefCell::borrow`, as a read guard.
+        pub(crate) fn borrow(&self) -> RwLockReadGuard<'_, T> {
+            self.0.read().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// `RefCell::borrow_mut`, as a write guard.
+        ///
+        /// `&self` rather than `&mut self`, exactly as [`RefCell`]'s is: the
+        /// whole point of the type is exclusive access through a shared
+        /// reference.
+        ///
+        /// [`RefCell`]: std::cell::RefCell
+        pub(crate) fn borrow_mut(&self) -> RwLockWriteGuard<'_, T> {
+            self.0.write().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// `RefCell::into_inner`.
+        #[allow(dead_code)] // used by some doubles and not others
+        pub(crate) fn into_inner(self) -> T {
+            self.0.into_inner().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// `RefCell::replace` / `Cell::replace`.
+        #[allow(dead_code)] // used by some doubles and not others
+        pub(crate) fn replace(&self, value: T) -> T {
+            std::mem::replace(&mut self.borrow_mut(), value)
+        }
+    }
+
+    impl<T: Copy> SyncCell<T> {
+        /// `Cell::get`.
+        ///
+        /// The guard is released before the value leaves the call, which is
+        /// why the `self.counter.set(self.counter.get() + 1)` idiom the
+        /// doubles use does not deadlock: the argument is evaluated, and its
+        /// read guard dropped, before `set` asks for the write guard.
+        #[allow(dead_code)] // used by some doubles and not others
+        pub(crate) fn get(&self) -> T {
+            *self.borrow()
+        }
+
+        /// `Cell::set`.
+        #[allow(dead_code)] // used by some doubles and not others
+        pub(crate) fn set(&self, value: T) {
+            *self.borrow_mut() = value;
+        }
+    }
+
+    impl<T: Default> SyncCell<T> {
+        /// `RefCell::take` / `Cell::take`.
+        #[allow(dead_code)] // used by some doubles and not others
+        pub(crate) fn take(&self) -> T {
+            std::mem::take(&mut self.borrow_mut())
+        }
+    }
+}
+
+/// Reads a 16-bit unsigned integer in little-endian order.
 ///
 /// # Panics
 ///
@@ -893,9 +838,6 @@ pub(crate) fn read16_le(buf: &[u8]) -> u16 {
 
 /// Reads a 32-bit unsigned integer in little-endian order.
 ///
-/// Supersedes `Curl_read32_le` (`lib/curl_endian.c:60-64`), whose body is
-/// `buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24)`.
-///
 /// # Panics
 ///
 /// Panics if `buf` holds fewer than 4 bytes. The C original reads out of
@@ -906,9 +848,6 @@ pub(crate) fn read32_le(buf: &[u8]) -> u32 {
 }
 
 /// Reads a 16-bit unsigned integer in big-endian order.
-///
-/// Supersedes `Curl_read16_be` (`lib/curl_endian.c:79-83`), whose body is
-/// `(buf[0] << 8) | buf[1]`.
 ///
 /// # Panics
 ///
@@ -943,26 +882,11 @@ pub(crate) fn read16_be(buf: &[u8]) -> u16 {
 //   * NO "/" special case -- POSIX returns "/" for a path made entirely of
 //     separators; this returns "".
 //
-// `std::path::Path::file_name()` is NOT used, for exactly those reasons: it
-// strips trailing separators, returns `None` for an empty path and for "..",
-// and treats the backslash as an ordinary character on Unix. Every one of
-// those differences is observable.
-//
-// Both separators are honoured on ALL platforms. That is deliberate in the C
+// Both `/` and `\` are honoured on ALL platforms. That is deliberate in the C
 // and is not turned into a `#[cfg(windows)]` here: curl accepts a Windows
 // path in a `CURLOPT_MIMEPOST` filename regardless of the host it runs on,
 // and the four mandated targets are Unix, so a platform-conditional would
 // change the behaviour on every target this build supports.
-//
-// The C is wrapped in `#ifndef HAVE_BASENAME` (`:26`), so a platform that
-// supplies its own `basename()` never compiles it. In Rust it is
-// unconditional: there is no system function to defer to and no configure
-// probe to ask, and -- as recorded above -- the system function would be the
-// wrong one anyway.
-//
-// CONSUMER. `crate::mime`, from `lib/mime.c:271`
-// (`curlx_strdup(curlx_basename(filename))`). The only other caller,
-// `src/tool_doswin.c:323,374`, is Windows-only and excluded.
 
 /// Returns the final component of `path`, after the rightmost `/` or `\`.
 ///
@@ -971,9 +895,6 @@ pub(crate) fn read16_be(buf: &[u8]) -> u16 {
 /// stripping, no `"."` for an empty input, no `"/"` special case, and both
 /// separators recognised on every platform. See the block comment above for
 /// the three POSIX behaviours that are deliberately absent.
-///
-/// The result borrows from `path` and never allocates, matching the C, which
-/// returns an interior pointer into its argument.
 ///
 /// ```text
 /// "a/b/c"    -> "c"        "a\\b\\c"  -> "c"
@@ -991,10 +912,7 @@ pub(crate) fn basename(path: &str) -> &str {
     let last_slash = path.rfind('/');
     let last_backslash = path.rfind('\\');
 
-    // The C's four-branch chain, branch for branch. `last_slash
-    // .max(last_backslash)` is equivalent, because `Option`'s ordering makes
-    // `None` less than every `Some`, but the explicit form is what a reviewer
-    // can check against the C by reading straight down.
+    // The C's four-branch chain, branch for branch.
     let cut = match (last_slash, last_backslash) {
         (Some(slash), Some(backslash)) => Some(slash.max(backslash)),
         (Some(slash), None) => Some(slash),
@@ -1022,15 +940,6 @@ pub(crate) fn basename(path: &str) -> &str {
 //       else if(dsize) dest[0] = 0;
 //     }
 //
-// THE BEHAVIOUR THAT MATTERS, and the reason this is not `strncpy`: when the
-// source does not fit, NOTHING IS COPIED -- but a NUL is still written at
-// `dest[0]` whenever the buffer is non-zero. It is a copy-or-empty, not a
-// truncating copy. That distinction is precisely what makes it safe: a
-// truncating copy hands the caller a prefix that looks like a valid value,
-// whereas an empty string is unmistakably a failure. Note also that the
-// comparison is `slen < dsize`, strictly: a source of exactly `dsize` bytes
-// does NOT fit, because the terminator needs the last byte.
-//
 // Rust normally has nothing to write here at all, because `String` and
 // `Vec<u8>` grow and the question never arises. This helper exists for the
 // one place where a fixed-size buffer is genuinely emulated: `inet.rs`, whose
@@ -1038,14 +947,6 @@ pub(crate) fn basename(path: &str) -> &str {
 // buffer and turn a copy that did not fit into `ENOSPC`. Returning `bool`
 // rather than `()` is what lets that caller keep doing so, since C recovers
 // the same information by inspecting `dest[0]` afterwards.
-//
-// The `DEBUGASSERT` is a CALLER-CONTRACT check, not a runtime guard: in C it
-// compiles away in a release build and the silent refusal is what remains.
-// `debug_assert!` has exactly that property, so the pair is preserved
-// faithfully -- and that is why the logic lives in a private inner function.
-// Testing the release-mode overflow path through the public entry point would
-// trip the assertion, which is what a debug C build does too; the tests
-// therefore drive `strcopy_inner` for that case and `strcopy` for the rest.
 
 /// Copies `src` into `dest` and NUL-terminates it, or leaves `dest` empty.
 ///
@@ -1132,10 +1033,6 @@ fn strcopy_inner(dest: &mut [u8], src: &[u8]) -> bool {
 // `curlx_strdup` is not defined in this file at all -- it is the allocator's
 // `strdup` under a name, and it needs no Rust counterpart for the same reason
 // as `curlx_memdup`.
-//
-// Writing thin `memdup`-shaped helpers here was considered and rejected: they
-// would add API surface with no consumer, and every call site reads better as
-// the standard-library method it actually wants.
 
 // ABSORBED SHIM 5 of 6 -- operating-system error strings.
 // `lib/curlx/strerr.c:24-331`
@@ -1152,21 +1049,12 @@ fn strcopy_inner(dest: &mut [u8], src: &[u8]) -> bool {
 //                              message text must match curl 8.19.0-DEV
 //                              exactly.
 //
-// NOT ONE `CURLcode` MESSAGE STRING APPEARS IN THIS FILE. Reproducing any of
-// them here would duplicate a table that must have exactly one owner.
-//
 // `lib/curlx/strerr.c` exports exactly one function -- measured: the file's
 // only other function, `get_winsock_error` at `:44`, is `static` and
 // Windows-only -- and the source calls it "Our thread-safe and smart
 // strerror() replacement":
 //
 //     const char *curlx_strerror(int err, char *buf, size_t buflen);
-//
-// Its 331 lines are a portability maze: `strerror_s` on Windows, then
-// POSIX-style versus glibc-style `strerror_r` selected by two configure
-// probes and backed by a compile-time `#error "strerror_r MUST be either
-// POSIX, glibc style"`, then a Winsock error table, then dispatch to
-// `Curl_sspi_strerror` and `curlx_winapi_strerror`.
 //
 // ALL OF IT COLLAPSES to `std::io::Error::from_raw_os_error(err)`, which is
 // thread-safe by construction. The reduction is spelled out so that a reader
@@ -1189,28 +1077,6 @@ fn strcopy_inner(dest: &mut [u8], src: &[u8]) -> bool {
 //      re-reads `errno` after formatting and there is nothing to protect.
 //   4. `get_winsock_error`, `Curl_sspi_strerror` and `curlx_winapi_strerror`
 //      are Windows-only and EXCLUDED, along with `lib/curl_sspi.c`.
-//
-// ONE DIVERGENCE IS REAL AND IS CORRECTED RATHER THAN ACCEPTED.
-// `std::io::Error`'s `Display` appends " (os error N)", so
-// `from_raw_os_error(2).to_string()` is "No such file or directory (os error
-// 2)" where the C yields the bare "No such file or directory". Measured
-// consequence: the suffix is NOT visible to the test harness -- searching the
-// 1,914-fixture corpus for the three commonest `errno` messages matches
-// exactly one file, `tests/data/test3027:14`, and that line is an FTP server
-// reply ("REPLY MDTM 550 Permission denied"), not `strerror` output. It IS
-// visible in `failf()` text, though, and the preservation mandate is about
-// behaviour and not only about fixtures, so the suffix is stripped.
-//
-// THIS FILE OWNS THAT STRIP FOR THE WHOLE WORKSPACE, and the centralization
-// is the correction of a measured divergence rather than tidiness. Three
-// independent implementations existed -- here, in
-// `curl-rs/src/output/formparse.rs` and in `curl-rs/src/output/filetime.rs` --
-// and two of them already disagreed: the `formparse` one stripped a single
-// trailing suffix, so under Miri, where `std` emits two (see
-// [`strip_os_error_suffix`]), it left one behind and a frozen diagnostic
-// changed. A diagnostic whose bytes depend on which file rendered it is a
-// defect no matter which spelling is nicer, so there is now exactly one
-// algorithm, reached by every consumer through [`os_error_message`].
 
 /// The annotation `std::io::Error`'s `Display` appends and C never emits.
 ///
@@ -1219,33 +1085,6 @@ fn strcopy_inner(dest: &mut [u8], src: &[u8]) -> bool {
 const OS_ERROR_INFIX: &str = " (os error ";
 
 /// Renders an [`std::io::Error`] the way `curlx_strerror` renders `errno`.
-///
-/// THE ONE ENTRY POINT for operating-system error text anywhere in the
-/// workspace, and the reason it is `pub` while the rest of this module is not:
-/// `curl-rs` interpolates `strerror(errno)` into frozen diagnostics at
-/// `src/tool_formparse.c:220` and `:561`, at `src/tool_filetime.c:79` and
-/// `:136`, and at `src/tool_operate.c:637-639`, and every one of those must
-/// produce the same bytes as every other. Reaching that guarantee by
-/// convention failed once already, which is recorded above.
-///
-/// The result is the bare system text: `No such file or directory`, not
-/// `No such file or directory (os error 2)`.
-///
-/// # Why it takes an error rather than an `errno`
-///
-/// Two of the three consumers hold an [`std::io::Error`] that the standard
-/// library handed them and never see a number; `raw_os_error()` would give
-/// them one only when the error came from the operating system at all. A
-/// helper that stripped an exact, known suffix when the caller had the number
-/// and a pattern otherwise would be two behaviours again -- which is precisely
-/// the shape of the bug being removed. It therefore recognises the annotation
-/// by its form, strictly, and never needs the number.
-///
-/// Callers holding an `errno` use `os_strerror`, which is this function with
-/// the error constructed for them. That one is crate-private -- it is named
-/// here without a link deliberately, because a link from public
-/// documentation to a private item is a rustdoc warning, and this crate
-/// carries no warnings.
 ///
 /// # Examples
 ///
@@ -1276,9 +1115,6 @@ pub fn os_error_message(error: &std::io::Error) -> String {
 /// `std::io::Error`'s `Display` appends is removed by
 /// [`os_error_message`], so the text matches what the C reports.
 ///
-/// This is the OPERATING SYSTEM's error text. curl's own result-code messages
-/// belong to [`crate::error`] and are not duplicated here.
-///
 /// # Panics
 ///
 /// In a debug build only, panics on a negative `err`, mirroring the C's
@@ -1294,10 +1130,6 @@ pub(crate) fn os_strerror(err: i32) -> String {
 }
 
 /// Removes every trailing [`OS_ERROR_INFIX`] annotation from rendered text.
-///
-/// Borrows rather than allocating, so a caller that only needs to print the
-/// text pays nothing; [`os_error_message`] owns the copy for the callers that
-/// need one.
 ///
 /// STRIPPING TO A FIXED POINT RATHER THAN ONCE is deliberate, and the reason
 /// was measured rather than guessed. On all four mandated targets `std`
@@ -1316,15 +1148,6 @@ pub(crate) fn os_strerror(err: i32) -> String {
 /// real check for an imaginary risk. A fixed-point strip is the only form that
 /// yields C's bare text in both environments while never yielding a
 /// *different* string on a real target.
-///
-/// One theoretical ambiguity is accepted with it, and named rather than
-/// hidden: an operating system whose bare message happened to END in
-/// ` (os error N)` would lose that ending. No platform does, and the
-/// alternative -- excusing this function from the Miri gate -- would trade a
-/// real check for an imaginary risk.
-///
-/// Each pass is [`strip_one_os_error_suffix`] and returns a strictly shorter
-/// slice, so the loop always terminates.
 fn strip_os_error_suffix(rendered: &str) -> &str {
     let mut text = rendered;
     while let Some(shorter) = strip_one_os_error_suffix(text) {
@@ -1342,9 +1165,6 @@ fn strip_os_error_suffix(rendered: &str) -> &str {
 /// `Display` implementation that never appended one -- yields `None` and
 /// leaves the text untouched. A future change to the standard library's
 /// format therefore leaves the message intact instead of mangling it.
-///
-/// The last occurrence is taken, so the innermost real message survives when
-/// several annotations are stacked.
 fn strip_one_os_error_suffix(rendered: &str) -> Option<&str> {
     // `?` and `get` are used in place of indexing so that no input can produce
     // a panicking path.
@@ -1359,16 +1179,6 @@ fn strip_one_os_error_suffix(rendered: &str) -> Option<&str> {
 
 // ABSORBED SHIM 6 of 6 -- narrowing conversions.
 // `lib/curlx/warnless.c:24-341`, `lib/curlx/warnless.h:26-80`
-//
-// This is the one absorbed shim with real semantics, and the one where a
-// plausible-looking simplification would be a defect.
-//
-// MEASURED INVENTORY, because the count matters and a summary of it was off:
-// `warnless.h` declares 18 FUNCTIONS plus 1 MACRO -- 19 items, not 20. All 18
-// are defined in `warnless.c` (at `:54, 72, 90, 110, 130, 151, 172, 191, 209,
-// 227, 248, 266, 281, 286, 297, 307, 323, 334`) and all 18 appear below. The
-// macro is `CURLX_FUNCTION_CAST`, dealt with at the end of this section.
-// Thirteen are plain narrowing; five carry behaviour that must survive.
 //
 // WHAT THE C ACTUALLY DOES, and it is not what the name suggests. Each plain
 // helper is a `DEBUGASSERT` on the range FOLLOWED BY A MASK, and the mask --
@@ -1396,28 +1206,8 @@ fn strip_one_os_error_suffix(rendered: &str) -> Option<&str> {
 // the C combines two assertions -- a non-negativity check and an upper bound
 // -- the Rust states the closed range once, which is both the same condition
 // and the form clippy prefers.
-//
-// A BARE `as` CAST IS NEVER USED FOR A NARROWING CONVERSION HERE. Where a
-// conversion is a widening that cannot lose information on any of the four
-// mandated 64-bit targets, `as` is used and the reason is proved in a comment
-// at the site; `try_into().expect(..)` was considered for those and rejected,
-// because it introduces a panic path for a condition that cannot arise.
-//
-// SEVERAL C BRANCHES ARE COMPILED OUT ON EVERY MANDATED TARGET, and each is
-// noted where it applies rather than silently dropped:
-// `#if ULONG_MAX < SIZE_MAX` (false: both 64-bit),
-// `#if SIZEOF_CURL_OFF_T > SIZEOF_SIZE_T` (false: both 8 bytes) and
-// `#if INT_MAX < SSIZE_MAX` (true, so those assertions DO apply).
 
 /// curl's file-size and offset type: `curl_off_t`.
-///
-/// 64-bit signed on all four mandated targets. `include/curl/system.h:396`
-/// defines `curl_off_t` as `CURL_TYPEOF_CURL_OFF_T`, which resolves to `long`
-/// or `long long` depending on the platform, and `lib/curl_setup.h:595-599`
-/// rejects any platform where it is smaller than 8 bytes outright ("too small
-/// curl_off_t") and pins `CURL_OFF_T_MAX` to `0x7FFFFFFFFFFFFFFF`. That is
-/// exactly [`i64::MAX`], which is why the saturation in [`uztoso`] can be
-/// expressed against the Rust constant.
 ///
 /// The alias exists so that a signature reading `CurlOffT` says "this is a
 /// curl offset" rather than "this happens to be 64 bits", and so that the
@@ -1529,11 +1319,6 @@ pub(crate) fn uztosz(uznum: usize) -> isize {
 
 /// `curl_off_t` to `size_t` -- `curlx_sotouz`, `warnless.c:209-222`.
 ///
-/// The C masks with `(curl_off_t)CURL_MASK_USIZE_T`, which on a target where
-/// `size_t` and `curl_off_t` are both 64 bits is all-ones -- the identity --
-/// so only the assertion carries meaning here. A release build reinterprets a
-/// negative value as a huge `usize`, exactly as the C does.
-///
 /// # Panics
 ///
 /// In a debug build only, if the value is negative.
@@ -1571,11 +1356,6 @@ pub(crate) fn uitous(uinum: u32) -> u16 {
 
 /// `int` to `size_t` -- `curlx_sitouz`, `warnless.c:266-279`.
 ///
-/// The C has no mask here, only the assertion, so a release build converts a
-/// negative value to a huge `usize` by two's-complement
-/// reinterpretation. Rust's `as` does the same on the mandated targets, which
-/// is why the behaviour is preserved without one.
-///
 /// # Panics
 ///
 /// In a debug build only, if the value is negative.
@@ -1586,12 +1366,6 @@ pub(crate) fn sitouz(sinum: i32) -> usize {
 }
 
 /// `unsigned int` to `size_t` -- `curlx_uitouz`, `warnless.c:281-284`.
-///
-/// The only helper in the C with neither an assertion nor a mask, because a
-/// 32-bit unsigned value always fits a 64-bit `size_t`. `usize::from` is not
-/// implemented for `u32` -- it would be wrong on a 16-bit target -- so the
-/// widening is spelled with `as`, and it cannot lose information on any
-/// mandated target.
 #[allow(dead_code)]
 pub(crate) fn uitouz(uinum: u32) -> usize {
     uinum as usize
@@ -1600,10 +1374,6 @@ pub(crate) fn uitouz(uinum: u32) -> usize {
 // --- The five conversions that carry behaviour ------------------------------
 
 /// Fits a `curl_off_t` into the `size_t` interval `[uzmin, uzmax]`.
-///
-/// Supersedes `curlx_sotouz_range` (`warnless.c:286-295`). SATURATES: the
-/// header's wording is "values outside this interval give the lower/upper
-/// bound", and a NEGATIVE value gives `uzmin`, the LOWER bound.
 ///
 /// [`Ord::clamp`] is deliberately not used. It panics when `min > max`,
 /// whereas the C -- `CURLMIN(CURLMAX(v, uzmin), uzmax)` -- returns `uzmax`
@@ -1661,12 +1431,6 @@ pub(crate) fn sztouz(sznum: isize) -> Option<usize> {
 /// inside `#if SIZEOF_CURL_OFF_T > SIZEOF_SIZE_T`; [`usize::try_from`] covers
 /// both without a conditional, so this is faithful there and correct
 /// elsewhere.
-///
-/// Kept distinct from [`sztouz`] even though the two bodies coincide on the
-/// mandated targets, because the C keeps them distinct and a call site that
-/// reads `sotouz_fits` is converting an OFFSET while one that reads `sztouz`
-/// is converting the RESULT OF A READ OR WRITE. Collapsing them would erase
-/// that at every call site.
 #[allow(dead_code)]
 pub(crate) fn sotouz_fits(sonum: CurlOffT) -> Option<usize> {
     usize::try_from(sonum).ok()
@@ -1686,16 +1450,7 @@ pub(crate) fn sltouz(slnum: i64) -> Option<usize> {
 
 // `CURLX_FUNCTION_CAST` -- the one item with NO Rust counterpart.
 //
-//     #define CURLX_FUNCTION_CAST(target_type, func) \
-//       (target_type)(void (*)(void))(func)
-//
-// `warnless.h:27-28`, three uses in the C tree. It launders a function
-// pointer through `void (*)(void)` so that a compiler cannot warn about
-// assigning a function of one signature to a pointer of another -- typically
-// a destructor whose real parameter type differs from the `void *` the vtable
-// slot declares.
-//
-// IT IS NOT REPRODUCED, and it must not be. Rust function items are strongly
+// The macro is NOT REPRODUCED, and it must not be. Rust function items are strongly
 // typed, and there is no safe expression of the cast because there is nothing
 // safe about it: the C pattern works only as long as every call goes through
 // the original signature, and nothing checks that. The pattern it enables is
@@ -1703,26 +1458,14 @@ pub(crate) fn sltouz(slnum: i64) -> Option<usize> {
 // `struct Curl_cftype` carries a `void *ctx` that every filter casts to its
 // own type (`lib/cfilters.h:210-226`), `Box<dyn ConnFilter>` carries a typed
 // field and the cast has no place to occur.
-//
-// Anything that appeared to need this macro is a design error at the call
-// site, and the fix belongs there rather than here.
 
 // TESTS
 //
-// `tests/unit/*.c` (59 files) and `tests/libtest/*.c` (235) link a debug
-// static libcurl and call internal `Curl_*` symbols, which a Rust static
-// library does not export. Their coverage therefore relocates into
-// `#[cfg(test)]` modules inside the files under test, and this is this file's
-// share of that relocation.
-//
-// TWO BUILD MODES, TWO SETS OF ASSERTIONS -- because the C behaves differently
-// in each and a single set would be able to check only one of them.
-// `cargo test` builds with `debug_assertions` on, so an out-of-range input
-// reaches a `debug_assert!` and panics; `cargo test --release` builds with it
-// off, so the same input reaches the mask and returns the masked value. The
-// tests below are split accordingly: `#[cfg(debug_assertions)]` proves the
-// contract assertions FIRE, and `#[cfg(not(debug_assertions))]` proves the
-// masked release behaviour matches the C. Everything else runs in both.
+// `tests/unit/*.c` (59 files) and `tests/libtest/*.c` link a debug static
+// libcurl and call internal `Curl_*` symbols, which a Rust static library does
+// not export. Their coverage therefore relocates into `#[cfg(test)]` modules
+// inside the files under test, and this is this file's share of that
+// relocation.
 //
 // Both halves must be run to have checked this file completely:
 //     cargo test -p curl-rs-lib
@@ -1819,35 +1562,12 @@ mod tests {
     /// The result borrows from the argument, as the C returns an interior
     /// pointer, and multi-byte text is never split: both separators are
     /// single-byte ASCII, so the cut is always on a character boundary.
-    ///
-    /// The multi-byte characters are written as `\u{..}` escapes rather than
-    /// literally. `scripts/spacecheck.pl` enumerates `git ls-files` and
-    /// rejects any byte in `[\x80-\xff]` outside the six files listed in its
-    /// `@non_ascii` allow-list; it runs in continuous integration at
-    /// `.github/workflows/hygiene.yml:164-165`. The escapes keep the source
-    /// pure ASCII while the strings under test stay multi-byte, so the
-    /// coverage is identical and the hygiene gate stays green.
     #[test]
     fn basename_borrows_and_respects_character_boundaries() {
         // "directory/na<U+00EF>ve-caf<U+00E9>.txt": spellchecker:disable-line
         // the two accented characters occupy two bytes each in UTF-8, so the
         // tail begins at byte 10 and spans 16 bytes rather than 14
         // characters' worth.
-        //
-        // The marker above and the one on the binding below are the
-        // repository's documented suppression for a false positive, not a
-        // concession that anything here is spelled wrongly. Both spell
-        // checkers split the literal at the `\u{..}` escape and read the
-        // three ASCII letters left in front of it as a truncated English
-        // word. `.github/scripts/typos.toml:19` registers
-        // `.*spellchecker:disable-line` for exactly this case, and
-        // `curl-rs-lib/src/util/parsedate.rs:276` already uses the same
-        // marker for one of its timezone abbreviations. Naming the string
-        // once keeps the suppression to a single line, and spelling the
-        // reason out without repeating either flagged token keeps this
-        // explanation from tripping the gates it describes. The word that
-        // stood between "the" and "gates" was itself one of those gates'
-        // findings, which is why it is no longer here.
         let name = "na\u{ef}ve-caf\u{e9}.txt"; // spellchecker:disable-line
         let path = String::from("directory/") + name;
         let base = basename(&path);
@@ -1955,13 +1675,6 @@ mod tests {
     }
 
     /// The annotation is stripped to a FIXED POINT, not once.
-    ///
-    /// This is the divergence that made the helper shared: the copy in
-    /// `curl-rs/src/output/formparse.rs` stripped a single suffix, so under
-    /// Miri -- where `std` emits two -- it left one behind and a frozen
-    /// diagnostic changed. The doubled form is asserted directly rather than
-    /// waited for, so the contract is checked on every target and not only
-    /// under the tool that produces it.
     #[test]
     fn the_suffix_strip_runs_to_a_fixed_point() {
         assert_eq!(
@@ -2180,12 +1893,6 @@ mod tests {
     }
 
     // --- the contract assertions, debug builds only ------------------------
-    //
-    // Each of these proves that a `debug_assert!` reproducing a C
-    // `DEBUGASSERT` is present and fires. They cannot run in a release
-    // build, where the assertion is compiled out by design and the masked
-    // value is returned instead -- which the release-only block below
-    // checks.
 
     /// `warnless.c:137` -- `DEBUGASSERT(slnum >= 0)`.
     #[test]

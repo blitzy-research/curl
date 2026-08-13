@@ -48,27 +48,26 @@
 //! source of truth and `include/curl/curl.h` is generated from it -- so
 //! the table moves to the crate that owns the enumeration it is keyed by.
 //!
-//! That crate is `curl-rs-ffi`, and `curl-rs-ffi/src/ffi/opts.rs` is the
-//! sole source of truth for the 308 `CURLoption` identifiers, their
-//! backward-compatibility aliases and the `curl_easyoption` metadata
-//! array (AAP 0.1.2). **This module restates none of it: not one option
-//! name, not one option integer, not one metadata row, and not even as a
-//! test fixture.** The reason is worth stating rather than asserting,
-//! because the failure mode is invisible: two populations of option
-//! metadata drift, and the drift shows up only when a consumer asks for an
-//! option by name and is handed the wrong identifier. Nothing crashes and
-//! no test fails until one is written for that exact pair.
+//! That crate is `curl-rs-ffi`, and `curl-rs-ffi/src/ffi/opts.rs` is the sole
+//! source of truth for the 308 `CURLoption` identifiers, their
+//! backward-compatibility aliases and the `curl_easyoption` metadata array.
+//! **This module restates none of it: not one option name, not one option
+//! integer, not one metadata row, and not even as a test fixture.** The reason
+//! is worth stating rather than asserting, because the failure mode is
+//! invisible: two populations of option metadata drift, and the drift shows up
+//! only when a consumer asks for an option by name and is handed the wrong
+//! identifier. Nothing crashes and no test fails until one is written for that
+//! exact pair.
 //!
 //! # How the algorithm reaches the table without a dependency cycle
 //!
 //! The crate graph is `curl-rs-ffi -> curl-rs-lib <- curl-rs` and it is
-//! acyclic (AAP 0.4.2). This crate may never name `curl_rs_ffi`, so it
-//! cannot reach for the table -- the table is **handed in**. Every entry
-//! point here takes `table: &'static [EasyOption]` as its first argument,
-//! and the ABI crate calls in with its own array and turns the returned
-//! reference back into the `const struct curl_easyoption *` a C caller
-//! expects. The direction stays `ffi -> lib`, and exactly one table
-//! exists in the workspace.
+//! acyclic. This crate may never name `curl_rs_ffi`, so it cannot reach for
+//! the table -- the table is **handed in**. Every entry point here takes
+//! `table: &'static [EasyOption]` as its first argument, and the ABI crate
+//! calls in with its own array and turns the returned reference back into the
+//! `const struct curl_easyoption *` a C caller expects. The direction stays
+//! `ffi -> lib`, and exactly one table exists in the workspace.
 //!
 //! `&'static` rather than a borrowed lifetime is deliberate: the C returns
 //! a pointer into an array of static storage duration and a consumer may
@@ -93,60 +92,11 @@
 //! that enumerates options sees that sequence. Nothing here sorts,
 //! filters or re-orders: the slice is consumed as given, and supplying it
 //! in `optiontable.pl`'s order is the ABI crate's obligation.
-//!
-//! # What is deliberately absent
-//!
-//! `lib/easygetopt.c:78-97` provides three always-`NULL` stubs under
-//! `#ifdef CURL_DISABLE_GETOPTIONS`. That macro has no counterpart in
-//! this workspace -- the Cargo feature vocabulary is the fifteen names
-//! listed in the crate root and none of them disables introspection -- so
-//! only the always-available path exists and no feature gates this module.
 
 use std::ffi::CStr;
 
 /// The type of value an option takes, as reported through the
 /// introspection API.
-///
-/// Supersedes `curl_easytype` (`include/curl/options.h:31-41`). The C
-/// declares nine members and gives none of them a value, so they are the
-/// declaration ordinals 0 through 8. **Every discriminant is written out
-/// below rather than inferred** (AAP 0.6.1): a member inserted in the
-/// middle of the C enumeration would silently renumber its successors,
-/// and a C program compiled against curl 8.19.0-DEV holds the *numbers*
-/// in its instruction stream.
-///
-/// `#[repr(i32)]` rather than `#[repr(C)]`, for the same reason the crate
-/// root keeps `c_int` out of the engine: the width is fixed by curl's ABI,
-/// not by whichever C compiler happens to build a consumer, so `i32`
-/// records the contract while `C` would record a platform. The two
-/// coincide on all four targets of AAP 0.8.3. The `#[repr(C)]`
-/// declaration that cbindgen emits into the generated `options.h` lives
-/// with the rest of the C surface, in `curl-rs-ffi/src/ffi/opts.rs`.
-///
-/// # This is *not* recoverable from the option's integer
-///
-/// It is tempting to derive the type from `id / 10000`, and it does not
-/// work. `include/curl/curl.h:1111-1115` defines five arithmetic bases --
-/// `CURLOPTTYPE_LONG` 0, `CURLOPTTYPE_OBJECTPOINT` 10000,
-/// `CURLOPTTYPE_FUNCTIONPOINT` 20000, `CURLOPTTYPE_OFF_T` 30000 and
-/// `CURLOPTTYPE_BLOB` 40000 -- and then `:1127-1136` makes
-/// `CURLOPTTYPE_STRINGPOINT`, `CURLOPTTYPE_SLISTPOINT` and
-/// `CURLOPTTYPE_CBPOINT` all aliases of `OBJECTPOINT`, and
-/// `CURLOPTTYPE_VALUES` an alias of `LONG`. Five bases therefore carry
-/// nine types: `Object`, `String`, `Slist` and `Cbptr` share base 10000,
-/// and `Long` shares base 0 with `Values`.
-///
-/// The header says so itself at `include/curl/options.h:49-50` -- the
-/// ranges "can still be used to figure out what type/size to use for
-/// `curl_easy_setopt()`", which makes them a size *hint* and not the
-/// classification -- and `lib/setopt.c:2917-2919` says it again from the
-/// other side: "unfortunately, different pointer types cannot be
-/// identified any other way than being listed explicitly". That is why a
-/// per-row table exists at all.
-///
-/// **So this value comes from the metadata table and from nowhere else.**
-/// [`OptionId::type_base`] is offered for the size question the header
-/// describes, and it must never be used to answer the type question.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EasyType {
@@ -206,10 +156,6 @@ impl EasyType {
     /// The member with this integer, or `None` for a value the
     /// enumeration does not define.
     ///
-    /// Recovered by comparison rather than by transmutation, so a value
-    /// arriving from C that is not a member yields `None` instead of an
-    /// invalid enumeration.
-    ///
     /// # Examples
     ///
     /// ```
@@ -237,12 +183,6 @@ impl EasyType {
 
 /// The one flag bit `struct curl_easyoption::flags` can carry.
 ///
-/// `include/curl/options.h:47` defines it as `(1 << 0)`, under a comment
-/// that explains what a flagged row is for: an "alias" exists so that
-/// "old programs remain functional, we prefer another name". There is no
-/// second bit -- the header's "Flag bits" section defines exactly this one
-/// -- so no other bit is invented here.
-///
 /// Exposed as a bare integer as well as through [`OptionFlags`] because
 /// the ABI crate has to place the same value into a C `unsigned int`, and
 /// a consumer testing `opt->flags & CURLOT_FLAG_ALIAS` is doing arithmetic
@@ -269,9 +209,6 @@ impl OptionFlags {
 
     /// Whether this row is an alias.
     ///
-    /// The predicate `lib/easygetopt.c:43` applies -- and it is the reason
-    /// [`by_id`] can never return an alias row.
-    ///
     /// # Examples
     ///
     /// ```
@@ -294,21 +231,13 @@ impl OptionFlags {
 /// One of the five arithmetic bases a `CURLOPT_*` identifier is composed
 /// from.
 ///
-/// `include/curl/curl.h:1120` composes every identifier as
-/// `#define CURLOPT(na, t, nu) na = ((t) + (nu))`, where `t` is one of the
-/// five bases of `:1111-1115` and `nu` is an ordinal well below 10000.
-/// The composition looks like a historical curiosity and is in fact what
-/// makes the ABI's variadic setters type-safe (AAP 0.6.2): the identifier
-/// alone tells the callee which of `long`, pointer, function pointer,
-/// `curl_off_t` or blob pointer occupies the argument slot, *before*
-/// anything reads that slot.
-///
-/// The discriminants **are** the base values, so [`Self::base`] is the
-/// identity and the two can never disagree.
-///
-/// Do not read this as the value's `EasyType`: three of the nine types
-/// share `ObjectPoint` and two share `Long`, as [`EasyType`] explains at
-/// length.
+/// `include/curl/curl.h:1120` composes every identifier as `#define
+/// CURLOPT(na, t, nu) na = ((t) + (nu))`, where `t` is one of the five bases
+/// of `:1111-1115` and `nu` is an ordinal well below 10000. The composition
+/// looks like a historical curiosity and is in fact what makes the ABI's
+/// variadic setters type-safe: the identifier alone tells the callee which of
+/// `long`, pointer, function pointer, `curl_off_t` or blob pointer occupies
+/// the argument slot, *before* anything reads that slot.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum OptionTypeBase {
@@ -365,32 +294,12 @@ impl OptionTypeBase {
 /// this crate cannot name it. A transparent newtype over `i32` carries
 /// the same information -- the composed integer *is* the identity -- while
 /// keeping the single source of truth on the other side of the boundary.
-///
-/// It is also the sound choice at the C boundary in its own right. A C
-/// caller may legally pass any `int` to `curl_easy_option_by_id`, and
-/// materialising a non-member in a `#[repr(C)]` Rust enumeration would be
-/// undefined; comparing integers is defined for every input.
-///
-/// `#[repr(transparent)]` so it is laid out exactly as the `CURLoption` of
-/// `include/curl/options.h:53`.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OptionId(pub i32);
 
 impl OptionId {
     /// The absent identifier.
-    ///
-    /// `lib/easygetopt.c:33-35` guards the whole search with
-    /// `DEBUGASSERT(name || id)` and `if(name || id)`, so the C treats a
-    /// **zero** id as "no id supplied" -- and that costs it nothing,
-    /// because option numbering starts at 1 and no row can carry zero.
-    /// [`lookup`] reproduces the guard against this constant.
-    ///
-    /// It is also what [`by_name`] passes for the ignored id argument. The
-    /// C passes `CURLOPT_LASTENTRY` there (`lib/easygetopt.c:56`), purely
-    /// as a non-zero filler that the name branch never reads; passing
-    /// zero instead is behaviourally identical whenever a name is present,
-    /// and it keeps this crate free of every option integer.
     pub const UNSET: Self = Self(0);
 
     /// The identifier as the `int` that crosses the C boundary.
@@ -400,16 +309,6 @@ impl OptionId {
     }
 
     /// The `CURLOPTTYPE_*` base this identifier was composed from.
-    ///
-    /// Truncation toward the base, so `10001` and `19999` both give
-    /// `10000`. Written as a subtraction of the remainder rather than as
-    /// `id / 10000 * 10000` because the two are equal for every `i32` --
-    /// Rust's `/` and `%` both truncate toward zero -- and the subtraction
-    /// makes the pairing with [`Self::type_ordinal`] obvious.
-    ///
-    /// This answers the *size* question the header describes at
-    /// `include/curl/options.h:49-50`. It does not answer the type
-    /// question; see [`EasyType`].
     ///
     /// # Examples
     ///
@@ -443,16 +342,6 @@ impl OptionId {
     /// Which of the five bands this identifier falls in, or `None` when it
     /// falls in none of them.
     ///
-    /// `None` is the honest answer for an identifier outside the composed
-    /// range -- a negative value, or one at or above 50000 -- and such
-    /// values do reach the ABI: a C caller may pass any `int`.
-    ///
-    /// The negative case needs its own guard and does not fall out of the
-    /// arithmetic, which is worth recording because it is easy to miss:
-    /// [`Self::type_ordinal`] truncates toward zero, so `OptionId(-1)` has
-    /// ordinal `-1` and therefore [`Self::type_base`] `0`. Matching on the
-    /// base alone would report `Long` for it.
-    ///
     /// # Examples
     ///
     /// ```
@@ -483,37 +372,18 @@ impl OptionId {
 
 /// One row of the option metadata table.
 ///
-/// The safe, engine-side view of `struct curl_easyoption`
-/// (`include/curl/options.h:51-56`), whose four fields appear below **in
-/// the header's order** -- name, id, type, flags -- so that projecting a
-/// row into the C struct is a field-for-field copy with no re-ordering to
-/// get wrong. No field is added and the type is not `#[non_exhaustive]`,
-/// because a consumer of the C struct reads all four by offset.
-///
 /// # This is not the C ABI struct, and saying otherwise would be false
 ///
 /// The C-ABI-exact declaration is `curl_easyoption` in
-/// `curl-rs-ffi/src/ffi/types.rs`, whose `name` is a `*const c_char`.
-/// `name` here is an `Option<&'static CStr>`, which is a *wide* pointer:
-/// measured, this struct is 32 bytes where the C struct is 24. The
-/// difference is the point rather than an oversight. This crate carries
-/// `#![deny(unsafe_code)]` with a single exemption for its `ffi` module,
-/// so a raw `const char *` here would be a field nothing in this crate
-/// could read; `Option<&CStr>` is readable, guarantees the terminator, and
-/// keeps the NULL sentinel representable -- which a plain `&CStr` would
-/// not. Turning a row into a pointer, and a pointer back into a row, is
-/// the ABI crate's job and is done exactly where `unsafe` is permitted.
-///
-/// `#[repr(C)]` is kept for the field order it fixes, not as a claim of C
-/// compatibility.
-///
-/// # The sentinel
-///
-/// `name: None` is C's `{ NULL, ... }` terminator. `lib/easygetopt.c:48`
-/// stops the search on it and `:70` stops the walk on it, so the row is
-/// never *examined* -- its `id`, `type` and `flags` are unreachable
-/// through this API, and the C fills them with `CURLOPT_LASTENTRY`,
-/// `CURLOT_LONG` and `0` only because an initialiser needs something.
+/// `curl-rs-ffi/src/ffi/types.rs`, whose `name` is a `*const c_char`. `name`
+/// here is an `Option<&'static CStr>`, which is a *wide* pointer: measured,
+/// this struct is 32 bytes where the C struct is 24. This crate carries
+/// `#![deny(unsafe_code)]` with a single exemption for its `ffi` module, so a
+/// raw `const char *` here would be a field nothing in this crate could read;
+/// `Option<&CStr>` is readable, guarantees the terminator, and keeps the NULL
+/// sentinel representable -- which a plain `&CStr` would not. Turning a row
+/// into a pointer, and a pointer back into a row, is the ABI crate's job and
+/// is done exactly where `unsafe` is permitted.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EasyOption {
@@ -574,11 +444,6 @@ impl EasyOption {
 
     /// The name as UTF-8, or `None` for the sentinel or for a name that is
     /// not valid UTF-8.
-    ///
-    /// Every real option name is ASCII, so the second case does not arise
-    /// for the workspace's table; it is still reported rather than
-    /// asserted away, because this module does not own the table and
-    /// cannot promise anything about a caller's rows.
     #[must_use]
     pub fn name_str(&self) -> Option<&'static str> {
         std::str::from_utf8(self.name_bytes()?).ok()
@@ -597,17 +462,6 @@ impl EasyOption {
 ///   return (CURLOPT_LASTENTRY % 10000) != (328 + 1);
 /// }
 /// ```
-///
-/// 328 is the ordinal of the last option `optiontable.pl` saw --
-/// `CURLOPT(CURLOPT_SSL_SIGNATURE_ALGORITHMS, CURLOPTTYPE_STRINGPOINT,
-/// 328)` at `include/curl/curl.h:2259` -- so the successor is the bound
-/// that follows it, `CURLOPT_LASTENTRY` at `:2261`.
-///
-/// This is a **tripwire**, not option identity: it is one number that says
-/// "the enumeration and the table were regenerated together", and it is
-/// deliberately the only option-adjacent integer in this file. The
-/// identifiers themselves, all 308 of them, stay in
-/// `curl-rs-ffi/src/ffi/opts.rs`.
 pub const EASYOPTS_LASTENTRY_ORDINAL: i32 = 328 + 1;
 
 /// Whether the option enumeration and the metadata table were regenerated
@@ -629,9 +483,6 @@ pub const EASYOPTS_LASTENTRY_ORDINAL: i32 = 328 + 1;
 ///   at all -- and `curl-rs-ffi/src/ffi/opts.rs` already pins the concrete
 ///   value that way. This function is the algorithm those assertions run.
 ///
-/// The identifier is passed in for the same reason the table is: it lives
-/// in `curl-rs-ffi`, and this crate must not name that crate.
-///
 /// # Examples
 ///
 /// ```
@@ -650,15 +501,6 @@ pub const fn easyopts_in_sync(last_entry: OptionId) -> bool {
 }
 
 /// The rows a search may examine: everything before the first sentinel.
-///
-/// This is the exact reach of C's loop. `lib/easygetopt.c:37-48` is a
-/// `do { ... o++; } while(o->name);`, so it examines element 0
-/// unconditionally, then advances while the row it has *moved to* still
-/// has a name. The sentinel therefore ends the loop without ever entering
-/// the body, and any row placed after it is unreachable.
-///
-/// Stopping at the end of the slice as well is what lets a caller pass a
-/// table with no sentinel at all and get identical answers.
 fn rows(
     table: &'static [EasyOption],
 ) -> impl Iterator<Item = &'static EasyOption> {
@@ -666,23 +508,6 @@ fn rows(
 }
 
 /// The name search, over raw bytes.
-///
-/// The comparison is ASCII case-insensitive, because C compares with
-/// `curl_strequal` (`lib/easygetopt.c:39`). It delegates to
-/// [`crate::util::strcase::casecompare`], the single case-folding
-/// authority in this crate: the exported `curl_strequal` is that same
-/// function plus a rule for two NULL pointers, and that rule cannot arise
-/// here because [`rows`] stops *at* the sentinel instead of comparing
-/// against it, so the only NULL name in the table is never an operand.
-///
-/// Alias rows are included. C's name branch tests nothing but the name, so
-/// asking for a retired spelling returns the retired spelling's own row --
-/// carrying the preferred id and the alias flag -- and not the preferred
-/// row. That is observable and is therefore preserved.
-///
-/// Names are matched whole and untrimmed: the table stores them with the
-/// `CURLOPT_` prefix already stripped, so a fully qualified spelling, a
-/// name with surrounding space, and the empty string all miss.
 fn search_by_name(
     table: &'static [EasyOption],
     wanted: &[u8],
@@ -754,18 +579,6 @@ pub fn lookup(
 
 /// Looks an option up by name, case-insensitively.
 ///
-/// Supersedes `curl_easy_option_by_name` (`lib/easygetopt.c:53-57`), which
-/// is `lookup(name, CURLOPT_LASTENTRY)` -- and whose own comment says
-/// "when name is used, the id argument is ignored". [`OptionId::UNSET`] is
-/// passed here instead of that filler, which is behaviourally identical
-/// because the name branch never reads the id, and which keeps this crate
-/// free of option integers.
-///
-/// Alias rows match, so a retired spelling resolves to its own row. The
-/// returned row's `id` is the **preferred** option either way, which is
-/// what makes an alias useful: a caller that looks up the old name still
-/// gets the identifier it should pass to `curl_easy_setopt`.
-///
 /// # The NULL-name case belongs to the caller
 ///
 /// C accepts a NULL `name` and answers NULL, by a longer route: `lookup`
@@ -784,19 +597,6 @@ pub fn by_name(
 }
 
 /// [`by_name`] for a caller that holds a Rust string.
-///
-/// The same search over the same bytes and the same case-folding
-/// authority, so the two cannot disagree: for any `&str` that a C caller
-/// could have supplied, this and [`by_name`] return the same row. It
-/// exists so that the command-line crate and the engine's own option
-/// dispatch never have to allocate a `CString` -- or, worse, hand-roll a
-/// second case-insensitive comparison -- to ask a question this module
-/// already answers.
-///
-/// A `&str` can hold an interior NUL where a C string cannot. Such a name
-/// matches nothing, and no special case is needed for it: a stored name
-/// comes from a `CStr`, so it contains no NUL, so the byte sequences
-/// cannot be equal.
 ///
 /// # Examples
 ///
@@ -853,22 +653,6 @@ pub fn by_name_str(
 ///   preferred one, whichever comes first in the table.
 /// * [`OptionId::UNSET`] finds nothing, because C's `if(name || id)`
 ///   rejects a NULL name with a zero id before searching.
-///
-/// An identifier with no matching preferred row yields `None`, including
-/// the table's own `CURLOPT_LASTENTRY` bound: the sentinel carries it, and
-/// the sentinel is never examined.
-///
-/// # Why the zero guard is hoisted out of [`lookup`]
-///
-/// C's `by_id` is literally `lookup(NULL, id)`, so a zero id reaches
-/// `DEBUGASSERT(name || id)` and *aborts a debug build* -- while a release
-/// build sails past the assertion, fails the same condition as an `if`,
-/// and returns NULL. The release answer is the shipped library's
-/// behaviour, so it is the answer given here in every build: a
-/// development-only assertion must not turn defined behaviour into a
-/// panic for a caller that did nothing undefined. [`lookup`] keeps the
-/// assertion, because there the precondition is its own documented
-/// contract rather than a value a C consumer chose.
 #[must_use]
 pub fn by_id(
     table: &'static [EasyOption],
@@ -892,21 +676,6 @@ pub fn by_id(
 /// * The sentinel yields `None`, matching C's `prev && prev->name` test
 ///   failing on a NULL name.
 /// * A row that is not an element of `table` yields `None`. See below.
-///
-/// Iteration order is the table's own order, which is
-/// `lib/optiontable.pl`'s: alphabetical by the stripped name. Nothing here
-/// re-orders it.
-///
-/// # Identity is by address, and a foreign row is rejected
-///
-/// C reaches the next row with `prev++`, which is defined only while
-/// `prev` points into `Curl_easyopts[]`; for anything else it reads memory
-/// it does not own. This resolves `prev` to its index by comparing
-/// addresses -- never by comparing *contents*, which would be wrong for a
-/// table holding two equal rows -- and answers `None` when it is not an
-/// element. Every row a consumer can obtain comes from this table, so no
-/// defined input behaves differently; an undefined one gets `None` instead
-/// of a wild read.
 ///
 /// # One deliberate hardening for a table that cannot exist
 ///
@@ -971,9 +740,6 @@ pub fn next(
 ///   that is not an alias. Every alias names a preferred option, so the
 ///   preferred row exists; verified against `lib/easyoptions.c`, whose 13
 ///   flagged rows all point at an unflagged one.
-///
-/// A trailing sentinel is not required, and rows placed after one are not
-/// examined -- they are unreachable through the API, exactly as in C.
 #[must_use]
 pub fn first_inconsistent_row(
     table: &'static [EasyOption],
@@ -1040,15 +806,6 @@ mod tests {
     use std::ffi::CStr;
 
     // EVERY ROW BELOW IS SYNTHETIC.
-    //
-    // Not one real option name or real option integer appears in this
-    // module, and that is a hard constraint rather than a stylistic one: a
-    // fixture that mirrored the authority table would BE the second table
-    // this design exists to prevent, and it would drift from the authority
-    // in exactly the silent way AAP 0.1.2 describes. The names are
-    // invented, and the identifiers are one arbitrary ordinal, 4321,
-    // shifted into four of the five bands so that band decoding is
-    // exercised without resembling anything in `lib/easyoptions.c`.
 
     /// A NUL-terminated name, checked at compile time.
     const fn name(bytes: &'static [u8]) -> &'static CStr {
@@ -1156,9 +913,7 @@ mod tests {
         visited
     }
 
-    // -----------------------------------------------------------------
     // The public vocabulary: pinned integers.
-    // -----------------------------------------------------------------
 
     #[test]
     fn easy_type_members_are_the_measured_ordinals() {
@@ -1325,9 +1080,7 @@ mod tests {
         assert_eq!(OptionId::UNSET.as_i32(), 0);
     }
 
-    // -----------------------------------------------------------------
     // The tripwire from lib/easyoptions.c.
-    // -----------------------------------------------------------------
 
     #[test]
     fn the_lastentry_tripwire_is_the_c_expression() {
@@ -1359,9 +1112,7 @@ mod tests {
         assert!(!easyopts_in_sync(OptionId::UNSET));
     }
 
-    // -----------------------------------------------------------------
     // The anti-duplication check: the algorithm and the table agree.
-    // -----------------------------------------------------------------
 
     #[test]
     fn the_three_entry_points_agree_about_every_row() {
@@ -1421,9 +1172,7 @@ mod tests {
         assert_eq!(defect.name, Some(OLD_BETA));
     }
 
-    // -----------------------------------------------------------------
     // by_name: lib/easygetopt.c:38-41 and :53-57.
-    // -----------------------------------------------------------------
 
     #[test]
     fn by_name_is_case_insensitive() {
@@ -1496,9 +1245,7 @@ mod tests {
         assert!(by_name_str(&TABLE, "IN_NO_TABLE_AT_ALL").is_none());
     }
 
-    // -----------------------------------------------------------------
     // by_id: lib/easygetopt.c:42-46 and :59-62.
-    // -----------------------------------------------------------------
 
     #[test]
     fn by_id_never_returns_an_alias() {
@@ -1541,9 +1288,7 @@ mod tests {
         assert!(by_id(&SENTINEL_ONLY, OptionId::UNSET).is_none());
     }
 
-    // -----------------------------------------------------------------
     // lookup: the two branches, and the ignored argument.
-    // -----------------------------------------------------------------
 
     #[test]
     fn lookup_ignores_the_identifier_when_a_name_is_given() {
@@ -1583,9 +1328,7 @@ mod tests {
         let _ = lookup(&TABLE, None, OptionId::UNSET);
     }
 
-    // -----------------------------------------------------------------
     // next: lib/easygetopt.c:65-76.
-    // -----------------------------------------------------------------
 
     #[test]
     fn next_from_nothing_yields_the_first_row() {
@@ -1651,9 +1394,7 @@ mod tests {
         assert!(next(&AFTER_SENTINEL, Some(&AFTER_SENTINEL[2])).is_none());
     }
 
-    // -----------------------------------------------------------------
     // Degenerate tables: no panic, no out-of-bounds index.
-    // -----------------------------------------------------------------
 
     #[test]
     fn a_sentinel_only_table_answers_nothing_everywhere() {
@@ -1675,9 +1416,7 @@ mod tests {
         assert!(walk(&EMPTY).is_empty());
     }
 
-    // -----------------------------------------------------------------
     // The row view type.
-    // -----------------------------------------------------------------
 
     #[test]
     fn the_row_predicates_partition_the_table() {

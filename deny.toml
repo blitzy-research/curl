@@ -217,16 +217,51 @@ unmaintained = "all"
 # zero CRITICAL advisories" - is satisfied by the graph itself and not by this
 # list.
 #
-# Their reachability needs stating precisely, because "behind a feature" reads
-# as "not shipped" and here it is the opposite. Each of the four sits behind
-# either `http3` or `ssh`, and AAP section 0.5.2 puts BOTH of those in the
-# default feature set. So every default build carries all four, and the only
-# configuration that escapes them is one that explicitly switches off two
-# mandated protocols - which is a diagnostic measurement, not a shippable
-# posture. That measurement is taken and asserted: rust-audit.yml proves the
-# graph without `ssh` and `http3` is advisory-free, which is what localises
-# every entry to an optional protocol surface without pretending the default
-# artifact is clean.
+# THEIR REACHABILITY, IN THREE LEVELS THAT MUST NOT BE CONFLATED. "Reachable"
+# on its own is the word that makes a risk register wrong in both directions:
+# "behind a feature" reads as "not shipped", and "in the default graph" reads as
+# "callable". Neither is the whole answer. Measured on this checkout, and this
+# is the canonical statement for all four entries below - the manifests point
+# here rather than repeating it:
+#
+#   LEVEL 1 - PRESENT IN THE DEPENDENCY GRAPH. **Yes, all four.** Each sits
+#   behind either `http3` or `ssh`, and AAP section 0.5.2 puts BOTH in the
+#   default feature set, so every default resolution carries all four. This is
+#   the only level `cargo audit` and `cargo deny` can see, because both read
+#   Cargo.lock and a lockfile is the union of every optional dependency
+#   regardless of features. It is why an unfiltered `cargo audit` exits 1 with
+#   exactly these four identifiers. The one configuration that escapes level 1
+#   is a build with both protocols switched off, which is a diagnostic
+#   measurement rather than a shippable posture - rust-audit.yml takes it and
+#   asserts it, which localises the exposure without pretending the default
+#   resolution is clean.
+#
+#   LEVEL 2 - COMPILED AND OFFERED TO THE LINKER. **Yes, all four.**
+#   `cargo build --release --verbose` shows librussh, librussh_cryptovec,
+#   librsa, libquinn and libquinn_proto among the rlibs on the link line, and
+#   rustc passes each to curl-rs-lib as `--extern`.
+#
+#   LEVEL 3 - PRESENT IN A SHIPPED ARTIFACT, AND CALLABLE. **No, none of the
+#   four, at this checkpoint.** No Rust source in this workspace contains a
+#   single reference to russh, quinn or rsa, so dead-strip removes every
+#   object. Measured: `nm -a target/release/libcurl.so` reports zero symbols
+#   matching russh, quinn or cryptovec, and `strings` reports zero occurrences
+#   of any of those names in libcurl.so or in the curl executable. The control
+#   that makes this a real result rather than a stripping artefact is `rustls`,
+#   which IS used and leaves 13,582 string hits in the same file.
+#
+# WHAT LEVEL 3 DOES AND DOES NOT LICENCE. It is not a mitigation and it is not
+# a reason to relax anything. The vulnerable code cannot execute only because
+# `protocols/sftp.rs`, `protocols/scp.rs` and `protocols/http3.rs` do not
+# exist, so nothing ever opens an SSH session or a QUIC connection. Level 3
+# becomes "yes" with the first `use russh`, and the remote CryptoVec path of
+# RUSTSEC-2026-0153 becomes genuinely reachable for sftp:// and scp:// the same
+# day. So the acceptances stay, the removal conditions on each entry stand, and
+# rust-audit.yml asserts level 3 mechanically: landing a protocol executor
+# while its advisory is still accepted FAILS the build instead of shipping
+# quietly. That assertion is the executable form of the release obligation -
+# these paths are not to be released until an advisory-free compatible
+# dependency strategy exists.
 #
 # A fifth and sixth entry were carried here at one point, for RUSTSEC-2026-0118
 # and RUSTSEC-2026-0119 against hickory-proto 0.25.2, and both have been REMOVED
@@ -409,16 +444,28 @@ ignore = [
   # without `ssh` and `http3` is advisory-free, which localises every entry
   # here to an optional protocol surface.
   #
-  # Remove this entry the moment the MSRV floor is raised to 1.85 or above:
-  # `cargo update -p quinn-proto --precise 0.11.16` then delete the line.
+  # THE UPGRADE WAS TAKEN AND MEASURED END TO END, not reasoned about:
+  # `cargo update -p quinn-proto --precise 0.11.15` RESOLVES, and it does remove
+  # this advisory - `cargo audit` drops from four findings to three. It is the
+  # floor that refuses it, and refuses it as a hard error rather than a warning:
+  #
+  #   error: package `quinn-proto v0.11.15` cannot be built because it requires
+  #   rustc 1.85 or newer, while the currently active rustc version is 1.75.0
+  #
+  # `--precise 0.11.16` is worse still, cascading rand_core 0.9.5 -> 0.10.1 and
+  # adding rand_pcg 0.10.2. So the fix is real, the blocker is real, and the two
+  # cannot both be had at this floor.
   #
   # Remove this entry the moment the MSRV floor is raised to 1.85 or above:
   # `cargo update -p quinn-proto --precise 0.11.16`, then delete the line.
   # Removal is mechanical and it is CHECKED: rust-audit.yml fails if this entry
   # is still present once the workspace's rust-version reaches 1.85, and fails
   # if cargo-audit stops reporting the advisory while the entry remains, so CI
-  # will insist on the deletion rather than trusting anyone to remember it.
-  { id = "RUSTSEC-2026-0185", reason = "quinn-proto 0.11.14, CVSS 7.5 HIGH remote-OOM DoS behind the http3 feature. Upgrade attempted and measured: quinn-proto >= 0.11.15 declares rust-version 1.85 (0.11.14 declares 1.74.1) and cascades to seven crates above the floor, six of them edition 2024, including rand 0.10.2 which the dependency selection pins at 0.8.7 for russh's rand ^0.8. The mandated MSRV of 1.75 is measured as currently SATISFIED on all four targets with and without the implementable feature set, so taking the fix would manufacture a compliance break rather than resolve one. http3 is mandated default-on, so dropping the feature is not available either, and quinn 0.11.9 is itself the newest quinn satisfying the floor. Not silently accepted: rust-audit.yml re-scans with ignores disabled and asserts this exact four-ID set, and fails once rust-version reaches 1.85. Remove as soon as the MSRV floor reaches 1.85." },
+  # will insist on the deletion rather than trusting anyone to remember it. That
+  # trigger is exercised, not assumed: with the floor temporarily set to 1.85
+  # the step prints `EXPIRED: rust-version is 1.85, so the fix for
+  # RUSTSEC-2026-0185 is now admissible` and exits 1.
+  { id = "RUSTSEC-2026-0185", reason = "quinn-proto 0.11.14, CVSS 7.5 HIGH remote-OOM DoS behind the http3 feature. At LEVEL 1 and LEVEL 2 today and not at LEVEL 3 - measured, zero quinn symbols and zero quinn strings in either shipped artifact, because protocols/http3.rs is absent and nothing calls it; that expires with the first `use quinn`. Upgrade attempted and measured: quinn-proto >= 0.11.15 declares rust-version 1.85 (0.11.14 declares 1.74.1) and cascades to seven crates above the floor, six of them edition 2024, including rand 0.10.2 which the dependency selection pins at 0.8.7 for russh's rand ^0.8. The mandated MSRV of 1.75 is measured as currently SATISFIED on all four targets with and without the implementable feature set, so taking the fix would manufacture a compliance break rather than resolve one. http3 is mandated default-on, so dropping the feature is not available either, and quinn 0.11.9 is itself the newest quinn satisfying the floor. Not silently accepted: rust-audit.yml re-scans with ignores disabled and asserts this exact four-ID set, and fails once rust-version reaches 1.85. Remove as soon as the MSRV floor reaches 1.85." },
 
   # RUSTSEC-2023-0071 - rsa 0.9.10
   #   Accepted   2026-07-31
@@ -451,7 +498,7 @@ ignore = [
   #
   # Remove this entry when rsa 0.10 ships as a stable release and russh depends
   # on it from a stable release of its own.
-  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10, CVSS 5.9 MEDIUM Marvin-Attack timing side channel behind the ssh feature. RustSec records no safe upgrade for the whole 0.9 line; the fix exists only in rsa 0.10.0-rc.x, the release-candidate cryptography the dependency selection deliberately rejected. curl's SSH client role is not an RSA decryption oracle. Remove when rsa 0.10 is stable and russh depends on it from a stable release." },
+  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10, CVSS 5.9 MEDIUM Marvin-Attack timing side channel behind the ssh feature. At LEVEL 1 and LEVEL 2 today and not at LEVEL 3, measured the same way as the two russh entries. RustSec records no safe upgrade for the whole 0.9 line; the fix exists only in rsa 0.10.0-rc.x, the release-candidate cryptography the dependency selection deliberately rejected. curl's SSH client role is not an RSA decryption oracle. Remove when rsa 0.10 is stable and russh depends on it from a stable release." },
 
   # RUSTSEC-2026-0154 - russh 0.54.5
   #   Accepted   2026-07-31
@@ -517,7 +564,7 @@ ignore = [
   #
   # Remove this entry when a russh release exists that carries the fix AND has
   # a fully stable dependency graph AND satisfies the workspace MSRV.
-  { id = "RUSTSEC-2026-0154", reason = "russh 0.54.5, CVSS 7.5 HIGH availability-only DoS behind the ssh feature: the SSH AGENT client and server accepted peer-controlled agent frame lengths with no maximum, so the untrusted peer is the local agent socket rather than the remote SSH server, and this workspace uses neither agent role. Shares GHSA-g9f8-wqj9-fjw5 with RUSTSEC-2026-0153, which is the half that carries a remote path. The fix requires russh >= 0.60.3, blocked twice over and independently: (1) russh 0.60.3 carries 17 pre-release version requirements covering the whole SSH crypto stack (rsa 0.10.0-rc.16, ed25519-dalek 3.0.0-pre.6, ml-kem 0.3.0-rc.1, pkcs1 0.8.0-rc.4 and 13 more), and no release in the 0.58.0-0.62.4 band is free of them; (2) russh 0.60.3 declares rust-version 1.85 against a measured, currently-satisfied floor of 1.75. Remove when a russh release carries the fix with a fully stable graph AND satisfies the MSRV." },
+  { id = "RUSTSEC-2026-0154", reason = "russh 0.54.5, CVSS 7.5 HIGH availability-only DoS behind the ssh feature: the SSH AGENT client and server accepted peer-controlled agent frame lengths with no maximum, so the untrusted peer is the local agent socket rather than the remote SSH server, and this workspace uses neither agent role - which is the one acceptance here whose reachability argument survives the arrival of an SSH executor, since the agent roles are not used by design rather than by absence. It is at LEVEL 1 and LEVEL 2 and not at LEVEL 3 today, like all four. Shares GHSA-g9f8-wqj9-fjw5 with RUSTSEC-2026-0153, which is the half that carries a remote path. The fix requires russh >= 0.60.3, blocked twice over and independently: (1) russh 0.60.3 carries 17 pre-release version requirements covering the whole SSH crypto stack (rsa 0.10.0-rc.16, ed25519-dalek 3.0.0-pre.6, ml-kem 0.3.0-rc.1, pkcs1 0.8.0-rc.4 and 13 more), and no release in the 0.58.0-0.62.4 band is free of them; (2) russh 0.60.3 declares rust-version 1.85 against a measured, currently-satisfied floor of 1.75. Remove when a russh release carries the fix with a fully stable graph AND satisfies the MSRV." },
 
   # RUSTSEC-2026-0153 - russh-cryptovec 0.52.0
   #   Accepted   2026-07-31
@@ -556,7 +603,7 @@ ignore = [
   # two entries are one decision, exactly as stated above.
   #
   # Remove this entry together with RUSTSEC-2026-0154.
-  { id = "RUSTSEC-2026-0153", reason = "russh-cryptovec 0.52.0, CVSS 7.5 HIGH availability-only DoS behind the ssh feature; the half of GHSA-g9f8-wqj9-fjw5 that carries a REMOTE path. Before russh 0.58.0 CryptoVec also backed the transport and compression buffers, so remote SSH traffic can drive unchecked growth through packet reads and zlib decompression output; russh is pinned at 0.54.5 with flate2 enabled, so that path is reachable and a hostile server can abort the process under memory pressure. Limited to sftp:// and scp://. russh 0.54.5 requires this exact version, so it cannot be resolved independently of RUSTSEC-2026-0154. Remove both entries together." },
+  { id = "RUSTSEC-2026-0153", reason = "russh-cryptovec 0.52.0, CVSS 7.5 HIGH availability-only DoS behind the ssh feature; the half of GHSA-g9f8-wqj9-fjw5 that carries a REMOTE path. Before russh 0.58.0 CryptoVec also backed the transport and compression buffers, so remote SSH traffic can drive unchecked growth through packet reads and zlib decompression output, letting a hostile server abort the process under memory pressure; russh is pinned at 0.54.5 with flate2 enabled, so this workspace WILL be on that code path once it opens an SSH session, and the blast radius is sftp:// and scp://. It is at LEVEL 1 and LEVEL 2 today and NOT at LEVEL 3 - measured, zero russh symbols and zero russh strings in either shipped artifact, because no source calls it while protocols/sftp.rs and protocols/scp.rs are absent. That is a property of this checkpoint, not a mitigation, and it expires with the first `use russh`. russh 0.54.5 requires this exact version, so it cannot be resolved independently of RUSTSEC-2026-0154. Remove both entries together." },
 ]
 
 # [licenses] - what we may redistribute

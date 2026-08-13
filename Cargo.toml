@@ -305,6 +305,55 @@ publish = false
 #
 # Do not raise any of these entries without first re-running
 # `cargo +1.75.0 metadata --locked --offline`.
+#
+# ---------------------------------------------------------------------------
+# RECONCILIATION AGAINST THE FROZEN INVENTORY OF AAP 0.5.1
+# ---------------------------------------------------------------------------
+#
+# The inventory is 54 rows: 50 library dependencies and 4 development tools
+# (cargo-llvm-cov, cargo-audit, cargo-deny, cross) that are installed rather
+# than declared. This table declares 48. The arithmetic is stated here, in one
+# place, because a reviewer counting rows finds a shortfall and cannot tell a
+# considered escalation from an omission - and only the first is acceptable.
+#
+# THREE DIVERGENCES, each an EXPLICIT ESCALATION rather than a silent
+# substitution. The one-line reason is below; the full evidence sits beside the
+# pin (or beside the ban in deny.toml) each one refers to.
+#
+#   1. `rustls-pemfile 2.2.0` - NOT DECLARED. The inventory names it for PEM
+#      parsing. RUSTSEC-2025-0134 marks 2.2.0 UNMAINTAINED with no upgrade to
+#      move to, and deny.toml sets `unmaintained = "all"`, so the first real
+#      consumer would fail the supply-chain gate. The capability is met in full
+#      by `rustls_pki_types::pem::PemObject`, which is the same upstream code
+#      2.2.0 wraps and is already pinned below. Full reasoning at the
+#      rustls-pki-types pin.
+#
+#   2. `mime_guess 2.0.5` - NOT DECLARED, and BANNED in deny.toml. The
+#      inventory names it for content-type inference on -F uploads. A
+#      general-purpose MIME database answers where curl 8.x answers
+#      application/octet-stream, which emits Content-Type bytes curl never
+#      emits. AAP 0.8.1's wire freeze and AAP 0.6.7's byte-exact comparison
+#      outrank an inventory row, and AAP 0.5.1 itself sets the precedent when it
+#      rejects a cookie-store crate for the same reason. Replaced by the native
+#      ten-row `ctts[]` table of lib/mime.c:1629-1640 in
+#      curl-rs-lib/src/mime/mod.rs. Full reasoning at the omitted pin below and
+#      in deny.toml's ban entry.
+#
+#   3. `russh 0.54.6` -> `0.54.5`. NOT a preference: 0.54.6 is UNRESOLVABLE.
+#      It adds one non-optional dependency over 0.54.5, `libcrux-ml-kem
+#      ^0.0.3`, and libcrux-ml-kem 0.0.3 is YANKED; a caret on a 0.0.x version
+#      admits nothing else, so there is no candidate. Proved by executing it
+#      rather than by reading the index: a throwaway crate depending on
+#      `russh = "=0.54.6"` fails resolution with `failed to select a version
+#      for the requirement libcrux-ml-kem = "^0.0.3" ... version 0.0.3 is
+#      yanked ... required by package russh v0.54.6`, while the identical probe
+#      at 0.54.5 locks 188 packages and exits 0. 0.54.5 declares the same
+#      rust-version (1.75) and the same requirement set. Full reasoning at the
+#      russh pin.
+#
+# Nothing else differs. Every other one of the 50 rows is declared below at the
+# exact version the inventory names, and `cargo deny check bans` enforces that
+# no second version of any of them enters the graph.
 [workspace.dependencies]
 
 # --- Async runtime and plumbing -------------------------------------------
@@ -468,11 +517,20 @@ tokio-rustls = { version = "=0.26.4", default-features = false, features = ["rin
 #
 # The replacement is not a substitute chosen here but the upstream successor:
 # rustls-pemfile 2.2.0 is itself a thin wrapper over the very rustls-pki-types
-# code pinned above. So the requirement AAP 0.5.1 records is met in full, by a
-# maintained crate, with one dependency instead of two and no advisory
+# code pinned above. So the CAPABILITY AAP 0.5.1 describes is delivered in full,
+# by a maintained crate, with one dependency instead of two and no advisory
 # acceptance -- the same reasoning AAP 0.5.1 applies when it rejects a
 # dependency that would put the audit gate "in permanent jeopardy", and the same
 # shape as the deliberate omission it records for cookie-store crates.
+#
+# THAT IS NOT THE SAME AS SATISFYING THE ROW, and this manifest previously said
+# it was ("the requirement AAP 0.5.1 records is met in full"). The inventory
+# names a PACKAGE, and that package is not here. The row is therefore a BLOCKED
+# gate, declared as such under
+# [workspace.metadata.curl-rs.blocked-aap-gates.rustls-pemfile] together with
+# the cargo-deny output that establishes it, and curl-rs-ffi/build.rs asserts on
+# every build that the declaration still matches the pin above. Nothing in this
+# workspace reports the 0.5.1 inventory as satisfied while that row stands.
 #
 # `cargo tree -i rustls-pemfile` correctly reports nothing. Consumers are to use
 # `rustls_pki_types::pem::PemObject`; the TLS option plumbing that will call it
@@ -492,11 +550,22 @@ rustls-native-certs = "=0.8.4"
 # libcrux-ml-kem ^0.0.3, and libcrux-ml-kem 0.0.3 is YANKED on crates.io. A
 # `^0.0.3` requirement on a 0.0.x version admits nothing but 0.0.3, so there
 # is no unyanked candidate and resolution fails; deny.toml also sets
-# `yanked = "deny"`. 0.54.5 has no libcrux-ml-kem dependency, is not yanked,
-# declares rust-version 1.75, and carries the identical requirement set (aes
-# ^0.8, digest ^0.10, hmac ^0.12, rand ^0.8, sha1 ^0.10.5, sha2 ^0.10.6, des
-# ^0.8.1, rsa ^0.9, tokio ^1.17.0). Moving forward is not available either:
+# `yanked = "deny"`. Measured rather than reasoned: `cargo metadata` with
+# `russh = "=0.54.6"` reports `error: failed to select a version for the
+# requirement libcrux-ml-kem = "^0.0.3" ... version 0.0.3 is yanked`, so cargo
+# itself refuses the graph. 0.54.5 has no libcrux-ml-kem dependency, is not
+# yanked, declares rust-version 1.75, and carries the identical requirement set
+# (aes ^0.8, digest ^0.10, hmac ^0.12, rand ^0.8, sha1 ^0.10.5, sha2 ^0.10.6,
+# des ^0.8.1, rsa ^0.9, tokio ^1.17.0). Moving forward is not available either:
 # russh 0.55.0 needs libcrux-ml-kem ^0.0.4 and raises its MSRV to 1.85.
+#
+# AAP 0.5.1 NAMES 0.54.6, SO THIS ROW IS A BLOCKED GATE AND NOT A CHOICE. It is
+# declared as one under [workspace.metadata.curl-rs.blocked-aap-gates.russh],
+# with the cargo output above as its evidence, and curl-rs-ffi/build.rs asserts
+# on every build that the declaration still matches this pin. The distinction
+# matters because "0.54.5 rather than 0.54.6" reads as a decision this
+# workspace made, and it is not one: no version of this workspace can pin
+# 0.54.6 while any unyanked libcrux-ml-kem 0.0.3 fails to exist.
 #
 # default-features = false is mandatory here for the same reason as for
 # rustls: russh's defaults are ["flate2", "aws-lc-rs", "rsa"], so accepting
@@ -518,41 +587,72 @@ rustls-native-certs = "=0.8.4"
 #                      AGENT client and server accepted peer-controlled
 #                      agent frame lengths with no maximum; the fix enforces
 #                      a 256 KiB cap. The peer here is the local agent, not
-#                      the remote server. This workspace never uses russh's
-#                      agent client or server, so the vulnerable code is not
-#                      reached at all.
+#                      the remote server, and nothing in this workspace uses
+#                      russh's agent client or server - so even once SSH runs,
+#                      this half stays out of reach by design rather than by
+#                      accident.
 #   RUSTSEC-2026-0153  russh-cryptovec 0.52.0, "Unchecked CryptoVec
-#                      allocation and growth handling". Two reachability
-#                      paths: on 0.60.x the same local agent frames, and on
-#                      releases BEFORE 0.58.0 the transport and compression
-#                      buffers as well, which lets remote SSH traffic drive
-#                      CryptoVec growth through packet reads and zlib
-#                      decompression output. 0.54.5 is pre-0.58.0 and
-#                      `flate2` is enabled below, so this remote path IS
-#                      reachable: a malicious or compromised SSH server can
-#                      force an allocation failure and abort the process,
-#                      affecting sftp:// and scp:// transfers. Every other
-#                      scheme, and any build without the `ssh` feature, is
-#                      unaffected. russh 0.54.5 requires exactly
-#                      russh-cryptovec 0.52.0, so this cannot be resolved
-#                      on its own.
+#                      allocation and growth handling". Two paths: on 0.60.x
+#                      the same local agent frames, and on releases BEFORE
+#                      0.58.0 the transport and compression buffers as well,
+#                      which lets remote SSH traffic drive CryptoVec growth
+#                      through packet reads and zlib decompression output.
+#                      0.54.5 is pre-0.58.0 and `flate2` is enabled below, so
+#                      this is the half that carries a REMOTE path, and the one
+#                      that matters once SSH runs. russh 0.54.5 requires
+#                      exactly russh-cryptovec 0.52.0, so it cannot be
+#                      resolved on its own.
+#
+# HOW REACHABLE, EXACTLY. Both entries above describe what the vulnerable code
+# does when it runs. Whether it runs here is a separate question with three
+# separate answers - present in the lockfile, handed to the linker, present in
+# the shipped artifact and called - and they do not agree at this checkpoint.
+# deny.toml states all three with the measurements, because the same
+# distinction governs all four accepted advisories rather than just these two;
+# do not restate it here, where it would drift. The short of it: the code is in
+# the graph, and it is in NO shipped artifact, because nothing in this
+# workspace calls russh yet. That is a fact about this checkpoint and not a
+# mitigation - it stops holding with the first `use russh`, which is why the
+# acceptances stay and rust-audit.yml checks the artifact mechanically.
 #
 # The 0.60.3 fix cannot be taken without breaking constraints that rank
-# above it. Every release in 0.55..=0.62 was checked: 0.61.0 and later need
-# digest ^0.11.0-rc.5, which breaks the single digest 0.10 generation and is
-# banned by deny.toml; 0.60.0 through 0.60.3, the first releases carrying the
-# fix, pull sixteen release-candidate cryptography crates (rsa 0.10.0-rc,
-# pkcs1/pkcs5/pkcs8/spki, ecdsa, elliptic-curve, crypto-bigint,
-# ml-kem 0.3.0-rc.1, curve25519-dalek and ed25519-dalek pre-releases,
-# p256/p384/p521, aead, aes-gcm); and every release from 0.55.0 up declares
-# MSRV 1.85, while 0.55.0 - the only one in that range with a stable graph -
-# does not contain the fix anyway.
+# above it. Every release in 0.55..=0.62 was checked, and the pre-release
+# requirement counts below are read from the crates.io index per version
+# rather than carried over: 0.61.0 and later need digest ^0.11.0-rc.5, which
+# breaks the single digest 0.10 generation and is banned by deny.toml; 0.60.3,
+# the first release carrying the fix, pulls SEVENTEEN release-candidate
+# cryptography requirements (rsa 0.10.0-rc.16, pkcs1/pkcs5/pkcs8/spki, ecdsa,
+# elliptic-curve, crypto-bigint 0.7.0-rc.28, ml-kem 0.3.0-rc.1,
+# curve25519-dalek 5.0.0-pre.6 and ed25519-dalek 3.0.0-pre.6, p256/p384/p521,
+# aead 0.6.0-rc.10, aes-gcm 0.11.0-rc.3, signature 3.0.0-rc.10); 0.61.0 has
+# thirteen, 0.62.0 ten, and 0.58.0, 0.59.0 and 0.62.4 three each, so NO member
+# of the 0.58.0..=0.62.4 band has a stable graph; and every release from
+# 0.55.0 up declares MSRV 1.85, while 0.55.0 - the only one in that range with
+# a stable graph - does not contain the fix anyway.
+#
+# The two `ssh` advisories are therefore blocked twice over and independently:
+# by the release-candidate cryptography and by the floor. Neither blocker is
+# removable from here. Two further routes were measured and are also closed:
+# russh-cryptovec cannot be advanced on its own, because russh 0.54.5 requires
+# `0.52.0` and the only releases inside `^0.52.0` are 0.52.0-beta.1 and
+# 0.52.0 itself; and the agent code that RUSTSEC-2026-0154 describes cannot be
+# excluded from the link, because russh declares it as a plain
+# `pub mod agent;` under src/keys/ with no feature gate.
 #
 # Both findings are HIGH, not CRITICAL, so the gate of zero critical
-# advisories still holds; a strict `cargo audit --deny warnings` does not,
-# and `cargo deny check advisories` reports them. That is the intended
-# outcome: the exposure is carried openly rather than muted with an extra
-# `ignore` entry here.
+# advisories still holds. `cargo audit --file Cargo.lock` reports them and
+# exits 1 - measured, all four, every run. `cargo deny check advisories`
+# reports `ok`, because deny.toml DOES carry an `ignore` entry for each of the
+# four, with the full reason and the removal condition beside it.
+#
+# That pairing is deliberate and is the whole risk register: the acceptances
+# are recorded in one reviewable place rather than spread across manifests,
+# and `cargo audit` is left unmuted so the exposure still shows up in an
+# unfiltered scan. rust-audit.yml then re-runs the scan with the ignores
+# DISABLED and asserts the reported set equals exactly those four identifiers,
+# which is what stops a fifth advisory from arriving unnoticed behind them.
+# What must not be said - and what this comment said until it was measured
+# against `cargo deny check` - is that deny does not ignore them. It does.
 #
 # One consequence for the zero-warnings gate: russh 0.54.5 trips a
 # future-incompatibility lint of its own (macro-expanded macro_export
@@ -878,12 +978,42 @@ tempfile = "=3.27.0"
 #                 licences and sources all still pass, but `cargo deny check
 #                 advisories` goes from ok to FAILED, which is AAP 0.8.4
 #                 gate 9. Enabling the feature therefore builds and advertises
-#                 nothing: curl-rs-lib/src/version.rs holds `ENGINE_DNS` absent,
-#                 so the resolver token is withheld at every feature setting
-#                 rather than the feature being a silent no-op OR an
-#                 unbuildable declaration. The DNS note above records the full
-#                 derivation; when the conflict is decided the pin belongs HERE,
-#                 per AAP 0.4.2, with `optional = true` on the member's side.
+#                 nothing: curl-rs-lib/src/version.rs holds `ENGINE_DNS` as
+#                 `Engine::inert`, so the resolver token is withheld at every
+#                 feature setting rather than the feature being a silent no-op
+#                 OR an unbuildable declaration.
+#
+#                 ESCALATED, and owed to a human rather than settled here. A
+#                 feature that selects no dependency is a defect in its own
+#                 right, and the three ways to remove it each breach an AAP
+#                 clause, so none of them is a choice this manifest may make:
+#
+#                   (i)   Wire hickory-resolver 0.25.2. Measured: makes the
+#                         accepted-advisory set SIX rather than four and adds
+#                         one - RUSTSEC-2026-0118 - for which `patched = []`,
+#                         so it could never be retired. AAP 0.5.1's own
+#                         reasoning rejects a dependency that puts the audit
+#                         gate "in permanent jeopardy".
+#                   (ii)  Wire hickory-resolver 0.26.1. Measured: it and
+#                         hickory-proto 0.26.1 both declare rust-version 1.88,
+#                         against the 1.75 floor AAP 0.8.3 preserves verbatim.
+#                   (iii) Delete the feature name. AAP 0.8.3 preserves the
+#                         directive naming hickory-dns as an optional
+#                         default-off feature, and AAP 0.5.2 fixes the
+#                         vocabulary at fifteen names.
+#
+#                 So the current state is the only one that breaches nothing,
+#                 and it is carried openly rather than presented as complete:
+#                 the feature is DECLARED, DEFAULT-OFF, BUILDS, and ADVERTISES
+#                 NOTHING. Removing this escalation needs either an amended
+#                 plan (relaxing the floor, or dropping the name) or an
+#                 upstream release that carries both fixes at 1.75 - and the
+#                 version search above is exhaustive, so no such release
+#                 exists today. When the conflict is decided the pin belongs
+#                 HERE, per AAP 0.4.2, with `optional = true` on the member's
+#                 side; rust-audit.yml's "the optional resolver stack is in NO
+#                 graph" step is what holds the present state honest until
+#                 then.
 #
 #   memdebug      A counting GlobalAlloc reproducing the log format of
 #                 lib/memdebug.c (MEM <src>:<line> malloc(<n>) = <ptr> and
@@ -960,6 +1090,109 @@ cargo-llvm-cov = "0.8.7"                # >= 80% on protocols/ and transfer/
 cargo-audit = "0.22.2"                  # zero critical advisories
 cargo-deny = "0.20.2"                   # licence and duplicate-version policy
 cross = "0.2.5"                         # aarch64-unknown-linux-gnu leg
+
+# BLOCKED AAP GATES - the requirements this build does NOT satisfy
+#
+# WHY THIS TABLE EXISTS. The specification's dependency inventory is FROZEN, and
+# four of its entries cannot be implemented as written without failing a
+# DIFFERENT requirement of the same specification. Documenting that in prose
+# beside each pin was not enough: prose reads as an explanation, and an
+# explanation reads as compliance. Every one of these four is a gate that is
+# BLOCKED, and nothing in this workspace may report the inventory as satisfied
+# while any row stands here.
+#
+# WHY IT IS DATA AND NOT A COMMENT. A comment goes stale silently - that is
+# measured, not feared: the engine registry in curl-rs-lib/src/version.rs
+# carried "the file does not exist" about two modules that had already landed,
+# and only a review caught it. So each row names the pin it is a statement
+# ABOUT, and curl-rs-ffi/build.rs asserts on every build that the manifest above
+# really does pin what `delivered` claims. Bump one of these versions and the
+# build fails until this table is brought with it.
+#
+# WHY IT IS NOT A BUILD REFUSAL. The A4 variadic gate refuses to build, because
+# it would otherwise ship an artifact whose ABI is known-wrong. These four are
+# different: the delivered code is correct and shippable, and it is the CLAIM of
+# inventory compliance that is unavailable. Refusing to build would make the
+# tree unusable to withhold a claim nobody has to make.
+#
+# WHAT A HUMAN MUST DO. Each row names the decision and its owner. Three of the
+# four need an upstream change nobody here controls; `mime_guess` needs the
+# requirement author to say which of two frozen requirements outranks the other,
+# and until they do, the preservation mandate is followed because it is the one
+# the fixture corpus enforces byte for byte.
+[workspace.metadata.curl-rs.blocked-aap-gates]
+
+[workspace.metadata.curl-rs.blocked-aap-gates.russh]
+aap-section = "0.5.1"
+requirement = "russh 0.54.6"
+delivered = "russh = { version = \"=0.54.5\""
+reason = """
+0.54.6 declares a NON-OPTIONAL dependency on libcrux-ml-kem ^0.0.3. On a 0.0.x \
+version that requirement admits 0.0.3 alone, and 0.0.3 is yanked on crates.io, \
+so the graph does not resolve at all. deny.toml independently sets \
+yanked = "deny". Moving forward instead raises the floor: russh 0.55.0 and the \
+whole 0.62 line declare rust-version 1.85, above the 1.75 that specification \
+0.8.3 freezes. 0.54.5 carries the identical requirement set and is not yanked.
+"""
+evidence = "cargo metadata with =0.54.6: `error: failed to select a version for the requirement libcrux-ml-kem = \"^0.0.3\" ... version 0.0.3 is yanked`"
+blocks = "specification 0.5.1 exact-inventory compliance for this row"
+decision-owner = "upstream russh, or whoever may raise the MSRV floor"
+
+[workspace.metadata.curl-rs.blocked-aap-gates.rustls-pemfile]
+aap-section = "0.5.1"
+requirement = "rustls-pemfile 2.2.0"
+delivered = "rustls-pki-types = \"=1.15.1\""
+reason = """
+RUSTSEC-2025-0134 marks rustls-pemfile UNMAINTAINED with patched = [], the \
+repository having been archived, and deny.toml sets unmaintained = "all". The \
+replacement is not a substitute chosen here but the upstream successor: \
+rustls-pemfile 2.2.0 is a thin wrapper over the pem::PemObject trait in \
+rustls-pki-types, which is already pinned. So the CAPABILITY the inventory \
+names is delivered in full, by a maintained crate; it is the NAMED PACKAGE that \
+is unavailable, and saying otherwise would be the overstatement this table \
+exists to prevent.
+"""
+evidence = "cargo deny check advisories with rustls-pemfile as a live dependency: `error[unmaintained]: rustls-pemfile is unmaintained / ID: RUSTSEC-2025-0134` / advisories FAILED"
+blocks = "specification 0.5.1 exact-inventory compliance for this row"
+decision-owner = "upstream rustls-pemfile, or whoever may accept an advisory"
+
+[workspace.metadata.curl-rs.blocked-aap-gates.mime_guess]
+aap-section = "0.5.1"
+requirement = "mime_guess 2.0.5, for content-type inference on -F uploads"
+delivered = "curl's own ten-row table in curl-rs-lib/src/mime/mod.rs; the crate is banned in deny.toml"
+reason = """
+This row conflicts with a HIGHER-PRECEDENCE requirement of the same frozen \
+specification rather than with a tool. curl's inference is the ten-entry ctts[] \
+of lib/mime.c:1629-1640 - .gif .jpg .jpeg .png .svg .txt .htm .html .pdf .xml - \
+returning NULL for anything else. A general-purpose database answers where curl \
+answers nothing, so a -F upload of, say, a .zip would carry a Content-Type curl \
+8.19.0-DEV never emits. Specification 0.8.1 freezes the bytes on the wire and \
+0.6.7 measures that 1,476 fixtures compare full request bytes as ONE string, \
+order and all. The inventory is a means; the wire is the contract.
+"""
+evidence = "lib/mime.c:1629-1640 read directly: ten entries, `return NULL` for an unmatched suffix"
+blocks = "specification 0.5.1 exact-inventory compliance for this row"
+decision-owner = "the requirement author, who alone may rank 0.5.1 above 0.8.1"
+
+[workspace.metadata.curl-rs.blocked-aap-gates.hickory-dns]
+aap-section = "0.5.2"
+requirement = "hickory-dns available as an optional, default-off resolver backend"
+delivered = "hickory-dns = [] - a declared feature name with no backend behind it"
+reason = """
+Three requirements of this specification cannot all hold. Every \
+hickory-resolver release that clears the 1.75 floor of 0.8.3 pulls a \
+hickory-proto in the 0.25 line, which carries RUSTSEC-2026-0118 (patched = [], \
+no fix published) and RUSTSEC-2026-0119 (patched only in >= 0.26.1); the 0.26 \
+line that fixes both declares rust-version 1.88. So 0.8.3 (MSRV 1.75), 0.5.2 \
+(hickory available) and 0.8.4 gate 9 (a clean advisory scan) are pairwise \
+satisfiable and jointly not. The feature name is kept declared and buildable so \
+that a build with it enabled still compiles, and curl-rs-lib/src/dns/resolver.rs \
+reports no alternative resolver at every feature setting so the banner cannot \
+name one this binary does not contain.
+"""
+evidence = "hickory-resolver =0.25.2 wired in: resolves, clears cargo +1.75.0 metadata, and cargo deny check advisories reports 2 errors against hickory-proto 0.25.2"
+blocks = "specification 0.5.2; the capability is vocabulary, not an implementation"
+decision-owner = "whoever may raise the MSRV floor or accept two DoS advisories"
 
 # Build profiles - deliberately conservative.
 #

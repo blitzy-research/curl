@@ -24,11 +24,9 @@
 
 //! ASCII-only, locale-independent case folding and comparison.
 //!
-//! Supersedes all of `lib/strcase.c` (146 lines) and all of
-//! `lib/strequal.c` (95 lines), with `lib/strcase.h` as the declaration
-//! contract. The inventory is six functions plus one macro from the first
-//! pair of files and two exported functions plus two file-static
-//! comparators from the second:
+//! The inventory is six functions plus one macro from the first pair of files
+//! and two exported functions plus two file-static comparators from the
+//! second:
 //!
 //! | C                  | Where                   | Here             |
 //! |--------------------|-------------------------|------------------|
@@ -75,30 +73,7 @@
 //! assumed: both are compared against a locally reconstructed copy of the
 //! C tables at all 256 indices.
 //!
-//! Nothing here may reach for a Unicode-aware fold: the case-conversion
-//! methods that consult the Unicode tables, on either a scalar value or a
-//! string slice, are prohibited in this file. They fold the Turkish dotted
-//! capital I (U+0130), the long s with dot above (U+1E9B), the Cyrillic
-//! alphabet and the German sharp s (U+00DF), producing matches curl does
-//! not make, and they would do it silently on real-world headers and URLs.
-//! Only the explicitly ASCII-suffixed spellings appear below, and a grep
-//! for the Unicode-aware ones finds nothing but this paragraph. The
-//! primitive is a BYTE, not a scalar value: curl compares byte strings,
-//! and a multi-byte UTF-8 sequence must pass through untouched byte by
-//! byte.
-//!
 //! # Public-ABI semantics, and why the shapes here are what they are
-//!
-//! `curl_strequal` and `curl_strnequal` are two of the 100 symbols
-//! `lib/libcurl.def` exports. Their behaviour is frozen -- specification
-//! 0.8.1 -- including two edge cases that read like defects:
-//!
-//! ```text
-//! curl_strequal (s1, s2)     -> casecompare(s1, s2)        both non-NULL
-//!                            -> s1 == NULL && s2 == NULL    otherwise
-//! curl_strnequal(s1, s2, n)  -> ncasecompare(s1, s2, n)     both non-NULL
-//!                            -> s1 == NULL && s2 == NULL && n != 0
-//! ```
 //!
 //! The trailing `&& n` at `lib/strequal.c:94` is not dead weight:
 //! `curl_strnequal(NULL, NULL, 0)` returns 0 while
@@ -123,50 +98,13 @@
 //!    `&[u8]` carries no such guarantee: an interior zero would make this
 //!    module and the C disagree, silently.
 //! 3. Those two are the shapes the adapters already call.
-//!
-//! The byte-native surface is still here, and it is where the rest of the
-//! engine talks to this module: [`casecompare`], [`ncasecompare`] and
-//! [`checkprefix`] all take `&[u8]`. They stay `pub(crate)`, because the
-//! crate root re-exports two names and not the module -- no other crate
-//! has business calling an internal comparator.
-//!
-//! # Visibility
-//!
-//! [`strequal`] and [`strnequal`] are `pub` because the crate root
-//! re-exports them for `curl-rs-ffi`; a `pub` item inside this
-//! `pub(crate)` module is the standard private-module / public-re-export
-//! idiom. Everything else is `pub(crate)`, including the two folding
-//! primitives: specification 0.4.2 turns C's `extern Curl_xyz(...)` into
-//! `pub(crate) fn xyz(...)`, and `lib/libcurl.def` was searched -- none of
-//! `Curl_raw_toupper`, `Curl_raw_tolower`, `Curl_strntoupper`,
-//! `Curl_strntolower`, `Curl_safecmp` or `Curl_timestrcmp` appears among
-//! its 100 names. Widening any of them would misrepresent the ABI surface
-//! as larger than it is, and specification 0.8.7 forbids re-exporting
-//! internals even to make `tests/unit` and `tests/libtest` link.
 
 use std::ffi::CStr;
 
-// ---------------------------------------------------------------------------
 // The fold. `lib/strcase.c:28-84`.
-// ---------------------------------------------------------------------------
 
 /// The byte a lower-case ASCII letter folds to, and every other byte
 /// unchanged.
-///
-/// Supersedes `Curl_raw_toupper` (`lib/strcase.c:72-77`), whose body is a
-/// single lookup into `touppermap` (`:28-48`). The table is the identity
-/// everywhere except `a`..=`z`, so `u8::to_ascii_uppercase` computes it --
-/// a measured equivalence, checked over all 256 indices by
-/// `the_upward_fold_reproduces_the_c_table` at the foot of this file.
-///
-/// Locale-independent by construction: no environment can change which 26
-/// pairs collapse. That is the entire reason the C carried a table instead
-/// of calling `toupper()`.
-///
-/// Takes and returns a `u8` where the C takes and returns `char`. The C
-/// casts to `unsigned char` before indexing (`lib/strcase.c:76`), so the
-/// byte is what the operation was always about; the signedness of C's
-/// `char` never reached the table.
 #[must_use]
 pub(crate) const fn raw_toupper(byte: u8) -> u8 {
     byte.to_ascii_uppercase()
@@ -174,35 +112,12 @@ pub(crate) const fn raw_toupper(byte: u8) -> u8 {
 
 /// The byte an upper-case ASCII letter folds to, and every other byte
 /// unchanged.
-///
-/// Supersedes `Curl_raw_tolower` (`lib/strcase.c:79-84`) and its
-/// `tolowermap` (`:50-70`), the mirror of [`raw_toupper`] in every respect
-/// including the untouched 0x80..=0xFF range.
-///
-/// Both directions exist because both are used: comparison folds UP, as
-/// `lib/strequal.c:38` does, while normalisation of a scheme or a host
-/// folds DOWN.
 #[must_use]
 pub(crate) const fn raw_tolower(byte: u8) -> u8 {
     byte.to_ascii_lowercase()
 }
 
 /// The byte at `index`, or the NUL the C would have read past the end.
-///
-/// The C comparators walk a NUL-terminated string and read the terminator
-/// itself: `lib/strequal.c:48` tests `*first` after the loop has already
-/// stopped on it, and `:63` compares that terminator against whatever the
-/// second string has at the same offset. The slices here come from
-/// [`CStr::to_bytes`] and so exclude the terminator, which is why every
-/// read goes through this helper: index `len()` yields the zero the C
-/// would have found there.
-///
-/// For the two comparators the synthetic terminator is the ONLY zero in
-/// play, because their slices come from a `CStr` and a `CStr` cannot
-/// contain an interior zero. [`timestrcmp`] uses the same helper over
-/// arbitrary slices, where an interior zero can occur -- and there stopping
-/// at it is exactly what the C does, which is why that function documents
-/// the behaviour rather than guarding against it.
 #[must_use]
 const fn byte_at(bytes: &[u8], index: usize) -> u8 {
     // `slice::get` is not `const` under this crate's minimum supported Rust
@@ -215,19 +130,9 @@ const fn byte_at(bytes: &[u8], index: usize) -> u8 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The comparators. `lib/strequal.c:35-95`.
-// ---------------------------------------------------------------------------
 
 /// Case-insensitive equality of two whole byte strings.
-///
-/// Supersedes `casecompare` (`lib/strequal.c:35-49`). The C walks the
-/// first string to its NUL and, on reaching it, returns
-/// `!*first == !*second` -- a comparison of ZERO-NESS, not of bytes, and
-/// its own comment says so: *"Note that the characters may not be exactly
-/// the same even if they match, we only want to compare zero-ness."* With
-/// `*first` known to be zero at that point, the test means exactly "the
-/// second string also ended here".
 ///
 /// The correspondence to the Rust form is worth spelling out, because the
 /// C's shape hides it. Three cases, and they are exhaustive:
@@ -240,10 +145,6 @@ const fn byte_at(bytes: &[u8], index: usize) -> u8 {
 /// * `second` longer -- the loop ends having matched every byte of
 ///   `first`, and the tail test compares `first`'s zero terminator against
 ///   a non-zero byte of `second`, giving `1 == 0`.
-///
-/// So the whole function is case-insensitive equality of the two byte
-/// sequences INCLUDING their lengths. The fold is [`raw_toupper`], upward,
-/// exactly as `lib/strequal.c:38` folds.
 #[must_use]
 pub(crate) fn casecompare(first: &[u8], second: &[u8]) -> bool {
     // The length test is the tail comparison of `lib/strequal.c:48`,
@@ -284,9 +185,6 @@ pub(crate) fn casecompare(first: &[u8], second: &[u8]) -> bool {
 ///   comparison is made, of `first`'s terminator against whatever `second`
 ///   has at the same offset -- so `second` must have ended there too, and
 ///   `ncasecompare("ab", "abc", 9)` is false.
-///
-/// Note which string governs the loop: only `first`'s terminator stops it.
-/// That is what makes the argument order of [`checkprefix`] matter.
 #[must_use]
 pub(crate) fn ncasecompare(first: &[u8], second: &[u8], max: usize) -> bool {
     let mut index = 0usize;
@@ -318,13 +216,6 @@ pub(crate) fn ncasecompare(first: &[u8], second: &[u8], max: usize) -> bool {
 /// Case-insensitive comparison of two whole strings -- backs
 /// `curl_strequal`.
 ///
-/// Reproduces `lib/strequal.c:76-84`. `None` models a NULL pointer: two
-/// NULLs compare equal, and one NULL against a string does not.
-///
-/// The comparison is locale-independent by construction: only the 26 ASCII
-/// letter pairs are folded, whatever the process locale says. That is the
-/// entire reason the function exists rather than deferring to `strcasecmp`.
-///
 /// # Examples
 ///
 /// ```
@@ -349,11 +240,6 @@ pub fn strequal(s1: Option<&CStr>, s2: Option<&CStr>) -> bool {
 
 /// Case-insensitive comparison of at most `n` bytes -- backs
 /// `curl_strnequal`.
-///
-/// Reproduces `lib/strequal.c:87-95`, including the null-pointer rule that
-/// differs from [`strequal`]: two NULLs are equal only when `n` is
-/// non-zero. That is the literal `&& n` of `lib/strequal.c:94`, and it is
-/// frozen ABI rather than an oversight to tidy up.
 ///
 /// # Examples
 ///
@@ -381,47 +267,20 @@ pub fn strnequal(s1: Option<&CStr>, s2: Option<&CStr>, n: usize) -> bool {
 
 /// True when `subject` begins with `prefix`, compared case-insensitively.
 ///
-/// Supersedes the `checkprefix()` macro of `lib/strcase.h:31-33`, the
-/// pervasive prefix test of the C tree -- header matching, scheme
-/// matching, option parsing.
-///
-/// **The macro's argument order is the reverse of what its name suggests,
-/// and this function keeps the macro's spelling rather than the
-/// expansion's.** `checkprefix(a, b)` expands to
-/// `curl_strnequal(b, STRCONST(a))`, and `STRCONST(x)` is
-/// `x, sizeof(x) - 1` (`lib/curl_setup.h:1285`), so the macro means
-/// `curl_strnequal(subject, literal, strlen(literal))`: the LITERAL is the
-/// first macro argument and the SUBJECT is the second, while the subject
-/// is the FIRST argument of the call it expands to. Call it as
-/// `checkprefix("Content-", header)`. Swapping the two silently inverts
-/// every prefix test, because [`ncasecompare`]'s loop is governed by its
-/// first argument's terminator.
-///
 /// Three consequences of that expansion, each verified against the C:
 ///
 /// * An empty prefix matches anything, because `max` is then zero and
 ///   `lib/strequal.c:60-61` returns "equal this far" before reading a
 ///   byte.
-/// * A subject shorter than the prefix never matches: the subject's
-///   terminator stops the loop with budget left, and the tail comparison
-///   finds a non-zero byte still to come in the prefix.
 /// * Only `prefix.len()` bytes are examined, so trailing content in the
 ///   subject is irrelevant -- which is the point of a prefix test.
-///
-/// `prefix` is a `&str` because every C call site passes a string literal.
-/// A prefix containing an interior NUL would break the analogy with the
-/// macro, whose `sizeof(x) - 1` counts the literal's declared bytes; no
-/// call site does that, and the byte-level form [`ncasecompare`] is
-/// available for anything that needs it.
 #[must_use]
-#[allow(dead_code)] // No consumer yet; scheme and header matching will call it.
+#[allow(dead_code)] // Callers: scheme and header matching.
 pub(crate) fn checkprefix(prefix: &str, subject: &[u8]) -> bool {
     ncasecompare(subject, prefix.as_bytes(), prefix.len())
 }
 
-// ---------------------------------------------------------------------------
 // Folding copies. `lib/strcase.c:86-114`.
-// ---------------------------------------------------------------------------
 
 /// Copies an upper-case fold of `src` into `dest`, returning the number of
 /// bytes written.
@@ -450,36 +309,6 @@ pub(crate) fn checkprefix(prefix: &str, subject: &[u8]) -> bool {
 /// * The `do`/`while` writes before it tests, so `n` is a count the caller
 ///   has to have got right; there is nothing to check it against.
 ///
-/// A Rust slice carries its own length, so `n` is not a separate argument:
-/// it IS `dest.len()`, and the caller passes `&mut dest[..n]` to say what
-/// the C said. The write is bounded by the shorter of the two slices and
-/// the count is returned, so a truncating call is detectable rather than
-/// silent -- information the C simply did not offer.
-///
-/// # Exactly where this differs from the C, measured rather than asserted
-///
-/// The CONTENT bytes are byte-for-byte the C's, at every length and every
-/// budget: `the_folding_copies_match_the_c_oracle` below checks that
-/// against a transcript taken from the C itself.
-///
-/// The one difference is the terminator, and it is worth being precise
-/// instead of claiming more than is true. The C's loop tests `*src++`
-/// AFTER writing, so when the budget outlives the source it also writes
-/// the source's NUL -- `Curl_strntoupper(dest, "ab", 5)` leaves
-/// `41 42 00` and stops, which was confirmed by running it. This function
-/// writes `41 42` and returns 2, because a `&[u8]` has no terminator to
-/// copy and appending a zero would be inventing a byte the source never
-/// had. Callers that need a C string terminate it themselves, at the
-/// offset this function returns; callers that hold a slice never wanted
-/// one. So the caveat the C comment had to state -- that the destination
-/// may be left unterminated -- stops being a hazard rather than being
-/// solved: there is nothing to forget.
-///
-/// The C additionally permits `dest` and `src` to overlap, which Rust's
-/// borrow rules exclude at compile time. In-place folding is expressed by
-/// `<[u8]>::make_ascii_uppercase`, which is the same ASCII-only operation
-/// and needs no wrapper here.
-///
 /// # Usage
 ///
 /// ```text
@@ -487,7 +316,7 @@ pub(crate) fn checkprefix(prefix: &str, subject: &[u8]) -> bool {
 /// assert_eq!(strntoupper(&mut buf, b"htTp"), 4);
 /// assert_eq!(&buf, b"HTTP");
 /// ```
-#[allow(dead_code)] // No consumer yet; scheme normalisation will call it.
+#[allow(dead_code)] // Callers: scheme normalisation.
 pub(crate) fn strntoupper(dest: &mut [u8], src: &[u8]) -> usize {
     let count = dest.len().min(src.len());
     for index in 0..count {
@@ -498,14 +327,7 @@ pub(crate) fn strntoupper(dest: &mut [u8], src: &[u8]) -> usize {
 
 /// Copies a lower-case fold of `src` into `dest`, returning the number of
 /// bytes written.
-///
-/// Supersedes `Curl_strntolower` (`lib/strcase.c:101-114`), the mirror of
-/// `Curl_strntoupper` in every respect. See [`strntoupper`] for why the
-/// C's `n` parameter and its not-null-terminated caveat both disappear
-/// here without any change in the bytes produced.
-///
-/// In-place folding is `<[u8]>::make_ascii_lowercase`.
-#[allow(dead_code)] // No consumer yet; host normalisation will call it.
+#[allow(dead_code)] // Callers: host normalisation.
 pub(crate) fn strntolower(dest: &mut [u8], src: &[u8]) -> usize {
     let count = dest.len().min(src.len());
     for index in 0..count {
@@ -514,9 +336,7 @@ pub(crate) fn strntolower(dest: &mut [u8], src: &[u8]) -> usize {
     count
 }
 
-// ---------------------------------------------------------------------------
 // Null-safe comparisons. `lib/strcase.c:116-146`.
-// ---------------------------------------------------------------------------
 
 /// Null-safe, **case-SENSITIVE** equality of two optional byte strings.
 ///
@@ -529,18 +349,8 @@ pub(crate) fn strntolower(dest: &mut [u8], src: &[u8]) -> usize {
 ///   return !a && !b;
 /// }
 /// ```
-///
-/// It lives in `strcase.c` and it is NOT a case-insensitive comparison.
-/// The delegate is `strcmp`, not `strcasecmp`, so `safecmp(Some(b"A"),
-/// Some(b"a"))` is false. Assuming otherwise from the file it came from is
-/// the mistake this paragraph exists to prevent.
-///
-/// The rule for absent operands is the intuitive one: both absent compare
-/// equal, one absent does not. Note that [`timestrcmp`] below answers the
-/// same question with the OPPOSITE polarity -- `true` here means
-/// "identical", whereas `0` there means "identical".
 #[must_use]
-#[allow(dead_code)] // No consumer yet; connection reuse will call it.
+#[allow(dead_code)] // Callers: connection reuse.
 pub(crate) fn safecmp(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
     match (a, b) {
         (Some(left), Some(right)) => left == right,
@@ -553,11 +363,6 @@ pub(crate) fn safecmp(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
 /// Compares two optional byte strings without branching on their contents;
 /// returns `0` when they are identical.
 ///
-/// Supersedes `Curl_timestrcmp` (`lib/strcase.c:126-146`), whose comment
-/// states the contract: *"returns 0 if the two strings are identical. The
-/// time this function spends is a function of the shortest string, not of
-/// the contents."*
-///
 /// ```text
 /// int match = 0, i = 0;
 /// if(a && b) {
@@ -566,43 +371,6 @@ pub(crate) fn safecmp(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
 /// else return a || b;
 /// return match;
 /// ```
-///
-/// # This function is SECURITY-RELEVANT
-///
-/// Every caller in the C tree compares credentials with it -- `user` and
-/// `passwd` when deciding whether a pooled connection may be reused
-/// (`lib/url.c:612-613`, `:1043-1046`, `:1126-1127`, `:1192-1193`), the
-/// Digest user and password (`lib/vauth/digest_sspi.c:426-427`), the FTP
-/// account (`lib/ftp.c:4311`) and the `.netrc` login
-/// (`lib/netrc.c:272`) -- and every one of them uses the result only for
-/// its zero-ness.
-///
-/// The defence is that the control flow must not depend on the DATA. So
-/// the differences of all byte pairs are accumulated with `|=` and the
-/// loop breaks only on a terminator, never on a mismatch. An early exit,
-/// however tempting, leaks the length of the matching prefix through the
-/// time taken and would defeat the entire purpose of the function.
-/// Therefore, and this is a prohibition rather than a preference: do NOT
-/// rewrite the body as `a == b`, as `starts_with`, as `iter().eq(..)`, or
-/// as anything else that short-circuits, and do not let a later
-/// simplification reintroduce one.
-///
-/// # The honest limitation
-///
-/// Rust offers no timing guarantee, and neither did the C. The optimiser
-/// is free to vectorise, to unroll, or in principle to introduce a branch;
-/// `#[inline(never)]` keeps the body from being folded into a caller where
-/// that is likelier, but it is a discouragement, not a proof. What is
-/// claimed here is exactly what the C claimed: the SOURCE contains no
-/// data-dependent branch. Anything stronger would need a primitive the
-/// language does not provide, so nothing stronger is claimed.
-///
-/// # The polarity, which is the inverse of [`safecmp`]
-///
-/// `0` means identical. The absent-operand branch is C's `return a || b`,
-/// which yields `0` when BOTH are absent -- absent equals absent -- and
-/// `1` when exactly one is. Getting this backwards would turn "the
-/// credentials differ" into "the connection may be reused".
 ///
 /// # Return value
 ///
@@ -623,7 +391,7 @@ pub(crate) fn safecmp(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
 /// instead.
 #[must_use]
 #[inline(never)]
-#[allow(dead_code)] // No consumer yet; connection reuse will call it.
+#[allow(dead_code)] // Callers: connection reuse.
 pub(crate) fn timestrcmp(a: Option<&[u8]>, b: Option<&[u8]>) -> i32 {
     let (left, right) = match (a, b) {
         (Some(left), Some(right)) => (left, right),
@@ -665,20 +433,6 @@ mod tests {
     }
 
     // THE TWO C FOLDING TABLES, TRANSCRIBED.
-    //
-    // `lib/strcase.c:28-48` and `:50-70` verbatim, value for value in
-    // declaration order. They are here rather than in the implementation
-    // because their only job is to make the equivalence claimed in the
-    // module documentation EXECUTABLE: `raw_toupper` is
-    // `u8::to_ascii_uppercase`, and the two tests below prove that agrees
-    // with the C at all 256 indices. Deriving the expectation from the same
-    // rule the implementation uses would prove nothing, so these digits are
-    // the C's digits.
-    //
-    // `#[rustfmt::skip]` because they are DATA. The only edit made to the C
-    // text is the row width -- twelve values per line instead of fifteen, so
-    // that every line fits the 80-column limit -- and no value is reordered,
-    // added or dropped.
 
     #[rustfmt::skip]
     const TOUPPERMAP: [u8; 256] = [
@@ -781,12 +535,6 @@ mod tests {
 
     /// Only the 52 ASCII letters move; every other ASCII byte is left
     /// exactly alone.
-    ///
-    /// The interesting region is 0x5B..=0x60 -- `[`, `\`, `]`, `^`, `_` and
-    /// the backquote -- which sits BETWEEN `Z` (0x5A) and `a` (0x61). An
-    /// implementation that folded by adding or subtracting 32 over a
-    /// too-wide range would corrupt precisely those six bytes, and they
-    /// appear in real header and URL text.
     #[test]
     fn neither_fold_touches_a_non_letter() {
         for byte in 0u8..=0x7F {
@@ -918,13 +666,6 @@ mod tests {
     }
 
     /// The scheme-lookup path of `protocols/mod.rs`.
-    ///
-    /// The registry derived from `lib/url.c` stores four names in UPPERCASE
-    /// -- `WS`, `WSS`, `SFTP`, `SCP` -- and matches them against lowercase
-    /// user input through this comparator. If the fold regressed, those four
-    /// schemes would stop resolving while every lowercase-stored scheme kept
-    /// working, which is exactly the kind of partial failure a test has to
-    /// catch rather than a reader.
     #[test]
     fn the_uppercase_registry_names_match_lowercase_input() {
         assert!(ncasecompare(b"WS", b"ws", 2));
@@ -1014,11 +755,6 @@ mod tests {
     // call's return value. The first covers every ordered pair; the second
     // covers every ordered pair against each of the seven `BUDGETS`. A
     // divergence therefore means this module disagrees with the shipped C.
-    //
-    // The corpus includes the four bytes adjacent to the folded ranges (`@`
-    // 0x40, `[` 0x5B, `` ` `` 0x60, `{` 0x7B), a DEL (0x7F), a byte above
-    // ASCII (0x80), and two UTF-8 strings differing only in a continuation
-    // byte -- the places an over-eager fold would show up.
 
     const C_STREQUAL_BITS: &str = concat!(
         "1000000000000000000000011000000000000000000001100000000000000000000001110000",
@@ -1339,34 +1075,6 @@ mod tests {
 
     // THE SECOND DIFFERENTIAL ORACLE -- for the six functions the transcripts
     // above do not reach.
-    //
-    // `C_STREQUAL_BITS` and `C_STRNEQUAL_BITS` cover only the two exported
-    // comparators. The five constants below extend the same method to
-    // `Curl_safecmp`, `Curl_timestrcmp`, `checkprefix()`, `Curl_strntoupper`
-    // and `Curl_strntolower`, over the SAME 22-entry `CORPUS` and the same
-    // seven `BUDGETS`, so a divergence in any of them fails a test instead of
-    // reaching a caller.
-    //
-    // How they were produced, so the numbers are auditable rather than
-    // magical: a C driver was built whose only content besides four
-    // `#include` lines was `lib/strcase.c:28-146` and `lib/strequal.c:35-95`
-    // copied VERBATIM out of this repository -- both folding tables and all
-    // eight functions, unedited -- and it printed one character per call.
-    // The driver was compiled with `gcc -O2 -Wall -Wextra`, produced no
-    // diagnostic, and was deleted afterwards; only its output is kept.
-    //
-    // The bit strings are indexed with `CORPUS` in the outer loop and
-    // `CORPUS` in the inner, 484 entries each. For `checkprefix` the OUTER
-    // string is the literal and the INNER one the subject, matching the
-    // macro's own argument order -- which is the asymmetry that makes this
-    // particular transcript worth having.
-    //
-    // The hex strings are the CONTENT bytes written by the two folding
-    // copies, iterating `CORPUS` outer and `BUDGETS` inner, taking
-    // `min(budget, len)` bytes each time. 345 bytes each. The C's extra
-    // terminator is deliberately outside the content region; the test named
-    // `the_folding_copies_stop_short_of_the_c_terminator` records that one
-    // difference separately, with the bytes the C actually produced.
 
     const C_SAFECMP_BITS: &str = concat!(
         "1000000000000000000000010000000000000000000000100000000000000000000001000000",
@@ -1558,11 +1266,6 @@ mod tests {
     /// The single measured difference from the C, recorded with the bytes the
     /// C actually produced so the claim in [`strntoupper`]'s documentation is
     /// checkable rather than remembered.
-    ///
-    /// `Curl_strntoupper(dest, "ab", 5)` over a buffer pre-filled with `0xEE`
-    /// leaves `41 42 00 EE EE`: two folded bytes and the source's NUL. This
-    /// function writes the two folded bytes, reports 2, and invents no
-    /// terminator, because a `&[u8]` source never had one.
     #[test]
     fn the_folding_copies_stop_short_of_the_c_terminator() {
         let mut destination = [0xEEu8; 5];
@@ -1592,12 +1295,6 @@ mod tests {
     /// The two null-safe comparisons answer the same question with OPPOSITE
     /// polarity, and getting that backwards would turn "the credentials
     /// differ" into "the connection may be reused".
-    ///
-    /// Asserted over NUL-free inputs, which is every real call site: the
-    /// two functions do diverge on a slice carrying an interior zero,
-    /// because [`timestrcmp`] stops there as the C string semantics
-    /// require while [`safecmp`] compares the whole slice. That difference
-    /// is documented on `timestrcmp` rather than papered over here.
     #[test]
     fn timestrcmp_polarity_is_the_inverse_of_safecmp() {
         let cases: [(Option<&[u8]>, Option<&[u8]>); 7] = [

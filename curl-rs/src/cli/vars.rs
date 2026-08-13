@@ -5,79 +5,9 @@
 //! `--variable` definitions and `{{name:func}}` expansion: `src/var.c` and
 //! `src/var.h`.
 //!
-//! This module owns two halves of one feature. [`setvariable`] is the
-//! `--variable` argument grammar (`src/var.c:372-492`), which defines a
-//! variable from a literal, a file, standard input or the process
-//! environment. [`varexpand`] is the substitution pass
-//! (`src/var.c:206-335`) that `src/tool_getparam.c:2966` runs over the
-//! argument of any `--expand-<option>`, and the five text functions
-//! (`src/var.c:75-204`) it can chain onto a value.
-//!
 //! Comments throughout cite `src/var.c:<line>` so that every frozen string,
 //! constant and behavioural quirk can be checked against the oracle line by
-//! line. AAP section 0.8.1 freezes all of it: option semantics, default
-//! values and every byte the tool prints.
-//!
-//! # The `replaced` flag is load-bearing, so it is in the type
-//!
-//! C's `varexpand(line, out, replaced)` writes an output buffer *and* a
-//! boolean, and `src/tool_getparam.c:2967-2971` keeps the ORIGINAL argument
-//! when that boolean is false -- the buffer having been discarded by
-//! `src/var.c:332-333`. [`varexpand`] returns
-//! `Result<Option<Vec<u8>>, ParameterError>` instead, where `Ok(None)` is
-//! exactly "nothing was substituted, there is no buffer" and `Ok(Some(bytes))`
-//! is "substituted, here it is". That is the same contract with one class of
-//! defect removed: a caller cannot read a buffer that was discarded, because
-//! there is no buffer to read.
-//!
-//! # Storage: a `Vec`, and the newest definition wins
-//!
-//! C keeps an intrusive singly-linked list of `struct tool_var`
-//! (`src/var.h:28-33`) hanging off `global->variables`, with the name as a
-//! flexible array member. AAP section 0.6.9 replaces intrusive lists with
-//! owned collections, so [`Variables`] holds a `Vec<ToolVar>`.
-//!
-//! Two properties of that list are observable and are preserved:
-//!
-//! * **`addvariable` PREPENDS** (`src/var.c:363-364`:
-//!   `p->next = global->variables; global->variables = p;`) while
-//!   `varcontent` walks from the head (`:50-56`). A redefinition therefore
-//!   shadows the earlier entry, which is still present. [`Variables::add`]
-//!   uses `Vec::insert(0, ..)` with a forward search, so the NEWEST wins. A
-//!   plain `push` with a forward search would return the OLDEST, which is
-//!   wrong; `push` with a reverse search would also have worked, and
-//!   `insert(0, ..)` was chosen because it keeps the storage order identical
-//!   to the C list rather than merely making the lookup agree.
-//! * **Lookup is exact-length and case-SENSITIVE** (`:52`:
-//!   `strlen(list->name) == nlen && !strncmp(...)`). Nothing here folds case.
-//!
-//! `varcleanup()` (`src/var.c:37-46`) has no counterpart and needs none: it
-//! walks the list freeing each node's content and then the node, which is
-//! precisely what dropping the `Vec<ToolVar>` does. The function disappears
-//! rather than being translated.
-//!
-//! The storage stays deliberately opaque, as `src/var.c:337-341` asks -- "so
-//! that we can improve this if we want better performance when managing many
-//! at a later point". A linear scan is the faithful translation of the C
-//! list; upstream has not replaced it with a map and neither does this. AAP
-//! section 0.1.1 makes performance an explicit non-goal: "Where a choice
-//! exists between a faster design and a more behaviourally faithful one,
-//! faithfulness wins."
-//!
-//! # Content is bytes, not a string
-//!
-//! [`ToolVar`]'s content is a `Vec<u8>`, and that is not a stylistic
-//! preference. `src/var.c:302-311` proves a variable may legitimately
-//! *contain* a NUL byte: the diagnostic `variable contains null byte` fires
-//! only when the value is about to be inserted into an expansion, never when
-//! it is defined. Storing content as a `String` would either reject such a
-//! value at definition time -- a behaviour change -- or lose the byte.
-//! `--variable %NAME` and `--variable name@file` can both yield bytes that
-//! are not valid UTF-8 for the same reason.
-//!
-//! The arguments are `&[u8]` throughout, matching
-//! [`crate::output::formparse`], because they come from `argv` and are not
-//! required to be UTF-8 either.
+//! line.
 //!
 //! # Three helpers belong to other modules and are called, not copied
 //!
@@ -90,10 +20,6 @@
 //! A second JSON escaper would drift from `--write-out '%{json}'`, a second
 //! percent-encoder from `curl_easy_escape`, and a second range reader from
 //! `--data @file`. None is written here.
-//!
-//! `curlx_base64_encode` and `curlx_base64_decode` (`:147`, `:167`) have no
-//! reachable owner. See [`base64_encode`] for GAP #1 and for what the two
-//! affected functions do in its absence.
 //!
 //! # Translation differences, each deliberate
 //!
@@ -117,19 +43,10 @@
 //!    handed to `format!`, which would collapse the `}}` in
 //!    [`MSG_MISSING_CLOSE`] to a single brace and silently change the
 //!    emitted bytes.
-//!
-//! # Why so much of this module is `#[allow(dead_code)]`
-//!
-//! `curl-rs/src/cli/args.rs` is the intended caller -- it consumes
-//! [`varexpand`] for the `--expand-` prefix (`src/tool_getparam.c:2921-2925`,
-//! applied at `:2955-2972`) and [`setvariable`] for row `:365` -- and the
-//! `clap` surface that reaches both is not yet delivered. The attribute marks
-//! a *pending caller*, not dead logic: every item below is exercised by the
-//! tests at the end of this file. The same convention is used throughout this
-//! crate for the same reason.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -145,38 +62,22 @@ use crate::output::writeout::json_quoted;
 // Constants -- src/var.c:33-34
 
 /// `MAX_EXPAND_CONTENT` -- `src/var.c:33`.
-///
-/// The `curlx_dyn_init` cap on every buffer this module builds: the expansion
-/// output (`:213`) and the working buffer the function chain writes into
-/// (`:292`). Exceeding it makes the append fail, which the C maps to
-/// `PARAM_NO_MEM` -- an over-long expansion is an ERROR, never a silent
-/// truncation. See [`dyn_addn`] for the exact bound, which is one byte below
-/// this value.
 pub(crate) const MAX_EXPAND_CONTENT: usize = 10_000_000;
 
 /// `MAX_VAR_LEN` -- `src/var.c:34`, "max length of a name".
-///
-/// Used two ways, and both matter. It sizes `char name[MAX_VAR_LEN]` in
-/// `varexpand`, where a name is rejected by `nlen >= sizeof(name)` (`:253`),
-/// and `char buf[MAX_VAR_LEN]` in `setvariable`, where the same rejection is
-/// spelled `nlen >= MAX_VAR_LEN` (`:395`). Both tests are `>=`, so the
-/// longest accepted name is 127 bytes.
 pub(crate) const MAX_VAR_LEN: usize = 128;
 
 /// `CURL_OFF_T_MAX` -- the open-ended upper bound of a byte range
 /// (`src/var.c:385`).
 ///
-/// `curl_off_t` is 64-bit on all four targets AAP section 0.1.1 mandates, so
-/// this is `i64::MAX`. It is both the default `endoffset` and the sentinel
-/// `:470` tests against to decide whether a range was given at all.
+/// It is both the default `endoffset` and the sentinel `:470` tests against to
+/// decide whether a range was given at all.
 const CURL_OFF_T_MAX: i64 = i64::MAX;
 
 // The frozen diagnostics -- verbatim C format strings with their anchors.
 //
-// Held as `const` items so that each appears exactly once and can be checked
-// byte for byte with `grep -F`. They are rendered ONLY by `render`; see
-// translation difference 4 in the module documentation for why `format!` is
-// not an option.
+// They are rendered ONLY by `render`; see translation difference 4 in the
+// module documentation for why `format!` is not an option.
 
 /// `warnf` -- `src/var.c:240`.
 const MSG_MISSING_CLOSE: &str = "missing close '}}' in '%s'";
@@ -249,27 +150,12 @@ const FROZEN_TEXTS: [&str; 11] = [
 
 /// `ISSPACE` -- `lib/curl_ctype.h:46`, which is
 /// `ISBLANK(x) || ((x) >= 0xa && (x) <= 0x0d)`.
-///
-/// The set is space, tab, `\n`, **`\v`**, `\f` and `\r`. Rust's
-/// [`u8::is_ascii_whitespace`] is NOT the same set -- it omits `\v` (0x0B) --
-/// so it is not used and the six bytes are spelled out. `trim` would
-/// otherwise leave a vertical tab behind that curl strips.
-///
-/// C applies the macro to a `char`, which is signed on all four mandated
-/// targets, so a byte at or above 0x80 promotes to a negative `int` and
-/// matches none of the three tests. Comparing on `u8` has exactly the same
-/// effect: no byte outside ASCII is whitespace.
 const fn is_space(byte: u8) -> bool {
     byte == b' ' || byte == b'\t' || matches!(byte, 0x0a..=0x0d)
 }
 
 /// `ISALNUM(x) || ((x) == '_')` -- the only bytes a variable name may hold
 /// (`src/var.c:271` and `:392`).
-///
-/// `ISALNUM` (`lib/curl_ctype.h:41`) is ASCII digit, `a`-`z` or `A`-`Z`, which
-/// is precisely [`u8::is_ascii_alphanumeric`]. As with [`is_space`], the C
-/// macro's signed-`char` promotion makes it ASCII-only, so no byte at or above
-/// 0x80 is ever accepted.
 const fn is_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
@@ -304,11 +190,6 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// One `curlx_dyn_addn` against a [`MAX_EXPAND_CONTENT`] cap.
 ///
-/// `dyn_nappend` (`lib/curlx/dynbuf.c:67-85`) computes
-/// `fit = len + idx + 1` -- the new bytes, the bytes already held, and the NUL
-/// it always keeps room for -- and fails when `fit > toobig`. The usable length
-/// is therefore one byte BELOW the cap: 9,999,999 here, not 10,000,000.
-///
 /// # Errors
 ///
 /// [`ParameterError::NoMem`], which is what `src/var.c` reports for every
@@ -327,21 +208,6 @@ fn dyn_addn(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ParameterError> {
 // Rendering the frozen texts
 
 /// Substitutes the conversion specifiers of a frozen C format string.
-///
-/// Handles exactly the four forms the constants above use -- `%s`, `%zd`,
-/// `%.*s` and `%%` -- each consuming one entry of `args` in order except `%%`,
-/// which consumes none. A `%` introducing anything else is copied through
-/// verbatim; that arm is unreachable for the constants in this module and
-/// exists so the function is total.
-///
-/// `%.*s`'s precision is applied by the CALLER, which slices its argument to
-/// `flen` before passing it. The specifier's two C varargs -- an `int`
-/// precision and a pointer -- thus become one already-bounded slice, which is
-/// what the specifier means and removes any way for the two to disagree.
-///
-/// This exists instead of `format!` because [`MSG_MISSING_CLOSE`] contains
-/// `}}`: a `format!` would treat that as an escaped single brace and emit
-/// `missing close '}' in '...'`, one byte short of the frozen text.
 fn render(format: &str, args: &[&[u8]]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(format.len());
     let mut next = 0usize;
@@ -406,9 +272,6 @@ fn push_arg(out: &mut Vec<u8>, args: &[&[u8]], next: &mut usize) {
 /// texts assertable in a unit test. The shape follows
 /// [`crate::output::formparse`]'s `FormDiag` so that the two argument-parsing
 /// modules report the same way.
-///
-/// The three emitters are private: the frozen texts are this module's, and
-/// nothing outside it has a reason to send one.
 pub(crate) struct VarDiag<'a> {
     /// The destination, byte-faithful unless it is a terminal.
     sink: &'a mut dyn DiagnosticSink,
@@ -429,13 +292,6 @@ impl<'a> VarDiag<'a> {
 
     /// `warnf` (`src/tool_msgs.c:93-101`): prefix `Warning: `, suppressed by
     /// `--silent` and NOT restored by `--show-error`.
-    ///
-    /// Routed through `warnf_bytes` rather than `warnf` because every one of
-    /// the four warnings here interpolates text taken straight from `argv`,
-    /// which is not required to be valid UTF-8. Rendering such a value through
-    /// `Display` would substitute U+FFFD and change the emitted bytes. The
-    /// prefix, the terminal wrapping and the 1,023-byte bound are identical on
-    /// both paths.
     fn warn(&mut self, format: &str, args: &[&[u8]]) {
         let message = render(format, args);
         msgs::warnf_bytes(&mut *self.sink, &self.config, &message);
@@ -453,11 +309,6 @@ impl<'a> VarDiag<'a> {
 
     /// `notef` (`src/tool_msgs.c:79-87`): prefix `Note: `, emitted ONLY under
     /// a trace or verbose selection and never gated on `--silent`.
-    ///
-    /// `crate::output::msgs` offers no byte-oriented note, and none is needed:
-    /// the single note this module emits interpolates a variable name, and a
-    /// name is ASCII alphanumeric or underscore by construction
-    /// (`src/var.c:271`, `:392`), so the lossy conversion cannot alter a byte.
     fn note(&mut self, format: &str, args: &[&[u8]]) {
         let message = render(format, args);
         let text = String::from_utf8_lossy(&message);
@@ -474,7 +325,7 @@ impl<'a> VarDiag<'a> {
 /// explicit `clen` beside it. Both become owned Rust values, so the `clen`
 /// field disappears into `Vec::len` and the `next` pointer into the enclosing
 /// [`Variables`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ToolVar {
     /// The name, guaranteed by construction to be shorter than
     /// [`MAX_VAR_LEN`] and to hold only bytes accepted by [`is_name_byte`].
@@ -482,15 +333,49 @@ pub(crate) struct ToolVar {
     name: String,
 
     /// The content, as bytes.
-    ///
-    /// This is deliberately NOT a `String`. `src/var.c:303-311` proves a
-    /// variable may legitimately hold a NUL -- and, by the same argument, any
-    /// other non-UTF-8 byte, since `--variable name@file` reads a file in
-    /// binary mode (`:452`) and `--variable %NAME` takes whatever the
-    /// environment holds. The diagnostic `variable contains null byte` fires
-    /// when the value is about to be substituted, not when it is defined, so
-    /// rejecting such a value here would be a behaviour change.
     content: Vec<u8>,
+}
+
+/// The name renders; the content never does.
+///
+/// # Why this is not `#[derive(Debug)]`
+///
+/// A `--variable` holds whatever the user put in it, and the two forms that
+/// make the option worth having are exactly the two that make it a credential
+/// store: `--variable %NAME` reads an environment variable, and
+/// `--variable name@file` reads a file (`src/var.c:452`). The documented use is
+/// to keep a secret off the command line -- `docs/cmdline-opts/variable.md`
+/// shows an API key -- so the values here are, by design, the things a user
+/// most wanted not to appear in a process listing. Rendering them in a
+/// diagnostic would defeat the option's purpose.
+///
+/// The NAME renders in full, because a name is chosen by the user for a
+/// command line and is visible in `--variable` itself; it is also the only
+/// thing a reader debugging an expansion failure needs. The content renders as
+/// a byte length, which distinguishes an empty variable from an unset one --
+/// `src/var.c:303-311` treats those differently -- without disclosing a byte.
+impl fmt::Debug for ToolVar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolVar")
+            .field("name", &self.name)
+            .field("content", &Hidden(self.content.len()))
+            .finish()
+    }
+}
+
+/// A [`fmt::Debug`] adaptor rendering a byte length in place of the bytes.
+///
+/// Local to this module rather than shared with `crate::config`, because the
+/// two are private to their own modules and a shared helper would need a home
+/// that neither owns. The spelling matches, so the two crates' diagnostics read
+/// alike.
+#[allow(dead_code)] // Reached only from the redacting formatters below.
+struct Hidden(usize);
+
+impl fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<redacted, {} bytes>", self.0)
+    }
 }
 
 impl ToolVar {
@@ -509,20 +394,12 @@ impl ToolVar {
 
 /// Every variable defined by `--variable`, in lookup order.
 ///
-/// C keeps these on `global->variables`, an intrusive singly-linked list
-/// reached through the mutable global config. AAP 0.6.9 replaces intrusive
-/// lists with owned collections, and AAP 0.1.2 replaces reaches into shared
-/// mutable state with explicit ownership, so this is a plain `Vec` that the
-/// caller owns and lends.
-///
 /// # Why a `Vec` and not a `HashMap`
 ///
 /// `src/var.c:339-341` documents the storage as deliberately opaque, "so that
 /// we can improve this if we want better performance when managing many at a
-/// later point". Upstream has not made that change, and AAP 0.1.1 settles the
-/// trade-off the other way in any case: "Where a choice exists between a
-/// faster design and a more behaviourally faithful one, faithfulness wins."
-/// A linear scan is the faithful translation.
+/// later point". A linear scan is the faithful translation, and faithfulness
+/// outranks speed here.
 ///
 /// # Why the order is load-bearing
 ///
@@ -543,10 +420,24 @@ impl ToolVar {
 /// the `Vec`, which drops each [`ToolVar`], which drops its `String` and
 /// `Vec<u8>`. The one call site (`src/tool_main.c` by way of
 /// `free_globalconfig`) disappears with it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Variables {
     /// Newest first, so a forward scan finds the most recent definition.
     vars: Vec<ToolVar>,
+}
+
+/// The defined variables, each redacted by [`ToolVar`]'s own formatter.
+///
+/// Hand-written only because the derive was removed from [`ToolVar`]. Rendering
+/// the elements rather than only their count is safe -- each one redacts itself
+/// -- and the set of defined NAMES is what a reader debugging an unexpanded
+/// `{{name}}` needs to see.
+impl fmt::Debug for Variables {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Variables")
+            .field("vars", &self.vars)
+            .finish()
+    }
 }
 
 impl Variables {
@@ -563,17 +454,6 @@ impl Variables {
 
     /// `addvariable` (`src/var.c:342-370`): defines `name`, replacing any
     /// earlier definition in lookup order.
-    ///
-    /// The note at `:352` is emitted BEFORE the new entry goes in, and only
-    /// when an entry with this name already exists. It is a note, not a
-    /// warning, so it appears only under `--verbose` or a trace selection
-    /// (`src/tool_msgs.c:79-87`) -- see [`VarDiag::note`].
-    ///
-    /// C's `DEBUGASSERT(nlen)` at `:347` becomes a `debug_assert!`. Both
-    /// callers reject an empty name before reaching here
-    /// (`src/var.c:395` and `:252`), so this is a statement about this
-    /// module's own consistency rather than about user input, and compiling it
-    /// out of a release build is the same choice C makes.
     fn add(&mut self, name: &[u8], content: Vec<u8>, diag: &mut VarDiag<'_>) {
         debug_assert!(!name.is_empty());
 
@@ -654,13 +534,6 @@ const FUNCS: [(VarFunc, &[u8]); 5] = [
 /// #define FUNCMATCH(ptr, name, len) \
 ///   (!strncmp(ptr, name, len) && ENDOFFUNC((ptr)[len]))
 /// ```
-///
-/// The `ENDOFFUNC` half is what makes this a whole-token match rather than a
-/// prefix match: `trimx` does NOT match `trim`, and neither does `trim` at the
-/// very end of the input, because the byte after the name must be `}` or `:`.
-/// C reads that byte from a NUL-terminated string, so at the end of input it
-/// sees `\0`, which is neither; `slice::get` returning `None` is the same
-/// answer without the terminator.
 fn match_func(f: &[u8]) -> Option<(VarFunc, usize)> {
     for (func, name) in FUNCS {
         // `!strncmp(ptr, name, len)`. `strncmp` stops at the first difference,
@@ -677,20 +550,6 @@ fn match_func(f: &[u8]) -> Option<(VarFunc, usize)> {
 }
 
 /// What a base64 call produced.
-///
-/// C's `curlx_base64_encode` and `curlx_base64_decode` return a `CURLcode`,
-/// and `src/var.c` treats a non-zero return two different ways: the encode
-/// path reports `PARAM_NO_MEM` (`:148-151`) while the decode path emits
-/// `[64dec-fail]` and carries on (`:169-172`). Those are the `Rejected` and
-/// `Produced` cases. The third case exists because of GAP #1 below and is kept
-/// distinct so that neither of the first two can be reported for a reason that
-/// is not about the input.
-///
-/// The `Produced` and `Rejected` variants are constructed only by tests while
-/// GAP #1 stands. They are retained rather than deferred because they are the
-/// shape [`apply_b64`] and [`apply_64dec`] need, and because the
-/// `[64dec-fail]` behaviour they drive is frozen and therefore has to stay
-/// asserted.
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CodecOutcome {
@@ -705,22 +564,6 @@ enum CodecOutcome {
 }
 
 /// `curlx_base64_encode(c, clen, &enc, &elen)` -- `src/var.c:147`.
-///
-/// Blocked: see the `GAP #1` comment in the body.
-///
-/// The owner fixed by AAP section 0.4.1 is
-/// `curl-rs-lib/src/util/base64.rs`, from `lib/curlx/base64.c`. That file does
-/// not exist, and `curl-rs-lib`'s `mod util` is `pub(crate)`
-/// (`curl-rs-lib/src/lib.rs:623`), so even once it does exist it will not be
-/// visible from this crate without a re-export the owning unit of work has to
-/// add. Every public module of `curl-rs-lib` was searched -- `error`,
-/// `version`, `url` and `multi` are the four that exist, and the crate root's
-/// re-export list holds no base64 entry.
-///
-/// Adding the `base64` crate and hand-rolling the codec are both ruled out, so
-/// this reports [`CodecOutcome::Unavailable`] and the two call sites turn that
-/// into `PARAM_NO_MEM` -- the same code C reports when the encode call fails,
-/// and never a claim about the caller's data.
 fn encode_base64(_input: &[u8]) -> CodecOutcome {
     // GAP #1: curl-rs-lib exposes no public base64; src/var.c:148,:167 needs
     // curlx_base64_encode/decode for the {{name:b64}} and {{name:64dec}}
@@ -779,18 +622,6 @@ fn apply_64dec(
 
 /// `varfunc` (`src/var.c:75-204`): runs a `:a:b:c` chain over `content`, left
 /// to right.
-///
-/// `functions` is the chain starting AT the colon that separates it from the
-/// name, running to the end of the line -- which is what C passes, since its
-/// `f` is a pointer into the still-terminated input rather than a bounded
-/// span. That is safe here for the same reason it is safe there: the loop stops
-/// as soon as it sees `}` (`:87-89`), and `FUNCMATCH` requires the byte after
-/// a name to be `}` or `:`, so no name can match across the closing `}}`.
-///
-/// `flen` is the chain's true length, `clp - funcp` (`src/var.c:295`). It is
-/// used for exactly one thing: the precision of the unknown-function
-/// diagnostic's `%.*s`, which shows the WHOLE chain from the first colon and
-/// not just the offending name.
 ///
 /// # Errors
 ///
@@ -890,9 +721,6 @@ fn varfunc(
                     // The limit is the dynbuf's own cap, which
                     // `src/var.c:292` set to `MAX_EXPAND_CONTENT`; the sibling
                     // applies the same `len + used + 1 > toobig` rule.
-                    //
-                    // Delegated rather than reimplemented so that this and
-                    // `--write-out '%{json}'` cannot drift apart.
                     json_quoted(&working, &mut out, false, MAX_EXPAND_CONTENT)
                         .map_err(|()| ParameterError::NoMem)?;
                 }
@@ -903,12 +731,14 @@ fn varfunc(
                 if !working.is_empty() {
                     // `curl_easy_escape(NULL, c, (int)clen)`, which takes an
                     // explicit length and therefore escapes an interior NUL as
-                    // `%00` rather than stopping at it. The engine's version
-                    // is infallible, so C's `if(!enc)` out-of-memory arm at
-                    // `:128-131` has no counterpart. The C then appends with
-                    // `curlx_dyn_add`, i.e. bounded by `strlen`; escaping
-                    // never emits a NUL, so the two agree.
-                    let encoded = curl_rs_lib::url::escape::escape(&working);
+                    // `%00` rather than stopping at it. The output is three
+                    // times the variable's own length, so a refusal IS reported
+                    // -- C's `if(!enc)` out-of-memory arm at `:128-131`, which
+                    // answers `PARAM_NO_MEM`. The C then appends with
+                    // `curlx_dyn_add`, i.e. bounded by `strlen`; escaping never
+                    // emits a NUL, so the two agree.
+                    let encoded = curl_rs_lib::url::escape::escape(&working)
+                        .map_err(|_| ParameterError::NoMem)?;
                     dyn_addn(&mut out, &encoded)?;
                 }
             }
@@ -944,23 +774,7 @@ fn varfunc(
 /// `varexpand` (`src/var.c:206-335`): substitutes every `{{name}}` and
 /// `{{name:func}}` in `line`.
 ///
-/// Returns `Some(expanded)` when at least one substitution was made and `None`
-/// when none was -- which is C's `*replaced` out-parameter, and it is
-/// load-bearing rather than informational. `src/tool_getparam.c:2967-2971`
-/// keeps the ORIGINAL argument when `replaced` is false, and C reinforces that
-/// by freeing the output buffer at `:332-333`. An `Option` makes the two
-/// inseparable: there is no way to read a buffer that was not replaced.
-///
 /// # The escaped-brace quirk, preserved deliberately
-///
-/// `\{{x}}` takes the backslash branch at `:216-229`, which emits the text
-/// without the backslash, emits `{{`, and -- this is the point -- does NOT set
-/// `added`. So an input whose only `{{` is escaped finishes with `added ==
-/// false`, the carefully built buffer is discarded, and the caller keeps the
-/// original string WITH the backslash still in it. The escape therefore only
-/// takes effect when some other `{{` in the same argument was expanded.
-/// AAP section 0.8.2 forbids a change justified by improvement, and this is
-/// squarely that: it is reproduced, not fixed.
 ///
 /// # Errors
 ///
@@ -988,12 +802,6 @@ pub(crate) fn varexpand(
     let mut added = false;
 
     // `do { envp = strstr(line, "{{"); ... } while(envp);` at `:214-324`.
-    //
-    // The C is a do-while whose body opens with the search, so when the search
-    // finds nothing both of the body's branches are skipped -- `(envp > line)`
-    // is false for a null `envp`, and so is `else if(envp)` -- and the
-    // `while(envp)` test then ends the loop. A `while let` over the search is
-    // that shape exactly, with no iteration in which `envp` is null.
     while let Some(at) = find(line, b"{{") {
         // `:216` -- `(envp > line) && envp[-1] == '\\'`. The `envp > line`
         // half is why a `{{` at position 0 can never be escaped: there is no
@@ -1161,14 +969,6 @@ enum StrError {
 
 /// `curlx_str_number` at base 10 (`lib/curlx/strparse.c:157-193`).
 ///
-/// "Get an unsigned decimal number with no leading space or minus. Leading
-/// zeroes are accepted." No sign, no blanks, no `0x`, and at least one digit.
-/// `pos` advances only on success, exactly as the C leaves `*linep` untouched
-/// when it returns non-zero.
-///
-/// C's low-`max` special case at `:174-181` is unreachable from this module:
-/// the only caller passes [`CURL_OFF_T_MAX`], which is far above the base.
-///
 /// # Errors
 ///
 /// [`StrError::NoNum`] when the first byte is not a digit, and
@@ -1227,9 +1027,7 @@ fn str_single(input: &[u8], pos: &mut usize, byte: u8) -> Result<(), StrError> {
 /// The three operating-system facilities `setvariable` reaches for.
 ///
 /// `src/var.c` calls `getenv` at `:408`, `curlx_fopen(line, "rb")` at `:446`
-/// and takes `stdin` at `:444`. All three are injected rather than reached for,
-/// per AAP section 0.3.3's P12, and for two concrete reasons rather than as a
-/// matter of taste:
+/// and takes `stdin` at `:444`.
 ///
 /// * every branch -- including the `Failed to open` diagnostic and the
 ///   blank-versus-absent environment distinction of `:400-401` -- becomes
@@ -1239,9 +1037,6 @@ fn str_single(input: &[u8], pos: &mut usize, byte: u8) -> Result<(), StrError> {
 ///   state that every other test in the same binary reads concurrently. The
 ///   production path still reads the live environment at run time, as
 ///   [`OsVarHost::getenv`] shows.
-///
-/// [`OsVarHost`] is the production implementation and the only one outside the
-/// tests below.
 pub(crate) trait VarHost {
     /// `getenv(name)` -- `src/var.c:408`.
     ///
@@ -1267,7 +1062,6 @@ pub(crate) trait VarHost {
 /// `"rb"` has no counterpart on the four mandated targets, all of which are
 /// Unix: there is no text mode to opt out of, and
 /// `lib/curlx/fopen.h:65` makes `curlx_fopen` a plain `fopen` off Windows.
-#[allow(dead_code)]
 pub(crate) struct OsVarHost;
 
 impl VarHost for OsVarHost {
@@ -1364,11 +1158,6 @@ pub(crate) fn setvariable(
         // `:402-407` -- C copies the name into `char buf[MAX_VAR_LEN]` when
         // something follows it, purely to obtain a terminator for `getenv`.
         // A slice is already bounded, so the copy has no counterpart.
-        //
-        // `std::env::var_os`, which [`OsVarHost::getenv`] calls, documents a
-        // panic for a key that is empty or holds `=` or NUL. None is
-        // reachable: `nlen >= 1` was just checked and every byte satisfied
-        // `is_name_byte`, which admits only ASCII alphanumerics and `_`.
         let value = host.getenv(name);
 
         // `:402` and `:409` both test `*line`, i.e. whether anything follows
@@ -1545,18 +1334,6 @@ mod tests {
 
     /// The message a diagnostic carried, with the line breaks `voutf_bytes`
     /// inserted for the terminal width taken back out.
-    ///
-    /// `crate::output::msgs` wraps at the terminal width, and that width comes
-    /// from the ambient `COLUMNS` or a `TIOCGWINSZ` probe, so a test that
-    /// compared raw sink bytes would pass under `cargo test` from a pipe and
-    /// fail from a terminal. Reversing the wrap is exact rather than
-    /// approximate: the prefix is written at the start of every emitted line
-    /// and no byte is dropped at a break -- the blank it breaks on is written
-    /// as part of the line it ends -- so deleting each newline-plus-prefix pair
-    /// reconstructs the message byte for byte at any width.
-    ///
-    /// `None` when the sink does not look like exactly one diagnostic with this
-    /// prefix.
     fn unwrapped(sink: &[u8], prefix: &str) -> Option<Vec<u8>> {
         let mut rest = sink.strip_prefix(prefix.as_bytes())?;
 
@@ -2262,11 +2039,6 @@ mod tests {
 
     /// All five names are recognised by `varexpand`, which is what separates a
     /// missing codec from a misspelled function.
-    ///
-    /// `b64` and `64dec` cannot yet produce bytes -- see GAP #1 on
-    /// [`encode_base64`] -- so what is asserted for those two is that the name
-    /// MATCHED: the outcome is `PARAM_NO_MEM` with an empty sink, and
-    /// emphatically not the unknown-function error.
     #[test]
     fn all_five_function_names_are_recognised() {
         let vars = one("v", b"aGk=");
@@ -2309,9 +2081,6 @@ mod tests {
     /// `:216-229` -- an escaped `{{` is emitted verbatim, and `added` is NOT
     /// set, so the whole expansion reports "not replaced" and the caller keeps
     /// the original argument WITH its backslash.
-    ///
-    /// This is a genuine quirk of curl 8.19.0-DEV rather than an oversight
-    /// here. AAP section 0.8.2 forbids a change justified by improvement.
     #[test]
     fn escaped_braces_leave_replaced_false() {
         let vars = one("v", b"V");
@@ -2938,12 +2707,6 @@ mod tests {
     }
 
     /// [`OsVarHost::getenv`] against the live environment, without mutating it.
-    ///
-    /// The production path has to be exercised as well as the double, or the
-    /// double would be the only thing under test. Nothing is set or removed
-    /// here: `std::env::set_var` mutates state that every other test in this
-    /// binary reads concurrently, and the properties that matter are reachable
-    /// from the environment as it already is.
     #[test]
     fn os_var_host_reads_the_live_environment() {
         let host = OsVarHost;
@@ -3261,5 +3024,45 @@ mod tests {
             Ok(Some(b"https://example.com%2Fa%20b?p=spaced".to_vec()))
         );
         assert!(sink.is_empty());
+    }
+
+    /// A variable's content cannot reach a formatted variable or set.
+    ///
+    /// `--variable` exists so a secret need not appear in a process listing
+    /// (`docs/cmdline-opts/variable.md`), so rendering the content in a
+    /// diagnostic would defeat the option. The NAME must survive, because it is
+    /// what a reader debugging an unexpanded reference needs.
+    #[test]
+    fn a_variable_content_cannot_reach_a_formatted_representation() {
+        const SECRET: &str = "sk-live-0123456789abcdef";
+
+        let var = ToolVar {
+            name: String::from("apikey"),
+            content: SECRET.as_bytes().to_vec(),
+        };
+        let one = format!("{var:?}");
+        assert!(!one.contains(SECRET), "the content leaked: {one}");
+        assert!(one.contains("apikey"), "the name must survive: {one}");
+        assert!(
+            one.contains(&format!("<redacted, {} bytes>", SECRET.len())),
+            "{one}"
+        );
+
+        let vars = Variables {
+            vars: vec![ToolVar {
+                name: String::from("apikey"),
+                content: SECRET.as_bytes().to_vec(),
+            }],
+        };
+        let all = format!("{vars:?}");
+        assert!(!all.contains(SECRET), "the content leaked: {all}");
+        assert!(all.contains("apikey"), "{all}");
+
+        // An empty variable stays distinguishable from a missing one.
+        let empty = ToolVar {
+            name: String::from("blank"),
+            content: Vec::new(),
+        };
+        assert!(format!("{empty:?}").contains("<redacted, 0 bytes>"));
     }
 }

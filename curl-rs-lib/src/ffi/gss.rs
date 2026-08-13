@@ -24,70 +24,10 @@
 
 //! The optional GSS-API binding: Negotiate, SPNEGO and Kerberos 5 support.
 //!
-//! This module supersedes `lib/curl_gssapi.c` (448 lines) and
-//! `lib/curl_gssapi.h` (71 lines). It is the smaller of the **two** files in
-//! `curl-rs-lib` permitted to contain `unsafe` -- the other being
-//! `src/ffi/sys.rs` -- and it is the only one that binds a C security library.
-//!
-//! # Why this file is allowed to exist at all
-//!
-//! The requirements contain an absolute prohibition -- no C TLS library at any
-//! configuration, "not as a default, not behind a feature flag, not as a
-//! fallback" -- and, in the same breath, mandate "Negotiate where OS Kerberos
-//! is available". Those two clauses are reconciled by one observation:
-//!
-//! > GSS-API is neither libcurl, nor libssl, nor a TLS library -- it is an
-//! > authentication mechanism. Negotiate sits behind a non-default
-//! > `negotiate` feature with the binding confined to
-//! > `curl-rs-lib/src/ffi/gss.rs`, so the default build links no C security
-//! > library at all.
-//!
-//! That is why the first attribute below is `#![cfg(feature =
-//! "negotiate")]`. It is deliberately belt-and-braces: `src/ffi/mod.rs`
-//! declares this module as `#[cfg(feature = "negotiate")] pub(crate) mod
-//! gss;`, and the inner attribute makes the guarantee hold *from this file
-//! alone*. With the feature off -- which is the default, since
-//! `curl-rs-lib/Cargo.toml` lists `negotiate` outside `default` alongside
-//! `hickory-dns` and `memdebug` -- this file contributes nothing whatsoever:
-//! no item, no `#[link]` directive, no linker input, no symbol. The negative
-//! proof is mechanical: `ldd` on a default build finds no `libgssapi_krb5`,
-//! and `nm` finds no undefined `gss_*`.
-//!
-//! # The two consumers, and nothing else
-//!
-//! The public surface here was sized for exactly two callers. Neither exists at
-//! this commit; both are `negotiate`-gated when they land, and the surface
-//! below is deliberately no wider than what they need:
-//!
-//! * `curl-rs-lib/src/auth/negotiate.rs`, to supersede
-//!   `lib/vauth/krb5_gssapi.c`, `lib/vauth/spnego_gssapi.c` and
-//!   `lib/http_negotiate.c`.
-//! * `curl-rs-lib/src/proxy/socks_gss.rs`, to supersede
-//!   `lib/socks_gssapi.c` (RFC 1961 SOCKS5 GSS-API).
-//!
-//! Every entry point added here permanently enlarges the surface that has to
-//! be audited by hand, so the binding covers the ten GSS-API functions the C
-//! files listed above demonstrably call and not one more. In particular
-//! `gss_seal()` and `gss_unseal()` are **not** bound: a search of the C tree
-//! finds them only inside RFC 1961 explanatory comments
-//! (`lib/socks_gssapi.c:343`, `:366-367`) and in the excluded VMS shim
-//! (`lib/setup-vms.h:363-364`). There is no call site anywhere.
-//!
-//! # What is transcribed from where
-//!
-//! Every constant and every argument order below comes from the C tree,
-//! cross-checked against the installed GSS-API headers:
-//!
-//! | Item | C source |
-//! |------|----------|
-//! | The two mechanism OIDs, byte for byte | `lib/curl_gssapi.c:63-68` |
-//! | `CURL_ALIGN8` on those descriptors | `lib/curl_gssapi.c:52-56` |
-//! | `req_flags` composition and the `gss_init_sec_context` call | `lib/curl_gssapi.c:313-371` |
-//! | Context teardown | `lib/curl_gssapi.c:373-385` |
-//! | The 1024-byte error-text assembler | `lib/curl_gssapi.c:387-442` |
-//! | `GSSAUTH_P_NONE` / `_INTEGRITY` / `_PRIVACY` | `lib/curl_gssapi.h:65-67` |
-//! | The Apple deprecation pragma | `lib/curl_gssapi.c:58-61`, `:444-446` |
-//! | `CURLGSSAPI_DELEGATION_*` bit values | `include/curl/curl.h:861-863` |
+//! This module supersedes `lib/curl_gssapi.c` and `lib/curl_gssapi.h`. It is
+//! the smaller of the **two** files in `curl-rs-lib` permitted to contain
+//! `unsafe` -- the other being `src/ffi/sys.rs` -- and it is the only one that
+//! binds a C security library.
 //!
 //! # `CURL_GSS_STUB` is deliberately absent
 //!
@@ -109,11 +49,7 @@
 //! # Diagnostics are injected, not reached for
 //!
 //! In C, `Curl_gss_log_error()` takes a `struct Curl_easy *data` and calls
-//! `infof()` on it (`lib/curl_gssapi.c:429-441`). The Rust equivalent of that
-//! session handle belongs in `src/easy/`, which does not exist yet and which
-//! this module must not depend on when it does:
-//! `src/ffi/` is a leaf, and keeping it a leaf is exactly what makes it
-//! testable under Miri without a live library. The `data` parameter is
+//! `infof()` on it (`lib/curl_gssapi.c:429-441`). The `data` parameter is
 //! therefore modelled as the [`Diagnostics`] trait, which the caller
 //! implements over its own trace sink. The text this module hands to it is
 //! byte-identical to what C's `infof(data, "%s%s", prefix, buf)` would emit,
@@ -123,21 +59,6 @@
 //! CURLVERBOSE` (`lib/curl_gssapi.h:50-62`). There is no verbosity feature in
 //! this workspace, so the real implementation is always present. That is
 //! intentional, not an oversight.
-//!
-//! # The truthfulness coupling with `src/version.rs`
-//!
-//! `src/version.rs` is to emit `GSS-API`, `SPNEGO` and `Kerberos` in the
-//! `Features:` line of `curl --version` only under `negotiate` and only when
-//! the capability is genuinely usable. `tests/runtests.pl` parses that line
-//! against a fixed 52-name vocabulary and uses it to decide which fixtures to
-//! run, and the asymmetry is decisive: **under-reporting a capability makes a
-//! fixture skip; over-reporting makes it run and fail.** A compile-time
-//! `cfg!` is therefore not enough, because a binary can be *built* with
-//! `negotiate` on a host where the runtime library is unusable. [`available`]
-//! exists to answer that question at run time. This module supplies only the
-//! predicate; the three banner spellings belong to `src/version.rs`, which
-//! gates them on `cfg!(feature = "negotiate")` alone at this commit and still
-//! owes the call to [`available`].
 //!
 //! # The safety seam
 //!
@@ -158,19 +79,6 @@
 //!   raw-pointer operation but not a foreign call, and
 //!   `unsafe impl Sync for GssOidDesc` asserts a thread-safety property the
 //!   compiler cannot derive because the type holds a raw pointer.
-//!
-//! Everything else is ordinary safe Rust parameterised over the trait, which is
-//! what lets the flag composition, the error-text assembly, the handshake
-//! stepping and the availability probe all be exercised by a pure-Rust double
-//! under `cargo miri test`.
-//!
-//! Buffer, name and context lifetimes are enforced by `Drop` rather than by
-//! hand-placed release calls, so no added `?` can skip one -- but "enforced by
-//! `Drop`" is not the same as "released only by `Drop`". Two of the three
-//! `release_name` call sites and one of the two `delete_sec_context` call sites
-//! are explicit rather than RAII, for reasons documented at each; the
-//! at-most-once property comes from a consume-and-discard convention plus a
-//! null-handle short-circuit, not from `Drop` being the sole releaser.
 
 #![cfg(feature = "negotiate")]
 
@@ -187,13 +95,6 @@ use std::sync::OnceLock;
 // Protection levels
 
 /// No per-message protection. `GSSAUTH_P_NONE` -- `lib/curl_gssapi.h:65`.
-///
-/// This family is the RFC 4752 section 3.1 **SASL security-layer bitmask**,
-/// which is a different encoding from the RFC 1961 SOCKS5 protection *level*;
-/// see [`SOCKS5_PROTECTION_NONE`] for the latter, and do not substitute one
-/// for the other. `lib/vauth/krb5_gssapi.c:234` rejects a server offer that
-/// does not include this bit and then masks the octet down to it at `:239`,
-/// because curl implements no security layer.
 pub(crate) const GSSAUTH_P_NONE: u8 = 1;
 
 /// Integrity protection. `GSSAUTH_P_INTEGRITY` -- `lib/curl_gssapi.h:66`.
@@ -209,12 +110,6 @@ pub(crate) const GSSAUTH_P_PRIVACY: u8 = 4;
 /// The warning C emits when the platform GSS-API lacks
 /// `GSS_C_DELEG_POLICY_FLAG`, reproduced verbatim from
 /// `lib/curl_gssapi.c:333-334`.
-///
-/// C spells it as two adjoining string literals; the value below is the
-/// concatenation the compiler produces, which is what `infof()` actually
-/// receives. It is public to the crate so `src/auth/negotiate.rs`, once it
-/// lands, can emit it through the same trace path as every other `infof()`
-/// message.
 pub(crate) const DELEGATION_POLICY_UNSUPPORTED_WARNING: &str =
     "WARNING: support for CURLGSSAPI_DELEGATION_POLICY_FLAG not compiled in";
 
@@ -265,14 +160,6 @@ const GSS_C_CONF_FLAG: OmUint32 = 16;
 const GSS_C_INTEG_FLAG: OmUint32 = 32;
 
 /// `GSS_C_DELEG_POLICY_FLAG` = 32768.
-///
-/// MIT Kerberos 1.8 and later define this, as does Apple's GSS.framework, so
-/// all four mandated targets have it; the probe measured 32768. It is absent
-/// from GNU GSS, which is what the `#else` branch at `lib/curl_gssapi.c:332-335`
-/// exists for. That branch is still modelled here -- see
-/// [`DELEGATION_POLICY_UNSUPPORTED_WARNING`] and the
-/// `policy_flag_supported` parameter of [`request_flags`] -- so the behaviour
-/// is reproduced.
 const GSS_C_DELEG_POLICY_FLAG: OmUint32 = 32768;
 
 /// `GSS_C_GSS_CODE` = 1: render a *major* status through `gss_display_status`.
@@ -348,12 +235,6 @@ impl GssBufferDesc {
     };
 
     /// A descriptor borrowing `bytes` for the duration of one call.
-    ///
-    /// GSS-API declares input buffers as the non-const `gss_buffer_t` for
-    /// purely historical reasons and never writes through them; C curl asserts
-    /// the same thing with its `CURL_UNCONST` macro. The `*const -> *mut` cast
-    /// therefore happens here, at the boundary, while the Rust side of the
-    /// data stays genuinely immutable.
     fn borrowing(bytes: &[u8]) -> Self {
         Self {
             length: bytes.len(),
@@ -363,9 +244,6 @@ impl GssBufferDesc {
 }
 
 /// `gss_OID_desc` -- `{ OM_uint32 length; void *elements; }`.
-///
-/// Measured: 16 bytes, `length` at offset 0, `elements` at offset 8,
-/// alignment 8.
 ///
 /// `align(8)` reproduces `CURL_ALIGN8`, which `lib/curl_gssapi.c:52-56`
 /// expands to `__attribute__((aligned(8)))` and applies to both mechanism
@@ -429,15 +307,6 @@ unsafe impl Sync for GssOidDesc {}
 
 /// `struct gss_channel_bindings_struct`, the referent of
 /// `gss_channel_bindings_t`.
-///
-/// Measured: 64 bytes, alignment 8, with `initiator_addrtype` at 0,
-/// `initiator_address` at 8, `acceptor_addrtype` at 24, `acceptor_address` at
-/// 32 and `application_data` at 48.
-///
-/// `lib/vauth/spnego_gssapi.c:152-159` fills `application_data` alone, leaving
-/// everything else zeroed by `memset`, and only when
-/// `GSS_C_CHANNEL_BOUND_FLAG` is available. [`channel_bindings`] reproduces
-/// that exactly.
 #[repr(C)]
 #[allow(dead_code)]
 struct GssChannelBindings {
@@ -529,20 +398,6 @@ static KRB5_MECH_OID_BYTES: [u8; 9] =
     [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
 
 /// `GSS_C_NT_HOSTBASED_SERVICE`, OID 1.2.840.113554.1.2.1.4.
-///
-/// C reaches for the library's exported `gss_OID` *variable*
-/// (`lib/vauth/spnego_gssapi.c:118`, `lib/vauth/krb5_gssapi.c:110`,
-/// `lib/socks_gssapi.c:156`). This binding carries the octets instead, for
-/// three reasons: GSS-API selects a name type by comparing the OID *value*,
-/// so the two are behaviourally identical; MIT exports the variable under a
-/// versioned symbol (`GSS_C_NT_HOSTBASED_SERVICE@@gssapi_krb5_2_MIT`), and
-/// declaring a versioned `extern static` from Rust is avoidable risk; and
-/// Apple's GSS.framework exports it differently again, so hard-coding keeps
-/// all four mandated targets on one code path.
-///
-/// The octets were not derived on paper -- they were printed from
-/// `libgssapi_krb5.so.2` at run time, which reported length 10 and exactly
-/// this sequence.
 static HOSTBASED_SERVICE_OID_BYTES: [u8; 10] =
     [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x01, 0x04];
 
@@ -644,16 +499,6 @@ impl NameType {
 // exists by design: the SSPI variants -- `lib/vauth/krb5_sspi.c`,
 // `spnego_sspi.c`, `digest_sspi.c`, `ntlm_sspi.c`, `lib/curl_sspi.c` and
 // `lib/socks_sspi.c` -- are all out of scope.
-//
-// A note on the deprecation pragma that wraps the whole C file
-// (`lib/curl_gssapi.c:58-61`, `:444-446`): it suppresses
-// `-Wdeprecated-declarations` under `__GNUC__ && __APPLE__` because Apple's
-// GSS.framework headers mark these entry points deprecated. Rust cannot
-// inherit that, because it does not read the C headers -- the declarations
-// below are this file's own and carry no `#[deprecated]`. There is therefore
-// no deprecation lint to silence on either Darwin target, and adding an
-// `#[allow(deprecated)]` "to match C" would be noise rather than parity. This
-// was verified by building for both Apple triples.
 
 /// The four mandated targets are `x86_64-unknown-linux-gnu`,
 /// `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and
@@ -901,13 +746,6 @@ impl ContextFlags {
 
     /// The RFC 1961 protection level this context supports, selected exactly
     /// as `lib/socks_gssapi.c:330-335` selects it.
-    ///
-    /// The returned value is the **RFC 1961 wire octet**, not a
-    /// [`GSSAUTH_P_NONE`]-family constant: C computes `gss_enc = 0` for no
-    /// protection, `2` for confidentiality and `1` for integrity, and writes
-    /// that octet into the protection-level message. The two families happen
-    /// to be different encodings of the same idea, and confusing them would
-    /// put the wrong byte on the wire -- so this returns C's, byte for byte.
     #[allow(dead_code)]
     pub(crate) fn socks5_protection_level(self) -> u8 {
         if self.has_confidentiality() {
@@ -930,13 +768,6 @@ pub(crate) const SOCKS5_PROTECTION_INTEGRITY: u8 = 1;
 pub(crate) const SOCKS5_PROTECTION_CONFIDENTIALITY: u8 = 2;
 
 /// The value of `CURLOPT_GSSAPI_DELEGATION`, as a type rather than a `long`.
-///
-/// `include/curl/curl.h:861-863` declares the option's three constants:
-/// `CURLGSSAPI_DELEGATION_NONE` is `0L`,
-/// `CURLGSSAPI_DELEGATION_POLICY_FLAG` is `(1L << 0)` and
-/// `CURLGSSAPI_DELEGATION_FLAG` is `(1L << 1)`. They are a bitmask, and
-/// `lib/curl_gssapi.c:329` and `:338` test them independently, so both may be
-/// set at once.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Delegation(i64);
 
@@ -952,12 +783,6 @@ impl Delegation {
     const ALWAYS_BIT: i64 = 1 << 1;
 
     /// Adopt the raw option value the easy handle holds.
-    ///
-    /// The parameter is `i64` rather than `libc::c_long` deliberately: no
-    /// `libc` type may appear in this module's crate-visible surface, and all
-    /// four mandated targets are LP64, so `c_long` and `i64` are the same
-    /// integer there. Unknown bits are preserved rather than rejected, exactly
-    /// as C preserves them -- it only ever tests the two it knows.
     #[allow(dead_code)]
     pub(crate) const fn from_option_value(value: i64) -> Self {
         Self(value)
@@ -975,12 +800,6 @@ impl Delegation {
 }
 
 /// Whether the platform GSS-API defines `GSS_C_DELEG_POLICY_FLAG`.
-///
-/// True on every mandated target -- MIT Kerberos has had it since 1.8 and
-/// Apple's GSS.framework defines it too -- which is why [`request_flags`] is
-/// normally called with this value. The constant exists so the value has a
-/// single home rather than being written `true` at the call site, and so the
-/// `false` path stays reachable and unit-tested rather than rotting.
 #[allow(dead_code)]
 const DELEGATION_POLICY_FLAG_SUPPORTED: bool = true;
 
@@ -1019,10 +838,6 @@ impl RequestedFlags {
 
 /// Compose `req_flags` exactly as `lib/curl_gssapi.c:324-339` composes it.
 ///
-/// This is the single highest-risk computation in the file, because the flags
-/// change the bytes on the wire, so it is a pure function of its inputs and is
-/// exhaustively unit-tested rather than being folded into the FFI call.
-///
 /// Order and seed are both load-bearing:
 ///
 /// 1. `req_flags` starts at `GSS_C_REPLAY_FLAG`, **not** zero (`:324`).
@@ -1035,9 +850,6 @@ impl RequestedFlags {
 ///    **not** silently dropped (`:329-336`).
 /// 4. `GSS_C_DELEG_FLAG` is added when the mask carries
 ///    `CURLGSSAPI_DELEGATION_FLAG` (`:338-339`).
-///
-/// `policy_flag_supported` is a parameter rather than a `cfg!` so that the
-/// GNU-GSS branch is reachable from a test on a host where MIT is installed.
 pub(crate) fn request_flags(
     mutual_auth: bool,
     delegation: Delegation,
@@ -1106,11 +918,6 @@ impl<T: Diagnostics + ?Sized> Diagnostics for &mut T {
 
 // The substitutable seam
 //
-// Everything below the `SystemGss` implementation of this trait is ordinary
-// safe Rust. That is what makes the flag composition, the error-text
-// assembler, the handshake stepping and the availability probe all runnable
-// under `cargo miri test`, which cannot call into a real GSS-API library.
-//
 // Three deliberate shapes make the seam safe rather than merely indirect:
 //
 //   * every method is a SAFE `fn`, so no caller needs an `unsafe` block; the
@@ -1149,13 +956,6 @@ trait GssProvider {
     fn delete_sec_context(&self, context: RawContext);
 
     /// `gss_init_sec_context`.
-    ///
-    /// Returns the possibly-replaced context handle, because the C parameter
-    /// is in/out and the library may hand back a different one on any call.
-    ///
-    /// Infallible on purpose: the handle must reach the caller even when the
-    /// step failed, so the fallible part lives in [`StepOutcome::token`]. See
-    /// that type for why.
     #[allow(dead_code)]
     fn init_sec_context(
         &self,
@@ -1288,12 +1088,6 @@ struct NameOutcome {
 /// `Result<StepOutcome, CURLcode>` reintroduces the hazard, because a single `?`
 /// then drops the replacement on the floor: the new handle leaks and the caller
 /// goes on to delete a handle the library has already freed.
-///
-/// So the only fallible part -- copying the output token into owned storage --
-/// is carried *inside* the outcome instead of in place of it. That makes the
-/// error impossible to observe before the handle has been adopted, and it is a
-/// property of the type rather than of the call sites: there is no `?` for a
-/// later edit to add, because there is no `Result` to apply one to.
 #[allow(dead_code)]
 struct StepOutcome {
     status: GssStatus,
@@ -1346,15 +1140,6 @@ struct StatusText {
 /// `lib/vauth/krb5_gssapi.c` and 2 in `lib/curl_gssapi.c` -- precisely because
 /// every early return needs its own, and each one is a leak waiting to happen.
 /// Here an added `?` cannot skip one.
-///
-/// A plain `grep -c` reports 31, one more than the executable calls. The
-/// extra match is `lib/curl_gssapi.c:34`,
-/// `#define Curl_gss_alloc malloc  /* freed via the GSS API
-/// gss_release_buffer() */` -- the name inside a TRAILING block comment on a
-/// `#define`, not a call. It is worth naming because the usual way of skipping
-/// comments, testing whether the line STARTS with a comment marker, does not
-/// catch this one: the count has to exclude comment interiors, not comment-only
-/// lines.
 #[allow(dead_code)]
 struct LibraryBuffer {
     descriptor: GssBufferDesc,
@@ -1377,22 +1162,6 @@ impl LibraryBuffer {
     }
 
     /// Copy the contents into owned storage.
-    ///
-    /// Returns an owned `Vec` so nothing outside this module ever holds a view
-    /// into library memory. An absurd length -- which only a broken or hostile
-    /// mechanism could report -- yields `CURLE_OUT_OF_MEMORY` rather than an
-    /// allocation abort, keeping every wrapper total.
-    ///
-    /// "Total" is the operative word, and it is why the copy reserves before it
-    /// writes. `[u8]::to_vec` and `Vec::extend_from_slice` allocate
-    /// *infallibly*: when the allocator refuses they call
-    /// `alloc::alloc::handle_alloc_error`, which aborts the process. A
-    /// mechanism reporting a token larger than the address space can satisfy --
-    /// a broken one, or one fed by a hostile peer -- would therefore take the
-    /// entire application down instead of failing one authentication. libcurl
-    /// has a code for that condition and every other allocation on this path
-    /// already reports it, so aborting would be both a denial of service and a
-    /// departure from the surrounding contract.
     #[allow(dead_code)]
     fn to_owned_vec(&self) -> Result<Vec<u8>, CURLcode> {
         if self.descriptor.value.is_null() || self.descriptor.length == 0 {
@@ -1531,16 +1300,6 @@ impl GssProvider for SystemGss {
         //   `available_with`          the availability probe, which releases
         //                             unconditionally and then inspects only
         //                             the status, never the handle.
-        //
-        // In all three the caller's `RawName` is dead at the point of call, so
-        // no live copy survives to be released a second time. `RawName` is
-        // `Copy`, which is what makes passing by value the right shape here:
-        // there is no move to observe, only a convention the three sites keep.
-        // The `GSS_C_NO_NAME` short-circuit above also makes a double release
-        // harmless rather than merely unreachable, since a poisoned handle
-        // returns before touching the library. Writing through `&mut handle`
-        // affects only the local, which is correct: the caller's copy is
-        // already being discarded.
         unsafe {
             gss_release_name(&mut minor, &mut handle);
         }
@@ -1574,10 +1333,6 @@ impl GssProvider for SystemGss {
         // short-circuit above and never reaches the library a second time. That
         // ordering -- delete, then poison, with no fallible step between -- is
         // the invariant to preserve if either function is ever edited.
-        //
-        // Null is passed for the output token, exactly as the C call sites do
-        // (for example `lib/socks_gssapi.c:196`), so no buffer can be leaked
-        // here.
         unsafe {
             gss_delete_sec_context(
                 &mut minor,
@@ -1848,19 +1603,6 @@ impl GssProvider for SystemGss {
 }
 
 // Ownership guards.
-//
-// From here down there is no `unsafe` and no raw-pointer OPERATION: every call
-// goes through the `GssProvider` trait, which is what lets the tests -- and
-// Miri -- drive it with a pure-Rust double. The guards do STORE raw pointers,
-// because `RawName` and `RawContext` are `#[repr(transparent)]` newtypes over
-// `*mut c_void`; what they never do is dereference one. That is the line worth
-// keeping: a handle may be held, copied and compared against its null value
-// here, and may only be dereferenced behind the trait.
-//
-// The guards are generic over the provider so the double can own them, and are
-// private for the same reason: a `pub(crate)` item may not name the private
-// `GssProvider` trait. The crate-visible types below are thin newtypes over
-// the `SystemGss` instantiation.
 
 /// An owned `gss_name_t`, released exactly once.
 ///
@@ -2032,12 +1774,6 @@ impl<P: GssProvider> ContextGuard<P> {
         // *retires* the handle that was here before, which is the half that
         // matters most -- if the library replaced it, the old value is already
         // freed and deleting it again would be a double free.
-        //
-        // `init_sec_context` returns no `Result`, so nothing can run between the
-        // call and these two lines. The status is recorded here for the same
-        // reason C assigns `nego->status` before its own error check
-        // (`lib/vauth/spnego_gssapi.c:175`): `lib/http_negotiate.c:237-238`
-        // reads it back after a failure, so it has to survive one.
         self.handle = outcome.context;
         self.status = outcome.status;
 
@@ -2209,11 +1945,6 @@ pub(crate) struct SealedMessage {
 
 /// Append every part of one status value to `buffer`, mirroring
 /// `display_gss_error()` at `lib/curl_gssapi.c:389-415`.
-///
-/// The loop is a `do`/`while`, so at least one call always happens, and it
-/// continues `while(!GSS_ERROR(maj_stat) && msg_ctx)`: GSS-API returns
-/// multi-part messages through the `msg_ctx` cursor, and a single call is not
-/// enough.
 #[allow(dead_code)]
 fn append_status_parts<P: GssProvider>(
     provider: &P,
@@ -2268,9 +1999,6 @@ struct GssStatusValue(OmUint32);
 
 /// `Curl_gss_log_error()` -- `lib/curl_gssapi.c:429-441`.
 ///
-/// Returns the string C passes to `infof(data, "%s%s", prefix, buf)` rather
-/// than logging it, because the sink is the caller's (see [`Diagnostics`]).
-///
 /// Two details are easy to get backwards and are therefore spelled out:
 ///
 /// * the **major** status is rendered only when it is not `GSS_S_FAILURE`
@@ -2278,9 +2006,6 @@ struct GssStatusValue(OmUint32);
 ///   not say better;
 /// * the **minor** status is rendered unconditionally (`:438`), with
 ///   `GSS_C_MECH_CODE` rather than `GSS_C_GSS_CODE`.
-///
-/// C's buffer is `char buf[1024] = ""`, so when neither status renders any text
-/// the result is the bare prefix. That is reproduced.
 #[allow(dead_code)]
 fn describe<P: GssProvider>(
     provider: &P,
@@ -2334,10 +2059,6 @@ impl TargetName {
     /// `gss_import_name` -- `lib/vauth/spnego_gssapi.c:117-127`,
     /// `lib/vauth/krb5_gssapi.c:109-118`, `lib/socks_gssapi.c:142-157`.
     ///
-    /// `name` is the service principal in the mechanism's textual form; for
-    /// [`NameType::HostBasedService`] that is `service@host`, which is what
-    /// `Curl_auth_build_spn()` produces.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::AuthError`] if the name is empty or the mechanism rejects
@@ -2353,9 +2074,6 @@ impl TargetName {
     }
 
     /// `gss_display_name` -- `lib/socks_gssapi.c:304-314`.
-    ///
-    /// Returns the mechanism's textual rendering, owned. SOCKS5 logs it as the
-    /// authenticated username.
     ///
     /// # Errors
     ///
@@ -2373,11 +2091,6 @@ impl TargetName {
 
 /// Everything [`SecurityContext::step`] needs, as named fields rather than a
 /// thirteen-argument call.
-///
-/// The default is the shape SPNEGO uses: mutual authentication on, no
-/// delegation, no channel bindings, no returned flags -- matching
-/// `lib/vauth/spnego_gssapi.c:162-171`, which passes `TRUE` for `mutual_auth`
-/// and `NULL` for `ret_flags`.
 pub(crate) struct StepOptions<'a> {
     /// The imported service principal.
     #[allow(dead_code)]
@@ -2428,23 +2141,6 @@ impl<'a> StepOptions<'a> {
 }
 
 /// An owned GSS-API security context, deleted exactly once.
-///
-/// Supersedes the `gss_ctx_id_t` C stores in `struct negotiatedata` and
-/// `struct kerberos5data`, plus `Curl_gss_init_sec_context()` and
-/// `Curl_gss_delete_sec_context()` (`lib/curl_gssapi.c:313-385`).
-///
-/// The whole lifecycle is here: a fresh value is `GSS_C_NO_CONTEXT`,
-/// [`Self::step`] drives the handshake and adopts whatever handle the library
-/// returns, and `Drop` deletes it. There is no way to observe a handle the
-/// library has replaced, and no path -- early return, `?`, or panic -- that
-/// leaks one or deletes one twice.
-///
-/// That last sentence is load-bearing rather than decorative, so the shape that
-/// enforces it is worth naming: the provider's `init_sec_context` returns a
-/// [`StepOutcome`] and *not* a `Result`, which leaves no expression between the
-/// library call and the adoption for a `?` to occupy. The one fallible step --
-/// copying the output token -- is carried inside that outcome and is unwrapped
-/// only after the handle and the status have been stored.
 #[allow(dead_code)]
 pub(crate) struct SecurityContext(ContextGuard<SystemGss>);
 
@@ -2464,12 +2160,6 @@ impl SecurityContext {
     }
 
     /// Whether a handshake completed successfully on this context.
-    ///
-    /// Both halves of `lib/vauth/spnego_gssapi.c:96`. A caller that sees this
-    /// return `true` on a *fresh* challenge is in the situation C answers with
-    /// `CURLE_LOGIN_DENIED` at `:101` -- the server rejected an authentication
-    /// the client considered finished -- and that mapping stays with the caller,
-    /// because only it knows a new challenge arrived.
     #[allow(dead_code)]
     pub(crate) fn is_established(&self) -> bool {
         self.0.is_established()
@@ -2538,11 +2228,6 @@ impl SecurityContext {
     /// `gss_wrap` with `GSS_C_QOP_DEFAULT` -- `lib/socks_gssapi.c:383-385`,
     /// `lib/vauth/krb5_gssapi.c:274-276`.
     ///
-    /// `confidentiality` is C's `conf_req_flag`, which both call sites pass as
-    /// `0`; the parameter exists because the value is observable in
-    /// [`SealedMessage::confidential`] and forcing it to `false` here would
-    /// hide a capability the ABI exposes.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::AuthError`] if the mechanism refuses, or
@@ -2599,38 +2284,6 @@ impl Default for SecurityContext {
 const AVAILABILITY_PROBE_NAME: &[u8] = b"host@localhost";
 
 /// Whether GSS-API is genuinely usable in this process, right now.
-///
-/// This is the predicate `src/version.rs` must consult before it puts
-/// `GSS-API`, `SPNEGO` or `Kerberos` in the `Features:` line of
-/// `curl --version`. It does not consult it yet: at this commit those three
-/// entries are gated on `cfg!(feature = "negotiate")` alone, which is the
-/// weaker test. A compile-time `cfg!` does not suffice, because a binary can be
-/// *built* with the feature on a host where the runtime library is present but
-/// unusable -- no mechanism configured, a broken `/etc/gss` or `gss_mech`
-/// setup -- and over-reporting in that state turns a clean fixture skip into a
-/// hard failure. `tests/runtests.pl` believes the banner, so the banner must
-/// be true.
-///
-/// Total by construction: it returns a `bool`, never panics, never propagates
-/// an error, and performs no I/O. The answer is computed once and cached, so
-/// repeated calls -- the banner is assembled more than once -- cost nothing and
-/// cannot disagree with each other.
-/// # Under Miri
-///
-/// Answers `false` without probing. Miri interprets rather than links, so
-/// calling `gss_import_name` there is an unsupported operation that aborts the
-/// run -- and that is not a defect to be worked around but the literal truth
-/// about the environment: no GSS-API mechanism is reachable from a Miri
-/// execution, so "unavailable" is the accurate answer as well as the
-/// conservative one.
-///
-/// The alternative would have been to mark every test that transitively reaches
-/// this predicate as `#[cfg_attr(miri, ignore)]`. That was rejected: `version.rs`
-/// consults it while assembling the whole capability banner, so `features_bitmask`
-/// and `feature_names` reach it, and ignoring their tests would surrender Miri
-/// coverage of 32 unrelated rows to shield one. Deciding here costs nothing --
-/// [`available_with`] is fully covered under Miri through `FakeGss`, so the logic
-/// this shortcut skips is tested, only the linkage is not.
 pub(crate) fn available() -> bool {
     #[cfg(miri)]
     {
@@ -2658,17 +2311,6 @@ fn available_with<P: GssProvider>(provider: &P) -> bool {
 }
 
 // Tests
-//
-// `tests/unit/*.c` and `tests/libtest/*.c` link a debug static libcurl and
-// call internal `Curl_*` symbols. A Rust static library does not export
-// `pub(crate)` items -- they are genuinely absent from the symbol table, not
-// merely hidden -- so no quality of implementation makes those programs link,
-// and their coverage is relocated here instead.
-//
-// Everything below runs against `FakeGss`, a pure-Rust double, which is why it
-// all runs under `cargo miri test` as well: Miri cannot call into a real
-// GSS-API library, so a seam that only *looked* substitutable would show up
-// here as an untestable gap.
 
 #[cfg(test)]
 mod tests {
@@ -2711,13 +2353,6 @@ mod tests {
         names_released: usize,
         contexts_deleted: usize,
         /// *Which* handles were deleted, in order.
-        ///
-        /// The count above answers "how many times", which is enough to catch a
-        /// leak or a double delete of the same value. It cannot distinguish
-        /// deleting the handle that is current from deleting one the library
-        /// already destroyed and replaced -- both are exactly one deletion. That
-        /// is the question the ownership tests below ask, so the identity is
-        /// recorded too.
         deleted: Vec<RawContext>,
         display_status_calls: Vec<(OmUint32, c_int)>,
         wrapped: Vec<(bool, Vec<u8>)>,
@@ -2745,11 +2380,6 @@ mod tests {
         step_handle: Cell<Option<usize>>,
         /// Fails only the step's token copy, leaving the status and the handle
         /// substitution intact.
-        ///
-        /// Distinct from `oversize`, which fails every buffer copy in the
-        /// double, and a `Cell` for the same reason as `step_handle`: the
-        /// interesting case is a step that fails *after* an earlier one
-        /// succeeded.
         token_copy_fails: Cell<bool>,
         display_status_parts: Vec<StatusPart>,
         display_name_major: OmUint32,
@@ -2792,14 +2422,6 @@ mod tests {
     }
 
     /// Distinct stand-ins for the opaque handles a real mechanism would return.
-    ///
-    /// Backed by a genuine static rather than produced by an integer-to-pointer
-    /// cast, so the double carries real pointer provenance and
-    /// `cargo miri test -Zmiri-strict-provenance` accepts it. (A cast such as
-    /// `1usize as *mut c_void` is accepted by default Miri but rejected under
-    /// strict provenance, and `ptr::without_provenance_mut` only stabilised
-    /// after MSRV 1.75.) Nothing ever dereferences these; the guards only ever
-    /// compare them against null and hand them back to the double.
     static HANDLE_SLOTS: [u8; 4] = [0, 1, 2, 3];
 
     /// The slot the double reports from `import_name`.
@@ -3097,13 +2719,6 @@ mod tests {
     }
 
     /// Neutralise a hand-built descriptor before it can drop.
-    ///
-    /// `LibraryBuffer::drop` hands a non-null `value` to the real
-    /// `gss_release_buffer`. These tests build descriptors that point at static
-    /// storage rather than at a library allocation, so they must be reset to
-    /// `GSS_C_EMPTY_BUFFER` -- which `drop` ignores -- before going out of
-    /// scope. Resetting rather than `mem::forget` keeps the guard's own
-    /// early-return path on the tested path.
     fn defuse(buffer: &mut LibraryBuffer) {
         buffer.descriptor = GssBufferDesc::EMPTY;
     }
@@ -3113,13 +2728,6 @@ mod tests {
         static ONE_BYTE: u8 = 0xa5;
 
         // GSS_C_EMPTY_BUFFER: nothing was ever allocated.
-        //
-        // The expected value is spelled `Vec::<u8>::new()` rather than `&[]`
-        // because a bare empty slice literal leaves its element type to
-        // inference, and inference fails outright in any dependency graph
-        // carrying a second `PartialEq<_> for u8` implementation. Naming the
-        // type keeps this assertion compiling for every consumer instead of
-        // only for the graphs that happen to have one candidate.
         let absent = LibraryBuffer::empty();
         assert_eq!(
             absent.to_owned_vec().expect("no buffer is not an error"),
@@ -4094,12 +3702,6 @@ mod tests {
     }
 
     // ---- the token copy must never strand the context ---------------------
-    //
-    // `gss_init_sec_context` writes `context_handle` before it returns, so by
-    // the time this side tries to copy the output token the caller's previous
-    // handle may already be freed and a replacement installed. The copy is the
-    // one fallible step on that path, and these tests pin down that failing it
-    // neither leaks the replacement nor deletes the value it superseded.
 
     #[test]
     fn a_failed_token_copy_still_adopts_the_handle_and_the_status() {
@@ -4367,13 +3969,6 @@ mod tests {
     }
 
     /// The cached, real-library predicate.
-    ///
-    /// Ignored under Miri because it calls `gss_import_name` for real, and Miri
-    /// interprets rather than links -- an FFI call is an unsupported operation
-    /// there. The logic it delegates to is covered by `available_with` above,
-    /// which is Miri-clean; this test exists to prove the wiring and the
-    /// caching, and to prove the predicate is total against whatever GSS-API
-    /// the host actually has.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn the_system_predicate_is_total_and_cached() {

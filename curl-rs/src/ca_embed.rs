@@ -95,24 +95,26 @@
 //! length. Emptiness is interpreted in exactly one place, `classify` below,
 //! and no accessor collapses `Some` into `None` afterwards.
 //!
-//! One coordination limit is reported rather than hidden, because it belongs
-//! to the producer. `curl-rs/build.rs` states that "emptiness is the signal
-//! that embedding is off; there is no separate flag", and also records the
-//! omission of a compile-time flag as a deliberate decision taken to keep the
-//! build warning-free at the declared minimum Rust
-//! version. Measured consequence: a configured file that is zero bytes long
-//! is normalised to the same empty artifact as an unset input, with the
-//! script emitting `CURL_CA_EMBED points at ..., which is empty; no CA bundle
-//! will be embedded` (`curl-rs/build.rs`). So within this workspace
-//! `CA_EMBED` is empty if and only if no bundle was embedded, which is what
-//! makes the single mapping below sound. It does diverge from C, where naming
-//! a zero-byte file still defines `CURL_CA_EMBED` and would therefore emit
-//! the `CAcert` token and apply a zero-length blob. Closing that gap is one
-//! line in the producer -- an additional generated `bool` constant, not a
-//! `cfg`, so the reason `build.rs:1564-1575` gives for refusing a `cfg` would
-//! not apply -- and one line here. It is reported as a producer-side gap
-//! instead of being worked around, and the interpretation is kept in a single
-//! function so that closing it stays a one-line change.
+//! The producer says which of the two states a build is in, and this module
+//! does not infer it. `curl-rs/build.rs` emits two constants --
+//! `CA_EMBED_CONFIGURED: bool` beside `CA_EMBED: &[u8]` -- so absence is
+//! carried rather than deduced from a length. That is what `configure.ac:2127`
+//! does too: `AM_CONDITIONAL(CURL_CA_EMBED_SET, test -n "$CURL_CA_EMBED")`
+//! tests the *variable*, so in C a zero-byte bundle is
+//! configured-and-empty -- `src/mk-file-embed.pl` emits
+//! `const unsigned char curl_ca_embed[] = { 0 };`, `src/tool_help.c:361` still
+//! appends the `CAcert` token, and `src/config2setopts.c:307` still applies a
+//! blob whose `strlen` is zero.
+//!
+//! An earlier revision of this pair inferred absence from emptiness, which had
+//! two consequences and both were wrong. A configured zero-byte file was
+//! **fatal** in the producer, which is neither of C's answers; and, had it not
+//! been, it would have been reported here as "no bundle was embedded", which
+//! would have withheld the `CAcert` token that C emits. The flag removes the
+//! inference entirely, so [`classify`] now reads a state rather than guessing
+//! at one -- and `Some(&[])` becomes a state a real build can produce, which is
+//! exactly what the "absence is not an empty bundle" tests below were written
+//! for.
 //!
 //! # Who consumes this, and who emits what
 //!
@@ -237,28 +239,34 @@ mod generated {
 
 /// Maps the generated artifact onto the two states a build can be in.
 ///
-/// This is the only place anywhere in the crate that reads emptiness as
-/// absence, and the reasoning for it is recorded in the module documentation
-/// above. Measured: the producer normalises an unset input, an unreadable
-/// file and a zero-byte file all to an empty payload, warning in the latter
-/// two cases, so within this workspace an empty artifact means no bundle was
-/// embedded. Should the producer ever grow the explicit flag described there,
-/// this function is the one place that changes.
+/// The state comes from `configured`, which `curl-rs/build.rs` sets from
+/// whether `CURL_CA_EMBED` named a file -- the same question
+/// `configure.ac:2127`'s `test -n "$CURL_CA_EMBED"` asks. **The payload's
+/// length is not consulted**, which is what makes `Some(&[])` reachable: a
+/// configured zero-byte bundle is present and empty, exactly as it is in C,
+/// and it therefore keeps the `CAcert` token and applies a zero-length blob
+/// rather than disappearing.
+///
+/// This is the only place in the crate where the two constants meet, so
+/// anything downstream of it sees one value and cannot re-derive a different
+/// answer.
 ///
 /// A `const fn` so that the whole classification happens while compiling and
 /// every accessor below can be `const` too.
-#[allow(dead_code)]
-const fn classify(embedded: &'static [u8]) -> Option<&'static [u8]> {
-    if embedded.is_empty() {
-        None
-    } else {
+const fn classify(
+    configured: bool,
+    embedded: &'static [u8],
+) -> Option<&'static [u8]> {
+    if configured {
         Some(embedded)
+    } else {
+        None
     }
 }
 
 /// The bundle state of this build, resolved once, at compile time.
-#[allow(dead_code)]
-const BUNDLE: Option<&'static [u8]> = classify(generated::CA_EMBED);
+const BUNDLE: Option<&'static [u8]> =
+    classify(generated::CA_EMBED_CONFIGURED, generated::CA_EMBED);
 
 /// Reports the length of a bundle state without disturbing it.
 ///
@@ -267,7 +275,6 @@ const BUNDLE: Option<&'static [u8]> = classify(generated::CA_EMBED);
 /// `Some(0)` and an absent one answers `None`. Nothing downstream of
 /// [`classify`] may turn a present bundle into an absent one, and this is
 /// where that is pinned down.
-#[allow(dead_code)]
 const fn len_of(state: Option<&'static [u8]>) -> Option<usize> {
     match state {
         Some(bytes) => Some(bytes.len()),
@@ -292,7 +299,6 @@ const fn len_of(state: Option<&'static [u8]>) -> Option<usize> {
 /// write it to standard output for `--dump-ca-embed` with no trailing newline
 /// (`src/tool_operate.c:2322`), and prints nothing while still succeeding
 /// when the answer here is `None`.
-#[allow(dead_code)]
 pub(crate) const fn bundle() -> Option<&'static [u8]> {
     BUNDLE
 }
@@ -332,7 +338,7 @@ pub(crate) const fn byte_len() -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::generated::CA_EMBED;
+    use super::generated::{CA_EMBED, CA_EMBED_CONFIGURED};
     use super::{bundle, byte_len, classify, is_embedded, len_of, BUNDLE};
 
     /// A payload whose first byte is a NUL, which C's `strlen` would measure
@@ -358,21 +364,30 @@ mod tests {
 
     // -- the live wiring, whichever configuration this was built in --------
 
-    /// The surface agrees with the artifact the producer wrote: an empty
-    /// payload is reported as absence, and any other payload is reported
-    /// verbatim. One of the two match arms runs in a build with no bundle and
-    /// the other in a build with one, so both are exercised by building twice.
+    /// The surface agrees with the artifact the producer wrote: the state comes
+    /// from the flag and the payload is reported verbatim. One of the two match
+    /// arms runs in a build with no bundle and the other in a build with one, so
+    /// both are exercised by building twice.
     #[test]
     fn surface_agrees_with_the_generated_artifact() {
-        assert_eq!(bundle(), classify(CA_EMBED));
-        assert_eq!(is_embedded(), classify(CA_EMBED).is_some());
-        assert_eq!(byte_len(), len_of(classify(CA_EMBED)));
+        assert_eq!(bundle(), classify(CA_EMBED_CONFIGURED, CA_EMBED));
+        assert_eq!(is_embedded(), CA_EMBED_CONFIGURED);
+        assert_eq!(byte_len(), len_of(classify(CA_EMBED_CONFIGURED, CA_EMBED)));
+        // The state and the flag agree in both directions. Written as one
+        // equality rather than an assertion inside each arm because the flag is
+        // a compile-time constant and `assert!(CONST)` is
+        // `clippy::assertions_on_constants`.
+        assert_eq!(bundle().is_some(), CA_EMBED_CONFIGURED);
+
         match bundle() {
             Some(bytes) => {
                 assert_eq!(bytes, CA_EMBED);
                 assert_eq!(byte_len(), Some(CA_EMBED.len()));
             }
             None => {
+                // The producer writes an empty payload when nothing was
+                // configured, and nothing here depends on that: the flag alone
+                // decided the state above.
                 assert_eq!(CA_EMBED.len(), 0);
                 assert_eq!(byte_len(), None);
             }
@@ -412,18 +427,43 @@ mod tests {
 
     // -- the mapping, in both directions, independent of configuration -----
 
-    /// The producer's empty artifact is the absent state.
+    /// An unconfigured build is the absent state, whatever the payload holds.
+    ///
+    /// The second assertion is the one that matters: the flag decides, so even a
+    /// non-empty payload behind `configured == false` -- which the producer
+    /// cannot write, but which nothing here relies on -- reports absence.
     #[test]
-    fn empty_artifact_classifies_as_absent() {
-        assert_eq!(classify(&[]), None);
+    fn an_unconfigured_build_classifies_as_absent() {
+        assert_eq!(classify(false, &[]), None);
+        assert_eq!(classify(false, PAYLOAD), None);
     }
 
-    /// Any non-empty artifact is present, and is passed through whole.
+    /// A configured build is present, and its payload is passed through whole.
     #[test]
-    fn non_empty_artifact_classifies_as_present() {
-        assert_eq!(classify(PAYLOAD), Some(PAYLOAD));
-        assert_eq!(len_of(classify(PAYLOAD)), Some(PAYLOAD.len()));
-        assert_eq!(len_of(classify(PAYLOAD)), Some(28));
+    fn a_configured_build_classifies_as_present() {
+        assert_eq!(classify(true, PAYLOAD), Some(PAYLOAD));
+        assert_eq!(len_of(classify(true, PAYLOAD)), Some(PAYLOAD.len()));
+        assert_eq!(len_of(classify(true, PAYLOAD)), Some(28));
+    }
+
+    /// F8-05, STATED AS AN ASSERTION. A configured zero-byte bundle is present
+    /// and empty -- `Some(&[])`, never `None`.
+    ///
+    /// `configure.ac:2127` tests `test -n "$CURL_CA_EMBED"`, so C reaches this
+    /// state whenever the builder names an empty file: `src/tool_help.c:361`
+    /// still appends the `CAcert` token and `src/config2setopts.c:307` still
+    /// applies a blob whose `strlen` is zero. The earlier revision of this pair
+    /// could not represent it at all -- the producer failed the build and this
+    /// function would have called it absence.
+    #[test]
+    fn a_configured_empty_bundle_is_present_and_empty() {
+        assert_eq!(classify(true, &[]), Some(&[][..]));
+        assert!(classify(true, &[]).is_some());
+        assert_eq!(len_of(classify(true, &[])), Some(0));
+        // And it is distinguishable from absence by the two answers a caller
+        // actually asks for.
+        assert_ne!(classify(true, &[]), classify(false, &[]));
+        assert_ne!(len_of(classify(true, &[])), len_of(classify(false, &[])));
     }
 
     /// A NUL is a byte of payload here, not a terminator. C's `strlen` would
@@ -432,18 +472,18 @@ mod tests {
     /// difference because printable text contains no NUL.
     #[test]
     fn nul_bytes_are_payload_and_are_never_truncated() {
-        assert_eq!(classify(LEADING_NUL), Some(LEADING_NUL));
-        assert_eq!(len_of(classify(LEADING_NUL)), Some(1));
-        assert_eq!(classify(INTERIOR_NUL), Some(INTERIOR_NUL));
-        assert_eq!(len_of(classify(INTERIOR_NUL)), Some(3));
+        assert_eq!(classify(true, LEADING_NUL), Some(LEADING_NUL));
+        assert_eq!(len_of(classify(true, LEADING_NUL)), Some(1));
+        assert_eq!(classify(true, INTERIOR_NUL), Some(INTERIOR_NUL));
+        assert_eq!(len_of(classify(true, INTERIOR_NUL)), Some(3));
     }
 
     /// Bytes that are not valid text pass through untouched and unexamined.
     /// The C type is `unsigned char`, so nothing may be decoded here.
     #[test]
     fn non_text_bytes_pass_through_untouched() {
-        assert_eq!(classify(NOT_TEXT), Some(NOT_TEXT));
-        assert_eq!(len_of(classify(NOT_TEXT)), Some(5));
+        assert_eq!(classify(true, NOT_TEXT), Some(NOT_TEXT));
+        assert_eq!(len_of(classify(true, NOT_TEXT)), Some(5));
     }
 
     // -- absence is structurally distinct from an empty bundle -------------

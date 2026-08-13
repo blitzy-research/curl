@@ -24,18 +24,6 @@
 
 // The safety invariant: no `unsafe` outside `src/ffi/`.
 //
-// The requirement is that `unsafe` be impossible anywhere in this crate except
-// under `src/ffi/`, with exactly one attribute granting that exemption.
-//
-// The attribute below is `deny`, not `forbid`, and the difference is forced.
-// `forbid` cannot be overridden from an inner scope, so the one exemption this
-// crate needs -- `#[allow(unsafe_code)]` on the `pub(crate) mod ffi;`
-// declaration further down -- is rejected under `#![forbid(unsafe_code)]` with
-// `error[E0453]: allow(unsafe_code) incompatible with previous forbid`, and the
-// `unsafe` it was meant to permit then fails as well. No placement of the
-// `allow` rescues it, an inner `#![allow(unsafe_code)]` at the top of
-// `src/ffi/mod.rs` included.
-//
 // `#![deny(unsafe_code)]` accepts that one exemption and still makes the same
 // `unsafe` a hard error in every module other than `ffi`. One gap remains, and
 // it is stated rather than glossed over: `deny`, unlike `forbid`, CAN be
@@ -44,23 +32,13 @@
 // against accident but not against a second deliberate exemption, which is why
 // the gate below is load-bearing rather than decoration.
 //
-// The gate, in three checks. Each expression is anchored for a reason: this
-// file legitimately discusses the attribute and the keyword many times over, so
-// an unanchored search matches the prose and reports a false failure.
-//
 //   1. Exactly one exemption exists, and it is in this file, on `mod ffi`:
-//
-//        grep -rnE '^[[:space:]]*#!?\[allow\(unsafe_code\)\]' \
-//          --include='*.rs' curl-rs-lib/src
 //
 //      must print exactly one line. Anchoring past indentation only is what
 //      excludes every `//`, `///` and `//!` line: a comment begins with a
 //      slash, so it can never match.
 //
 //   2. No `unsafe` keyword lives outside the sanctioned directory:
-//
-//        grep -rnE '^[^/]*\bunsafe\b' --include='*.rs' curl-rs-lib/src \
-//          | grep -v '^curl-rs-lib/src/ffi/'
 //
 //      must print nothing. `^[^/]*` requires the keyword to appear before any
 //      slash on the line, which again excludes comments and trailing comments.
@@ -83,31 +61,10 @@
 //      `every_unsafe_block_in_this_crate_is_covered_by_a_safety_comment`
 //      performs in `mod source_policy` at the foot of this file. Measured
 //      there on this tree: 26 blocks under `src/ffi/`, none uncovered.
-//
-//      `clippy::undocumented_unsafe_blocks` would mechanize this check. It is
-//      enabled nowhere -- not here, not in `clippy.toml` -- so this one is
-//      not a lint. It is not merely a convention either: the same walk runs
-//      as a test in `mod source_policy`, and the grep is the form a reader
-//      at a terminal can run.
-//
-// Never add `#![allow(unsafe_code)]` at crate level, and never add a second
-// `#[allow(unsafe_code)]` anywhere. Doing either silently converts a
-// compiler-checked invariant back into a review obligation.
-//
-// No other lint level is escalated here, deliberately. Continuous
-// integration runs `cargo clippy --workspace -- -D warnings`, which is where
-// the lint gate belongs so that a lint failure names itself instead of
-// hiding inside a build log. A crate-wide escalation such as
-// `#![warn(missing_docs)]` written here would additionally impose a gate on
-// the module files this crate currently contains -- and on every further
-// module the AAP's graph still adds to it -- none of which this file can
-// inspect, and a crate root must not legislate for code it does not contain.
 #![deny(unsafe_code)]
 
 //! curl and libcurl: the protocol engine, in safe Rust.
 //!
-//! Comments throughout this crate cite `AAP <section>` -- the frozen
-//! migration specification that this implementation is measured against.
 //! Its section numbers are stable, and a citation marks a decision the
 //! specification fixes rather than one this code is free to change.
 //!
@@ -121,85 +78,6 @@
 //!      cdylib +         a plain rlib)     binary)
 //!      staticlib)
 //! ```
-//!
-//! The direction is acyclic and one-way. Nothing here may name `curl_rs` or
-//! `curl_rs_ffi`; a type both adapters need belongs *here*.
-//!
-//! # What this crate supersedes
-//!
-//! 163,664 lines of C, measured rather than estimated -- `lib/*.c` and
-//! `lib/*.h` (126 and 129 files) together with all five of its subtrees:
-//!
-//! - `lib/` -- transfer core, multi handle, connection management, HTTP,
-//!   FTP, DNS, cookies, the URL API, MIME, authentication dispatch.
-//! - `lib/curlx/` -- portability and utility layer: dynbuf, base64,
-//!   timeval, strparse, warnless.
-//! - `lib/vtls/` -- TLS abstraction, session cache, X.509 handling,
-//!   cipher-suite mapping, key logging.
-//! - `lib/vauth/` -- Digest, NTLM, Negotiate/SPNEGO, OAuth2, cleartext.
-//! - `lib/vquic/` -- the QUIC and HTTP/3 filter layer.
-//! - `lib/vssh/` -- the SSH transport behind SFTP and SCP.
-//!
-//! Superseded, not wrapped: no C source file from those trees is compiled,
-//! linked or bridged. The C tree stays in the repository as the reference
-//! oracle for the transformation and for the 1,914 test fixtures that
-//! validate it.
-//!
-//! # The three frozen contracts
-//!
-//! The implementation beneath is replaced entirely; the observable behaviour
-//! is not touched at all. Three contracts are frozen, and every module in
-//! this crate is written to preserve them:
-//!
-//! 1. **The bytes on the wire.** Request-line composition, header content,
-//!    header order, header casing, chunked framing, FTP command sequencing
-//!    and the construction of Digest, NTLM and AWS SigV4 messages. 1,476 of
-//!    the 1,914 fixtures carry a `<protocol>` block, and the harness joins
-//!    both sides into a single string and compares them whole -- there is no
-//!    per-line matching and no normalization, so header *order* is as
-//!    significant as header content. This is why
-//!    [`protocols::http1`] owns request serialization instead of delegating
-//!    it to `hyper`, which emits neither curl's default headers nor a
-//!    guaranteed order.
-//! 2. **The command-line surface.** Option names, aliases, argument arity,
-//!    argument type and default value, for all 282 rows of the `aliases[]`
-//!    table (`src/tool_getparam.c:80`) and the `--no-<flag>` negations that
-//!    the `ARG_NO`-flagged rows generate. Owned by `curl-rs`, but every
-//!    default it applies is read from here.
-//! 3. **The C ABI.** Parameter lists, return types, and the *integer* value
-//!    behind every public enumerator. `lib/libcurl.def` lists exactly 100
-//!    exported symbols and a C program compiled against curl 8.19.0-DEV
-//!    embeds the numeric value of every enumerator it uses directly in its
-//!    instruction stream, so nominal parity is not parity. See
-//!    [`error`] for how the result codes are pinned.
-//!
-//! Performance is an explicit non-goal of this work. No latency, throughput
-//! or allocation objective appears anywhere in the requirements, and where a
-//! choice existed between a faster design and a more behaviourally faithful
-//! one, faithfulness won. Nothing in this crate should be restructured, and
-//! no `#[inline]` or link-time-optimization hint should be added, on speed
-//! grounds alone.
-//!
-//! # Reported identity -- frozen, and not to be bumped
-//!
-//! Measured in `include/curl/curlver.h` and reproduced by [`version`]:
-//!
-//! | Macro                   | Value                                | Site |
-//! |-------------------------|--------------------------------------|------|
-//! | `LIBCURL_COPYRIGHT`     | `Daniel Stenberg, <daniel@haxx.se>.` | `:31` |
-//! | `LIBCURL_VERSION`       | `8.19.0-DEV`                         | `:35` |
-//! | `LIBCURL_VERSION_MAJOR` | `8`                                  | `:39` |
-//! | `LIBCURL_VERSION_MINOR` | `19`                                 | `:40` |
-//! | `LIBCURL_VERSION_PATCH` | `0`                                  | `:41` |
-//! | `LIBCURL_VERSION_NUM`   | `0x081300`                           | `:61` |
-//! | `LIBCURL_TIMESTAMP`     | `[unreleased]`                       | `:72` |
-//!
-//! Every parity claim in this crate is against curl and libcurl 8.19.0-DEV
-//! as checked out at commit `54cf587b9c`. "curl 8.x" is a version family
-//! rather than a version, so it is bound to that exact tree and nothing
-//! else. The version string is also load-bearing at run time, not merely
-//! informational: it is the `User-Agent` default, and the test harness
-//! substitutes a `%VERSION` placeholder into fixture expectations from it.
 //!
 //! # The safety invariant
 //!
@@ -244,181 +122,6 @@
 //!   query and a small number of platform calls -- is confined to
 //!   [`ffi::sys`].
 //!
-//! # Configuration: Cargo features replace the preprocessor
-//!
-//! `lib/curl_setup.h` is included by 200 files under `lib/` and 203 across
-//! `lib/` and `src/`. It has no successor here, because its three distinct
-//! jobs separate cleanly:
-//!
-//! - Capability selection becomes Cargo `[features]`, resolved when the
-//!   build graph is constructed rather than while preprocessing. The C
-//!   header's cascades -- `HTTP_ONLY` force-defining fifteen
-//!   `CURL_DISABLE_*` macros at `:230-276`, and `CURL_DISABLE_HTTP`
-//!   cascading eleven more at `:288-322` -- become feature dependencies in
-//!   `Cargo.toml`, where they are enumerable and testable.
-//! - Platform detection becomes `#[cfg(target_os = "...")]` and
-//!   `#[cfg(target_arch = "...")]`, never a feature.
-//! - Shared type declarations become ordinary `use` statements against the
-//!   module that owns each type.
-//!
-//! `configure.ac` carries 57 `AC_ARG_ENABLE` plus 44 `AC_ARG_WITH` knobs --
-//! 101 in total. They are replaced by **15** features, and that reduction is
-//! intentional and documented rather than an omission: the knobs this
-//! workspace does not reproduce select between C libraries that are gone
-//! (seven TLS backends, two SSH backends, two QUIC backends, c-ares,
-//! libidn2, libpsl, libgsasl), or target platforms outside the four-target
-//! matrix, or disable protocols that are stubbed for ABI completeness
-//! instead of being switchable.
-//!
-//! The 15, declared once in `curl-rs-lib/Cargo.toml`:
-//!
-//! | Feature       | Default | Replaces |
-//! |---------------|---------|----------|
-//! | `http2`       | on      | `USE_NGHTTP2` |
-//! | `http3`       | on      | `USE_NGTCP2` / `USE_QUICHE` |
-//! | `ftp`         | on      | `CURL_DISABLE_FTP` |
-//! | `ssh`         | on      | `USE_LIBSSH2` / `USE_LIBSSH` |
-//! | `websockets`  | on      | `CURL_DISABLE_WEBSOCKETS` |
-//! | `cookies`     | on      | `CURL_DISABLE_COOKIES` |
-//! | `hsts`        | on      | `CURL_DISABLE_HSTS` |
-//! | `altsvc`      | on      | `CURL_DISABLE_ALTSVC` |
-//! | `doh`         | on      | `CURL_DISABLE_DOH` |
-//! | `brotli`      | on      | `HAVE_BROTLI` |
-//! | `zstd`        | on      | `HAVE_ZSTD` |
-//! | `gzip`        | on      | `HAVE_LIBZ` |
-//! | `negotiate`   | **off** | `USE_SPNEGO` / `HAVE_GSSAPI` |
-//! | `hickory-dns` | **off** | `CURLRES_ARES` |
-//! | `memdebug`    | **off** | `CURL_MEMDEBUG` |
-//!
-//! **There is no `tls` feature, and there must never be one.** TLS is
-//! unconditional in this crate. rustls is the only TLS implementation at any
-//! configuration -- not as a default, not behind a flag, not as a fallback
-//! -- and certificate validation is on unless `--insecure` is given, so an
-//! off-switchable `tls` would permit a build that contradicts both
-//! requirements. The prohibition is also mechanically enforced rather than
-//! merely stated: writing `feature = "tls"` anywhere produces
-//! `warning: unexpected 'cfg' condition value: 'tls'`, which under
-//! `-D warnings` is a build failure. That was verified by compiling it.
-//!
-//! The audit for it must be anchored, for the same reason the safety gate's
-//! expressions are -- this crate *discusses* the absent feature in prose, so
-//! an unanchored search reports false hits:
-//!
-//! ```text
-//! grep -rnE '^[^/]*feature = "tls"' --include='*.rs' curl-rs-lib/src
-//! ```
-//!
-//! must print nothing. Measured: empty, and it does find a planted
-//! `#[cfg(feature = "tls")]`, so the check is discriminating rather than
-//! vacuous.
-//!
-//! # Import discipline
-//!
-//! The C tree's most pervasive dependency is a blanket `#include`. Three
-//! transformation rules replace it, and they apply throughout this crate:
-//!
-//! 1. FROM `#include "urldata.h"`, one include granting access to all
-//!    connection, transfer and TLS state, TO one `use` per type actually
-//!    used: `use crate::conn::Connection;` plus
-//!    `use crate::transfer::TransferState;`. Applies to every file in this
-//!    crate.
-//! 2. FROM `#include "curl_setup.h"` followed by `#ifdef USE_NGHTTP2`, TO
-//!    `#[cfg(feature = "http2")]` on the item, with the feature declared in
-//!    the manifest. Applies to every file whose C original was
-//!    conditionally compiled.
-//! 3. FROM `#include "vtls/vtls.h"` in each protocol implementation, TO no
-//!    TLS import at all -- the connection-filter chain interposes TLS
-//!    transparently, so a protocol module never names it. Applies to every
-//!    file under `protocols`.
-//!
-//! Internal linkage changes character with them. C declares internal
-//! functions `extern` under a `Curl_` prefix and relies on the convention
-//! that anything so prefixed is private by agreement:
-//!
-//! ```c
-//! /* C: private by convention, visible to the linker */
-//! extern CURLcode Curl_cf_setup_insert_after(struct Curl_cfilter *cf_at, ...);
-//! ```
-//!
-//! Here it is private by enforcement:
-//!
-//! ```ignore
-//! pub(crate) fn cf_setup_insert_after(
-//!     at: &mut FilterChain,
-//!     /* ... */
-//! ) -> Result<(), Error>
-//! ```
-//!
-//! That change is what stops `tests/unit/*.c` (59 files) and
-//! `tests/libtest/*.c` (235 files) from linking: a Rust static library does
-//! not export `pub(crate)` items -- they are genuinely absent from the
-//! symbol table, not merely hidden -- so no quality of implementation makes
-//! those 294 C programs link. Their coverage is relocated into this crate as
-//! `#[cfg(test)]` modules instead. This is a documented deviation, not a
-//! defect to work around: re-exporting internals to satisfy them would
-//! defeat the encapsulation that makes the zero-`unsafe` guarantee possible.
-//! It is also strictly distinct from `tests/data`, whose 1,914 fixtures
-//! drive only the command-line binary through documented flags and do pass
-//! unmodified.
-//!
-//! # Dependency injection is an architectural requirement
-//!
-//! Not a style preference. The line-coverage gate over `protocols` and
-//! `transfer` is reachable only because the resolver, the clock and the
-//! TLS provider are *injected* rather than reached for globally, which is
-//! what lets those modules be exercised without live network access, without
-//! a real system clock and without process-global state that makes two tests
-//! influence each other.
-//!
-//! Concretely, and already in force in the modules that exist:
-//!
-//! - **Clock.** [`trace::TraceClock`] is the injected time source; nothing
-//!   in `trace` calls `SystemTime::now()` or `Instant::now()`. A trace line
-//!   carrying an unpinnable timestamp could not be compared byte for byte.
-//! - **Sinks.** [`trace::TraceSink`] is injected into the tracer, so a test
-//!   captures output without touching process state.
-//! - **System calls.** [`ffi::sys::SysCalls`] abstracts the platform, with
-//!   `RealSys` as the production implementation and every accessor offered
-//!   in a `_with(sys, ...)` form for tests.
-//!
-//! No global mutable state, no `static mut`, and no lazily-initialised
-//! singleton for the resolver, the clock or the TLS provider. `lib/hostip.c`
-//! reaches for a process-global `sigjmp_buf` behind a spinlock; that pattern
-//! does not survive the migration. The one unavoidable exception is the
-//! optional allocator wired at the foot of this file, because a
-//! `GlobalAlloc` is process-global by construction; it is default-off and
-//! holds two thread-safe items of state and nothing else.
-//!
-//! # Cryptographic-provider hygiene
-//!
-//! `rustls`, `tokio-rustls` and `quinn` are pinned in the workspace manifest
-//! with `default-features = false` and the **`ring`** provider. Nothing in
-//! this crate may enable a feature that unions `aws_lc_rs`,
-//! `prefer-post-quantum` or `platform-verifier` back into the graph. Cargo
-//! unions features across the *whole* graph, so a single stray feature on
-//! one optional dependency re-links a second cryptographic provider. Three
-//! distinct defects follow from letting that happen:
-//!
-//! - `prefer-post-quantum` -- a `rustls` default -- offers a hybrid
-//!   X25519MLKEM768 key exchange, which **changes the bytes of the TLS
-//!   ClientHello** relative to curl 8.19.0-DEV. Under the byte-exact
-//!   comparison described above that endangers every HTTPS fixture.
-//! - `aws-lc-rs` vendors C and assembly and adds CMake and NASM to the
-//!   build's requirements, which is hostile to the cross-compiled
-//!   `aarch64-unknown-linux-gnu` target.
-//! - `platform-verifier` delegates trust decisions to the operating-system
-//!   store, which conflicts with `--cacert`, `--capath` and `--insecure`
-//!   remaining authoritative.
-//!
-//! The honest caveat, recorded rather than buried: **neither `ring` nor
-//! `aws-lc-rs` is pure Rust**; both contain C and assembly. The constraint
-//! satisfied here is that no C *TLS library* is linked -- rustls implements
-//! the TLS state machine, the record layer and certificate verification in
-//! Rust, and the provider supplies only primitives. `ring` is chosen as the
-//! more portable and more readily cross-compiled of the two. If "no C or
-//! assembly whatsoever" were intended, no rustls configuration satisfies it
-//! and the requirement is unmeetable as written.
-//!
 //! # Platform support
 //!
 //! Four targets, all 64-bit: `x86_64-unknown-linux-gnu`,
@@ -450,36 +153,13 @@
 //! compiling all 129 programs in `docs/examples/`; and every claim about
 //! existing behaviour made in this crate's documentation carries a repository
 //! locator so that it can be checked rather than believed.
-//!
-//! # Minimum supported Rust version
-//!
-//! Edition 2021, MSRV 1.75, mirrored by `rust-version` in every member
-//! manifest and by `msrv` in `clippy.toml`. No nightly-only feature appears
-//! anywhere in this crate; nightly is reserved for the Miri and
-//! AddressSanitizer continuous-integration legs, which name it per
-//! invocation.
 
 // FEATURE-SET NOTE -- the one declared name with no crate behind it.
-//
-// `hickory-dns` is part of the fifteen-name feature vocabulary the plan
-// fixes, and it must stay in that vocabulary: the `Features:` banner in
-// `src/version.rs`, the capability table in `curl-rs-ffi/build.rs` and
-// `curlinfo`'s 29-entry table are all written against those fifteen names,
-// and deleting one would silently change three self-description surfaces.
 //
 // The feature therefore EXISTS, is default-off, BUILDS, and advertises
 // nothing. It carries no dependency, and the option space that explains why
 // was measured from the registry index, sorted by parsed semantic version.
 // The two halves are disjoint:
-//
-//   hickory-resolver 0.24.0-0.25.2  clear the workspace MSRV (they declare
-//     1.67.0-1.71.1) but require hickory-proto ^0.24 / ^0.25, and every
-//     hickory-proto below 0.26.1 carries RUSTSEC-2026-0119 - CPU exhaustion
-//     through BinEncoder's linear name-compression scan, fixed only in
-//     >= 0.26.1.
-//   hickory-resolver 0.26.0-0.26.1  carry the fix and declare rust-version
-//     1.88, which breaks the MSRV floor that is measured and satisfied
-//     today.
 //
 // The advisory could not have been confined to the feature either, because
 // cargo-deny and cargo-audit read `Cargo.lock` rather than the active
@@ -487,21 +167,12 @@
 // report `advisories FAILED` on a DEFAULT build with the feature off. That
 // was measured, not predicted.
 //
-// HOW THE CAPABILITY IS WITHHELD, AND WHY NOT WITH A BUILD FAILURE.
-//
-// The requirement is the truthfulness rule of AAP 0.6.5: over-reporting a
-// capability is the fatal failure mode, under-reporting is merely a skip.
-// So enabling this feature must NOT make `curl --version` name a resolver
-// that is not in the build. There are three ways to satisfy that and only
-// one of them is right.
-//
 //   * A bare `hickory-dns = []` cfg switch that the banner still keys off.
-//     WRONG, and it is what this feature used to be: enabling it added
-//     `hickory-resolver/0.25.2` to the banner with nothing behind it. That
-//     is over-reporting, the one outcome AAP 0.6.5 forbids.
-//   * `compile_error!` on the feature. Also wrong, and it is what this block
-//     used to contain. It converts a DECLARED feature into a hard build
-//     failure, which makes `--all-features` impossible for a workspace whose
+//     WRONG: enabling it adds `hickory-resolver/0.25.2` to the banner while no
+//     resolver in the graph uses it.
+//   * `compile_error!` on the feature. Also wrong. It converts a DECLARED
+//     feature into a hard build failure, which makes `--all-features`
+//     impossible for a workspace whose
 //     own `deny.toml` sets `all-features = true`, forces four workflows to
 //     enumerate fourteen feature names in lockstep instead, and breaks
 //     `rust-audit.yml`'s check that an enabled feature actually resolves
@@ -510,29 +181,22 @@
 //   * `configured && implementation_ready`, which is the rule this workspace
 //     already applies to every other capability
 //     (`version.rs`: `compiled_in = configured && engine.is_present()`).
-//     `ENGINE_DNS` is `Engine::absent("curl-rs-lib/src/dns/resolver.rs")`,
-//     so `version_parts` withholds the resolver token no matter how the
-//     feature is set, and the feature compiles to nothing observable. This
-//     is under-reporting, which is safe.
+//     `ENGINE_DNS` is `Engine::inert("curl-rs-lib/src/dns/resolver.rs")` --
+//     the module is on disk, and what it lacks is a caller -- so
+//     `version_parts` withholds the resolver token no matter how the feature
+//     is set, and the feature compiles to nothing observable. This is
+//     under-reporting, which is safe.
 //
 // The third is what is implemented. The feature is a reserved NAME whose
-// engine is absent, recorded in exactly the same registry as the other
-// thirty-odd absent capabilities rather than in a special case here.
+// engine cannot execute, recorded in exactly the same registry as the other
+// twenty-two unavailable capabilities rather than in a special case here.
 //
 // Wire the dependency in the root manifest, and flip `ENGINE_DNS` to
-// `present`, when a hickory-resolver release exists whose hickory-proto
+// `working`, when a hickory-resolver release exists whose hickory-proto
 // requirement admits >= 0.26.1 AND whose declared rust-version satisfies
 // this workspace's floor. Nothing in this file needs to change then.
 
 // MODULE INVENTORY -- 9 declarations, with the rest of the graph mapped below.
-//
-// This list replaces `lib/Makefile.inc`, the manifest both C build systems
-// share. That file groups its sources into six lists -- LIB_CURLX_CFILES and
-// LIB_CURLX_HFILES (`:26`, `:46`), LIB_VAUTH_* (`:68`, `:83`), LIB_VTLS_*
-// (`:87`, `:104`), LIB_VQUIC_* (`:122`, `:128`), LIB_VSSH_* (`:135`, `:140`)
-// and LIB_CFILES with LIB_HFILES (`:144`, `:271`) -- and joins them into
-// CSOURCES (`:400`) and HHEADERS (`:402`). Here the compiler reads the
-// inventory directly, so the manifest and the code cannot drift apart.
 //
 // ORDER is dependency order, not alphabetical: `error` first because every
 // other module returns its types, then the two other leaves, then the
@@ -540,34 +204,14 @@
 // finally the three handle interfaces that the C ABI exposes. It is a
 // topological ordering of the module graph, not a schedule: every module
 // lands together.
-//
-// The blank line between each declaration is REQUIRED. `rustfmt.toml` sets
-// `reorder_modules = true`, and that setting sorts only `mod` items which are
-// contiguous with no intervening blank line. Deleting a blank line here would
-// let `cargo fmt` reorder the inventory and destroy the dependency reading.
-//
-// VISIBILITY is `pub` only where `curl-rs-ffi` or `curl-rs` demonstrably
-// needs it -- each such module backing a named family of the 100 symbols in
-// `lib/libcurl.def` -- and `pub(crate)` everywhere else. C's convention
-// of an `extern` declaration under a `Curl_` prefix, private by agreement
-// and visible to the linker, becomes privacy by enforcement.
 
 /// Result codes: the type foundation of the crate.
-///
-/// Supersedes `lib/strerror.c`. Declares `CURLcode` (103 tokens,
-/// `CURL_LAST` = 102, including the 15 retired `CURLE_OBSOLETE*` placeholders
-/// that hold exactly `{20, 24, 29, 32, 34, 40, 41, 44, 46, 50, 51, 57, 62,
-/// 75, 76}`), `CURLMcode`, `CURLUcode`, `CURLHcode` and `CURLSHcode`, each
-/// `#[repr(i32)]` with every discriminant written out rather than inferred.
-/// Dropping one placeholder would silently shift every later code by one.
 ///
 /// `pub` because the codes cross the C ABI unchanged and because
 /// `curl-rs-ffi`'s `curl_easy_strerror`, `curl_multi_strerror`,
 /// `curl_share_strerror` and `curl_url_strerror` are thin adapters over the
 /// message accessors declared here -- the four C functions do not even share
 /// one unknown-value fallback, so all four strings live in this one module.
-///
-/// Declared first: everything else in the crate returns its types.
 pub mod error;
 
 /// The version and capability banner: `curl_version` and
@@ -580,11 +224,6 @@ pub mod error;
 /// under-reporting a capability makes a fixture skip, while over-reporting
 /// makes it run and fail. Truthful advertisement is therefore the optimal
 /// strategy and not merely the honest one.
-///
-/// `pub`, and exposing the data *programmatically* rather than only as a
-/// formatted banner, because `curl-rs/src/cli/libinfo.rs` queries the
-/// protocol and feature set to build `--version` output and because
-/// `curl-rs-ffi` populates a `curl_version_info_data` from it.
 pub mod version;
 
 /// Trace, verbose and error-buffer output.
@@ -594,37 +233,9 @@ pub mod version;
 /// so this module reproduces C's record shapes byte for byte, including
 /// where the identifier block sits relative to the two-character kind
 /// prefix -- which differs between a stream sink and a user callback.
-///
-/// `pub(crate)`, and the declaration stays that way even though one item
-/// inside it is now `pub`. [`TraceConfig`] is re-exported by name at the crate
-/// root, because `curl_global_trace` is one of the 100 exported symbols and its
-/// entire C body is `Curl_trc_opt(config)`; the re-export site records why the
-/// grammar may have only one owner. Everything the levels are *interpreted*
-/// with -- `Tracer`, `TraceSink`, `TraceFeature`, `TraceFilter`, `TraceLevel`,
-/// `TraceCategory` and the record layouts -- remains crate-private, so widening
-/// this declaration would export a great deal that is not an exported symbol.
-/// The command-line tool reaches trace output through `CURLOPT_DEBUGFUNCTION`
-/// and the option surface, not by naming this module.
 pub(crate) mod trace;
 
 /// The portability and utility layer.
-///
-/// Supersedes the six `lib/curlx/` files with genuine Rust counterparts
-/// (`base64.c`, `dynbuf.c`, `strparse.c`, `timediff.c`, `timeval.c`,
-/// `inet_ntop.c` with `inet_pton.c`) together with `lib/llist.c`,
-/// `lib/splay.c`, `lib/hash.c`, the four integer-keyed containers
-/// (`uint-bset.c`, `uint-spbset.c`, `uint-hash.c`, `uint-table.c`),
-/// `lib/parsedate.c`, `lib/curl_fnmatch.c`, `lib/curl_range.c`,
-/// `lib/curl_get_line.c`, `lib/curl_memrchr.c`, `lib/bufq.c`,
-/// `lib/bufref.c`, `lib/slist.c`, `lib/strcase.c` with `lib/strequal.c`,
-/// `lib/curl_fopen.c`, `lib/curl_endian.c`, and the remaining `curlx` shims
-/// whose function -- string duplication, cast narrowing, address formatting
-/// -- has a direct standard-library expression.
-///
-/// Date parsing carries a public obligation even though the module is
-/// crate-private: `curl_getdate` is one of the 100 exported symbols, so
-/// every format curl accepts must still be accepted, and `curl-rs-ffi`
-/// reaches it through a `pub` accessor rather than through this declaration.
 pub(crate) mod util;
 
 /// Operating-system integration that has no safe expression.
@@ -636,35 +247,10 @@ pub(crate) mod util;
 /// comment at the head of this file for the compiler diagnostics that settled
 /// the `forbid`-versus-`deny` question and for the grep gate that closes the
 /// one gap `deny` leaves open.
-///
-/// `sys` holds the residue that `socket2` cannot absorb -- a hostname query
-/// and a small number of platform calls -- behind an injected `SysCalls`
-/// trait, and, under the default-off `memdebug` feature, the counting
-/// allocator wired at the foot of this file. `gss` holds the optional
-/// GSS-API binding for Negotiate, behind the default-off `negotiate`
-/// feature; that feature resolves the apparent conflict with "no C TLS
-/// linkage at any configuration", because GSS-API is an authentication
-/// mechanism and not a TLS library, so the default build links no C security
-/// library at all.
-///
-/// Deliberately `pub(crate)`: nothing outside this crate may reach the
-/// `unsafe` island, which is what keeps the audit surface one directory
-/// wide.
 #[allow(unsafe_code)]
 pub(crate) mod ffi;
 
 /// Cryptographic primitives.
-///
-/// Supersedes `lib/md5.c`, `lib/md4.c`, `lib/sha256.c`,
-/// `lib/curl_sha512_256.c`, `lib/hmac.c` and `lib/rand.c`. The hand-rolled C
-/// implementations are replaced by RustCrypto crates held to a single
-/// `digest` generation, because two generations in one graph do not unify
-/// their traits and `Hmac<Sha1>` would then fail to compile.
-///
-/// `pub(crate)`: no exported symbol is a hash function. These primitives
-/// serve Digest and NTLM authentication, AWS SigV4 signing, certificate
-/// pinning and the WebSocket handshake accept key, all of which live inside
-/// this crate.
 pub(crate) mod crypto;
 
 /// The URL API, percent-encoding and internationalised domain names.
@@ -673,36 +259,9 @@ pub(crate) mod crypto;
 /// quirks are preserved rather than delegated wholesale to a general-purpose
 /// URL crate, because the quirks are observable through the API and through
 /// the fixture corpus.
-///
-/// `pub` because it backs six of the exported symbols -- `curl_url`,
-/// `curl_url_cleanup`, `curl_url_dup`, `curl_url_get`, `curl_url_set` and
-/// `curl_url_strerror` -- plus `curl_escape` and `curl_unescape`. `CURLU` is
-/// the one public handle that is a genuine opaque struct rather than a
-/// `void`, so its representation is part of the contract.
-///
-/// Complete. `url/mod.rs` carries the URL API from `lib/urlapi.c` and
-/// declares its two children, `escape` (from `lib/escape.c`) and `idn` (from
-/// `lib/idn.c`) -- the three files specification 0.3.1 names for this folder,
-/// and no more. The scheme table the parser needs is **injected** rather than
-/// imported: `url` defines `SchemeInfo` and the `SchemeRegistry` trait, and
-/// `protocols` is expected to implement it and to expose
-/// `scheme_registry() -> &'static dyn crate::url::SchemeRegistry`, re-exported
-/// from this root so that `curl-rs-ffi`'s argument-less `curl_url()` can reach
-/// it. That direction is what keeps the graph acyclic: the URL API must not
-/// depend on the transfer engine.
 pub mod url;
 
 /// TLS -- rustls, and rustls only.
-///
-/// Supersedes `lib/vtls/`: the roughly 22-entry backend vtable of
-/// `vtls.c`, certificate and hostname verification (`x509asn1.c`,
-/// `hostcheck.c`), the session-resumption cache and its serialization
-/// (`vtls_scache.c`, `vtls_spack.c`), cipher-suite name mapping
-/// (`cipher_suite.c`) and `SSLKEYLOGFILE` support (`keylog.c`).
-/// `lib/vtls/rustls.c` is the highest-value reference in the C tree: curl
-/// already ships a rustls backend through rustls-ffi, so the mapping from
-/// curl's TLS semantics onto rustls concepts is followed rather than
-/// reinvented.
 ///
 /// **Declared unconditionally.** There is no `tls` feature and there must
 /// never be one; see the crate documentation above for why, and for the
@@ -712,54 +271,12 @@ pub mod url;
 /// disabled" state has to be readable from outside this crate -- it is
 /// surfaced through the option and handle surface of the `easy` module
 /// rather than by widening this declaration.
-///
-/// The backend-identity struct keeps `curl_ssl_backend info` as its FIRST
-/// member. `lib/vtls/vtls_int.h:142-145` states the reason verbatim: "This
-/// *must* be the first entry to allow returning the list of available
-/// backends in `curl_global_sslset()`." `curl-rs-ffi` reports
-/// `CURLSSLBACKEND_RUSTLS`, whose value 14 already exists in the public
-/// `curl_sslbackend` enumeration, so no value is invented.
-///
-/// `pub(crate)`: the multi-backend dispatch collapses to one implementation,
-/// and backend identity reaches C through [`version`].
-/// **Delivered.** All five of this module's planned children exist --
-/// `cipher_suite`, `keylog`, `verify`, `session_cache` and `rustls_backend` --
-/// while the backend trait itself lives in the module root. `tls/mod.rs`
-/// declares exactly those five.
 pub(crate) mod tls;
 
 /// The multi interface: many transfers, one driver.
-///
-/// Supersedes `lib/multi.c` with `lib/multihandle.h` (the 18-state machine,
-/// preserved as an explicit enumeration because `CURLINFO` and the multi
-/// interface expose state-dependent behaviour, and made exhaustive so that
-/// an unhandled state is a compile error rather than a runtime
-/// fall-through), `lib/multi_ev.c` (socket-callback event plumbing) and
-/// `lib/multi_ntfy.c` (the message queue behind `curl_multi_info_read`).
-///
-/// The easy-handle collection becomes a slab with generational keys, so a
-/// handle removed and then reused is detectably stale rather than a dangling
-/// pointer into an intrusive list.
-///
-/// `pub` because it backs the 22 exported `curl_multi_*` symbols --
-/// including `curl_multi_socket` and `curl_multi_socket_all`, which are
-/// deprecated in the public headers yet still exported and therefore still
-/// in the parity set. Nothing deprecated is removed.
-/// **Partially delivered.** Of this module's planned children, only `state`
-/// exists yet; the multi handle itself, the event plumbing (`multi_ev.c`) and
-/// the notification queue (`multi_ntfy.c`) arrive with their files.
-/// `multi/mod.rs` is the module root: it declares `state` and carries
-/// `wakeup_available`, and no `curl_multi_*` symbol is backed until the handle
-/// lands.
 pub mod multi;
 
 /// Name resolution: the DNS cache, the address types and the resolver seam.
-///
-/// Supersedes `lib/hostip.c`, `lib/hostip4.c`, `lib/hostip6.c`,
-/// `lib/curl_addrinfo.c`, `lib/fake_addrinfo.c`, `lib/asyn-base.c`,
-/// `lib/asyn-thrdd.c` and `lib/curl_threads.c`, plus `lib/doh.c` behind the
-/// `doh` feature, `lib/httpsrr.c` and `lib/if2ip.c`. The system resolver is
-/// the default; `hickory-dns` is an optional, default-off alternative.
 ///
 /// This is where the migration retires the single most hazardous construct
 /// in the C tree: `lib/hostip.c` bounds a blocking lookup with `alarm()`
@@ -767,68 +284,12 @@ pub mod multi;
 /// across allocation boundaries, guarded by a process-global `sigjmp_buf`
 /// behind a spinlock. `tokio::time::timeout` replaces all of it, and the
 /// thread abstraction of `lib/curl_threads.c` is subsumed by the runtime.
-///
-/// Declared BEFORE [`conn`] because that is the dependency direction: a
-/// connection needs an address, and nothing here needs a connection. The one
-/// edge that would have pointed the other way -- DoH, which performs an
-/// HTTPS transfer in order to resolve a name -- is an injected transport
-/// seam rather than an import, for exactly that reason.
-///
-/// `pub(crate)`: no exported symbol of `lib/libcurl.def` resolves a name
-/// directly. The resolver is injected into the modules that need it rather
-/// than reached for globally, which is what makes them testable without a
-/// network and what puts the 80% line-coverage gate of specification 0.8.4
-/// within reach at all.
-/// `dns/mod.rs` is the module root and carries the cache, the entry and
-/// address types, the ALPN identifiers, the `CURLOPT_RESOLVE` loader and the
-/// injection seams; the four children the AAP names -- `resolver`, `doh`,
-/// `httpsrr` and `if2ip` -- are all declared, each having arrived WITH its
-/// file for the E0583 reason this file records for its own remaining
-/// subsystems.
 pub(crate) mod dns;
 
 /// Connection establishment, the filter chain and socket readiness.
-///
-/// Supersedes `lib/connect.c`, `lib/cfilters.c`, `lib/cf-socket.c`,
-/// `lib/cf-ip-happy.c`, `lib/conncache.c`, `lib/cshutdn.c`, `lib/select.c`
-/// and `lib/curlx/wait.c`. `struct Curl_cftype`'s 14-member vtable with its
-/// untyped `void *ctx` (`lib/cfilters.h:210-226`) becomes a
-/// `Box<dyn ConnFilter>` chain with a TYPED context field, which removes the
-/// cast at every filter boundary and with it the largest single category of
-/// unsound pattern in the C tree. Because HTTP/3 is already a filter in the C
-/// design, QUIC, TLS, SOCKS, HAProxy and raw sockets all compose through that
-/// one trait instead of three parallel abstractions.
-///
-/// Together with the transfer layer this is the crate's ASYNCHRONOUS half,
-/// and it is where `tokio` enters: `poll` and `select` become the reactor,
-/// and `lib/hostip.c`'s `alarm()` with `sigsetjmp`/`siglongjmp` -- a
-/// non-local jump out of a signal handler across allocation boundaries, the
-/// most hazardous construct in the C tree -- becomes
-/// `tokio::time::timeout`. The utility layer deliberately keeps the runtime
-/// out for exactly this reason: `crate::util::bufq` and
-/// `crate::util::timeval` say so in their own documentation.
-///
-/// `pub(crate)`: no exported symbol is backed from here directly. Connection
-/// state reaches C through [`multi`] and [`easy`], which is what keeps it out
-/// of the ABI's reach.
-/// **Delivered.** All six of this module's planned children exist --
-/// `select`, `filters`, `shutdown`, `socket`, `happy_eyeballs` and `pool`.
-/// `select` came first as the foundation the others consume, since
-/// `lib/select.c` and `lib/select.h` name the filter chain nowhere while
-/// `lib/cfilters.c:33` and `lib/cf-socket.c:64` both include `select.h`.
 pub(crate) mod conn;
 
 /// The easy interface: one handle, one transfer.
-///
-/// Supersedes `lib/easy.c`, `lib/setopt.c` (308 options), `lib/getinfo.c`
-/// (70 `CURLINFO` accessors) and the generated `lib/easyoptions.c` with
-/// `lib/easygetopt.c`.
-///
-/// The god-struct is decomposed here. `lib/urldata.h` is included nearly
-/// universally in C and concentrates connection, transfer and TLS state in one
-/// declaration; those fields migrate to the module that owns their lifecycle,
-/// and cross-module access becomes an explicit borrow rather than an implicit
-/// reach into shared mutable state.
 ///
 /// The option table is NOT declared here. `curl-rs-ffi` is the sole source of
 /// truth for the 308 `CURLoption` identifiers, their backward-compatibility
@@ -840,23 +301,9 @@ pub(crate) mod conn;
 /// the option-identity vocabulary and owns no rows -- and which takes the table
 /// as an argument, because the crate that holds it depends on this one and this
 /// one may never name it.
-///
-/// `pub` because it backs the 21 exported `curl_easy_*` symbols, and because
-/// the "peer verification disabled" state that obliges `curl-rs` to warn on
-/// standard error before proceeding is readable through this surface.
-/// **Partially delivered.** Of this module's planned children, only `options`
-/// exists yet; the easy handle itself, the option setters and the `CURLINFO`
-/// accessors arrive with their files. `easy/mod.rs` is the module root and
-/// declares exactly that one.
 pub mod easy;
 
 /// Header storage and the header-inspection API.
-///
-/// Supersedes `lib/headers.c` (the public inspection API, the internal push
-/// and cleanup entry points and the client writer that collects response
-/// headers as they arrive) together with `lib/dynhds.c` (the bounded, ordered,
-/// duplicate-permitting field set the HTTP/1, HTTP/2, HTTP/3 and
-/// CONNECT-proxy layers compose requests in).
 ///
 /// `pub` because it backs four of the 100 exported symbols: the
 /// `curl_easy_header` and `curl_easy_nextheader` pair, and
@@ -864,121 +311,18 @@ pub mod easy;
 /// struct those fill is layout-visible to callers, so its field order and
 /// types are frozen; this module supplies the borrowed projection that fills
 /// it, and `curl-rs-ffi` owns the `#[repr(C)]` mirror.
-///
-/// Storage is an ordered `Vec` of byte strings that preserves arrival order
-/// and the case each name arrived in. That is not a stylistic choice: 1,476
-/// of the 1,914 fixtures compare full request bytes as a single joined
-/// string, so a map, a sorted container or `http::HeaderMap` would each
-/// change an observable result.
 pub mod headers;
 
 /// Persisted client state: the cookie jar, `.netrc`, HSTS and Alt-Svc.
-///
-/// Supersedes `lib/cookie.c`, `lib/psl.c`, `lib/netrc.c`, `lib/hsts.c` and
-/// `lib/altsvc.c`. What these five share, and the reason they share a
-/// module, is that every one of them reads and writes a file on the user's
-/// disk whose format is frozen: a jar written by curl 8.19.0-DEV must be
-/// readable here and vice versa, and the HSTS cache, the Alt-Svc cache and
-/// `.netrc` carry the same obligation. No general-purpose cookie crate
-/// commits to the Netscape on-disk shape, so the jar is implemented
-/// natively and `publicsuffix` supplies only the domain-matching rules that
-/// libpsl previously supplied.
-///
-/// `pub(crate)`: no exported symbol resolves a name here. The cookie
-/// engine, the two caches and `.netrc` are all reached through an easy
-/// handle's option surface.
-///
-/// The jar, the HSTS cache and the Alt-Svc cache are gated by the
-/// capability names `cookies`, `hsts` and `altsvc` when they land.
-/// **`.netrc` is NOT gated and must never become so**: the C's
-/// `CURL_DISABLE_NETRC` has no counterpart in the fifteen-name vocabulary,
-/// and credential lookup serves every protocol rather than only HTTP, so
-/// attaching it to the cookie engine would silently disable `--netrc` for
-/// FTP and SFTP.
-/// **Partially delivered.** Of this module's planned children, only `netrc`
-/// exists yet; the cookie jar, the public-suffix rules, the HSTS cache and
-/// the Alt-Svc cache arrive with their files. `cookies/mod.rs` is the module
-/// root and declares exactly that one.
 pub(crate) mod cookies;
 
 /// Authentication mechanism selection, vocabulary and shared plumbing.
-///
-/// Supersedes `lib/vauth/vauth.c` with `lib/vauth/vauth.h` as its declaration
-/// contract, the mechanism-arbitration logic of `lib/http.c`, and the
-/// HTTP-relevant slice of `lib/curl_sasl.c`. When its children land it also
-/// supersedes `lib/vauth/cleartext.c` (Basic), `lib/vauth/digest.c` with
-/// `lib/http_digest.c`, `lib/vauth/oauth2.c` (Bearer), `lib/vauth/ntlm.c` with
-/// `lib/curl_ntlm_core.c` and `lib/http_ntlm.c` (NTLM, in pure Rust),
-/// `lib/http_aws_sigv4.c`, and -- behind the default-off `negotiate` feature --
-/// `lib/vauth/krb5_gssapi.c`, `lib/vauth/spnego_gssapi.c`,
-/// `lib/http_negotiate.c` and `lib/curl_gssapi.c`.
-///
-/// `lib/curl_sasl.c` sits astride the scope boundary: it serves SMTP, IMAP and
-/// POP3, which are stubbed, as well as HTTP authentication, which is
-/// implemented. The mechanism is therefore SPLIT rather than migrated or
-/// dropped wholesale -- the mechanism-name vocabulary, its prefix matcher and
-/// the `CURLAUTH_*` to `SASL_MECH_*` translation are ported, and the SASL
-/// command state machine is not. The module root says so in as many words, so
-/// that a later reader does not "finish" it.
-///
-/// Message construction is byte-exact: a Digest or NTLM message is compared
-/// against a literal expectation in the fixture corpus, and 168 fixtures carry
-/// an `Authorization: ` line inside a byte-exact comparison block, so the
-/// bytes are the specification rather than an implementation detail.
-///
-/// `pub(crate)`: no exported symbol is an authentication mechanism. The
-/// application selects one through `CURLOPT_HTTPAUTH` and `CURLOPT_PROXYAUTH`
-/// and observes the outcome through `CURLINFO_HTTPAUTH_AVAIL` and
-/// `CURLINFO_HTTPAUTH_USED`, all of which are option and info surface.
-/// **Partially delivered.** `auth/mod.rs` is the module root -- the
-/// `CURLAUTH_*` vocabulary, the three mechanism-ordering tables,
-/// arbitration, the `lib/vauth/vauth.c` plumbing, the SASL vocabulary slice
-/// and the mechanism trait -- and it declares no children yet, because none of
-/// the six exists. Each declaration arrives with its file.
 pub(crate) mod auth;
 
 /// The transfer core: the loop, its buffers and its accounting.
-///
-/// Supersedes `lib/transfer.c` (the transfer loop, which becomes async),
-/// `lib/request.c` (per-request state), `lib/sendf.c` (manual buffers become
-/// `BytesMut`), `lib/cw-out.c` with `lib/cw-pause.c` (the client-writer chain
-/// and pause handling), `lib/progress.c` (accounting, with the output format
-/// frozen), `lib/ratelimit.c` (`--limit-rate` pacing),
-/// `lib/content_encoding.c` (zlib, brotli and zstd calls become `flate2`,
-/// `brotli` and `zstd`) and `lib/http_chunks.c` (chunked framing, byte-exact
-/// in both directions).
-///
-/// One of the two modules the line-coverage gate measures, which is why the
-/// clock and the resolver reach it by injection rather than being read for
-/// globally. Everything here is time-driven -- pacing, progress, pause
-/// expiry -- so a module that read the host clock itself could not be tested
-/// deterministically and the gate would be unreachable.
-///
-/// `pub(crate)`: a transfer is driven through an easy or a multi handle, and
-/// no exported symbol names a transfer directly.
-/// **Partially delivered.** Of this module's planned children, `ratelimit`,
-/// `progress`, `sendf`, `request` and `writeout` exist; the transfer loop,
-/// content encoding and chunked framing arrive with their files.
-/// `transfer/mod.rs` is the module root and declares exactly those five. The
-/// order is dependency order: `ratelimit` came first as a self-contained
-/// arithmetic primitive that progress accounting EMBEDS, following
-/// `lib/urldata.h:788-793`, where `struct pgrs_dir` carries a
-/// `struct Curl_rlimit` as a member.
 pub(crate) mod transfer;
 
 /// The protocol implementations and the scheme registry.
-///
-/// Supersedes `lib/url.c`'s scheme lookup and `lib/cf-https-connect.c`'s ALPN
-/// version negotiation, plus `lib/http.c` with `lib/http1.c`, `lib/http2.c`,
-/// `lib/vquic/*`, `lib/ftp.c` with `lib/pingpong.c`, `lib/ftplistparser.c` and
-/// `lib/fileinfo.c`, `lib/vssh/*`, `lib/file.c` and `lib/ws.c`.
-///
-/// **Declared unconditionally**, and that is load-bearing: the per-protocol
-/// capability names (`http2`, `http3`, `ftp`, `ssh`, `websockets`) belong INSIDE
-/// the module, on its children, not on this declaration, so that the registry
-/// itself always exists. A build with every protocol feature off must still
-/// answer an unsupported scheme with `CURLE_UNSUPPORTED_PROTOCOL` and still
-/// report a truthful `Protocols:` line, rather than fail to compile.
 ///
 /// The C tree defines and registers 33 URL schemes. Nine are implemented here;
 /// the other 24 are registered for ABI completeness, return
@@ -988,72 +332,19 @@ pub(crate) mod transfer;
 /// array is declared `all_schemes[67]` at `lib/url.c:1488` but only 33 entries
 /// are defined and registered -- the array is over-allocated, and 67 must not be
 /// read as a count.
-///
-/// The HTTP/1.1 module owns request-line composition and header emission in
-/// curl's exact order, using `hyper` only for connection management, keep-alive
-/// and framing. Delegating serialization would fail a large fraction of the
-/// 1,476 byte-exact fixtures for reasons unrelated to correctness.
-///
-/// The other module the line-coverage gate measures, alongside [`transfer`].
-///
-/// `pub(crate)`: a scheme is selected by URL, never named by a caller.
-/// **Partially delivered.** Of this directory's planned modules only the FTP
-/// directory-listing parser exists yet; `protocols/mod.rs` is the module root
-/// and `protocols/ftp/mod.rs` is the FTP root, each declaring exactly the one
-/// child that exists. The rest arrive with their files.
 pub(crate) mod protocols;
 
 /// Proxy support: tunnelling, SOCKS, the PROXY protocol header, and the
 /// no-proxy predicate.
-///
-/// Supersedes `lib/http_proxy.c`, `lib/cf-h1-proxy.c` and
-/// `lib/cf-h2-proxy.c` (CONNECT tunnelling over HTTP/1 and HTTP/2),
-/// `lib/socks.c` (SOCKS4 and SOCKS5), `lib/socks_gssapi.c` (behind the
-/// default-off `negotiate` feature), `lib/cf-haproxy.c` (the PROXY protocol
-/// header) and `lib/noproxy.c` (`NO_PROXY` matching semantics, which are
-/// quirky and are preserved exactly).
-///
-/// Five of the six are filters in the chain owned by [`conn`], which is why
-/// proxying needs no special case in the protocol layer. The sixth,
-/// `noproxy`, deliberately is not: it is a pure predicate consulted BEFORE
-/// any filter is inserted, and its answer decides whether the proxy filters
-/// are built at all.
-///
-/// `pub(crate)`: proxies are configured through options, never named
-/// directly by a caller.
-/// **Partially delivered.** Of this directory's planned modules only the
-/// no-proxy predicate exists yet -- the one module here that names the filter
-/// chain nowhere, and therefore the one that can be built and tested before
-/// the chain does. `proxy/mod.rs` is the module root and declares exactly
-/// that one. CONNECT tunnelling, SOCKS, GSS-API SOCKS5 and the PROXY protocol
-/// header arrive with their files.
 pub(crate) mod proxy;
 
 /// MIME multipart bodies and the legacy form API.
-///
-/// Supersedes `lib/mime.c` (2,228 lines) and `lib/mime.h` (173 lines), and,
-/// when its `formdata` child lands, `lib/formdata.c` as well.
 ///
 /// `pub` because it backs 15 of the 100 exported symbols: the 12
 /// `curl_mime_*` functions of `lib/libcurl.def:37-48`, and the three legacy
 /// `curl_formadd`, `curl_formfree` and `curl_formget` entry points
 /// (`:24-26`), which are deprecated in the documentation yet still exported
 /// and therefore still part of the parity set.
-///
-/// Every literal in that module is protocol data rather than source
-/// formatting. `compareparts` (`tests/getpart.pm:351+`) joins both arrays
-/// into one string and compares them as one string, so the boundary's 24
-/// dashes and 22 alphanumeric characters, the order of the three generated
-/// headers, the elision of the first delimiter's leading CRLF and the absence
-/// of a space after `boundary=` are all observable results. 48 fixtures gate
-/// on the `Mime` feature, 20 of them through `<strippart>` substitutions
-/// whose match sides are exact dash counts, and `tests/data/test44` asserts a
-/// literal `Content-Length: 432` that reproduces only with a 46-byte
-/// boundary.
-///
-/// **Partially delivered.** The multipart engine is the module root; the
-/// `formdata` child arrives with its own file, per the convention this file
-/// states for the whole crate.
 pub mod mime;
 
 /// State deliberately shared between easy handles.
@@ -1072,28 +363,9 @@ pub mod mime;
 /// cases, which is why the `threadsafe` capability is advertised
 /// unconditionally, and they additionally give the share the interior
 /// locking the C leaves to its caller.
-///
-/// `pub` because it backs the four exported `curl_share_*` symbols:
-/// `curl_share_init`, `curl_share_setopt`, `curl_share_cleanup` and
-/// `curl_share_strerror` -- rows 81 to 84 of the 100 names in
-/// `lib/libcurl.def`.
 pub mod share;
 
 // MODULE MAP -- the remaining subsystems of the target design.
-//
-// The entries below name the rest of this crate's module graph and the C
-// translation units each one supersedes. They are recorded in this file for
-// two reasons. First, this file replaces `lib/Makefile.inc`, the manifest
-// both C build systems share, and that manifest enumerates the whole tree
-// rather than a part of it. Second, the order in which these subsystems
-// compose is architectural information that no other file in the crate
-// carries: it is the dependency order described above -- leaves first, then
-// the utility and platform layers, then the subsystems built on them, and
-// finally the handle interfaces the C ABI exposes.
-//
-// Each entry keeps the visibility the target design assigns it, stated with
-// the consumer that justifies it, so that widening one later is a decision
-// made against a recorded reason rather than a guess.
 
 // Name resolution -- NOW DECLARED above as `pub(crate) mod dns;`, whose own
 // documentation carries the detail this entry used to. It is kept in the map
@@ -1107,9 +379,11 @@ pub mod share;
 //
 // MIME and the legacy form API are no longer described here either: they are
 // DECLARED above as `pub mod mime`, which carries the detail this entry used
-// to, because the multipart engine of `lib/mime.c` now exists. What remains
-// unwritten is `formdata`, a child of that module rather than a subsystem of
-// its own.
+// to, because the multipart engine of `lib/mime.c` now exists -- and so, since
+// that entry was written, does `formdata`, its child covering the three legacy
+// `curl_form*` exports. Neither is reachable from a transfer yet, which is a
+// wiring gap and not a missing file; `version.rs`'s `ENGINE_MIME` and
+// `ENGINE_FORM` record it on those terms.
 //
 // The share interface is no longer described here either: it is DECLARED
 // above as `pub mod share`, which carries the detail this entry used to,
@@ -1117,6 +391,27 @@ pub mod share;
 // no unwritten subsystem at all -- every entry above names a module that is
 // declared, and what remains unwritten is children of those modules rather
 // than subsystems of their own.
+//
+// WHICH CHILDREN, measured against this checkout rather than left vague,
+// because "children remain" is the kind of statement that survives long after
+// it stops being true. Eighteen of the files AAP 0.4.1 assigns to this crate are
+// not on disk: `easy/{handle,setopt,getinfo}.rs`;
+// `transfer/{chunked,content_encoding}.rs`; the eight per-scheme executors
+// `protocols/{http1,http2,http3,ftp/pingpong,sftp,scp,file,ws}.rs` together with
+// `protocols/stub.rs`; and `proxy/{socks,socks_gss,http_connect,haproxy}.rs`.
+// Every other assigned file exists. That distinction is what
+// `version.rs`'s engine registry records per capability, and
+// `curl-rs/src/bin/curlinfo.rs` checks each of its claims against the tree.
+//
+// Those same eighteen paths are held as data, not prose, by
+// `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs`, alongside the sixteen
+// `curl-rs` and three `curl-rs-ffi` targets that are also unwritten -- 37
+// across the workspace. That gate fails, naming the file, as soon as one of
+// them lands, which is what keeps this paragraph from outliving its accuracy
+// the way its predecessor did. Registry granularity and file granularity are
+// deliberately both recorded: the registry answers "can this capability run",
+// the gate answers "what is left to write", and neither substitutes for the
+// other.
 //
 // THE OPTIONAL ALLOCATION LOG -- `memdebug`, default OFF.
 //
@@ -1130,47 +425,11 @@ pub mod share;
 // a safe attribute, so the wiring below builds cleanly under the crate-root
 // `#![deny(unsafe_code)]`, both with the feature and without it.
 //
-// WHY IT IS OFF BY DEFAULT, and what that costs.
-//
 // `tests/runtests.pl:1759` wraps its entire memory check in
 // `if($feature{"TrackMemory"})`, and `:660` derives that feature from a
 // single regular expression over the version banner:
 //
 //     $feature{"TrackMemory"} = $feat =~ /Debug/i;
-//
-// A binary that does not advertise `Debug` therefore has all leak checking
-// and all allocation-cap checking skipped, and a missing memory-dump file
-// appends only a `-` marker rather than failing the test. The chosen posture
-// is not to advertise `Debug`, which makes the 28 fixtures carrying a
-// `<limits>` block inert. The cost is stated openly rather than buried: 98
-// fixtures require `Debug` and will skip, and `make torture-test`
-// hard-requires the feature (`tests/runtests.pl:847-849`) and is therefore
-// not applicable. This feature exists so that the trade can be reversed
-// without a redesign should it prove unacceptable.
-//
-// What makes a Rust allocator viable at all is that the fixture assertion is
-// a CAP, not an equality: `tests/runtests.pl:1786-1826` tests
-// `if($allocs > $lim_allocs)`, defaulting to 1000 allocations and 1,000,000
-// bytes when a fixture omits the block. A Rust allocation pattern that
-// differs from C's but is not larger passes. `tests/data/test1`, for
-// instance, specifies `Allocations: 135` and `Maximum allocated: 136000`.
-//
-// The log destination is the path named by the `CURL_MEMDEBUG` environment
-// variable (`tests/runner.pm:165` sets it to "$logdir/$MEMDUMP"). The
-// per-fixture opt-out `<command option="no-memdebug">` DELETES that variable
-// at `tests/runner.pm:1026-1028` and restores it at `:1056`, so an unset,
-// empty or unwritable destination must simply disable logging: silently, with
-// nothing written anywhere and nothing panicking. `lib/memdebug.c:149` takes
-// the same view, opening the file only `if(logname && *logname)`.
-//
-// The record formats reproduce `lib/memdebug.c` exactly, and the asymmetric
-// comma spacing is not a typo -- `calloc` has no space after its comma
-// (`:257`) and `realloc` has one (`:349`), and `tests/memanalyzer.pm` parses
-// both with regular expressions, so either mistake breaks the parse. The
-// allocation cap mirrors `curl_dbg_memlimit()` (`:175-181`) including its
-// one-shot `if(!memlimit)` guard, and `countcheck()` (`:183-205`) writes its
-// `LIMIT %s:%d %s reached memlimit` record to BOTH the log and standard
-// error before failing the allocation.
 
 #[cfg(feature = "memdebug")]
 #[global_allocator]
@@ -1179,26 +438,17 @@ static MEMDEBUG_ALLOCATOR: crate::ffi::sys::memdebug::TrackingAllocator =
 
 // CRATE-ROOT RE-EXPORTS -- deliberately minimal, and every entry justified.
 //
-// A crate root is not a convenience header. Re-exporting broadly here would
-// rebuild exactly the coupling that replacing `#include "urldata.h"` removes,
-// so the rule is: re-export a symbol only where naming its owning module
-// would be actively unhelpful, and let every other consumer write the full
-// path (`curl_rs_lib::easy::...`, `curl_rs_lib::url::...`).
-//
 // TWO EXCLUSIONS, stated rather than silently omitted:
 //
-//  * The easy, multi and share HANDLE TYPES are NOT re-exported. The easy and
-//    multi handles are authored separately and do not exist at this commit,
-//    so any type name written here for them would be an unverified claim
-//    about code this file cannot inspect -- and the discipline this work is
-//    held to is that claims are evidenced, not asserted. `share::Share` does
-//    exist, and it is left unexported for consistency with the other two
-//    rather than for want of a name: re-exporting one handle type and not its
-//    siblings would make the root's surface depend on authoring order. Nothing
-//    is lost: `easy`, `multi` and `share` are all `pub`, so a consumer names
-//    the type through its owning module, which is the one-import-per-type
-//    discipline in any case. Adding a re-export later is a compatible change;
-//    a wrong one is a build break for two other crates.
+//  * The easy, multi and share HANDLE TYPES are NOT re-exported.
+//    `share::Share` does exist, and it is left unexported for consistency with
+//    the other two rather than for want of a name: re-exporting one handle
+//    type and not its siblings would make the root's surface depend on
+//    authoring order. Nothing is lost: `easy`, `multi` and `share` are all
+//    `pub`, so a consumer names the type through its owning module, which is
+//    the one-import-per-type discipline in any case. Adding a re-export later
+//    is a compatible change; a wrong one is a build break for two other
+//    crates.
 //  * No blanket `pub use error::*;` or `pub use version::*;`. A glob
 //    re-export makes the crate's public surface implicit, and the C ABI it
 //    backs is the opposite of implicit.
@@ -1236,14 +486,6 @@ pub use crate::version::{
 // `curl-rs-ffi` has no other way in -- `util` is crate-private by
 // enforcement, and a private path cannot be named from another crate.
 //
-// This is the standard private-module / public-re-export idiom, and it is
-// load-bearing: WITHOUT this line the facade
-// would have to reimplement `lib/parsedate.c`, putting engine logic in a
-// crate whose stated job is the C ABI and nothing else. WITH it, the adapter
-// converts a `*const c_char` to a `&str`, calls this, and maps `None` to
-// `-1`. Every parsing decision -- the six-part walk, the 69 timezone names,
-// the two-digit-year pivot, the `-1`-to-`0` adjustment -- stays here.
-//
 // Deliberately ONE name, not the module. `pub use crate::util::parsedate;`
 // would expose the module and with it `getdate_capped`, which backs the
 // INTERNAL `Curl_getdate_capped` and is not an exported symbol; widening it
@@ -1262,9 +504,6 @@ pub use crate::util::parsedate::getdate;
 // rules -- `curl_strequal(NULL, NULL)` is true while
 // `curl_strnequal(NULL, NULL, 0)` is false -- belong to the contract and so
 // live here.
-//
-// Deliberately TWO names, not the module: `casecompare` and `ncasecompare` are
-// internal comparators and no other crate has any business calling them.
 pub use crate::util::strcase::{strequal, strnequal};
 
 // The trace configuration. Re-exported by the same idiom and for the same
@@ -1272,16 +511,6 @@ pub use crate::util::strcase::{strequal, strnequal};
 // of the 100 symbols `lib/libcurl.def` exports (`:34`), its whole body in C is
 // `Curl_trc_opt(config)` (`lib/easy.c:292-308`), and `curl-rs-ffi` has no other
 // way in because `trace` is crate-private by enforcement.
-//
-// WITHOUT this line the facade would have to reimplement `trc_opt()`'s grammar
-// -- the 32-byte token cap, the two sign prefixes, the four category keywords,
-// the `doh` alias and the by-name fallback over both component registries --
-// giving one wire-visible grammar two owners in one workspace, which is exactly
-// the drift the single-source-of-truth discipline exists to prevent. WITH it,
-// the facade converts a `*const c_char` into `Option<&[u8]>`, calls
-// `apply_code`, and returns the `CURLcode`. Every parsing decision stays here,
-// where [`TraceConfig::apply`] already documents and tests it against the frozen
-// library.
 //
 // WHY THE PROCESS-WIDE INSTANCE IS NOT HERE. C keeps the levels in file-scope
 // statics that `trc_opt()` writes through (`lib/curl_trc.c:578`, `:584`,
@@ -1293,13 +522,6 @@ pub use crate::util::strcase::{strequal, strnequal};
 // allocator hooks -- and is lent to each transfer. A C consumer has no
 // command-line tool to hold one on its behalf, so somebody must, and the
 // facade is the only layer that may.
-//
-// Deliberately ONE name, not the module. `pub use crate::trace;` would expose
-// `Tracer`, `TraceSink`, `TraceFeature`, `TraceFilter`, `TraceLevel` and the
-// `--trace` record layouts, none of which is an exported symbol; widening it
-// would misrepresent the ABI surface as larger than the 100 names. The four
-// interpreting types stay `pub(crate)`, so the facade can construct, configure
-// and lend a configuration but can neither read nor forge a level.
 pub use crate::trace::TraceConfig;
 
 // The scheme table. Re-exported by the same idiom and for the same reason as
@@ -1310,17 +532,6 @@ pub use crate::trace::TraceConfig;
 // must obtain the table without being handed one, and `protocols` is
 // crate-private by enforcement.
 //
-// This line is the wiring contract that `crate::url::SchemeRegistry` and the
-// `protocols` declaration above BOTH already spell out; it exists now because
-// the URL API's five entry points do.
-//
-// WITHOUT it, the facade would have to carry the 33-scheme table itself --
-// putting protocol knowledge in a crate whose stated job is the C ABI and
-// nothing else (pattern P10), and duplicating a table AAP section 0.4.1 assigns
-// to `protocols/mod.rs` from `lib/url.c`. WITH it, the facade calls one function
-// and every port, every `PROTOPT_URLOPTIONS` flag and every runnable predicate
-// stays here.
-//
 // Deliberately ONE name, not the module, and NOT a glob. `pub use
 // crate::protocols::*;` would expose whatever the protocol modules add next --
 // none of which is an exported symbol -- and would misrepresent the ABI surface
@@ -1330,40 +541,19 @@ pub use crate::protocols::scheme_registry;
 // THE EXTENDED-ATTRIBUTE PRIMITIVE IS NOT RE-EXPORTED HERE, and the absence is
 // deliberate rather than an omission.
 //
-// `pub use crate::ffi::sys::{set_fd_xattr, xattr_available};` stood here. Both
-// names were public, documented as the way `curl-rs` reaches `--xattr` support,
-// and consumed by nothing whatever -- the only mention of either outside its own
-// definition was a doctest. What the tool actually consumes is `set_file_xattr`,
-// in the platform-facade list below, and what decides whether to call it is
-// `version::supports_xattr`. Two more public names for the same capability were
-// two more ways for the answer to differ from itself.
-//
-// So the surface is now exactly one function and one predicate:
+// The surface is exactly one function and one predicate, because two public
+// names for one capability are two ways for the answer to differ from itself:
 //
 //   * `set_file_xattr` -- below, with the rest of the platform facade. It takes
 //     `BorrowedFd<'_>` and `&[u8]` names, and applies the `strlen(value)`
-//     measurement `src/tool_xattr.c:88-92` applies, which the withdrawn
-//     `set_fd_xattr` did not.
+//     measurement `src/tool_xattr.c:88-92` applies.
 //   * `version::supports_xattr` -- the engine-owned capability query, which
 //     answers from `ffi::sys::xattr_available` through the crate-internal path.
 //     `xattr_available` is `pub(crate)` accordingly: it has a real consumer, and
 //     that consumer is inside this crate.
 //
-// `set_fd_xattr` is gone rather than merely narrowed. A `pub(crate)` function
-// with no caller is dead code, and this one brought a second `unsafe`
-// implementation of `fsetxattr` with it: `SysCalls::fsetxattr` and
-// `XattrCalls::fsetxattr` were two seams, two `RealSys` impls and two SAFETY
-// blocks for one syscall. Removing the unused path removes one of them, which is
-// the direction AAP section 0.6.9 requires the unsafe surface to move in.
-// THE PLATFORM FACADE -- six functions and one guard, and the only names from
-// `mod ffi` that leave this crate.
-//
 // Re-exported here, and nowhere else, because `curl-rs` cannot reach them any
-// other way and must not be made able to. That crate carries
-// `#![forbid(unsafe_code)]`, has no `mod ffi`, and AAP 0.8.5 conflict C3
-// reserves `curl-rs-lib/src/ffi/` for "genuine OS residue" -- so the four
-// capabilities the command-line tool needs from the operating system arrive
-// through this list or not at all:
+// other way and must not be made able to.
 //
 //   * `disable_echo` / `EchoGuard` -- clears the terminal's `ECHO` bit while a
 //     password is typed and restores it in `Drop`, reproducing the
@@ -1386,20 +576,11 @@ pub use crate::protocols::scheme_registry;
 // WHAT THIS DOES NOT DO, because the distinction is the whole reason the list
 // is a list and not a `pub mod`:
 //
-//   * `mod ffi` stays `pub(crate)`. No consumer can name a path into the
-//     `unsafe` island, so nothing there can be reached except through these
-//     seven names.
+//   * `mod ffi` stays `pub(crate)`.
 //   * The seam traits (`TerminalCalls`, `XattrCalls`, `TimeCalls`,
 //     `SysCalls`), `RealSys`, `SavedTerminal` and every `_with` variant stay
 //     `pub(crate)`. A consumer gets the capability, never the mechanism.
-//   * No new module and no new file is introduced to carry this. A `pub mod`
-//     wrapper would add a module name that AAP 0.3.1 does not list for this
-//     crate, and the crate-root re-export mechanism this section already
-//     documents is the mechanism that exists for exactly this purpose.
-//
-// Every one of the seven is a safe function over `std` types -- `BorrowedFd`,
-// `io::Result`, `Option`, `&[u8]` -- and each forms its raw pointer, uses it
-// and drops it inside a single call.
+//   * No new module and no new file is introduced to carry this.
 pub use crate::ffi::{
     disable_echo, local_utc_offset_secs, set_file_xattr,
     set_locale_from_environment, strftime_gmt, terminal_columns, EchoGuard,
@@ -1415,22 +596,9 @@ pub use crate::ffi::{
 // independent implementations of the `" (os error N)"` strip existed and two
 // already disagreed under Miri, so `crate::util` now owns the algorithm and
 // this is how `curl-rs` reaches it. See `os_error_message` for the measurement.
-//
-// `mod util` itself stays `pub(crate)`: the other absorbed shims -- the
-// narrowing conversions, `basename`, `strcopy`, the endian readers -- have no
-// consumer outside this crate and gain nothing from being nameable by one.
 pub use crate::util::os_error_message;
 
 // OPERATING-SYSTEM FACADE -- the narrowest safe bridge to `src/ffi/sys.rs`.
-//
-// `curl-rs` carries `#![forbid(unsafe_code)]` with ZERO exemptions and declares
-// no `libc` dependency, so it cannot make a platform call at all; and AAP
-// section 0.8.5 conflict C3 requires the residue that `socket2` does not absorb
-// to live in `curl-rs-lib/src/ffi/sys.rs`. Every platform capability the
-// command-line tool needs therefore reaches it from this crate, and the two
-// groups here are the whole of that surface.
-//
-// IT CROSSES IN TWO SHAPES, and the difference is visibility rather than taste.
 //
 //  * RE-EXPORTED AS THEY STAND -- the seven names in the `pub use crate::ffi`
 //    above: `disable_echo` and `EchoGuard` (F15, terminal echo while a password
@@ -1449,41 +617,8 @@ pub use crate::util::os_error_message;
 //    `pub(crate)`, so nothing outside this crate can name a path into the
 //    `unsafe` island, and each wrapper narrows what it exposes so that no
 //    `pub(crate)` type ever reaches a public signature.
-//
-// WHAT NEITHER SHAPE EXPOSES: no `libc` type, no raw pointer and no raw
-// descriptor integer anywhere. The `unsafe` blocks are reachable from outside
-// this crate only through these ten names -- eleven with `memdebug` -- and each
-// of them forms the raw pointer it needs, uses it and drops it inside a single
-// call.
-//
-// EVERY DESCRIPTOR CROSSES AS `BorrowedFd<'_>`, NOT `RawFd`. The three
-// descriptor functions below took `std::os::unix::io::RawFd` -- a
-// standard-library alias, which is why it looked acceptable. It is not, and the
-// reason is the one thing an alias for `i32` cannot do: a descriptor integer
-// carries no lifetime, so nothing stops a caller passing one whose file has
-// already been closed, and nothing stops the kernel having reissued that same
-// number for an unrelated file in between. The call would then succeed against
-// the wrong file. `BorrowedFd<'_>` makes the borrow the compiler's business:
-// the descriptor provably outlives the call, and the integer is formed only
-// inside the island, at the `libc::` call itself.
-//
-// The caller already held the safe form. `curl-rs/src/output/formparse.rs`
-// reaches its descriptor through `io::Stdin::as_fd`, so passing `RawFd` meant
-// degrading a `BorrowedFd` to an integer at the call site and taking the
-// weaker guarantee for no gain. It now passes what it holds. `set_file_xattr`
-// took `BorrowedFd<'_>` from the start, so this makes the facade uniform rather
-// than introducing a new convention.
 
 /// The extent of `fd` when it is a regular file that can be read lazily.
-///
-/// `Some((origin, size))` where `origin` is the descriptor's current offset and
-/// `size` is the file's total length -- the pair `src/tool_formparse.c:128,131-135`
-/// gathers before deciding that standard input need not be buffered.
-///
-/// [`None`] is an ordinary answer rather than an error, and it covers every case
-/// C's compound condition collapses into its "buffer it instead" branch at
-/// `:140`: a pipe, a socket, a terminal, a directory, a closed descriptor and an
-/// unseekable one alike. A caller that receives [`None`] must buffer.
 pub fn regular_file_extent(
     fd: std::os::fd::BorrowedFd<'_>,
 ) -> Option<(i64, i64)> {
@@ -1491,17 +626,6 @@ pub fn regular_file_extent(
 }
 
 /// Reads from `fd` into `buf`, returning how many bytes were placed there.
-///
-/// Stands in for `fread(buffer, 1, nitems, stdin)`
-/// (`src/tool_formparse.c:216`); `Ok(0)` is end of input, as a short `fread`
-/// without `ferror` is.
-///
-/// # Why `io::Result` rather than a `CURLcode`
-///
-/// The caller distinguishes end of input from failure and needs the underlying
-/// error to do it, which is precisely what C's `ferror(stdin)` check at `:218`
-/// consults. Flattening that into a `CURLcode` would discard the distinction at
-/// the boundary and force the caller to re-invent it.
 ///
 /// # Errors
 ///
@@ -1516,14 +640,6 @@ pub fn read_file_descriptor(
 
 /// Repositions `fd` to `offset`, counted from the start of the file.
 ///
-/// Reproduces `curlx_fseek(stdin, offset, SEEK_SET)`
-/// (`src/tool_formparse.c:244`), where the offset already includes the origin.
-///
-/// The descriptor is repositioned directly rather than through a buffered
-/// stream, which is what makes this safe to pair with [`read_file_descriptor`]:
-/// there is no user-space buffer left holding bytes from before the seek. A
-/// caller that mixes this with `io::Stdin` would have exactly that bug.
-///
 /// # Errors
 ///
 /// Whatever `lseek(2)` reports. An unseekable descriptor is the case
@@ -1537,71 +653,14 @@ pub fn seek_file_descriptor(
 
 /// Applies the `CURL_MEMLIMIT` allocation cap, reproducing
 /// `src/tool_main.c:117-125`.
-///
-/// Returns whether *this* call armed the cap. The allocator also arms itself
-/// from the same variable on its first use, so a [`false`] here does not mean no
-/// cap is in force -- see `ffi::sys::memdebug::init_from_env` for the measured
-/// detail. Calling this as early as possible in `main` is still worthwhile: it
-/// is what makes the cap's numbering start where the C's does, rather than two
-/// allocations earlier.
-///
-/// Present only with the `memdebug` feature, which is off by default. AAP
-/// section 0.6.6 records why: `tests/runtests.pl:1759` gates every memory check
-/// on `TrackMemory`, which `:660` derives from a `Debug` token in the version
-/// banner that this build deliberately withholds.
 #[cfg(feature = "memdebug")]
 pub fn memdebug_init_from_env() -> bool {
     crate::ffi::init_from_env()
 }
 
 // DIAGNOSTIC-OUTPUT FACADE -- the bridge to `src/trace.rs`'s neutralization.
-//
-// One more function, and here for the same structural reason as the four above:
-// the implementation is `pub(crate)` in a `pub(crate) mod`, and `curl-rs` is a
-// separate crate that cannot reach it.
-//
-// The rule spans three files that each render attacker-influenced text --
-// `curl-rs-lib/src/trace.rs`, `curl-rs-lib/src/tls/cipher_suite.rs` and
-// `curl-rs/src/output/msgs.rs`. The first two are inside this crate and call
-// `crate::trace::escape_controls` directly; only the third needs a bridge, so
-// only what the third needs crosses. `ControlEscaping` stays private and the
-// single-line mode is baked in, because a warning, an error or an embedded
-// diagnostic fragment is one line by construction -- which is exactly why an LF
-// in one was injected rather than structural.
 
 /// Neutralize display-affecting control bytes in a one-line diagnostic.
-///
-/// # What this is for
-///
-/// Text that is about to reach a terminal and that carries bytes this process
-/// did not choose -- a server-supplied error string, a hostname, a certificate
-/// subject, a negotiated cipher name. Such bytes can contain an ESC sequence
-/// that repositions the cursor or recolours the screen (CWE-150), or a CR or LF
-/// that overwrites or fabricates a line of output (CWE-117).
-///
-/// Every byte below `0x20`, plus `0x7F`, becomes `.` -- the same substitution
-/// `dump()` already makes for unprintable bytes (`src/tool_setup.h:63`,
-/// `UNPRINTABLE_CHAR`). One byte in, one byte out, so the result is exactly as
-/// long as the input and this can never amplify output. Bytes at or above `0x80`
-/// are left alone: they are legitimate 8-bit or UTF-8 payload and cannot affect
-/// a display.
-///
-/// Returns [`std::borrow::Cow::Borrowed`] when there is nothing to replace,
-/// which is the overwhelmingly common case, so ordinary messages cost no
-/// allocation and are passed through unchanged.
-///
-/// # When NOT to call it
-///
-/// Only for a destination whose bytes are interpreted. A redirected file must
-/// stay byte-faithful so its contents can be diffed or replayed against the C
-/// tool, and neutralizing there would be a behaviour change with no security
-/// benefit. Decide on the destination first, then call this only for the
-/// terminal case.
-///
-/// Multi-line payloads -- a whole header block, a trace record -- must NOT go
-/// through here: it would replace their line terminators. Those are handled
-/// inside [`crate::trace`], which keeps LF and keeps CR where it precedes LF
-/// while still neutralizing a lone CR.
 #[must_use]
 pub fn escape_control_bytes(text: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     crate::trace::escape_controls(
@@ -1634,27 +693,10 @@ pub fn escape_control_bytes(text: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 //    terminal; the executable gate is what a change has to get past. Both are
 //    anchored, because this file discusses the attribute in prose and an
 //    unanchored search would match the discussion.
-//
-// `mod source_policy` carries one further invariant that is not about `unsafe`
-// at all: no lint level for `dead_code` may be set on a crate root or a module
-// root, anywhere in the workspace. That form of suppression also silences the
-// NEXT item somebody adds, so it hides incomplete scaffolding instead of
-// recording it. Items whose consumer has yet to be migrated carry a per-item
-// `#[allow(dead_code)]` instead, which is an inventory: every one is
-// load-bearing, and each is deleted when its consumer lands.
 
 #[cfg(test)]
 mod tests {
     /// The capability vocabulary, evaluated at compile time.
-    ///
-    /// Every name below is a feature declared in `curl-rs-lib/Cargo.toml`.
-    /// That is not merely a convention: naming an UNDECLARED feature makes
-    /// `rustc` emit `unexpected 'cfg' condition value`, which the lint gate
-    /// turns into a build failure. This table is therefore a mechanical check
-    /// that the 15 names are exactly the 15 that exist, spelled correctly.
-    ///
-    /// The `bool` records whether the feature is enabled in the build under
-    /// test, which varies by invocation and is deliberately not asserted.
     const FEATURES: &[(&str, bool)] = &[
         ("altsvc", cfg!(feature = "altsvc")),
         ("brotli", cfg!(feature = "brotli")),
@@ -1694,12 +736,6 @@ mod tests {
     }
 
     /// `LIBCURL_VERSION_NUM` is the packed form of the three components.
-    ///
-    /// `curlver.h:43-61` builds the number as
-    /// `(major << 16) | (minor << 8) | patch` so that a consumer can compare
-    /// versions arithmetically. If the two ever disagreed, `CURL_AT_LEAST_
-    /// VERSION` would answer wrongly, so the relationship is asserted rather
-    /// than assumed.
     #[test]
     fn packed_version_matches_its_components() {
         let packed = (crate::version::LIBCURL_VERSION_MAJOR << 16)
@@ -1710,11 +746,6 @@ mod tests {
 
     /// The re-exported result codes resolve at the crate root and keep their
     /// pinned integers.
-    ///
-    /// The point is reachability through `crate::`, not the values
-    /// themselves -- `error` owns those and asserts all 103 of them. The four
-    /// anchors here are the ones a C consumer is most likely to compare
-    /// against.
     #[test]
     fn result_codes_reach_the_crate_root() {
         assert_eq!(crate::CURLcode::Ok.as_i32(), 0);
@@ -1791,21 +822,6 @@ mod tests {
     }
 
     /// TLS is not switchable, and rustls is the only backend.
-    ///
-    /// There is no `tls` feature and there must never be one: an
-    /// off-switchable TLS would permit a build with no TLS at all, which
-    /// contradicts "rustls exclusively, validation on by default". The
-    /// vocabulary table above is the mechanical half of this check -- it
-    /// contains no `tls` entry, and adding one would not compile cleanly --
-    /// and this is the behavioural half.
-    ///
-    /// The `SSL` capability CLAIM is a separate question from the absence of a
-    /// switch, and the two must not be conflated: the claim is governed solely
-    /// by `version::ENGINE_TLS`, so it is withheld until the backend module
-    /// exists and becomes `true` the moment it does. Asserting `has_feature`
-    /// unconditionally here would be asserting that a capability is present
-    /// because it cannot be configured away, which is the confusion the engine
-    /// registry exists to remove.
     #[test]
     fn tls_is_not_switchable_and_rustls_is_the_only_backend() {
         assert!(
@@ -1850,13 +866,6 @@ mod tests {
     }
 
     /// The default-off trio is off unless explicitly asked for.
-    ///
-    /// Guarded so that the test still passes when a feature-matrix leg turns
-    /// one of them on deliberately; what it forbids is a default build that
-    /// silently carries them. `negotiate` would link a C security library,
-    /// `hickory-dns` would displace the system resolver, and `memdebug`
-    /// would replace the global allocator -- none of which may happen by
-    /// accident.
     #[test]
     #[cfg(not(any(
         feature = "negotiate",
@@ -1907,12 +916,6 @@ mod tests {
     }
 
     // BEGIN FACADE TESTS -- extracted for out-of-tree verification.
-    //
-    // These cover the operating-system facade above. They exercise the real
-    // platform calls rather than a fake, because the facade deliberately binds
-    // the non-injected wrappers; the injected `_with` variants and every branch
-    // of the surrounding logic are covered inside `src/ffi/sys.rs`, where a
-    // pure-Rust fake makes them reachable under Miri.
 
     /// A local UTC offset is available and within the range zones actually use.
     ///
@@ -1949,15 +952,6 @@ mod tests {
 
     /// Echo suppression reaches the tool through the crate root, and a
     /// redirected standard input does not break it.
-    ///
-    /// This is the case `tests/runtests.pl` always takes, since it runs curl with
-    /// standard input redirected. `tcgetattr` fails there, yet
-    /// `src/tool_getpass.c:148` still reports `TRUE` and `:183-185` still emits
-    /// the extra newline -- so the guard must report echo as disabled regardless,
-    /// and dropping it must not panic on a descriptor whose attributes were never
-    /// readable. The byte-level parity argument is recorded on
-    /// `EchoGuard::echo_disabled`; this covers only that the name resolves at the
-    /// crate root, which is what `curl-rs/src/terminal.rs` depends on.
     #[test]
     #[cfg_attr(miri, ignore = "tcgetattr(3) is a foreign function")]
     fn echo_suppression_crosses_the_crate_boundary_on_a_non_terminal() {
@@ -1978,19 +972,6 @@ mod tests {
     }
 
     /// An attribute name containing an interior NUL is rejected.
-    ///
-    /// Checked through the facade because it is the boundary a caller in
-    /// `curl-rs` actually crosses. No writable filesystem and no extended
-    /// attribute support is needed: the name cannot be made into a C string, so
-    /// the platform call is never attempted and the borrowed descriptor is never
-    /// touched.
-    ///
-    /// The *failing* platform call -- an attribute the filesystem refuses, which
-    /// `src/tool_xattr.c:105` keeps as the first error while completing the
-    /// transfer -- is covered where it can be forced deterministically, by
-    /// `the_platform_errno_survives_inside_the_error` over the injected seam in
-    /// `src/ffi/sys.rs`. Forcing it here would mean depending on whether the test
-    /// host's filesystem carries `user.*` attributes at all.
     #[test]
     fn an_xattr_name_with_an_interior_nul_is_rejected() {
         use std::os::fd::AsFd as _;
@@ -2050,29 +1031,17 @@ mod tests {
 //  1. Exactly one `#[allow(unsafe_code)]` exists per crate that needs one, and
 //     it is on the `ffi` module declaration. `curl-rs` needs none and must
 //     have none.
-//  2. No lint level for `dead_code` is set on a crate root or a module root
-//     anywhere in the workspace.
-//
-// The gate lives in this crate rather than in a separate test crate because
-// every workspace member depends on this one, so `cargo test --workspace`
-// cannot pass without running it, and because a file that states a rule should
-// be the file that enforces it. `curl-rs-ffi/src/lib.rs` carries the same
-// checks for its own tree; the overlap is deliberate -- either crate can be
-// tested alone and still be governed.
 //
 // Every test below is `#[cfg_attr(miri, ignore)]`d, and the reason is the same
 // one each time: these tests read the source tree, not the program. Miri
 // interprets Rust's runtime semantics, and it runs with host isolation on, so
 // `fs::read_dir` fails with `unsupported operation: `opendir` not available
 // when isolation is enabled` -- which aborts the whole interpreter and takes
-// the required `cargo miri test -p curl-rs-lib` gate (AAP section 0.8.4) down
-// with it. Ignoring them under Miri costs nothing and hides nothing: there is
-// no pointer arithmetic, no aliasing and no uninitialised memory in a string
-// scan, so Miri has nothing to find here, and the assertions still run in full
-// under `cargo test --workspace` -- the gate that owns them. The alternative,
-// `-Zmiri-disable-isolation`, was rejected: it would make the Miri workflow
-// pass a flag, and `.github/workflows/rust-miri.yml` deliberately passes none
-// so that the gate stays exactly the command the AAP specifies.
+// the required `cargo miri test -p curl-rs-lib` gate down with it. Ignoring
+// them under Miri costs nothing and hides nothing: there is no pointer
+// arithmetic, no aliasing and no uninitialised memory in a string scan, so
+// Miri has nothing to find here, and the assertions still run in full under
+// `cargo test --workspace` -- the gate that owns them.
 
 #[cfg(test)]
 mod source_policy {
@@ -2080,11 +1049,6 @@ mod source_policy {
     use std::path::{Path, PathBuf};
 
     /// The workspace members, in dependency order.
-    ///
-    /// Spelled out rather than discovered by reading the root manifest: the
-    /// membership is fixed by AAP section 0.3.1 at exactly three crates, so a
-    /// fourth appearing on disk is a change that should be made deliberately
-    /// and reflected here, not absorbed silently by a glob.
     const MEMBERS: [&str; 3] = ["curl-rs-lib", "curl-rs", "curl-rs-ffi"];
 
     /// The workspace root, derived from this crate's manifest directory.
@@ -2100,10 +1064,6 @@ mod source_policy {
 
     /// Every `.rs` file under `<member>/src`, plus that member's build script
     /// when it has one.
-    ///
-    /// Build scripts are included because they are ordinary Rust that the same
-    /// rules govern: a `#![allow(dead_code)]` in a build script would hide
-    /// exactly the same incomplete scaffolding as one in a library module.
     fn sources(member: &str) -> Vec<PathBuf> {
         let member_dir = workspace_root().join(member);
         let src = member_dir.join("src");
@@ -2164,14 +1124,6 @@ mod source_policy {
     }
 
     /// `line` with its comment tail and every string literal removed.
-    ///
-    /// Identical in intent to the helper of the same name in
-    /// `curl-rs-ffi/src/lib.rs`, and necessary for the same two reasons: this
-    /// crate discusses the `unsafe` keyword at length in prose, and the gate
-    /// below compares against literals, so a scan that kept either would flag
-    /// its own implementation. Raw strings are not lexed, which
-    /// [`no_raw_string_literal_defeats_the_stripper`] proves harmless for the
-    /// tree actually scanned.
     fn code_only(line: &str) -> String {
         let without_comment = line.split("//").next().unwrap_or("");
         let mut out = String::with_capacity(without_comment.len());
@@ -2209,12 +1161,6 @@ mod source_policy {
     }
 
     /// True when `code` opens a raw string literal.
-    ///
-    /// Judged lexically: a `"` preceded by a run of `#`, then `r`, optionally
-    /// `b`-prefixed, whose own predecessor is neither an identifier character
-    /// nor a backslash. Excluding the backslash is what keeps `b"ends in \r"`
-    /// from reading as a raw-string opener -- measured on
-    /// `tls/keylog.rs` and `trace.rs`, both of which contain exactly that.
     fn opens_a_raw_string(code: &str) -> bool {
         let bytes: Vec<char> = code.chars().collect();
         for (index, ch) in bytes.iter().enumerate() {
@@ -2251,16 +1197,6 @@ mod source_policy {
     /// fixed-width Rust integers and the `c_*` spellings appear only where a
     /// real C boundary is being crossed: `curl-rs-lib/src/ffi/`, the sanctioned
     /// island, and `curl-rs-ffi`, which owns the ABI.
-    ///
-    /// This is not a distinction without a difference even though the two
-    /// coincide on all four targets of specification 0.8.3. The widths in
-    /// `include/curl/curl.h` are fixed by curl's ABI, not by the compiler, so
-    /// stating them as `i32` and `u32` records the contract; `c_int` records a
-    /// platform. The gate exists because the coincidence means a reintroduced
-    /// `c_int` would compile silently and never be noticed.
-    ///
-    /// Scoped to this crate. `curl-rs-ffi` is where the conversions belong, and
-    /// `curl-rs` is checked by its own gates for its own invariants.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn c_scalar_types_appear_only_inside_the_ffi_island() {
@@ -2533,10 +1469,6 @@ mod source_policy {
         // not its opener. The walk goes back over blank lines and attributes,
         // then over the contiguous run of `//` comment lines, and requires that
         // run to contain a line beginning `// SAFETY:`.
-        //
-        // Only `unsafe` *blocks* and `unsafe impl`s need a justification. An
-        // `unsafe fn` declaration states its contract in its doc comment
-        // instead, which is where a caller reads it.
         let mut uncovered = Vec::new();
         let mut covered = 0_usize;
         for path in sources("curl-rs-lib") {

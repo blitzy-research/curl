@@ -22,17 +22,6 @@
 // DIRECTORY CARRIES, and the difference is deliberate. Read this before
 // "fixing" it to match its neighbours.
 //
-// The twenty-two other modules under `curl-rs-lib/src/util/` open with the
-// curl project's own twenty-three-line banner, ASCII art and all, because
-// the C translation units they supersede carry it. The two this file
-// supersedes do not. `lib/curlx/inet_ntop.c:1-18` and
-// `lib/curlx/inet_pton.c:1-19` are Internet Software Consortium code from
-// BIND, and each declares an SPDX licence identifier naming `ISC` rather
-// than naming curl. `super` records the exception at its own head, in the
-// paragraph beginning "Every one of the 23 files in this directory carries
-// this same block, with ONE deliberate exception": re-licensing this file
-// to curl's terms would be a licence violation, not a tidy-up.
-//
 // WHAT IS REPRODUCED, AND FROM WHICH FILE. This module merges two
 // translation units, so it carries the provenance of both:
 //
@@ -51,27 +40,9 @@
 //     both;
 //   * the SPDX identifier is `inet_ntop.c:17` and `inet_pton.c:18`, which
 //     agree.
-//
-// ONE SPELLING RULE INSIDE THIS FILE, and it is the reason no paragraph
-// below ever writes an SPDX tag out in full a second time. `reuse` scans
-// every line of a file for the identifier keyword followed by its colon and
-// parses whatever comes after as a licence expression, so a prose mention
-// becomes a parse error rather than prose -- `super` records that measured
-// failure at its own head. The tag therefore appears exactly once, on the
-// last line of the banner, and every discussion of licensing anywhere in
-// this file names a licence in words instead.
-//
-// The requirement is enforced rather than trusted. `reuse lint` runs in
-// continuous integration in the same job as the linter and the spellchecker,
-// `REUSE.toml` annotates only files that cannot be annotated directly and
-// covers nothing under `curl-rs-lib/src/`, and `LICENSES/ISC.txt` is already
-// present in this repository because the C originals need it. So the
-// annotation has to be in this file, and `reuse lint-file` on it must be
-// silent -- which is checkable in one command and was checked.
 
-//! Address presentation and parsing -- supersedes `lib/curlx/inet_ntop.c`
-//! (222 lines) and `lib/curlx/inet_pton.c` (221), together with their two
-//! thin headers.
+//! Address presentation and parsing -- supersedes `lib/curlx/inet_ntop.c` and
+//! `lib/curlx/inet_pton.c`, together with their two thin headers.
 //!
 //! Four functions in the C, wearing two names. `curlx_inet_ntop` turns four
 //! or sixteen network-order bytes into the text a human reads, and
@@ -81,190 +52,7 @@
 //! here, without the `inet_` prefix that the enclosing module already
 //! supplies.
 //!
-//! # Why this is transcribed rather than delegated to [`std::net`]
-//!
-//! Rust ships [`Ipv4Addr`] and [`Ipv6Addr`] with a [`Display`] impl and a
-//! [`FromStr`] impl, and reaching for them would be the obvious move. It is
-//! the wrong one, because **the output of these functions is wire- and
-//! file-visible and the specification governing this work freezes it.**
-//!
-//! Twenty files in the C tree consume this pair -- measured with
-//! `grep -rln 'curlx_inet_ntop\|curlx_inet_pton' lib/ src/`, which reports
-//! `altsvc.c`, `asyn-ares.c`, `cf-socket.c`, `connect.c`,
-//! `curl_addrinfo.c`, `curlx/curlx.h`, `ftp.c`, `hostip.c`, `hostip6.c`,
-//! `if2ip.c`, `noproxy.c`, `socks.c`, `urlapi.c`, `vtls/openssl.c`,
-//! `vtls/schannel_verify.c` and `vtls/vtls.c` beside the four `inet_*` files
-//! themselves. What they do with the strings is the point:
-//!
-//! | Consumer | Where the bytes end up |
-//! |---|---|
-//! | `urlapi.c:435` | the host component of a parsed URL, hence `Host:` |
-//! | `ftp.c:1032` | the `EPRT` and `PORT` command arguments |
-//! | `socks.c:794` | the address field of a SOCKS request |
-//! | `altsvc.c:246` | the on-disk Alt-Svc cache |
-//! | `connect.c:227` | `CURLINFO_PRIMARY_IP`, hence `--write-out` |
-//! | `hostip.c:213` | resolver trace output and the connection cache key |
-//! | `vtls/vtls.c:1212` | whether a name is a literal, hence Server Name |
-//! | `noproxy.c:55` | `NO_PROXY` network matching |
-//!
-//! Specification 0.6.7 establishes that 1,476 of the 1,914 fixtures under
-//! `tests/data/` carry a `<protocol>` block whose bytes are compared as one
-//! joined string, with no per-line matching and no normalisation. A
-//! rendering that differs from curl's in any character fails those
-//! comparisons for a reason that has nothing to do with correctness. So the
-//! algorithms below are transcriptions, and [`Ipv4Addr`] and [`Ipv6Addr`]
-//! appear only as **container types** for the four- and sixteen-byte
-//! payloads, never as the implementation.
-//!
-//! ## Two divergences from [`std::net`], measured rather than assumed
-//!
-//! Both were established by running the two implementations against each
-//! other rather than by reading either one's documentation, and both are
-//! asserted by a test at the foot of this file that pins curl's answer and
-//! names Rust's beside it. The count is two, not "several": the sweep below
-//! is what fixes it, and an earlier draft of this paragraph claimed a third
-//! that measurement disproved.
-//!
-//! **1. An IPv4-compatible address renders as `::a.b.c.d`.** The C's
-//! condition (`inet_ntop.c:155-156`) is `i == 6 && best.base == 0 &&
-//! (best.len == 6 || (best.len == 5 && words[5] == 0xffff))`, so it covers
-//! the deprecated compatible form as well as the mapped one. Current Rust
-//! special-cases the **mapped** form only and renders the compatible form in
-//! hexadecimal, so `[0, 0, 0, 0, 0, 0, 0xc0a8, 0x0001]` is
-//! `"::192.168.0.1"` here and `"::c0a8:1"` there.
-//!
-//! A sweep of 65,536 addresses built from the group alphabet
-//! `{0, 1, 0xffff, 0x0100}` found **exactly twelve** disagreements, and all
-//! twelve are that shape. The mapped form agrees, and so does every
-//! compressed and uncompressed hexadecimal form.
-//!
-//! The `best.len == 6` **equality** is the hinge, and both of its branches
-//! are worth holding in view because they land on opposite sides. Satisfied,
-//! the dotted quad is emitted and the two part company. Failed because group
-//! 6 is itself zero -- `[0, 0, 0, 0, 0, 0, 0, 0x0100]`, whose zero run is
-//! seven long -- hexadecimal is emitted and they agree on `"::100"`. That
-//! second branch is also what saves `::` and `::1` from coming out as
-//! `"::0.0.0.0"` and `"::0.0.0.1"` with no special case written for them.
-//!
-//! **2. A trailing colon is accepted.** `pton6(b"1::2:")` succeeds here and
-//! yields `1::2`, because the final colon flushes the pending group and the
-//! `::` close-up then fills the address out. Rust's [`FromStr`] rejects it.
-//! The same holds for `b"::1:"`, `b"1::2:3:"` and a complete address with a
-//! colon stuck on the end, `b"1:2:3:4:5:6:7:8:"`. None of those is something
-//! a caller should emit, but this function's job is to accept exactly what
-//! curl accepts, so tightening it would itself be the behaviour change.
-//!
-//! A trailing colon does not, however, repair a short address:
-//! `b"1:2:3:4:5:6:7:"` is fourteen bytes with no `::` to stand for the rest,
-//! and both implementations reject it.
-//!
-//! ## Where the two agree, including two places worth naming
-//!
-//! Everything else in a 35-case parsing corpus agrees, `:1::`, `1:::2`,
-//! `::1::2`, `12345::`, `g::1`, the empty string and `fe80::1%eth0` among
-//! them. Two of the agreements deserve a sentence each, because both are
-//! agreement about an *outcome* reached by different routes:
-//!
-//! - **Leading zeros in a dotted quad are rejected by both.** curl rejects
-//!   through `if(saw_digit && *tp == 0) return 0` (`inet_pton.c:77-78`),
-//!   which tests the accumulator rather than the digit -- so `0` is a valid
-//!   octet and `00` is not.
-//! - **A complete address that also carries `::` is rejected by both**, and
-//!   here the interesting disagreement is not with Rust but with the C's own
-//!   documentation. `inet_pton.c:109` claims "`::` in a full address is
-//!   silently ignored"; `inet_pton.c:178-179` reads
-//!   `if(tp == endp) return 0;`. The code is what ships, so the code is what
-//!   is transcribed, and the stale comment is flagged again at the site in
-//!   [`pton6`].
-//!
-//! # The error surface collapses, in three separate ways
-//!
-//! The C signatures carry failure modes that this module cannot have, and
-//! each is recorded rather than quietly dropped.
-//!
-//! **The address family, and with it `-1`.** `curlx_inet_pton`
-//! (`inet_pton.c:196-198`) documents three returns: `1` for a valid
-//! address, `0` for an invalid one, and `-1` for "some other error". The
-//! only path to `-1` is the `default:` arm of its own `switch`, which sets
-//! `SOCKEAFNOSUPPORT` for a family that is neither `AF_INET` nor
-//! `AF_INET6`; `curlx_inet_ntop` has the matching arm at
-//! `inet_ntop.c:217-219`. Here the family is not a parameter -- [`pton4`]
-//! and [`pton6`] are separate functions and [`ntop4`] and [`ntop6`] take
-//! arrays of the one length each accepts -- so that arm has no successor and
-//! `-1` is unreachable. The parsers therefore return [`Option`]: [`Some`] is
-//! the C's `1` and [`None`] is its `0`. No `AF_INET` constant is defined
-//! anywhere below, deliberately: inventing one would pull `libc` into a
-//! module that has no business naming it, and specification 0.8.5 confines
-//! that crate to the FFI island.
-//!
-//! **The caller's buffer, and with it `ENOSPC`.** Both C formatters take a
-//! `char *` and a size, and both fail with `ENOSPC` when the result does not
-//! fit (`inet_ntop.c:73-80` and `:186-193`; the same sites set `WSAEINVAL`
-//! under Winsock, a branch excluded with the rest of the Windows support by
-//! specification 0.2.2, and the C's own note at `:206-208` about storing the
-//! error in the thread `errno` rather than the Winsock error code goes with
-//! it). [`ntop4`] and [`ntop6`] return an owned [`String`], which cannot be
-//! too small, so that failure has nowhere to live either and both are
-//! **infallible**. `Option<String>` was considered and rejected: a [`None`]
-//! that no input can produce forces every call site to handle an impossible
-//! case, and the compiler would stop helping anyone who cared about the real
-//! ones. No fixed-capacity variant writing into a caller's buffer is offered
-//! alongside, because no caller needs one -- `curlx_inet_ntop` is not among
-//! the 100 symbols of `lib/libcurl.def`, so nothing in `curl-rs-ffi`
-//! reaches this module, and every consumer named in the table above wants a
-//! string it can keep. A second entry point with no call site would be
-//! surface rather than capability.
-//!
-//! **The `errno` channel itself.** Nothing below sets a global error
-//! variable or names one. The two failure modes that survive are in the
-//! return type where a caller cannot miss them.
-//!
-//! # The portability guards have no successor, which stabilises behaviour
-//!
-//! Both C files are wrapped in a probe result -- `#ifndef HAVE_INET_NTOP` at
-//! `inet_ntop.c:21` and `#ifndef HAVE_INET_PTON` at `inet_pton.c:22`. They
-//! are *fallbacks*: where the platform supplies the function, the whole
-//! translation unit compiles to nothing and the header redirects the name to
-//! the C library instead. On all four mandated targets the probe succeeds,
-//! so curl 8.19 as built today runs the **platform's** converters on Linux
-//! and macOS alike, and its own only where neither exists.
-//!
-//! Here there is one implementation, unconditionally, on all four targets:
-//! curl's. **That is a change and it is recorded as one.** It is a change
-//! for the better in the only dimension this work measures -- an
-//! implementation detail that used to vary with the host C library no longer
-//! varies at all, so the strings that reach a `Host:` header or an Alt-Svc
-//! file are now determined by this file rather than by whoever built the
-//! binary. Wire determinism is exactly what specification 0.6.7 needs. But
-//! it is not a null change, and anyone comparing this module against a
-//! platform `inet_ntop(3)` should expect the divergences above to appear
-//! where they previously did not.
-//!
-//! The other conditional in both files also has no successor, for a plainer
-//! reason. `inet_ntop.c:46-48` and `inet_pton.c:46-48` carry
-//!
-//! ```c
-//! #if !defined(USE_IPV6) && !defined(AF_INET6)
-//! #define AF_INET6 (AF_INET + 1)
-//! #endif
-//! ```
-//!
-//! so that IPv6 text can still be *parsed* in a build with IPv6 support
-//! switched off, without a fabricated constant escaping into the rest of the
-//! tree. With no family parameter and no `AF_INET6` to fabricate, there is
-//! nothing to shim: [`pton6`] is compiled and callable in every
-//! configuration of this crate, which is what that shim was for.
-//!
 //! # Visibility, layering and inputs
-//!
-//! `pub(crate)`, with no `pub` item. Neither `curlx_inet_ntop` nor
-//! `curlx_inet_pton` appears in `lib/libcurl.def`, so no exported symbol is
-//! backed from here and the crate root adds no re-export. Specification
-//! 0.8.7 settles the temptation to widen it anyway: `tests/unit` and
-//! `tests/libtest` link a debug static library and call internal symbols, so
-//! widening would make some of them link -- and that is precisely the
-//! re-export the specification forbids. The coverage lives in this file's
-//! own test module instead.
 //!
 //! Two sibling modules are imported and nothing else: `super`'s [`ultouc`]
 //! for the one narrowing the C writes as a cast, and
@@ -286,30 +74,13 @@
 //! # Conventions
 //!
 //! No `unsafe` anywhere: the crate root denies the lint and grants its one
-//! exemption to `mod ffi`, which this module is not. That matters
-//! particularly here, because both C originals are pointer-walking parsers
-//! whose bounds are arithmetic on raw pointers -- `tp + INT16SZ > endp`,
-//! `*++tp = 0`, `endp - i` -- and specification 0.6.9 names that class as
-//! the one this migration replaces with checked slice access. Every index
-//! below is either bounded by a mask or proved in range at the site.
+//! exemption to `mod ffi`, which this module is not. Every index below is
+//! either bounded by a mask or proved in range at the site.
 //!
 //! No panic on hostile input, which is not a stylistic preference: these
 //! strings arrive from URLs, DNS answers, `Alt-Svc` response headers and
 //! SOCKS replies. Nothing below indexes with a value derived from input
 //! length, and nothing unwraps a fallible lookup.
-//!
-//! Edition 2021, minimum supported Rust version 1.75. Performance is an
-//! explicit non-goal of this work, so where a choice arose between a faster
-//! expression and a more faithful one, faithfulness won -- the four masked
-//! hexadecimal tests in [`ntop6`] are the clearest example, kept as four
-//! tests rather than collapsed into a formatter, with an exhaustive test
-//! proving the two agree.
-//!
-//! [`Display`]: core::fmt::Display
-//! [`FromStr`]: core::str::FromStr
-//! [`Ipv4Addr`]: std::net::Ipv4Addr
-//! [`Ipv6Addr`]: std::net::Ipv6Addr
-//! [`ultouc`]: crate::util::ultouc
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -322,13 +93,6 @@ use crate::util::ultouc;
 pub(crate) const IN6ADDRSZ: usize = 16;
 
 /// The width of an IPv4 address in bytes -- `INADDRSZ`.
-///
-/// `inet_pton.c:38`. The formatter's translation unit defines the same name
-/// at `inet_ntop.c:38` but leaves it **commented out**, because `inet_ntop4`
-/// indexes `src[0]` through `src[3]` literally and never needs the width. One
-/// definition serves both halves here, and the asymmetry is recorded only so
-/// that a reader diffing this file against `inet_ntop.c` is not surprised to
-/// find a constant that file does not have.
 pub(crate) const INADDRSZ: usize = 4;
 
 /// The width of one IPv6 group in bytes -- `INT16SZ`.
@@ -356,50 +120,17 @@ const EMBEDDED_V4_GROUP: usize = 6;
 const EMBEDDED_V4_OFFSET: usize = IN6ADDRSZ - INADDRSZ;
 
 /// The lower-case hexadecimal digits, as an explicit table.
-///
-/// `static const unsigned char ldigits[] = "0123456789abcdef";`
-/// (`inet_ntop.c:166`), whose own comment records why it is local rather than
-/// shared: *"Lower-case digits. Cannot use the set from mprintf.c since this
-/// needs to work as a curlx function."* That constraint does not apply here,
-/// but the table is transcribed anyway because it is the thing that makes the
-/// output lower case, and lower case is a property of the bytes on the wire.
 const LDIGITS: [u8; 16] = *b"0123456789abcdef";
 
 /// The longest string [`ntop4`] can return.
-///
-/// The C sizes its scratch buffer as `char tmp[sizeof("255.255.255.255")]`
-/// (`inet_ntop.c:60`), which is 16 bytes: fifteen characters and a
-/// terminator. Spelled as the length of the same literal so that the two
-/// cannot drift, and one byte smaller than the C's figure because a [`String`]
-/// stores no terminator.
-///
-/// This is also the value behind `DEBUGASSERT(size >= 16)`
-/// (`inet_ntop.c:63`), the C's assertion that the caller's buffer can hold
-/// the widest possible answer.
 const NTOP4_MAX_LEN: usize = "255.255.255.255".len();
 
 /// The longest string [`ntop6`] can return.
-///
-/// The C sizes its scratch buffer as
-/// `char tmp[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")]`
-/// (`inet_ntop.c:97`) -- 46 bytes, so 45 characters. The widest answer is an
-/// address with no compressible zero run whose last four bytes are rendered
-/// as a dotted quad, which is exactly the literal.
 const NTOP6_MAX_LEN: usize =
     "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255".len();
 
 /// A run of zero groups: the C's anonymous `struct { int base; int len; }`
 /// (`inet_ntop.c:99-102`), which it instantiates twice as `best` and `cur`.
-///
-/// `base` is [`Option<usize>`] where the C uses `int` with `-1` as the
-/// sentinel. That is the whole of the change: `-1` was a value that had to be
-/// remembered not to index with, and the C tests for it at four separate
-/// sites (`:121`, `:128`, `:129`, `:134`, `:136`, `:142`, `:155`, `:182`).
-/// [`None`] cannot be indexed with at all.
-///
-/// [`Copy`] because the C assigns `best = cur` by value at `:130` and `:135`,
-/// and the assignment copies both fields together -- which matters, since a
-/// version that copied only `len` would silently keep the wrong base.
 #[derive(Clone, Copy)]
 struct Run {
     /// The index of the first zero group in the run, or [`None`] for the C's
@@ -418,30 +149,7 @@ impl Run {
 }
 
 /// Formats four network-order bytes as a dotted quad.
-///
-/// Supersedes `inet_ntop4` (`inet_ntop.c:58-83`), whose body is one
-/// `snprintf` with the format string `"%d.%d.%d.%d"` and its own note that
-/// it *"uses no static variables"* and *"takes an unsigned char\* not an
-/// in_addr as input"*.
-///
-/// Decimal, one to three digits per octet, **no padding and no leading
-/// zero**: `%d` applied to a value the C has already masked with `0xff`.
-/// Rust's `{}` on a [`u8`] is the same rendering, which
-/// `tests::ntop4_renders_every_byte_value_without_padding` proves for all 256
-/// values rather than assuming.
-///
-/// # Infallible, where the C can fail twice
-///
-/// The C returns `NULL` with `errno` set to `ENOSPC` when the result does not
-/// fit the caller's buffer (`:73-80`), and its dispatcher returns `NULL` for
-/// an unsupported family (`:217-219`). Neither can happen here: the result is
-/// an owned [`String`], and the parameter is a `&[u8; 4]` so no other width
-/// can be passed. The module documentation records the collapse in full.
-///
-/// The C's `len == 0` half of that overflow test is dead code even there. The
-/// shortest possible answer is `"0.0.0.0"`, seven characters, so `strlen` can
-/// never return zero.
-#[allow(dead_code)] // No consumer yet; `dns`, `conn` and `url` will call it.
+#[allow(dead_code)] // Callers: `dns`, `conn` and `url`.
 #[must_use]
 pub(crate) fn ntop4(addr: &[u8; INADDRSZ]) -> String {
     // `SNPRINTF(tmp, sizeof(tmp), "%d.%d.%d.%d", src[0] & 0xff, ...)`. The
@@ -480,11 +188,7 @@ pub(crate) fn ntop4(addr: &[u8; INADDRSZ]) -> String {
 /// * a run reaching the end of the address gains a **second** colon at
 ///   `:182-183`, which is what makes the all-zero address `"::"` rather than
 ///   `":"`.
-///
-/// Infallible, for the reasons given on [`ntop4`] and in the module
-/// documentation. The C's overflow check at `:186-193` guarded a caller's
-/// buffer that no longer exists.
-#[allow(dead_code)] // No consumer yet; `dns`, `conn` and `url` will call it.
+#[allow(dead_code)] // Callers: `dns`, `conn` and `url`.
 #[must_use]
 pub(crate) fn ntop6(addr: &[u8; IN6ADDRSZ]) -> String {
     let words = groups_of(addr);
@@ -500,11 +204,6 @@ pub(crate) fn ntop6(addr: &[u8; IN6ADDRSZ]) -> String {
     for index in 0..GROUPS {
         // `if(best.base != -1 && i >= best.base && i < (best.base +
         // best.len)) { if(i == best.base) *tp++ = ':'; continue; }`
-        //
-        // Inside the compressed run: emit one colon at its start and nothing
-        // for the rest. The closing colon comes from the NEXT group's
-        // `if(i)`, or -- when the run reaches the end and there is no next
-        // group -- from the trailing rule below.
         if let Some(base) = best.base {
             if index >= base && index < base + best.len {
                 if index == base {
@@ -521,34 +220,12 @@ pub(crate) fn ntop6(addr: &[u8; IN6ADDRSZ]) -> String {
 
         // `if(i == 6 && best.base == 0 && (best.len == 6 || (best.len == 5 &&
         // words[5] == 0xffff)))`
-        //
-        // The embedded-IPv4 forms, both of them. `best.len == 6` is the
-        // deprecated IPv4-compatible address `::a.b.c.d`; the second arm is
-        // the IPv4-mapped address `::ffff:a.b.c.d`, where group 5 holds the
-        // marker and so is not part of the zero run.
-        //
-        // `best.len == 6` is an EQUALITY, and that is deliberate rather than
-        // sloppy: a zero run of seven or eight groups means group 6 is itself
-        // zero, and the address is `::`, `::1` or something like `::100` that
-        // reads better in hexadecimal. That is also what saves `::` and `::1`
-        // from being rendered `::0.0.0.0` and `::0.0.0.1` without a special
-        // case being written for them.
-        //
-        // Satisfying the first arm is where this function and Rust's own
-        // formatter part company, measured: a sweep of 65,536 addresses found
-        // twelve disagreements and all twelve are the compatible form, which
-        // current Rust renders in hexadecimal. See the module documentation.
         if index == EMBEDDED_V4_GROUP
             && best.base == Some(0)
             && (best.len == 6 || (best.len == 5 && words[5] == 0xffff))
         {
             // `if(!inet_ntop4(src + 12, tp, sizeof(tmp) - (tp - tmp)))
             //    return NULL;`
-            //
-            // The size argument was the remaining room, and the C's
-            // `DEBUGASSERT(size >= 16)` inside `inet_ntop4` holds for both
-            // arms: the widest prefix reaching this point is `"::ffff:"`,
-            // seven characters of the forty-six.
             //
             // Indexing is proved in range by the array type: the offsets are
             // 12 through 15 of a `&[u8; 16]`, all constants.
@@ -570,12 +247,6 @@ pub(crate) fn ntop6(addr: &[u8; IN6ADDRSZ]) -> String {
 
     // `if(best.base != -1 && (best.base + best.len) == (IN6ADDRSZ /
     // INT16SZ)) *tp++ = ':';`
-    //
-    // A run that reaches the end of the address has no following group to
-    // supply its closing colon, so one is appended here. This is what turns
-    // `1:0:0:0:0:0:0:0` into `"1::"` and the all-zero address into `"::"` --
-    // for the latter, the loop emitted a single colon at group 0 and skipped
-    // every other group, so this line supplies the second.
     if let Some(base) = best.base {
         if base + best.len == GROUPS {
             out.push(':');
@@ -596,22 +267,7 @@ pub(crate) fn ntop6(addr: &[u8; IN6ADDRSZ]) -> String {
 
 /// Formats an address of either family -- supersedes `curlx_inet_ntop`
 /// (`inet_ntop.c:210-221`).
-///
-/// The C takes an `int af` and switches on it, with a `default:` arm that
-/// sets `SOCKEAFNOSUPPORT` and returns `NULL`. [`IpAddr`] is that switch: it
-/// has exactly two variants, the compiler checks the match is exhaustive, and
-/// there is no third case to fail on. That is why this returns [`String`]
-/// rather than `Option<String>`.
-///
-/// Kept as a separate entry point because the family really is dynamic at
-/// most C call sites -- eight of the nine read it from a `struct addrinfo` or
-/// a `struct sockaddr` (`hostip.c:213` and `:220`, `if2ip.c:158` and `:231`,
-/// `ftp.c:1032` and `:1036`, `connect.c:227` and `:235`) and only
-/// `urlapi.c:435` passes a literal. Four of those eight sit inside a `switch`
-/// arm that has already discriminated on the same value, and in Rust the arm
-/// and the call fuse into one [`ntop4`] or [`ntop6`]; the rest arrive holding
-/// an [`IpAddr`] and want this.
-#[allow(dead_code)] // No consumer yet; `dns` and `conn` will call it.
+#[allow(dead_code)] // Callers: `dns` and `conn`.
 #[must_use]
 pub(crate) fn ntop(addr: IpAddr) -> String {
     match addr {
@@ -635,26 +291,6 @@ pub(crate) fn ntop(addr: IpAddr) -> String {
 /// if(w & 0xfff0) *tp++ = ldigits[(w & 0x00f0) >>  4];
 /// *tp++ = ldigits[(w & 0x000f)];
 /// ```
-///
-/// The second and third masks are deliberately **wider than the nibble being
-/// printed**, and that is the whole trick. Each test asks "is any nibble at or
-/// above this position non-zero", so a digit is emitted exactly when a more
-/// significant digit already was -- which is what makes `0x0100` render as
-/// `100` rather than `10`. The low nibble is unconditional, and that is what
-/// gives a zero group the single `0` it needs.
-///
-/// Kept as four tests rather than replaced by `{:x}`, per the
-/// faithfulness-over-tidiness rule in the module documentation. The two are
-/// nevertheless the same function:
-/// `tests::the_four_masked_tests_agree_with_lower_hex_for_every_group` proves
-/// it for all 65,536 values, which is why this file can carry the
-/// transcription without also carrying a doubt about it.
-///
-/// Every index is a nibble, so it lies in `0..=15` by construction and cannot
-/// reach past a sixteen-entry table -- no input length participates in it.
-/// `usize::from` rather than a cast: the widening from [`u16`] cannot lose
-/// information on any target this workspace builds for, and the conversion
-/// that says so is the one written.
 fn push_group_hex(out: &mut String, word: u16) {
     if (word & 0xf000) != 0 {
         out.push(char::from(LDIGITS[usize::from((word & 0xf000) >> 12)]));
@@ -678,17 +314,6 @@ fn push_group_hex(out: &mut String, word: u16) {
 /// for(i = 0; i < IN6ADDRSZ; i++)
 ///   words[i / 2] |= ((unsigned int)src[i] << ((1 - (i % 2)) << 3));
 /// ```
-///
-/// The shift amount is `(1 - (i % 2)) << 3`, which is 8 for an even index and
-/// 0 for an odd one: byte 0 becomes the high half of group 0. That is
-/// big-endian, so [`u16::from_be_bytes`] over each pair is the same function,
-/// and it is the one written here because it cannot be got wrong and needs no
-/// bound to be re-derived. `tests::group_decomposition_matches_the_c_shift`
-/// runs the C expression above beside it and requires the two to agree, so
-/// the correspondence is checked rather than asserted.
-///
-/// The C's `memset` has no counterpart: the array is initialised to zero on
-/// declaration and every element is then assigned rather than or-ed into.
 fn groups_of(addr: &[u8; IN6ADDRSZ]) -> [u16; GROUPS] {
     let mut words = [0u16; GROUPS];
 
@@ -715,9 +340,6 @@ fn groups_of(addr: &[u8; IN6ADDRSZ]) -> [u16; GROUPS] {
 ///   would otherwise have committed it;
 /// * **a run of one is discarded** (`:136-137`). Replacing a single zero group
 ///   with `::` would save no characters and is not curl's rendering.
-///
-/// The C leaves `cur.len` stale when it clears `cur.base`; so does this,
-/// because the next zero group assigns `len = 1` before anything reads it.
 fn longest_zero_run(words: &[u16; GROUPS]) -> Run {
     // `best.base = -1; cur.base = -1; best.len = 0; cur.len = 0;`
     let mut best = Run::NONE;
@@ -760,18 +382,6 @@ fn longest_zero_run(words: &[u16; GROUPS]) -> Run {
 
 /// Parses a dotted quad into four network-order bytes.
 ///
-/// Supersedes `inet_pton4` (`inet_pton.c:64-101`), whose own documentation
-/// describes it as *"like inet_aton() but without all the hexadecimal and
-/// shorthand"*, promises that it *"does not touch `dst` unless it is
-/// returning 1"*, and credits *"Paul Vixie, 1996."*
-///
-/// Exactly four octets, each of one to three decimal digits with a value of at
-/// most 255, separated by single dots. No shorthand, so `1.2.3` and
-/// `1.2.3.4.5` are both rejected; no trailing dot, because a dot arriving once
-/// four octets have started meets `if(octets == 4) return 0` at `:89-90`; no
-/// hexadecimal and no octal, because the only accepted characters are those
-/// [`is_digit`](strparse::is_digit) admits.
-///
 /// # Leading zeros are rejected, and the mechanism is worth reading
 ///
 /// `if(saw_digit && *tp == 0) return 0;` (`:77-78`) tests the **accumulator**,
@@ -782,18 +392,7 @@ fn longest_zero_run(words: &[u16; GROUPS]) -> Run {
 /// | `0` | the first digit leaves the accumulator at 0 with `saw_digit` set, and nothing follows, so it is accepted |
 /// | `01` | the second digit finds `saw_digit` set and the accumulator still 0, so it is rejected |
 /// | `10` | the second digit finds the accumulator at 1, so it is accepted |
-///
-/// So a bare `0` is a valid octet and `00` is not, which is what makes
-/// `0.0.0.0` parse and `01.2.3.4` fail.
-///
-/// # The C's promise about `dst` becomes structural
-///
-/// The C copies into the caller's buffer only on the last line, after every
-/// rejection has had its chance, and documents that it leaves `dst` untouched
-/// otherwise. Returning [`Option`] makes that a property of the type instead
-/// of a property of the control flow: there is no output to touch until there
-/// is an answer.
-#[allow(dead_code)] // No consumer yet; `dns`, `conn` and `proxy` will call it.
+#[allow(dead_code)] // Callers: `dns`, `conn` and `proxy`.
 #[must_use]
 pub(crate) fn pton4(src: &[u8]) -> Option<[u8; INADDRSZ]> {
     // `saw_digit = 0; octets = 0; tp = tmp; *tp = 0;`
@@ -815,16 +414,6 @@ pub(crate) fn pton4(src: &[u8]) -> Option<[u8; INADDRSZ]> {
     for &ch in src {
         if strparse::is_digit(ch) {
             // `unsigned int val = (*tp * 10) + (ch - '0');`
-            //
-            // The C widens to `unsigned int` so that neither the product nor
-            // the sum can wrap before the range test at `:79-80` sees the
-            // true value. Checked arithmetic in the octet's own width says
-            // the same thing without a narrowing cast on the way back: a
-            // [`None`] from either step is precisely a value the C would have
-            // computed as greater than 255.
-            //
-            // `ch - b'0'` cannot underflow -- the guard on this arm admits
-            // only `0` through `9`.
             let val = acc
                 .checked_mul(10)
                 .and_then(|scaled| scaled.checked_add(ch - b'0'));
@@ -841,13 +430,6 @@ pub(crate) fn pton4(src: &[u8]) -> Option<[u8; INADDRSZ]> {
             acc = val;
 
             // `if(!saw_digit) { if(++octets > 4) return 0; saw_digit = 1; }`
-            //
-            // The bound is unreachable and is transcribed anyway, so that
-            // nobody deletes it as dead weight without first reproducing the
-            // argument: `octets` rises only on the first digit of a new
-            // octet, a new octet begins only after a dot, and the dot arm
-            // rejects once `octets` reaches four. Five is therefore not
-            // representable, and the C's check is belt and braces.
             if !saw_digit {
                 octets += 1;
                 if octets > INADDRSZ {
@@ -872,10 +454,6 @@ pub(crate) fn pton4(src: &[u8]) -> Option<[u8; INADDRSZ]> {
             //     cursor and this index. The first digit of the address writes
             //     slot 0 either way, and the first digit after a dot writes
             //     the slot the C's `*++tp` had just stepped onto.
-            //
-            // Nothing else is interposed but the unreachable bound argued for
-            // above, and `octets` is at least one and at most four here, so
-            // the index lies in `0..4`.
             tmp[octets - 1] = acc;
         } else if ch == b'.' && saw_digit {
             // `if(octets == 4) return 0;`
@@ -908,9 +486,6 @@ pub(crate) fn pton4(src: &[u8]) -> Option<[u8; INADDRSZ]> {
 
 /// Parses an IPv6 address into sixteen network-order bytes.
 ///
-/// Supersedes `inet_pton6` (`inet_pton.c:115-190`), which credits *"inspired
-/// by Mark Andrews"* and *"Paul Vixie, 1996."*
-///
 /// The accepted grammar is the C's, transcribed statement by statement:
 ///
 /// * up to eight groups of **at most four** hexadecimal digits
@@ -924,40 +499,11 @@ pub(crate) fn pton4(src: &[u8]) -> Option<[u8; INADDRSZ]> {
 ///   `::1.2.3.4` while rejecting a quad anywhere but at the end;
 /// * the result must be **exactly** sixteen bytes (`if(tp != endp) return 0`
 ///   at `:186-187`).
-///
-/// A **zone identifier is not handled here**. `fe80::1%eth0` reaches the
-/// rejecting arm on the `%`, so this function answers [`None`], and that is
-/// the C's behaviour too. Scope handling belongs to whatever parses the host
-/// component -- `lib/urlapi.c` strips it before calling, and `lib/if2ip.c`
-/// appends it after formatting -- and adding it here would change the accept
-/// set of a function whose accept set is frozen.
-///
-/// # A stale comment in the original, and which side wins
-///
-/// `inet_pton.c:109` states that *"`::` in a full address is silently
-/// ignored"*. It is not: `:178-179` is `if(tp == endp) return 0;`, so an
-/// address whose groups already fill sixteen bytes and which also carries a
-/// `::` is **rejected**. `b"1:2:3:4:5:6:7:8::"` is [`None`] here. The code is
-/// transcribed and the comment is not, and the discrepancy is flagged again at
-/// the site.
-///
-/// # What is accepted that Rust's own parser rejects
-///
-/// A trailing colon after a complete group. `b"1::2:"` parses to `1::2`,
-/// because the final colon flushes the pending group and the `::` close-up
-/// then fills the address out; `b"1:2:3:4:5:6:7:8:"` parses for the same
-/// reason, reaching sixteen bytes with no `::` recorded. Both are tested. The
-/// module documentation lists this among the deliberate divergences.
-#[allow(dead_code)] // No consumer yet; `dns`, `url` and `proxy` will call it.
+#[allow(dead_code)] // Callers: `dns`, `url` and `proxy`.
 #[must_use]
 pub(crate) fn pton6(src: &[u8]) -> Option<[u8; IN6ADDRSZ]> {
     // `memset((tp = tmp), 0, IN6ADDRSZ); endp = tp + IN6ADDRSZ;
     //  colonp = NULL;`
-    //
-    // `tp` and `colonp` are offsets into `tmp` where the C holds pointers,
-    // and `endp` is the one-past-the-end offset that every bound below is
-    // written against. Naming it rather than writing `IN6ADDRSZ` at each
-    // comparison keeps those comparisons readable as the C's.
     let mut tmp = [0u8; IN6ADDRSZ];
     let mut tp = 0usize;
     let endp = IN6ADDRSZ;
@@ -999,15 +545,6 @@ pub(crate) fn pton6(src: &[u8]) -> Option<[u8; IN6ADDRSZ]> {
 
         // `if(ISXDIGIT(ch)) { val <<= 4; val |= curlx_hexval(ch);
         //                     if(++saw_xdigit > 4) return 0; continue; }`
-        //
-        // The C validates with `ISXDIGIT` and only then calls `curlx_hexval`,
-        // because that macro indexes a table with no bound check and its
-        // header says so in capitals: *"THIS ONLY WORKS ON VALID HEXADECIMAL
-        // LETTER INPUT. Verify before calling this!"* The successor returns
-        // [`Option`], which fuses the two steps into one lookup that cannot be
-        // performed in the wrong order. The accept sets are identical --
-        // `tests::hexval_and_is_xdigit_admit_the_same_bytes` checks that here,
-        // for all 256 values, because this transcription depends on it.
         if let Some(digit) = strparse::hexval(ch) {
             val = (val << 4) | u32::from(digit);
             saw_xdigit += 1;
@@ -1042,11 +579,6 @@ pub(crate) fn pton6(src: &[u8]) -> Option<[u8; IN6ADDRSZ]> {
 
             // `*tp++ = (unsigned char)((val >> 8) & 0xff);
             //  *tp++ = (unsigned char)(val & 0xff);`
-            //
-            // Most significant byte first: network order. Both arguments are
-            // masked to a byte BEFORE narrowing, which is what the C's casts
-            // do and what keeps `ultouc`'s debug-build contract satisfied for
-            // an accumulator that may hold four nibbles.
             tmp[tp] = ultouc(u64::from((val >> 8) & 0xff));
             tmp[tp + 1] = ultouc(u64::from(val & 0xff));
             tp += INT16SZ;
@@ -1060,11 +592,6 @@ pub(crate) fn pton6(src: &[u8]) -> Option<[u8; IN6ADDRSZ]> {
         // `if(ch == '.' && ((tp + INADDRSZ) <= endp) &&
         //     inet_pton4(curtok, tp) > 0) {
         //   tp += INADDRSZ; saw_xdigit = 0; break; }`
-        //
-        // The room test comes first, so a quad is never attempted where its
-        // four bytes could not fit. [`pton4`] consumes the rest of the input,
-        // which is why the C can `break` and comment that *"'\0' was seen by
-        // inet_pton4()"*: there is nothing left for this loop to read.
         //
         // A failure of any of the three conjuncts falls through to the
         // rejection below, exactly as the C's bare `return 0;` does.
@@ -1127,10 +654,6 @@ pub(crate) fn pton6(src: &[u8]) -> Option<[u8; IN6ADDRSZ]> {
 /// Slides the groups written after a `::` to the end of the address and zeros
 /// the gap they leave.
 ///
-/// Transcribes the shift at `inet_pton.c:170-185`, which the C performs by
-/// hand and explains: *"Since some memmove()'s erroneously fail to handle
-/// overlapping regions, we will do the shift by hand."*
-///
 /// ```c
 /// const ssize_t n = tp - colonp;
 /// for(i = 1; i <= n; i++) {
@@ -1138,30 +661,6 @@ pub(crate) fn pton6(src: &[u8]) -> Option<[u8; IN6ADDRSZ]> {
 ///   *(colonp + n - i) = 0;
 /// }
 /// ```
-///
-/// [`slice::copy_within`] is that loop's copy, with overlap handled correctly
-/// by definition rather than by hope, and the zero-fill is kept because the C
-/// writes it: the bytes vacated by the slide must read as the elided zero
-/// groups.
-///
-/// # Why the fill stops where it does
-///
-/// The C interleaves the copy and the zeroing, so a byte that is both a source
-/// and a destination is zeroed and then overwritten. Working through the
-/// indices: at step `i` the source is `tp - i` and the destination is
-/// `IN6ADDRSZ - i`, and since `tp < IN6ADDRSZ` the source is always the lower
-/// of the two. A byte at index `k` in `colon_at..tp` is therefore zeroed at
-/// step `tp - k`, and if it is also a destination it is written at step
-/// `IN6ADDRSZ - k`, which is strictly later. The destination write wins.
-///
-/// So the net effect is the slide followed by a zero-fill of exactly
-/// `colon_at..min(tp, IN6ADDRSZ - n)` -- the part of the vacated region that
-/// no destination write reclaims. Writing the bound that way rather than as
-/// `colon_at..tp` makes the equivalence hold whatever the bytes beyond `tp`
-/// happen to be, instead of relying on the caller having left them zero.
-/// `tests::close_up_matches_the_c_hand_shift_for_every_position` checks it
-/// against a literal transcription of the loop above for every position the
-/// function can be called with.
 ///
 /// # Preconditions
 ///
@@ -1194,31 +693,7 @@ fn close_up_double_colon(
 
 /// Parses an address of either family -- the successor of `curlx_inet_pton`
 /// (`inet_pton.c:207-219`).
-///
-/// The C takes the family as a parameter and returns `-1` for one it does not
-/// know. Here the family is the **answer** rather than a question: IPv4 is
-/// tried first and IPv6 second, and the variant of the [`IpAddr`] returned
-/// says which succeeded. The `-1` case has no successor, as the module
-/// documentation records.
-///
-/// # Why the order does not matter, and why it is still v4 first
-///
-/// The two accept sets are disjoint, so at most one attempt can succeed and
-/// the order changes only how much work is done. `b"1.2.3.4"` reaches
-/// [`pton6`]'s dotted-quad arm with `tp` at zero and finishes four bytes short
-/// of an address, so it is rejected there; `b"::1"` fails [`pton4`] on its
-/// first character. The order is nevertheless IPv4 first because that is the
-/// order every C caller uses -- `hostip6.c:95-96`, `hostip.c:789-791`,
-/// `noproxy.c:208-211`, `vtls/vtls.c:1212-1215` and `curl_addrinfo.c:411-417`
-/// and `:428-433` all try `AF_INET` before `AF_INET6` -- and a difference in
-/// evaluation order is the kind of thing that stops being invisible the moment
-/// somebody adds a side effect.
-///
-/// This is the shape those six call sites want; the thirty-two remaining C
-/// call sites all pass a literal family and want [`pton4`] or [`pton6`]
-/// directly, which is why no family enumeration is defined anywhere in this
-/// module.
-#[allow(dead_code)] // No consumer yet; `dns` and `proxy::noproxy` will call it.
+#[allow(dead_code)] // Callers: `dns` and `proxy::noproxy`.
 #[must_use]
 pub(crate) fn pton(src: &[u8]) -> Option<IpAddr> {
     // `case AF_INET: return inet_pton4(src, dst);`
@@ -1241,15 +716,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     /// Builds a sixteen-byte address from eight groups.
-    ///
-    /// Tests read as addresses rather than as byte arrays, which matters here
-    /// because the behaviour under test is stated in terms of groups: "a
-    /// single zero group is not compressed" is a claim about
-    /// `[1, 0, 2, 3, 4, 5, 6, 7]`, not about thirty-two nibbles.
-    ///
-    /// Written with [`u16::to_be_bytes`] rather than with `groups_of`'s
-    /// inverse, so that a fault in the decomposition cannot cancel itself out
-    /// between the fixture and the code under test.
     fn address(groups: [u16; GROUPS]) -> [u8; IN6ADDRSZ] {
         let mut bytes = [0u8; IN6ADDRSZ];
         for (index, group) in groups.iter().enumerate() {
@@ -1274,12 +740,6 @@ mod tests {
 
     /// `%d`, not `%03d`: every octet is one to three digits with no padding
     /// and no leading zero, checked for all 256 values.
-    ///
-    /// The properties are asserted rather than compared against a second
-    /// renderer, because any renderer written here would be the same code
-    /// twice. Parsing the answer back is what closes the loop: a padded or
-    /// truncated digit run would either fail to parse or parse to a different
-    /// byte.
     #[test]
     fn ntop4_renders_every_byte_value_without_padding() {
         for byte in 0..=u8::MAX {
@@ -1384,12 +844,6 @@ mod tests {
     /// **On a tie the FIRST longest run wins**, because `cur.len > best.len`
     /// at `inet_ntop.c:129` and `:134` is strict rather than
     /// greater-or-equal.
-    ///
-    /// The expected string is derived from the algorithm rather than guessed:
-    /// with groups `[1, 0, 0, 1, 0, 0, 1, 1]` the first run is
-    /// `base 1, len 2` and the second is `base 4, len 2`, the strict
-    /// comparison declines to replace the first, so groups 1 and 2 collapse
-    /// and groups 4 and 5 are printed as `0` and `0`.
     #[test]
     fn ntop6_compresses_the_first_of_two_equal_longest_runs() {
         assert_eq!(ntop6(&address([1, 0, 0, 1, 0, 0, 1, 1])), "1::1:0:0:1:1");
@@ -1440,18 +894,6 @@ mod tests {
     /// IPv4-**compatible**: the first six groups are zero and group 6 is not,
     /// which is the `best.len == 6` arm. The deprecated form is rendered as a
     /// dotted quad exactly as the mapped form is.
-    ///
-    /// **This is where curl and [`Ipv6Addr`]'s own formatter diverge**, and the
-    /// divergence is measured rather than asserted from documentation: current
-    /// Rust carries a special case for the mapped form only and renders the
-    /// compatible form in hexadecimal. A sweep over 65,536 addresses drawn
-    /// from the group alphabet `{0, 1, 0xffff, 0x0100}` found exactly twelve
-    /// disagreements and **all twelve are this shape** -- six zero groups
-    /// followed by a non-zero group 6.
-    ///
-    /// Both spell the same address. Only curl's spelling may appear in a
-    /// `Host:` header or an Alt-Svc cache file, which is the whole reason this
-    /// module transcribes the algorithm instead of delegating to [`Ipv6Addr`].
     #[test]
     fn ntop6_renders_an_ipv4_compatible_address_as_a_dotted_quad() {
         let mut bytes = [0u8; IN6ADDRSZ];
@@ -1474,19 +916,6 @@ mod tests {
     }
 
     /// The other side of the same equality, where the two agree again.
-    ///
-    /// `inet_ntop.c:156` tests `best.len == 6` as an EQUALITY, and that is the
-    /// hinge. Given groups `[0, 0, 0, 0, 0, 0, 0, 0x0100]` **group 6 is itself
-    /// zero**, so the run is seven long, the equality fails, and curl falls
-    /// through to hexadecimal -- which is what Rust does for every compatible
-    /// address. So the test above and this one exercise the two branches of
-    /// one condition and reach opposite verdicts about agreement, which is
-    /// exactly why the condition is transcribed as an equality rather than
-    /// relaxed to `>=`.
-    ///
-    /// It is also what makes `::` and `::1` come out right without a special
-    /// case: both have runs longer than six, so neither can reach the
-    /// dotted-quad branch and be rendered as `::0.0.0.0` or `::0.0.0.1`.
     #[test]
     fn ntop6_prefers_hexadecimal_when_the_seventh_group_is_zero() {
         let bytes = address([0, 0, 0, 0, 0, 0, 0, 0x0100]);
@@ -1504,26 +933,7 @@ mod tests {
     /// The four masked tests and `{:x}` are the same function, for all 65,536
     /// group values.
     ///
-    /// This is the test that closes the whole leading-zero question, and it is
-    /// why the transcription in [`push_group_hex`] can be kept without also
-    /// keeping a doubt about it. The argument it confirms: mask `k` asks
-    /// whether any nibble at or above position `k` is non-zero, so a digit is
-    /// emitted exactly when a more significant one already was, and the low
-    /// nibble is unconditional. That is precisely "suppress leading zeros but
-    /// always print at least one digit".
-    ///
-    /// One [`String`] is reused across the sweep rather than allocated per
-    /// iteration, so the only per-iteration allocation is the reference
-    /// rendering's.
-    ///
     /// # Why this one is `#[cfg_attr(miri, ignore)]`d
-    ///
-    /// Measured, not assumed: under Miri this test had not finished after
-    /// twenty-five minutes, because 65,536 passes through `core::fmt` is
-    /// exactly the shape an interpreter is worst at. Every other test in this
-    /// module completes under Miri in seconds, so leaving this one in would
-    /// make the required `cargo miri test -p curl-rs-lib` gate cost more than
-    /// the rest of the crate combined.
     ///
     /// Nothing is hidden by the exclusion, and the reasoning is specific
     /// rather than a shrug. Miri looks for undefined behaviour -- aliasing,
@@ -1556,14 +966,6 @@ mod tests {
     /// The same equivalence at every value where the masks can change their
     /// answer, so that [`push_group_hex`] stays covered under the Miri gate
     /// that the exhaustive sweep above steps out of.
-    ///
-    /// The cases are chosen rather than sampled. A mask's verdict can only
-    /// change at a nibble boundary, so the set carries, for each of the four
-    /// digit positions, the smallest value that turns that position on, the
-    /// largest value that leaves it off, and the all-ones value above it --
-    /// plus the two values the module documentation singles out, `0x0100`
-    /// (which must render `100`, not `10`) and `0x0000` (which must render a
-    /// single `0` from the unconditional low nibble).
     #[test]
     fn the_masked_tests_agree_at_every_nibble_boundary() {
         const BOUNDARIES: [u16; 20] = [
@@ -1596,10 +998,7 @@ mod tests {
 
     /// [`groups_of`] and the C's shift-and-or expression agree.
     ///
-    /// The reference below is `inet_ntop.c:110-112` transliterated, kept as an
-    /// index walk rather than made idiomatic so that a reviewer can check it
-    /// against the original line by line. Its whole purpose is to be
-    /// comparable with the C, not to be good Rust.
+    /// Its whole purpose is to be comparable with the C, not to be good Rust.
     #[test]
     fn group_decomposition_matches_the_c_shift() {
         /// `words[i / 2] |= ((unsigned int)src[i] << ((1 - (i % 2)) << 3));`
@@ -1634,13 +1033,6 @@ mod tests {
 
     /// The `::` close-up and the C's hand-written shift agree, for **every**
     /// position the function can be called with.
-    ///
-    /// This is the one substitution in the whole module where a library call
-    /// replaces a loop the C wrote out deliberately -- its comment says *"some
-    /// memmove()'s erroneously fail to handle overlapping regions"* -- so the
-    /// equivalence is established exhaustively rather than argued. The domain
-    /// is small enough to enumerate: `colon_at` in `0..16` and `tp` in
-    /// `colon_at..16`, which is 136 combinations.
     ///
     /// The fixture deliberately fills the bytes beyond `tp` with a non-zero
     /// pattern, even though the real caller always leaves them zero. That is
@@ -1682,14 +1074,6 @@ mod tests {
     }
 
     /// The width promise behind `char tmp[46]` (`inet_ntop.c:97`) holds.
-    ///
-    /// The debug assertion inside [`ntop6`] checks this on every call a test
-    /// makes, but a case that reaches the maximum exactly is worth naming: the
-    /// widest answer is an address with no compressible run whose last four
-    /// bytes are nonetheless rendered as a dotted quad -- which cannot
-    /// actually happen, since the quad requires a run of five. The real
-    /// maximum is therefore the eight-group hexadecimal form, and the
-    /// constant is the C's bound rather than a tight one.
     #[test]
     fn ntop6_stays_within_the_width_the_c_promises() {
         let widest = ntop6(&[0xff; IN6ADDRSZ]);
@@ -1702,12 +1086,6 @@ mod tests {
 
     /// [`hexval`](strparse::hexval) answers for exactly the bytes
     /// [`is_xdigit`](strparse::is_xdigit) admits.
-    ///
-    /// [`pton6`] relies on this: it fuses the C's validate-then-decode pair
-    /// into a single [`Option`] lookup, which is only faithful if the two
-    /// agree. `strparse` proves the same property for its own reasons; it is
-    /// re-proved here because THIS transcription depends on it, and a
-    /// dependency worth relying on is worth checking at the point of reliance.
     #[test]
     fn hexval_and_is_xdigit_admit_the_same_bytes() {
         for byte in 0..=u8::MAX {
@@ -1821,11 +1199,6 @@ mod tests {
 
     /// At most four hexadecimal digits per group
     /// (`if(++saw_xdigit > 4) return 0;`, `inet_pton.c:136-137`).
-    ///
-    /// Four is accepted and five is not, which is also why the accumulator in
-    /// [`pton6`] is thirty-two bits wide: the fifth nibble is shifted in
-    /// **before** the count is checked, so a sixteen-bit accumulator would
-    /// overflow on `12345::` rather than reject it.
     #[test]
     fn pton6_accepts_at_most_four_hex_digits_per_group() {
         assert_eq!(
@@ -1843,11 +1216,6 @@ mod tests {
 
     /// **A complete address that also carries `::` is rejected**, contradicting
     /// the C's own doc comment.
-    ///
-    /// `inet_pton.c:109` says "`::` in a full address is silently ignored";
-    /// `:178-179` says `if(tp == endp) return 0;`. The code is what ships and
-    /// the code is what is transcribed, so this test pins the code's answer
-    /// and exists mainly to stop anybody implementing the comment.
     #[test]
     fn pton6_rejects_a_full_address_that_also_carries_a_double_colon() {
         assert_eq!(pton6(b"1:2:3:4:5:6:7:8::"), None);
@@ -1861,11 +1229,6 @@ mod tests {
 
     /// A zone identifier is not handled here, and that is the C's behaviour
     /// too: `%` reaches the rejecting arm.
-    ///
-    /// Scope handling belongs to whatever parses the host component --
-    /// `lib/urlapi.c` strips it before calling and `lib/if2ip.c` appends it
-    /// after formatting -- so accepting it here would widen an accept set that
-    /// is frozen.
     #[test]
     fn pton6_rejects_a_zone_identifier() {
         assert_eq!(pton6(b"fe80::1%eth0"), None);
@@ -1910,15 +1273,6 @@ mod tests {
     }
 
     /// **A trailing colon is accepted, where Rust's own parser rejects it.**
-    ///
-    /// Measured, then explained: the final colon finds a pending group, flushes
-    /// it through the colon arm at `inet_pton.c:148-153`, and the `::` close-up
-    /// then fills the address out. `b"1:2:3:4:5:6:7:8:"` reaches sixteen bytes
-    /// by the same route with no `::` recorded at all.
-    ///
-    /// Neither spelling is something a caller should emit. This function's job
-    /// is to accept exactly what curl accepts, and the divergence is pinned
-    /// here so that nobody "tightens" it into a wire-behaviour change.
     #[test]
     fn pton6_accepts_a_trailing_colon_where_rust_does_not() {
         use std::str::FromStr;
@@ -1949,15 +1303,6 @@ mod tests {
     // ---- the byte-slice contract -------------------------------------------
 
     /// An interior NUL is a character, not a terminator.
-    ///
-    /// The C reads a NUL-terminated `char *`, so `inet_pton4("1.2.3.4\0x")`
-    /// parses the prefix and returns success. A slice is exactly its bytes, so
-    /// the NUL reaches the rejecting arm and the answer is [`None`].
-    ///
-    /// **Strictly less permissive, never more**, which is the direction that
-    /// matters: no address the C rejects can be accepted here, so no wire
-    /// behaviour can change. Recorded as a test rather than only as prose
-    /// because it is a real difference in the accept set.
     #[test]
     fn an_interior_nul_is_rejected_rather_than_treated_as_a_terminator() {
         assert_eq!(pton4(b"1.2.3.4\0"), None);
@@ -2007,12 +1352,6 @@ mod tests {
     /// Text to bytes to text, for IPv6 -- including both embedded-IPv4 forms
     /// and a fully populated address, which the specification names as the
     /// priority cases.
-    ///
-    /// Note the second entry in each pair: the round trip is only an identity
-    /// where the input is already in the canonical spelling this module
-    /// produces, so an input that is not canonical is listed with the answer
-    /// it canonicalises to. That is the property callers depend on -- writing
-    /// the same address into a `Host:` header twice must give the same bytes.
     #[test]
     fn pton6_and_ntop6_round_trip() {
         for (text, canonical) in [

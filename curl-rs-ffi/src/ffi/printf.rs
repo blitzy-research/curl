@@ -4,10 +4,6 @@
 
 //! The ten `curl_m*printf` exports: curl's own `printf`, not the platform's.
 //!
-//! `include/curl/mprintf.h` is 85 lines and declares ten of the 100 symbols in
-//! `lib/libcurl.def`. It is the densest export-per-line file in the public
-//! headers, and the only one whose members do not share a return type.
-//!
 //! | Symbol | `mprintf.h` | Returns | Shape | `CURL_TEMP_PRINTF` |
 //! |---|---|---|---|---|
 //! | `curl_mprintf` | 56-57 | `int` | `...` | `(1, 2)` |
@@ -20,11 +16,6 @@
 //! | `curl_mvsnprintf` | 71-73 | `int` | `va_list` | `(3, 0)` |
 //! | `curl_maprintf` | 74-75 | **`char *`** | `...` | `(1, 2)` |
 //! | `curl_mvaprintf` | 76-77 | **`char *`** | `va_list` | `(1, 0)` |
-//!
-//! **The return types are not uniform.** `curl_maprintf` and `curl_mvaprintf`
-//! hand back heap memory the application releases with `curl_free`; the other
-//! eight return a byte count. Getting that wrong is an ABI break that compiles
-//! cleanly on the Rust side, so it is stated before anything else.
 //!
 //! The variadic set is **ten** prototypes in total: five plain `...` forms and
 //! five that take a `va_list` parameter. Both halves need handling stable Rust
@@ -40,25 +31,14 @@
 //! module emits none, because a rustc warning from here would fail validation
 //! gate 1 and `clippy -D warnings`.
 //!
-//! The header spells `curl_mfprintf`'s first parameter **`fd`**, while
-//! `lib/mprintf.c:1204` calls it `whereto`. The header spelling is the
-//! ABI-visible one, because `.github/scripts/verify-synopsis.pl` compiles the
-//! manual-page synopses against the generated header, so `fd` is what the
-//! prototypes say and what this module's documentation uses.
-//!
 //! # This is not a wrapper around the platform `printf`
 //!
 //! `lib/mprintf.c` is a complete, self-contained `printf` with curl's own
 //! conversion set, and it differs from the C library's on purpose: `%zd` and
 //! `%Od` for `size_t` and `curl_off_t`, `%S` as a quoted `%s`, `(nil)` for a
 //! null `%s` or `%p`, positional `%N$` arguments, and a several-place-deep set
-//! of padding quirks recorded on the functions below. Specification 0.6.7
-//! makes that reproduction load-bearing rather than cosmetic: 1,476 of the
-//! 1,914 fixtures under `tests/data/` compare the exact bytes a transfer emits
-//! with `compareparts`, which joins both sides into a single string and
-//! compares them whole -- no per-line matching, no normalisation, no
-//! reordering. Padding, precision, sign and `curl_off_t` rendering are all
-//! byte-visible there.
+//! of padding quirks recorded on the functions below. Padding, precision, sign
+//! and `curl_off_t` rendering are all byte-visible there.
 //!
 //! So nothing here delegates to Rust's `format!`, whose syntax and rounding
 //! differ, nor to the platform's `printf`. The single exception is floating
@@ -66,24 +46,6 @@
 //! format string it has just constructed; [`out_double`] reproduces that
 //! construction byte for byte and makes the same call, which is the only way
 //! to stay identical to it.
-//!
-//! # One core formatter, four sinks
-//!
-//! The C file's architecture is preserved exactly, because ten independent
-//! implementations would drift:
-//!
-//! * [`format_into`] is `formatf` (`lib/mprintf.c:942`) -- parse the format
-//!   once into an input array and an output-segment array, then walk the
-//!   segments emitting one byte at a time through a callback.
-//! * [`BoundedBuffer`] is `addbyter` (`:1065`), which stops at `maxlength`.
-//! * [`GrowingBuffer`] is `alloc_addbyter` (`:1113`) over `dynbuf`, capped at
-//!   `DYN_APRINTF`.
-//! * [`UnboundedBuffer`] is `storebuffer` (`:1167`), which trusts the caller.
-//! * [`FileSink`] is `fputc_wrapper` (`:1186`).
-//!
-//! The ten entry points are thin adapters over those five pieces, and the five
-//! plain forms are thinner still: each is a `va_start` shim that delegates to
-//! its `va_list` sibling, which is precisely how `lib/mprintf.c` arranges them.
 //!
 //! # MSRV CONFLICT, and the route taken
 //!
@@ -101,14 +63,6 @@
 //! from the header's own side: it defines three-argument enforcement macros for
 //! exactly those four functions and for none of these ten.
 //!
-//! Specification 0.8.6 lists three ways out, and two of them are closed here.
-//! Raising the minimum contradicts specification 0.8.3, which fixes it at 1.75.
-//! Dropping the symbols is refused by specification 0.8.2 and by the `nm`
-//! parity gate, which compares the whole 100-symbol set. A `cc`-compiled C shim
-//! is ABI-exact but would add a build dependency `curl-rs-ffi/Cargo.toml` does
-//! not carry -- its build-dependencies are `cbindgen` alone -- so it is
-//! reported rather than adopted unilaterally.
-//!
 //! **The route taken is the fourth, which costs none of those three: a
 //! hand-written `va_start` prologue in stable `core::arch::global_asm!`, plus a
 //! pure-Rust `va_list` walker per target ABI.** `core::arch::global_asm!` is
@@ -122,59 +76,63 @@
 //! general-purpose and the floating-point register-to-stack overflow
 //! transitions.
 //!
-//! # The one thing the route does NOT buy, measured
+//! # What the route did NOT buy on its own, and what closed it
 //!
-//! An assembled entry point cannot be exported from this crate's **shared**
-//! library at the declared minimum, and no linker flag changes that. rustc
-//! builds a cdylib's export list from Rust items carrying `#[no_mangle]` and
-//! hands the linker an anonymous version script shaped
+//! An assembled entry point is not exported from a `cdylib` merely by being
+//! `.globl`. rustc builds a cdylib's export list from Rust items carrying
+//! `#[no_mangle]` and hands the linker an anonymous version script shaped
 //! `{ global: <those items>; local: *; };` -- captured verbatim from 1.75.0 and
 //! 1.97.1 alike and byte-identical between them. A `.globl` label matches
 //! nothing in `global:`, falls to the wildcard, is localised, and -- being
 //! unreferenced -- is discarded. Measured on x86_64-unknown-linux-gnu, in both
-//! profiles: `nm -D --defined-only libcurl.so` reports the five `va_list` forms
-//! and not the five trampolines, which appear nowhere in a symbol table of 2703
-//! entries, while `nm --defined-only libcurl.a` reports all ten as `T`.
+//! profiles: `nm -D --defined-only libcurl.so` reported the five `va_list`
+//! forms and not the five trampolines, which appeared nowhere in a symbol table
+//! of 2703 entries, while `nm --defined-only libcurl.a` reported all ten as `T`.
 //!
 //! Eight linker routes were measured. Seven do nothing at all
 //! (`--export-dynamic-symbol`, `--export-dynamic-symbol-list`, `--dynamic-list`,
-//! `-u`, `--export-dynamic`, and combinations). The eighth, a second anonymous
-//! `--version-script` naming the five, works under LLD and **fails the link**
-//! under GNU ld with `anonymous version tag cannot be combined with other
-//! version tags` -- which is three of the four required targets, the 1.75 floor
-//! among them. It was implemented, verified on the one target where it works,
-//! and removed. `build.rs` carries the full matrix and the three rejected
-//! alternatives under "Trap 3", including the finding that the `cc`-shim route
-//! would not have helped either: the version script governs the whole link, so a
-//! C object's symbols are localised exactly as an assembled label is.
+//! `-u`, `--export-dynamic`, and combinations), because a symbol rustc's own
+//! script has already matched against `local: *` stays local. The eighth, a
+//! second anonymous `--version-script` naming the five, WORKS -- and it is what
+//! `build.rs`'s `promote_assembled_exports` emits.
 //!
-//! What ships, therefore: the static library carries all ten and is correct, and
-//! the shared library carries the five `va_list` forms. The gap is LOUD -- a
-//! consumer linking `-lcurl` against the shared library gets
+//! The condition it carries is the linker: GNU ld fails the link with
+//! `anonymous version tag cannot be combined with other version tags`, while
+//! LLD merges the two additively. An earlier revision of this comment inferred
+//! from that failure that the route worked on one of four targets and removed
+//! it. The inference was wrong, and the missing row is now measured: both
+//! pinned toolchains ship LLD at
+//! `<sysroot>/lib/rustlib/<HOST>/bin/gcc-ld/ld.lld`, and selecting it
+//! explicitly makes the route work at the 1.75 floor and on the aarch64 cross
+//! leg as well as on the host. After the change, both artifacts export the same
+//! 59 `curl_*` symbols, nothing else is exported, the soname is unchanged, and a
+//! `-Wall -Wextra -Werror` C driver linked against the shared object calls the
+//! promoted labels and gets the right answers.
+//!
+//! What ships, therefore: on ELF the static and shared libraries carry all ten
+//! forms and agree. On Mach-O the five trampolines are still absent, because
+//! ld64's export list is replaced rather than extended, and that residual gap is
+//! LOUD -- a consumer linking `-lcurl` gets
 //! `undefined reference to 'curl_maprintf'` at link time, and the specification
-//! 0.8.4 parity gate fails on it by design. That is the deciding property. The
-//! one alternative that would export all ten -- declaring the register-resident
-//! variadic arguments as ordinary parameters -- caps the argument count, because
-//! `addr_of!` of the last stack-passed parameter was measured to be the caller's
-//! slot in debug and a callee-local copy in release, putting the overflow area
-//! out of reach. A capped printf mis-renders a legal C call **silently**, and
-//! specification 0.6.2 says of exactly this class of hazard that silent
-//! acceptance is the worst option. A loud absence beats a quiet wrong answer.
+//! 0.8.4 parity gate fails on it by design. That is the deciding property, and
+//! it is why the one alternative that would have exported all ten everywhere --
+//! declaring the register-resident variadic arguments as ordinary parameters --
+//! is still refused: it caps the argument count, because `addr_of!` of the last
+//! stack-passed parameter was measured to be the caller's slot in debug and a
+//! callee-local copy in release, putting the overflow area out of reach. A
+//! capped printf mis-renders a legal C call **silently**, and specification
+//! 0.6.2 says of exactly this class of hazard that silent acceptance is the
+//! worst option. A loud absence on one object format beats a quiet wrong answer
+//! on all of them.
 //!
-//! The complete remedy makes the five Rust items, which means raising the
-//! minimum -- `#[naked]` at 1.88 or `c_variadic` at 1.99 -- and that is the user
-//! decision A4 already reserves. What this adds to A4 is that the obstacle is
-//! wider than first filed: not only Apple's variadic ABI, but Rust's cdylib
-//! export model, and it applies on every target.
+//! The earlier claim that Rust's cdylib export model widened A4 "on every
+//! target" is withdrawn as measured wrong. A4 is once again only what it was
+//! filed as: Apple's variadic argument-passing convention.
 //!
 //! # ESCALATION A4
 //!
-//! Specification 0.8.6 escalates open ambiguity A4 -- that Apple's arm64 ABI
-//! passes variadic arguments on the stack while AAPCS64 passes them in
-//! registers -- to whoever set the requirements, and calls silent acceptance
-//! the worst option. It is restated here, in the module whose ten symbols sit
-//! closest to it, with the three `va_list` representations that make it
-//! concrete:
+//! It is restated here, in the module whose ten symbols sit closest to it,
+//! with the three `va_list` representations that make it concrete:
 //!
 //! | Target | `va_list` is |
 //! |---|---|
@@ -196,6 +154,52 @@
 //! trailing-pointer functions it was raised about. That is a documented gap and
 //! not a silent one.
 //!
+//! # The decision, stated as options, and the one that was removed
+//!
+//! Two facts above are separate defects with one remedy, and stating them
+//! together is the point of this section -- a reader who meets only one of them
+//! will reach for a fix that cannot work.
+//!
+//! * **The cdylib export gap, now closed on ELF and open only on Mach-O.** Six
+//!   of the 100 symbols in `lib/libcurl.def` reached `libcurl.a` and not
+//!   `libcurl.so`: this module's five trampolines (`curl_mprintf`,
+//!   `curl_mfprintf`, `curl_msprintf`, `curl_msnprintf`, `curl_maprintf`) and
+//!   `curl_formadd`, which `ffi/form.rs` records for the same cause. Measured
+//!   on x86_64-unknown-linux-gnu before the promotion: `nm -D` over the shared
+//!   object read 53 where the static archive read 59. Measured after it, on
+//!   both Linux targets and in both profiles: both read the same 59, these five
+//!   among them. On Mach-O the five are still absent, because ld64's export
+//!   list is replaced rather than extended, so what is left of this defect is
+//!   confined to the two Apple targets -- and it is loud there, an undefined
+//!   symbol at link time rather than a wrong answer at run time.
+//! * **The Apple arm64 trailing-pointer mismatch**, which is A4 as originally
+//!   filed, and which concerns `curl_easy_setopt`, `curl_easy_getinfo`,
+//!   `curl_multi_setopt` and `curl_share_setopt` rather than these ten.
+//!
+//! What remains of each closes only by raising the declared minimum --
+//! `#[naked]` at 1.88 makes the trampolines Rust items and therefore exportable
+//! by ld64 as well, `c_variadic` at 1.99 removes the need for them at all -- and
+//! the minimum is a requirement, so the decision belongs to whoever set it. The
+//! options are exactly the two `build.rs`'s `check_variadic_abi` prints when it
+//! refuses the target:
+//!
+//! 1. Raise the MSRV above 1.75 to a toolchain carrying the mechanism, and
+//!    implement the target-correct entry points.
+//! 2. Drop `aarch64-apple-darwin` from the target matrix, narrowing the
+//!    contract to what is deliverable at 1.75.
+//!
+//! **There is no third option, and there was.**
+//! `CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs` once built the
+//! target with a known-wrong variadic ABI, and that bypass has been removed. It
+//! recorded an acceptance rather than a repair, and the defect it accepted is
+//! silent at run time -- a callee reading register `x2` that the caller never
+//! populated. Specification 0.6.2 names silent acceptance the worst of the
+//! available options for exactly this hazard, `build.rs` now refuses a build
+//! that sets the variable at all, and no file in this crate sets it, defaults it
+//! or infers it. Neither remaining option is available to this crate either:
+//! both edit the requirements. Until one is chosen, the four-target matrix of
+//! gate 8 cannot pass, and the honest report is that it does not.
+//!
 //! Nothing in this module emits a warning and nothing calls `compile_error!` on
 //! a required target, both for the reason given above: either would fail a gate
 //! that specification 0.8.4 requires to pass on all four. A `compile_error!`
@@ -208,17 +212,6 @@
 //! register-width argument slot holds a `curl_off_t` only where `curl_off_t`
 //! fits a register; all four required targets are 64-bit, so the question is
 //! settled for the required matrix and for nothing wider.
-//!
-//! # The one module here that needs nothing from `curl-rs-lib`
-//!
-//! Specification 0.4.1 maps this file from `include/curl/mprintf.h` and
-//! `lib/mprintf.c` and assigns it no `curl-rs-lib` module, because a `printf`
-//! implementation is not protocol logic and the C family it reproduces has no
-//! protocol dependency either. So the formatter lives here, and that is the one
-//! sanctioned exception to the facade rule the rest of `ffi` follows.
-//! `curl-rs-lib`'s own internal formatting is served by Rust's `format!`
-//! machinery; this family exists for external consumers and for `--libcurl`
-//! emission, and the two are deliberately not unified.
 
 use crate::ffi::memory;
 use crate::ffi::panic_boundary;
@@ -266,19 +259,6 @@ const MIN_FIRST_ALLOC: usize = 32;
 
 /// What the eight `int`-returning entry points report when a precondition this
 /// module checks is violated.
-///
-/// `lib/mprintf.c` never returns a negative value: `formatf` answers `0` when
-/// it cannot parse the format, and `curl_mvsnprintf` only ever decrements a
-/// count that was at least one. A negative result is therefore unambiguous --
-/// no successful call can produce it -- and it is C99's conventional failure
-/// signal, which is why the crate root already assigns it as the
-/// panic-containment fallback for this return type. Both defensive paths
-/// consequently look identical to a caller, which is the honest outcome, since
-/// both mean the library refused and produced nothing.
-///
-/// The C functions would instead have dereferenced the null pointer. Preserving
-/// that is not an option, and no other value distinguishes "you passed
-/// garbage" from `curl_msnprintf(buf, 10, "")`, which legitimately returns `0`.
 const REFUSED: c_int = -1;
 
 /// Lower-case digits, `Curl_ldigits` (`lib/mprintf.c:35`).
@@ -301,30 +281,17 @@ const EOF: c_int = -1;
 extern "C" {
     /// The C `stdout` stream, which `curl_mprintf` and `curl_mvprintf` write
     /// to (`lib/mprintf.c:1198`, `:1223`).
-    ///
-    /// Declared here rather than imported because the pinned `libc` 0.2.189
-    /// exports no stdio stream globals. It is an object of type `FILE *`, not a
-    /// function: `readelf -sW` on glibc shows `stdout` as an eight-byte
-    /// `GLOBAL OBJECT`. Apple spells the same object `__stdoutp`.
-    ///
-    /// Reaching the application's own `FILE` is the point. Substituting
-    /// `fdopen(1, ...)` or a raw `write(2)` would give a second, separately
-    /// buffered view of descriptor 1 and would reorder this module's output
-    /// against the application's own `printf`, which the fixture corpus
-    /// compares byte for byte.
     #[cfg_attr(target_vendor = "apple", link_name = "__stdoutp")]
     #[cfg_attr(not(target_vendor = "apple"), link_name = "stdout")]
     static mut STDOUT: *mut libc::FILE;
 }
 
-// ---------------------------------------------------------------------------
 // Conversion and display flags -- `lib/mprintf.c:64-86`
 //
 // The numeric values matter, not just the names: the C code tests, sets and
 // clears them in combinations whose behaviour depends on the exact bits, and
 // several of the padding quirks reproduced below are visible only when the same
 // combinations arise.
-// ---------------------------------------------------------------------------
 
 const FLAGS_SPACE: u32 = 1 << 0;
 const FLAGS_SHOWSIGN: u32 = 1 << 1;
@@ -358,16 +325,6 @@ const FLAGS_SUBSTR: u32 = 1 << 20;
 
 /// Which `va_arg` type an input argument is read as, `FormatType`
 /// (`lib/mprintf.c:48-62`).
-///
-/// `Unset` stands in for C's uninitialised array slot. `parsefmt` cannot leave
-/// a reachable slot unset -- it returns `PFMT_INPUTGAP` for any index below
-/// `max_param` that no conversion claimed -- so the variant exists to make that
-/// unreachability explicit rather than to be handled.
-///
-/// `MTYPE_LONGDOUBLE` is present in the C enumeration and never assigned by
-/// `parsefmt`: `%Lf` sets `FLAGS_LONGDOUBLE` but still reads a `double`. It is
-/// therefore absent here, which is the same set of behaviours with one fewer
-/// unreachable branch.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FormatType {
     Unset,
@@ -404,14 +361,6 @@ enum FormatType {
 ///   after `*1$` had claimed it as a width. The result is garbage, and it is
 ///   *curl's* garbage -- reproducing it costs nothing and diverging from it
 ///   would be an invented behaviour.
-///
-/// Every union member is at most eight bytes wide on all four required targets,
-/// which are 64-bit and little-endian, so one `u64` cell models it exactly:
-/// truncating it to `c_int` reads the same bytes a C union read would.
-///
-/// Value reads, unlike width reads, are always type-consistent: the type tag
-/// the fetch loop used is the same tag the emitter dispatches on, so no cell is
-/// ever dereferenced as a pointer unless a pointer was stored in it.
 #[derive(Clone, Copy)]
 struct VaInput {
     ty: FormatType,
@@ -471,12 +420,6 @@ struct MProperty {
 
 /// Why a format string could not be parsed, the `PFMT_*` codes
 /// (`lib/mprintf.c:158-170`).
-///
-/// Every one of them makes `formatf` return `0` without emitting anything, so
-/// the distinctions are diagnostic rather than observable. They are kept
-/// separate anyway: the set is what documents which malformed formats curl
-/// rejects, and collapsing them would make the parser's acceptance rules
-/// impossible to check against the C.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ParseError {
     /// Bad dollar for the main parameter.
@@ -502,19 +445,10 @@ enum ParseError {
     /// Maxed out the output segments.
     ManySegs,
     /// No argument list was supplied, but the format needs one.
-    ///
-    /// Not one of the C codes. `formatf` receives the `va_list` its caller
-    /// created and cannot be handed a null one; this module's entry points can,
-    /// because C lets an application pass anything. It is grouped with the
-    /// parse failures because that is where it is detected and because the
-    /// resulting `0` is what C would have produced for any other unusable
-    /// format.
     NoArguments,
 }
 
-// ---------------------------------------------------------------------------
 // The output sinks -- one per `int (*stream)(unsigned char, void *)` in the C
-// ---------------------------------------------------------------------------
 
 /// Where one formatted byte goes.
 ///
@@ -525,10 +459,6 @@ enum ParseError {
 /// truncated `curl_msnprintf` reports the bytes stored rather than the bytes
 /// the format would have produced. That asymmetry is reproduced in
 /// [`out_byte`] and is the reason the trait cannot simply return `()`.
-///
-/// Dispatch is dynamic, as it is in C. A generic parameter would monomorphise
-/// the whole formatter once per sink for no behavioural gain, and performance
-/// is an explicit non-goal of specification 0.1.1.
 trait Sink {
     /// Accepts one byte. Returns `true` to stop the whole conversion.
     fn emit(&mut self, byte: u8) -> bool;
@@ -598,10 +528,8 @@ impl Sink for BoundedBuffer {
 
 /// `storebuffer` (`lib/mprintf.c:1167-1173`).
 ///
-/// Writes without any bound, because `curl_msprintf`'s and `curl_mvsprintf`'s C
-/// prototypes give it none. The trust is the caller's, exactly as in C: adding a
-/// bound here would be a behaviour change specification 0.8.2 forbids, and
-/// would silently truncate output the fixture corpus compares whole.
+/// Writes without any bound, because `curl_msprintf`'s and `curl_mvsprintf`'s
+/// C prototypes give it none.
 struct UnboundedBuffer {
     buffer: *mut c_char,
 }
@@ -643,16 +571,6 @@ impl Sink for FileSink {
 
 /// `alloc_addbyter` (`lib/mprintf.c:1113-1121`) over `dynbuf`
 /// (`lib/curlx/dynbuf.c`), capped at [`DYN_APRINTF`].
-///
-/// The block is obtained from [`memory`], so `curl_maprintf`'s result really is
-/// the application's own allocator's and `curl_free` -- or the plain `free` some
-/// applications use -- releases it exactly as it would against C libcurl. That
-/// is why this grows a raw block rather than a `Vec`: a `Vec` would come from
-/// Rust's global allocator and handing it to `curl_free` would be heap
-/// corruption.
-///
-/// The growth schedule is `dyn_nappend`'s, byte for byte, so the number of
-/// allocator calls an accounting hook observes matches C's.
 struct GrowingBuffer {
     buf: *mut u8,
     len: usize,
@@ -776,24 +694,13 @@ impl Sink for GrowingBuffer {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The argument list
-// ---------------------------------------------------------------------------
 
-// A REFUSAL, and deliberately not the one specification 0.8.6 forbids.
-//
 // Every `va_list` layout below is a measured property of one specific ABI.
 // There is no portable fallback: guessing at a fourth layout would read a
 // caller's stack through a record whose fields are somewhere else, which is
 // memory-unsafe rather than merely wrong. So an architecture outside the
 // required matrix is refused here.
-//
-// This is the opposite case from open ambiguity A4, where a `compile_error!`
-// would break `aarch64-apple-darwin` -- a target specification 0.8.3 REQUIRES
-// -- and thereby fail the four-target matrix. All four required targets satisfy
-// the condition below, so this refusal is unreachable for every configuration
-// any gate builds, and it exists to make the deliberate forfeit of 32-bit and
-// of foreign ABIs explicit instead of silent.
 #[cfg(not(all(
     target_family = "unix",
     target_pointer_width = "64",
@@ -811,11 +718,6 @@ compile_error!(
 );
 
 /// One argument, fetched from wherever the argument list actually is.
-///
-/// The type list is exactly the `va_arg` calls `parsefmt` makes
-/// (`lib/mprintf.c:537-582`) and no more, which is what makes it possible to
-/// state that no fetch is ever wider than eight bytes -- the fact every
-/// [`VaArgs`] slot calculation below depends on.
 ///
 /// Dynamically dispatched so that the parser exists once for both
 /// implementations: the real C argument list, and the fixed list [`out_double`]
@@ -838,17 +740,6 @@ pub(crate) trait ArgSource {
 }
 
 /// x86-64 System V's `__va_list_tag`, on Linux and on macOS alike.
-///
-/// Measured with gcc 15.2: `sizeof` is 24 and `alignof` is 8, and because the C
-/// type is a one-element array of this record a `va_list` *parameter* decays to
-/// a pointer to it (`movq %rsp, %rsi` at the call site). `gp_offset` and
-/// `fp_offset` are `unsigned int`, which is why they are `c_uint` and not
-/// `usize`.
-///
-/// `reg_save_area` addresses 176 bytes: the six general-purpose argument
-/// registers at 0, 8, 16, 24, 32 and 40, then the eight SSE registers at 48
-/// through 160 in 16-byte steps. `gp_offset` indexes the first half and reaches
-/// 48 when exhausted; `fp_offset` indexes the second and reaches 176.
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
 pub(crate) struct SysvVaList {
@@ -859,15 +750,6 @@ pub(crate) struct SysvVaList {
 }
 
 /// AAPCS64's `struct __va_list`, used by `aarch64-unknown-linux-gnu`.
-///
-/// Measured with `aarch64-linux-gnu-gcc`: 32 bytes, and because AAPCS64 passes
-/// a composite larger than 16 bytes as a pointer to a caller-allocated copy, a
-/// `va_list` *parameter* arrives as a pointer here too (`mov x1, sp` at the call
-/// site).
-///
-/// The two `_offs` fields are negative offsets from the corresponding `_top`,
-/// counting up to zero as registers are consumed; zero means the register file
-/// is exhausted and `stack` takes over.
 #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
 #[repr(C)]
 pub(crate) struct Aapcs64VaList {
@@ -897,19 +779,6 @@ pub(crate) type CVaList = Aapcs64VaList;
 pub(crate) type CVaList = c_char;
 
 /// A cursor over the C caller's argument list.
-///
-/// # The invariant every fetch relies on
-///
-/// A `printf`-family function cannot validate its own arguments: the format
-/// string is the only description of them that exists, and a caller who got it
-/// wrong has already produced undefined behaviour in C. That is not a
-/// limitation of this implementation, it is the contract of the interface, and
-/// it is stated on every entry point's `# Safety` section rather than papered
-/// over. What this module does guarantee is that it never reads a slot the
-/// format did not direct it to: the parser fetches exactly one argument per
-/// conversion, in the order and of the type the conversion names.
-/// `pub(crate)` for the reason [`ArgSource`] gives: `super::form` walks the
-/// same slots with the same cursor rather than with a second copy of it.
 pub(crate) struct VaArgs {
     /// On x86-64 and AAPCS64 this points at the caller's own record and is
     /// mutated through, which is what C's `va_arg` does to a `va_list` passed
@@ -1046,12 +915,6 @@ impl VaArgs {
     /// uses a slot size equal to the pointer width and rounds each argument's
     /// size up to it, so an `int` sits in the low four bytes of its slot and
     /// the cursor still advances by eight.
-    ///
-    /// This is the target open ambiguity A4 was raised about, and here the
-    /// caller and this module agree by construction: `build.rs`'s
-    /// `check_variadic_strategy` measured an Apple arm64 caller storing its
-    /// variadic argument with `str x1, [sp]`, and the trampoline below hands
-    /// that same `sp` over as the cursor.
     fn slot(&mut self) -> *const u8 {
         let addr = self.list.cast::<u8>();
         // SAFETY: the cursor addresses the caller's own stack arguments; the
@@ -1092,10 +955,6 @@ impl VaArgs {
     /// build to: on a big-endian ABI a type narrower than its slot sits at the
     /// slot's high address instead, and every fetch would silently read
     /// padding.
-    ///
-    /// `read_unaligned` rather than `read` because it costs nothing on either
-    /// supported architecture and removes an alignment precondition that would
-    /// otherwise have to be argued at each of the nine call sites.
     fn read<T: Copy>(slot: *const u8) -> T {
         // SAFETY: the slot came from `gp_slot` or `fp_slot`, each of which
         // returned an address inside a register save area or a stack argument
@@ -1145,13 +1004,6 @@ impl ArgSource for VaArgs {
 }
 
 /// One argument of a list this module supplies itself.
-///
-/// The set is closed and mirrors [`ArgSource`]'s nine fetches one for one, so a
-/// fixed argument list can drive the formatter through exactly the paths a
-/// `va_list` drives it through. Outside the test module only `Int` is
-/// constructed -- [`append_number`] is the sole production caller -- so the
-/// dead-code allowance is scoped to non-test builds rather than granted
-/// outright, which keeps the test suite obliged to exercise all nine.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Arg {
@@ -1167,16 +1019,6 @@ enum Arg {
 }
 
 /// An argument list this module built rather than received.
-///
-/// `lib/mprintf.c:611` and `:640` call `curl_msnprintf` recursively to render
-/// the width and precision of a `%f` into the format string it then hands to
-/// the platform `snprintf`. [`out_double`] reproduces that, and this is how it
-/// reaches the same parser without a `va_list`: the recursion is a `"%d"` and a
-/// single `c_int`, both fixed at the call site.
-///
-/// It is also what makes the formatter testable without any assembly at all,
-/// which is why the fidelity tests at the end of this file can compare against
-/// the C's documented behaviour directly.
 struct SliceArgs<'a> {
     args: &'a [Arg],
     at: usize,
@@ -1261,9 +1103,7 @@ impl ArgSource for SliceArgs<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The format string
-// ---------------------------------------------------------------------------
 
 /// `%z`, curl's `size_t` length modifier (`lib/mprintf.c:317-323`).
 ///
@@ -1301,12 +1141,6 @@ enum Dollar {
 }
 
 /// A byte cursor over a NUL-terminated format string.
-///
-/// C walks the format with a bare `const char *`, testing `*fmt` and stepping
-/// with `fmt++`, `fmt--` and `fmt += 2`. The same walk is expressed as a base
-/// pointer plus an offset so that a segment can record where a literal run
-/// began without carrying a second raw pointer, and so that the one place raw
-/// reads happen is this type.
 #[derive(Clone, Copy)]
 struct FmtCursor {
     base: *const c_char,
@@ -1339,17 +1173,6 @@ impl FmtCursor {
 }
 
 /// `curlx_str_number` (`lib/curlx/strparse.c:195`) for base ten.
-///
-/// Returns the value and advances past the digits, or returns `None` and leaves
-/// the cursor exactly where it was -- which is what C does, since it writes
-/// `*linep` only on success. `None` therefore covers both "not a number" and
-/// "overflowed `max`", and both of this function's call sites turn it into a
-/// parse error, so the distinction is not observable.
-///
-/// `str_num_base`'s `max < base` special case is not reproduced because it
-/// cannot be reached: the two call sites pass [`MAX_PARAMETERS`] and `INT_MAX`,
-/// both far above ten. The overflow test is transcribed exactly, including its
-/// integer division, because a looser one would accept a width C rejects.
 fn str_number(fmt: &mut FmtCursor, max: i64) -> Option<i64> {
     if !fmt.peek().is_ascii_digit() {
         return None;
@@ -1404,17 +1227,6 @@ fn mark_arg_used(bits: &mut [u8; MAX_PARAMETERS / 8], index: usize) {
 }
 
 /// `parsefmt` (`lib/mprintf.c:171-587`): the format string, once.
-///
-/// Fills `out` with the output segments and `input` with the type and value of
-/// every argument, and answers `(segments, arguments)`. Parsing before emitting
-/// is what lets positional `%2$s %1$s` work at all, and it is also why an
-/// unparseable format produces no output whatsoever rather than a prefix.
-///
-/// `args` is `None` when the caller supplied no argument list. C cannot be in
-/// that position -- its `va_list` comes from its own `va_start` -- but an
-/// application calling `curl_mvprintf(fmt, NULL)` can be, and a format with no
-/// conversions makes that harmless, exactly as in C. So the absence is only an
-/// error once an argument is actually needed.
 #[allow(clippy::too_many_lines)]
 fn parse_format(
     format: *const c_char,
@@ -1750,13 +1562,6 @@ fn parse_format(
             // would receive, including its widening: `va_arg(int)` lands in
             // `val.nums` and so sign-extends, while `va_arg(unsigned int)`
             // lands in `val.numu` and so zero-extends.
-            //
-            // `c_long` and `c_ulong` need no conversion because every target
-            // this module builds for is LP64 -- the refusal above restricts it
-            // to 64-bit Unix, where `long` is 64 bits on Linux and on macOS
-            // alike. On an LLP64 target they would need widening, and the
-            // refusal is what makes writing that unnecessary rather than
-            // wrong.
             slot.bits = match slot.ty {
                 FormatType::Str => args.next_str() as usize as u64,
                 FormatType::IntPtr | FormatType::Ptr => {
@@ -1798,28 +1603,10 @@ fn unsigned_type(flags: u32) -> FormatType {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The emitters
-//
-// Width and precision arithmetic uses `wrapping_sub` throughout. That is not
-// defensive vagueness, it is the only faithful choice: C subtracts a precision
-// of up to `INT_MAX` from a width of up to `INT_MAX` in `out_number`, then
-// subtracts two more for a `%#x` prefix, which is signed overflow -- undefined
-// in C and, on every target in the required matrix, a two's-complement wrap.
-// Reproducing the wrap keeps the output identical for such a format; using
-// checked arithmetic would panic in a debug build and turn a pathological
-// format string into a contained panic and a `-1`.
-// ---------------------------------------------------------------------------
 
 /// `out_number` (`lib/mprintf.c:703-830`): every integer conversion, `%c`
 /// included.
-///
-/// The scratch buffer is filled from its far end towards its start, exactly as
-/// C fills `work` backwards from `workend`, so `first` here is the index of the
-/// lowest byte written and C's pointer `w` is `first - 1`. That correspondence
-/// is what lets the arithmetic be transcribed rather than re-derived: C's
-/// `workend - w` is `WORKEND + 1 - first`, its guard `w >= work` is
-/// `first > 0`, and its final `while(++w <= workend)` is `first..=WORKEND`.
 #[allow(clippy::too_many_lines)]
 fn out_number(
     sink: &mut dyn Sink,
@@ -2084,12 +1871,6 @@ fn out_string(
 /// A non-null pointer is rendered as `%#x` of its numeric value, which is why
 /// `p` is taken mutably -- C sets `FLAGS_HEX | FLAGS_ALT` on the property
 /// itself before delegating.
-///
-/// **The null case pads on the wrong side, and that is faithful.** C tests
-/// `FLAGS_LEFT` to decide whether to pad *before* `(nil)`, the opposite of what
-/// left alignment means and the opposite of what every other conversion here
-/// does. `%-10p` of `NULL` therefore right-aligns and `%10p` left-aligns.
-/// Correcting it would be a behaviour change specification 0.8.2 forbids.
 fn out_pointer(
     sink: &mut dyn Sink,
     p: &mut MProperty,
@@ -2126,35 +1907,9 @@ fn out_pointer(
 
 /// The one iteration bound this module adds, and the one place it departs from
 /// the C.
-///
-/// `lib/mprintf.c:631-634` reduces a working precision with
-/// `while(val >= 10.0) { val /= 10; maxprec--; }`. For any finite `double` that
-/// terminates in at most 309 steps, `DBL_MAX` being about 1.8e308. For positive
-/// infinity it never terminates at all.
-///
-/// **That is measured, not inferred.** A driver linked against a real libcurl
-/// and asked for `curl_maprintf("%.2f", 1.0/0.0)` did not return; it had to be
-/// killed. The C loop spins forever while `maxprec` underflows, which is also
-/// undefined behaviour in its own right. A bound is therefore mandatory.
-///
-/// The departure is from a hang to the answer the C would have produced had it
-/// terminated, so nothing observable changes. Any bound above 326 leaves
-/// `maxprec` far enough below zero that the clamps below force a precision of
-/// zero, giving the format `"%0.0f"` and therefore `inf` -- which is what the
-/// platform `snprintf` yields and what the tests assert. Every finite value
-/// reaches the same result it would have anyway, since the loop exits on its own
-/// long before this bound.
 const MAXPREC_STEPS: u32 = 400;
 
 /// `out_double` (`lib/mprintf.c:596-701`): `%f`, `%e`, `%E`, `%g` and `%G`.
-///
-/// This is the one conversion curl does not implement itself. It assembles a
-/// format string from the flags, the width and the clamped precision and hands
-/// it to the platform `snprintf` (`:684`), with a comment admitting that not
-/// every `sprintf` reports its output length. Calling the same function with
-/// the same constructed format is the only way to stay byte-identical to it,
-/// and calling a C-variadic function from Rust is stable even though defining
-/// one is not.
 ///
 /// Two quirks of the assembly are load-bearing:
 ///
@@ -2277,17 +2032,6 @@ fn out_double(
 }
 
 /// `curl_msnprintf(dst, max, "%d", value)`, or `".%d"` when `dot` is set.
-///
-/// `out_double` uses `curl_msnprintf` recursively to render the width and the
-/// precision into the format string it is assembling (`lib/mprintf.c:611`,
-/// `:640`), and this is that call: the same core formatter, the same bounded
-/// sink, the same terminator rule, reached with a fixed argument list rather
-/// than with a `va_list`. Routing it through [`format_into`] rather than
-/// open-coding the digits is what keeps a single implementation of `%d`.
-///
-/// The effective bound is the smaller of `max` and the slice, which coincide
-/// for every reachable call: `max` is 31 or less and the slice is at least 27
-/// bytes, while the longest output is four characters.
 fn append_number(dst: &mut [u8], max: usize, dot: bool, value: c_int) -> usize {
     let bound = max.min(dst.len());
     let format: &[u8] = if dot { b".%d\0" } else { b"%d\0" };
@@ -2460,23 +2204,6 @@ fn format_into(
 
 /// `%n` (`lib/mprintf.c:1044-1055`): report the count so far through the
 /// caller's pointer.
-///
-/// The width of the store follows the length modifiers, and the chain is C's:
-/// `long long`, then `long`, then `int`, then `short`.
-///
-/// A null pointer is the one place this module declines rather than reproducing
-/// what the C does, and what the C does was measured rather than guessed: a
-/// driver linked against a real libcurl and asked for
-/// `curl_maprintf("ab%ncd", NULL)` **died with SIGSEGV**. No program that uses
-/// `%n` correctly can pass null, so declining cannot change a legitimate result,
-/// and a segmentation fault is not a behaviour a caller can be depending on.
-///
-/// `write_unaligned` because the caller's object need not be aligned and C's
-/// store would have been undefined behaviour if it were not.
-///
-/// `%n` is *supported*, not sanitised. Refusing it, or making it conditional,
-/// would be a behaviour change specification 0.8.2 forbids -- and curl's own
-/// code uses it.
 fn store_count(p: &MProperty, value: VaInput, done: c_int) {
     let target = value.as_ptr::<c_void>();
     if target.is_null() {
@@ -2506,28 +2233,14 @@ fn store_count(p: &MProperty, value: VaInput, done: c_int) {
 const EMPTY: &[u8; 1] = b"\0";
 
 // The scratch buffer's geometry, checked at compile time rather than by a test.
-//
-// `out_number` fills backwards from `WORKEND` and then emits `first..=WORKEND`,
-// so the highest index it ever touches is `WORKEND`, and `out_double` hands
-// `BUFFSIZE` to `snprintf` as the bound on a buffer of `WORKSIZE`. Both are
-// safe only while these hold, and a future edit to any one of the three
-// constants would otherwise turn a compile-time certainty into a runtime
-// question.
 const _: () = assert!(WORKSIZE == BUFFSIZE + 2);
 const _: () = assert!(WORKEND == BUFFSIZE - 2);
 const _: () = assert!(WORKEND + 1 < WORKSIZE);
 const _: () = assert!(BUFFSIZE <= WORKSIZE);
 
-// ---------------------------------------------------------------------------
 // The shared cores behind the entry points
-// ---------------------------------------------------------------------------
 
 /// Owns the `va_list` wrapper so a `&mut dyn ArgSource` can borrow from it.
-///
-/// The indirection exists for a borrow-checking reason and not a stylistic one:
-/// [`format_into`] takes `Option<&mut dyn ArgSource>`, so something must own the
-/// [`VaArgs`] for the duration of the call, and every entry point needs the same
-/// two lines to arrange it.
 ///
 /// A null `ap` becomes `None` rather than a refusal. That is deliberate: C
 /// dereferences a `va_list` only when a conversion asks for an argument, so
@@ -2567,11 +2280,6 @@ impl ArgHolder {
 /// * a full buffer -- `length == max` -- has its **last stored byte replaced**
 ///   by the NUL and the return value **decremented**, so the count excludes it;
 /// * otherwise the NUL goes at the current position and the count stands.
-///
-/// The consequence is worth stating because it differs from C99: on truncation
-/// this reports the number of bytes it *stored*, one less than the buffer size,
-/// not the number it would have needed. Specification 0.8.1 freezes that, and
-/// `lib/mprintf.c` is the definition of it.
 ///
 /// # Safety
 ///
@@ -2682,24 +2390,12 @@ unsafe fn stream_format(
     format_into(&mut info, format, args)
 }
 
-// ---------------------------------------------------------------------------
 // The five `va_list` entry points
-//
-// Each is the real implementation; the five plain-variadic siblings reach these
-// through the assembly trampolines further down. Every body is wrapped in the
-// crate's single panic boundary, so an unwind can never cross back into C: the
-// eight `int` forms report `REFUSED` and the two `char *` forms report null,
-// which is what `curl-rs-ffi/src/lib.rs` documents for this crate as a whole.
-// ---------------------------------------------------------------------------
 
 /// `curl_mvsnprintf` -- bounded formatting into a caller's buffer.
 ///
 /// `mprintf.h:71-73`, `CURL_TEMP_PRINTF(3, 0)`. Implements
 /// `lib/mprintf.c:1077-1100`.
-///
-/// Returns the number of bytes stored, excluding the terminator, or a negative
-/// value if the arguments cannot be honoured. See [`bounded_format`] for the
-/// truncation convention, which is curl's rather than C99's.
 ///
 /// # Safety
 ///
@@ -2770,9 +2466,6 @@ pub unsafe extern "C" fn curl_mvsprintf(
 /// `mprintf.h:65-66`, `CURL_TEMP_PRINTF(1, 0)`. Implements
 /// `lib/mprintf.c:1221-1224`.
 ///
-/// The destination is the C library's `stdout`, so output interleaves with the
-/// application's own `printf` exactly as it does under C libcurl.
-///
 /// # Safety
 ///
 /// * `format` must be a NUL-terminated string.
@@ -2807,11 +2500,6 @@ pub unsafe extern "C" fn curl_mvprintf(
 /// `mprintf.h:67-68`, `CURL_TEMP_PRINTF(2, 0)`. Implements
 /// `lib/mprintf.c:1226-1229`.
 ///
-/// The first parameter is named `fd` because that is the header's spelling and
-/// the header is what `verify-synopsis.pl` compiles the manual pages against.
-/// `lib/mprintf.c` calls it `whereto`; the two are the same parameter and the
-/// header's name is the ABI-visible one.
-///
 /// # Safety
 ///
 /// * `fd` must be a stream open for writing.
@@ -2840,15 +2528,6 @@ pub unsafe extern "C" fn curl_mvfprintf(
 /// `mprintf.h:76-77`, `CURL_TEMP_PRINTF(1, 0)`. Implements
 /// `lib/mprintf.c:1139-1155`.
 ///
-/// **Returns `char *`, not `int`** -- one of the two members of this family that
-/// does. The block belongs to the caller and must be released with `curl_free`.
-/// It comes from the same allocator `curl_free` releases, including any hooks
-/// `curl_global_init_mem` installed, so the pairing holds however the
-/// application configured memory.
-///
-/// A null result means failure and nothing else. An empty result is an allocated
-/// empty string.
-///
 /// # Safety
 ///
 /// * `format` must be a NUL-terminated string.
@@ -2871,7 +2550,6 @@ pub unsafe extern "C" fn curl_mvaprintf(
     })
 }
 
-// ---------------------------------------------------------------------------
 // The five plain-variadic entry points
 //
 // MSRV CONFLICT, resolved -- see the module documentation for the full account.
@@ -2886,40 +2564,13 @@ pub unsafe extern "C" fn curl_mvaprintf(
 //   x86-64 System V   a 24-byte record, register save area plus two cursors
 //   AAPCS64           a 32-byte record, three area pointers plus two offsets
 //   Apple arm64       a bare `char *` cursor, everything on the stack
-//
-// A single implementation cannot serve all three, and the difference is silent
-// rather than diagnosable: reading the wrong shape returns plausible rubbish.
-// Emitting the right prologue per target is what closes A4 for this family --
-// and note that the Apple legs are cross-assembled and disassembled here, never
-// executed, because no Apple host is available. That gap is real and is stated
-// rather than papered over.
-//
-// The layouts below are not read off a specification alone. Each was measured by
-// compiling a reference variadic function with the target's own C compiler and
-// disassembling its prologue, then the assembled trampoline was disassembled and
-// compared field by field.
-// ---------------------------------------------------------------------------
 
 /// x86-64 System V, ELF flavour.
-///
-/// Frame of 200 bytes: the six general-purpose argument registers at 0, the
-/// eight vector registers at 48 in sixteen-byte steps, and the 24-byte
-/// `__va_list_tag` at 176. `subq $200` turns the entry alignment of 8 into 0
-/// modulo 16, which is what makes the `movaps` stores legal.
 ///
 /// `overflow_arg_area` is `entry_rsp + 8`, one slot past the return address,
 /// and `gp_offset` starts at eight times the number of named parameters because
 /// those consume the first registers. `fp_offset` always starts at 48, the size
 /// of the general-purpose half.
-///
-/// The vector registers are saved unconditionally rather than under the usual
-/// `testb %al, %al` guard. SSE2 is baseline on every x86-64 target, the stores
-/// go into this frame alone, and saving eight registers the caller may not have
-/// set writes only values that no conversion can ask for.
-///
-/// `%rax` is clobbered to compute `overflow_arg_area`, which is sound: it is not
-/// an argument register, and the vector count it carried has already served its
-/// only purpose.
 #[cfg(all(target_arch = "x86_64", not(target_vendor = "apple")))]
 macro_rules! variadic_trampoline {
     (
@@ -2974,12 +2625,6 @@ macro_rules! variadic_trampoline {
 }
 
 /// x86-64 System V, Mach-O flavour.
-///
-/// Identical arithmetic to the ELF form; only the assembler dialect differs.
-/// Mach-O decorates symbols with a leading underscore, and its assembler rejects
-/// `.type` and `.size` outright -- measured, not assumed: both produce
-/// `error: unknown directive` when the ELF form is cross-assembled for
-/// `x86_64-apple-darwin`.
 #[cfg(all(target_arch = "x86_64", target_vendor = "apple"))]
 macro_rules! variadic_trampoline {
     (
@@ -3032,20 +2677,6 @@ macro_rules! variadic_trampoline {
 }
 
 /// AAPCS64, ELF flavour -- `aarch64-unknown-linux-gnu`.
-///
-/// Frame of 240 bytes: the frame record at 0, x0 through x7 at 16, q0 through q7
-/// at 80, and the 32-byte `struct __va_list` at 208. The record's three pointers
-/// are the *ends* of the two save areas and the start of the caller's stack
-/// arguments -- `__gr_top` at 80, `__vr_top` at 208, `__stack` at 240, which is
-/// the entry stack pointer because AAPCS64 keeps the return address in x30
-/// rather than on the stack.
-///
-/// The two offsets count up towards zero from a negative start: `__gr_offs` is
-/// `-(8 - named) * 8` and `__vr_offs` is -128, all eight vector registers being
-/// available to variadics.
-///
-/// x9 is a temporary the ABI leaves free. The list pointer is placed after the
-/// register saves, so overwriting x1, x2 or x3 with it cannot lose an argument.
 #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
 macro_rules! variadic_trampoline {
     (
@@ -3106,14 +2737,6 @@ macro_rules! variadic_trampoline {
 /// variadic argument on the stack, so `va_list` is a bare cursor and `va_start`
 /// reduces to "take the entry stack pointer". Named parameters keep their
 /// registers, so nothing needs saving and the sibling can be tail-called.
-///
-/// **This is the target open ambiguity A4 was raised about, and this is the
-/// resolution for this family.** The specification's concern was a Rust callee
-/// reading a register the Apple caller never populated; the trampoline removes
-/// the possibility by never treating a register as a variadic argument. The
-/// residual gap is that the code is cross-assembled and disassembled here rather
-/// than executed, no Apple host being available -- stated plainly because
-/// specification 0.6.2 calls silent acceptance the worst option.
 #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 macro_rules! variadic_trampoline {
     (
@@ -3198,23 +2821,7 @@ variadic_trampoline! {
     arm_list = "x1",
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-//
-// Every expectation below was produced differentially rather than reasoned out:
-// a C driver was compiled against a real libcurl, run, and its output recorded,
-// so each string is what curl's own `lib/mprintf.c` emits for that format rather
-// than what this module's author believed it would emit. Where the two disagreed
-// during development the C answer won, which is the only ordering consistent
-// with specification 0.8.1's freeze on observable behaviour.
-//
-// The formats are driven through the **plain-variadic** entry points wherever a
-// test can be, because that exercises the whole chain at once: the assembly
-// trampoline's `va_start`, the per-target `va_list` walk, the parser, and the
-// emitters. Rust may *declare* a C-variadic function even though it may not
-// define one, so `extern "C" { fn curl_maprintf(_: *const c_char, ...) }` calls
-// the assembled symbol exactly as a C caller would.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -3295,13 +2902,6 @@ mod tests {
     }
 
     /// This module's source with the test module removed.
-    ///
-    /// The structural checks below search for text that they themselves
-    /// contain -- a macro invocation, a `.globl` fragment, the name of an
-    /// unstable feature -- so searching the whole file would make every one of
-    /// them find itself and pass or fail for the wrong reason. Splitting at the
-    /// `#[cfg(test)]` attribute, whose first occurrence in the file *is* that
-    /// attribute, leaves exactly the half being asserted about.
     fn production_source() -> &'static str {
         let source = include_str!("printf.rs");
         let at = source
@@ -3515,11 +3115,9 @@ mod tests {
 
     #[test]
     fn a_null_pointer_pads_on_the_wrong_side_and_that_is_faithful() {
-        // `out_number` and `out_string` pad before the value when FLAGS_LEFT is
-        // clear. `out_pointer`'s null path tests the flag the other way round,
-        // so `%10p` left-aligns and `%-10p` right-aligns. Reproduced because
-        // specification 0.8.2 forbids changing observable behaviour, and
-        // verified against a real libcurl rather than assumed.
+        // `out_number` and `out_string` pad before the value when FLAGS_LEFT
+        // is clear. `out_pointer`'s null path tests the flag the other way
+        // round, so `%10p` left-aligns and `%-10p` right-aligns.
         check!(b"(nil)     |", "%10p|", ptr::null::<c_void>());
         check!(b"     (nil)|", "%-10p|", ptr::null::<c_void>());
     }
@@ -4306,40 +3904,44 @@ mod tests {
     }
 
     #[test]
-    fn the_cdylib_export_gap_is_recorded_and_no_linker_flag_papers_over_it() {
-        // MEASURED DEFECT, kept visible here because this module is the only
-        // thing in the crate it affects. `.globl` is necessary but not
-        // sufficient: rustc builds a cdylib's export list from Rust items
-        // carrying `#[no_mangle]` and hands the linker an anonymous version
-        // script shaped `{ global: <those items>; local: *; };`. An assembled
-        // label matches nothing in `global:`, falls to the wildcard, is
-        // localised, and -- being unreferenced -- is discarded. On
-        // x86_64-unknown-linux-gnu, in both profiles,
-        // `nm -D --defined-only libcurl.so` reports FIVE of this family and
-        // `nm -a | grep curl_mprintf` reports none at all in a symbol table of
-        // 2703 entries, while `nm --defined-only libcurl.a` reports all ten as
-        // `T`. Every test in this module still passes either way, because a test
-        // binary links the rlib, where the labels are plainly visible.
+    fn the_cdylib_export_route_is_emitted_for_elf_and_recorded_for_mach_o() {
+        // MEASURED DEFECT AND ITS MEASURED FIX, kept visible here because this
+        // module owns five of the six symbols it affects. `.globl` is necessary
+        // but not sufficient: rustc builds a cdylib's export list from Rust
+        // items carrying `#[no_mangle]` and hands the linker an anonymous
+        // version script shaped `{ global: <those items>; local: *; };`. An
+        // assembled label matches nothing in `global:`, falls to the wildcard,
+        // is localised, and -- being unreferenced -- is discarded. Before the
+        // fix, `nm -D --defined-only libcurl.so` reported 53 `curl_*` symbols
+        // where `nm --defined-only libcurl.a` reported 59, the six missing
+        // being this module's five plus `curl_formadd`.
         //
-        // Eight linker routes were measured and seven do nothing at all;
-        // the eighth, a second anonymous version script, works only under LLD
-        // and FAILS THE LINK under GNU ld with "anonymous version tag cannot be
-        // combined with other version tags" -- which is three of the four
-        // required targets, including the 1.75 floor. It was implemented,
-        // verified, and removed. The full matrix and the three rejected
-        // alternatives are in `build.rs` under "Trap 3".
+        // Eight linker routes were measured and seven do nothing at all,
+        // because a symbol rustc's own script has already matched against
+        // `local: *` stays local. The eighth, a second anonymous version
+        // script, works -- but only under LLD, and GNU ld fails the link with
+        // "anonymous version tag cannot be combined with other version tags".
+        // An earlier revision concluded from that that the route worked on one
+        // target only, and the conclusion was wrong: the linker is a choice.
+        // Both pinned toolchains ship LLD in their own sysroot, and selecting
+        // it explicitly makes the route work at the 1.75 floor and on the
+        // aarch64 cross leg alike. Measured after the fix: 59 of 59, zero
+        // leaked, soname intact, and a C driver calling the promoted labels
+        // through the shared object gets the right answers. The full matrix is
+        // in `build.rs` under "Trap 3".
         //
-        // This test therefore asserts the two things that must stay true: the
-        // finding is on the record, and nobody has quietly re-added the flag
-        // that breaks three targets.
+        // This test asserts what must stay true: the finding is on the record,
+        // the three arguments that close it are emitted TOGETHER and scoped to
+        // the cdylib, and none of the seven routes that do nothing has been
+        // re-added in their place.
         let build = include_str!("../../build.rs");
 
-        // The finding is recorded, with the numbers that make it checkable.
+        // The finding is recorded, with the phrases that make it checkable.
         for evidence in [
             "MEASURED FINDING, Trap 3",
             "anonymous version tag cannot be combined",
-            "declaration discipline, not from link-time filtering",
-            "specification 0.6.2 says of precisely this class of hazard",
+            "THE ROW THAT WAS MISSING",
+            "fn promote_assembled_exports",
         ] {
             assert!(
                 build.contains(evidence),
@@ -4347,25 +3949,53 @@ mod tests {
             );
         }
 
-        // And no linker flag is emitted to paper over it. A `cargo:` directive
-        // is a `println!`, so the needle is the emission and not the prose that
-        // explains why there is none -- hence the `cargo:` prefix rather than
-        // the bare flag name, which appears throughout the discussion above it.
-        for forbidden in [
-            "cargo:rustc-link-arg-cdylib=-Wl,--version-script",
-            "cargo:rustc-link-arg=-Wl,--version-script",
-            "cargo:rustc-link-arg-cdylib=-Wl,--export-dynamic-symbol",
-            "cargo:rustc-link-arg-cdylib=-Wl,--dynamic-list",
-            "cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol",
+        // The three arguments that close it, all cdylib-scoped. A `cargo:`
+        // directive is a `println!`, so the needle is the emission itself and
+        // not the prose around it.
+        for required in [
+            "cargo:rustc-link-arg-cdylib=-Wl,--version-script=",
+            "cargo:rustc-link-arg-cdylib=-fuse-ld=lld",
+            "cargo:rustc-link-arg-cdylib=-B",
         ] {
             assert!(
-                !build.contains(forbidden),
-                "{forbidden} was measured not to work, or to break three of \
-                 the four required targets; it must not be re-added",
+                build.contains(required),
+                "{required} is what promotes the assembled labels; without all \
+                 three the shared library caps at 53 of 100",
             );
         }
 
-        // The soname directives that DO work are untouched by any of this.
+        // The version script must never be emitted UNSCOPED. `rustc-link-arg=`
+        // reaches both command-line binaries as well, and a version script on
+        // an executable is at best pointless and at worst a link failure.
+        assert!(
+            !build.contains("cargo:rustc-link-arg=-Wl,--version-script"),
+            "the version script must stay scoped to the cdylib",
+        );
+
+        // The routes measured to do nothing must not be re-added: each would
+        // read as a second, redundant mechanism and invite the next reader to
+        // believe the promotion depends on it.
+        for forbidden in [
+            "cargo:rustc-link-arg-cdylib=-Wl,--export-dynamic-symbol",
+            "cargo:rustc-link-arg-cdylib=-Wl,--dynamic-list",
+            "cargo:rustc-link-arg-cdylib=-Wl,--export-dynamic",
+        ] {
+            assert!(
+                !build.contains(forbidden),
+                "{forbidden} was measured to change nothing, because rustc's \
+                 own version script overrides it; it must not be re-added",
+            );
+        }
+
+        // Mach-O gets no export argument, and that is deliberate: ld64's
+        // export list is REPLACED rather than extended, so promoting the six
+        // there would hide the other fifty-three.
+        assert!(
+            !build.contains("cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol"),
+            "an ld64 export list would replace rather than extend rustc's",
+        );
+
+        // The soname directives that were already working are untouched.
         assert!(
             build.contains("cargo:rustc-link-arg-cdylib=-Wl,--soname="),
             "the Linux soname directive must survive",
@@ -4376,7 +4006,7 @@ mod tests {
         );
 
         // The five names still come from one table, so the trampoline check and
-        // any future export work can never disagree about which they are.
+        // the export promotion can never disagree about which they are.
         for name in [
             "curl_mprintf",
             "curl_mfprintf",
@@ -4396,10 +4026,6 @@ mod tests {
         // The declared minimum is 1.75, where `c_variadic` and `VaList` are
         // unstable. The trampolines exist precisely so that neither is needed,
         // and a later edit reaching for them would be a silent MSRV rise.
-        //
-        // `VaList` alone is not a usable needle -- this module's own
-        // `SysvVaList` and `Aapcs64VaList` contain it -- so the needles are the
-        // paths and call shapes the unstable API actually requires.
         let source = production_source();
         for forbidden in [
             "#![feature(",

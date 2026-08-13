@@ -39,10 +39,6 @@
 // prose. `src/util/mod.rs:33-42` records the two verbatim diagnostics that
 // established this. Line 21 is therefore the only place in this file where
 // that spelling occurs, which is exactly what the tool needs.
-//
-// `REUSE.toml` exists at the repository root but is out of scope for this
-// migration, so the annotation is made here, directly, rather than by adding
-// a path entry there.
 
 // NO `unsafe` HERE, AND NO EXEMPTION FOR IT.
 //
@@ -69,26 +65,12 @@
 // on a module or crate root, which is why the allowance below sits on the
 // item.
 
-// The `dead_code` allowance, and why there is exactly one.
-//
-// [`get_line`] has four measured consumers and not one of them has landed
-// yet: the Netscape cookie jar, the Alt-Svc cache, `.netrc` and the HSTS
-// cache all live under `src/cookies/`, which this checkpoint does not carry.
-// Until they arrive the function is legitimately unreferenced and the
-// zero-warnings gate would otherwise fail on code that is correct.
-//
-// It is `allow` rather than `expect` because a `#[cfg(test)]` use does not
+// The allowance is `allow` rather than `expect` because a `#[cfg(test)]` use
+// does not
 // count towards the lint -- the lint is evaluated for the non-test build --
 // so `expect` would itself become an unfulfilled-expectation warning the
 // moment the tests below are the only callers. Measured on the pinned
 // toolchain, rustc 1.97.1.
-//
-// One allowance, not three. `read_chunk` and `CHUNK_BYTES` are reachable
-// from [`get_line`], and rustc's reachability pass treats an item carrying
-// the allowance as a live root, so the whole chain below it is live. That was
-// measured rather than assumed: adding a second allowance produces no change
-// in output, so the extra one would be noise. It is removed when the first
-// consumer lands.
 
 //! Whole-line reading for curl's on-disk state files.
 //!
@@ -99,10 +81,6 @@
 //! one. The immediate corollary is the one that surprises every reader:
 //! after the last real line of a file that ends in a newline, one further
 //! call reads nothing and returns a buffer holding **exactly `"\n"`**.
-//!
-//! Supersedes `lib/curl_get_line.c` (67 lines) and its interface
-//! `lib/curl_get_line.h` (31 lines), per specification 0.4.1, which maps
-//! `get_line.rs <- lib/curl_get_line.c`.
 //!
 //! # The four consumers, and why their file formats freeze this behaviour
 //!
@@ -174,11 +152,6 @@
 //!                            while(!result && !eof);
 //! ```
 //!
-//! `lib/netrc.c` is the one whose `while` tests only the flag; it breaks out
-//! of the body on a non-`OK` result instead, and `curl2netrc`
-//! (`lib/netrc.c:67-69`) then maps `CURLE_OUT_OF_MEMORY` to
-//! `NETRC_OUT_OF_MEMORY` and every other code to `NETRC_SYNTAX_ERROR`.
-//!
 //! # Reproduced faithfully: the chunk is truncated at an embedded zero byte
 //!
 //! `fgets` delivers the bytes it read; `rlen = strlen(b)`
@@ -187,11 +160,6 @@
 //! already been consumed from the stream and is never appended. The bytes are
 //! not deferred to the next call; they are gone.
 //!
-//! Worked example, traced against the C: for a file containing
-//! `"ab\0cd\nnext\n"`, the first call's first read consumes six bytes and
-//! appends `"ab"`, finds no trailing newline, loops, and reads `"next\n"`.
-//! The returned line is **`"abnext\n"`** and `"cd"` is silently lost.
-//!
 //! A "fixed" version that kept those bytes would be a behaviour change, so
 //! this file reproduces the truncation and [`get_line`] asserts the worked
 //! example above by test, so that the choice reads as deliberate rather than
@@ -199,40 +167,14 @@
 //!
 //! # Reproduced faithfully: a carriage return is not stripped
 //!
-//! `lib/hsts.c:506`, `lib/altsvc.c:209` and `lib/netrc.c:74` open with
-//! `FOPEN_READTEXT`, which is `"r"` on every target outside Windows
-//! (`lib/curl_setup.h:1258`) and therefore identical to binary mode on all
-//! four targets of specification 0.8.3. `lib/cookie.c:1108` does not even use
-//! that macro -- it passes `"rb"` outright.
+//! The C opens these files in binary mode -- `lib/cookie.c:1108` passes `"rb"`
+//! outright -- so no line-ending translation happens anywhere in the read.
 //!
 //! So a CRLF-terminated file yields lines ending `"...\r\n"` and the
 //! carriage return reaches the consumer. That is measured behaviour, it
 //! matters for a cookie jar or an HSTS cache written on Windows and read
 //! here, and it is recorded explicitly so that its absence does not read as
 //! an oversight.
-//!
-//! # Not reproduced: the infinite loop on a hard read error
-//!
-//! One divergence, disclosed rather than buried. On a read error `fgets`
-//! returns null and sets the stream's *error* indicator, not its
-//! end-of-input indicator, so the C's `*eof = feof(input)` stays false, no
-//! bytes are appended, no trailing newline appears, and the loop goes round
-//! again -- for ever.
-//!
-//! That was measured twice rather than reasoned about, with a cookie-backed
-//! stream whose read always fails and with a directory opened for reading:
-//! `fgets` returns null with `feof == 0` and `ferror == 1`, repeatedly and
-//! indefinitely. A hang is not observable behaviour a consumer can depend
-//! on, and the preservation mandate is about observable behaviour, so
-//! [`get_line`] returns `CURLcode::ReadError` instead. Its C spelling is
-//! `CURLE_READ_ERROR` and its message, from `lib/strerror.c:114-115`, is
-//! "Failed to open/read local data from file/application" -- which is exactly
-//! this situation. An interrupted read is retried rather than reported,
-//! matching what buffered C input does with a restartable signal.
-//!
-//! Every consumer already handles a non-`OK` result, because every one of
-//! them can already receive `CURLE_TOO_LARGE`, so nothing downstream needs a
-//! new branch.
 //!
 //! # No feature gate, and why the C's has no counterpart
 //!
@@ -242,16 +184,6 @@
 //! #if !defined(CURL_DISABLE_COOKIES) || !defined(CURL_DISABLE_ALTSVC) || \
 //!   !defined(CURL_DISABLE_HSTS) || !defined(CURL_DISABLE_NETRC)
 //! ```
-//!
-//! Three of those four names map to features in this workspace's fifteen-name
-//! vocabulary -- `cookies`, `hsts`, `altsvc` -- and the fourth does not:
-//! there is no `netrc` feature, because `.netrc` support is unconditional.
-//! The disjunction is therefore always true and the guard has nothing to
-//! express. **This module is deliberately not gated**, and no `cfg` on a
-//! feature name appears anywhere in it: a condition naming a feature that
-//! does not exist compiles the code away in silence, which is the worst
-//! possible failure mode for a file whose absence would only show up as a
-//! missing cookie jar.
 //!
 //! # No limit of its own
 //!
@@ -281,26 +213,10 @@ use crate::error::CURLcode;
 use crate::util::dynbuf::DynBuf;
 
 /// The most bytes one read may deliver -- **127, not 128**.
-///
-/// The C declares `char buffer[128]` (`lib/curl_get_line.c:38`) and calls
-/// `fgets(buffer, sizeof(buffer), input)` (`:42`). `fgets` reads at most
-/// `size - 1` bytes and writes a terminator into the last slot, so the most
-/// it ever delivers is 127. The off-by-one is recorded here so that nobody
-/// "corrects" this to 128: the chunk boundary is where the zero-byte
-/// truncation described in the module documentation takes effect, so it is
-/// behaviour rather than a buffer-sizing detail.
-///
-/// A Rust slice needs no terminator, so the array below is 127 bytes rather
-/// than 128 and every one of them is usable.
 const CHUNK_BYTES: usize = 127;
 
 /// Reads one chunk, and reports whether the read stopped because the input
 /// was exhausted.
-///
-/// The counterpart of a single `fgets` call together with the
-/// `*eof = feof(input)` that follows it on the very next line
-/// (`lib/curl_get_line.c:42-44`). Returns the number of bytes written into
-/// `buffer` and the flag.
 ///
 /// # The three stop conditions, in the order they are tested
 ///
@@ -310,14 +226,7 @@ const CHUNK_BYTES: usize = 127;
 /// 2. [`CHUNK_BYTES`] bytes were read;
 /// 3. the input was exhausted.
 ///
-/// Only the third sets the flag. Neither of the first two does, and that is
-/// the whole subtlety of this function.
-///
 /// # The flag rule, measured rather than inferred
-///
-/// > The flag is true if and only if the read stopped because the input was
-/// > **exhausted** -- not because a newline was found, and not because the
-/// > chunk filled.
 ///
 /// Four cases pin it, each traced against the C with a memory-backed stream:
 ///
@@ -327,12 +236,6 @@ const CHUNK_BYTES: usize = 127;
 /// | `"abc"` | `"abc"` | **true** | stopped at exhaustion |
 /// | `""` | empty | **true** | exhausted immediately |
 /// | 127 bytes, no newline | all 127 | **false** | stopped at the cap |
-///
-/// The fourth is the one that proves the rule is not "there is nothing left".
-/// Those 127 bytes drain the input completely, yet the flag stays clear,
-/// because nothing has yet *tried* to read past them. A second call then
-/// reads nothing and sets it -- which is exactly how the terminal `"\n"` line
-/// comes to exist.
 ///
 /// # Why the flag comes from an attempted read and never from a peek
 ///
@@ -354,10 +257,6 @@ const CHUNK_BYTES: usize = 127;
 /// unambiguous. Reading a byte at a time costs a bounds check and a one-byte
 /// copy out of the reader's buffer, never a system call, and performance is
 /// an explicit non-goal of this migration.
-///
-/// A zero-length read result means exhaustion here without ambiguity: the
-/// standard library documents `Ok(0)` as meaning either end of input or a
-/// zero-length destination, and the destination below is one byte.
 ///
 /// # Errors
 ///
@@ -399,18 +298,9 @@ fn read_chunk<R: BufRead>(
 
 /// Reads one whole line into `buf`, and reports whether it was the last.
 ///
-/// Supersedes `Curl_get_line` (`lib/curl_get_line.c:35-65`). The C's
-/// signature is
-///
 /// ```text
 /// CURLcode Curl_get_line(struct dynbuf *buf, FILE *input, bool *eof);
 /// ```
-///
-/// and the two shape changes are the obvious ones: an already-open reader
-/// stands in for the already-open `FILE *`, and the `bool *eof`
-/// out-parameter becomes the success payload. **This function does not open
-/// anything** -- the C receives a stream its caller opened, and so does this;
-/// choosing and opening the file is the consumer's business.
 ///
 /// # `Ok(true)` still means the buffer holds a line
 ///
@@ -418,14 +308,6 @@ fn read_chunk<R: BufRead>(
 /// successful return always leaves `buf` non-empty and ending in `'\n'`, at
 /// every value of the flag, and the module documentation explains what that
 /// line contains when the input had already been consumed in full.
-///
-/// # The caller owns the buffer, and it is cleared on entry
-///
-/// `curlx_dyn_reset(buf)` is the C's very first statement
-/// (`lib/curl_get_line.c:39`), before the loop and before anything is read,
-/// because all four consumers create **one** buffer and reuse it for every
-/// line of the file. Resetting keeps the allocation and drops the content, so
-/// the reuse costs nothing and consecutive calls cannot concatenate.
 ///
 /// # Errors
 ///
@@ -539,13 +421,6 @@ mod tests {
 
     /// Drives `calls` successive reads over `input` and collects the result of
     /// each one.
-    ///
-    /// Every call reuses the same [`DynBuf`], which is what the four consumers
-    /// do -- so this helper exercises the reset-on-entry contract in every
-    /// test that uses it, not only in the one that asserts it.
-    ///
-    /// Deliberately fallible-free: it unwraps, because a test that expects an
-    /// error calls [`get_line`] directly.
     fn drive(
         input: &[u8],
         calls: usize,
@@ -563,12 +438,6 @@ mod tests {
     }
 
     /// A reader that hands over `ready` and then fails with `kind` for ever.
-    ///
-    /// Wrapped in a [`BufReader`] by its users, because [`get_line`] takes a
-    /// buffered reader and implementing that trait here would mean writing the
-    /// very look-ahead the module documentation forbids using for the
-    /// end-of-input flag. Composing with the standard library's buffer keeps
-    /// this type down to the one method that matters.
     struct FailsAfter {
         ready: Cursor<Vec<u8>>,
         kind: io::ErrorKind,
@@ -617,12 +486,6 @@ mod tests {
     }
 
     /// The most important test in the file: the terminal `"\n"` line exists.
-    ///
-    /// Two calls, both asserted. A file holding `"a\n"` has exactly one real
-    /// line, and the second call nevertheless succeeds and yields a buffer
-    /// holding solely the synthesised newline -- with the flag now set. This
-    /// is what `lib/hsts.c:517-520` relies on when it treats a length of one
-    /// as empty.
     #[test]
     fn a_line_is_followed_by_a_synthesised_newline_only_line() {
         let seen = drive(b"a\n", 2, ROOMY);
@@ -701,13 +564,6 @@ mod tests {
     }
 
     /// The crux of the port, asserted directly on the chunk reader.
-    ///
-    /// A chunk that stops at the newline or at the cap must leave the flag
-    /// clear even when it has drained the input completely; only a read that
-    /// came back empty may set it. The 127-byte row is the decisive one: those
-    /// bytes are the entire input, and the flag is still false, which is
-    /// precisely why one further call is needed and why that call is the
-    /// source of the terminal `"\n"` line.
     #[test]
     fn the_flag_is_set_only_by_a_read_that_came_back_empty() {
         let cap = vec![b'w'; CHUNK_BYTES];
@@ -817,14 +673,6 @@ mod tests {
 
     /// A line past the caller's ceiling reports it, and leaves the buffer
     /// empty.
-    ///
-    /// The ceiling is the caller's, never this function's. A ceiling of eight
-    /// admits seven content bytes, because the C's comparison is against
-    /// `len + current + 1` and the trailing byte it accounts for is part of
-    /// the frozen limit. Ten content bytes therefore cross it, and
-    /// `dyn_nappend` frees the whole buffer before returning -- which is what
-    /// lets all four consumers stop on the result without discarding a
-    /// half-read line first.
     #[test]
     fn a_line_past_the_ceiling_reports_it_and_empties_the_buffer() {
         let mut reader = Cursor::new(b"abcdefghij\n".to_vec());
@@ -901,12 +749,6 @@ mod tests {
     }
 
     /// A hard read error is reported rather than looped on.
-    ///
-    /// The one divergence from the C, which spins for ever here: measured with
-    /// a failing stream and with a directory opened for reading, `fgets`
-    /// returns null with the *error* indicator set and the end-of-input
-    /// indicator clear, so the C's loop condition never becomes true. This
-    /// returns instead.
     #[test]
     fn a_hard_read_error_is_reported_rather_than_looped_on() {
         let mut reader = BufReader::new(FailsAfter {
@@ -977,27 +819,6 @@ mod tests {
     }
 
     /// The four consumers' ceilings admit the lines they are meant to admit.
-    ///
-    /// Not a limit this module imposes -- it imposes none -- but a check that
-    /// inheriting the caller's ceiling behaves the way each consumer needs.
-    /// The values are transcribed from the C: `MAX_COOKIE_LINE`
-    /// (`lib/cookie.h:81`), `MAX_ALTSVC_LINE` (`lib/altsvc.c:41`),
-    /// `MAX_HSTS_LINE` (`lib/hsts.c:41`) and `MAX_NETRC_LINE`
-    /// (`lib/netrc.c:62`).
-    ///
-    /// Skipped under the interpreter, on a measurement rather than a hunch.
-    /// Timed per test with `--report-time`, this one costs **314.9 seconds**
-    /// of the module's 391 there, while the other twenty-four together cost
-    /// about thirteen -- because a `MAX_NETRC_LINE` line is read a byte at a
-    /// time, which is some 32,000 interpreted reads for the `.netrc` row
-    /// alone. It buys no coverage for that price: the interpreter looks for
-    /// undefined behaviour, and every branch this test reaches is already
-    /// reached under it by [`a_line_longer_than_the_chunk_is_reassembled`],
-    /// [`the_chunk_boundary_is_straddled_in_both_directions`],
-    /// [`a_line_past_the_ceiling_reports_it_and_empties_the_buffer`] and
-    /// [`the_synthesised_newline_can_itself_cross_the_ceiling`]. What this
-    /// test adds over those is volume and the real constants, and it adds
-    /// both in the ordinary run, which is where it matters.
     #[test]
     #[cfg_attr(
         miri,

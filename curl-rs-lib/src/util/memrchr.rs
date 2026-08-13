@@ -22,8 +22,8 @@
 //
 //***************************************************************************
 
-//! Reverse byte search -- supersedes `lib/curl_memrchr.c` (53 lines) and
-//! `lib/curl_memrchr.h` (40).
+//! Reverse byte search -- supersedes `lib/curl_memrchr.c` and
+//! `lib/curl_memrchr.h`.
 //!
 //! One function wide, and deliberately so: the C translation unit defines
 //! exactly one symbol and its header declares exactly one, so this module
@@ -32,48 +32,6 @@
 //! because the C original is a separate translation unit for a reason that
 //! is worth keeping in view: the whole of it sits inside a portability
 //! guard, which is a property of a file rather than of a function.
-//!
-//! # The contract being reproduced
-//!
-//! `lib/curl_memrchr.c:24-53`, quoted in full because it is short enough
-//! that paraphrasing would lose the detail this module exists to preserve:
-//!
-//! ```c
-//! #ifndef HAVE_MEMRCHR
-//! void *Curl_memrchr(const void *s, int c, size_t n)
-//! {
-//!   if(n > 0) {
-//!     const unsigned char *p = s;
-//!     const unsigned char *q = s;
-//!
-//!     p += n - 1;
-//!
-//!     while(p >= q) {
-//!       if(*p == (unsigned char)c)
-//!         return CURL_UNCONST(p);
-//!       p--;
-//!     }
-//!   }
-//!   return NULL;
-//! }
-//! #endif /* HAVE_MEMRCHR */
-//! ```
-//!
-//! `lib/curl_memrchr.h:29-35` states the intent in prose: "Our memrchr()
-//! function clone for systems which lack this function. The memrchr()
-//! function is like the memchr() function, except that it searches backwards
-//! from the end of the n bytes pointed to by s instead of forward from the
-//! beginning."
-//!
-//! Three behaviours are frozen by that, and each is asserted by its own test
-//! at the foot of this file:
-//!
-//! * the walk starts at `s[n - 1]` and runs DOWN, so the answer is the
-//!   position of the LAST occurrence rather than the first -- the one
-//!   behaviour that distinguishes this function from its forward twin;
-//! * `n == 0` short-circuits to "not found" before any byte is read, which
-//!   is the `if(n > 0)` guard;
-//! * an absent byte is "not found" -- `NULL` in C, [`None`] here.
 //!
 //! # `int` going in, [`u8`] here
 //!
@@ -87,85 +45,11 @@
 //! a character literal -- `'/'` at `lib/urlapi.c:784` and `:1261`, `'.'` at
 //! `lib/cookie.c:168` and `:170`, and `'.'` at `lib/vtls/hostcheck.c:102`.
 //!
-//! # Why an index, and why not also a sub-slice
-//!
-//! The C returns an interior pointer. An index is the safe equivalent, and
-//! it is also what every caller actually wants -- which is a measurement
-//! rather than an assumption. All five calls in the C tree, spread over four
-//! functions in three files, convert the pointer into an offset immediately:
-//!
-//! | Call site | What it does with the result |
-//! |---|---|
-//! | `lib/urlapi.c:784` | `curlx_dyn_setlen(&out, last - ptr)` |
-//! | `lib/urlapi.c:1261` | `cutoff++`, then `prelen = cutoff - base` |
-//! | `lib/cookie.c:168` | passes `last - domain` as the next search length |
-//! | `lib/cookie.c:170` | `len -= (++first - domain)` |
-//! | `lib/vtls/hostcheck.c:102` | compares it with the forward result |
-//!
-//! So no caller wants a sub-slice, and none is offered. A second entry point
-//! returning `&haystack[index..]` would be surface with no call site. The one
-//! shape that looks as though it needs one turns out not to:
-//! `lib/cookie.c:170` searches the PREFIX ending at the previous hit, which
-//! is `memrchr(b'.', &domain[..last])` -- the caller slices its own input
-//! going in, not this module's answer coming back.
-//!
-//! # Why `memchr::memrchr` rather than a scan written here
-//!
-//! A correctness-and-safety decision, and it must not be mistaken for a
-//! performance one: performance is an explicit non-goal of this work, and no
-//! choice in this file is justified on speed grounds. What the crate buys is
-//! that the byte scan exists once, in a dependency whose scanning internals
-//! are audited and carry their own test suite, instead of a second time
-//! here where it would have to be re-reviewed. Its signature is already
-//! exactly the one this module needs, and it documents the guarantee that a
-//! returned index is less than `haystack.len()`, so no bound has to be
-//! re-derived at any call site.
-//!
-//! The dependency is not a new one. `curl-rs-lib/Cargo.toml` already
-//! declares `memchr`, and the comment beside that declaration names
-//! `lib/curl_memrchr.c` as the reason it is there. This module is its first
-//! consumer, and nothing is added to any manifest.
-//!
-//! # The portability guard has no successor
-//!
-//! `memrchr` is a GNU extension rather than a C or POSIX function, so curl
-//! probes for it -- twice, once per build system: `check_symbol_exists(
-//! "memrchr" "string.h" HAVE_MEMRCHR)` at `CMakeLists.txt:1591`, and the
-//! link, macro, prototype and compile probes at
-//! `m4/curl-functions.m4:3121-3200`. Where a probe succeeds the whole C file
-//! compiles to nothing and `lib/curl_memrchr.h:36` redirects the name to the
-//! C library; where it fails, `Curl_memrchr` is the live implementation. That
-//! split is real on the four mandated targets rather than hypothetical:
-//! glibc has the function, so both Linux targets take the library path,
-//! while both Apple targets take curl's own.
-//!
-//! Here there is one implementation on all four, unconditionally. This file
-//! carries no `#[cfg(...)]` and no Cargo feature gates it, because a
-//! portability probe answers "does this platform have it" and the answer in
-//! a Cargo build is "the dependency graph does" -- a fact about the build
-//! rather than about the host.
-//!
-//! # What the migration removes, precisely
-//!
-//! The C walks a raw pointer down from `s + n - 1` and stops on `p >= q`. On
-//! the final miss `p` is decremented one step below `s`, and merely forming
-//! that pointer is undefined behaviour in C even though nothing is ever read
-//! through it: the comparison meant to stop the loop is evaluated only after
-//! the invalid pointer already exists. Real compilers do the expected thing
-//! on a flat address space, which is why the code has worked for years, but
-//! it is precisely the class of construct this migration eliminates by
-//! construction rather than by review -- an index cannot be walked below
-//! zero unless the check is written, and the reference walk in this file's
-//! test module carries that check on the line where the C has nothing.
-//!
 //! # Visibility and layering
 //!
 //! `pub(crate)`. Neither `memrchr` nor `Curl_memrchr` appears in
 //! `lib/libcurl.def`, so no exported symbol is backed from here, nothing in
 //! `curl-rs-ffi` reaches it, and the crate root adds no re-export for it.
-//! Internals stay internal; the `tests/unit` coverage that would have called
-//! it through a debug static library in C lives in the test module below
-//! instead.
 //!
 //! This file names no sibling module. `super` records the layering rule for
 //! the whole directory -- `util` may depend on nothing inside this crate
@@ -174,22 +58,6 @@
 //! answer for "not found" is [`None`] rather than an error.
 
 /// Returns the index of the last occurrence of `needle` in `haystack`.
-///
-/// Supersedes `Curl_memrchr` (`lib/curl_memrchr.c:37-52`). Where the C
-/// returns an interior pointer or `NULL`, this returns `Some(index)` or
-/// [`None`]; the index is zero-based and, by the dependency's own documented
-/// guarantee, always less than `haystack.len()`.
-///
-/// The C signature's `n` parameter has no counterpart. A slice carries its
-/// own length, so the `(pointer, length)` pair that C passes separately
-/// cannot disagree here, and the family of defects that follows from a
-/// mismatched length simply has nowhere to live. An empty slice is the
-/// `n == 0` case: it yields [`None`] without reading anything, reproducing
-/// the C's `if(n > 0)` guard.
-///
-/// Searching a prefix -- the shape `lib/cookie.c:170` needs, where the bound
-/// is the offset of a previous hit -- is a slice at the call site:
-/// `memrchr(b'.', &domain[..last])`.
 #[allow(dead_code)]
 pub(crate) fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     // Fully qualified rather than imported. `use memchr::memrchr;` would
@@ -205,17 +73,6 @@ mod tests {
 
     /// A transliteration of `Curl_memrchr` (`lib/curl_memrchr.c:37-52`) that
     /// walks the way the C walks, used as the differential oracle below.
-    ///
-    /// Written as an index walk rather than as an iterator so that it stays a
-    /// line-for-line reading of the original: the point of an oracle is that
-    /// a reviewer can check it against the C, not that it is idiomatic.
-    ///
-    /// One line here is NOT in the C, and it is the whole reason this
-    /// function is worth reading. The C's loop condition is `while(p >= q)`,
-    /// so on the final miss it decrements `p` below the start of the object
-    /// and only then evaluates the comparison -- by which point the invalid
-    /// pointer has already been formed. An index cannot be walked below zero
-    /// unless the check is written, so here it is written.
     fn walk_backwards(needle: u8, haystack: &[u8]) -> Option<usize> {
         // `if(n > 0)`.
         if haystack.is_empty() {
@@ -326,11 +183,6 @@ mod tests {
     /// Differential against `walk_backwards` over every string of length 0 to
     /// 4 inclusive drawn from a three-symbol alphabet, for four needles: 121
     /// haystacks and 484 comparisons.
-    ///
-    /// The alphabet includes a NUL and the needle set includes a byte that
-    /// never occurs, so both the found and the absent paths are exercised at
-    /// every length -- including length 1, where the C's decrement steps off
-    /// the front of the object on the very first miss.
     #[test]
     fn agrees_with_the_c_walk_on_every_short_input() {
         const ALPHABET: [u8; 3] = [b'a', b'b', 0x00];

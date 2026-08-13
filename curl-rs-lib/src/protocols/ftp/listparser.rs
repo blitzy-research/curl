@@ -28,8 +28,7 @@
 //! and `lib/fileinfo.c:30-41` with `lib/fileinfo.h:31-35`. The data model it
 //! fills is declared publicly at `include/curl/curl.h:292-358`: the nine
 //! `curlfiletype` values, the eight `CURLFINFOFLAG_*` bits, `struct
-//! curl_fileinfo` and the five chunk-callback result codes. AAP 0.4.1 maps
-//! all four C files onto this one Rust file.
+//! curl_fileinfo` and the five chunk-callback result codes.
 //!
 //! # What lives here and what does not
 //!
@@ -54,72 +53,6 @@
 //! placeholder fields in a crate-private Rust type would preserve the C's
 //! padding and nothing else.
 //!
-//! # The parse is incremental because the C's is
-//!
-//! `Curl_ftp_parselist` (`lib/ftplistparser.c:1013-1089`) is installed as the
-//! transfer's write callback for the duration of `LIST`, so it is handed
-//! whatever slice of the response the socket produced. Every byte is pushed
-//! through a finite-state machine exactly once, and all of the parse state --
-//! the detected server format, the main and sub state, the accumulated line,
-//! the field offsets into it, and any partially built record -- has to
-//! survive between calls. [`ParselistData::push`] therefore accepts an
-//! arbitrary chunk, including one byte at a time, and produces the same
-//! result either way.
-//!
-//! Two things follow that a from-scratch parser would get wrong. Splitting
-//! the response on newlines and then splitting each line on whitespace loses
-//! the chunk state, and it also loses the historical edge behaviour that the
-//! byte-by-byte machine encodes -- which substates tolerate a stray
-//! character, which reset a field, and exactly where a carriage return is
-//! removed. The C's structure is preserved for that reason, function for
-//! function, and not out of nostalgia.
-//!
-//! # Field offsets, and the terminators that go with them
-//!
-//! The C accumulates each listing record into one `dynbuf` and remembers six
-//! offsets into it (`lib/ftplistparser.c:165-172`). As each field ends it
-//! writes a zero byte over the delimiter, so `str + offset` is a C string
-//! (`ftp_pl_insert_finfo`, `:307-318`). This module keeps both halves of that
-//! design: the same six offsets, and the same zero bytes written into the
-//! same positions of the record buffer. That is what lets six plain indices
-//! address six variable-length fields without a second table of lengths, and
-//! it reproduces the C's termination byte for byte -- including the cases
-//! where the C writes over a carriage return rather than over a space.
-//!
-//! The offsets are read only when a record completes, and only then is any
-//! owned string materialized. An offset of zero means "this field was never
-//! assigned", which is how `strings.perm`, `strings.user`, `strings.group`
-//! and `strings.target` become absent; `filename` and `strings.time` are
-//! assigned unconditionally by the C and are therefore always present.
-//!
-//! # Two recorded divergences from the C
-//!
-//! Both are stated here rather than buried, because each is a place where a
-//! reader diffing against `lib/ftplistparser.c` will find a difference.
-//!
-//! **1. A valid `total` line is accepted.** `parse_unix` at `:838-844` sets
-//! the main state to `PL_UNIX_FILETYPE` after a well-formed `total 12` line
-//! and then falls through to the file-type arm, which is handed the line
-//! feed that ended the line and rejects it -- `unix_filetype` (`:353-384`)
-//! admits only the eight type characters. The shape predates the split into
-//! sub-functions (commit `3b4e84c44f`) and is an upstream defect, not a rule:
-//! no fixture in the corpus exercises it, because the listing generator at
-//! `tests/directories.pm:183-201` emits no `total` line. Here the line feed
-//! that completes a valid `total` line is consumed, the record buffer is
-//! reset and the next byte starts a file entry -- while a NON-`t` first byte
-//! is still reprocessed through the file-type arm without being lost, which
-//! is the fall-through the C actually intends.
-//!
-//! **2. Listing bytes that are not valid text are replaced, not preserved.**
-//! [`FileInfo`] holds `String` and `Option<String>`, so materializing a field
-//! goes through a lossy conversion and a byte sequence that is not valid text
-//! becomes the replacement character. The C hands out the raw bytes. Every
-//! fixture in the corpus is ASCII, so nothing measured changes, but a server
-//! that lists names in a legacy single-byte encoding would see them altered.
-//! The owned-text model is what AAP 0.4.1 specifies for this file, and the
-//! conversion happens in exactly one helper so that a future change of mind
-//! has one place to edit.
-//!
 //! # Conventions
 //!
 //! Memory-safe Rust throughout: no raw pointers, no self-referential
@@ -129,14 +62,6 @@
 //! `Curl_fileinfo_cleanup` become ordinary construction and drop -- there is
 //! no zeroed allocation to imitate and no memory to wipe.
 //!
-//! The C function names are kept, so that a grep against
-//! `lib/ftplistparser.c` still lands: `unix_filetype`,
-//! `ftp_pl_get_permission`, `parse_unix_totalsize`, `parse_unix_permission`,
-//! `parse_unix_hlinks`, `parse_unix_user`, `parse_unix_group`,
-//! `parse_unix_size`, `parse_unix_time`, `parse_unix_filename`,
-//! `parse_unix_symlink`, `parse_unix`, `parse_winnt` and
-//! `ftp_pl_insert_finfo`.
-//!
 //! The whole of the C is wrapped in `#ifndef CURL_DISABLE_FTP`
 //! (`lib/ftplistparser.c:26`), so the whole of this module carries
 //! `#[cfg(feature = "ftp")]`, written as an inner attribute below for the
@@ -144,12 +69,6 @@
 //! with the code it governs, and the parent then declares the module
 //! unconditionally. There is no TLS feature in this workspace and this parser
 //! has no TLS responsibility, so no other gate appears.
-//!
-//! Edition 2021, minimum supported Rust version 1.75, and nothing here needs
-//! anything newer. No dependency is added: the record buffer is
-//! [`crate::util::dynbuf`], the comparator is [`crate::util::fnmatch`], the
-//! number and blank handling is [`crate::util::strparse`], and the error type
-//! is [`crate::error`].
 
 #![cfg(feature = "ftp")]
 
@@ -162,50 +81,16 @@ use crate::util::strparse::{
     is_alnum, is_blank, is_digit, str_number, str_numblanks, str_passblanks,
 };
 
-// ---------------------------------------------------------------------------
 // Pinned numeric contracts
-// ---------------------------------------------------------------------------
 
 /// The ceiling on one accumulated listing record, in bytes.
-///
-/// `MAX_FTPLIST_BUFFER` (`lib/ftplistparser.c:351`), whose own comment reads
-/// "arbitrarily set". It is the `toobig` argument the C hands
-/// `curlx_dyn_init` at `:1050`, and it is a hard bound rather than a hint: a
-/// record that reaches it makes the append fail, which the driver loop turns
-/// into `CURLE_OUT_OF_MEMORY` at `:1055-1058`.
-///
-/// The number of bytes actually admitted is one less than this, because
-/// [`DynBuf`] measures a candidate append as `len + idx + 1` -- the C carries
-/// the same `+ 1` for the terminator it stores (`lib/curlx/dynbuf.c:72`), so
-/// both implementations accept 9,999 bytes and refuse the 10,000th.
 pub(crate) const MAX_FTPLIST_BUFFER: usize = 10000;
 
 /// The bit `ftp_pl_get_permission` sets when a permission character is
 /// neither the one its position expects nor `-`.
-///
-/// `FTP_LP_MALFORMATED_PERM` (`lib/ftplistparser.c:229`). It is not a
-/// permission bit: it sits far above the twelve real ones so that a single
-/// test on the result detects a malformed field, which
-/// `parse_unix_permission` turns into `CURLE_FTP_BAD_FILE_LIST` at
-/// `:449-450`. The spelling of the C macro is preserved, typo included, so a
-/// grep against the original lands.
 const FTP_LP_MALFORMATED_PERM: u32 = 0x0100_0000;
 
 /// The nine file types a listing can report.
-///
-/// `curlfiletype` (`include/curl/curl.h:292-304`). Every discriminant is
-/// written out and none is left to Rust's implicit "previous plus one", for
-/// the reason AAP 0.6.1 records for `CURLcode`: a caller compiled against
-/// the C tree holds the numbers, not the names, and this value reaches such a
-/// caller through `struct curl_fileinfo`. `#[repr(i32)]` because a C
-/// enumeration is an `int`.
-///
-/// [`FileType::File`] is the default because `Curl_fileinfo_alloc`
-/// (`lib/fileinfo.c:30-33`) allocates with `calloc`, so an unparsed record
-/// starts at zero. Both WinNT branches then assign a type explicitly
-/// (`lib/ftplistparser.c:944,953`), and the Unix parser assigns one from the
-/// first character of every line, so the default is observable only for a
-/// record that never reached its type field.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum FileType {
@@ -270,15 +155,6 @@ impl FileType {
 }
 
 /// The result of a `CURLOPT_CHUNK_BGN_FUNCTION` callback.
-///
-/// The three macros at `include/curl/curl.h:344-347`. The callback itself
-/// returns a C `long` (`:352-354`), so the discriminants are pinned in that
-/// width; a caller compiled against the C tree returns these exact integers.
-///
-/// An enumeration rather than three loose constants because the driver has to
-/// classify whatever integer arrives, and [`ChunkBgn::from_i64`] is where
-/// that classification lives instead of in a `match` the next caller would
-/// write again.
 // Unreferenced until the wildcard driver in `ftp/mod.rs` lands and classifies
 // a callback's return value. The allowance is per item, as this crate's
 // policy requires, and covers the variants along with the type.
@@ -364,14 +240,6 @@ impl ChunkEnd {
 }
 
 /// The eight states of a wildcard download.
-///
-/// `wildcard_states` (`lib/ftplistparser.h:42-54`). `#[repr(u8)]` because the
-/// C stores it in `unsigned char state` (`:65`) rather than in the
-/// enumeration's own width, and the two explicit values the C writes -- 0 and
-/// 1 -- make the rest positional, so all eight are written out here.
-///
-/// The comments the C attaches to five of them are reproduced, because they
-/// are the only description of the state machine's intent in the tree.
 #[allow(dead_code)]
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -452,32 +320,15 @@ impl OsType {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The file-information model
-// ---------------------------------------------------------------------------
 
 /// The textual fields of a listing entry.
-///
-/// The anonymous inner struct of `struct curl_fileinfo`
-/// (`include/curl/curl.h:326-333`), whose own comment reads "If some of these
-/// fields is not NULL, it is a pointer to b_data". Every member there is a
-/// `char *` into the record buffer; here each is owned, so the buffer can be
-/// dropped as soon as the record completes.
-///
-/// The optionality is not uniform, and it is not a style choice:
-/// `ftp_pl_insert_finfo` (`lib/ftplistparser.c:309-318`) assigns `time`
-/// unconditionally and guards the other four on a non-zero offset. That
-/// asymmetry is reproduced exactly, so a consumer sees a value present in
-/// precisely the cases the C makes it non-null.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FileInfoStrings {
     /// `strings.time`. Always present: the C assigns `str + offsets.time`
     /// with no guard (`lib/ftplistparser.c:316`), and a WinNT listing leaves
     /// that offset at zero on purpose, which makes the whole date-and-time
     /// prefix of the line the value.
-    ///
-    /// This is the ONLY time information a listing yields. The numeric
-    /// [`FileInfo::time`] beside it stays zero; see its own note.
     pub(crate) time: String,
     /// `strings.perm`. The nine permission characters, exactly as the server
     /// spelled them -- `rwxr-xr-x`. Absent for a WinNT listing, which has no
@@ -502,21 +353,6 @@ pub(crate) struct FileInfoStrings {
 /// division of labour: the C-layout mirror of that struct, including the three
 /// legacy private members that must never be interfered with, belongs to
 /// `curl-rs-ffi`.
-///
-/// # Which flags a parse actually sets
-///
-/// Eight bits are defined and the parser sets three. Measured at
-/// `lib/ftplistparser.c:452` ([`FileInfo::KNOWN_PERM`]), `:490`
-/// ([`FileInfo::KNOWN_HLINKCOUNT`]), and `:590` with `:956`
-/// ([`FileInfo::KNOWN_SIZE`], once from the Unix size column and once from
-/// the WinNT size-or-directory column). Nothing sets
-/// [`FileInfo::KNOWN_FILENAME`], [`FileInfo::KNOWN_FILETYPE`],
-/// [`FileInfo::KNOWN_TIME`], [`FileInfo::KNOWN_UID`] or
-/// [`FileInfo::KNOWN_GID`], and this module does not start: a filename and a
-/// file type are present on every entry the parser emits, so a bit claiming
-/// they are "known" would carry no information the consumer does not already
-/// have, and the C's callers -- `tests/libtest/lib576.c:41-52` among them --
-/// are written against the three that are set.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FileInfo {
     /// `filename`. Always present.
@@ -524,14 +360,6 @@ pub(crate) struct FileInfo {
     /// `filetype`.
     pub(crate) filetype: FileType,
     /// `time`.
-    ///
-    /// Always zero. The public header annotates the member exactly that way
-    /// -- `time_t time; /* always zero! */` at
-    /// `include/curl/curl.h:319` -- and no path in the C parser writes it.
-    /// The listing's own date and time is text and lives in
-    /// [`FileInfoStrings::time`]; converting it would need a year the
-    /// short Unix format omits and a time zone no listing states, so curl
-    /// does not try and neither does this.
     pub(crate) time: i64,
     /// `perm`. The twelve permission bits
     /// [`ftp_pl_get_permission`](fn@ftp_pl_get_permission) computes, valid
@@ -557,13 +385,6 @@ pub(crate) struct FileInfo {
 }
 
 // The eight `CURLFINFOFLAG_*` bits, at `include/curl/curl.h:306-313`.
-//
-// Associated constants rather than free ones so that a reader writes
-// `FileInfo::KNOWN_PERM` and gets the type along with the value, and so that
-// one allowance covers the five the parser never sets. Those five are part of
-// the public contract whether or not this parser reaches them, which is why
-// they are declared rather than omitted -- a consumer testing for
-// `CURLFINFOFLAG_KNOWN_TIME` must be able to name it.
 #[allow(dead_code)]
 impl FileInfo {
     /// `CURLFINFOFLAG_KNOWN_FILENAME` = `1 << 0`.
@@ -606,21 +427,6 @@ impl FileInfo {
 }
 
 /// The numeric half of a record, while the record is still being parsed.
-///
-/// `struct curl_fileinfo`'s scalar members, and nothing else. The textual
-/// members cannot be filled yet, because each one is a span of the record
-/// buffer whose end is not known until the following delimiter arrives; they
-/// are materialized in one step when the record completes.
-///
-/// The C has no counterpart type -- it writes straight into
-/// `parser->file_data->info`, the same struct it later hands the caller. The
-/// split exists here because that struct's textual members are owned
-/// [`String`]s: keeping the partial record's scalars apart from the finished
-/// entry means there is never a moment when a [`FileInfo`] holds a
-/// half-assigned string.
-///
-/// Zero throughout on construction, matching the `calloc` in
-/// `Curl_fileinfo_alloc` (`lib/fileinfo.c:30-33`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FileInfoAccumulator {
     /// `info.filetype`.
@@ -644,13 +450,6 @@ struct FileInfoAccumulator {
 }
 
 /// A listing record under construction.
-///
-/// `struct fileinfo` (`lib/fileinfo.h:31-35`) without its intrusive list
-/// node: the accumulated scalars and the byte buffer the record's text lives
-/// in. The C's `struct Curl_llist_node list` member exists so that the same
-/// allocation can be threaded onto `wc->filelist` without a second one; a
-/// [`VecDeque`] owns its elements, so there is nothing to thread and the
-/// member has no successor.
 ///
 /// `Curl_fileinfo_alloc` and `Curl_fileinfo_cleanup` (`lib/fileinfo.c:30-42`)
 /// become [`Default`] and the ordinary drop glue. There is no zeroed
@@ -678,20 +477,6 @@ impl Default for InProgressFile {
 
 impl InProgressFile {
     /// Writes a zero byte at `index`, if the record holds that many bytes.
-    ///
-    /// The C's field terminators: `mem[10] = 0` at
-    /// `lib/ftplistparser.c:447`, `mem[parser->item_offset +
-    /// parser->item_length - 1] = 0` at `:487`, `:523`, `:552`, `:587`,
-    /// `:664`, `:705`, `:713`, `:802`, `:813` and `:920`, `mem[... - 4] = 0`
-    /// at `:776`, and `mem[len - 1] = 0` at `:979` and `:983`.
-    ///
-    /// Every one of those writes is in bounds at the moment the C performs
-    /// it, and the arithmetic that produces each index is reproduced
-    /// unchanged, so the guard here never fires on a well-formed parse. It is
-    /// what makes the write total rather than conditional on that reasoning
-    /// holding: a stray index skips the write instead of reaching past the
-    /// buffer, and the field it would have terminated then simply runs to the
-    /// next zero byte or to the end of the record.
     fn poke_nul(&mut self, index: usize) {
         if let Some(slot) = self.buf.as_mut_slice().get_mut(index) {
             *slot = 0;
@@ -699,21 +484,9 @@ impl InProgressFile {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The Unix state machine's states
-// ---------------------------------------------------------------------------
 
 /// The ten fields a Unix listing line is read in.
-///
-/// `pl_unix_mainstate` (`lib/ftplistparser.c:52-63`), in the C's declaration
-/// order. Only `PL_UNIX_TOTALSIZE = 0` is written explicitly there and the
-/// rest are positional; all ten are written out here for the reason AAP 0.6.1
-/// gives, and because the order IS the grammar -- the state after the size
-/// column is the time column and nothing else.
-///
-/// [`UnixMain::TotalSize`] is the default because the C's `calloc` starts the
-/// parser there, which is what lets a leading `total 12` line be recognised
-/// before any file entry.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum UnixMain {
@@ -799,12 +572,6 @@ enum SizeSub {
 }
 
 /// `time` -- `lib/ftplistparser.c:91-98`.
-///
-/// Six substates for three parts, alternating between the padding before a
-/// part and the part itself. The three parts are month, day and either a time
-/// of day or a year, which is how one machine reads both formats 1 and 2 of
-/// the C's header comment (`lib/ftplistparser.c:31-34`) without deciding in
-/// advance which it is looking at.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum TimeSub {
@@ -838,12 +605,6 @@ enum FilenameSub {
 }
 
 /// `symlink` -- `lib/ftplistparser.c:106-115`.
-///
-/// Eight substates, four of which spell out the exact four bytes of `" -> "`
-/// one at a time. Any of those four positions receiving something else sends
-/// the machine back to [`SymlinkSub::Name`], which is what lets a name
-/// containing a space, a hyphen or a greater-than sign parse as a name rather
-/// than as the start of a target.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum SymlinkSub {
@@ -868,19 +629,6 @@ enum SymlinkSub {
 }
 
 /// The Unix substate, tagged with the field it belongs to.
-///
-/// `pl_unix_substate` (`lib/ftplistparser.c:65-116`) is a `union` of eight
-/// anonymous enumerations. A `union` makes every substate the same storage,
-/// so reading the member the current main state does not imply is undefined
-/// behaviour in C and the invariant that keeps the two halves in step is
-/// maintained entirely by hand.
-///
-/// A tagged enumeration removes the hazard rather than documenting it: the
-/// substate carries which field it belongs to, so a mismatch is representable
-/// and answerable instead of undefined. Every transition in this module
-/// assigns both halves together through
-/// [`ParselistData::set_unix`](ParselistData::set_unix), which is what keeps
-/// the pair consistent by construction.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum UnixSub {
     /// The `total <n>` line's substate.
@@ -912,15 +660,6 @@ impl Default for UnixSub {
 // The eight extractors below each answer "what is the substate of MY field",
 // and each maps a substate belonging to another field onto its own field's
 // INITIAL value.
-//
-// That fallback is unreachable on any parse this module performs, because
-// every transition sets the main state and the substate together. It is
-// written rather than left out because the alternative shapes are all worse:
-// returning an `Option` would put a decision at eleven call sites that have no
-// second answer to give, and reaching for a panic would convert a state this
-// module makes impossible into a crash in a network-facing parser. Mapping to
-// the initial value is what the C effectively does when its union is freshly
-// zeroed, so the fallback is also the closest thing to the original.
 impl UnixSub {
     /// The `total <n>` substate.
     const fn total_dirsize(self) -> TotalDirSizeSub {
@@ -987,9 +726,7 @@ impl UnixSub {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The WinNT state machine's states
-// ---------------------------------------------------------------------------
 
 /// The four fields a WinNT listing line is read in.
 ///
@@ -1097,17 +834,6 @@ impl WinNtSub {
 }
 
 /// The parse position, tagged with the listing format it belongs to.
-///
-/// The outer `union` at `lib/ftplistparser.c:149-159`, which pairs a main
-/// state with a substate for each of the two formats. Tagging it means the
-/// byte dispatcher matches once and cannot reach a Unix arm while parsing a
-/// WinNT listing.
-///
-/// This tag and [`ParselistData::os_type`] are set together, at the single
-/// point where the format is detected. They are both kept because they answer
-/// different questions: the tag says which machine is running, and
-/// [`OsType`] additionally has a value for "no listing byte has arrived yet",
-/// which the C needs at `:1034` and which a two-variant tag cannot express.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum ParseState {
     /// Parsing a Unix listing.
@@ -1139,28 +865,6 @@ impl Default for ParseState {
 }
 
 /// Where each of a record's six textual fields begins.
-///
-/// The anonymous struct at `lib/ftplistparser.c:165-172`, with exactly its six
-/// members and the C's `size_t` width. Each is an index into the record
-/// buffer, and each field runs from there to the zero byte the parse wrote at
-/// its end.
-///
-/// # Zero means absent, and the set is deliberately not cleared per record
-///
-/// An offset of zero is how `ftp_pl_insert_finfo` (`:310-318`) reports an
-/// absent field, which works because no field of a well-formed record can
-/// begin at index zero -- index zero holds the Unix type character, and a
-/// WinNT record assigns only `filename` and `time`.
-///
-/// The C never resets this struct between records: it lives on the parser,
-/// while the record buffer is replaced for every entry. That is observable. A
-/// symlink assigns `symlink_target`, and the entries that follow it in the
-/// same listing inherit the assignment, so each of them reports a target read
-/// at that stale index of its own buffer. The behaviour is reproduced --
-/// resetting the offsets would be a silent change to what a
-/// `CURLOPT_CHUNK_BGN_FUNCTION` callback receives -- with one difference
-/// forced by the language: a stale index beyond the shorter buffer is a read
-/// past the end in C, and here it yields an empty field instead.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Offsets {
     /// `offsets.filename`.
@@ -1177,9 +881,7 @@ struct Offsets {
     symlink_target: usize,
 }
 
-// ---------------------------------------------------------------------------
 // The comparator, and the callback guard around it
-// ---------------------------------------------------------------------------
 
 /// A filename comparator, and the callback bookkeeping that goes with it.
 ///
@@ -1202,16 +904,6 @@ struct Offsets {
 /// may not be named from here. [`DefaultMatcher`] is the
 /// `Curl_fnmatch` half, and [`ParselistData::push`] uses it, so a caller with
 /// no user callback configured needs no implementation of its own.
-///
-/// # Zero means match
-///
-/// The return value is the integer contract of `curl_fnmatch_callback`
-/// (`include/curl/curl.h:368-377`): `CURL_FNMATCHFUNC_MATCH` 0,
-/// `CURL_FNMATCHFUNC_NOMATCH` 1 and `CURL_FNMATCHFUNC_FAIL` 2. The C admits a
-/// file on zero and excludes it on anything else, which means `NOMATCH` and
-/// `FAIL` are indistinguishable at this one call site. They stay distinct in
-/// the type, because the callback contract distinguishes them and a user
-/// implementation is entitled to return either.
 pub(crate) trait FilenameMatcher {
     /// Compares `filename` against `pattern`, returning zero for a match.
     ///
@@ -1229,11 +921,6 @@ pub(crate) trait FilenameMatcher {
     /// it set would disable that protection for the rest of the transfer.
     /// [`InCallbackGuard`] is what makes the pairing structural rather than a
     /// rule to remember.
-    ///
-    /// The default implementation does nothing, because
-    /// [`DefaultMatcher`] is not a callback: `Curl_fnmatch` is
-    /// libcurl's own code and entering it is not entering user code. An
-    /// adapter over a user-supplied comparator overrides this.
     fn set_in_callback(&mut self, inside: bool) {
         let _ = inside;
     }
@@ -1290,17 +977,9 @@ impl<M: FilenameMatcher + ?Sized> Drop for InCallbackGuard<'_, M> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Byte helpers
-// ---------------------------------------------------------------------------
 
 /// The byte at `index`, or the zero the C would have read past a terminator.
-///
-/// Every index this module computes is derived from the C's own arithmetic and
-/// is in bounds where the C dereferences it. This helper is what makes the
-/// read total anyway, and it returns the same value a C read would find at the
-/// end of a terminated buffer, so a caller's comparison against a character
-/// behaves identically.
 const fn byte_at(bytes: &[u8], index: usize) -> u8 {
     if index < bytes.len() {
         bytes[index]
@@ -1310,27 +989,11 @@ const fn byte_at(bytes: &[u8], index: usize) -> u8 {
 }
 
 /// `strchr(set, c) != NULL`.
-///
-/// Three of the C's validations are spelled as `strchr` over a literal:
-/// `"rwx-tTsS"` at `lib/ftplistparser.c:439`, `"0123456789-"` at `:895` and
-/// `"APM0123456789:"` at `:925`. All three are reproduced through this helper
-/// rather than through `contains`, for one measurable reason: `strchr` finds
-/// the argument's own terminator, so `strchr(set, 0)` returns a non-null
-/// pointer and a zero byte therefore PASSES every one of those three
-/// validations in C. `set.contains(&0)` would refuse it. The difference shows
-/// only on a listing carrying a zero byte, and reproducing it costs one
-/// comparison.
 fn set_contains(set: &[u8], c: u8) -> bool {
     c == 0 || set.contains(&c)
 }
 
 /// The zero-terminated field beginning at `offset`.
-///
-/// The C's `str + offset`, read as a C string: the bytes from `offset` up to
-/// the first zero, or to the end of the record when the parse wrote no
-/// terminator after it. An `offset` past the end yields an empty field, which
-/// is where this differs from the C -- there the same index is a read past the
-/// buffer. See [`Offsets`] for the one case that reaches it.
 fn cstr_at(bytes: &[u8], offset: usize) -> &[u8] {
     let tail = match bytes.get(offset..) {
         Some(tail) => tail,
@@ -1365,12 +1028,6 @@ fn owned_text(bytes: &[u8]) -> String {
 }
 
 /// Whether `haystack` contains `needle`.
-///
-/// The `strstr(finfo->strings.target, " -> ")` of
-/// `lib/ftplistparser.c:331`, which is the test that discards a symlink whose
-/// target itself looks like a symlink line. Written as a window scan because
-/// the byte slice has no `strstr`, and kept as a named helper so the call site
-/// reads as the C does.
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
@@ -1383,16 +1040,9 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-// ---------------------------------------------------------------------------
 // The two field decoders
-// ---------------------------------------------------------------------------
 
 /// The file type a Unix listing's leading character names.
-///
-/// `unix_filetype` (`lib/ftplistparser.c:353-384`). Eight characters are
-/// accepted and every other byte is a malformed listing -- including `-` in
-/// any position but the first, which cannot reach here, and including a
-/// letter that names a type on some other system.
 ///
 /// # Errors
 ///
@@ -1427,23 +1077,6 @@ fn unix_filetype(c: u8) -> CurlResult<FileType> {
 /// bit  1<<8 1<<7 1<<6    1<<5 1<<4 1<<3    1<<2 1<<1 1<<0
 /// extra           1<<11                    1<<10          1<<9
 /// ```
-///
-/// The three extra positions distinguish an upper-case letter from a lower-case
-/// one, and the distinction is not cosmetic: `s` means the special bit is set
-/// AND the execute bit is set, while `S` means the special bit is set and the
-/// execute bit is NOT. The same holds for `t` against `T` in the last
-/// position. Everything else -- `1<<11` for set-user-id, `1<<10` for
-/// set-group-id, `1<<9` for sticky -- follows from that.
-///
-/// Any position holding neither the character it expects nor `-` adds
-/// [`FTP_LP_MALFORMATED_PERM`] and the rest of the field is still examined,
-/// so one call reports every malformed position at once. The caller turns the
-/// marker into `CURLE_FTP_BAD_FILE_LIST`.
-///
-/// A short slice reads as zeros through [`byte_at`], which no position
-/// expects, so it too comes back marked. The C reads past its terminator
-/// there; a well-formed call site cannot produce it, and this one cannot
-/// misbehave if a future one does.
 fn ftp_pl_get_permission(text: &[u8]) -> u32 {
     let at = |index: usize| byte_at(text, index);
     let mut permissions: u32 = 0;
@@ -1520,21 +1153,13 @@ fn ftp_pl_get_permission(text: &[u8]) -> u32 {
 /// A `CURLE_FTP_BAD_FILE_LIST` carrying the line that produced it.
 ///
 /// Every rejection the C spells as `return CURLE_FTP_BAD_FILE_LIST` becomes
-/// one of these. The code is frozen by AAP 0.8.1 -- an unparsable listing is
-/// this error and not a more descriptive one -- so the context string is
-/// diagnostic only and never reaches a caller comparing codes.
+/// one of these.
 fn bad_file_list(context: &'static str) -> Error {
     Error::with_context(CURLcode::FtpBadFileList, context)
 }
 
 /// The slice beginning at `offset`, or an empty slice when `offset` is past
 /// the end.
-///
-/// The C's `mem + parser->item_offset` handed to a number parser, which reads
-/// forwards until a non-digit. Unlike [`cstr_at`] this keeps everything after
-/// the field's terminator, because a caller needs to see where the parse
-/// stopped -- `parse_unix_size` tests exactly that at
-/// `lib/ftplistparser.c:589`.
 fn tail_at(bytes: &[u8], offset: usize) -> &[u8] {
     match bytes.get(offset..) {
         Some(tail) => tail,
@@ -1542,9 +1167,7 @@ fn tail_at(bytes: &[u8], offset: usize) -> &[u8] {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The parser
-// ---------------------------------------------------------------------------
 
 /// What the byte machine wants done with the record it was given.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1556,13 +1179,6 @@ enum Step {
 }
 
 /// Whether the `total <n>` arm consumed the byte or handed it on.
-///
-/// The C expresses this by testing whether the arm changed the main state and
-/// then falling through a `switch` (`lib/ftplistparser.c:842-844`). A returned
-/// value says the same thing without depending on statement order, and it
-/// separates the two ways the arm can leave the state at `PL_UNIX_FILETYPE`
-/// -- which is the difference divergence 1 of the module documentation turns
-/// on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TotalSize {
     /// The byte belonged to the `total <n>` line and is spent.
@@ -1575,29 +1191,18 @@ enum TotalSize {
 
 /// The FTP listing parser.
 ///
-/// `struct ftp_parselist_data` (`lib/ftplistparser.c:142-173`), whose C
-/// members are all present: the detected format, the tagged main-and-substate
-/// pair, the latched error, the record under construction, the current item's
-/// length and offset, and the six field offsets.
-///
 /// Two things are held here that the C keeps on `struct WildcardData`
 /// instead:
 ///
 /// * The pattern. The C reads `wc->pattern` at the moment it compares
-///   (`:327`), reaching across from the parser to the wildcard state. A copy
-///   is taken at construction here so that [`ParselistData::push`] has the
-///   signature AAP 0.4.1 specifies -- one slice of listing bytes and nothing
-///   else -- rather than requiring the caller to thread the pattern through
-///   every call. [`WildcardData::pattern`] remains the configured value and
-///   outlives the parser.
+///   (`:327`), reaching across from the parser to the wildcard state.
+///   [`WildcardData::pattern`] remains the configured value and outlives the
+///   parser.
 /// * The accepted entries. The C appends into `wc->filelist` (`:341`), which
 ///   would be a borrow of the very structure that owns the parser. Entries
 ///   accumulate here in arrival order instead and the driver moves them across
 ///   with [`ParselistData::take_accepted`], which keeps the ownership acyclic
 ///   without changing the order or the contents.
-///
-/// `Curl_ftp_parselist_data_alloc` and `Curl_ftp_parselist_data_free`
-/// (`:210-222`) become [`ParselistData::new`] and drop glue.
 #[derive(Debug)]
 pub(crate) struct ParselistData {
     /// `os_type`.
@@ -1621,23 +1226,6 @@ pub(crate) struct ParselistData {
 }
 
 // THE ALLOWANCE, AND WHEN IT COMES OFF.
-//
-// Nothing in this crate calls this parser yet. The one consumer AAP 0.4.1
-// gives it is the wildcard driver, which arrives with `ftp/mod.rs`, and until
-// then `push` is a live root reached from nowhere -- which makes every state,
-// every substate variant, every field decoder and every helper in this file
-// unreachable along with it, and a zero-warning build is a gate.
-//
-// The allowance therefore sits HERE, on the one implementation block that is
-// the entry point, and not on a module: `src/lib.rs`'s
-// `no_lint_level_for_dead_code_is_set_on_a_crate_or_module_root` gate forbids
-// the module form outright, because a module-wide allowance would go on hiding
-// the next unreferenced item somebody adds. Marking the entry point live is
-// enough for the whole graph below it, so this is the only one in the file
-// beyond the four on items that are part of the public contract without being
-// on any parse path.
-//
-// It comes off when the driver lands and calls `push`.
 #[allow(dead_code)]
 impl ParselistData {
     /// A parser for `pattern`.
@@ -1663,12 +1251,6 @@ impl ParselistData {
     /// Feeds listing bytes through the machine, comparing filenames with
     /// curl's own matcher.
     ///
-    /// The write-callback replacement: `Curl_ftp_parselist`
-    /// (`lib/ftplistparser.c:1013-1089`) with `data->set.fnmatch` unset, so
-    /// that `Curl_fnmatch` is the comparator (`:321-323`). `bytes` may be any
-    /// slice of the response, including one byte, and splitting a response
-    /// differently cannot change the outcome.
-    ///
     /// # Errors
     ///
     /// `CURLE_FTP_BAD_FILE_LIST` for a listing this machine cannot read, and
@@ -1681,28 +1263,6 @@ impl ParselistData {
     }
 
     /// [`ParselistData::push`] with a caller-supplied comparator.
-    ///
-    /// The `CURLOPT_FNMATCH_FUNCTION` half of `:321-323`. `matcher` is
-    /// `?Sized`, so a caller holding `&mut dyn FilenameMatcher` may pass it
-    /// directly; nothing here requires that shape.
-    ///
-    /// # A failure is permanent
-    ///
-    /// The C latches the code into `parser->error` and every later call
-    /// returns immediately from `:1024-1032`, whose comment spells out the
-    /// scenario: a first call succeeds, a second fails, and the third "is
-    /// skipped RIGHT HERE and the error is handled later in wc_statemach()".
-    /// This reproduces that exactly. Once a call has failed, the same error
-    /// comes back from every subsequent call, no byte is examined, no entry is
-    /// queued and no memory is touched. The record under construction is
-    /// released at the moment of the first failure, matching the C's `fail:`
-    /// path at `:1080-1088`, so no half-parsed entry survives.
-    ///
-    /// The C additionally reports success by returning the byte count it was
-    /// given -- even on failure, so that the transfer keeps feeding it until
-    /// the wildcard state machine notices `parser->error`. There is no count
-    /// to manufacture here: a successful call consumed the whole slice, and a
-    /// failure says so directly.
     ///
     /// # Errors
     ///
@@ -1797,13 +1357,6 @@ impl ParselistData {
 
     /// `parser->item_offset + parser->item_length - 1`: the index of the
     /// delimiter that has just ended a field.
-    ///
-    /// The C writes its terminator there at `lib/ftplistparser.c:487`, `:523`,
-    /// `:552`, `:587`, `:664`, `:705`, `:713`, `:802`, `:813` and `:920`, and
-    /// reads the field from `item_offset` up to it. Both saturating steps are
-    /// unreachable: `item_length` is at least one wherever this is called,
-    /// because a field is only ended by the delimiter that follows at least
-    /// one byte of content, and the sum is bounded by the record ceiling.
     const fn item_end(&self) -> usize {
         self.item_offset
             .saturating_add(self.item_length as usize)
@@ -1811,13 +1364,6 @@ impl ParselistData {
     }
 
     /// Records the error and releases the record under construction.
-    ///
-    /// `parser->error = result` at `lib/ftplistparser.c:1072` together with
-    /// the `fail:` path at `:1082-1086`. The record is already out of
-    /// [`ParselistData::file_data`] by the time this runs -- the caller took
-    /// it for the duration of the byte -- so dropping the caller's local IS
-    /// the release, and the assignment here only records that the slot is
-    /// empty.
     fn latch(&mut self, error: Error) -> Error {
         self.error = Some(error.code());
         self.file_data = None;
@@ -1864,8 +1410,8 @@ impl ParselistData {
 
         // `:1055-1058`. Every failure the buffer can report becomes
         // `CURLE_OUT_OF_MEMORY`, the ceiling included, because that is the
-        // single mapping the C performs and AAP 0.8.1 freezes it. The record
-        // is not put back, so it is dropped here.
+        // single mapping the C performs. The record is not put back, so it is
+        // dropped here.
         if infop.buf.addn(&[c]).is_err() {
             return Err(self.latch(Error::with_context(
                 CURLcode::OutOfMemory,
@@ -1898,16 +1444,6 @@ impl ParselistData {
     }
 
     /// A completed record: compare it, then queue or discard it.
-    ///
-    /// `ftp_pl_insert_finfo` (`lib/ftplistparser.c:296-349`). The C's return
-    /// type is `CURLcode` and its only value is `CURLE_OK`; there is nothing
-    /// to propagate, so this returns nothing.
-    ///
-    /// The record arrives by value. That is the whole of the C's `file_data =
-    /// NULL` at `:347` and its `Curl_fileinfo_cleanup` at `:344`: a queued
-    /// entry is built from the record and the record is dropped, and a
-    /// discarded one is dropped without being built. Either way the parser's
-    /// slot is already empty, so the next byte starts a fresh entry.
     fn insert_finfo<M>(&mut self, infop: InProgressFile, matcher: &mut M)
     where
         M: FilenameMatcher + ?Sized,
@@ -1968,9 +1504,7 @@ impl ParselistData {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The Unix machine
-// ---------------------------------------------------------------------------
 
 impl ParselistData {
     /// One byte of a Unix listing.
@@ -2031,21 +1565,6 @@ impl ParselistData {
     }
 
     /// The optional `total <n>` line that opens many Unix listings.
-    ///
-    /// `parse_unix_totalsize` (`lib/ftplistparser.c:386-431`).
-    ///
-    /// Only a leading `t` enters the line: any other first byte means there is
-    /// no `total` line, and that byte is the file type of the first entry and
-    /// must be reprocessed rather than dropped.
-    ///
-    /// On the line feed the accumulated text must begin exactly `total `,
-    /// followed by blanks, then digits, then nothing. `total ` with no digits
-    /// at all is accepted, because the C's `endptr` then sits on the
-    /// terminator and its `if(*endptr)` is false.
-    ///
-    /// A carriage return is removed rather than tolerated: the C decrements
-    /// both the item length and the buffer length (`:405-409`), so the line
-    /// the prefix test sees is the same whether the server sent LF or CRLF.
     ///
     /// # Errors
     ///
@@ -2133,10 +1652,6 @@ impl ParselistData {
                 // `:422-423`. The line is discarded and the record buffer
                 // starts again, so the first file entry begins at index zero
                 // exactly as it would have without a total line.
-                //
-                // Divergence 1: the C falls through to the file-type arm here
-                // and hands it this line feed, which no file type admits. The
-                // line feed is spent, so it is consumed.
                 self.set_unix(
                     UnixMain::FileType,
                     UnixSub::TotalDirSize(TotalDirSizeSub::Init),
@@ -2148,11 +1663,6 @@ impl ParselistData {
     }
 
     /// The nine permission characters, and the space that ends them.
-    ///
-    /// `parse_unix_permission` (`lib/ftplistparser.c:433-461`). The field is
-    /// fixed width, so it is read by counting rather than by looking for a
-    /// delimiter, and the count is what decides which of the two tests below
-    /// applies.
     ///
     /// # Errors
     ///
@@ -2210,16 +1720,6 @@ impl ParselistData {
 
     /// The hard-link count.
     ///
-    /// `parse_unix_hlinks` (`lib/ftplistparser.c:463-503`). Padding is skipped,
-    /// then digits are collected to the next space.
-    ///
-    /// A count the number parser refuses -- one long enough to overflow the
-    /// bound, which is the only way it can refuse a field already checked
-    /// digit by digit -- leaves [`FileInfo::KNOWN_HLINKCOUNT`] unset and the
-    /// value at zero, and the parse CONTINUES. That is the C at `:489-492`:
-    /// the flag guards the value, so an unusable count is reported as absent
-    /// rather than as a broken listing.
-    ///
     /// # Errors
     ///
     /// `CURLE_FTP_BAD_FILE_LIST` when the field does not begin with a digit,
@@ -2256,9 +1756,7 @@ impl ParselistData {
                 if c == b' ' {
                     infop.poke_nul(self.item_end());
 
-                    // `:489`. `LONG_MAX` is the C's bound and equals
-                    // `i64::MAX` on every target of AAP 0.8.3, all four of
-                    // which are 64-bit.
+                    // `:489`.
                     let parsed = {
                         let mut cursor =
                             tail_at(infop.buf.as_slice(), self.item_offset);
@@ -2286,12 +1784,6 @@ impl ParselistData {
     }
 
     /// The owner column.
-    ///
-    /// `parse_unix_user` (`lib/ftplistparser.c:506-532`). Unlike the two
-    /// numeric columns this one validates nothing: format 3 of the C's header
-    /// comment (`:35-36`) shows the column holding a bare number, and a server
-    /// may put anything there, so the field is whatever lies between the
-    /// padding and the next space.
     fn parse_unix_user(
         &mut self,
         sub: UserSub,
@@ -2382,12 +1874,6 @@ impl ParselistData {
     /// the value an overflow saturates to in some parsers and is therefore
     /// treated as "no answer" rather than as a real size.
     ///
-    /// If the number does not parse at all, nothing moves: no flag, no value,
-    /// no state change and no error. The machine stays inside the size column,
-    /// which the C reaches by returning past its whole transition block. Only
-    /// a field long enough to overflow can produce it, and the next byte is
-    /// then judged as a continuation of the same number.
-    ///
     /// # Errors
     ///
     /// `CURLE_FTP_BAD_FILE_LIST` when the column does not begin with a digit,
@@ -2459,22 +1945,6 @@ impl ParselistData {
     }
 
     /// The three-part date and time.
-    ///
-    /// `parse_unix_time` (`lib/ftplistparser.c:607-679`). Six substates read
-    /// three whitespace-separated parts, which covers both `Jan 29 23:32` and
-    /// `Jan 29 1997` without deciding in advance which is present -- the C's
-    /// formats 1 and 2 (`:31-34`).
-    ///
-    /// The accepted characters widen as the parts go by: parts one and two
-    /// take letters, digits and a full stop, and part three additionally takes
-    /// a colon, because that is where a time of day appears. Nothing here
-    /// interprets the text; the whole field becomes
-    /// [`FileInfoStrings::time`] and the numeric [`FileInfo::time`] stays
-    /// zero.
-    ///
-    /// The space that ends part three is also where the entry's shape is
-    /// decided: a symlink goes on to the symlink states and everything else to
-    /// the filename states.
     ///
     /// # Errors
     ///
@@ -2586,11 +2056,6 @@ impl ParselistData {
 
     /// The filename, to the end of the line.
     ///
-    /// `parse_unix_filename` (`lib/ftplistparser.c:682-722`). Everything from
-    /// the first non-space to the line ending is the name, spaces inside it
-    /// included, and no character is rejected -- the line ending is the only
-    /// delimiter.
-    ///
     /// # Errors
     ///
     /// `CURLE_FTP_BAD_FILE_LIST` when a carriage return is followed by
@@ -2648,13 +2113,6 @@ impl ParselistData {
     }
 
     /// Terminates the filename and readies the machine for the next entry.
-    ///
-    /// The three lines the C repeats at `lib/ftplistparser.c:705-707` and
-    /// `:713-715`. The main state returns to `PL_UNIX_FILETYPE` while the
-    /// substate is left alone, exactly as the C leaves its union alone, and
-    /// the item cursor is not reset here: the completed record clears
-    /// [`ParselistData::file_data`], and the next byte resets the cursor when
-    /// it creates the next record.
     fn finish_unix_name(
         &mut self,
         sub: FilenameSub,
@@ -2666,15 +2124,6 @@ impl ParselistData {
     }
 
     /// A symlink's name, the arrow between, and the target.
-    ///
-    /// `parse_unix_symlink` (`lib/ftplistparser.c:725-826`). The four bytes of
-    /// `" -> "` are recognised one substate at a time, and any of the four
-    /// positions receiving something else returns to
-    /// [`SymlinkSub::Name`] rather than failing -- which is what lets a name
-    /// containing a space, a hyphen or a greater-than sign parse as a name.
-    /// The consequence is that the LAST arrow in the line separates name from
-    /// target, and a target that still contains an arrow is discarded later by
-    /// [`ParselistData::insert_finfo`].
     ///
     /// # Errors
     ///
@@ -2822,13 +2271,6 @@ impl ParselistData {
 
     /// Terminates the symlink target and readies the machine for the next
     /// entry.
-    ///
-    /// The C repeats these lines at `lib/ftplistparser.c:802-808` and
-    /// `:813-819`, where the return to `PL_UNIX_FILETYPE` is guarded on the
-    /// insertion having succeeded. `ftp_pl_insert_finfo` returns `CURLE_OK`
-    /// unconditionally (`:348`), so the guard never fires and the transition is
-    /// made here, before the insertion, which keeps the two call sites
-    /// identical.
     fn finish_unix_symlink(
         &mut self,
         sub: SymlinkSub,
@@ -2840,24 +2282,10 @@ impl ParselistData {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The WinNT machine
-// ---------------------------------------------------------------------------
 
 impl ParselistData {
     /// One byte of a WinNT listing.
-    ///
-    /// `parse_winnt` (`lib/ftplistparser.c:881-1011`). Format 5 of the C's
-    /// header comment (`:39-40`) is the whole grammar --
-    /// `01-29-97 11:32PM <DIR> prog` -- and four states read it: a
-    /// fixed-width date, a time, either `<DIR>` or a byte count, and a name.
-    ///
-    /// There is no permission, owner, group or hard-link column, so a WinNT
-    /// entry leaves those four offsets untouched and its
-    /// [`FileInfoStrings`] reports them absent. Its
-    /// [`Offsets::time`] stays at zero as well, because the item offset never
-    /// moves off the start of the line -- which is exactly why the C assigns
-    /// `strings.time` with no guard.
     ///
     /// # Errors
     ///
@@ -3023,13 +2451,6 @@ impl ParselistData {
 
     /// A WinNT filename, to the end of the line.
     ///
-    /// The `PL_WINNT_FILENAME` arm of `parse_winnt`
-    /// (`lib/ftplistparser.c:964-1007`), split out so that
-    /// [`ParselistData::parse_winnt`] stays readable. Spaces inside the name
-    /// are kept once content has begun, so a name with a space in it survives
-    /// -- which matters here more than in a Unix listing, where DOS-era names
-    /// are the reason the column is last.
-    ///
     /// # Errors
     ///
     /// `CURLE_FTP_BAD_FILE_LIST` when a carriage return is followed by
@@ -3110,30 +2531,9 @@ impl ParselistData {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Wildcard ownership
-// ---------------------------------------------------------------------------
 
 /// The writer slot the listing parser occupies while `LIST` runs.
-///
-/// The `backup` member of `struct ftp_wc` (`lib/ftp.h:89-92`), which the C
-/// uses to stash `data->set.fwrite_func` and `data->set.out` so that
-/// `Curl_ftp_parselist` can stand in as the write callback and the caller's
-/// own writer can be put back afterwards.
-///
-/// What is stashed there has no counterpart here, and the reason is
-/// structural rather than an omission. In C the caller's writer lives in a
-/// mutable global-per-handle slot that has to be saved before it is
-/// overwritten; in the Rust design the wildcard driver owns the caller's
-/// writer for the whole transfer and lends the listing to this parser, so
-/// there is nothing to save and nothing that could be lost. Neither the
-/// callback type nor the output stream is nameable from this module in any
-/// case: both belong to layers that depend on this one.
-///
-/// What remains is the one bit of the C's state that is genuinely observable
-/// -- whether the substitution is currently in force -- which is what
-/// `backup.write_function` being non-null means at
-/// `lib/ftp.c`'s teardown.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WriteBackup {
@@ -3143,13 +2543,6 @@ pub(crate) struct WriteBackup {
 }
 
 /// The FTP-specific half of a wildcard download.
-///
-/// `struct ftp_wc` (`lib/ftp.h:86-93`): the listing parser, and the writer
-/// slot it occupies. The C reaches it through `wc->ftpwc`, a `void *` with a
-/// separately stored destructor function pointer
-/// (`lib/ftplistparser.h:63-64`, `:193-197`); here it is an owned field of a
-/// concrete type, so the destructor is the compiler's and the `void *` is
-/// gone.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct FtpWildcard {
@@ -3185,18 +2578,6 @@ impl FtpWildcard {
 /// * `struct ftp_wc *ftpwc` with its `wildcard_dtor` becomes
 ///   [`Option<FtpWildcard>`]. Two members collapse into one, because the
 ///   destructor existed only to type-erase the pointer.
-///
-/// `Curl_wildcard_init` (`:181-185`) and `Curl_wildcard_dtor` (`:187-208`)
-/// become [`WildcardData::default`], [`WildcardData::reset`] and drop glue.
-/// Both C functions leave the state at `CURLWC_INIT` -- initialization at
-/// `:184` and teardown at `:205`, the latter on a structure it is about to
-/// free -- and both of these do the same, so a reset structure is
-/// indistinguishable from a fresh one.
-///
-/// There is no [`Drop`] implementation here on purpose. Every member releases
-/// itself, so one would add nothing, and it would additionally forbid moving
-/// a field out of the structure -- which the driver does when it takes the
-/// parser out to feed it.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct WildcardData {
@@ -3219,11 +2600,6 @@ pub(crate) struct WildcardData {
 impl Default for WildcardData {
     /// `Curl_wildcard_init` (`lib/ftplistparser.c:181-185`): an empty file
     /// list and [`WildcardState::Init`].
-    ///
-    /// [`WildcardState::Clear`] is the value a zeroed allocation carries
-    /// BEFORE that function runs, and it is deliberately not what this
-    /// produces -- there is no moment here at which a `WildcardData` exists
-    /// uninitialized.
     fn default() -> Self {
         Self {
             path: None,
@@ -3238,14 +2614,6 @@ impl Default for WildcardData {
 #[allow(dead_code)]
 impl WildcardData {
     /// Releases everything and returns to the initialized state.
-    ///
-    /// `Curl_wildcard_dtor` (`lib/ftplistparser.c:187-208`) without the final
-    /// `free`: the FTP context goes first, then the file list, then the path
-    /// and the pattern, and the state ends at [`WildcardState::Init`]. The C
-    /// runs this on a structure it is about to release, so its assignments to
-    /// `NULL` and to `CURLWC_INIT` are unobservable there; here the same
-    /// sequence is reusable, which is what a wildcard download needs between
-    /// two directories.
     pub(crate) fn reset(&mut self) {
         self.ftpwc = None;
         self.filelist.clear();
@@ -3255,21 +2623,9 @@ impl WildcardData {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 /// The unit suite for the listing parser.
-///
-/// AAP 0.8.7 records that `tests/libtest/*.c` and `tests/unit/*.c` cannot link
-/// against a Rust `staticlib`, because a `pub(crate)` item is genuinely absent
-/// from the symbol table rather than merely hidden, and that the coverage of
-/// those C programs is preserved by relocating the assertions into the crate.
-/// `tests/libtest/lib576.c` and its siblings drive this parser through a live
-/// FTP server; what follows drives it directly, with no network and no server,
-/// and asserts against the same published expectations -- `tests/data/test576`
-/// and the listing generator at `tests/directories.pm:183-201` are where the
-/// byte layouts below come from.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3303,11 +2659,6 @@ mod tests {
 
     /// Everything about a parser that must not depend on how the input was
     /// chopped up.
-    ///
-    /// Every field of `struct ftp_parselist_data` is here, with the record
-    /// under construction represented by its bytes: two parses of the same
-    /// listing have to agree on all of it, not merely on the entries they
-    /// produced.
     type Snapshot = (
         OsType,
         ParseState,
@@ -3469,9 +2820,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // The five documented formats
-    // -----------------------------------------------------------------------
 
     #[test]
     fn format_1_is_a_directory_with_a_time_of_day() {
@@ -3592,17 +2941,10 @@ mod tests {
         assert_eq!(entry.filetype, FileType::Directory);
     }
 
-    // -----------------------------------------------------------------------
     // The fixture server's own listings
-    // -----------------------------------------------------------------------
 
     /// `/fully_simulated/UNIX/` exactly as `tests/directories.pm:188-194`
     /// generates it: fourteen entries, CRLF endings, no total line.
-    ///
-    /// The layout is the generator's, character for character --
-    /// `"$ftype$fperm $fhlink $fuser $fgroup $fsize $ftime $name$eol"` at
-    /// `:232`, with `%4d` on the link count, `%7s` or `%7d` on the size and
-    /// `%10s` on the time.
     const SERVER_UNIX: &str = concat!(
         "drwxrwxrwx    4 ftp-default ftp-default   20480 Apr 27  5:12 .\r\n",
         "drwxrwxrwx    4 ftp-default ftp-default   20480 Apr 23  3:12 ..\r\n",
@@ -3657,16 +2999,6 @@ mod tests {
         // `tests/libtest/lib576.c` prints from a `CURLOPT_CHUNK_BGN_FUNCTION`
         // for this listing. Fourteen entries, in the server's order, with the
         // permissions that fixture states in octal.
-        //
-        // The target column deserves a word, because three of its values look
-        // wrong and are not. The first nine entries have no target at all,
-        // since `offsets.symlink_target` is still zero. The two symlinks have
-        // the target they state. The three entries AFTER them INHERIT that
-        // offset, because the C never resets the offsets between records --
-        // see [`Offsets`] -- and it lands past the end of each of their
-        // shorter buffers, which is a read past the buffer in C and an empty
-        // field here. `lib576.c:60-64` prints a target only for a symlink,
-        // which is why `tests/data/test576` shows no trace of it.
         let expected: [(&str, FileType, i64, i64, u32, &str, Option<&str>);
             14] = [
             (
@@ -3891,9 +3223,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Chunk-boundary invariance
-    // -----------------------------------------------------------------------
 
     #[test]
     fn one_call_and_one_byte_at_a_time_agree_exactly() {
@@ -3974,9 +3304,7 @@ mod tests {
         assert_eq!(parser.os_type(), OsType::Unix);
     }
 
-    // -----------------------------------------------------------------------
     // The file-type decoder
-    // -----------------------------------------------------------------------
 
     #[test]
     fn every_documented_type_character_decodes() {
@@ -4026,9 +3354,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The permission decoder
-    // -----------------------------------------------------------------------
 
     #[test]
     fn plain_permissions_decode_to_their_octal_value() {
@@ -4139,9 +3465,7 @@ mod tests {
         assert_ne!(ftp_pl_get_permission(b"") & FTP_LP_MALFORMATED_PERM, 0);
     }
 
-    // -----------------------------------------------------------------------
     // The `total <n>` line
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_total_line_is_accepted_and_contributes_no_entry() {
@@ -4235,9 +3559,7 @@ mod tests {
         assert_eq!(rejected(b"*", b"tot\n"), CURLcode::FtpBadFileList);
     }
 
-    // -----------------------------------------------------------------------
     // Symlinks
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_symlink_target_ending_in_crlf_parses() {
@@ -4422,9 +3744,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Absent against present, for each optional member
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_unix_entry_has_permission_owner_and_group_but_no_target() {
@@ -4504,9 +3824,7 @@ mod tests {
         assert_eq!(alone.strings.target, None);
     }
 
-    // -----------------------------------------------------------------------
     // The record ceiling
-    // -----------------------------------------------------------------------
 
     /// The Unix prefix through the time column, so that only the filename
     /// grows.
@@ -4569,9 +3887,7 @@ mod tests {
         assert_eq!(parser.geterror(), CURLcode::Ok);
     }
 
-    // -----------------------------------------------------------------------
     // The latched error
-    // -----------------------------------------------------------------------
 
     #[test]
     fn an_error_latches_and_every_later_push_repeats_it() {
@@ -4635,9 +3951,7 @@ mod tests {
         assert_eq!(parser.os_type(), OsType::Unknown);
     }
 
-    // -----------------------------------------------------------------------
     // Format detection
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_leading_digit_selects_the_dos_format() {
@@ -4693,9 +4007,7 @@ mod tests {
         assert_eq!(names(&parser), vec!["f"]);
     }
 
-    // -----------------------------------------------------------------------
     // The DOS machine's own rejections
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_dos_date_with_a_bad_character_is_rejected() {
@@ -4741,9 +4053,7 @@ mod tests {
         assert!(entry.knows(FileInfo::KNOWN_SIZE));
     }
 
-    // -----------------------------------------------------------------------
     // The Unix machine's numeric columns
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_non_numeric_hard_link_count_is_rejected() {
@@ -4904,9 +4214,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The comparator and its guard
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_default_comparator_applies_the_pattern() {
@@ -5039,9 +4347,7 @@ mod tests {
         assert_eq!(concrete.flag, vec![true, false]);
     }
 
-    // -----------------------------------------------------------------------
     // The queue
-    // -----------------------------------------------------------------------
 
     #[test]
     fn entries_keep_the_order_the_server_listed_them_in() {
@@ -5077,9 +4383,7 @@ mod tests {
         assert_eq!(names(&parser), vec!["prog"]);
     }
 
-    // -----------------------------------------------------------------------
     // The pinned integers
-    // -----------------------------------------------------------------------
 
     #[test]
     fn every_file_type_holds_its_declared_integer() {
@@ -5335,9 +4639,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The byte helpers
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_read_past_the_end_yields_the_terminator() {
@@ -5427,9 +4729,7 @@ mod tests {
         assert_eq!(names(&parser), vec!["f\u{fffd}g"]);
     }
 
-    // -----------------------------------------------------------------------
     // Wildcard ownership
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_fresh_wildcard_is_initialized_rather_than_cleared() {

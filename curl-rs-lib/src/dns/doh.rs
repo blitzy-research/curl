@@ -24,21 +24,10 @@
 
 //! DNS-over-HTTPS: RFC 8484 name resolution through an HTTPS transfer.
 //!
-//! Supersedes all of `lib/doh.c` (1,340 lines, the largest file in the DNS
-//! group) and all of `lib/doh.h` (181 lines). AAP 0.4.1's row reads
-//! *"`curl-rs-lib/src/dns/doh.rs` | CREATE | `lib/doh.c` | DNS-over-HTTPS via
-//! the crate's own HTTP client."*
-//!
-//! Three things in this module are frozen and one is deleted, and the
-//! distinction runs through every item below.
-//!
 //! # What is frozen
 //!
-//! * **The query bytes.** [`req_encode`] emits a DNS message whose every
-//!   byte is fixed by `lib/doh.c:104-166`. AAP 0.6.7 measures the oracle that
-//!   enforces it: `compareparts` joins both sides into one string and compares
-//!   them whole (`tests/getpart.pm:351+`), so ordering, casing and every
-//!   individual octet are significant across 1,476 fixtures.
+//! * **The query bytes.** [`req_encode`] emits a DNS message whose every byte
+//!   is fixed by `lib/doh.c:104-166`.
 //! * **The request shape.** POST, a raw binary body, and exactly one header
 //!   reading `Content-Type: application/dns-message` (`:313-314`).
 //!   [`DohProbeRequest`] carries that shape whole rather than letting a
@@ -48,61 +37,12 @@
 //!   two genuine source asymmetries that would look like typos to a reader who
 //!   had not checked -- see [`print_buf`] and [`print_httpsrr`].
 //!
-//! # What is deleted, and why the absence is deliberate
-//!
-//! In C a DoH probe is a *nested easy handle on the caller's multi handle*.
-//! `doh_probe_run` calls `Curl_open`, sets 25 options on the new handle,
-//! stashes a `struct doh_request` in an easy-meta slot keyed
-//! `CURL_EZM_DOH_PROBE` (`lib/doh.h:77`), records `doh->master_mid =
-//! data->mid`, installs `data->sub_xfer_done = doh_probe_done`, and hands the
-//! handle to `curl_multi_add_handle` (`:403-420`). Completion arrives later,
-//! out of band, at `doh_probe_done`, which searches the slot array for the
-//! finishing `mid`, decrements a `pending` counter, copies the body across and
-//! marks the master transfer dirty (`:212-255`).
-//!
-//! Awaiting a future subsumes all of it. The following C entities therefore
-//! have **no successor in this file**, and each is listed so that its absence
-//! reads as a decision rather than an oversight:
-//!
-//! * **`CURL_EZM_DOH_PROBE`** -- `lib/doh.h:77` -- An easy-meta key exists to
-//!   attach state to a handle a callback will later find. There is no second
-//!   handle and no later callback.
-//! * **`struct doh_request`** -- `lib/doh.h:84-90` -- Its four members are the
-//!   request body, its length, the header list and the response accumulator --
-//!   all locals of one `async fn` here.
-//! * **`doh_probe_write_cb`** -- `:169-182` -- A write callback exists so that
-//!   C can be pushed bytes. [`DohTransport::post`] returns them.
-//! * **`doh_probe_done`** -- `:212-255` -- The out-of-band completion hook,
-//!   with its slot search and its `pending--`.
-//! * **`doh_probe_dtor`** -- `:257-267` -- Frees the meta slot. `Drop` does it.
-//! * **`pending`, `probe_mid`** -- `lib/doh.h:103`, `:93` -- A counter and a
-//!   handle identifier that exist only to correlate an asynchronous completion
-//!   with its slot.
-//! * **`Curl_doh_close`, `Curl_doh_cleanup`** -- `:1297-1336` -- Remove the
-//!   sub-handles from the multi handle and free them. Ownership and
-//!   cancellation do both.
-//! * **`"Curl_doh_close: xfer for mid=%u not found!"`** -- `:1313` -- Describes
-//!   a slot whose recorded `mid` is no longer in the multi handle. Unreachable
-//!   once the probes are owned values, so the line is dropped rather than made
-//!   unreachable.
-//! * **`"unknown sub request done"`** -- `:226` -- `failf` for a completion
-//!   whose `mid` matches no slot. Same reason.
-//! * **`"a DoH request is completed, %u to go"`** -- `:231` -- Reports the
-//!   `pending` countdown. There is no counter to report.
-//! * **`"DoH request %s"`** -- `:248` -- Emitted from `doh_probe_done` for a
-//!   failed sub-transfer. Its situation survives -- a probe can still fail --
-//!   so **this one is kept**; see [`msg::doh_request`].
-//! * **`Curl_multi_mark_dirty`** -- `:252` -- Wakes the master transfer. There
-//!   is nothing to wake.
-//!
 //! # The transport is injected, never imported
 //!
-//! AAP 0.4.1 requires DoH *"via the crate's own HTTP client"*, and a DoH
-//! request is itself an HTTPS transfer whose own hostname needs resolving. The
-//! import that would express it directly, `use crate::protocols`, would close
-//! a `dns -> protocols -> dns` cycle, so the dependency is inverted into a
-//! seam exactly as AAP 0.3.3 P12 prescribes. **This file names neither
-//! `crate::protocols` nor `crate::conn`, and must never come to.**
+//! The import that would express it directly, `use crate::protocols`, would
+//! close a `dns -> protocols -> dns` cycle, so the dependency is inverted into
+//! a seam. **This file names neither `crate::protocols` nor `crate::conn`, and
+//! must never come to.**
 //!
 //! The seam already exists: [`crate::dns::DohTransport`] is declared by this
 //! directory's module root (`dns/mod.rs`), whose own documentation says
@@ -117,9 +57,29 @@
 //! triple that `doh_probe_run` sets -- all of which are frozen and all of
 //! which belong to this file's contract. They are therefore represented here,
 //! in [`DohProbeRequest`], and reachable by a transport through the richer
-//! [`DohProbeTransport`]. A blanket implementation adapts every
-//! [`DohTransport`] into a [`DohProbeTransport`], so the narrow seam remains
-//! sufficient and the full shape remains stated, asserted and available.
+//! [`DohProbeTransport`].
+//!
+//! A blanket implementation used to adapt every [`DohTransport`] into a
+//! [`DohProbeTransport`] by forwarding those two fields and dropping the other
+//! eleven. **It is gone.** Dropping them was not a simplification: it meant a
+//! request built to verify a private resolver against a pinned CA, or built with
+//! `--doh-insecure`, would go out under the transport's own policy with nothing
+//! reporting the substitution -- and it applied itself by coherence, so no call
+//! site had to admit to it. The narrowing is now spelled
+//! [`NarrowDohTransport`], which forwards the two fields only when the other
+//! eleven carry nothing, and otherwise **refuses the request**.
+//!
+//! **No PRODUCTION transport is registered, and that is what withholds the
+//! `DoH` label.** Every implementor of either trait in this tree -- here and in
+//! `dns/mod.rs` alike -- is a `#[cfg(test)]` double, because a real one has to
+//! perform an HTTPS transfer and `curl-rs-lib/src/protocols/http1.rs` does not
+//! exist. The module root holds the registry, `dns::DOH_TRANSPORTS`, and
+//! [`crate::version::supports_doh`] conjoins it: the capability turns itself on
+//! when the slice gains an entry and cannot be turned on before. So the codec,
+//! the probe pairing and the record walk below are complete and exercised while
+//! the banner stays silent -- which is the direction AAP 0.6.5 requires, since a
+//! `DoH`-gated fixture that skips reports the gap and one that runs against a
+//! seam nothing fills reports a defect that does not exist.
 //!
 //! # Everything decoded here is attacker-controlled
 //!
@@ -164,14 +124,6 @@
 //!   `doh_resp_decode_httpsrr` (`lib/doh.c:1099-1156`) and
 //!   `doh_print_httpsrr` (`:1158-1196`), which live in `lib/doh.c` and not in
 //!   `lib/httpsrr.c` because both need the DNS-wire helpers that are here.
-//!
-//! [`resp_decode_httpsrr`] therefore calls
-//! [`HttpsRrInfo::set_param`](crate::dns::httpsrr::HttpsRrInfo::set_param)
-//! and re-implements none of its eight arms: duplicating them would duplicate
-//! their trace output, which the byte-exact comparison of AAP 0.6.7 would
-//! catch as a difference. The dependency is one-directional -- this file may
-//! read `httpsrr`, and `httpsrr` must never read this one, which is what lets
-//! it compile with `doh` off.
 
 use core::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -183,12 +135,11 @@ use crate::dns::{
 use crate::error::{CURLcode, CodeResult};
 use crate::trace::{failf, infof, trc_feat, TraceFeature, Tracer};
 use crate::util::dynbuf::{DynBuf, DYN_DOH_CNAME, DYN_DOH_RESPONSE};
+use crate::util::redact::Redacted;
 use crate::util::timediff::{mstotv, TimeDiff};
 use crate::util::timeval::Clock;
 
-// ---------------------------------------------------------------------------
 // Constants -- `lib/doh.h` and `lib/doh.c:41`.
-// ---------------------------------------------------------------------------
 
 /// The DNS `CLASS` this module queries and accepts: `IN`, the Internet.
 ///
@@ -198,12 +149,6 @@ use crate::util::timeval::Clock;
 pub(crate) const DNS_CLASS_IN: u16 = 0x01;
 
 /// The largest DNS query this module will build: 272 bytes.
-///
-/// `#define DOH_MAX_DNSREQ_SIZE (256 + 16)` (`lib/doh.h:79-80`), whose comment
-/// reads *"the largest one we can make, based on RFCs 1034, 1035"*. The
-/// arithmetic is left as C wrote it because the two terms mean different
-/// things: 256 is the longest QNAME encoding and 16 is the fixed overhead of
-/// the twelve-byte header plus a two-byte `TYPE` and a two-byte `CLASS`.
 pub(crate) const DOH_MAX_DNSREQ_SIZE: usize = 256 + 16;
 
 /// The most addresses one [`DohEntry`] retains: 24.
@@ -219,28 +164,9 @@ pub(crate) const DOH_MAX_ADDR: usize = 24;
 pub(crate) const DOH_MAX_CNAME: usize = 4;
 
 /// The most HTTPS resource records one [`DohEntry`] retains: 4.
-///
-/// `#define DOH_MAX_HTTPS 4` (`lib/doh.h:121`), and C's own comment on the
-/// limit is *"silently ignore RRs over the limit"* (`:592`).
-///
-/// Storing four and decoding one is not a contradiction to be tidied: only the
-/// first is ever decoded (`:1263`), which [`is_resolved`] preserves and
-/// documents.
 pub(crate) const DOH_MAX_HTTPS: usize = 4;
 
 /// A character that may need escaping inside an ALPN string value.
-///
-/// `#define COMMA_CHAR ','` (`lib/doh.h:137`), under the comment *"These may
-/// need escaping when found within an ALPN string value"*.
-///
-/// **No escaping is performed anywhere in the C tree.** `grep` finds the two
-/// macros defined in `lib/doh.h` and used nowhere: the ALPN decoder
-/// (`lib/httpsrr.c:34-69`, now
-/// [`decode_alpn`](crate::dns::httpsrr)) walks length-prefixed wire values,
-/// which have no delimiter to escape. They are carried because they are part
-/// of the superseded header and because a future producer that renders an ALPN
-/// list as the comma-separated *text* form of RFC 9460 section 7.1 would need
-/// exactly these two characters and would otherwise rediscover them.
 #[allow(dead_code)] // Carried from `lib/doh.h:137`; the C has no user either.
 pub(crate) const COMMA_CHAR: u8 = b',';
 
@@ -258,24 +184,9 @@ pub(crate) const BACKSLASH_CHAR: u8 = b'\\';
 pub(crate) const PORT_HTTPS: u16 = 443;
 
 /// `CURL_MAX_INPUT_LENGTH` -- 8,000,000.
-///
-/// `lib/urldata.h:131`, consulted by `Curl_junkscan` (`lib/urlapi.c:228-229`)
-/// as its first test. Transcribed rather than imported for the same reason
-/// `auth/ntlm.rs:471` and `cookies/mod.rs:781` transcribe it: the module that
-/// owns the URL-validation vocabulary, `crate::url`, does not carry it, and
-/// AAP 0.4.2 forbids reaching for a module this file has no dependency on.
-/// [`junkscan`] is the one consumer here and
-/// [`tests::junkscan_rejects_a_name_longer_than_the_input_limit`] pins the
-/// value.
 const CURL_MAX_INPUT_LENGTH: usize = 8_000_000;
 
 /// The longest label a QNAME may carry: 63 bytes.
-///
-/// The two-bit label-type field of RFC 1035 section 4.1.4 leaves six bits of
-/// length, so a literal label cannot exceed 63. C writes the number inline at
-/// `lib/doh.c:137`; it is named here because [`skipqname`] and
-/// [`DohEntry::store_cname`] depend on the *same* six-bit boundary from the
-/// other direction, through [`LABEL_TYPE_MASK`].
 const MAX_LABEL_LEN: usize = 63;
 
 /// The two high bits that classify a QNAME length byte: `0xc0`.
@@ -301,12 +212,6 @@ const LABEL_TYPE_POINTER: u8 = 0xc0;
 const LABEL_POINTER_OFFSET_MASK: u8 = 0x3f;
 
 /// The iteration budget [`DohEntry::store_cname`] gives a compressed name.
-///
-/// `unsigned int loop = 128; /* a valid DNS name can never loop this much */`
-/// (`lib/doh.c:609`). It is the loop-detection mechanism, not an optimisation:
-/// a compression pointer may point backwards to anywhere, including at itself,
-/// and following one is the only way to decode a real name. Exhausting the
-/// budget is [`DohCode::DnsLabelLoop`].
 const CNAME_LOOP_BUDGET: u32 = 128;
 
 /// The fixed size of a DNS message header: 12 bytes.
@@ -342,27 +247,9 @@ const OFFSET_ARCOUNT: usize = 10;
 /// *"doh_print_buf truncates if the hex string will be more than this"*.
 const LOCAL_PB_HEXMAX: usize = 400;
 
-// ---------------------------------------------------------------------------
 // `DOHcode` -- `lib/doh.h:30-45`.
-// ---------------------------------------------------------------------------
 
 /// Why a DoH message could not be built or parsed.
-///
-/// Supersedes `DOHcode` (`lib/doh.h:30-45`). **Every discriminant is written
-/// out**, because the declaration order is load-bearing twice over: C's
-/// `doh_strerror` indexes `errors[]` by the code (`lib/doh.c:63-64`), and the
-/// range test that guards that index is `(code >= DOH_OK) && (code <=
-/// DOH_DNS_NAME_TOO_LONG)`, which is only correct while the two named bounds
-/// really are the first and last. C's own inline annotations `/* 1 */` through
-/// `/* 13 */` are carried on each variant as the evidence for its number.
-///
-/// This is **not** a [`CURLcode`] and is never converted to one implicitly.
-/// The two are related at exactly the places C relates them, and nowhere else:
-/// an encode failure becomes [`CURLcode::OutOfMemory`] (`:303`, and see
-/// [`DohProbeRequest::build`] for why that surprising mapping is preserved),
-/// and a decode failure reaches the caller as the
-/// [`CURLcode::CouldntResolveHost`] or [`CURLcode::CouldntResolveProxy`] that
-/// [`is_resolved`] selects.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(i32)]
 pub(crate) enum DohCode {
@@ -386,10 +273,14 @@ pub(crate) enum DohCode {
     /// `DOH_OUT_OF_MEM` -- `/* 5 */`.
     ///
     /// In C this reports a failed `curlx_memdup` or a `dynbuf` append that hit
-    /// its ceiling. Rust aborts on allocation failure rather than reporting
-    /// it, so the *allocation* half has no counterpart -- but the **ceiling**
-    /// half does: appending past [`DYN_DOH_CNAME`] still fails, and still
-    /// arrives here. See [`DohEntry::store_cname`].
+    /// its ceiling. **Both halves are live here.** The ceiling half always was:
+    /// appending past [`DYN_DOH_CNAME`] fails and arrives here (see
+    /// [`DohEntry::store_cname`]). The allocation half arrived with
+    /// `crate::util::dynbuf`'s growth becoming fallible: a refused
+    /// `try_reserve_exact` is `CURLE_OUT_OF_MEMORY` from the buffer, exactly as
+    /// a null `realloc` is in the C, and it reaches this code by the same
+    /// route. The one route with no counterpart is the fixed-size `memdup` of a
+    /// name already in memory.
     OutOfMem = 5,
     /// `DOH_DNS_RDATA_LEN` -- `/* 6 */`. An `A` record whose RDATA is not four
     /// bytes, or an `AAAA` record whose RDATA is not sixteen.
@@ -436,12 +327,6 @@ pub(crate) enum DohCode {
 ///   integer-taking form, which is where a value that is not a variant can
 ///   still arrive.
 ///
-/// **The strings are not derived from the identifiers**, and two are visibly
-/// shorter than their names: `DOH_DNS_OUT_OF_RANGE` prints `"Out of range"`
-/// and `DOH_TOO_SMALL_BUFFER` prints `"Too small"`. Both are transcribed, and
-/// [`tests::strerror_maps_all_fourteen_codes_to_the_c_strings`] pins all
-/// fourteen.
-///
 /// C compiles this under `#ifdef CURLVERBOSE`. There is no such feature here
 /// and none is invented: gating fourteen short literals would only create a
 /// configuration in which a trace line silently lost its text.
@@ -466,15 +351,6 @@ pub(crate) const fn strerror(code: DohCode) -> &'static str {
 }
 
 /// The text C prints for a raw `DOHcode` integer, including its fall-through.
-///
-/// The other half of `doh_strerror` (`lib/doh.c:61-66`): the range test and
-/// the `"bad error code"` it guards. Split out from [`strerror`] because a
-/// [`DohCode`] can never be out of range, so keeping the two together would
-/// have left one arm unreachable and the string untestable.
-///
-/// Reachable in production wherever a code crosses a boundary as an integer --
-/// `curl-rs-ffi` is the eventual such boundary -- and reachable in test now,
-/// which is what keeps the fall-through honest.
 #[allow(dead_code)] // The FFI boundary is later code; the tests exercise it.
 pub(crate) fn strerror_raw(code: i32) -> &'static str {
     // `if((code >= DOH_OK) && (code <= DOH_DNS_NAME_TOO_LONG))`, with the two
@@ -512,9 +388,7 @@ impl fmt::Display for DohCode {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `DNStype` -- `lib/doh.h:47-54`.
-// ---------------------------------------------------------------------------
 
 /// A DNS record type this module can query or recognise.
 ///
@@ -528,11 +402,6 @@ impl fmt::Display for DohCode {
 /// * **[`Self::Aaaa`]** -- 28 -- queried when IPv6 is usable (`:485`)
 /// * **[`Self::Dname`]** -- 39 -- never queried; accepted and ignored (`:759`)
 /// * **[`Self::Https`]** -- 65 -- queried for HTTP-family transfers (`:504`)
-///
-/// There is deliberately **no zero variant**. C uses a zero `dnstype` as "this
-/// slot never completed" (`:1229`), which is a distinct fact rather than a
-/// distinct type, and is expressed here by [`Option`] on
-/// [`DohResponse::dnstype`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u16)]
 pub(crate) enum DnsType {
@@ -566,17 +435,6 @@ impl DnsType {
     }
 
     /// The display name of this type, or `"unknown"`.
-    ///
-    /// Supersedes `doh_type2name` (`lib/doh.c:1011-1025`), whose three named
-    /// cases are `A`, `AAAA` and -- under `#ifdef USE_HTTPSRR` -- `HTTPS`, with
-    /// everything else falling through to `"unknown"`. The `HTTPS` arm is
-    /// unconditional here for the reason the module preamble gives: there is no
-    /// `httpsrr` feature to gate it on.
-    ///
-    /// [`Self::Ns`], [`Self::Cname`] and [`Self::Dname`] therefore print
-    /// `"unknown"`, which is C's behaviour and not an omission: the function
-    /// exists only to label the one trace line at `:1235-1236`, and that line
-    /// only ever reports a type this module queried.
     #[rustfmt::skip]
     pub(crate) const fn type2name(self) -> &'static str {
         match self {
@@ -596,25 +454,9 @@ impl fmt::Display for DnsType {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `enum doh_slot_num` -- `lib/doh.h:56-75`.
-// ---------------------------------------------------------------------------
 
 /// Which probe a response belongs to.
-///
-/// Supersedes `enum doh_slot_num` (`lib/doh.h:56-75`), carrying C's own
-/// comment on why the first two are written out: *"Explicit values for first
-/// two symbols so as to match hard-coded constants in existing code."* All
-/// three are explicit here, for the reason [`DohCode`] gives.
-///
-/// **The HTTPS-RR slot is unconditional.** In C it sits inside `#ifdef
-/// USE_HTTPSRR` (`lib/doh.h:64-66`), which makes `DOH_SLOT_COUNT` either two
-/// or three and therefore changes the size of every array indexed by a slot.
-/// There is no `httpsrr` feature in this crate's fifteen, so the slot is always
-/// present and [`SLOT_COUNT`] is always three -- which additionally removes a
-/// whole class of C configuration bug, since a build with the macro off and an
-/// array sized for three is indistinguishable at the type level from one sized
-/// for two.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(usize)]
 pub(crate) enum DohSlot {
@@ -628,22 +470,10 @@ pub(crate) enum DohSlot {
 }
 
 /// How many probe slots exist: 3.
-///
-/// `DOH_SLOT_COUNT` (`lib/doh.h:74`), which C computes by placing the
-/// enumerator after every slot definition. Written out here and checked
-/// against [`DohSlot::ALL`] by
-/// [`tests::the_slot_vocabulary_is_exactly_three_in_wire_order`], so the two
-/// cannot disagree.
 pub(crate) const SLOT_COUNT: usize = 3;
 
 impl DohSlot {
     /// Every slot, in declaration order.
-    ///
-    /// The order is the array order of C's `probe_resp[DOH_SLOT_COUNT]`, and it
-    /// is behaviour rather than convenience: [`is_resolved`] decodes the slots
-    /// in this sequence, and the sequence decides the order addresses reach
-    /// [`doh2ai`] and therefore the order `conn/happy_eyeballs.rs` will race
-    /// them in.
     pub(crate) const ALL: [Self; SLOT_COUNT] =
         [Self::Ipv4, Self::Ipv6, Self::HttpsRr];
 
@@ -653,23 +483,9 @@ impl DohSlot {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Observable text, frozen.
-// ---------------------------------------------------------------------------
 
 /// Every string this module emits, transcribed with its locator.
-///
-/// AAP 0.8.1 freezes `--verbose` and `--trace` output and AAP 0.6.7 measures
-/// the comparison that enforces it: `compareparts` joins both sides into one
-/// string, so casing, spacing and punctuation are all significant.
-/// `#[rustfmt::skip]` therefore covers the whole module -- these are program
-/// output wearing the costume of source code, and a formatter that rewrapped
-/// one of them would change what a fixture sees.
-///
-/// The parameterised messages are functions returning [`String`] rather than
-/// format strings, because [`infof!`](crate::trace::infof) and its siblings
-/// require a literal format string and check it for newlines at compile time.
-/// One definition per message beats a template duplicated at its call site.
 ///
 /// # Two asymmetries that are not typos
 ///
@@ -679,14 +495,11 @@ impl DohSlot {
 ///   **plural** (`:1189` versus `:1193`), where the IPv4 pair at `:1177` and
 ///   `:1181` is plural on both sides.
 ///
-/// Both are in the C source, both reach a `--trace` log, and both are
-/// reproduced exactly. [`tests`] asserts each of them by literal.
-///
 /// # What is deliberately NOT here
 ///
 /// `"HTTPS RR target: %s"` and `"HTTPS RR priority: %u"` -- note the absent
 /// colon after `RR` -- belong to `lib/httpsrr.c:191` and `:193`, inside
-/// `#ifdef USE_ARES`, and go with c-ares under AAP 0.5.2. The DoH forms this
+/// `#ifdef USE_ARES`, and go with c-ares, which is dropped. The DoH forms this
 /// module does emit have the colon in a different place; see
 /// [`https_rr_priority_target`].
 #[rustfmt::skip]
@@ -808,13 +621,6 @@ pub(crate) mod msg {
     }
 
     /// `"HTTPS RR: priority %d, target: %s"` -- `lib/doh.c:1166`.
-    ///
-    /// The target is a `char *` that C prints with `%s`; it is
-    /// [`Option<String>`](Option) here, and [`None`] cannot occur on this path
-    /// because the record walk always sets it before succeeding (`:1126`).
-    /// `"(nil)"` would be the glibc rendering of the impossible case and is
-    /// deliberately not invented -- see
-    /// [`print_httpsrr`](super::print_httpsrr).
     pub(crate) fn https_rr_priority_target(
         priority: u16, target: &str,
     ) -> String {
@@ -884,21 +690,9 @@ pub(crate) mod msg {
     pub(crate) const DEFAULT_PROTOCOL: &str = "https";
 }
 
-// ---------------------------------------------------------------------------
 // Bounds-checked wire primitives -- `lib/doh.c:545-562`.
-// ---------------------------------------------------------------------------
 
 /// Reads a big-endian `u16` at `index`, or [`None`] if it does not fit.
-///
-/// Supersedes `doh_get16bit` (`lib/doh.c:545-549`), which is
-/// `(doh[index] << 8) | doh[index + 1]` **with no bounds check of its own** --
-/// every caller is expected to have tested first, and the module preamble
-/// records that this expectation has failed historically.
-///
-/// The bound is enforced here instead, and the return type is what makes that
-/// enforceable: a caller cannot forget to check, because there is nothing to
-/// read until it has. `u16::from_be_bytes` over a two-element slice pattern
-/// does the assembly, which removes the shift entirely.
 fn get16bit(doh: &[u8], index: usize) -> Option<u16> {
     let end = index.checked_add(2)?;
     let bytes = doh.get(index..end)?;
@@ -990,9 +784,7 @@ fn skipqname(doh: &[u8], index: &mut usize) -> Result<(), DohCode> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `struct dohaddr` -- `lib/doh.h:123-129`.
-// ---------------------------------------------------------------------------
 
 /// One address a DoH answer carried.
 ///
@@ -1030,8 +822,6 @@ impl DohAddr {
     /// C stores it in the `type` member and reads it back in `doh_show`
     /// (`lib/doh.c:862`, `:867`) and `doh2ai` (`:937`). Derived here, so the
     /// two can never disagree.
-    // No consumer yet; `show` matches the address directly, and `conn/` will
-    // want the record type when it reports where an address came from.
     #[allow(dead_code)]
     pub(crate) const fn dnstype(self) -> DnsType {
         match self.0 {
@@ -1041,20 +831,9 @@ impl DohAddr {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `struct dohhttps_rr` -- `lib/doh.h:140-143`.
-// ---------------------------------------------------------------------------
 
 /// One HTTPS resource record's RDATA, stored verbatim.
-///
-/// Supersedes `struct dohhttps_rr` (`lib/doh.h:140-143`), whose two members are
-/// `uint16_t len; /* raw encoded length */` and `unsigned char *val; /* raw
-/// encoded octets */`. A [`Vec<u8>`] carries both, which is the point: the
-/// pointer and the length in C are free to disagree and a `Vec` is not.
-///
-/// The bytes are **not** interpreted at storage time. C defers interpretation
-/// to `Curl_doh_is_resolved` (`lib/doh.c:1261-1264`), which decodes exactly one
-/// of them; [`is_resolved`] preserves that and says why.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DohHttpsRr {
     /// C's `val` and `len` as one owned buffer.
@@ -1074,17 +853,10 @@ impl DohHttpsRr {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `struct dohentry` -- `lib/doh.h:146-156`, plus the `store_*` family and
 // `de_init` / `de_cleanup` -- `lib/doh.c:564-710`, `:1028-1038`.
-// ---------------------------------------------------------------------------
 
 /// Everything one or more DoH answers contributed.
-///
-/// Supersedes `struct dohentry` (`lib/doh.h:146-156`) together with the five
-/// `doh_store_*` functions, `doh_rdata`, `de_init` and `de_cleanup`, which are
-/// its constructor, its mutators and its destructor and therefore belong with
-/// it.
 ///
 /// ```c
 /// struct dohentry {
@@ -1097,40 +869,10 @@ impl DohHttpsRr {
 ///   int numhttps_rrs;
 /// };
 /// ```
-///
-/// # Fixed arrays plus counts become vectors with caps
-///
-/// Each `numX` member exists only because C cannot ask an array how much of it
-/// is in use. [`Vec::len`] answers that, so the three counters are gone and the
-/// three limits survive as the caps the mutators enforce -- which is where the
-/// behaviour actually lives: exceeding [`DOH_MAX_ADDR`],
-/// [`DOH_MAX_CNAME`] or [`DOH_MAX_HTTPS`] is **silently ignored** in every
-/// case, never reported.
-///
-/// # `de_init` and `de_cleanup` are deleted
-///
-/// `de_init` (`lib/doh.c:702-709`) is a `memset`, a `ttl` seed and four
-/// `curlx_dyn_init` calls; `de_cleanup` (`:1028-1038`) frees the CNAME buffers
-/// and the HTTPS-RR octets. [`Default`] is the first and [`Drop`] is the
-/// second, so neither has a hand-written successor and neither can be
-/// forgotten at a call site -- which is the whole of what the pair existed to
-/// prevent. The one part of `de_init` that is *behaviour* rather than
-/// bookkeeping is the `ttl` seed, and it is stated on [`Self::ttl`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DohEntry {
     /// C's `cname[DOH_MAX_CNAME]` and `numcname`, capped at
     /// [`DOH_MAX_CNAME`].
-    ///
-    /// Raw octets, not a [`String`]: a DNS label may contain any byte, and C
-    /// stores exactly what the wire carried. Rendering is
-    /// [`show`]'s problem and is where C's `%s` semantics are applied.
-    ///
-    /// **The [`DYN_DOH_CNAME`] ceiling is not lost by storing bytes.** C
-    /// initialises each of its four buffers with that cap, so a decoded name
-    /// longer than 256 bytes fails the append and becomes
-    /// [`DohCode::OutOfMem`]; here [`decode_cname_into`] decodes *into* a
-    /// [`DynBuf`] carrying the same cap and only the finished bytes are kept.
-    /// The limit therefore applies at exactly the moment C applies it.
     pub(crate) cname: Vec<Vec<u8>>,
     /// C's `addr[DOH_MAX_ADDR]` and `numaddr`, capped at [`DOH_MAX_ADDR`].
     ///
@@ -1139,16 +881,6 @@ pub(crate) struct DohEntry {
     /// change which address a transfer connects to.
     pub(crate) addr: Vec<DohAddr>,
     /// C's `ttl`, seeded to `INT_MAX`.
-    ///
-    /// `de->ttl = INT_MAX;` (`lib/doh.c:706`) into an `unsigned int` field, and
-    /// then `if(ttl < d->ttl) d->ttl = ttl;` (`:776-777`) at every answer:
-    /// **the minimum TTL across all records wins**.
-    ///
-    /// The seed is `i32::MAX` and not `u32::MAX`, which is measurable rather
-    /// than incidental -- a record advertising a TTL above 2,147,483,647 does
-    /// **not** lower it, because the comparison is unsigned and the seed is
-    /// already smaller. Written as `i32::MAX as u32` so the derivation from C's
-    /// `INT_MAX` stays visible.
     pub(crate) ttl: u32,
     /// C's `https_rrs[DOH_MAX_HTTPS]` and `numhttps_rrs`, capped at
     /// [`DOH_MAX_HTTPS`].
@@ -1178,12 +910,6 @@ impl Default for DohEntry {
 
 impl DohEntry {
     /// Stores an `A` record's four octets, or silently drops it.
-    ///
-    /// Supersedes `doh_store_a` (`lib/doh.c:564-574`), whose own comment is
-    /// *"silently ignore addresses over the limit"*. The RDATA slice is exactly
-    /// four bytes because [`Self::rdata`] has already rejected any other
-    /// length with [`DohCode::DnsRdataLen`]; the slice pattern re-states that
-    /// so the conversion needs no index.
     fn store_a(&mut self, rdata: &[u8]) {
         // `if(d->numaddr < DOH_MAX_ADDR)`
         if self.addr.len() >= DOH_MAX_ADDR {
@@ -1217,7 +943,8 @@ impl DohEntry {
     /// that case -- an over-limit record is success, not an error.
     ///
     /// C's remaining failure mode, `if(!h->val) return DOH_OUT_OF_MEM;` after a
-    /// `curlx_memdup`, has **no counterpart**: Rust aborts on allocation
+    /// `curlx_memdup` of bytes already resident, has **no counterpart**: a
+    /// duplication has no stable fallible spelling and Rust aborts on allocation
     /// failure rather than reporting it. The return type is therefore `()`
     /// rather than a `Result` that could only ever be `Ok`.
     fn store_https(&mut self, rdata: &[u8]) {
@@ -1278,10 +1005,6 @@ impl DohEntry {
         // managed to write is retained even when it then fails. Pushing after
         // the walk with the outcome held aside is the same observable result
         // and needs no borrow of `self` across the walk.
-        //
-        // On a ceiling failure `DynBuf` empties itself, exactly as C's
-        // `curlx_dyn_addn` calls `curlx_dyn_free` and leaves the pointer NULL,
-        // so the retained value is empty in the same circumstances.
         let mut buffer = DynBuf::new(DYN_DOH_CNAME);
         let outcome = decode_cname_into(doh, index, &mut buffer);
         self.cname.push(buffer.take());
@@ -1314,11 +1037,6 @@ impl DohEntry {
     /// * `default` -- *"unsupported type, just skip it"* (`:695-697`). Reached
     ///   only through [`DnsType::Ns`], the one variant this module recognises
     ///   without handling.
-    ///
-    /// `rdata` is the already-sliced RDATA rather than the message plus an
-    /// offset, **except** for `CNAME`: a compressed name may point anywhere in
-    /// the message, so that arm needs the whole of it. Both are passed, which
-    /// is exactly the information C's `(doh, dohlen, index)` triple carried.
     ///
     /// # Errors
     ///
@@ -1365,11 +1083,6 @@ impl DohEntry {
 }
 
 /// The compression-following name walk of `doh_store_cname`'s loop body.
-///
-/// Split out of [`DohEntry::store_cname`] so that the walk borrows only its
-/// output buffer and never the whole entry. Every clause and every code is
-/// documented on [`DohEntry::store_cname`], which is the item a reader looking
-/// for `doh_store_cname` will find.
 ///
 /// # Errors
 ///
@@ -1451,21 +1164,9 @@ fn decode_cname_into(
     }
 }
 
-// ---------------------------------------------------------------------------
 // `doh_resp_decode` -- `lib/doh.c:711-852`.
-// ---------------------------------------------------------------------------
 
 /// Decodes one DNS response into `entry`.
-///
-/// Supersedes `doh_resp_decode` (`lib/doh.c:711-852`), marked `UNITTEST` there
-/// because `tests/unit/unit1655.c` and its neighbours reach it directly. Per
-/// AAP 0.8.7 those C unit tests cannot link against a Rust static library, so
-/// their coverage lives in this file's [`tests`] module instead.
-///
-/// `entry` is `&mut` rather than returned because a single entry accumulates
-/// the answers of **several** probes: [`is_resolved`] decodes the `A`, `AAAA`
-/// and `HTTPS` responses into one [`DohEntry`], which is what makes the minimum
-/// TTL a minimum across all of them.
 ///
 /// # The walk, section by section
 ///
@@ -1514,30 +1215,6 @@ fn decode_cname_into(
 /// #endif
 ///     return DOH_NO_CONTENT;
 /// ```
-///
-/// **That spelling occurs exactly once in the entire repository -- at this line
-/// -- and is defined nowhere.** It was verified by `grep -rn 'USE_HTTTPS' .`
-/// over the whole tree, which returns that single hit. The intended macro is
-/// `USE_HTTPSRR`, which is defined and used 40 times elsewhere.
-///
-/// The consequence is not cosmetic. The `#else` branch compiles in **every**
-/// real build, so `numhttps_rrs` is not consulted, and therefore **a response
-/// carrying only HTTPS resource records -- no address and no CNAME -- returns
-/// [`DohCode::NoContent`]**, even though the code the author clearly meant to
-/// write would have accepted it.
-///
-/// AAP 0.8.1 freezes observable behaviour and AAP 0.2.2 puts behavioural change
-/// outside this work's authority, so **the effective behaviour is reproduced**:
-/// [`DohEntry::stored_nothing`] tests the CNAME and address lists and ignores
-/// the HTTPS-RR list. It is not silently copied and it is not silently
-/// "corrected"; the reasoning is here, the locator is here, and
-/// [`tests::an_https_rr_only_answer_is_no_content_per_the_use_htttps_typo`]
-/// pins it so that a future change has to argue with a failing test.
-///
-/// The `type != CURL_DNS_TYPE_NS` clause of the same condition is likewise
-/// preserved and is likewise unreachable through this module's own probes,
-/// which never query [`DnsType::Ns`]. It is reachable through a caller that
-/// passes it, which is why it is a real branch rather than dead weight.
 ///
 /// # Errors
 ///
@@ -1674,11 +1351,6 @@ pub(crate) fn resp_decode(
 
 /// Advances `index` by `step`, requiring the bytes to be present.
 ///
-/// The shape C writes six times as `if(dohlen < (index + n)) return
-/// DOH_DNS_OUT_OF_RANGE; index += n;`. One helper is used so that the addition
-/// is checked once rather than six times, and so that a caller cannot advance
-/// without testing -- the mistake C's repetition invites.
-///
 /// # Errors
 ///
 /// [`DohCode::DnsOutOfRange`].
@@ -1691,16 +1363,6 @@ fn advance(doh: &[u8], index: usize, step: usize) -> Result<usize, DohCode> {
 }
 
 /// Skips one record of the authority or additional section.
-///
-/// Supersedes the two identical loop bodies at `lib/doh.c:797-813` and
-/// `:819-835`: skip the name, require eight bytes, step over `TYPE`, `CLASS`
-/// and `TTL` as `2 + 2 + 4`, read `RDLENGTH`, require that much room, and step
-/// over it.
-///
-/// C's `if(dohlen < (index + 8))` is exactly the `2 + 2 + 4` it then skips, and
-/// the second test at `if(dohlen < (index + 2))` is what covers the
-/// `RDLENGTH` read that follows. Both are kept, in C's order, as one
-/// `advance` each.
 ///
 /// # Errors
 ///
@@ -1725,13 +1387,6 @@ fn skip_unparsed_record(doh: &[u8], index: &mut usize) -> Result<(), DohCode> {
 }
 
 /// The [`DnsType`] a wire code names, or [`None`].
-///
-/// C has no such function: it compares `unsigned short` integers directly, so
-/// an unrecognised code simply fails every comparison. This is the same
-/// decision expressed once, and it is deliberately **not** `TryFrom`: the
-/// failure carries no information beyond "not one of the six", so an
-/// [`Option`] says everything a caller needs and none of them has an error to
-/// propagate.
 #[rustfmt::skip]
 const fn dns_type_from_u16(raw: u16) -> Option<DnsType> {
     match raw {
@@ -1745,18 +1400,10 @@ const fn dns_type_from_u16(raw: u16) -> Option<DnsType> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `doh_req_encode` -- `lib/doh.c:70-167`. BYTE-EXACT.
-// ---------------------------------------------------------------------------
 
 /// Builds the DNS query for `host` and `dnstype` into `out`, returning its
 /// length.
-///
-/// Supersedes `doh_req_encode` (`lib/doh.c:72-167`), marked `/* @unittest 1655
-/// */` at `:70`. **Every byte of the output is frozen** -- see the module
-/// preamble for the oracle -- and
-/// [`tests::the_golden_query_for_example_com_is_byte_exact`] asserts the whole
-/// of it against a literal rather than against a re-derivation.
 ///
 /// # The length pre-computation, and why the `+ 1` is there
 ///
@@ -1782,10 +1429,6 @@ const fn dns_type_from_u16(raw: u16) -> Option<DnsType> {
 /// > completed by appending a zero byte, representing the zero-length root
 /// > label, again increasing the overall length by one.
 ///
-/// So `expected_len = 12 + 1 + hostlen + 4`, plus one more when the host has no
-/// trailing dot (`:106-108`). The two constants are the header and the
-/// `TYPE`/`CLASS` pair; the standalone `+ 1` is the root label.
-///
 /// # The twelve-byte header
 ///
 /// ```text
@@ -1797,16 +1440,6 @@ const fn dns_type_from_u16(raw: u16) -> Option<DnsType> {
 /// 00 00   NSCOUNT = 0
 /// 00 00   ARCOUNT = 0
 /// ```
-///
-/// **The ID is always zero**, which is not laziness: it is why [`resp_decode`]
-/// can reject a non-zero ID outright with [`DohCode::DnsBadId`]. A DoH query
-/// travels inside one HTTPS request-response pair, so there is no second
-/// outstanding query for an identifier to disambiguate, and RFC 8484 section
-/// 4.1 recommends zero for exactly that reason -- a constant ID makes responses
-/// cacheable.
-///
-/// C writes the `QDCOUNT` pair as `'\0'` then a literal `1` (`:120-121`),
-/// high byte first. Every multi-byte field here is big-endian.
 ///
 /// # Divergences, both stated
 ///
@@ -1971,16 +1604,6 @@ pub(crate) fn req_encode(
 /// result = doh_probe_run(data, CURL_DNS_TYPE_HTTPS,
 ///                        qname ? qname : hostname, ...);
 /// ```
-///
-/// **This is wire-observable.** The prefixed form is the attrleaf convention of
-/// RFC 9460 section 9.1, and the format string is reproduced exactly --
-/// underscore, decimal port, `._https.`, host. On the default HTTPS port the
-/// plain hostname is used with no prefix at all, which is the same section's
-/// rule and not an optimisation.
-///
-/// `%d` is a signed conversion over C's `int port`; the port is a [`u16`] here,
-/// so the rendering is identical for every value that can arrive and negative
-/// ports are unrepresentable rather than merely unlikely.
 pub(crate) fn https_rr_qname(host: &str, port: u16) -> String {
     if port == PORT_HTTPS {
         host.to_owned()
@@ -1989,10 +1612,8 @@ pub(crate) fn https_rr_qname(host: &str, port: u16) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The HTTPS resource record: `doh_decode_rdata_name` (`lib/doh.c:1056-1097`),
 // `doh_resp_decode_httpsrr` (`:1099-1156`) and the local `Curl_junkscan`.
-// ---------------------------------------------------------------------------
 
 /// Decodes the DNS name at the head of `rdata`, returning it and what follows.
 ///
@@ -2002,42 +1623,6 @@ pub(crate) fn https_rr_qname(host: &str, port: u16) -> String {
 /// > The input buffer pointer will be modified so it points to just after the
 /// > end of the DNS name encoding on output. (And that is why it is an
 /// > "unsigned char \*\*" :-)
-///
-/// Returning the remainder as a slice is that modification, without the second
-/// level of indirection or the possibility of the caller forgetting to consume
-/// it.
-///
-/// # It cannot follow compression pointers, and that is the point
-///
-/// RFC 9460 section 2.2 forbids compression in a `TargetName`, and this
-/// function is given only the RDATA -- never the enclosing message -- so it has
-/// no base to resolve an offset against even if one appeared. That
-/// self-containment is exactly what lets the HTTPS-RR record decoder live here
-/// without taking on the message-wide coupling [`decode_cname_into`] needs.
-///
-/// A length byte with its type bits set is therefore treated as an ordinary
-/// length, as C does: C reads `clen = *cp++` and tests only `clen >= rem`, so a
-/// `0xc0` byte asks for 192 octets and fails the bound. That is reproduced
-/// rather than improved on.
-///
-/// # The name always ends with a dot, including the root
-///
-/// Each label is appended followed by `"."` (`:1081-1082`), so `"name"` becomes
-/// `"name."`. A zero-length name is the special case at `:1071-1074`, which
-/// returns `"."` alone. Both are what `tests/unit/unit1658.c` expects -- its
-/// vectors read `name.`, `name.some.` and `.` -- and both are wire-observable
-/// through the trace line of [`print_httpsrr`].
-///
-/// # C's error codes, kept as they are rather than as they should be
-///
-/// C returns `CURLE_OUT_OF_MEMORY` for three distinct bound failures
-/// (`:1066`, `:1079`, `:1089`) and `CURLE_TOO_LARGE` for an append that hit the
-/// [`CURL_MAXLEN_HOST_NAME`] ceiling (`:1083`). Neither is what the condition
-/// describes, but the caller collapses both into
-/// [`CURLcode::WeirdServerReply`] before anything observes them
-/// (`:1124-1125` jumps to `err` with `result` still holding its
-/// `CURLE_OUT_OF_MEMORY` initialiser from `:1112`), so the distinction is not
-/// observable and the codes are reproduced without being relied upon.
 ///
 /// # Errors
 ///
@@ -2115,12 +1700,6 @@ fn decode_rdata_name(rdata: &[u8]) -> CodeResult<(String, &[u8])> {
 
 /// Rejects a name carrying control bytes, a space, or `DEL`.
 ///
-/// Supersedes `Curl_junkscan(url, urllen, FALSE)` (`lib/urlapi.c:222-239`),
-/// **implemented locally rather than imported**. `Curl_junkscan` lives in
-/// `lib/urlapi.c`, whose successor is `crate::url`, and this module has no
-/// dependency on that module and must not acquire one; AAP 0.4.2's rule is that
-/// an import resolves to a declared dependency or does not exist.
-///
 /// ```c
 /// /* scan for byte values <= 31, 127 and sometimes space */
 /// CURLUcode Curl_junkscan(const char *url, size_t *urllen, bool allowspace)
@@ -2138,25 +1717,6 @@ fn decode_rdata_name(rdata: &[u8]) -> CodeResult<(String, &[u8])> {
 ///   return CURLUE_OK;
 /// }
 /// ```
-///
-/// The call site passes `allowspace = FALSE` (`lib/doh.c:1127`), so `control`
-/// is `0x20` and **the space character itself is rejected** -- the comment's
-/// *"sometimes space"* resolves to "yes, here". The rule is therefore: reject
-/// any byte at or below `0x20`, and reject `0x7f`.
-///
-/// The `*urllen` out-parameter is C's way of returning the `strlen` it already
-/// computed; there is nothing to return here, because a [`str`] carries its
-/// length. The [`CURLUcode`](crate::error::CURLUcode) the C returns is likewise
-/// not propagated: the one call site discards it and substitutes
-/// [`CURLcode::WeirdServerReply`] (`lib/doh.c:1128-1130`), so a [`bool`] is
-/// exactly the information used.
-///
-/// One divergence, and it is a tightening rather than a loosening: C scans up
-/// to the first NUL because it takes a C string, so a name containing an
-/// interior NUL is silently truncated and its tail unexamined. A [`str`] has no
-/// terminator, so every byte is scanned -- and an interior NUL is `0x00`, which
-/// this rejects. A name C would have accepted-after-truncating is rejected
-/// here, which is the safe direction for a value that came off the wire.
 fn junkscan(name: &str) -> bool {
     // `if(n > CURL_MAX_INPUT_LENGTH) return CURLUE_MALFORMED_INPUT;`
     if name.len() > CURL_MAX_INPUT_LENGTH {
@@ -2169,17 +1729,6 @@ fn junkscan(name: &str) -> bool {
 }
 
 /// Decodes one HTTPS resource record's RDATA into an [`HttpsRrInfo`].
-///
-/// Supersedes `doh_resp_decode_httpsrr` (`lib/doh.c:1104-1156`), marked
-/// `/* @unittest 1658 */` at `:1103`. **This function belongs to this file and
-/// not to `httpsrr.rs`**, exactly as it belongs to `lib/doh.c` and not to
-/// `lib/httpsrr.c`: it needs [`get16bit`] and [`decode_rdata_name`], which are
-/// DNS-wire helpers. The module preamble states the boundary in full.
-///
-/// The per-SvcParam work is **delegated**, not duplicated:
-/// [`HttpsRrInfo::set_param`] owns all eight arms and their eight trace
-/// strings, and re-implementing any of them here would duplicate that output
-/// and be caught by the byte-exact comparison of AAP 0.6.7.
 ///
 /// # The record layout
 ///
@@ -2210,20 +1759,6 @@ fn junkscan(name: &str) -> bool {
 ///   expected_min_pcode = pcode + 1;
 /// }
 /// ```
-///
-/// `expected_min_pcode = pcode + 1` is what makes the ordering **strict**: a
-/// repeated key is rejected as firmly as a descending one, which RFC 9460
-/// section 2.2 requires and which is also why
-/// [`HttpsRrInfo::set_param`]'s replace-on-repeat semantics is unreachable
-/// through this path. `expected_min_pcode` is a `uint32_t` over a `uint16_t`
-/// `pcode`, so `pcode + 1` cannot wrap even at `0xffff`; [`u32`] is used here
-/// for the same reason.
-///
-/// **The loop condition is `len >= 4`, so a remainder of one to three bytes
-/// ends it silently.** C then asserts the remainder is zero in a debug build
-/// only, and a release build tolerates it. That is reproduced with
-/// [`debug_assert!`] and is deliberately **not** hardened into an error:
-/// hardening it would reject records curl accepts.
 ///
 /// # Errors
 ///
@@ -2259,13 +1794,6 @@ pub(crate) fn resp_decode_httpsrr(
 
     // `lhrr = curlx_calloc(1, sizeof(struct Curl_https_rrinfo));` and the
     // `if(!lhrr) return CURLE_OUT_OF_MEMORY;` that has no counterpart.
-    //
-    // C allocates the record first and then fills `priority` and `target` into
-    // it; both are read above and moved in here instead, so the record is
-    // never observable in a partly-filled state. That reordering is
-    // unobservable: the record is a local until it is returned, and every
-    // failure above is a `goto err` in C which discards the whole allocation
-    // without anyone having read it.
     let mut record = HttpsRrInfo {
         priority,
         target: Some(target),
@@ -2302,13 +1830,6 @@ pub(crate) fn resp_decode_httpsrr(
         // `cp += plen; len -= plen;`
         rest = rest.get(plen..).ok_or(CURLcode::WeirdServerReply)?;
         // `expected_min_pcode = pcode + 1;`
-        //
-        // C's `expected_min_pcode` is a `uint32_t` and `pcode` a `uint16_t`,
-        // so the addition cannot overflow there and cannot here either --
-        // 65,535 + 1 is comfortably inside `u32`. The saturating form is used
-        // rather than a bare `+` so that the widening is explicit and no
-        // release-mode wrap is possible even if the operand type ever changes;
-        // a wrapped bound would let a descending key pass the ascent test.
         expected_min_pcode = u32::from(pcode).saturating_add(1);
     }
 
@@ -2323,10 +1844,8 @@ pub(crate) fn resp_decode_httpsrr(
     Ok(record)
 }
 
-// ---------------------------------------------------------------------------
 // Diagnostic output: `doh_print_buf` (`lib/doh.c:189-205`), `doh_show`
 // (`:855-897`) and `doh_print_httpsrr` (`:1162-1195`).
-// ---------------------------------------------------------------------------
 
 /// Traces a labelled hexadecimal dump of `buf`, truncating a long one.
 ///
@@ -2361,13 +1880,6 @@ pub(crate) fn resp_decode_httpsrr(
 ///   400, halting at 2. A 200-byte buffer therefore prints 199 bytes' worth of
 ///   hex and claims not to be truncated. Reproduced exactly, with
 ///   [`HEXENCODE_MAX_INPUT`] naming the real limit.
-///
-/// C compiles this under `#if defined(USE_HTTPSRR) && defined(DEBUGBUILD) &&
-/// defined(CURLVERBOSE)`. None of the three has a successor here: there is no
-/// `httpsrr` feature and no `CURLVERBOSE`, and the `DEBUGBUILD` half is
-/// answered at the call sites that need it -- see [`print_httpsrr`]. The
-/// function itself is unconditional, because a trace emitter that vanishes by
-/// configuration is a trace emitter whose output cannot be tested.
 pub(crate) fn print_buf(prefix: &str, buf: &[u8], tracer: &mut Tracer<'_>) {
     // `if(len > (LOCAL_PB_HEXMAX / 2)) truncated = TRUE;`
     let truncated = buf.len() > LOCAL_PB_HEXMAX / 2;
@@ -2393,12 +1905,6 @@ pub(crate) fn print_buf(prefix: &str, buf: &[u8], tracer: &mut Tracer<'_>) {
 
 /// The most bytes `Curl_hexencode` will encode into a [`LOCAL_PB_HEXMAX`]
 /// buffer: 199.
-///
-/// `while(len-- && (olen >= 3))` writing two characters and subtracting two
-/// from `olen` per iteration (`lib/escape.c:205-211`). Starting at 400 the
-/// budget reaches 2 after 199 iterations and the loop stops, leaving room for
-/// the terminator C needs and Rust does not. Derived rather than written as
-/// `199` so the arithmetic stays checkable.
 const HEXENCODE_MAX_INPUT: usize = (LOCAL_PB_HEXMAX - 2) / 2;
 
 /// Traces everything a [`DohEntry`] holds.
@@ -2423,13 +1929,6 @@ const HEXENCODE_MAX_INPUT: usize = (LOCAL_PB_HEXMAX - 2) / 2;
 /// * `"CNAME: %s"` (`:895`) -- and note that it carries **no `[DoH]`
 ///   prefix**, unlike its three neighbours. That is in the C source and is
 ///   left alone.
-///
-/// The HTTPS-RR loop has two forms (`:886-892`): a debug build with verbose
-/// tracing dumps the record's bytes through [`print_buf`] with the prefix
-/// `"DoH HTTPS"`, and every other build prints
-/// `"DoH HTTPS RR: length %d"`. Both are reproduced, selected by
-/// [`cfg!(debug_assertions)`](cfg) -- the closest available reading of
-/// `DEBUGBUILD`, and the same reading [`print_httpsrr`] uses.
 pub(crate) fn show(entry: &DohEntry, tracer: &mut Tracer<'_>) {
     // `infof(data, "[DoH] TTL: %u seconds", d->ttl);`
     infof!(tracer, "{}", msg::doh_ttl(entry.ttl));
@@ -2468,13 +1967,6 @@ pub(crate) fn show(entry: &DohEntry, tracer: &mut Tracer<'_>) {
 }
 
 /// The assembled IPv6 line of `lib/doh.c:869-882`.
-///
-/// Eight colon-separated groups of four lowercase hexadecimal digits, built
-/// from the sixteen stored octets two at a time, after the literal
-/// [`msg::DOH_AAAA_PREFIX`]. Written as its own function so that the assembly
-/// is testable in isolation against the C's `"%s%02x%02x"` walk, and so that
-/// the deliberate refusal to use [`Ipv6Addr`]'s [`fmt::Display`] has somewhere
-/// to be stated once.
 fn aaaa_line(addr: Ipv6Addr) -> String {
     let mut line = String::from(msg::DOH_AAAA_PREFIX);
     // `for(j = 0; j < 16; j += 2)` with `"%s%02x%02x"` and `j ? ":" : ""`.
@@ -2489,12 +1981,6 @@ fn aaaa_line(addr: Ipv6Addr) -> String {
 }
 
 /// The text C's `%s` would print for a byte buffer it holds as a `char *`.
-///
-/// A decoded CNAME is arbitrary octets, and C hands the buffer straight to
-/// `infof`'s `%s`, which stops at the first NUL and copies the rest verbatim.
-/// Both halves are reproduced: the scan stops at a NUL, and the surviving bytes
-/// are converted lossily because a trace line is text and a label is not
-/// required to be UTF-8.
 fn cstr_text(bytes: &[u8]) -> String {
     let end = memchr::memchr(0, bytes).unwrap_or(bytes.len());
     let upto = bytes.get(..end).unwrap_or(bytes);
@@ -2502,17 +1988,6 @@ fn cstr_text(bytes: &[u8]) -> String {
 }
 
 /// Traces every field of a decoded HTTPS resource record.
-///
-/// Supersedes `doh_print_httpsrr` (`lib/doh.c:1162-1195`). **This function
-/// belongs to this file**, not to `httpsrr.rs`, because it is declared and
-/// defined in `lib/doh.c` and because it prints through [`print_buf`], which is
-/// this file's. The module preamble states the boundary.
-///
-/// C compiles it under `#if defined(DEBUGBUILD) && defined(CURLVERBOSE)` and
-/// calls it under the same pair (`:1271-1273`). The gate is answered at the
-/// call site in [`is_resolved`] with [`cfg!(debug_assertions)`](cfg); the
-/// function itself is unconditional so that its eleven strings are reachable
-/// from a test in every build.
 ///
 /// # Eleven strings, and the singular/plural asymmetry
 ///
@@ -2531,20 +2006,6 @@ fn cstr_text(bytes: &[u8]) -> String {
 ///   absent: [`msg::HTTPS_RR_NO_ECHCONFIGLIST`]
 /// * **`ipv6hint`** -- present: [`msg::HTTPS_RR_IPV6HINT`] via [`print_buf`] --
 ///   absent: [`msg::HTTPS_RR_NO_IPV6HINTS`]
-///
-/// **The IPv6 pair is singular on the positive side and plural on the
-/// negative** (`:1189` versus `:1193`), where the IPv4 pair is plural on both.
-/// Real, in the shipped source, visible in a `--trace` log, and preserved.
-///
-/// The ALPN test is `if(hrr->alpns[0] != ALPN_none)` (`:1167`) -- **the first
-/// slot only**, read directly rather than through an iterator, which is why
-/// `httpsrr.rs` keeps a fixed four-element array. All four slots are then
-/// printed unconditionally, trailing zeros included.
-///
-/// The target is a `char *` C prints with `%s` and is [`Option`] here.
-/// [`None`] cannot arrive: [`resp_decode_httpsrr`] sets it on every success
-/// path. The empty string is used for the impossible case rather than
-/// inventing a `"(nil)"` that no C build would print on this path.
 pub(crate) fn print_httpsrr(record: &HttpsRrInfo, tracer: &mut Tracer<'_>) {
     // `infof(data, "HTTPS RR: priority %d, target: %s", priority, target);`
     let target = record.target.as_deref().unwrap_or_default();
@@ -2591,9 +2052,7 @@ pub(crate) fn print_httpsrr(record: &HttpsRrInfo, tracer: &mut Tracer<'_>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The request shape -- `doh_probe_run`'s option block, `lib/doh.c:328-401`.
-// ---------------------------------------------------------------------------
 
 /// Which URL schemes a DoH probe may use.
 ///
@@ -2608,21 +2067,6 @@ pub(crate) fn print_httpsrr(record: &HttpsRrInfo, tracer: &mut Tracer<'_>) {
 ///   ERROR_CHECK_SETOPT(CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
 /// #endif
 /// ```
-///
-/// **The default is [`Self::HttpsOnly`], and a release build can reach no other
-/// value.** That is stated as a decision rather than inherited by accident: an
-/// unencrypted DoH query defeats the point of DoH, so plain HTTP must never
-/// become reachable in a shipped artifact. [`Self::for_this_build`] is the one
-/// place the choice is made, and it selects the permissive value only under
-/// [`cfg!(debug_assertions)`](cfg).
-///
-/// `debug_assertions` is the closest available reading of `DEBUGBUILD`, and the
-/// difference matters enough to record: `DEBUGBUILD` is a compile-time switch
-/// independent of the `Debug` token in the `curl --version` banner, and AAP
-/// 0.6.6's decision not to advertise `Debug` therefore does **not** decide
-/// this. A `cargo test` run is a debug build and does get the permissive value,
-/// which is what lets a fixture serve DoH over plain HTTP; `cargo build
-/// --release` does not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DohProtocols {
     /// `CURLPROTO_HTTPS` alone -- the release-build value.
@@ -2633,12 +2077,6 @@ pub(crate) enum DohProtocols {
 
 impl DohProtocols {
     /// The value this build uses.
-    ///
-    /// Written as a runtime `if` over [`cfg!`] rather than as two
-    /// `#[cfg]`-gated bodies so that both arms are type-checked in both
-    /// builds, and so that the release arm cannot silently disappear if the
-    /// attribute is ever misspelled -- the failure mode a `cfg` on a
-    /// non-existent name produces.
     pub(crate) fn for_this_build() -> Self {
         if cfg!(debug_assertions) {
             Self::HttpAndHttps
@@ -2648,7 +2086,6 @@ impl DohProtocols {
     }
 
     /// True when a `http://` DoH URL is permitted.
-    // No consumer yet; a transport consults it before accepting a URL.
     #[allow(dead_code)]
     pub(crate) fn allows_plain_http(self) -> bool {
         matches!(self, Self::HttpAndHttps)
@@ -2663,14 +2100,6 @@ impl DohProtocols {
 /// ERROR_CHECK_SETOPT(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
 /// ERROR_CHECK_SETOPT(CURLOPT_PIPEWAIT, 1L);
 /// ```
-///
-/// `CURL_HTTP_VERSION_2TLS` is *"use version 2 for HTTPS, version 1.1 for
-/// HTTP"*, and `CURLOPT_PIPEWAIT` asks the transfer to wait for an existing
-/// connection to be usable for multiplexing rather than opening a second one --
-/// which is what lets several DoH probes share one HTTP/2 connection, and
-/// therefore what makes the hint worth setting at all.
-///
-/// The successor gate is `#[cfg(feature = "http2")]`, one of the fifteen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DohHttpVersion {
     /// `CURL_HTTP_VERSION_2TLS` (the integer 4 in `include/curl/curl.h`).
@@ -2696,17 +2125,6 @@ pub(crate) enum DohHttpVersion {
 /// the DoH server's certificate: weakening the transfer does not weaken the
 /// name resolution that precedes it, and there is no option that weakens both
 /// at once.
-///
-/// AAP 0.8.1 freezes default-on verification, so [`Self::default`] is all three
-/// on, which is `CURLOPT_DOH_SSL_VERIFY*`'s own default.
-///
-/// # `2`, not `1`
-///
-/// `CURLOPT_SSL_VERIFYHOST` historically accepted `1` as "check the name exists
-/// but do not compare it", a setting curl now rejects; `2` is "compare the
-/// name". C writes `2L` and so does this, through
-/// [`Self::verify_host_value`]. Writing `1` would be a different option value
-/// and is exactly the kind of silent weakening this struct exists to prevent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DohVerify {
     /// `data->set.doh_verifyhost`, from `CURLOPT_DOH_SSL_VERIFYHOST`.
@@ -2718,8 +2136,6 @@ pub(crate) struct DohVerify {
 }
 
 impl Default for DohVerify {
-    /// All three on, which is `CURLOPT_DOH_SSL_VERIFY*`'s documented default
-    /// and what AAP 0.8.1 freezes.
     fn default() -> Self {
         Self {
             host: true,
@@ -2731,11 +2147,6 @@ impl Default for DohVerify {
 
 impl DohVerify {
     /// The `CURLOPT_SSL_VERIFYHOST` value: `2` or `0`. **Never `1`.**
-    ///
-    /// `i64` rather than a C width because `crate::ffi` owns those spellings;
-    /// the two coincide on every target in AAP 0.1.1 G8's matrix, all four of
-    /// which are LP64, so nothing is lost.
-    // No consumer yet; a transport applies it as `CURLOPT_SSL_VERIFYHOST`.
     #[allow(dead_code)]
     pub(crate) const fn verify_host_value(self) -> i64 {
         if self.host {
@@ -2746,11 +2157,6 @@ impl DohVerify {
     }
 
     /// The `CURLOPT_SSL_VERIFYPEER` value: `1` or `0`.
-    ///
-    /// Written as an `if` rather than `i64::from(bool)` because `From` is not a
-    /// const trait at the MSRV floor of 1.75, and this being `const` is what
-    /// lets a test compare against it without a runtime call.
-    // No consumer yet; a transport applies it as `CURLOPT_SSL_VERIFYPEER`.
     #[allow(dead_code)]
     pub(crate) const fn verify_peer_value(self) -> i64 {
         if self.peer {
@@ -2761,7 +2167,6 @@ impl DohVerify {
     }
 
     /// The `CURLOPT_SSL_VERIFYSTATUS` value: `1` or `0`.
-    // No consumer yet; a transport applies it as `CURLOPT_SSL_VERIFYSTATUS`.
     #[allow(dead_code)]
     pub(crate) const fn verify_status_value(self) -> i64 {
         if self.status {
@@ -2798,7 +2203,7 @@ impl DohVerify {
 /// record about them is not their value but the *decision* -- "inherit, and
 /// only when set" -- so each is a presence flag, and the transport that holds
 /// the real callback consults it.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct DohTlsSettings {
     /// `data->set.ssl.custom_cafile`, copied directly at `:370` rather than
     /// through `curl_easy_setopt`.
@@ -2840,12 +2245,46 @@ pub(crate) struct DohTlsSettings {
     pub(crate) ssl_options: i64,
 }
 
+/// Presence and lengths, never a trust-material path or blob.
+///
+/// The three `Option<String>` paths -- `cainfo`, `capath`, `crlfile` -- and the
+/// `cainfo_blob` bytes describe where this process's trust anchors live and
+/// what they are. A path discloses a filesystem layout and, for a
+/// per-tenant deployment, often a tenant identity; a CA blob is the anchor
+/// itself. Neither belongs in a log, and neither is needed there: what a reader
+/// debugging a DoH trust failure needs is whether a custom anchor was supplied
+/// at all, which is what a presence flag and a length say.
+///
+/// The booleans and `ssl_options` render in full: they are the policy, they are
+/// what `doh_probe_run` (`lib/doh.c:362-401`) copies, and none of them is a
+/// secret.
+impl fmt::Debug for DohTlsSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DohTlsSettings")
+            .field("custom_cafile", &self.custom_cafile)
+            .field("custom_capath", &self.custom_capath)
+            .field("custom_cablob", &self.custom_cablob)
+            .field("cainfo", &self.cainfo.as_deref().map(str::len))
+            .field("cainfo_blob", &self.cainfo_blob.as_deref().map(Redacted))
+            .field("capath", &self.capath.as_deref().map(str::len))
+            .field("crlfile", &self.crlfile.as_deref().map(str::len))
+            .field("certinfo", &self.certinfo)
+            .field("ssl_ctx_callback", &self.ssl_ctx_callback)
+            .field("ssl_ctx_data", &self.ssl_ctx_data)
+            .field("debug_callback", &self.debug_callback)
+            .field("debug_data", &self.debug_data)
+            .field("ec_curves", &self.ec_curves.as_deref().map(str::len))
+            .field("ssl_options", &self.ssl_options)
+            .finish()
+    }
+}
+
 /// Everything a DoH probe needs from the user's transfer.
 ///
 /// The inputs of `doh_probe_run` that come from `data`, gathered so that the
 /// probe builder has one argument instead of a dozen. Nothing here is computed;
 /// [`DohProbeRequest::build`] is what turns these into a request.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct DohSettings {
     /// `data->set.str[STRING_DOH]` -- `CURLOPT_DOH_URL`, from `--doh-url`.
     pub(crate) url: String,
@@ -2871,6 +2310,31 @@ pub(crate) struct DohSettings {
     pub(crate) redirect_stderr: bool,
 }
 
+/// The endpoint is redacted; the policy is not.
+///
+/// `CURLOPT_DOH_URL` is a full URL and may carry userinfo -- a private DoH
+/// resolver commonly authenticates by embedding a token in the authority or
+/// the path, which is why `docs/cmdline-opts/doh-url.md` describes it as an
+/// ordinary URL. `crate::url::Url` redacts userinfo for the same reason, so
+/// rendering this as a plain string would have reinstated the disclosure. It
+/// renders as a byte count.
+///
+/// Everything else -- the verification triple, the inherited TLS settings
+/// (themselves redacted), and the three inherited flags -- renders in full,
+/// because those are the policy a reader is checking and none is a secret.
+impl fmt::Debug for DohSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DohSettings")
+            .field("url", &Redacted(self.url.as_bytes()))
+            .field("verify", &self.verify)
+            .field("tls", &self.tls)
+            .field("verbose", &self.verbose)
+            .field("no_signal", &self.no_signal)
+            .field("redirect_stderr", &self.redirect_stderr)
+            .finish()
+    }
+}
+
 /// One fully-specified DoH request, ready for a transport.
 ///
 /// The successor of everything `doh_probe_run` (`lib/doh.c:278-428`)
@@ -2893,7 +2357,7 @@ pub(crate) struct DohSettings {
 /// to be pushed them. `doh->master_mid` (`:404`) correlates a completion with
 /// its parent and has nothing to correlate. Both are in the module preamble's
 /// deletion table.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct DohProbeRequest {
     /// `CURLOPT_URL` (`:328`) -- the DoH endpoint, not the name being resolved.
     pub(crate) url: String,
@@ -2938,19 +2402,56 @@ pub(crate) struct DohProbeRequest {
     pub(crate) redirect_stderr: bool,
 }
 
+/// The endpoint and the query are redacted; the request shape is not.
+///
+/// # Why the raw query is a privacy matter and not merely a secret
+///
+/// [`Self::body`] is a DNS wire query, and its QNAME is **the hostname the
+/// user is resolving**. The entire purpose of DNS-over-HTTPS is to stop that
+/// name being observable (RFC 8484 section 1), so writing it into a log defeats
+/// the feature the caller opted into. It renders as a byte count.
+///
+/// [`Self::url`] and [`Self::headers`] are redacted for the reason
+/// [`DohSettings`] records: a private endpoint's credential lives in the URL,
+/// and the single header is the `Content-Type` the C freezes, whose value is
+/// uninteresting but whose slot is a place a future change could put a token.
+///
+/// Everything that decides the request's SHAPE renders in full -- the protocol
+/// restriction, the HTTP version, `pipewait`, the timeout, the record type, the
+/// verification triple and the inherited flags -- because that is what a test
+/// or a reader is comparing against `lib/doh.c:290-401`, and none of it is
+/// sensitive.
+impl fmt::Debug for DohProbeRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DohProbeRequest")
+            .field("url", &Redacted(self.url.as_bytes()))
+            .field("body", &Redacted(&self.body))
+            .field("headers", &self.headers.len())
+            .field("protocols", &self.protocols)
+            .field("http_version", &self.http_version)
+            .field("pipewait", &self.pipewait)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("dnstype", &self.dnstype)
+            .field("verify", &self.verify)
+            .field("tls", &self.tls)
+            .field("verbose", &self.verbose)
+            .field("no_signal", &self.no_signal)
+            .field("redirect_stderr", &self.redirect_stderr)
+            .finish()
+    }
+}
+
 impl DohProbeRequest {
     /// The HTTP method, which is always `POST`.
     ///
     /// C expresses it by setting `CURLOPT_POSTFIELDS` (`:332`), which makes the
     /// request a POST as a side effect. Named here so that a test can assert it
     /// and a transport need not infer it from the presence of a body.
-    // No consumer yet; a transport reads it, and the tests assert it.
     #[allow(dead_code)]
     pub(crate) const METHOD: &'static str = "POST";
 
     /// `CURLOPT_DEFAULT_PROTOCOL` (`:329`) -- the scheme assumed for a DoH URL
     /// written without one.
-    // No consumer yet; a transport reads it, and the tests assert it.
     #[allow(dead_code)]
     pub(crate) const DEFAULT_PROTOCOL: &'static str = msg::DEFAULT_PROTOCOL;
 
@@ -2962,17 +2463,10 @@ impl DohProbeRequest {
     /// > DoH handles must not inherit private_data. The handles may be passed to
     /// > the user via callbacks and the user will be able to identify them as
     /// > internal handles because private data is not set.
-    ///
-    /// The *mechanism* is gone with the sub-handle, but the *intent* survives
-    /// and is what this constant states: a DoH request is internal, is
-    /// identifiable as internal, and carries no application-supplied
-    /// private data.
-    // No consumer yet; a transport reads it to mark the request internal.
     #[allow(dead_code)]
     pub(crate) const INTERNAL: bool = true;
 
     /// `CURLOPT_POSTFIELDSIZE` (`:333`) -- the body length C passes separately.
-    // No consumer yet; a transport reads it as `CURLOPT_POSTFIELDSIZE`.
     #[allow(dead_code)]
     pub(crate) fn body_len(&self) -> usize {
         self.body.len()
@@ -3001,12 +2495,6 @@ impl DohProbeRequest {
     /// }
     /// ```
     ///
-    /// A name too long, a bad label and a buffer too small all become "out of
-    /// memory", which describes none of them. AAP 0.8.1 freezes observable
-    /// behaviour and a returned code is observable, so it is reproduced. The
-    /// [`DohCode`] is not lost -- it is what the `failf` line reports, which is
-    /// where a user actually learns what went wrong.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::OutOfMemory`] for a query that cannot be encoded, or
@@ -3034,11 +2522,6 @@ impl DohProbeRequest {
 
         // Step 2. `timeout_ms = Curl_timeleft_ms(data); if(timeout_ms < 0)
         // { result = CURLE_OPERATION_TIMEDOUT; goto error; }`.
-        //
-        // The sign test comes FIRST and is never routed through `mstotv`:
-        // `mstotv` reads a negative count as "block forever", which is the
-        // exact opposite of what a negative time-left means. `crate::dns::
-        // resolver` documents the same clash at the same depth.
         if timeout_ms < 0 {
             return Err(CURLcode::OperationTimedout);
         }
@@ -3072,13 +2555,6 @@ impl DohProbeRequest {
 
     /// The deadline as a [`Duration`](core::time::Duration), or [`None`] for no
     /// deadline.
-    ///
-    /// [`mstotv`]'s reading, which is what a transport wants: [`None`] means
-    /// "do not bound the wait", and a zero millisecond count reaches it as
-    /// `Some(ZERO)`. The negative case cannot arrive, because
-    /// [`Self::build`] refuses it -- which is why calling `mstotv` here is safe
-    /// where calling it there would have inverted the meaning.
-    // No consumer yet; a transport bounds its wait with it.
     #[allow(dead_code)]
     pub(crate) fn timeout(&self) -> Option<core::time::Duration> {
         mstotv(self.timeout_ms)
@@ -3087,26 +2563,32 @@ impl DohProbeRequest {
 
 /// The DoH transport seam, carrying the whole request rather than two fields.
 ///
-/// [`crate::dns::DohTransport`] is this directory's declared seam and is
-/// deliberately narrow -- *"carries bytes and nothing else"*, as its own
-/// documentation says. That narrowness is right for the cycle it breaks and
-/// insufficient for the request shape this file freezes, so this trait is the
-/// same seam widened to a [`DohProbeRequest`], and **every [`DohTransport`] is
-/// one automatically** through the blanket implementation below.
-///
 /// A production transport in `crate::protocols` therefore has a choice:
 ///
-/// * implement [`DohTransport`] and receive the URL and the query, letting the
-///   blanket implementation drop the rest -- correct whenever the transport
-///   already applies curl's own option defaults, which the crate's own HTTP
-///   client does; or
 /// * implement this trait directly and receive everything, including the
-///   verification triple and the protocol restriction.
+///   verification triple, the trust material and the protocol restriction; or
+/// * implement [`DohTransport`] and be wrapped in [`NarrowDohTransport`], which
+///   forwards the URL and the query and **refuses, rather than silently
+///   dropping, a request carrying policy those two fields cannot express.**
 ///
-/// It may not do both: the blanket implementation covers every
-/// [`DohTransport`], so a type implementing both would be a coherence error.
-/// That is a feature rather than a limitation -- there is exactly one way for
-/// any given transport to be reached.
+/// # There is no blanket implementation, deliberately
+///
+/// There was: `impl<T: DohTransport + ?Sized> DohProbeTransport for T` forwarded
+/// `url` and `body` and discarded the other eleven fields, on the argument that
+/// a narrow transport "is being trusted to apply curl's own defaults". The
+/// argument does not survive contact with the fields it was dropping.
+/// [`DohProbeRequest::verify`] and [`DohProbeRequest::tls`] are not defaults to
+/// be re-derived -- they are the caller's `CURLOPT_DOH_SSL_VERIFYPEER`,
+/// `CURLOPT_DOH_SSL_VERIFYHOST`, `CURLOPT_DOH_SSL_VERIFYSTATUS` and the CA
+/// file, path, blob and client certificate that go with them. A request built
+/// to verify a private DoH resolver against a pinned CA would have executed
+/// against the transport's own trust store instead, with nothing anywhere
+/// reporting the substitution.
+///
+/// Being implicit was the whole defect: a coherent-looking `impl DohTransport`
+/// silently became the strictest-looking `DohProbeTransport`. Requiring the
+/// wrapper to be named makes the narrowing a decision somebody wrote down, and
+/// makes it checkable -- see [`NarrowDohTransport::unconveyable`].
 pub(crate) trait DohProbeTransport: fmt::Debug + Send + Sync {
     /// Issues one DoH request and returns the response body.
     ///
@@ -3122,25 +2604,117 @@ pub(crate) trait DohProbeTransport: fmt::Debug + Send + Sync {
     ) -> ResolveFuture<'a, Vec<u8>>;
 }
 
-impl<T: DohTransport + ?Sized> DohProbeTransport for T {
-    /// Adapts the narrow seam by handing it the two fields it takes.
+/// Adapts a narrow [`DohTransport`] to the full seam, **fail-closed**.
+///
+/// Named rather than blanket, and that is the point: wrapping a transport that
+/// only carries bytes is a decision to forgo everything else the request says,
+/// so it has to be written at the call site instead of applying itself by
+/// coherence.
+///
+/// The wrapper does not merely document the loss, it refuses it.
+/// [`Self::unconveyable`] enumerates every field the two forwarded arguments
+/// cannot express, and [`Self::probe`] returns
+/// [`CURLcode::SslConnectError`] rather than issuing a request under a weaker
+/// policy than the caller asked for. A transport that needs the whole request
+/// implements [`DohProbeTransport`] directly; a transport that genuinely only
+/// carries bytes may be wrapped, and will then be told when the request has
+/// outgrown it.
+#[derive(Debug)]
+#[allow(dead_code)] // The production transport lands with crate::protocols.
+pub(crate) struct NarrowDohTransport<T: ?Sized>(
+    /// The byte-carrying transport being adapted.
+    pub(crate) T,
+);
+
+#[allow(dead_code)]
+impl<T: DohTransport + ?Sized> NarrowDohTransport<T> {
+    /// The first field this request carries that the narrow seam cannot convey,
+    /// or [`None`] when the request is fully expressible as a URL and a body.
     ///
-    /// The URL and the body are the two that decide the bytes on the wire, so a
-    /// narrow transport is not being deprived of anything that changes what a
-    /// fixture observes -- it is being trusted to apply curl's own defaults for
-    /// the header, the method and the verification, which is what "the crate's
-    /// own HTTP client" means.
+    /// Split out as a pure function over the request so the policy is testable
+    /// without a transport, a runtime or a network -- the same reason
+    /// `crate::tls::keylog` splits its own verdict out.
+    ///
+    /// The order is severity, not declaration: the trust material and the
+    /// verification triple come first, because those are the two whose loss
+    /// changes who the resolver is allowed to be. It has no effect on whether a
+    /// request is accepted.
+    ///
+    /// `headers` is compared against the single header
+    /// [`DohProbeRequest::build`] always sets, `Content-Type:
+    /// application/dns-message`. That one IS conveyable, because
+    /// [`DohTransport::post`]'s contract is to send it -- its own documentation
+    /// says the seam "POSTs it with `Content-Type: application/dns-message`".
+    /// Any other header is not.
+    ///
+    /// `dnstype` is absent from the list on purpose: it is already encoded in
+    /// the query bytes, so forwarding the body forwards it.
+    fn unconveyable(request: &DohProbeRequest) -> Option<&'static str> {
+        if request.tls != DohTlsSettings::default() {
+            // A CA file, path or blob, a client certificate, a CRL, a curve
+            // list, an SSL_CTX callback or a debug callback. All of these decide
+            // which resolver is trusted, and none reaches a `post(url, body)`.
+            return Some("CURLOPT_DOH_SSL trust material");
+        }
+        if request.verify != DohVerify::default() {
+            // `--doh-insecure` and its two siblings. Note the direction: this
+            // refuses a request that has RELAXED verification just as firmly as
+            // one that has tightened it, because a narrow transport applying its
+            // own defaults would silently re-tighten it, and a caller who asked
+            // for `--doh-insecure` and got a hard failure is better served than
+            // one who asked and was quietly overruled.
+            return Some("CURLOPT_DOH_SSL_VERIFY* policy");
+        }
+        if request.protocols != DohProtocols::for_this_build() {
+            return Some("a CURLOPT_PROTOCOLS_STR restriction");
+        }
+        if request.timeout_ms != 0 {
+            return Some("a resolve timeout");
+        }
+        if request.headers.as_slice()
+            != [msg::CONTENT_TYPE_DNS_MESSAGE.to_owned()]
+        {
+            return Some("request headers beyond the DNS content type");
+        }
+        // `http_version` and `pipewait` are deliberately NOT checked. Neither is
+        // caller policy: `Self::build` derives `http_version` from
+        // `cfg!(feature = "http2")` and sets `pipewait` from whether that
+        // produced a value, mirroring the single `#ifdef USE_HTTP2` block in
+        // `lib/doh.c` that sets `CURLOPT_HTTP_VERSION` and `CURLOPT_PIPEWAIT`
+        // together. They describe the build, and a narrow transport applying
+        // curl's own defaults arrives at the same pair. Refusing them would
+        // reject every request on an HTTP/2 build, which is the whole corpus.
+        None
+    }
+}
+
+impl<T: DohTransport + ?Sized> DohProbeTransport for NarrowDohTransport<T> {
+    /// Forwards the URL and the query, or refuses the request.
+    ///
+    /// # Errors
+    ///
+    /// [`CURLcode::SslConnectError`] when [`Self::unconveyable`] names a field.
+    /// That code rather than `CURLcode::NotBuiltIn` or
+    /// `CURLcode::BadFunctionArgument` because the condition is a TLS policy
+    /// that could not be honoured, and `lib/doh.c`'s caller turns a failed probe
+    /// into `CURLE_COULDNT_RESOLVE_HOST` through [`is_resolved`] anyway -- so
+    /// the resolve fails, as it must, and the specific code survives in a trace
+    /// for whoever has to work out why.
     fn probe<'a>(
         &'a self,
         request: &'a DohProbeRequest,
     ) -> ResolveFuture<'a, Vec<u8>> {
-        self.post(&request.url, &request.body)
+        if Self::unconveyable(request).is_some() {
+            // Fail closed. The alternative -- issuing the request with the
+            // transport's own policy -- is the defect this type exists to
+            // prevent, and it is silent, which is what made it dangerous.
+            return Box::pin(async { Err(CURLcode::SslConnectError) });
+        }
+        self.0.post(&request.url, &request.body)
     }
 }
 
-// ---------------------------------------------------------------------------
 // `struct doh_response` and `struct doh_probes` -- `lib/doh.h:92-106`.
-// ---------------------------------------------------------------------------
 
 /// One probe's outcome.
 ///
@@ -3172,7 +2746,7 @@ impl<T: DohTransport + ?Sized> DohProbeTransport for T {
 /// failed, and `:1229`'s `if(!p->dnstype) continue;` skips both. [`None`] is
 /// that zero, and [`DnsType`] deliberately has no zero variant so the state
 /// cannot be confused with a record type.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct DohResponse {
     /// Whether this probe was issued at all -- C's `probe_mid != UINT32_MAX`.
     pub(crate) started: bool,
@@ -3190,16 +2764,29 @@ pub(crate) struct DohResponse {
     pub(crate) result: CodeResult<()>,
 }
 
+/// The answer body is redacted; the outcome is not.
+///
+/// A DoH response body carries the resolved addresses for the name that
+/// [`DohProbeRequest::body`] asked about, so it discloses the same private
+/// resolution the query does and is redacted for the same reason (RFC 8484
+/// section 1). `started`, `dnstype` and `result` are the outcome, which is what
+/// a reader of a resolution failure needs and what `lib/doh.c:1209-1214`
+/// branches on.
+impl fmt::Debug for DohResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DohResponse")
+            .field("started", &self.started)
+            .field("dnstype", &self.dnstype)
+            .field("body", &Redacted(&self.body))
+            .field("result", &self.result)
+            .finish()
+    }
+}
+
 impl Default for DohResponse {
     /// The `calloc` state of `struct doh_response`, plus C's explicit
     /// `probe_mid = UINT32_MAX` and `curlx_dyn_init(&body, DYN_DOH_RESPONSE)`
     /// (`lib/doh.c:461-464`).
-    ///
-    /// `result` starts as success rather than as an error, matching the zeroed
-    /// `CURLcode` -- and that zero is not innocuous. `Curl_doh_is_resolved`
-    /// `memset`s its own `rc[]` array to zero for the same reason at `:1222`,
-    /// which is what makes the success test at `:1241` behave the way
-    /// [`is_resolved`] documents.
     fn default() -> Self {
         Self {
             started: false,
@@ -3222,15 +2809,6 @@ impl Default for DohResponse {
 ///   const char *host;
 /// };
 /// ```
-///
-/// `pending` is gone with the rest of the sub-transfer machinery: it counts
-/// probes that have not called back, and awaiting them all leaves nothing to
-/// count. The module preamble's deletion table records it.
-///
-/// `host` is an owned [`String`] where C holds a `const char *` aliasing
-/// `data->state.async.hostname` -- itself a `curlx_strdup` of the caller's
-/// hostname made at `:452`. So C already copies once and then aliases the copy;
-/// owning it here is the same copy with no alias to outlive it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DohProbes {
     /// C's `host`.
@@ -3256,12 +2834,6 @@ impl DohProbes {
     }
 
     /// One slot's outcome.
-    ///
-    /// Destructured rather than indexed, which makes the lookup **total**: the
-    /// array pattern binds exactly [`SLOT_COUNT`] elements and the `match` is
-    /// exhaustive over [`DohSlot`], so there is no index to be out of range and
-    /// no fallback to invent. Adding a slot stops this compiling, which is the
-    /// diagnostic C's `probe_resp[slot]` cannot give.
     pub(crate) fn response(&self, slot: DohSlot) -> &DohResponse {
         let [ipv4, ipv6, https_rr] = &self.responses;
         match slot {
@@ -3282,17 +2854,9 @@ impl DohProbes {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `Curl_doh` -- `lib/doh.c:435-519`.
-// ---------------------------------------------------------------------------
 
 /// What one DoH resolution is being asked for.
-///
-/// The arguments of `Curl_doh` (`lib/doh.c:435-436`) plus the two facts it
-/// reads from `data->conn` rather than from its parameters. Grouped into a
-/// struct for the same reason `crate::dns::resolver` groups its own: the
-/// alternative is a function of nine positional arguments, most of them
-/// booleans, where a transposition would compile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DohQuery<'a> {
     /// C's `hostname`. Already in wire form: `Curl_resolv` has applied
@@ -3314,10 +2878,6 @@ pub(crate) struct DohQuery<'a> {
     /// `conn->scheme->protocol & PROTO_FAMILY_HTTP` (`:496`), evaluated by the
     /// caller because `conn` belongs to `crate::conn`, which this file must not
     /// name.
-    ///
-    /// C's comment is *"Only use HTTPS RR for HTTP(S) transfers"*: an FTP
-    /// transfer gains nothing from an HTTPS resource record, so the third probe
-    /// is not sent at all.
     pub(crate) http_family: bool,
     /// `Curl_timeleft_ms(data)` (`:307`) -- the parent transfer's remaining
     /// time, in milliseconds, where **negative means already expired**.
@@ -3326,15 +2886,6 @@ pub(crate) struct DohQuery<'a> {
 
 /// Runs every applicable DoH probe and collects their responses.
 ///
-/// Supersedes `Curl_doh` (`lib/doh.c:435-519`) **and** the awaiting that
-/// `doh_probe_done` plus `pending` performed on its behalf. C starts the probes
-/// and returns immediately, leaving the multi handle to re-enter
-/// `Curl_doh_is_resolved` until `pending` reaches zero; here the probes are
-/// awaited concurrently and the function returns when all of them are done.
-/// The `pending` arm of `Curl_doh_is_resolved` (`:1287-1289`), which returns
-/// `CURLE_OK` to mean "ask me again", therefore has no successor -- it is the
-/// `.await` on this function.
-///
 /// # Which probes fire
 ///
 /// | Probe | C | Condition |
@@ -3342,29 +2893,6 @@ pub(crate) struct DohQuery<'a> {
 /// | [`DnsType::A`] | `:473-480` | **unconditional** |
 /// | [`DnsType::Aaaa`] | `:482-493` | `ip_version != V4 && ipv6_works` |
 /// | [`DnsType::Https`] | `:495-513` | `http_family` |
-///
-/// **The `A` probe is unconditional, including for [`IpVersion::V6`].** There
-/// is no `if` around it in the C and none here: a transfer restricted to IPv6
-/// still sends an `A` query, whose answers then have nowhere to go. That is
-/// measured behaviour rather than an inference, and it is preserved. The `AAAA`
-/// probe is the conditional one, and its condition is `!=` rather than `==` so
-/// that [`IpVersion::Whatever`] sends both.
-///
-/// The `HTTPS` probe's **query name is port-dependent and wire-observable** --
-/// see [`https_rr_qname`].
-///
-/// # Failure is immediate, as in C
-///
-/// Each `doh_probe_run` failure does `goto error`, which runs
-/// `Curl_doh_cleanup` and returns the code, so a probe that cannot even be
-/// *started* aborts the whole resolution rather than proceeding with the
-/// others. Returning `Err` from here is that, with the cleanup being the drop
-/// of the partially-built [`DohProbes`].
-///
-/// A probe that starts and then *fails* is a different matter entirely: its
-/// code is recorded in its own slot, [`msg::doh_request`] is traced, and the
-/// resolution continues -- which is what lets an `A`-only answer succeed when
-/// the `AAAA` query was refused.
 ///
 /// # Errors
 ///
@@ -3488,16 +3016,6 @@ where
     //   aborts rather than returning -- so the `:239` reassignment of `result`
     //   has **no reachable counterpart here**, and the local `result` the
     //   `infof` at `:248` names is always the transport's.
-    //
-    // The consequence is that a slot is decodable exactly when its transport
-    // succeeded and its body was within the ceiling, which is what leaves
-    // `dnstype` unset on either failure and makes `is_resolved` skip the slot.
-    //
-    // The `result` field itself is write-only in C: `probe_resp[].result` is
-    // assigned at `:232` and read nowhere in the entire tree (verified by
-    // grep -- `is_resolved` gates on `dnstype` instead). It is reproduced
-    // because it is part of `struct doh_response`, and it is deliberately not
-    // consulted here for the same reason C does not consult it.
     for ((slot, request), outcome) in planned.iter().zip(issued) {
         let response = probes.response_mut(*slot);
 
@@ -3528,11 +3046,6 @@ where
                 // `is_verbose()` reduce to the same test when the label in
                 // force *is* DNS -- which is why the feature emitter is the
                 // faithful spelling here.
-                //
-                // It is deliberately NOT `failf!`: `Curl_failf` stores its
-                // message in `CURLOPT_ERRORBUFFER` and emits whenever an error
-                // buffer is present even with tracing off, and C places
-                // nothing in the error buffer at this point.
                 trc_feat!(
                     tracer,
                     TraceFeature::Dns,
@@ -3548,16 +3061,6 @@ where
 
 /// Accepts a response body, applying the ceiling C's write callback applies.
 ///
-/// `doh_probe_write_cb` (`lib/doh.c:169-182`) appends every received chunk to a
-/// `dynbuf` initialised with [`DYN_DOH_RESPONSE`] (`:296`) and returns `0` when
-/// the append fails, which libcurl reports as `CURLE_WRITE_ERROR`. So **a DoH
-/// response longer than 3,000 bytes fails the transfer**, and that limit is
-/// behaviour rather than an implementation detail of the callback.
-///
-/// The callback itself is in the module preamble's deletion table -- a
-/// transport that returns bytes needs nothing to push them to -- but the
-/// ceiling is not, and this is where it lives instead.
-///
 /// # Errors
 ///
 /// [`CURLcode::WriteError`], which is what a `0` return from a write callback
@@ -3570,9 +3073,7 @@ fn accumulate_body(body: &[u8]) -> CodeResult<Vec<u8>> {
     Ok(accumulator.take())
 }
 
-// ---------------------------------------------------------------------------
 // `doh2ai` -- `lib/doh.c:915-1008`.
-// ---------------------------------------------------------------------------
 
 /// Turns the stored addresses into the crate's resolved-address list.
 ///
@@ -3586,9 +3087,7 @@ fn accumulate_body(body: &[u8]) -> CodeResult<Vec<u8>> {
 /// The list, the manual linking through `ai_next`, the single `calloc` holding
 /// a `struct Curl_addrinfo` plus a `sockaddr` plus the canonical name, and the
 /// paired free are all gone: [`ResolvedAddr`] owns its address and its name,
-/// and a [`Vec`] owns the sequence. AAP 0.6.9 names the intrusive list as one
-/// of the patterns to remove, and `crate::dns` has already done the removing --
-/// this function only has to produce what that module defined.
+/// and a [`Vec`] owns the sequence.
 ///
 /// # Three behaviours that are not bookkeeping
 ///
@@ -3604,12 +3103,6 @@ fn accumulate_body(body: &[u8]) -> CodeResult<Vec<u8>> {
 ///   order the answers arrived in. `conn/happy_eyeballs.rs` races what this
 ///   produces, so sorting it would change which address is connected to first.
 ///
-/// # `if(!de->numaddr) return CURLE_COULDNT_RESOLVE_HOST;`
-///
-/// The empty case is an error (`:931-932`), and it is the error that a probe
-/// which started and failed ultimately produces -- see [`is_resolved`], where
-/// the success test lets such a case through and this is what stops it.
-///
 /// # Errors
 ///
 /// [`CURLcode::CouldntResolveHost`] when no address was stored.
@@ -3624,11 +3117,6 @@ pub(crate) fn doh2ai(
     }
 
     // `for(i = 0; i < de->numaddr; i++)`, in order.
-    //
-    // C's `#ifndef USE_IPV6 ... continue;` arm at `:938-940`, which drops IPv6
-    // answers on a build without IPv6 support, has no counterpart: every target
-    // in AAP 0.1.1 G8's matrix has IPv6 and `crate::conn` is built on `socket2`
-    // and `tokio`, both of which support it unconditionally.
     Ok(entry
         .addr
         .iter()
@@ -3642,17 +3130,9 @@ pub(crate) fn doh2ai(
         .collect())
 }
 
-// ---------------------------------------------------------------------------
 // `Curl_doh_is_resolved` -- `lib/doh.c:1199-1295`.
-// ---------------------------------------------------------------------------
 
 /// What [`is_resolved`] needs beyond the probe results.
-///
-/// The three things `Curl_doh_is_resolved` reads from `data` that are not in
-/// `data->state.async.doh`: the cache to insert into, the clock the entry is
-/// stamped with, and whether the transfer goes through a proxy. Each is
-/// injected rather than reached for, which is what lets the whole completion
-/// path run under Miri with no syscall.
 #[derive(Debug)]
 pub(crate) struct DohResolveContext<'a> {
     /// The cache `Curl_dnscache_add` inserts into (`lib/doh.c:1279`).
@@ -3687,8 +3167,6 @@ impl DohResolveContext<'_> {
 /// Supersedes `Curl_doh_is_resolved` (`lib/doh.c:1199-1295`), minus the
 /// re-entrancy: C is called repeatedly by the multi state machine and returns
 /// `CURLE_OK` with `*dnsp == NULL` while `pending` is non-zero (`:1287-1289`).
-/// That arm is the `.await` inside [`doh`] and has no successor here, which is
-/// why this function is synchronous and always reaches a verdict.
 ///
 /// # The order of operations is C's
 ///
@@ -3720,16 +3198,6 @@ impl DohResolveContext<'_> {
 /// * A slot is only written when it had an answer to decode.
 /// * The test is `||`, not `&&`.
 ///
-/// So a slot that **never ran**, or that ran and whose **transfer failed**,
-/// reads as `DOH_OK` and satisfies the condition on its own. The branch is
-/// therefore entered even when the only probe that ran failed to decode --
-/// which is not a bug that leaks a wrong answer, because [`doh2ai`] then finds
-/// no address and returns [`CURLcode::CouldntResolveHost`], and because
-/// `result` was seeded to that same code *"until we know better"*. The
-/// observable outcome is correct; the route to it is indirect. Reproduced
-/// exactly, and pinned by
-/// [`tests::a_single_failed_probe_still_enters_the_success_branch_and_then_fails`].
-///
 /// # Only the FIRST HTTPS record is ever decoded
 ///
 /// ```c
@@ -3737,22 +3205,6 @@ impl DohResolveContext<'_> {
 ///   result = doh_resp_decode_httpsrr(data, de.https_rrs->val,
 ///                                    de.https_rrs->len, &hrr);
 /// ```
-///
-/// `de.https_rrs->val` is `de.https_rrs[0].val`. Up to [`DOH_MAX_HTTPS`] are
-/// stored and one is used, and the other three are silently discarded with the
-/// entry. Preserved.
-///
-/// On failure the entry is unlinked and the whole resolution fails
-/// (`:1265-1269`) -- so a malformed HTTPS record loses the addresses too, even
-/// though they decoded cleanly. That is C's severity and it is not softened.
-///
-/// # `permanent` is false
-///
-/// `Curl_dnscache_mk_entry(data, &ai, dohp->host, 0, dohp->port, FALSE)`
-/// (`:1256-1257`). A DoH answer times out like any other; only
-/// `CURLOPT_RESOLVE` produces a permanent entry. The entry construction and the
-/// insertion are both **delegated** to [`DnsCache`], which owns them --
-/// nothing about the cache is re-implemented here.
 ///
 /// # Errors
 ///
@@ -3810,13 +3262,6 @@ pub(crate) fn is_resolved(
 
     // `result = CURLE_COULDNT_RESOLVE_HOST; /* until we know better */` plus
     // `if(!rc[DOH_SLOT_IPV4] || !rc[DOH_SLOT_IPV6])`.
-    //
-    // The seeded code is what C returns when the branch is not entered, and it
-    // is the PLAIN `CURLE_COULDNT_RESOLVE_HOST` -- **not** the proxied variant.
-    // `CONN_IS_PROXIED` is consulted at `:1212` and nowhere else in this
-    // function, so a proxied transfer whose DoH answers both failed to decode
-    // reports the host and not the proxy. Measured, and easy to "unify" by
-    // mistake, which is why the two paths use different expressions here.
     let ipv4_ok = rc.get(DohSlot::Ipv4.index()).is_some_and(Result::is_ok);
     let ipv6_ok = rc.get(DohSlot::Ipv6.index()).is_some_and(Result::is_ok);
     if !(ipv4_ok || ipv6_ok) {
@@ -3826,10 +3271,6 @@ pub(crate) fn is_resolved(
     // `if(Curl_trc_ft_is_verbose(data, &Curl_trc_feat_dns)) {
     //    CURL_TRC_DNS(data, "hostname: %s", dohp->host);
     //    doh_show(data, &de); }`
-    //
-    // The guard is C's and is kept even though both emitters guard themselves:
-    // `doh_show` is several lines of formatting per address, and C's macros
-    // exist so that suppressed output is never formatted at all.
     if tracer.is_feature_verbose(TraceFeature::Dns) {
         trc_feat!(tracer, TraceFeature::Dns, "{}", msg::hostname(&probes.host));
         show(&entry, tracer);
@@ -3884,24 +3325,12 @@ pub(crate) fn is_resolved(
 
 /// Resolves `query` over DoH from end to end.
 ///
-/// The composition the multi state machine performs in C: `Curl_doh` starts the
-/// probes, `multi_runsingle` re-enters `Curl_doh_is_resolved` until it stops
-/// answering "still pending", and the last call produces the entry. Awaiting
-/// [`doh`] collapses the middle, so the whole of it is two calls.
-///
-/// Provided as its own function because that composition is what a caller
-/// actually wants and because leaving it to each caller would let two callers
-/// disagree about it -- particularly about the failure path, where the probes
-/// must still be collected before [`is_resolved`] can report on them.
-///
 /// # Errors
 ///
 /// Whatever [`doh`] or [`is_resolved`] reports.
-// No consumer yet; `crate::dns::resolver` calls this where
-// `lib/hostip.c:936-940` calls `Curl_doh`, and `crate::conn` reaches it
-// through the resolver. Annotated as the ONE live root of this module, which
-// is what keeps its whole call graph -- the encoder, the decoders, the
-// printers and the probe orchestration -- out of the dead-code report.
+// Annotated as the ONE live root of this module, which is what keeps its whole
+// call graph -- the encoder, the decoders, the printers and the probe
+// orchestration -- out of the dead-code report.
 #[allow(dead_code)]
 pub(crate) async fn resolve<T>(
     transport: &T,
@@ -3935,9 +3364,6 @@ mod tests {
 
     /// The record a `[DNS]`-labelled trace line produces.
     ///
-    /// `InfoType::Text`'s two-byte `"* "` prefix, the feature's bracketed name,
-    /// the message, and the newline the emitter appends.
-    ///
     /// **Which lines get this bracket is a property of the C source, not of
     /// this harness**, and the two helpers exist to keep the distinction
     /// visible at every assertion. `lib/doh.c` emits on two different handles:
@@ -3948,24 +3374,11 @@ mod tests {
     ///   which `doh_probe_run` labels with
     ///   `doh->state.feat = &Curl_trc_feat_dns` (`:327`) -- so `"DoH request
     ///   ..."` is bracketed too.
-    ///
-    /// Everything else in the file -- `doh_print_buf` (`:201`, `:203`),
-    /// `doh_show` (`:859`-`:895`), `doh_print_httpsrr` (`:1166`-`:1193`),
-    /// `failf(data, ...)` (`:302`, `:1211`) and `infof(data, ...)` (`:1266`,
-    /// `:1270`) -- runs on the **master** handle, whose label is whatever the
-    /// user's own transfer has in force. That is `None` for a bare handle, so
-    /// those lines carry no bracket at all; see [`info_line`].
     fn dns_line(message: &str) -> String {
         format!("* [DNS] {message}\n")
     }
 
     /// The record an unlabelled trace line produces.
-    ///
-    /// What `infof(data, ...)` and `failf(data, ...)` emit on a handle carrying
-    /// no feature label -- `Tracer::infof` assembles with `self.state.feat`,
-    /// and `Tracer::failf` never consults a label at all. See [`dns_line`] for
-    /// the handle-by-handle breakdown of which of this file's strings land
-    /// here and which are bracketed.
     fn info_line(message: &str) -> String {
         format!("* {message}\n")
     }
@@ -4004,12 +3417,6 @@ mod tests {
     }
 
     /// Drives a future to completion on a current-thread runtime.
-    ///
-    /// The same helper `dns/mod.rs`'s tests use, and for the same reason: the
-    /// seams here are `async` because a DoH probe is, and a unit test needs an
-    /// executor to observe one. `enable_time` is on because
-    /// `DohProbeRequest::timeout` hands a duration to a caller that may arm a
-    /// timer with it.
     fn block_on<F: core::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -4024,15 +3431,6 @@ mod tests {
 
     /// A [`DohProbeTransport`] that answers from a script and records what it
     /// was asked.
-    ///
-    /// This is what makes the whole DoH path testable with no resolver, no
-    /// socket and no network -- the property the injection seam exists for, and
-    /// the property that lets these tests run under Miri.
-    ///
-    /// It implements the RICH trait rather than [`DohTransport`], so the
-    /// assertions can reach the header, the method and the verification triple.
-    /// `BytesTransport` below implements the narrow one, which exercises the
-    /// blanket adapter.
     #[derive(Debug)]
     struct MockDohTransport {
         /// One answer per call, in order. An exhausted script is a test bug and
@@ -4415,18 +3813,6 @@ mod tests {
         // Exactly at the limit is ACCEPTED, which is what makes the comparison
         // `>` and not `>=`. Because the name is accepted, the scan cannot
         // short-circuit: `bytes().any()` visits all eight million bytes.
-        //
-        // That is the one assertion in this module Miri cannot afford, and the
-        // reason is volume rather than a missing seam -- there is no syscall,
-        // no clock and no transport involved, so there is nothing to inject.
-        // Eight million interpreted iterations of a single bounds-checked byte
-        // comparison cannot reveal any undefined behaviour that the
-        // hundred-byte names in
-        // `junkscan_accepts_printable_names_and_rejects_the_rest` do not
-        // already exercise on the identical code path. The exception is
-        // therefore scoped to this one statement rather than the test, and
-        // every non-Miri configuration -- debug, release, and all four
-        // mandated targets -- still asserts it.
         #[cfg(not(miri))]
         {
             let at_limit = "a".repeat(CURL_MAX_INPUT_LENGTH);
@@ -4921,13 +4307,6 @@ mod tests {
     }
 
     /// **Pins the `USE_HTTTPS` typo at `lib/doh.c:842` -- THREE T's.**
-    ///
-    /// That macro is spelled with three `T`s, occurs exactly once in the whole
-    /// repository, and is defined nowhere, so the `#else` branch at `:846`
-    /// always compiles and `numhttps_rrs` is not consulted. An HTTPS-RR-only
-    /// answer therefore reports [`DohCode::NoContent`] even though the record
-    /// was stored -- which this asserts, so that "fixing" the typo has to argue
-    /// with a failing test.
     #[test]
     fn an_https_rr_only_answer_is_no_content_per_the_use_htttps_typo() {
         let mut entry = DohEntry::default();
@@ -5311,12 +4690,6 @@ mod tests {
 
     /// `unit1658`'s output format, so that its expectations can be compared
     /// as it compared them.
-    ///
-    /// `rrresults` (`tests/unit/unit1658.c:52-114`) renders one record as
-    /// `r:<code>|` optionally followed by `p:<priority>|<target>|` and then
-    /// `alpn:`, `no-def-alpn`, `port:`, `ipv4:`, `ech:` and `ipv6:` groups.
-    /// Reproducing it lets each of the C's nineteen vectors be asserted against
-    /// the exact string the C expected.
     fn rrresults(outcome: &CodeResult<HttpsRrInfo>) -> String {
         let code = match outcome {
             Ok(_) => 0,
@@ -5607,11 +4980,6 @@ mod tests {
     /// `lib/doh.c:1133`, `:1149`: a one-to-three byte remainder is tolerated in
     /// release and only debug-asserted, so it must NOT be hardened into an
     /// error.
-    ///
-    /// Both builds are pinned, each by the assertion appropriate to it: this
-    /// test asserts the release tolerance, and
-    /// [`a_short_trailing_remainder_debug_asserts`] asserts that the debug
-    /// build does fire instead. Neither asserts a constant.
     #[test]
     fn a_short_trailing_remainder_ends_the_svcparam_loop() {
         let base: &[u8] = b"\x00\x00\x00";
@@ -5633,13 +5001,6 @@ mod tests {
     }
 
     /// The other half of [`a_short_trailing_remainder_ends_the_svcparam_loop`].
-    ///
-    /// `DEBUGASSERT(!len)` (`lib/doh.c:1149`) fires in a debug build, and the
-    /// successor `debug_assert!` must do the same -- a tolerance that silently
-    /// applied in both builds would mean the assertion had been dropped rather
-    /// than reproduced. Compiled only where `debug_assert!` is live, since a
-    /// release build would not panic and the test would fail for the right
-    /// reason but the wrong build.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "consumes its RDATA exactly")]
@@ -6459,16 +5820,26 @@ mod tests {
         assert_eq!(cache.len(), 1);
     }
 
-    /// The narrow seam works through the blanket adapter.
+    /// The narrow seam reaches the rich one only through the named adapter.
+    ///
+    /// It used to reach it through a blanket implementation, which is what
+    /// discarded the caller's policy. Wrapping in [`NarrowDohTransport`] is now
+    /// the only route, and the `.0` in the assertions below is the visible
+    /// evidence of that: the narrowing is a thing somebody wrote.
     #[test]
     fn a_narrow_doh_transport_satisfies_the_rich_seam() {
-        let transport = BytesTransport {
+        let transport = NarrowDohTransport(BytesTransport {
             answer: a_response("example.com"),
             seen: Mutex::new(Vec::new()),
-        };
+        });
+        // `timeout_ms: 0` -- unbounded. A byte-only `post(url, body)` has
+        // nowhere to put a deadline, so a bounded query is refused rather than
+        // issued without one; `the_narrow_adapter_refuses_a_request_it_cannot_convey`
+        // asserts that, and this test is the conveyable case.
         let query = DohQuery {
             ip_version: IpVersion::V4,
             http_family: false,
+            timeout_ms: 0,
             ..spec("example.com", 443)
         };
         let probes = silent(|tracer| {
@@ -6478,7 +5849,12 @@ mod tests {
         assert_eq!(probes.response(DohSlot::Ipv4).dnstype, Some(DnsType::A));
 
         // The adapter handed over exactly the URL and the body.
-        let seen = transport.seen.lock().map(|s| s.clone()).unwrap_or_default();
+        let seen = transport
+            .0
+            .seen
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
         assert_eq!(seen.len(), 1);
         let (url, body) = seen.first().expect("one call");
         assert_eq!(url, "https://doh.example/dns-query");
@@ -6487,13 +5863,139 @@ mod tests {
             .expect("encodes");
         assert_eq!(body.as_slice(), expected.get(..len).unwrap_or(&[]));
 
-        // And `&dyn DohTransport` reaches the rich seam too, which is the
-        // coercion the generic signature exists to permit.
-        let erased: &dyn DohTransport = &transport;
+        // And the wrapper erases, which is what its `T: ?Sized` bound is for:
+        // `&NarrowDohTransport<BytesTransport>` unsizes to
+        // `&NarrowDohTransport<dyn DohTransport>`, so a caller holding a
+        // transport of unknown type can wrap it once and pass it everywhere.
+        // This is the coercion the old blanket implementation provided by
+        // accident and this one provides deliberately.
+        let erased: &NarrowDohTransport<dyn DohTransport> = &transport;
         let probes =
             silent(|tracer| block_on(doh(erased, &query, &settings(), tracer)))
                 .expect("the erased transport works identically");
         assert!(probes.response(DohSlot::Ipv4).started);
+    }
+
+    /// A request carrying policy the narrow seam cannot express is REFUSED.
+    ///
+    /// The heart of the fix. Each case is a real option a caller can set, and
+    /// each one used to be dropped in silence while the request went out under
+    /// the transport's own policy. The first two are the ones that decide which
+    /// resolver is trusted.
+    #[test]
+    fn the_narrow_adapter_refuses_a_request_it_cannot_convey() {
+        type Narrow = NarrowDohTransport<BytesTransport>;
+
+        // A conveyable request: exactly what `build` produces by default.
+        let base = silent(|tracer| {
+            DohProbeRequest::build(
+                "example.com",
+                DnsType::A,
+                0,
+                &settings(),
+                tracer,
+            )
+        })
+        .expect("the default request builds");
+        assert_eq!(
+            Narrow::unconveyable(&base),
+            None,
+            "a default request loses nothing and must be accepted"
+        );
+
+        // Trust material: a pinned CA for a private resolver.
+        let mut pinned = base.clone();
+        pinned.tls.cainfo = Some(String::from("/etc/pki/private-doh.pem"));
+        assert_eq!(
+            Narrow::unconveyable(&pinned),
+            Some("CURLOPT_DOH_SSL trust material"),
+            "a pinned CA cannot be silently replaced by the transport's store"
+        );
+
+        // Verification: all three of `CURLOPT_DOH_SSL_VERIFY*` default to ON
+        // (`DohVerify::default`), so every departure a caller can express is a
+        // RELAXATION -- `--doh-insecure` and its siblings. Each is refused,
+        // because a narrow transport would apply its own defaults and quietly
+        // re-tighten what the caller deliberately loosened. Being overruled in
+        // silence is worse than being told no: all three are asserted so that
+        // none can be forgotten.
+        for relax in [
+            DohVerify {
+                peer: false,
+                ..DohVerify::default()
+            },
+            DohVerify {
+                host: false,
+                ..DohVerify::default()
+            },
+            DohVerify {
+                status: false,
+                ..DohVerify::default()
+            },
+        ] {
+            let mut relaxed = base.clone();
+            relaxed.verify = relax;
+            assert_eq!(
+                Narrow::unconveyable(&relaxed),
+                Some("CURLOPT_DOH_SSL_VERIFY* policy"),
+                "a relaxed {relax:?} must not be silently re-tightened"
+            );
+        }
+
+        // A resolve timeout. `post(url, body)` has nowhere to put a deadline, so
+        // forwarding a bounded request would produce an unbounded probe -- a
+        // DoH resolver that never answers would hang the transfer instead of
+        // failing it at the deadline the caller set.
+        let mut bounded = base.clone();
+        bounded.timeout_ms = 5_000;
+        assert_eq!(Narrow::unconveyable(&bounded), Some("a resolve timeout"));
+
+        // An extra header.
+        let mut headed = base.clone();
+        headed.headers.push(String::from("X-Trace: 1"));
+        assert_eq!(
+            Narrow::unconveyable(&headed),
+            Some("request headers beyond the DNS content type"),
+        );
+
+        // The HTTP version hint is NOT policy and must not be refused: it comes
+        // from `cfg!(feature = "http2")` rather than from any caller option, so
+        // refusing it would reject every request on an HTTP/2 build. Asserted
+        // explicitly because it is the one field where "differs from a bare
+        // default" and "is caller policy" come apart.
+        assert_eq!(
+            base.http_version.is_some(),
+            cfg!(feature = "http2"),
+            "the hint tracks the build, so it is the build's business"
+        );
+        assert_eq!(
+            base.pipewait,
+            base.http_version.is_some(),
+            "and pipewait is set with it, as lib/doh.c sets the pair together"
+        );
+
+        // And the refusal really reaches `probe`, not just the predicate.
+        let transport = NarrowDohTransport(BytesTransport {
+            answer: a_response("example.com"),
+            seen: Mutex::new(Vec::new()),
+        });
+        let outcome = block_on(transport.probe(&pinned));
+        assert_eq!(
+            outcome.err(),
+            Some(CURLcode::SslConnectError),
+            "the request must fail closed rather than go out unprotected"
+        );
+        let seen = transport
+            .0
+            .seen
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        assert!(
+            seen.is_empty(),
+            "and nothing must have been sent: {} call(s) reached the transport",
+            seen.len()
+        );
     }
 
     /// `lib/doh.c:1209-1214`: neither address probe started.
@@ -6528,12 +6030,6 @@ mod tests {
     }
 
     /// **`lib/doh.c:1222` and `:1241`: the `||` over a zero-seeded `rc[]`.**
-    ///
-    /// A single probe that started and whose transfer failed leaves both slots
-    /// reading `DOH_OK`, so the success branch IS entered -- and then `doh2ai`
-    /// finds no address and the seeded `CURLE_COULDNT_RESOLVE_HOST` is what the
-    /// caller sees. The route is indirect and the outcome is correct; both are
-    /// preserved.
     #[test]
     fn a_single_failed_probe_still_enters_the_success_branch_and_then_fails() {
         let transport = MockDohTransport::always(Err(CURLcode::CouldntConnect));
@@ -6814,9 +6310,6 @@ mod tests {
         );
     }
 
-    /// The unbracketed lines are unbracketed because of the *handle*, not
-    /// because the label was dropped on the way to the sink.
-    ///
     /// Every emitter in this file other than the two `CURL_TRC_DNS` calls and
     /// `:248` runs on the master handle -- `infof(data, ...)` and
     /// `failf(data, ...)` -- whose label is whatever the user's own transfer
@@ -6977,5 +6470,51 @@ mod tests {
             assert!(response.body.is_empty());
             assert_eq!(response.result, Ok(()));
         }
+    }
+
+    /// The queried name cannot appear in a formatted DoH request or response.
+    ///
+    /// The whole purpose of DoH is that the queried name is not observable
+    /// (RFC 8484 section 1), so a formatter that printed the wire query would
+    /// defeat the feature the caller opted into. The endpoint is redacted for
+    /// the ordinary reason: a private resolver authenticates through its URL.
+    #[test]
+    fn a_doh_query_and_endpoint_cannot_reach_a_formatted_request() {
+        let settings = DohSettings {
+            url: String::from("https://token:s3cret@doh.example/dns-query"),
+            ..DohSettings::default()
+        };
+        let request = silent(|tracer| {
+            DohProbeRequest::build(
+                "private.internal.example",
+                DnsType::A,
+                5_000,
+                &settings,
+                tracer,
+            )
+        })
+        .expect("the request builds");
+
+        let text = format!("{request:?}");
+        assert!(
+            !text.contains("s3cret"),
+            "the endpoint token leaked: {text}"
+        );
+        assert!(!text.contains("doh.example"), "the endpoint leaked: {text}");
+        // The QNAME is inside the binary body; assert the body is not rendered
+        // at all rather than searching for an encoded form of the name.
+        assert!(text.contains("body: <redacted,"), "{text}");
+        // The request SHAPE still renders, which is what a test or a reader
+        // compares against `lib/doh.c:290-401`.
+        assert!(text.contains("dnstype: A"), "{text}");
+        assert!(text.contains("timeout_ms: 5000"), "{text}");
+
+        let settings_text = format!("{settings:?}");
+        assert!(!settings_text.contains("s3cret"), "{settings_text}");
+        assert!(!settings_text.contains("doh.example"), "{settings_text}");
+
+        // And the request still carries the bytes a transport needs.
+        assert_eq!(request.url, settings.url);
+        assert!(!request.body.is_empty());
     }
 }

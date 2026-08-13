@@ -109,8 +109,10 @@
 //!   `lib/idn.c:45`, and it is referenced only at `:86`, `:87`, `:98`, `:120`
 //!   and `:126` -- all within that arm. The libidn2 path, which is the path
 //!   this module supersedes, has no such cap, so applying one here would
-//!   reject hostnames curl accepts. The only length policy in force is
-//!   UTS-46's own _VerifyDNSLength_, selected explicitly below.
+//!   reject hostnames curl accepts. The only length policies in force are
+//!   libidn2's own, reproduced by [`dns_bounds_ok`] for the A-label direction
+//!   and inline in [`idn_to_unicode`] for the U-label direction, both from
+//!   measurement.
 //! * **`Curl_idnconvert_hostname` (`lib/idn.c:359-376`) and
 //!   `Curl_free_idnconverted_hostname` (`lib/idn.c:349-352`)**. Those
 //!   operate on `struct hostname` -- `host->name`, `host->dispname`,
@@ -126,11 +128,17 @@
 //!   compiled in at a version pinned by `Cargo.lock`, so a runtime
 //!   version-skew check has nothing to check. The branch is omitted rather
 //!   than faked, and no code path here yields `CURLcode::NotBuiltIn`.
-//! * **The out-of-memory branch**. `lib/idn.c:288` maps
+//! * **Most of the out-of-memory branch**. `lib/idn.c:288` maps
 //!   `IDNA_MALLOC_ERROR` to `CURLE_OUT_OF_MEMORY`, and `:313`/`:338` do the
-//!   same for a failed `strdup`. Rust aborts on allocation failure instead
-//!   of returning, so that branch collapses away and every failure here is
-//!   `CURLcode::UrlMalformat`. Again: not faked, just absent.
+//!   same for a failed `strdup`. Two of those three have no counterpart: the
+//!   A-label direction's allocation happens inside the `idna` crate, which
+//!   offers no fallible entry point, and the two `strdup`s duplicate a host
+//!   name already resident -- bounded by 253 bytes, so not externally sized in
+//!   the sense `crate::util::fallible` addresses. The third *is* reproduced:
+//!   [`idn_to_unicode`] owns its accumulator, reserves it through
+//!   `crate::util::fallible`, and therefore reports
+//!   `CURLcode::OutOfMemory` exactly where `lib/idn.c:288` does. Every other
+//!   failure in this module is `CURLcode::UrlMalformat`.
 //!
 //! # UTF-8 is validated here, and that is a fixture-backed requirement
 //!
@@ -171,12 +179,12 @@
 //! configuration be explicit rather than defaulted.
 //!
 //! The values below were not reasoned out; they were **measured** against
-//! curl 8.19.0-DEV built with libidn2 2.3.8, driven through
-//! `curl_url_get(CURLUPART_HOST, ...)` with `CURLU_PUNYCODE` and
-//! `CURLU_PUNY2IDN` over a 61-probe corpus, and compared against all four
-//! plausible knob combinations. The selected pair reproduces the C oracle on
-//! 29 of 31 `to_ascii` probes and 27 of 31 `to_unicode` probes, including
-//! every fixture-derived case.
+//! libidn2 2.3.8 driven exactly as `lib/idn.c:247-268` drives it -- see the
+//! divergence section below for the harness -- and compared against all four
+//! plausible knob combinations. They apply to the A-label direction only:
+//! since the U-label direction is a per-label punycode decode rather than
+//! UTS-46 _ToUnicode_ (see [`idn_to_unicode`]), it takes no UTS-46 parameters
+//! at all and none of these constants reaches it.
 //!
 //! * **`AsciiDenyList::EMPTY`** (_UseSTD3ASCIIRules=false_). curl does not
 //!   pass `IDN2_USE_STD3_ASCII_RULES`, and the oracle accordingly accepts
@@ -192,23 +200,24 @@
 //!   input that is already an A-label still passes: UTS-46 decodes the
 //!   `xn--` prefix before the hyphen test runs, so `xn--4cab6c.se` survives
 //!   unchanged.
-//! * **`Hyphens::Allow`** for `to_unicode` (_CheckHyphens=false_). The
-//!   asymmetry is not an oversight -- it mirrors an asymmetry in C. The
-//!   A-label direction goes through libidn2's *lookup* API, which validates;
-//!   the U-label direction goes through `idn2_to_unicode_8z8z`
-//!   (`lib/idn.c:286`), which is a conversion API and validates almost
-//!   nothing. The oracle accordingly returns `foo--bar.example`, `-foo.se`
-//!   and `foo-.se` unchanged, and `Hyphens::Check` would reject all three.
-//! * **`DnsLength::VerifyAllowRootDot`** for `to_ascii`
-//!   (_VerifyDNSLength=true_, tolerating the root label's trailing dot).
-//!   This is the knob `tests/data/test1035` ("HTTP over proxy with too long
-//!   IDN hostname", exit code 3) turns on: with `DnsLength::Ignore` that
-//!   host converts successfully and the fixture fails. The oracle likewise
-//!   rejects a 300-byte name. `DnsLength::Verify` is *too* strict -- it
-//!   rejects any trailing dot outright, whereas the oracle converts
-//!   `<U+00E5><U+00E4><U+00F6>.se.` to `xn--4cab6c.se.`. `Uts46::to_unicode`
-//!   takes no such parameter, which is consistent with the C conversion API
-//!   applying no total-length rule either.
+//!   No hyphen policy reaches the U-label direction at all, and that
+//!   asymmetry mirrors an asymmetry in C: the A-label direction goes through
+//!   libidn2's *lookup* API, which validates, while the U-label direction
+//!   goes through `idn2_to_unicode_8z8z` (`lib/idn.c:286`), which validates
+//!   almost nothing. Measured -- the oracle returns `foo--bar.example`,
+//!   `-foo.se`, `foo-.se` and `a.-.se` unchanged, and `Hyphens::Check`
+//!   rejects all four.
+//! * **`DnsLength::Ignore`** for `to_ascii`, with libidn2's own bound applied
+//!   by [`dns_bounds_ok`] instead. The bound is not optional:
+//!   `tests/data/test1035` ("HTTP over proxy with too long IDN hostname",
+//!   exit code 3) depends on it, and with no bound at all that host converts
+//!   and the fixture fails. What is wrong with `idna`'s spelling of it is
+//!   one clause -- [`idna::uts46::verify_dns_length`] also rejects an empty
+//!   label, and libidn2 does not, so `.se`, `a..b`, `<U+00E5>..b` and
+//!   `<U+00E5>.se..` were being refused where the oracle converts them.
+//!   `dns_bounds_ok` is that function minus that clause, so the root-dot
+//!   discount survives: the oracle converts `<U+00E5><U+00E4><U+00F6>.se.` to
+//!   `xn--4cab6c.se.`, which is what rules out `DnsLength::Verify`.
 //!
 //! Normalization needs no separate step. `lib/idn.c:253` passes
 //! `IDN2_NFC_INPUT` ("Normalize input string using normalization form C"),
@@ -258,72 +267,93 @@
 //!
 //! `Curl_idn_encode` has no such check -- `lib/idn.c:341-342` simply
 //! assigns. **The asymmetry is deliberate fidelity, not an oversight**, and
-//! it is observable: `Uts46::to_unicode` maps U+200B ZERO WIDTH SPACE to
-//! nothing and reports success with an empty output, so `to_unicode`
-//! returns `Ok("")` on that input while `to_ascii` returns
-//! `Err(UrlMalformat)`. `tests/data/test763` ("Unicode hostname ending up in
-//! a blank name") is the fixture that names this behaviour.
+//! it is observable on the empty host, which `to_unicode` converts to
+//! `Ok("")` while `to_ascii` returns `Err(UrlMalformat)` -- measured, the
+//! oracle agrees in both directions. `tests/data/test763` ("Unicode hostname
+//! ending up in a blank name") is the fixture that names the `to_ascii` half.
+//!
+//! The witness used to be U+200B ZERO WIDTH SPACE, on the grounds that
+//! `Uts46::to_unicode` maps it away and succeeds with an empty output. That
+//! was a divergence rather than a demonstration: the oracle returns U+200B
+//! unchanged, because `idn2_to_unicode_8z8z` maps nothing. The empty host is
+//! the honest witness and U+200B is now a passthrough test.
 //!
 //! # Divergences from the C oracle that remain, all measured
 //!
-//! The final check was mechanical rather than anecdotal: a 63-host corpus was
-//! run through `curl_url_get` on curl 8.19.0-DEV built with libidn2 2.3.8, and
-//! through this module behind the same `lib/urlapi.c:1401-1420` gate, and the
-//! two hex-encoded outputs were diffed. **119 of 126 comparisons are
-//! byte-identical.** Of the seven that are not, two are not this module's
-//! behaviour at all -- see the note below -- leaving the five recorded here.
+//! The check is mechanical rather than anecdotal, and it is reproducible: a
+//! C driver linked against the installed libidn2 2.3.8 reproduces
+//! `idn_decode` (`lib/idn.c:247-280`) and `idn_encode` (`lib/idn.c:282-300`)
+//! statement for statement -- `idn2_lookup_ul` twice with
+//! `IDN2_NFC_INPUT | IDN2_NONTRANSITIONAL` then `IDN2_TRANSITIONAL`, and
+//! `idn2_to_unicode_8z8z` with flags `0` -- under `LC_ALL=C.UTF-8` and with
+//! `setlocale(LC_ALL, "")` called first, which `idn2_lookup_ul` requires in
+//! order to see a UTF-8 codeset. A **165-host corpus** was driven through both
+//! it and this module, hex-encoded on both sides and diffed: **325 of 330
+//! comparisons are byte-identical.**
 //!
-//! Each is unreachable from the eligible fixture corpus: `CURLU_PUNYCODE` and
-//! `CURLU_PUNY2IDN` are referenced only by `lib/urlapi.c` itself and by
-//! `tests/libtest/lib1560.c`, and no `tests/data` fixture contains a
-//! right-to-left hostname. Four of the five are in the stricter direction.
+//! Of the five that are not, two are an artefact of the C string interface
+//! rather than a behavioural difference, and the remaining three share a
+//! single cause.
 //!
-//! **The two comparisons that are not about IDN at all**, recorded because
-//! they are a cross-file obligation rather than a defect here: the host
-//! `1234567890` comes back from the oracle as `73.150.2.210`, in both
-//! directions. That is `curl_url_set` reading the label as a 32-bit integer
-//! IPv4 address (0x499602D2) and re-spelling it in dotted-quad form, which
-//! happens in the URL parser before any IDN code is reached. `lib/idn.c` has
-//! no part in it. Whoever writes the sibling `super` module owns that
-//! normalization; this module correctly leaves such a host alone, because
-//! `is_ascii_name` reports it as ASCII and no conversion applies.
+//! **The one behavioural divergence: UTS-46 _CheckBidi_, in the A-label
+//! direction only.** Three corpus hosts differ, all of them names that mix
+//! writing directions inside one label:
+//! `<U+05E9><U+05DC><U+05D5><U+05DD>abc.se` and its A-label form
+//! `xn--abc-9pe8ah5f.se`, which open right-to-left and close with a Latin
+//! run, and `<U+00E5><U+05E9>.se`, which does the reverse. The oracle
+//! converts all three; this module rejects them, because RFC 5893's
+//! conditions on a bidi label forbid them and `idna 1.1.0` applies _CheckBidi_
+//! to every name. **The pin is what makes this irreducible**, and every public
+//! entry point was checked rather than assumed: the crate states at
+//! `idna-1.1.0/src/uts46.rs:17` that _CheckBidi_ is "Always _true_; cannot be
+//! configured"; `Uts46::to_ascii` exposes no fourth knob for it; and dropping
+//! to the low-level `Uts46::process` with `ErrorPolicy::MarkErrors` does not
+//! help either, because `ProcessingError::ValidityError` is documented at
+//! `uts46.rs:425-427` as producing **no output at all** for the _ToASCII_
+//! operation -- unlike _ToUnicode_, which does get a U+FFFD-marked string. The
+//! mapping and normalization stages one would have to drive instead are
+//! private (`Uts46::data`), so closing this would mean reimplementing UTS-46
+//! and NFC inside this crate rather than configuring the dependency.
+//! `Cargo.toml` freezes `idna` at exactly 1.1.0 under AAP section 0.5.1, and
+//! section 0.8.2 forbids substituting a dependency for one. The
+//! divergence is in the stricter direction and is confined to the mixed case:
+//! a well-formed right-to-left name such as `<U+05E9><U+05DC><U+05D5><U+05DD>.se`
+//! satisfies _CheckBidi_ and yields `xn--9dbne9b.se` in both implementations.
+//! It is also unreachable from the eligible fixture corpus -- `CURLU_PUNYCODE`
+//! and `CURLU_PUNY2IDN` are referenced only by `lib/urlapi.c` itself and by
+//! `tests/libtest/lib1560.c`, and no `tests/data` fixture carries a
+//! right-to-left hostname.
 //!
-//! 1. `to_ascii` of `<U+00E5>..b`: the oracle yields `xn--5ca..b`, this
-//!    module rejects it, because `idna`'s `verify_dns_length`
-//!    (`uts46.rs:477-479`) treats an empty label as a length violation
-//!    while libidn2 checks only the 63-byte and 253-byte bounds. Stricter,
-//!    and an empty DNS label cannot resolve in any case.
-//! 2. `to_ascii` of a *mixed-direction* label -- one that opens with
-//!    right-to-left characters and closes with Latin ones, such as
-//!    `<U+05E9><U+05DC><U+05D5><U+05DD>abc.se`: the oracle yields
-//!    `xn--abc-9pe8ah5f.se`, this module rejects it. `idna` applies UTS-46
-//!    _CheckBidi_ unconditionally and offers no knob to disable it, and RFC
-//!    5893's third condition on a right-to-left label forbids the trailing
-//!    Latin run. Stricter. The divergence is confined to the mixed case: a
-//!    well-formed right-to-left name such as
-//!    `<U+05E9><U+05DC><U+05D5><U+05DD>.se` satisfies _CheckBidi_ and
-//!    yields `xn--9dbne9b.se` in both implementations.
-//! 3. `to_unicode` of `EXAMPLE.COM`: the oracle preserves the case, this
-//!    module returns `example.com`, because UTS-46 ToUnicode case-folds
-//!    every label whereas `idn2_to_unicode_8z8z` rewrites only the labels
-//!    that carry an `xn--` prefix. DNS is case-insensitive, so nothing
-//!    observable downstream changes.
-//! 4. `to_unicode` of a 64-byte ASCII label: the oracle rejects it, this
-//!    module accepts it, because `Uts46::to_unicode` takes no _DnsLength_
-//!    parameter. This is the only divergence in the permissive direction,
-//!    and it is confined to `curl_url_get` with `CURLU_PUNY2IDN` on a host
-//!    that could not have resolved anyway.
-//! 5. `to_unicode` of `xn--a.se`: the oracle yields the four bytes
-//!    `C2 80 2E 73 65`, i.e. U+0080 followed by `.se` -- a C1 control
-//!    character presented as a hostname label. `idn2_to_unicode_8z8z` is a
-//!    pure punycode decode with no validity check, so it emits whatever the
-//!    payload decodes to; UTS-46 ToUnicode classifies U+0080 as disallowed
-//!    and reports failure, so this module returns `Err(UrlMalformat)`.
-//!    Stricter, and the stricter answer is the one the documented contract
-//!    asks for: `docs/libcurl/curl_url_get.md:104-114` requires
-//!    `CURLUE_BAD_HOSTNAME` when a punycode name "cannot be converted to IDN
-//!    correctly", and a control byte in a hostname is not a correct
-//!    conversion.
+//! **The two comparisons that are an interface artefact**, on the host
+//! `<U+0000>.se`: libidn2 takes a `const char *`, so it sees an empty string
+//! and converts it to nothing -- which `Curl_idn_decode`'s own zero-length
+//! check (`lib/idn.c:317-320`) then rejects, and which the U direction returns
+//! as `""` -- while this module takes `&[u8]` and converts all four bytes.
+//! The C loop in `Curl_is_ASCII_name` stops at the same terminator, and the
+//! difference is unobservable for the real callers, whose hosts come from
+//! NUL-terminated storage: an interior NUL cannot reach here. Recorded, not
+//! reproduced -- truncating a Rust slice at a NUL byte in order to match a C
+//! measurement artefact would be a defect, not fidelity.
+//!
+//! **Two further comparisons that are not about IDN at all**, recorded
+//! because they are a cross-file obligation rather than a defect here: driven
+//! through `curl_url_get` rather than through libidn2 directly, the host
+//! `1234567890` comes back as `73.150.2.210` in both directions. That is
+//! `curl_url_set` reading the label as the 32-bit integer 0x499602D2 and
+//! re-spelling it in dotted-quad form, which happens in the URL parser before
+//! any IDN code is reached. `lib/idn.c` has no part in it. Whoever writes the
+//! sibling `super` module owns that normalization; this module correctly
+//! leaves such a host alone, because `is_ascii_name` reports it as ASCII and
+//! no conversion applies.
+//!
+//! Four divergence classes recorded by an earlier revision of this file have
+//! since been closed, and they are named here so that a reader who finds the
+//! old text in the history knows it is superseded rather than mistaken: the
+//! empty-label rejection (now [`dns_bounds_ok`]), and -- all three from
+//! replacing `Uts46::to_unicode` with a per-label punycode decode -- the
+//! case folding of ASCII labels, the missing length rule, and the rejection
+//! of a control-character payload such as `xn--a.se`, which the oracle
+//! decodes to U+0080 followed by `.se` and this module now does too.
 //!
 //! # Feature advertisement
 //!
@@ -444,21 +474,64 @@ const DENY_LIST: AsciiDenyList = AsciiDenyList::EMPTY;
 #[allow(dead_code)]
 const TO_ASCII_HYPHENS: Hyphens = Hyphens::Check;
 
-/// _VerifyDNSLength=true_, tolerating the root label's trailing dot.
+/// _VerifyDNSLength=false_, because the length rule is applied by
+/// [`dns_bounds_ok`] instead.
 ///
-/// The 63-byte label bound and 253-byte name bound that `tests/data/test1035`
-/// depends on, without the outright rejection of a trailing dot that
-/// [`DnsLength::Verify`] would add.
+/// The bound itself is not abandoned -- `tests/data/test1035` depends on it,
+/// and [`uts46_to_ascii`] still enforces it on the A-label that comes out.
+/// What is abandoned is `idna`'s *spelling* of the rule, because
+/// [`idna::uts46::verify_dns_length`] additionally rejects an empty label
+/// and libidn2 does not. Measured: the oracle converts `<U+00E5>..b` to
+/// `xn--5ca..b`, `.se` and `a..b` to themselves, and `<U+00E5>.se..` to
+/// `xn--5ca.se..`; with [`DnsLength::VerifyAllowRootDot`] all four are
+/// rejected. See [`dns_bounds_ok`] for the rule that replaces it.
 #[allow(dead_code)]
-const TO_ASCII_DNS_LENGTH: DnsLength = DnsLength::VerifyAllowRootDot;
+const TO_ASCII_DNS_LENGTH: DnsLength = DnsLength::Ignore;
 
-/// _CheckHyphens=false_ for the U-label direction.
+/// The DNS label bound, `IDN2_LABEL_MAX_LENGTH` (`/usr/include/idn2.h:162`).
 ///
-/// Reproduces `idn2_to_unicode_8z8z` (`lib/idn.c:286`), a conversion entry
-/// point that applies no hyphen policy at all. Not a copy-paste slip: see
-/// the asymmetry discussion in the module documentation.
-#[allow(dead_code)]
-const TO_UNICODE_HYPHENS: Hyphens = Hyphens::Allow;
+/// Counted in *bytes* for an A-label, which is ASCII, and in *code points*
+/// for a U-label. That is libidn2's own asymmetry rather than a convenience:
+/// `idn2_to_unicode_8z8z` works on UTF-32 internally, so its label bound is
+/// a code-point count. Measured -- a 40-code-point, 80-byte label converts,
+/// a 64-code-point, 128-byte one is `IDN2_TOO_BIG_LABEL`.
+const MAX_LABEL: usize = 63;
+
+/// The A-label name bound: 253 bytes once a single root dot is discounted.
+///
+/// Measured against libidn2 2.3.8: a 253-byte ASCII name converts, 254 is
+/// `IDN2_TOO_BIG_DOMAIN`, and a 254-byte name *ending in a dot* converts
+/// while 255 does not. Note this is not `IDN2_DOMAIN_MAX_LENGTH` (255): the
+/// lookup direction is stricter than the conversion direction, and 253 is
+/// the figure `idna`'s own [`idna::uts46::verify_dns_length`] uses.
+const MAX_ALABEL_NAME: usize = 253;
+
+/// The U-label name bound: 255 code points, `IDN2_DOMAIN_MAX_LENGTH`
+/// (`/usr/include/idn2.h:173`), with label separators counted and no root-dot
+/// discount.
+///
+/// Measured: 255 code points convert, 256 is `IDN2_TOO_BIG_DOMAIN`, and a
+/// 254-code-point/443-byte name converts -- so the count is code points, not
+/// bytes. The bound applies to the *decoded* result and not to the input: a
+/// 277-byte punycode host decoding to 102 code points converts.
+const MAX_ULABEL_NAME: usize = 255;
+
+/// The largest U-label result in bytes, and therefore the accumulator's
+/// capacity.
+///
+/// [`MAX_ULABEL_NAME`] code points of at most four UTF-8 bytes each. Because
+/// [`idn_to_unicode`] checks the running count *before* appending, the output
+/// never exceeds this, so a single reservation of it makes every subsequent
+/// `push_str` incapable of reallocating -- which is what keeps that function's
+/// only allocation fallible without a fallible `push_str`.
+const MAX_ULABEL_NAME_BYTES: usize = MAX_ULABEL_NAME * 4;
+
+/// The ACE prefix that marks a punycode label, `xn--`.
+///
+/// Matched case-insensitively. Measured: `XN--4CAB6C.se`, `Xn--4cab6c.se` and
+/// `xN--4cab6c.se` all decode, while `xn-4cab6c.se` and `xn4cab6c.se` are
+/// copied through untouched.
+const ACE_PREFIX: &str = "xn--";
 
 /// The `idna` version this module is compiled against.
 ///
@@ -608,11 +681,51 @@ fn transitional_map(input: &str) -> Cow<'_, str> {
 
 // idn_decode / Curl_idn_decode -- Unicode host to A-label
 
+/// libidn2's DNS length rule for an A-label, which tolerates empty labels.
+///
+/// Derived from [`idna::uts46::verify_dns_length`]
+/// (`idna-1.1.0/src/uts46.rs:463-487`) with one clause removed: that function
+/// returns `false` for an empty label, and libidn2's lookup has no such rule.
+/// Everything else is identical, including the root-dot discount, so this is
+/// a narrowing of `idna`'s rule rather than a reimplementation of DNS.
+///
+/// The three clauses, each measured against libidn2 2.3.8 driven exactly as
+/// `lib/idn.c:247-268` drives it:
+///
+/// * One trailing dot is discounted. `<U+00E5><U+00E4><U+00F6>.se.` converts
+///   to `xn--4cab6c.se.`, so a rooted name is legal, and the 253-byte bound
+///   is measured on the name *without* that dot -- 254 bytes ending in a dot
+///   converts, 255 does not.
+/// * The name, so discounted, is at most [`MAX_ALABEL_NAME`] bytes.
+/// * Every label is at most [`MAX_LABEL`] bytes. An empty label satisfies
+///   this, which is the whole point.
+///
+/// Applied to the *output* of the conversion rather than the input, because
+/// that is where libidn2 applies it: twenty `<U+00E5><U+00E4><U+00F6>` labels
+/// are 142 input bytes and 222 A-label bytes and convert, while thirty are
+/// 212 input bytes and 332 A-label bytes and are `IDN2_TOO_BIG_DOMAIN`.
+#[allow(dead_code)]
+fn dns_bounds_ok(alabel: &str) -> bool {
+    let bytes = alabel.as_bytes();
+    let without_root_dot = bytes.strip_suffix(b".").unwrap_or(bytes);
+    if without_root_dot.len() > MAX_ALABEL_NAME {
+        return false;
+    }
+    without_root_dot
+        .split(|byte| *byte == b'.')
+        .all(|label| label.len() <= MAX_LABEL)
+}
+
 /// One UTS-46 _ToASCII_ attempt with this module's fixed parameters.
 ///
 /// `None` on any validity error, which is all `idn_to_ascii` needs in order
 /// to decide whether to make its second attempt. `idna::Errors` carries no
 /// discriminated detail in 1.1.0, so nothing is lost by collapsing it.
+///
+/// The length rule is applied here rather than inside `Uts46::to_ascii` -- see
+/// [`TO_ASCII_DNS_LENGTH`] and [`dns_bounds_ok`] -- and it is applied to the
+/// A-label that came out, so a name that is short in Unicode but long once
+/// encoded is still rejected.
 #[allow(dead_code)]
 fn uts46_to_ascii(input: &str) -> Option<String> {
     Uts46::new()
@@ -624,6 +737,7 @@ fn uts46_to_ascii(input: &str) -> Option<String> {
         )
         .ok()
         .map(Cow::into_owned)
+        .filter(|alabel| dns_bounds_ok(alabel))
 }
 
 /// The two-attempt conversion of `idn_decode` (`lib/idn.c:247-280`).
@@ -703,6 +817,58 @@ pub(crate) fn to_ascii(host: &[u8]) -> Result<String, CURLcode> {
 
 // idn_encode / Curl_idn_encode -- A-label to U-label
 
+/// The punycode payload of an ACE label, or `None` if the label is not one.
+///
+/// The prefix test is case-insensitive and exact-width: measured against
+/// libidn2 2.3.8, `XN--4CAB6C.se`, `Xn--4cab6c.se` and `xN--4cab6c.se` all
+/// decode to `<U+00E5><U+00E4><U+00F6>.se`, while `xn-4cab6c.se` and
+/// `xn4cab6c.se` are copied through untouched. An empty payload is returned
+/// as `Some("")` rather than treated as a non-ACE label, because the oracle
+/// rejects `xn--.se` outright instead of passing it through.
+///
+/// Indexing at [`ACE_PREFIX`]`.len()` cannot split a character: the bytes
+/// before that point have just been compared against ASCII, so byte 4 is a
+/// character boundary whenever the comparison succeeded.
+#[allow(dead_code)]
+fn ace_payload(label: &str) -> Option<&str> {
+    let bytes = label.as_bytes();
+    if bytes.len() >= ACE_PREFIX.len()
+        && bytes[..ACE_PREFIX.len()].eq_ignore_ascii_case(ACE_PREFIX.as_bytes())
+    {
+        Some(&label[ACE_PREFIX.len()..])
+    } else {
+        None
+    }
+}
+
+/// One label of the U-label direction: punycode-decoded, or copied verbatim.
+///
+/// Borrowed for a non-ACE label so that the overwhelmingly common case --
+/// an ASCII label that needs nothing done to it -- copies once into the
+/// accumulator rather than twice.
+///
+/// The `is_ascii` rejection is the rule that makes `xn--ab-`, `xn--abc-`,
+/// `xn----` and `xn--AB-` errors rather than the labels `ab`, `abc`, `-` and
+/// `AB`. All four are `IDN2_PUNYCODE_BAD_INPUT` from the oracle, and all four
+/// decode successfully as far as RFC 3492 is concerned -- what they have in
+/// common is that nothing was inserted, so the label was never a legitimate
+/// A-label in the first place. RFC 5891 section 4.2 says as much: an A-label
+/// must decode to a U-label, and a pure-ASCII string is not one.
+#[allow(dead_code)]
+fn decode_label(label: &str) -> Result<Cow<'_, str>, CURLcode> {
+    match ace_payload(label) {
+        Some(payload) => {
+            let decoded = idna::punycode::decode_to_string(payload)
+                .ok_or(CURLcode::UrlMalformat)?;
+            if decoded.is_ascii() {
+                return Err(CURLcode::UrlMalformat);
+            }
+            Ok(Cow::Owned(decoded))
+        }
+        None => Ok(Cow::Borrowed(label)),
+    }
+}
+
 /// The conversion of `idn_encode` (`lib/idn.c:282-300`).
 ///
 /// The C body is a single call with no flags:
@@ -717,25 +883,74 @@ pub(crate) fn to_ascii(host: &[u8]) -> Result<String, CURLcode> {
 /// There is no retry here, in either implementation -- transitional
 /// processing is a property of the *lookup* direction only.
 ///
-/// `Uts46::to_unicode` returns its output and its verdict as a pair, and the
-/// output is only meaningful when the verdict is `Ok`: on failure the string
-/// carries U+FFFD REPLACEMENT CHARACTERs marking each error, and the crate
-/// documents that such a string "must not be used for naming in a network
-/// protocol". It is therefore discarded rather than returned, which is also
-/// what `docs/libcurl/curl_url_get.md:104-114` requires -- a punycode name
-/// that "cannot be converted to IDN correctly" yields
-/// `CURLUE_BAD_HOSTNAME`, not a best-effort string.
+/// # Why this is not `Uts46::to_unicode`
+///
+/// `idn2_to_unicode_8z8z` is not UTS-46 _ToUnicode_. It is a **per-label
+/// punycode decode**: a label carrying the `xn--` prefix is decoded, every
+/// other label is copied byte for byte, and no mapping, case folding,
+/// normalization or validity check is applied to either kind. Driving
+/// `Uts46::to_unicode` instead diverges on four measurable classes of input,
+/// all of them reachable through `curl_url_get(CURLU_PUNY2IDN)`:
+///
+/// * **Case.** `EXAMPLE.COM` comes back unchanged from the oracle; UTS-46
+///   folds it to `example.com`.
+/// * **Mapping.** U+200B ZERO WIDTH SPACE and U+00AD SOFT HYPHEN come back
+///   unchanged; UTS-46 maps both away and yields the empty string.
+/// * **Validity.** `a<U+200C>b.se` comes back unchanged; UTS-46 rejects the
+///   label because ZWNJ is CONTEXTJ outside a joining context. `xn--a.se`
+///   decodes to U+0080 followed by `.se`; UTS-46 rejects U+0080 as
+///   disallowed.
+/// * **Length.** The bounds apply to the decoded result in code points, and
+///   `Uts46::to_unicode` takes no _DnsLength_ parameter at all, so a 64-byte
+///   label that the oracle calls `IDN2_TOO_BIG_LABEL` would be accepted.
+///
+/// So the direction is spelled out here, using the crate's punycode decoder
+/// -- `idna::punycode::decode_to_string`, public at
+/// `idna-1.1.0/src/punycode.rs:48` -- for the only step that needs an
+/// implementation. The decoder is the right one to the byte: it emits the
+/// basic code points verbatim rather than lower-casing them, so
+/// `xn--BCHER-kva.de` yields `B<U+00FC>CHER.de` exactly as the oracle does,
+/// and it accepts an upper-case payload, so `xn--4CAB6C.se` decodes.
+///
+/// # Ordering
+///
+/// Both bounds are checked *before* the label is appended, which is what
+/// keeps the accumulator inside its one reservation -- see
+/// [`MAX_ULABEL_NAME_BYTES`]. It also bounds the work: a host of a million
+/// dots is refused after the 256th rather than copied.
 #[allow(dead_code)]
 fn idn_to_unicode(puny: &str) -> Result<String, CURLcode> {
-    let (unicode, verdict) =
-        Uts46::new().to_unicode(puny.as_bytes(), DENY_LIST, TO_UNICODE_HYPHENS);
+    let mut out =
+        crate::util::fallible::string_with_capacity(MAX_ULABEL_NAME_BYTES)
+            .map_err(crate::util::fallible::oom)?;
+    let mut total = 0usize;
+    let mut first = true;
 
-    match verdict {
-        Ok(()) => Ok(unicode.into_owned()),
-        // The IDNA_MALLOC_ERROR -> CURLE_OUT_OF_MEMORY arm of
-        // lib/idn.c:288 has no Rust analogue; see the module docs.
-        Err(_) => Err(CURLcode::UrlMalformat),
+    for label in puny.split('.') {
+        let needs_separator = !first;
+        first = false;
+
+        let decoded = decode_label(label)?;
+        let code_points = decoded.chars().count();
+        if code_points > MAX_LABEL {
+            return Err(CURLcode::UrlMalformat);
+        }
+        total += usize::from(needs_separator) + code_points;
+        if total > MAX_ULABEL_NAME {
+            return Err(CURLcode::UrlMalformat);
+        }
+
+        if needs_separator {
+            out.push('.');
+        }
+        out.push_str(&decoded);
     }
+
+    debug_assert!(
+        out.len() <= MAX_ULABEL_NAME_BYTES,
+        "the reservation must be an upper bound on the result"
+    );
+    Ok(out)
 }
 
 /// Converts an A-label (punycode) hostname to its Unicode U-label form.
@@ -754,24 +969,29 @@ fn idn_to_unicode(puny: &str) -> Result<String, CURLcode> {
 ///    is expected to be an A-label and therefore ASCII, but nothing
 ///    guarantees it, and the same failure mode in both directions is worth
 ///    more than a saved check.
-/// 2. UTS-46 _ToUnicode_ runs once, with no transitional fallback.
+/// 2. Each label is punycode-decoded if it carries the `xn--` prefix and
+///    copied verbatim otherwise, with no transitional fallback -- see
+///    [`idn_to_unicode`] for why this is a decode rather than UTS-46
+///    _ToUnicode_.
 /// 3. **An empty result is *not* rejected.** `lib/idn.c:341-342` assigns
 ///    unconditionally, and that asymmetry against [`to_ascii`] is preserved
-///    on purpose. It is reachable: U+200B ZERO WIDTH SPACE maps to nothing
-///    and this function returns `Ok("")` for it.
+///    on purpose. It is reachable: an empty host converts to `Ok("")` here
+///    and to `Err` there.
 ///
 /// # Errors
 ///
-/// [`CURLcode::UrlMalformat`] for ill-formed UTF-8 and for input UTS-46
-/// cannot convert -- an invalid punycode payload, for instance. The caller
-/// turns it into `CURLUE_BAD_HOSTNAME`.
+/// [`CURLcode::UrlMalformat`] for ill-formed UTF-8, for an `xn--` label whose
+/// payload is not decodable punycode or decodes to pure ASCII, and for a
+/// decoded label or name over its length bound. The caller turns it into
+/// `CURLUE_BAD_HOSTNAME`. [`CURLcode::OutOfMemory`] if the accumulator cannot
+/// be reserved, which is the `IDNA_MALLOC_ERROR` arm of `lib/idn.c:288`.
 ///
 /// # Examples
 ///
 /// ```text
 ///   to_unicode(b"xn--4cab6c.se")     == Ok("<U+00E5><U+00E4><U+00F6>.se")
 ///   to_unicode(b"XN--4CAB6C.se")     == Ok("<U+00E5><U+00E4><U+00F6>.se")
-///   to_unicode(b"example.com")       == Ok("example.com")
+///   to_unicode(b"EXAMPLE.COM")       == Ok("EXAMPLE.COM")   // case kept
 ///   to_unicode(b"xn--zzzzzz.se")     == Err(UrlMalformat)
 /// ```
 #[allow(dead_code)]
@@ -838,17 +1058,16 @@ pub fn version_string() -> Option<&'static str> {
 //
 //   * `tests/data/test*` -- the behavioural specification.
 //   * `tests/libtest/lib1560.c:206-239` -- the URL API's own IDN corpus.
-//   * A mechanical diff against curl 8.19.0-DEV built with libidn2 2.3.8:
-//     a 63-host corpus driven through `curl_url_get(CURLUPART_HOST, ...)` in
-//     both flag directions, compared hex-for-hex against this module behind
-//     the same `lib/urlapi.c:1401-1420` gate. 119 of 126 comparisons are
-//     byte-identical. Five of the seven that are not are each covered by a
-//     `divergence_*` test below that names the cause; the remaining two are
-//     the numeric-host case, which belongs to the URL parser rather than
-//     here, and `numeric_hosts_pass_through_untouched` proves this module
-//     does not produce them. A test asserting a divergence is therefore
-//     doing real work: it makes an `idna` upgrade that changes the behaviour
-//     fail loudly here rather than silently on the wire.
+//   * A mechanical diff against libidn2 2.3.8, driven exactly as
+//     `lib/idn.c:247-300` drives it: a 165-host corpus, hex-encoded on both
+//     sides, 325 of 330 comparisons byte-identical. Every expectation below
+//     that cites "the oracle" is a row of that diff and not an inference.
+//     Three of the five differences are the one surviving divergence,
+//     _CheckBidi_, which `divergence_a_mixed_direction_label_is_rejected`
+//     asserts so that an `idna` upgrade changing the behaviour fails loudly
+//     here rather than silently on the wire; the other two are the
+//     interior-NUL interface artefact, covered by
+//     `an_interior_nul_is_not_a_c_string_terminator`.
 //
 // Nothing below touches the network, the filesystem, the clock or the
 // environment, so the whole module runs under Miri.
@@ -967,8 +1186,9 @@ mod tests {
         // tests/data/test1035, keyword FAILURE, expects exit code 3. The
         // host below is the fixture's, with %hex[...]hex% expanded. Its
         // A-label exceeds the 63-byte label bound, so this is the assertion
-        // that DnsLength::VerifyAllowRootDot exists for: with
-        // DnsLength::Ignore the conversion succeeds and the fixture fails.
+        // dns_bounds_ok exists for: with no length rule at all the
+        // conversion succeeds and the fixture fails. Measured -- the oracle
+        // answers IDN2_TOO_BIG_LABEL for this host.
         let host = "too-long-IDN-name-c\u{fc}rl-r\u{fc}le\u{df}\
                     -la-la-la-dee-da-flooby-nooby.local";
         assert_eq!(to_ascii(host.as_bytes()), Err(CURLcode::UrlMalformat));
@@ -1094,31 +1314,37 @@ mod tests {
     // The empty-result asymmetry -- lib/idn.c:317-320 vs :341-342
 
     #[test]
-    fn to_ascii_rejects_an_empty_result_and_to_unicode_does_not() {
-        // U+200B ZERO WIDTH SPACE is mapped away entirely by UTS-46, so the
-        // conversion of a host consisting only of it is the empty string.
-        //
-        // This single input demonstrates the deliberate asymmetry between
-        // the two C functions: Curl_idn_decode rejects a zero-length result
-        // (lib/idn.c:317-320, "ended up zero length, not acceptable") while
-        // Curl_idn_encode assigns unconditionally (lib/idn.c:341-342).
-        let zwsp = "\u{200b}".as_bytes();
-        assert_eq!(to_ascii(zwsp), Err(CURLcode::UrlMalformat));
-        assert_eq!(to_unicode(zwsp), Ok(String::new()));
-    }
-
-    #[test]
-    fn a_soft_hyphen_only_host_shows_the_same_asymmetry() {
-        // U+00AD SOFT HYPHEN is likewise mapped away.
-        let shy = "\u{ad}".as_bytes();
-        assert_eq!(to_ascii(shy), Err(CURLcode::UrlMalformat));
-        assert_eq!(to_unicode(shy), Ok(String::new()));
-    }
-
-    #[test]
-    fn an_empty_host_follows_the_same_rule() {
+    fn an_empty_host_shows_the_asymmetry_between_the_two_directions() {
+        // The deliberate asymmetry between the two C functions:
+        // Curl_idn_decode rejects a zero-length result (lib/idn.c:317-320,
+        // "ended up zero length, not acceptable") while Curl_idn_encode
+        // assigns unconditionally (lib/idn.c:341-342). Measured: the oracle
+        // agrees in both directions on this host.
         assert_eq!(to_ascii(b""), Err(CURLcode::UrlMalformat));
         assert_eq!(to_unicode(b""), Ok(String::new()));
+    }
+
+    #[test]
+    fn characters_uts46_maps_away_survive_the_u_label_direction() {
+        // U+200B ZERO WIDTH SPACE and U+00AD SOFT HYPHEN are mapped away
+        // entirely by UTS-46, which is why they used to demonstrate the
+        // asymmetry above -- Uts46::to_unicode returned Ok(""). That was a
+        // divergence: idn2_to_unicode_8z8z maps nothing, and the oracle
+        // returns both hosts unchanged (measured, C2 AD and E2 80 8B
+        // respectively). The A-label direction still rejects them, because
+        // there the mapping does run and the result is empty.
+        for host in ["\u{200b}", "\u{ad}"] {
+            assert_eq!(
+                to_unicode(host.as_bytes()),
+                Ok(host.to_string()),
+                "{host:?} must pass through the U-label direction"
+            );
+            assert_eq!(
+                to_ascii(host.as_bytes()),
+                Err(CURLcode::UrlMalformat),
+                "{host:?} must fail the A-label direction"
+            );
+        }
     }
 
     // UTF-8 validation -- rejected, never repaired
@@ -1353,18 +1579,35 @@ mod tests {
     }
 
     #[test]
-    fn to_unicode_never_returns_a_replacement_marked_string() {
-        // Uts46::to_unicode returns its output and its verdict as a pair,
-        // and on failure the output carries U+FFFD markers that the crate
-        // documents as unusable in a network protocol. The error arm must
-        // discard it rather than pass it on.
-        for host in ["xn--zzzzzz.se", "a\u{200c}b.se", "xn--a.se"] {
-            match to_unicode(host.as_bytes()) {
-                Err(CURLcode::UrlMalformat) => {}
-                Ok(value) => panic!("{host:?} unexpectedly produced {value:?}"),
-                Err(other) => panic!("unexpected code {other:?}"),
+    fn to_unicode_never_invents_a_replacement_character() {
+        // This used to guard against Uts46::to_unicode's failure mode, which
+        // returns a lossy string alongside the error verdict -- a string the
+        // crate documents as unusable in a network protocol. That mode is
+        // gone with the function: a per-label punycode decode either produces
+        // the label or reports an error, and has no lossy path to leak. What
+        // remains worth asserting is that U+FFFD never appears in an output
+        // unless the caller put it in the input.
+        for host in [
+            "xn--zzzzzz.se",
+            "a\u{200c}b.se",
+            "xn--a.se",
+            "xn--ab-.se",
+            "\u{e5}\u{e4}\u{f6}.se",
+            "example.com",
+        ] {
+            if let Ok(value) = to_unicode(host.as_bytes()) {
+                assert!(
+                    !value.contains('\u{fffd}'),
+                    "{host:?} produced a replacement character: {value:?}"
+                );
             }
         }
+        // And an input that does carry one keeps it, verbatim, because a
+        // non-ACE label is copied rather than validated.
+        assert_eq!(
+            to_unicode("\u{fffd}.se".as_bytes()),
+            Ok("\u{fffd}.se".to_string())
+        );
     }
 
     // Totality: nothing here may panic, whatever arrives
@@ -1413,12 +1656,14 @@ mod tests {
     }
 
     #[test]
-    fn every_error_this_module_produces_is_url_malformat() {
-        // The module documentation claims UrlMalformat is the only code
-        // reachable from here -- no CURLE_OUT_OF_MEMORY, because Rust
-        // aborts on allocation failure, and no CURLE_NOT_BUILT_IN, because
-        // there is no runtime version check to fail. This asserts it over
-        // every failing input the suite knows about.
+    fn every_malformed_host_is_reported_as_url_malformat() {
+        // UrlMalformat is the only code a *malformed host* produces here. The
+        // one other reachable code is CURLE_OUT_OF_MEMORY, from the single
+        // reservation in idn_to_unicode, which reproduces lib/idn.c:288 and
+        // cannot be provoked by any of the inputs below. CURLE_NOT_BUILT_IN
+        // stays unreachable, because there is no runtime version check to
+        // fail. This asserts it over every failing input the suite knows
+        // about.
         let failing: Vec<Vec<u8>> = vec![
             b"\xff".to_vec(),
             b"invalid-utf8-\xe2\x90.local".to_vec(),
@@ -1443,37 +1688,100 @@ mod tests {
         }
     }
 
-    // Divergences from the C oracle, asserted so a regression is loud
+    // Parity with the C oracle on the cases that used to diverge
 
     #[test]
-    fn divergence_an_empty_interior_label_is_rejected() {
-        // Oracle: `<U+00E5>..b` converts to `xn--5ca..b`. The idna crate's
-        // verify_dns_length (uts46.rs:477-479) counts an empty label as a
-        // length violation, while libidn2 checks only the 63- and 253-byte
-        // bounds, so this module is stricter. Unreachable from any fixture,
-        // and an empty DNS label cannot resolve in any case.
-        assert_eq!(
-            to_ascii("\u{e5}..b".as_bytes()),
-            Err(CURLcode::UrlMalformat)
-        );
-        // The U-label direction has no DnsLength parameter, so there it
-        // agrees with the oracle.
+    fn an_empty_label_converts_rather_than_failing_the_length_rule() {
+        // Measured, all six rows: the oracle converts `<U+00E5>..b` to
+        // `xn--5ca..b` and leaves the rest alone, because libidn2's lookup
+        // checks only the 63- and 253-byte bounds. idna's own
+        // verify_dns_length (idna-1.1.0/src/uts46.rs:463-487) additionally
+        // counts an empty label as a violation, which is the one clause
+        // dns_bounds_ok drops.
+        for (host, expected) in [
+            ("\u{e5}..b", "xn--5ca..b"),
+            (".se", ".se"),
+            ("a..b", "a..b"),
+            ("\u{e5}.se..", "xn--5ca.se.."),
+            (".", "."),
+            ("...", "..."),
+        ] {
+            assert_eq!(
+                to_ascii(host.as_bytes()),
+                Ok(expected.to_string()),
+                "to_ascii({host:?})"
+            );
+        }
+        // The U-label direction never had a DnsLength parameter to get
+        // wrong, and agrees.
         assert_eq!(to_unicode(b"a..b"), Ok("a..b".to_string()));
+        assert_eq!(to_unicode(b"."), Ok(".".to_string()));
     }
 
     #[test]
+    fn dns_bounds_ok_is_verify_dns_length_without_the_empty_label_clause() {
+        // The three clauses, each at its boundary. Bytes, because an A-label
+        // is ASCII.
+        assert!(dns_bounds_ok(&"a".repeat(MAX_LABEL)));
+        assert!(!dns_bounds_ok(&"a".repeat(MAX_LABEL + 1)));
+        let name = |total: usize| {
+            let mut out = String::new();
+            while out.len() < total {
+                let chunk = (total - out.len()).min(50);
+                out.push_str(&"a".repeat(chunk));
+                out.push('.');
+            }
+            out.truncate(total);
+            if out.ends_with('.') {
+                out.pop();
+                out.push('a');
+            }
+            out
+        };
+        assert!(dns_bounds_ok(&name(MAX_ALABEL_NAME)));
+        assert!(!dns_bounds_ok(&name(MAX_ALABEL_NAME + 1)));
+        // One trailing dot is discounted, so 254 bytes ending in a dot pass
+        // and 255 do not. Measured against the oracle at both boundaries.
+        assert!(dns_bounds_ok(&format!("{}.", name(MAX_ALABEL_NAME))));
+        assert!(!dns_bounds_ok(&format!("{}.", name(MAX_ALABEL_NAME + 1))));
+        // And the dropped clause: empty labels are accepted anywhere.
+        for host in ["", ".", "..", "a..b", "xn--5ca..b", ".a", "a."] {
+            assert!(dns_bounds_ok(host), "{host:?} must satisfy the bounds");
+        }
+    }
+
+    // The one surviving divergence
+
+    #[test]
     fn divergence_a_mixed_direction_label_is_rejected() {
-        // Oracle: the host `<U+05E9><U+05DC><U+05D5><U+05DD>abc.se` converts
-        // to `xn--abc-9pe8ah5f.se`. That label
-        // opens with right-to-left characters and closes with Latin ones,
-        // which violates the third condition RFC 5893 places on an RTL
-        // label. idna applies UTS-46 CheckBidi unconditionally and exposes
-        // no knob to disable it, so this module is stricter than libidn2
-        // here. Unreachable from the fixture corpus: no `tests/data`
-        // fixture carries a right-to-left hostname.
+        // THE ONE DIVERGENCE FROM THE ORACLE THAT REMAINS. Measured: the host
+        // `<U+05E9><U+05DC><U+05D5><U+05DD>abc.se` converts to
+        // `xn--abc-9pe8ah5f.se`, its A-label form converts to itself, and
+        // `<U+00E5><U+05E9>.se` converts to `xn--5ca28w.se`. Each label mixes
+        // writing directions, which violates the conditions RFC 5893 places
+        // on a bidi label, and idna 1.1.0 applies UTS-46 CheckBidi to every
+        // name: `idna-1.1.0/src/uts46.rs:17` states it is "Always _true_;
+        // cannot be configured", and Uts46::to_ascii exposes no knob for it.
+        // Cargo.toml freezes idna at exactly 1.1.0 under AAP section 0.5.1,
+        // so this is irreducible rather than unfinished. Stricter, and
+        // unreachable from the fixture corpus: no `tests/data` fixture
+        // carries a right-to-left hostname.
+        for host in [
+            "\u{5e9}\u{5dc}\u{5d5}\u{5dd}abc.se",
+            "xn--abc-9pe8ah5f.se",
+            "\u{e5}\u{5e9}.se",
+        ] {
+            assert_eq!(
+                to_ascii(host.as_bytes()),
+                Err(CURLcode::UrlMalformat),
+                "{host:?} is the CheckBidi divergence"
+            );
+        }
+        // The U-label direction is unaffected, because it no longer runs
+        // UTS-46 at all: both spellings decode exactly as the oracle does.
         assert_eq!(
-            to_ascii("\u{5e9}\u{5dc}\u{5d5}\u{5dd}abc.se".as_bytes()),
-            Err(CURLcode::UrlMalformat)
+            to_unicode(b"xn--abc-9pe8ah5f.se"),
+            Ok("\u{5e9}\u{5dc}\u{5d5}\u{5dd}abc.se".to_string())
         );
         // The divergence is confined to the mixed-direction case. A
         // well-formed RTL name satisfies CheckBidi and converts to the same
@@ -1490,45 +1798,193 @@ mod tests {
     }
 
     #[test]
-    fn divergence_to_unicode_case_folds_ascii_labels() {
-        // Oracle: `EXAMPLE.COM` is returned unchanged, because
-        // idn2_to_unicode_8z8z rewrites only labels carrying an `xn--`
-        // prefix, whereas UTS-46 ToUnicode maps every label. DNS is
-        // case-insensitive, so nothing observable downstream changes.
-        assert_eq!(to_unicode(b"EXAMPLE.COM"), Ok("example.com".to_string()));
+    fn the_u_label_direction_preserves_case_and_maps_nothing() {
+        // Measured: the oracle returns `EXAMPLE.COM` and `Foo.Example.COM`
+        // unchanged, because idn2_to_unicode_8z8z rewrites only labels
+        // carrying an `xn--` prefix. UTS-46 ToUnicode folded every label,
+        // which is why this was a divergence.
+        assert_eq!(to_unicode(b"EXAMPLE.COM"), Ok("EXAMPLE.COM".to_string()));
+        assert_eq!(
+            to_unicode(b"Foo.Example.COM"),
+            Ok("Foo.Example.COM".to_string())
+        );
+        // Inside a decoded label the punycode decoder keeps the case of the
+        // basic code points too: `xn--BCHER-kva.de` is `B<U+00FC>CHER.de`,
+        // not `b<U+00FC>cher.de`, exactly as the oracle has it.
+        assert_eq!(
+            to_unicode(b"xn--BCHER-kva.de"),
+            Ok("B\u{fc}CHER.de".to_string())
+        );
+        assert_eq!(
+            to_unicode(b"xn--bcher-kva.de"),
+            Ok("b\u{fc}cher.de".to_string())
+        );
         // The A-label direction folds case in both implementations.
         assert_eq!(to_ascii(b"EXAMPLE.COM"), Ok("example.com".to_string()));
     }
 
     #[test]
-    fn divergence_a_control_character_payload_is_rejected() {
-        // Oracle: `xn--a.se` decodes to the bytes C2 80 2E 73 65, i.e. U+0080
-        // followed by `.se`. libidn2's conversion entry point is a bare
-        // punycode decode and emits the C1 control character as a hostname
-        // label; UTS-46 ToUnicode classifies U+0080 as disallowed. Stricter,
-        // and the stricter answer is what curl_url_get.md:104-114 asks for.
-        assert_eq!(to_unicode(b"xn--a.se"), Err(CURLcode::UrlMalformat));
-        // Confirm the module never emits that byte sequence by any route.
-        for host in [&b"xn--a.se"[..], &b"xn--a"[..], &b"XN--A.SE"[..]] {
-            if let Ok(value) = to_unicode(host) {
-                assert!(
-                    !value.chars().any(|c| c.is_control()),
-                    "{host:?} produced a control character: {value:?}"
-                );
-            }
+    fn a_control_character_payload_decodes_exactly_as_the_oracle_does() {
+        // Measured: `xn--a.se` decodes to the bytes C2 80 2E 73 65, i.e.
+        // U+0080 followed by `.se` -- a C1 control character presented as a
+        // hostname label. libidn2's conversion entry point is a bare punycode
+        // decode with no validity check, so it emits whatever the payload
+        // decodes to, and this module now does the same. UTS-46 ToUnicode
+        // classified U+0080 as disallowed and rejected it, which was the
+        // divergence.
+        assert_eq!(to_unicode(b"xn--a.se"), Ok("\u{80}.se".to_string()));
+        assert_eq!(to_unicode(b"xn--a"), Ok("\u{80}".to_string()));
+        // The prefix match is case-insensitive and the remaining labels are
+        // copied verbatim, so the suffix keeps its case.
+        assert_eq!(to_unicode(b"XN--A.SE"), Ok("\u{80}.SE".to_string()));
+        // The A-label direction still refuses it, in both implementations:
+        // the oracle answers IDN2_INVALID_NONTRANSITIONAL.
+        assert_eq!(to_ascii(b"xn--a.se"), Err(CURLcode::UrlMalformat));
+    }
+
+    #[test]
+    fn the_u_label_direction_bounds_the_decoded_length_in_code_points() {
+        // Measured, and every row is a boundary. The bound applies to the
+        // decoded result rather than the input, and counts code points rather
+        // than bytes -- which is why replacing Uts46::to_unicode, a function
+        // with no DnsLength parameter at all, needed the rule spelled out.
+
+        // A 64-byte ASCII label is IDN2_TOO_BIG_LABEL in both directions;
+        // 63 converts.
+        let long = format!("{}.se", "a".repeat(MAX_LABEL + 1));
+        assert_eq!(to_unicode(long.as_bytes()), Err(CURLcode::UrlMalformat));
+        assert_eq!(to_ascii(long.as_bytes()), Err(CURLcode::UrlMalformat));
+        let ok = format!("{}.se", "a".repeat(MAX_LABEL));
+        assert_eq!(to_unicode(ok.as_bytes()), Ok(ok.clone()));
+
+        // Code points, not bytes: 63 U+00E5 is 126 bytes and converts, 64 is
+        // IDN2_TOO_BIG_LABEL.
+        let wide_ok = format!("{}.se", "\u{e5}".repeat(MAX_LABEL));
+        assert_eq!(to_unicode(wide_ok.as_bytes()), Ok(wide_ok.clone()));
+        let wide_bad = format!("{}.se", "\u{e5}".repeat(MAX_LABEL + 1));
+        assert_eq!(
+            to_unicode(wide_bad.as_bytes()),
+            Err(CURLcode::UrlMalformat)
+        );
+
+        // The decoded length is what counts, not the input's: `xn--` plus
+        // sixty `a` is a 64-byte input label and decodes to sixty U+0080.
+        let sixty = format!("xn--{}.se", "a".repeat(60));
+        assert_eq!(
+            to_unicode(sixty.as_bytes()),
+            Ok(format!("{}.se", "\u{80}".repeat(60)))
+        );
+
+        // The name bound is 255 code points with separators counted and no
+        // root-dot discount: 63 A-labels of `<U+00E5><U+00E4><U+00F6>` plus
+        // `se` decode to 254 code points and convert, 64 exceed it. Note the
+        // 254-code-point result is 443 bytes, so a byte count would refuse it.
+        let within = format!("{}.se", ["xn--4cab6c"; 63].join("."));
+        let decoded = to_unicode(within.as_bytes()).expect("254 code points");
+        assert_eq!(decoded.chars().count(), 254);
+        assert_eq!(decoded.len(), 443);
+        let beyond = format!("{}.se", ["xn--4cab6c"; 64].join("."));
+        assert_eq!(to_unicode(beyond.as_bytes()), Err(CURLcode::UrlMalformat));
+
+        // And the input is not bounded: 25 A-labels are 277 input bytes and
+        // decode to 102 code points, which the oracle accepts.
+        let long_input = format!("{}.se", ["xn--4cab6c"; 25].join("."));
+        assert_eq!(long_input.len(), 277);
+        assert_eq!(
+            to_unicode(long_input.as_bytes()).map(|out| out.chars().count()),
+            Ok(102)
+        );
+    }
+
+    #[test]
+    fn an_ace_label_that_decodes_to_pure_ascii_is_bad_input() {
+        // Measured: all four are IDN2_PUNYCODE_BAD_INPUT, and all four decode
+        // successfully as far as RFC 3492 is concerned -- to `ab`, `abc`, `-`
+        // and `AB`. What they have in common is that nothing was inserted, so
+        // the label was never a legitimate A-label. RFC 5891 section 4.2 makes
+        // the same point: an A-label must decode to a U-label.
+        for host in ["xn--ab-.se", "xn--abc-.se", "xn----.se", "xn--AB-.se"] {
+            assert_eq!(
+                to_unicode(host.as_bytes()),
+                Err(CURLcode::UrlMalformat),
+                "{host:?} decodes to pure ASCII and must be refused"
+            );
+        }
+        // An empty payload is refused by the same rule rather than passed
+        // through as the label `xn--`, which is what the oracle does too.
+        for host in ["xn--.se", "xn--", "xn--."] {
+            assert_eq!(
+                to_unicode(host.as_bytes()),
+                Err(CURLcode::UrlMalformat),
+                "{host:?} must be refused"
+            );
+        }
+        // One inserted character is enough, and it need not be the whole
+        // label: `xn--abc-a` is `<U+0080>abc`.
+        assert_eq!(to_unicode(b"xn--abc-a.se"), Ok("\u{80}abc.se".to_string()));
+    }
+
+    #[test]
+    fn ace_payload_matches_the_prefix_exactly_and_case_insensitively() {
+        assert_eq!(ace_payload("xn--4cab6c"), Some("4cab6c"));
+        assert_eq!(ace_payload("XN--4CAB6C"), Some("4CAB6C"));
+        assert_eq!(ace_payload("Xn--4cab6c"), Some("4cab6c"));
+        assert_eq!(ace_payload("xN--4cab6c"), Some("4cab6c"));
+        assert_eq!(ace_payload("xn--"), Some(""));
+        // Not the prefix: too short, or the wrong number of hyphens.
+        for label in ["xn-", "xn", "x", "", "xn-4cab6c", "xn4cab6c", "-xn--a"] {
+            assert_eq!(ace_payload(label), None, "{label:?} is not an A-label");
+        }
+        // Measured: the oracle copies `xn-.se` and `xn.se` through untouched.
+        assert_eq!(to_unicode(b"xn-.se"), Ok("xn-.se".to_string()));
+        assert_eq!(to_unicode(b"xn.se"), Ok("xn.se".to_string()));
+    }
+
+    #[test]
+    fn non_ace_labels_are_copied_verbatim_whatever_they_contain() {
+        // idn2_to_unicode_8z8z applies no mapping, no case folding, no
+        // normalization and no validity check to a label without the prefix.
+        // Every row is measured: the oracle returns each of these unchanged.
+        for host in [
+            "a\u{200c}b.se",
+            "a\u{200d}b.se",
+            "a\u{30a}.se",
+            "\u{c5}\u{c4}\u{d6}.se",
+            "\u{80}.se",
+            "\u{7f}.se",
+            "a b.se",
+            "a@b.se",
+            "1234567890",
+            "[::1]",
+            "\u{1f600}.se",
+            "\u{df}.de",
+            "\u{131}.se",
+        ] {
+            assert_eq!(
+                to_unicode(host.as_bytes()),
+                Ok(host.to_string()),
+                "{host:?} must be copied verbatim"
+            );
         }
     }
 
     #[test]
-    fn divergence_to_unicode_applies_no_length_rule() {
-        // Oracle: a 64-byte label yields CURLUE_BAD_HOSTNAME. This is the
-        // one divergence in the permissive direction, and it exists because
-        // Uts46::to_unicode takes no DnsLength parameter -- consistent with
-        // the C conversion API applying no total-length rule either.
-        let host = format!("{}.se", "a".repeat(64));
-        assert_eq!(to_unicode(host.as_bytes()), Ok(host.clone()));
-        // The A-label direction does apply the rule.
-        assert_eq!(to_ascii(host.as_bytes()), Err(CURLcode::UrlMalformat));
+    fn an_interior_nul_is_not_a_c_string_terminator() {
+        // The two corpus comparisons that differ for a reason that is not a
+        // behavioural difference. libidn2 takes a `const char *`, so for the
+        // host `<U+0000>.se` it sees an empty string: the A direction ends up
+        // with a zero-length result that lib/idn.c:317-320 rejects, and the U
+        // direction returns "". This module takes `&[u8]` and converts all
+        // four bytes, which is the answer the slice signature demands.
+        //
+        // Unobservable for the real callers -- hosts arrive from
+        // NUL-terminated storage, so an interior NUL cannot reach here -- and
+        // truncating at the NUL in order to match the measurement artefact
+        // would be a defect rather than fidelity. U+0000 is
+        // disallowed_STD3_valid, so with AsciiDenyList::EMPTY it survives
+        // even the A-label direction.
+        assert_eq!(to_unicode(b"\0.se"), Ok("\0.se".to_string()));
+        assert_eq!(to_ascii(b"\0.se"), Ok("\0.se".to_string()));
     }
 
     #[test]

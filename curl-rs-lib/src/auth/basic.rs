@@ -71,7 +71,7 @@
 //!
 //! # The nominal source is SASL, and none of it is ported
 //!
-//! AAP 0.4.1 gives this file the source `lib/vauth/cleartext.c`. Measured,
+//! The source for this file is `lib/vauth/cleartext.c`. Measured,
 //! that file contains no HTTP Basic code at all: its entire body sits inside
 //! a single preprocessor guard, `lib/vauth/cleartext.c:29-31`,
 //!
@@ -81,8 +81,8 @@
 //!   (!defined(CURL_DISABLE_LDAP) && defined(USE_OPENLDAP))
 //! ```
 //!
-//! and all four of those protocols are out of scope (AAP 0.2.2), their
-//! command sequencing living in `crate::protocols::stub` and answering
+//! and all four of those protocols are out of scope, their command sequencing
+//! living in `crate::protocols::stub` and answering
 //! `CURLcode::UnsupportedProtocol`. The three functions the file defines are
 //! SASL mechanisms rather than HTTP ones, and none is a colon-joined
 //! credential:
@@ -96,14 +96,6 @@
 //! * `Curl_auth_create_login_message()` -- the raw value, no encoding at all.
 //! * `Curl_auth_create_external_message()` -- delegates to the login form.
 //!
-//! None of the three is ported. The omission is recorded here, rather than
-//! left as an absence, so that a later reader does not conclude the three
-//! were overlooked: they belong to SMTP, IMAP, POP3 and OpenLDAP, and they
-//! will be needed only by whatever lands those protocols. HTTP Basic shares
-//! no code with them -- the two encodings differ in their separator, their
-//! length rule and their input validation -- so there is nothing here that a
-//! future SASL module would reuse.
-//!
 //! # Credentials are per transfer, not per connection
 //!
 //! `lib/http.c:253-254` states it as a comment on the selection below, and it
@@ -113,12 +105,6 @@
 //! > credentials are unique per transfer for HTTP, do not use the ones for
 //! > the connection
 //!
-//! So Basic reads `data->state.aptr.user` and `.passwd` for the origin server
-//! and `data->state.aptr.proxyuser` and `.proxypasswd` for a proxy, selected
-//! by the same `proxy` flag that selects the `"Proxy-"` prefix. [`Basic`]
-//! holds both pairs for that reason and picks between them in
-//! [`Basic::credentials`], exactly where the C's `if(proxy)` picks.
-//!
 //! # The four error codes, and which of them can actually happen
 //!
 //! `http_output_basic()` names three failure codes and inherits a fourth.
@@ -127,7 +113,7 @@
 //!
 //! | Code | C site | Reachable here |
 //! |------|--------|----------------|
-//! | `CURLE_OUT_OF_MEMORY` | `:272`, `:290` | no -- allocation failure aborts the process in Rust rather than returning |
+//! | `CURLE_OUT_OF_MEMORY` | `:272`, `:290` | no -- both are FIXED-SIZE `curlx_maprintf` buffers whose size this module chooses, not the caller; the caller-sized allocation on this path is the base64 encoder's, which does report it (last row) |
 //! | `CURLE_REMOTE_ACCESS_DENIED` | `:279-282` | no -- see below, and it is unreachable in the C too |
 //! | `CURLE_NOT_BUILT_IN` | `:261` | no -- there is no `proxy` Cargo feature to remove proxy support |
 //! | `CURLE_TOO_LARGE` | `lib/curlx/base64.c:182-183` | **yes** -- inherited from the encoder |
@@ -146,31 +132,6 @@
 //! part of the contract and a future change to either the separator or the
 //! encoder would make it matter again.
 //!
-//! `CURLE_NOT_BUILT_IN` is the `#else` of `#ifndef CURL_DISABLE_PROXY` at
-//! `lib/http.c:256-262`: a build without proxy support refuses to compose a
-//! `Proxy-Authorization:` header. This workspace declares fifteen Cargo
-//! features and none of them is `proxy`, so proxy support cannot be
-//! configured out and no `cfg` may be invented to model it. The mapping is
-//! recorded rather than dropped so that a reader comparing the two files
-//! finds every code accounted for.
-//!
-//! # Credentials gain no new path to a log
-//!
-//! This file formats no secret into any diagnostic, and it holds no tracer:
-//! every Basic diagnostic curl has lives in `crate::auth`. Nor does it
-//! suppress anything, which would be the opposite mistake -- curl has no
-//! redaction mechanism, `lib/http.c:2888-2895` puts the finished
-//! `Authorization:` line straight into the request buffer where `--verbose`
-//! prints it verbatim, and 86 fixtures carry a literal
-//! `Authorization: Basic` or `Proxy-Authorization: Basic` line **inside** a
-//! byte-exact `<protocol>` block -- counted, in this tree, by walking the
-//! block boundaries rather than by grepping the file. What is required here
-//! is narrower than suppression: no secret gains a path to a log that curl
-//! does not already have. [`crate::auth::Credentials`] enforces it for every
-//! holder at once through a hand-written formatter, which is why [`Basic`]
-//! can derive [`core::fmt::Debug`] safely and why a test asserts that it
-//! does.
-//!
 //! # Visibility
 //!
 //! `pub(crate)` throughout. `http_output_basic()` was `static` in C, so it
@@ -188,24 +149,10 @@ use crate::error::CURLcode;
 use crate::util::base64;
 
 /// The `auth-scheme` token this mechanism writes, from `lib/http.c:285`.
-///
-/// A literal rather than a call to
-/// [`AuthScheme::header_scheme`][crate::auth::AuthScheme::header_scheme],
-/// because it is a wire byte sequence: it is compared literally by every
-/// Basic fixture, and a parity test must state its expectation instead of
-/// deriving it from the code under test. The two are pinned to each other by
-/// [`tests::the_scheme_token_agrees_with_the_shared_vocabulary`], so the
-/// duplication cannot become a divergence.
 pub(crate) const SCHEME_TOKEN: &str = "Basic";
 
 /// The byte between the username and the secret: the `:` of `"%s:%s"`
 /// (`lib/http.c:270`).
-///
-/// Named because it is the entire delimiter of RFC 7617's `user-pass`
-/// production -- `userid ":" password` -- and therefore the reason
-/// [`credential_string`] cannot validate its inputs: with the separator
-/// carrying no escape, a colon inside either half is indistinguishable from
-/// the separator itself, and curl resolves that by leaving both alone.
 pub(crate) const CREDENTIAL_SEPARATOR: u8 = b':';
 
 /// Joins a username and a secret into the bytes that get base64 encoded.
@@ -242,11 +189,6 @@ pub(crate) const CREDENTIAL_SEPARATOR: u8 = b':';
 ///   `tests/data/test1910` expects `%b64[user%0aname:pass%0aword]b64%`, whose
 ///   `%0a` escapes `tests/testutil.pm:136-141` expands to raw line feeds
 ///   before encoding.
-///
-/// The only byte this function adds is the separator, so the result is never
-/// empty even when both halves are: `None, None` yields a single `:`. That is
-/// what makes [`output_basic`]'s `CURLE_REMOTE_ACCESS_DENIED` branch
-/// unreachable, as the module documentation records.
 pub(crate) fn credential_string(
     user: Option<&[u8]>,
     secret: Option<&[u8]>,
@@ -270,12 +212,6 @@ pub(crate) fn credential_string(
 }
 
 /// Composes one `Authorization:` or `Proxy-Authorization:` header line.
-///
-/// Supersedes `http_output_basic()` (`lib/http.c:243-297`) in full, less the
-/// two pieces of it that belong elsewhere: the selection of which credential
-/// pair to read, which is [`Basic::credentials`] because the caller holds the
-/// pairs, and the guard that decides whether to call this at all, which is
-/// [`crate::auth::select_emitter`].
 ///
 /// The returned line is complete and CRLF terminated, ready to be written
 /// into a request. C stores it in `data->state.aptr.userpwd` or
@@ -322,37 +258,11 @@ pub(crate) fn output_basic(
 }
 
 /// The Basic mechanism: the two credential pairs, and nothing else.
-///
-/// Basic keeps no state between requests. `crate::auth`'s `state_scope`
-/// records the distinction machine-readably -- NTLM and Negotiate are
-/// per-connection, Digest is per-transfer, and Basic, Bearer and AWS SigV4
-/// store nothing and recompute their credential every time -- which is why
-/// this type has no nonce, no counter and no handshake step.
-///
-/// # Why both pairs, rather than one
-///
-/// Because the C selects between them inside the function this type's
-/// [`HttpAuthMechanism::output`] supersedes. `http_output_basic(data, proxy)`
-/// reads `aptr.proxyuser`/`.proxypasswd` or `aptr.user`/`.passwd` according
-/// to its `proxy` argument (`lib/http.c:255-268`), and the same argument
-/// arrives here as [`AuthContext::proxy`]. Holding one pair and requiring
-/// the caller to choose would move that decision to every call site, which
-/// is how a proxy request comes to be signed with origin credentials.
-///
-/// # Deriving `Debug` is safe here, and deliberately so
-///
-/// [`Credentials`] hand-writes its own formatter precisely so that a derived
-/// one on an enclosing type cannot leak a secret
-/// (`crate::auth`'s type documentation states the reasoning). This is that
-/// enclosing type, so the derive is the intended outcome rather than an
-/// oversight, and [`tests::the_debug_form_shows_the_user_and_hides_the_secret`]
-/// asserts the property instead of trusting it.
 // The production consumer is `crate::protocols::http1`, which composes the
-// request headers and has not landed yet; until it does, this type is reached
-// only by this file's tests. The allowance is written at the item rather than
-// on the module, because a module-level one would also hide the next
-// unreferenced item somebody adds -- `src/lib.rs` (`mod source_policy`)
-// enforces that distinction as a test.
+// request headers. The allowance is written at the item rather than on the
+// module, because a module-level one would also hide the next unreferenced
+// item somebody adds -- `src/lib.rs` (`mod source_policy`) enforces that
+// distinction as a test.
 #[derive(Clone, Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct Basic {
@@ -364,12 +274,6 @@ pub(crate) struct Basic {
 
 impl Basic {
     /// The mechanism with both credential pairs supplied.
-    ///
-    /// Either may be [`Credentials::none`], which is C's pair of NULL
-    /// pointers: a transfer with no proxy simply never has the second pair
-    /// populated, and asking for a proxy header anyway produces `:` --
-    /// well-formed, and rejected by the server rather than by curl, exactly
-    /// as the C does.
     #[must_use]
     #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not yet landed.
     pub(crate) const fn new(origin: Credentials, proxy: Credentials) -> Self {
@@ -397,15 +301,6 @@ impl HttpAuthMechanism for Basic {
     }
 
     /// Consumes nothing: `auth_basic()` has no challenge body to decode.
-    ///
-    /// `lib/http.c:969-984` sets the availability bit, and on a repeat
-    /// challenge for the already-picked method clears `avail`, emits
-    /// [`crate::auth::BASIC_PROBLEM`] and sets `authproblem`. All of that is
-    /// bookkeeping on `struct auth` rather than parsing, so `crate::auth`
-    /// owns it in `scan_bit_only` and never routes a Basic challenge to a
-    /// decoder. The parameters are therefore unused, which is a statement
-    /// about the mechanism and not a gap: a Basic challenge carries only a
-    /// realm, and curl reads none of it.
     fn input(
         &mut self,
         _challenge: &[u8],
@@ -422,11 +317,6 @@ impl HttpAuthMechanism for Basic {
     /// -- [`AuthEmission::is_done`] is true for `Final` -- rather than by two
     /// assignments that could diverge, which is what C's `bool *done`
     /// out-parameter risked.
-    ///
-    /// [`AuthEmission::Nothing`] is never returned. The "no header this
-    /// round" case belongs to the guard in
-    /// [`crate::auth::select_emitter`], which declines to name an emitter at
-    /// all; by the time this runs the decision to emit has been made.
     ///
     /// # Errors
     ///
@@ -448,12 +338,6 @@ impl HttpAuthMechanism for Basic {
 // table rather than merely hidden. Their coverage is relocated here, inside
 // the module under test, which is also where a private item is reachable
 // without widening its visibility to accommodate a test.
-//
-// Every base64 expectation below is written as a LITERAL. Deriving one by
-// calling the encoder would make the test agree with whatever the encoder
-// does, which is the one thing a wire-parity test must not do. Ten of them
-// are additionally the expectations of real fixtures, cited row by row, so
-// the literals are checkable against something outside this workspace.
 
 #[cfg(test)]
 mod tests {
@@ -474,12 +358,7 @@ mod tests {
 
     /// A context for [`HttpAuthMechanism::output`], for the given side.
     ///
-    /// The clock and the random source are real ones rather than stubs, which
-    /// is the point: Basic reads neither, so supplying working ones and
-    /// observing that the output is deterministic proves the independence
-    /// instead of asserting it.
-    ///
-    /// They are also the only reason `crate::util::timeval` and
+    /// The tracing fixtures are also the only reason `crate::util::timeval` and
     /// `crate::crypto::rand` are named anywhere in this file:
     /// [`AuthContext`]'s own definition types those two fields, so a test
     /// that exercises the trait method -- rather than only the free function
@@ -529,9 +408,8 @@ mod tests {
 
     #[test]
     fn an_absent_half_and_an_empty_half_are_indistinguishable() {
-        // The formatted result of `""` and of a NULL pointer given `? :` is
-        // the same string, so no consumer can tell them apart. Asserting it
-        // here is what lets the emitter accept either without a branch.
+        // Asserting it here is what lets the emitter accept either without a
+        // branch.
         assert_eq!(
             credential_string(None, Some(b"password")),
             credential_string(Some(b""), Some(b"password"))

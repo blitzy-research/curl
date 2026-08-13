@@ -24,35 +24,10 @@
 
 // THE LAYERING RULE, AS IT APPLIES TO THIS FILE IN PARTICULAR.
 //
-// `super` states the rule for the whole directory: `util` may depend on
-// nothing inside this crate except `crate::error`. Most children honour it
-// without effort, because a byte search or a hash table has no reason to know
-// about a transfer. THIS file is one of the two the rule genuinely bites on,
-// and `util/mod.rs:146` names it for exactly that reason.
-//
 // The C original does not parse a range. It parses a range AND WRITES THE
 // ANSWER INTO THE EASY HANDLE:
 //
 //   CURLcode Curl_range(struct Curl_easy *data);   /* lib/curl_range.h:30 */
-//
-// `lib/curl_range.h:28` includes `urldata.h` so that the signature is
-// expressible at all -- the god-struct arriving inside a 31-line header.
-// Reproducing that shape here would put `crate::easy`, and through
-// `struct SingleRequest` also `crate::transfer`, BELOW the base of the module
-// graph. That is a cycle, not a stylistic preference, and no amount of care
-// inside the function body would remove it.
-//
-// So the write is removed and the value is returned. `parse` decides
-// everything the C decides, in the same order, on the same inputs, and hands
-// back a `RangeSpec`; the two call sites perform the assignment themselves.
-// Nothing is lost by the move, because the C's two assignments WERE its
-// entire output -- it has no other effect and it reads no other field.
-//
-// The `use` list below is the proof, and it is the whole list: the sibling
-// `strparse`, and `crate::error`. No `crate::easy`, no `crate::transfer`, no
-// `crate::protocols`, no `crate::conn`, no operating system, no runtime, no
-// third-party crate.
-
 // THE FOUR DIAGNOSTICS THAT DO NOT COME ACROSS, PRESERVED VERBATIM.
 //
 // The C emits four trace lines, and every one of them is wrapped in
@@ -61,11 +36,7 @@
 //
 //  * this layer holds no handle and performs no output. `infof` writes
 //    through `data`, which is precisely what the note above removed; and
-//  * the specification settles the observable question independently. AAP
-//    0.6.6 decided NOT to advertise the `Debug` feature in the version
-//    banner, and `tests/runtests.pl:660` derives `$feature{"TrackMemory"}`
-//    from that banner, so no `DEBUGF` line is part of the observable contract
-//    of the artifact being built.
+// * the specification settles the observable question independently.
 //
 // Recording the format strings costs nothing and keeps the provenance, so
 // that whichever module ever wants them emits the same text instead of
@@ -77,13 +48,6 @@
 //   "RANGE from %" FMT_OFF_T " getting %" FMT_OFF_T " bytes"
 //   "range-download from %" FMT_OFF_T
 //     " to %" FMT_OFF_T ", totally %" FMT_OFF_T " bytes"
-//
-// One detail in the fourth is worth keeping in view, because it is the kind
-// of thing a reader assumes is a bug: it prints `to` on every path, including
-// the `X-` path where the second number never parsed. `to` is zero there --
-// `str_num_base` writes `*nump = 0` before it looks at anything -- so the
-// line reads "to 0" for a range that has no upper bound at all. The
-// arithmetic never uses that zero; only the discarded trace line does.
 
 // THE C's CONDITIONAL COMPILATION HAS NO COUNTERPART HERE.
 //
@@ -91,15 +55,6 @@
 //
 //   /* Only include this function if one or more of FTP, FILE are enabled. */
 //   #if !defined(CURL_DISABLE_FTP) || !defined(CURL_DISABLE_FILE)
-//
-// It is a disjunction over the two schemes that call it, and in this
-// workspace it is ALWAYS TRUE, because the `file` scheme is unconditional
-// here. The feature vocabulary is fixed at fifteen names -- `http2`, `http3`,
-// `ftp`, `ssh`, `websockets`, `cookies`, `hsts`, `altsvc`, `doh`, `brotli`,
-// `zstd`, `gzip`, `negotiate`, `hickory-dns` and `memdebug` -- and `file` is
-// not among them, so there is nothing to switch on. `src/lib.rs` holds the
-// executable check that the vocabulary is exactly those fifteen,
-// `feature_vocabulary_is_the_declared_fifteen`.
 //
 // So NO `#[cfg(feature = ...)]` appears anywhere in this file, and the
 // omission is a decision rather than an oversight. Writing
@@ -116,36 +71,13 @@
 // the module from a build that still has `file://`, which is the exact
 // mistake the C's disjunction exists to avoid.
 
-//! Byte-range parsing -- supersedes `lib/curl_range.c` (91 lines) and
-//! `lib/curl_range.h` (31).
+//! Byte-range parsing -- supersedes `lib/curl_range.c` and `lib/curl_range.h`.
 //!
 //! One function wide. The C translation unit defines exactly one symbol and
 //! its header declares exactly one, so this module publishes one entry
 //! point, [`parse`], together with the type it answers in, [`RangeSpec`],
 //! and the one named constant its callers need,
 //! [`MAXDOWNLOAD_UNLIMITED`].
-//!
-//! # What a range is, and who asks for one
-//!
-//! `-r` / `--range` on the command line, `CURLOPT_RANGE` through the
-//! library. The string reaches the engine as `data->state.range` and is
-//! parsed once per transfer, immediately before the bytes start moving.
-//!
-//! Exactly TWO call sites consume it, measured with
-//! `grep -rn 'Curl_range' lib/ src/`:
-//!
-//! | Call site | What it does with the answer |
-//! |---|---|
-//! | `lib/file.c:474` | resolves a negative offset against `st_size`, caps the size, seeks |
-//! | `lib/ftp.c:2237` | sets `dont_check` when a limit was written, then `REST`/`RETR` |
-//!
-//! HTTP is absent from that table, and the absence is a measurement rather
-//! than an omission: the HTTP path never calls this function at all. It
-//! forwards the range string to the server verbatim in a `Range:` header and
-//! lets the server do the arithmetic, so nothing in
-//! `crate::protocols::http1` depends on this module. That is also why the
-//! module can be this strict about layering -- its only consumers are two
-//! protocol implementations that already own the state being written.
 //!
 //! # Three outcomes, not two fields
 //!
@@ -160,22 +92,6 @@
 //! | `-Y` | `-Y` | `Y` |
 //! | `X-Y` | `X` | `(Y - X) + 1` |
 //! | *no range at all* | *untouched* | `-1` |
-//!
-//! A two-field struct has to invent a value for every blank cell in that
-//! table, and the invented value is observable. `lib/ftp.c:2239` reads
-//! `data->req.maxdownload >= 0` to decide whether to skip the
-//! transfer-completeness check, and `lib/request.c:125` initialises the
-//! field to `-1`, so a `X-` range that "helpfully" wrote a limit of zero, or
-//! of `i64::MAX`, would change which FTP transfers are verified. Hence
-//! [`RangeSpec`] is an enum with one variant per branch, and
-//! [`RangeSpec::maxdownload`] answers [`None`] for the branch that writes
-//! nothing.
-//!
-//! The fourth row is not this function's business at all. It corresponds to
-//! the C's outer `else`, which is reached when `data->state.use_range` is
-//! false or `data->state.range` is null -- state inspection, on a handle
-//! this layer does not have. The caller performs that test and applies
-//! [`MAXDOWNLOAD_UNLIMITED`] itself.
 //!
 //! # The grammar, in one table
 //!
@@ -201,20 +117,6 @@
 //! | `abc` | `E` | no number and no leading dash |
 //! | ` 100-200` | `E` | blanks are not skipped |
 //! | `99999999999999999999-` | `E` | overflow, and not a clamp |
-//!
-//! Three of those rows are surprising enough to have caused the wrong
-//! implementation to be written, so each gets its own paragraph.
-//!
-//! ## `-` and `-abc` succeed, and yield offset zero
-//!
-//! The natural reading of the C is that a failed `curlx_str_number` leaves
-//! `from` indeterminate and the `X-` branch then stores garbage. It does
-//! not. `str_num_base` assigns `*nump = 0` at `lib/curlx/strparse.c:167`,
-//! BEFORE the digit test at `:169`, so every failure path leaves the
-//! out-parameter at zero. `-` therefore parses as "resume from byte zero",
-//! which is the whole file, and `-abc` parses identically because `abc` is
-//! not a number either. There is no undefined behaviour to reproduce, and
-//! the zero is reproduced deliberately.
 //!
 //! ## Trailing bytes are accepted, leading blanks are not
 //!
@@ -248,14 +150,11 @@
 //!
 //! # Visibility and layering
 //!
-//! `pub(crate)` throughout, with no `pub` item. `grep -i range
-//! lib/libcurl.def` finds nothing, so no exported symbol is backed from
-//! here, nothing in `curl-rs-ffi` reaches it, and the crate root adds no
-//! re-export. `CURLOPT_RANGE` is set through `curl_easy_setopt`, whose
-//! variadic dispatch lives in the ABI crate; the string it stores arrives
-//! here later, as a slice.
+//! `pub(crate)` throughout, with no `pub` item. `CURLOPT_RANGE` is set through
+//! `curl_easy_setopt`, whose variadic dispatch lives in the ABI crate; the
+//! string it stores arrives here later, as a slice.
 //!
-//! Per AAP 0.8.7 no internal item is widened to make the C's own tests
+//! No internal item is widened to make the C's own tests
 //! link. `lib/curl_range.c` has no `tests/unit` counterpart in any case --
 //! its coverage in the C tree comes from the FTP and `file://` fixtures --
 //! and the test module at the foot of this file is where that coverage now
@@ -271,55 +170,13 @@ use crate::util::strparse;
 /// -1 means unlimited"*. `lib/request.c:125` initialises the field to it at
 /// the start of every request, and `lib/curl_range.c:87` re-applies it on the
 /// path where no range was given at all.
-///
-/// It is exported from this module because that last path belongs to the
-/// CALLER. [`parse`] is only reached once a range string exists, so it never
-/// returns this value and never needs to; the caller applies it when
-/// `use_range` is false or the range string is absent, which is state
-/// inspection this layer cannot do. Naming the constant here keeps the
-/// magic number beside the code that explains it, and keeps both call sites
-/// from spelling `-1` themselves.
-///
-/// The sign is load-bearing rather than conventional. `lib/ftp.c:2239` tests
-/// `data->req.maxdownload >= 0` and `lib/file.c:501` tests
-/// `data->req.maxdownload > 0`, so a limit of zero is a REAL limit of zero
-/// bytes and is not interchangeable with "unlimited".
-#[allow(dead_code)] // No consumer yet; `protocols::{file, ftp}` will apply it.
+#[allow(dead_code)] // Applied by `protocols::{file, ftp}`.
 pub(crate) const MAXDOWNLOAD_UNLIMITED: i64 = -1;
 
 /// A parsed byte-range specification: what the transfer should do.
-///
-/// One variant per success branch of `Curl_range` (`lib/curl_range.c:48-81`),
-/// because the three branches write different subsets of the two fields the C
-/// assigns. `super`'s module documentation carries the table; the short form
-/// is that `X-` writes an offset and no limit, while `-Y` and `X-Y` write
-/// both.
-///
-/// The two field names are the C's, unchanged, so that a reader can trace
-/// them: `resume_from` is `struct UrlState`'s at `lib/urldata.h:997`
-/// (*"continue [ftp] transfer from here"*) and `maxdownload` is
-/// `struct SingleRequest`'s at `lib/request.h:58`. Both are `curl_off_t`,
-/// which is `i64` on all four mandated targets -- `CURL_OFF_T_MAX` is
-/// `0x7FFFFFFFFFFFFFFF` at `lib/curl_setup.h:599`.
-///
-/// Read the values through [`RangeSpec::resume_from`] and
-/// [`RangeSpec::maxdownload`] rather than by matching, unless the call site
-/// genuinely needs to distinguish the branches: the accessors are what encode
-/// "this branch writes nothing" as [`None`], and a `match` that forgets a
-/// branch cannot express that.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RangeSpec {
     /// `X-` -- start at `X` and continue to the end of the resource.
-    ///
-    /// `data->state.resume_from = from;` (`lib/curl_range.c:51`) and NOTHING
-    /// else. `data->req.maxdownload` keeps whatever it held, which for a
-    /// fresh request is [`MAXDOWNLOAD_UNLIMITED`] from
-    /// `lib/request.c:125` -- and that is the correct answer, because a range
-    /// with no upper bound imposes no limit.
-    ///
-    /// Reached whenever the SECOND number is absent, whether or not the first
-    /// one parsed: `-` and `-abc` both land here with `resume_from` at zero,
-    /// for the reason `super` records.
     FromOffset {
         /// The offset to resume from. Non-negative.
         resume_from: i64,
@@ -331,34 +188,12 @@ pub(crate) enum RangeSpec {
     /// (`lib/curl_range.c:60-61`). Both fields are written, and the offset is
     /// **negative**: that sign is how "measure from the end" travels to the
     /// consumers, and it is not normalised away here.
-    ///
-    /// `lib/file.c:478-486` is what reads it -- a negative `resume_from`
-    /// requires a stat, fails with `CURLE_READ_ERROR` when the size is
-    /// unknown, and otherwise has the file size added to it to become a real
-    /// offset. Storing the count positively and negating in
-    /// [`RangeSpec::resume_from`] keeps the field readable while handing the
-    /// caller exactly the value the C stored.
-    ///
-    /// Reachable ONLY when the first number was absent, which is the C's
-    /// `else if(!first_num)`. `count` is at least 1, because `-0` is
-    /// rejected.
     LastBytes {
         /// How many bytes from the end. In `1..=i64::MAX`.
         count: i64,
     },
 
     /// `X-Y` -- the bytes from `X` to `Y` inclusive.
-    ///
-    /// `data->req.maxdownload = totalsize + 1;` and
-    /// `data->state.resume_from = from;` (`lib/curl_range.c:76-77`), where
-    /// `totalsize` is `to - from`.
-    ///
-    /// The `+ 1` is the semantics, not an off-by-one: the C's own comment on
-    /// that line is *"include last byte"*, so the range is inclusive at both
-    /// ends in the HTTP sense and `0-0` is a request for exactly one byte.
-    /// The guard that makes the addition safe -- rejecting a span of exactly
-    /// `CURL_OFF_T_MAX` -- is why `0-9223372036854775807` is an error while
-    /// `1-9223372036854775807` is not.
     Span {
         /// The offset to resume from, the C's `from`. Non-negative.
         resume_from: i64,
@@ -375,7 +210,7 @@ impl RangeSpec {
     ///
     /// Negative for [`RangeSpec::LastBytes`], and deliberately so -- see that
     /// variant. Non-negative for the other two.
-    #[allow(dead_code)] // No consumer yet; the two callers will read it.
+    #[allow(dead_code)] // Readers: the two callers.
     #[must_use]
     pub(crate) const fn resume_from(&self) -> i64 {
         match *self {
@@ -383,17 +218,6 @@ impl RangeSpec {
             Self::FromOffset { resume_from } => resume_from,
 
             // `data->state.resume_from = -to;`
-            //
-            // `wrapping_neg` rather than `-`, and the choice is about
-            // totality rather than about wrapping. A plain negation of
-            // `i64::MIN` panics in a debug build, and the compiler cannot see
-            // that `count` is never `i64::MIN`. [`parse`] proves it is not --
-            // `count` comes from [`strparse::str_number`] under a `max` of
-            // `i64::MAX`, so it lies in `0..=i64::MAX`, and `parse`
-            // additionally rejects the value outright if its negation does
-            // not fit. This accessor therefore cannot wrap on any value
-            // `parse` produces, and on a value it could not produce the
-            // answer is `i64::MIN` instead of an aborted transfer.
             Self::LastBytes { count } => count.wrapping_neg(),
 
             // `data->state.resume_from = from;`
@@ -404,15 +228,7 @@ impl RangeSpec {
     /// The value the caller must store in `data->req.maxdownload`, or
     /// [`None`] when the C writes nothing.
     ///
-    /// [`None`] means *"leave the field exactly as it was"*, which is the
-    /// `X-` branch: `lib/curl_range.c:51` assigns `resume_from` and returns
-    /// without touching the limit. It does NOT mean "unlimited", and the
-    /// distinction matters because the two are only accidentally the same --
-    /// they coincide for a fresh request, whose limit `lib/request.c:125` has
-    /// already initialised to [`MAXDOWNLOAD_UNLIMITED`], and they diverge for
-    /// any handle whose limit was set by something else first.
-    ///
-    /// So the correct call-site shape is a conditional store, and NOT
+    /// The correct call-site shape is therefore a conditional store, and NOT
     /// `unwrap_or(MAXDOWNLOAD_UNLIMITED)`:
     ///
     /// ```text
@@ -421,7 +237,7 @@ impl RangeSpec {
     ///     request.maxdownload = limit;
     /// }
     /// ```
-    #[allow(dead_code)] // No consumer yet; the two callers will read it.
+    #[allow(dead_code)] // Readers: the two callers.
     #[must_use]
     pub(crate) const fn maxdownload(&self) -> Option<i64> {
         match *self {
@@ -438,12 +254,6 @@ impl RangeSpec {
 }
 
 /// Parses a `-r` / `CURLOPT_RANGE` specification.
-///
-/// Supersedes the body of `Curl_range` (`lib/curl_range.c:37-85`) with the
-/// handle removed: the C's `if(data->state.use_range && data->state.range)`
-/// test and its `else` are the caller's, and everything inside the `if` is
-/// here. The parse is a transcription, branch for branch, in the C's own
-/// order -- see `super` for the grammar table and the three surprising rows.
 ///
 /// # Two helper conventions that read backwards
 ///
@@ -496,7 +306,7 @@ impl RangeSpec {
 /// returns from this function apart from `CURLE_OK`, and it has one
 /// backward-compatibility alias in the public header, `CURLE_HTTP_RANGE_ERROR`
 /// (`include/curl/curl.h:704`), which resolves to the same integer.
-#[allow(dead_code)] // No consumer yet; the two callers will call it.
+#[allow(dead_code)] // Callers: the two callers.
 pub(crate) fn parse(range: &[u8]) -> Result<RangeSpec, CURLcode> {
     // `const char *p = data->state.range;`
     //
@@ -525,10 +335,6 @@ pub(crate) fn parse(range: &[u8]) -> Result<RangeSpec, CURLcode> {
     // `if(curlx_str_single(&p, '-'))`
     //   `/* no leading dash or after the first number is an error */`
     //   `return CURLE_RANGE_ERROR;`
-    //
-    // The one mandatory byte of the grammar. A bare `100`, an empty string,
-    // `abc`, ` 100-200` and `99999999999999999999-` are all rejected right
-    // here, each for its own reason, and `super`'s table records which.
     if strparse::str_single(&mut cursor, b'-').is_err() {
         return Err(CURLcode::RangeError);
     }
@@ -542,9 +348,6 @@ pub(crate) fn parse(range: &[u8]) -> Result<RangeSpec, CURLcode> {
         //   `/* no second number */ /* X - */`
         //   `data->state.resume_from = from;`
         // `}`
-        //
-        // Note what is NOT here: no assignment to `maxdownload`. That is the
-        // whole reason [`RangeSpec`] is an enum.
         Err(_) => Ok(RangeSpec::FromOffset { resume_from: from }),
 
         // `else if(!first_num) {`  `/* -Y */`
@@ -560,20 +363,6 @@ pub(crate) fn parse(range: &[u8]) -> Result<RangeSpec, CURLcode> {
             }
 
             // `data->state.resume_from = -to;`
-            //
-            // The negation itself belongs to the caller now, so it happens in
-            // [`RangeSpec::resume_from`]; the CHECK stays here, where `to`'s
-            // provenance is known, so that the accessor is total.
-            //
-            // [`i64::checked_neg`] answers [`None`] for `i64::MIN` alone, and
-            // `to` cannot be `i64::MIN`: [`strparse::str_number`] accumulates
-            // from zero over non-negative decimal digits under a `max` of
-            // `i64::MAX`, so it lies in `0..=i64::MAX`, and the test above
-            // has already excluded zero. The rejection is therefore
-            // unreachable on every input, and it is written rather than
-            // asserted because an unreachable comparison costs nothing while
-            // an unchecked negation would cost a panic if that reasoning ever
-            // stopped holding.
             if to.checked_neg().is_none() {
                 return Err(CURLcode::RangeError);
             }
@@ -601,12 +390,6 @@ pub(crate) fn parse(range: &[u8]) -> Result<RangeSpec, CURLcode> {
 
             // `if(totalsize == CURL_OFF_T_MAX)`
             //   `return CURLE_RANGE_ERROR;`
-            //
-            // The C's guard for the addition below, kept exactly as written so
-            // that the same inputs are refused. `0-9223372036854775807` is the
-            // only range that triggers it: `from` is non-negative and `to` is
-            // at most `i64::MAX`, so a difference of exactly `i64::MAX` forces
-            // both ends.
             if totalsize == i64::MAX {
                 return Err(CURLcode::RangeError);
             }
@@ -636,26 +419,11 @@ mod tests {
     /// The two field values a fresh request starts with, so that every
     /// assertion below about "the field was not written" has something real to
     /// compare against.
-    ///
-    /// `resume_from` is zero because `struct UrlState` is zero-initialised
-    /// with the handle, and `maxdownload` is `-1` because
-    /// `lib/request.c:125` assigns it at the start of every request.
     const FRESH: (i64, i64) = (0, MAXDOWNLOAD_UNLIMITED);
 
     /// A transliteration of `Curl_range` (`lib/curl_range.c:37-85`) that
     /// writes through two out-parameters the way the C writes into two struct
     /// fields, used as the differential oracle in the sweeps below.
-    ///
-    /// Written as a line-for-line reading of the original rather than
-    /// idiomatically, because the point of an oracle is that a reviewer can
-    /// check it against the C. It calls the same two helpers the C calls, so
-    /// what it tests is the BRANCH STRUCTURE and the arithmetic -- exactly
-    /// where a transcription of this function goes wrong.
-    ///
-    /// The C's outer `if(data->state.use_range && data->state.range)` is
-    /// absent, for the same reason it is absent from [`parse`]: it inspects a
-    /// handle. Its `else` branch is the one line reproduced, on the caller's
-    /// behalf, by [`FRESH`].
     fn c_curl_range(
         range: &[u8],
         resume_from: &mut i64,
@@ -753,9 +521,7 @@ mod tests {
         Ok((resume_from, maxdownload))
     }
 
-    // -----------------------------------------------------------------------
     // The `X-` form: an offset, and NO limit.
-    // -----------------------------------------------------------------------
 
     /// `0-` is the whole resource stated the long way, and the assertion that
     /// matters is the second one: the limit is [`None`], so a caller leaves
@@ -794,14 +560,6 @@ mod tests {
     }
 
     /// `-abc` follows the same path as `-`, and is therefore NOT an error.
-    ///
-    /// Traced once more against `lib/curl_range.c:41-53` before this
-    /// assertion was written, because "text after a dash" looks like a
-    /// rejection: the first `curlx_str_number` fails on the dash leaving
-    /// `from` at zero, `curlx_str_single` consumes the dash, the second
-    /// `curlx_str_number` fails on `a`, and the `if` that tests it is
-    /// therefore true -- which is the `X-` branch, not the `-Y` branch. The
-    /// `-Y` branch is only reachable when the second number PARSES.
     #[test]
     fn a_dash_followed_by_text_is_the_whole_resource() {
         assert_eq!(
@@ -812,9 +570,7 @@ mod tests {
         assert_eq!(apply(b"-abc"), apply_c(b"-abc"));
     }
 
-    // -----------------------------------------------------------------------
     // The `-Y` form: the last N bytes, encoded as a NEGATIVE offset.
-    // -----------------------------------------------------------------------
 
     /// The sign is the signal, so it is asserted explicitly rather than
     /// implied by an enum comparison.
@@ -884,9 +640,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The `X-Y` form: inclusive at both ends.
-    // -----------------------------------------------------------------------
 
     /// `(200 - 100) + 1`. The `+ 1` is the C's *"include last byte"*.
     #[test]
@@ -932,12 +686,6 @@ mod tests {
 
     /// The guard that keeps `totalsize + 1` from overflowing, and the pair of
     /// inputs that sit immediately either side of it.
-    ///
-    /// `0-i64::MAX` has a span of exactly `CURL_OFF_T_MAX` and is refused;
-    /// `1-i64::MAX` has a span one smaller and yields a length of exactly
-    /// `i64::MAX`. The second assertion is the one that would panic in a
-    /// debug build if the addition were written unchecked and the guard were
-    /// ever loosened.
     #[test]
     fn the_widest_span_is_rejected_and_the_next_widest_is_not() {
         assert_eq!(
@@ -958,9 +706,7 @@ mod tests {
         assert_eq!(spec.maxdownload(), Some(i64::MAX));
     }
 
-    // -----------------------------------------------------------------------
     // Rejections.
-    // -----------------------------------------------------------------------
 
     /// The C's comment: *"no leading dash or after the first number is an
     /// error"*.
@@ -983,13 +729,6 @@ mod tests {
 
     /// An out-of-range number is an ERROR, not a clamp, and the rejection
     /// comes from the dash test rather than from the overflow.
-    ///
-    /// `str_num_base` returns `STRE_OVERFLOW` without assigning `*linep`, so
-    /// the cursor still points at the first `9`; `curlx_str_single` then finds
-    /// a digit where it needs a dash. The second assertion pins the mechanism
-    /// rather than the outcome: consuming the digits and then failing would
-    /// give the same answer here but a different one for `99999999999999999`
-    /// followed by more input.
     #[test]
     fn an_overflowing_number_is_rejected() {
         assert_eq!(
@@ -1008,14 +747,6 @@ mod tests {
 
     /// An overflowing SECOND number is not an error at all, and this is the
     /// most counter-intuitive consequence of the helper's contract.
-    ///
-    /// `curlx_str_number` reports `STRE_OVERFLOW` and `STRE_NO_NUM` through
-    /// the same non-zero return, and `lib/curl_range.c:48` tests only "did it
-    /// fail". So an upper bound too large to represent is indistinguishable
-    /// from an upper bound that was never written, and the `X-` branch runs:
-    /// the lower bound is kept and no limit is imposed. It is emphatically NOT
-    /// clamped to `CURL_OFF_T_MAX`, which would silently truncate the transfer
-    /// at one byte short of the whole resource instead of fetching all of it.
     #[test]
     fn an_overflowing_upper_bound_becomes_an_open_ended_range() {
         assert_eq!(
@@ -1052,9 +783,7 @@ mod tests {
         assert_eq!(parse(b"+100-200"), Err(CURLcode::RangeError));
     }
 
-    // -----------------------------------------------------------------------
     // Leniency that is part of the frozen surface.
-    // -----------------------------------------------------------------------
 
     /// Trailing bytes are never inspected, so these are all exactly
     /// `100-200`. The leniency is deliberate and no end-of-input check is
@@ -1094,9 +823,7 @@ mod tests {
         assert_eq!(parse(b"0x10-0x20"), Err(CURLcode::RangeError));
     }
 
-    // -----------------------------------------------------------------------
     // Bytes, not text.
-    // -----------------------------------------------------------------------
 
     /// A range string that is not valid text is rejected by the GRAMMAR, as
     /// [`CURLcode::RangeError`], which is what the `&[u8]` signature is for:
@@ -1149,9 +876,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The constant, and the contract around the field it names.
-    // -----------------------------------------------------------------------
 
     /// The value is `-1` and nothing else, because `lib/ftp.c:2239` and
     /// `lib/file.c:501` both test its sign.
@@ -1180,12 +905,6 @@ mod tests {
     /// coincide for a fresh request and diverge for a handle whose limit was
     /// already set, so the test drives both starting points through the
     /// documented call-site shape.
-    ///
-    /// Two lines of this test are reported as UNCOVERED by `cargo llvm-cov`,
-    /// and that is the assertion rather than a gap: the bodies of the first
-    /// two conditional stores must never run, because the whole point is that
-    /// `100-` writes no limit. The third store, on a `Span`, is there so that
-    /// the shape is shown to be discriminating rather than dead.
     #[test]
     fn no_limit_written_means_the_field_is_left_alone() {
         let spec = parse(b"100-").expect("a valid range");
@@ -1221,19 +940,9 @@ mod tests {
         assert_eq!(maxdownload, 101, "a written limit replaces the old one");
     }
 
-    // -----------------------------------------------------------------------
     // The two call sites, reproduced far enough to prove the answer fits them.
-    // -----------------------------------------------------------------------
 
     /// `lib/file.c:474-503`, the arithmetic that follows the parse.
-    ///
-    /// A negative offset is resolved against the stat size (`:478-486`), a
-    /// positive one is subtracted from the expected size or refused with
-    /// `CURLE_BAD_DOWNLOAD_RESUME` (`:488-497`), and a limit greater than zero
-    /// replaces the expected size outright (`:501-502`). Reproduced here
-    /// because it is the only place the NEGATIVE encoding is consumed, and a
-    /// sign error in this module would show up as an off-by-the-file-size
-    /// there rather than as a parse failure.
     #[test]
     fn the_file_scheme_resolves_every_form_against_a_known_size() {
         let file_size: i64 = 1000;
@@ -1276,13 +985,6 @@ mod tests {
 
     /// `lib/ftp.c:2237-2242`: `dont_check` is set when, and only when, a limit
     /// was written.
-    ///
-    /// The C tests `data->req.maxdownload >= 0` on the field, so the `X-`
-    /// branch -- which writes nothing and leaves the `-1` from
-    /// `lib/request.c:125` -- must NOT set it. That is the observable
-    /// consequence of [`RangeSpec::maxdownload`] answering [`None`] rather
-    /// than a number, so it is asserted through the field rather than through
-    /// the enum.
     #[test]
     fn the_ftp_scheme_skips_the_completeness_check_only_when_limited() {
         let dont_check = |range: &[u8]| -> bool {
@@ -1296,18 +998,10 @@ mod tests {
         assert!(!dont_check(b"-"), "and neither does a lone dash");
     }
 
-    // -----------------------------------------------------------------------
     // Differential sweeps against the transliterated C.
-    // -----------------------------------------------------------------------
 
     /// Every string of length 0 to 4 inclusive over a six-symbol alphabet,
     /// compared field for field against [`c_curl_range`]: 1,555 inputs.
-    ///
-    /// The alphabet is chosen so that every branch is reachable rather than to
-    /// be large: three digits (including the zero that `-0` turns on), the
-    /// dash the grammar requires, a letter that ends a number, and a blank
-    /// that is never skipped. Exhaustive and deterministic rather than random,
-    /// so a failure is reproducible and the sweep costs the same on every run.
     #[test]
     fn agrees_with_the_c_on_every_short_input() {
         // Three digits (including the zero that `-0` turns on), the dash
@@ -1410,12 +1104,6 @@ mod tests {
     /// path in [`parse`] is capable of overflowing an `i64` and Rust's
     /// checked debug arithmetic turns any lapse into a panic rather than a
     /// wrong answer.
-    ///
-    /// Deterministic rather than random: a 64-bit linear congruential
-    /// generator with a fixed seed, run over 4,096 strings of length 0 to 23
-    /// drawn from the whole byte range, so a failure reproduces exactly. The
-    /// generator is written out because pulling in a random-number dependency
-    /// for a test that must be reproducible would be the wrong trade.
     #[test]
     fn no_input_panics() {
         // Numerical Recipes' 64-bit multiplier and increment. Any full-period
@@ -1432,17 +1120,6 @@ mod tests {
         };
 
         // THE HIGH BITS, ALWAYS -- and this is not a stylistic preference.
-        //
-        // The low bits of a linear congruential generator with a
-        // power-of-two modulus have very short periods: the low two are a
-        // rigid four-cycle. An earlier version of this sweep selected on
-        // `draw % 4`, and the consequence was not a slightly worse sample but
-        // a broken one -- the residues marched 0, 3, 2, 1, 0, ... so every
-        // one of the 4,096 inputs began with the same byte, not one of them
-        // was ACCEPTED, and the entire success half of this function went
-        // unexercised while the test still passed. The coverage report is
-        // what caught it; the non-vacuity assertions at the foot of this
-        // function are what keep it caught.
         for _ in 0..4096 {
             let length =
                 usize::try_from((next() >> 40) % 24).expect("under 24");

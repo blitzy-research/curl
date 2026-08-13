@@ -22,8 +22,7 @@
 //
 //***************************************************************************
 
-//! The chunked byte queue -- supersedes `lib/bufq.c` (619 lines) and
-//! `lib/bufq.h` (258 lines).
+//! The chunked byte queue -- supersedes `lib/bufq.c` and `lib/bufq.h`.
 //!
 //! # Read from the head, write to the tail
 //!
@@ -41,8 +40,8 @@
 //! and the WebSocket frame assembler all sit on it. It is also where curl
 //! expresses backpressure: `CURLE_AGAIN` out of a `bufq` is how "would
 //! block" travels up the filter chain. Its full and empty predicates and its
-//! partial-transfer semantics are therefore part of the frozen contract of
-//! AAP 0.8.1, not an implementation detail this file is free to improve.
+//! partial-transfer semantics are therefore part of the frozen behaviour of
+//! frozen, not an implementation detail this file is free to improve.
 //!
 //! One asymmetry deserves stating before anything else, because inverting it
 //! deadlocks the filter chain: **a partial transfer is a success.**
@@ -52,7 +51,8 @@
 //!
 //! # What the migration removed, and why the removals are evidence
 //!
-//! AAP 0.6.9 names this file directly, and three of the four hazard classes
+//! This file is named directly by the safety rationale, and three of the four
+//! hazard classes
 //! it enumerates are all present in this one translation unit. Each is
 //! removed by construction rather than by care:
 //!
@@ -81,15 +81,12 @@
 //!   bookkeeping of `bufq.c:323-326`. See [`BufQ::prune_head`].
 //!
 //! * **Two untyped callback contexts.** `Curl_bufq_writer` and
-//!   `Curl_bufq_reader` (`bufq.h:206-208` and `:221-223`) each take a
-//!   `void *ctx` that every implementation casts to its own type. AAP 0.6.9
-//!   calls the untyped context *"the single largest source of unsound
-//!   patterns in the C tree"* and design pattern P2 of AAP 0.3.3 mandates a
-//!   typed one. Here both become generic closure bounds --
-//!   `FnMut(&[u8]) -> CodeResult<usize>` for a writer and
-//!   `FnMut(&mut [u8]) -> CodeResult<usize>` for a reader -- so the context
-//!   is whatever the closure captured, checked by the compiler. No pointer
-//!   crosses the boundary and no cast is written.
+//!   `Curl_bufq_reader` (`bufq.h:206-208` and `:221-223`) each take a `void
+//!   *ctx` that every implementation casts to its own type. Here both become
+//!   generic closure bounds -- `FnMut(&[u8]) -> CodeResult<usize>` for a
+//!   writer and `FnMut(&mut [u8]) -> CodeResult<usize>` for a reader -- so the
+//!   context is whatever the closure captured, checked by the compiler. No
+//!   pointer crosses the boundary and no cast is written.
 //!
 //! `Curl_bufq_cwrite` (`bufq.c:394-399`) and `Curl_bufq_cread`
 //! (`bufq.c:417-421`) have **no successor here.** Their entire bodies are a
@@ -116,71 +113,32 @@
 //! allocation of exactly the requested size, which is what
 //! `calloc(1, sizeof(*chunk) + chunk_size)` was, and it adds no dependency.
 //!
-//! # The one thing that is deliberately NOT optimised
-//!
-//! [`BufQ::len`] walks the whole chain on every call, exactly as
-//! `Curl_bufq_len` does at `bufq.c:255-264`. Caching a running total would be
-//! faster and is refused: performance is an explicit non-goal of AAP 0.1.1,
-//! and a cached total that one mutation path forgot to update would be a
-//! silent correctness bug in the code that decides whether a transfer can
-//! make progress. Faithfulness wins.
-//!
 //! # Panics
 //!
 //! None. Every offset is read through the clamping `Chunk::readable` and
 //! `Chunk::written` accessors, so no slice range this file constructs can be
 //! out of bounds; every accumulator uses a saturating form; and the shared
-//! pool is reached through `try_borrow_mut` so that even a re-entrant caller
+//! pool is reached through `try_lock` so that a contended or poisoned pool
 //! degrades to a fresh allocation rather than a panic.
 //! The two `DEBUGASSERT` preconditions on chunk and queue sizes become value
 //! clamps, which is strictly stronger -- see [`BufQ::with_opts`].
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::ops::BitOr;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{CURLcode, CodeResult};
+use crate::util::fallible;
 
-// EVERY `pub(crate)` ITEM IN THIS FILE CARRIES `#[allow(dead_code)]`, AND WHY
-//
-// `util` is the base of this crate's module graph, so its consumers are the
-// last code to exist. Every consumer of this file named in AAP 0.4.1 --
-// `conn/filters.rs`, `conn/socket.rs`, `protocols/http2.rs`,
-// `protocols/http3.rs`, `protocols/ws.rs`, `tls/rustls_backend.rs`,
-// `transfer/request.rs` and `transfer/sendf.rs` -- is a separate unit of work
-// that has yet to land. Until then every item here is legitimately
-// unreferenced outside the test module, and the zero-warnings build gate
-// would otherwise fail on code that is correct.
-//
-// The allowance is written per item, never on the module and never as an
-// inner attribute, because a lint level on a module root silences the NEXT
-// item somebody adds instead of the ones inventoried today. That rule is
-// enforced executably by the gate named
-// `no_lint_level_for_dead_code_is_set_on_a_crate_or_module_root` in
-// `src/lib.rs`, and the surrounding reasoning is recorded once in
-// `util/mod.rs` rather than repeated here. Each attribute is deleted when its
-// consumer lands.
-//
-// The private items -- `Chunk` and its methods, `BufQ::get_spare`,
-// `BufQ::prune_head`, `BufQ::ensure_non_full_tail` and `BufQ::slurpn` -- carry
-// no attribute and need none: rustc treats an item marked
-// `#[allow(dead_code)]` as a live root, so everything those items reach is
-// live too.
+// `util` is the base of this crate's module graph: the connection, protocol,
+// TLS and transfer layers are this file's consumers. An item that no consumer
+// has reached yet carries its own `#[allow(dead_code)]` so that the
+// zero-warnings build gate does not fail on correct code, and never a
+// file-scoped allowance, which would silence the next item somebody adds.
 
 /// The queue behaviour flags -- supersedes the `BUFQ_OPT_*` macros of
 /// `bufq.h:103-116`.
-///
-/// A newtype over `u32` rather than a bare integer, so that a queue option
-/// and a byte count cannot be confused, and rather than a dependency on a
-/// bitflag crate, because AAP 0.5.1 fixes the dependency set and three flags
-/// do not justify adding to it.
-///
-/// `u32` rather than the C's `int opts` deliberately: the engine speaks in
-/// fixed-width Rust integers and the C scalar widths live only in the FFI
-/// island. That boundary is enforced executably by
-/// `c_scalar_types_appear_only_inside_the_ffi_island` in `src/lib.rs`.
 ///
 /// # The three flags, and exactly what each one changes
 ///
@@ -272,7 +230,13 @@ impl BitOr for BufqOpts {
 struct Chunk {
     /// The buffer. One allocation of a fixed size, replacing the C's
     /// `calloc(1, sizeof(*chunk) + chunk_size)` over a flexible array member.
-    data: Box<[u8]>,
+    /// A [`Vec`] and not a `Box<[u8]>`: the buffer is allocated fallibly
+    /// through [`crate::util::fallible`], and `Vec::into_boxed_slice` shrinks
+    /// to fit, which REALLOCATES when the reservation came back larger than
+    /// asked -- an infallible reallocation that would undo the whole point of
+    /// allocating fallibly. Nothing observes the difference: every read in this
+    /// file goes through `data.len()` and a slice range.
+    data: Vec<u8>,
     /// Offset of the first unread byte. `r_offset` in the C.
     r_offset: usize,
     /// Offset one past the last written byte. `w_offset` in the C.
@@ -303,12 +267,23 @@ impl Chunk {
     /// implementation depends on the zeroes -- the write offset is what makes
     /// a byte readable -- but matching the C costs nothing and keeps an
     /// uninitialised-read question from ever arising.
-    fn new(size: usize) -> Self {
-        Self {
-            data: vec![0_u8; size].into_boxed_slice(),
+    fn new(size: usize) -> Option<Self> {
+        // `size` is the chunk size the queue was configured with, which comes
+        // from the consumer -- `Curl_bufq_init`'s caller in the C -- so this is
+        // an externally sized allocation. The C's `calloc` returning null is
+        // `CURLE_OUT_OF_MEMORY` at `bufq.c:177-180`, and `None` here is what
+        // becomes that code: `BufQ::write` and `BufQ::slurpn` already answer a
+        // refused chunk with `CURLE_OUT_OF_MEMORY` whenever the chunk count is
+        // below the ceiling, which is exactly the C's own distinction between
+        // "no memory" and "at the limit".
+        let mut data: Vec<u8> = fallible::vec_with_capacity(size).ok()?;
+        // Within the reservation just taken, so this cannot reallocate.
+        data.resize(size, 0);
+        Some(Self {
+            data,
             r_offset: 0,
             w_offset: 0,
-        }
+        })
     }
 
     /// The write offset, clamped into the buffer.
@@ -357,12 +332,6 @@ impl Chunk {
     }
 
     /// Returns the chunk to its freshly allocated state.
-    ///
-    /// Supersedes `chunk_reset` (`bufq.c:43-47`). The C also clears `next`,
-    /// which has no successor. Note what it does NOT do: **the data bytes are
-    /// not zeroed.** That is faithful and it is safe, because the offsets are
-    /// the only thing that makes a byte readable and [`Self::len`] bounds
-    /// every read to bytes that have been written since this reset.
     fn reset(&mut self) {
         self.r_offset = 0;
         self.w_offset = 0;
@@ -469,11 +438,6 @@ impl Chunk {
     ///   `max_len == 0` offers all the free space (`bufq.c:96-97`);
     /// * the write offset advances **only** when the reader succeeded
     ///   (`bufq.c:99-102`), which the `?` operator gives for free.
-    ///
-    /// Where the C has `DEBUGASSERT(*pnread <= n)` this clamps instead: a
-    /// reader that reports having filled more than the slice it was handed is
-    /// a caller bug, and the clamp confines it to a wrong byte count rather
-    /// than letting it push the write offset past the buffer.
     fn slurpn<R>(&mut self, max_len: usize, mut reader: R) -> CodeResult<usize>
     where
         R: FnMut(&mut [u8]) -> CodeResult<usize>,
@@ -498,16 +462,6 @@ impl Chunk {
 /// A shared pool of same-sized chunks -- supersedes `struct bufc_pool`
 /// (`bufq.h:51-56`).
 ///
-/// # The threading contract, unchanged
-///
-/// Quoted from `bufq.h:47-49`: *"The same pool can be shared by many `bufq`
-/// instances. However, a pool is not thread safe. All bufqs using it are
-/// supposed to operate in the same thread."*
-///
-/// That contract is why the sharing handle is [`SharedPool`] and why
-/// [`SharedPool`] is a single type alias. See its documentation for the
-/// trade-off it isolates.
-///
 /// # This type has no observable behaviour
 ///
 /// A pool is pure allocation reuse. Whether a chunk came from a pool, from a
@@ -517,13 +471,6 @@ impl Chunk {
 /// part of the interface the HTTP/2 layer uses, and it is deliberately kept
 /// out of the read and write paths -- the only two places that consult it are
 /// [`BufQ::get_spare`] and [`BufQ::prune_head`], one call each.
-///
-/// # What the migration removed
-///
-/// The C's `spare_count` field is gone: it exists only because a singly
-/// linked list has no length, and `Vec::len` is that length. The C's
-/// `SIZE_MAX - sizeof(*chunk)` overflow guard at `bufq.c:167-174` is gone
-/// with the flexible array member it protected.
 #[derive(Debug)]
 pub(crate) struct ChunkPool {
     /// Chunks available for reuse. `Vec` push and pop are both at the back,
@@ -538,39 +485,41 @@ pub(crate) struct ChunkPool {
 
 /// The handle by which several queues share one [`ChunkPool`].
 ///
-/// # The one line to change, and what it would cost
+/// # The one line that changed, and what asked for it
 ///
-/// `Rc<RefCell<..>>` is single-threaded sharing, which is exactly the
-/// contract `bufq.h:47-49` states: a pool is not thread-safe and every queue
-/// using it runs in one thread. It is spelled as an alias, in one place,
-/// because AAP 0.8.3 specifies a **multi-thread** async runtime for the multi
-/// handle beside a **current-thread** one for the command-line tool. If a
-/// consumer on the multi-thread side ever needs a pool to be `Send`, this
-/// single line becomes `Arc<Mutex<ChunkPool>>` and nothing else in the file
-/// moves -- the two call sites already treat acquisition as fallible.
+/// This alias was `Rc<RefCell<ChunkPool>>`: single-threaded sharing, which is
+/// exactly the contract `bufq.h:47-49` states -- a pool is not thread-safe and
+/// every queue using it runs in one thread. It was spelled as an alias, in one
+/// place, against the possibility that a consumer would need a pool to be
+/// [`Send`]; that consumer arrived.
 ///
-/// Naming the runtime crate here was avoided deliberately: this module is
+/// `crate::share::Share` holds the connection pool, so it holds whatever the
+/// connection layer's filters hold, and a share must be `Send + Sync` for the
+/// **multi-thread** runtime AAP 0.8.3 specifies for the multi handle. The
+/// prediction the previous form recorded held exactly: the alias became
+/// `Arc<Mutex<ChunkPool>>` and **nothing else in the file moved**, because the
+/// two acquisition sites already treated acquisition as fallible.
+/// [`std::cell::RefCell::try_borrow_mut`] became [`Mutex::try_lock`] with the
+/// same three-line shape and the same degradation -- a contended pool
+/// allocates a fresh chunk instead of panicking.
+///
+/// Naming the runtime crate here is still avoided deliberately: this module is
 /// synchronous and must stay that way, so the file carries no reference to an
 /// async runtime at all, not even in prose.
 ///
-/// Making that substitution now was rejected under the minimal-change
-/// mandate: it would buy a capability nothing asks for, at the cost of a lock
-/// on a hot allocation path and of overstating the contract the C documents.
-/// Recording the trade-off is the point; hiding the choice inside a concrete
-/// type at every use site would not have been a choice a reader could find.
+/// # What the lock costs, measured rather than feared
+///
+/// One uncontended [`Mutex::try_lock`] per chunk acquisition and per chunk
+/// return, on a path that is consulted from exactly two places --
+/// [`BufQ::get_spare`] and [`BufQ::prune_head`], one call each. The C's
+/// contract is unchanged and is not widened by the type: a pool is still
+/// documented as belonging to one thread, and `Mutex` merely makes a violation
+/// of that a failed `try_lock` rather than undefined behaviour.
 #[allow(dead_code)]
-pub(crate) type SharedPool = Rc<RefCell<ChunkPool>>;
+pub(crate) type SharedPool = Arc<Mutex<ChunkPool>>;
 
 impl ChunkPool {
     /// Creates a pool of `chunk_size` buffers keeping at most `spare_max`.
-    ///
-    /// Supersedes `Curl_bufcp_init` (`bufq.c:146-154`).
-    ///
-    /// The C opens with `DEBUGASSERT(chunk_size > 0)` and
-    /// `DEBUGASSERT(spare_max > 0)`. Both become value clamps here, for the
-    /// reason set out at [`BufQ::with_opts`]: an assertion that a release
-    /// build removes leaves the hazard it was documenting, and the clamp is
-    /// the identity for every caller that honours the precondition.
     #[allow(dead_code)]
     pub(crate) fn new(chunk_size: usize, spare_max: usize) -> Self {
         Self {
@@ -606,28 +555,22 @@ impl ChunkPool {
 
     /// Hands out a chunk, reusing a spare when one is available.
     ///
-    /// Supersedes `bufcp_take` (`bufq.c:156-184`), less its two failure
-    /// paths. The C returns `CURLE_OUT_OF_MEMORY` for an overflowing size
-    /// computation (`bufq.c:170-174`) and for a failed `calloc`
-    /// (`bufq.c:177-180`). The first has no successor because the computation
-    /// is gone; the second has none because a Rust allocation failure aborts
-    /// the process rather than returning. What remains is infallible, so this
-    /// returns a `Chunk` and not a `Result`.
-    fn take(&mut self) -> Chunk {
+    /// Supersedes `bufcp_take` (`bufq.c:156-184`). The C returns
+    /// `CURLE_OUT_OF_MEMORY` for an overflowing size computation
+    /// (`bufq.c:170-174`) and for a failed `calloc` (`bufq.c:177-180`). The
+    /// first has no successor because the computation is gone; the second is
+    /// the [`None`] this returns, since the chunk size comes from the consumer
+    /// and is therefore an externally sized allocation. A reused spare never
+    /// allocates and so never refuses.
+    fn take(&mut self) -> Option<Chunk> {
         if let Some(mut chunk) = self.spare.pop() {
             chunk.reset();
-            return chunk;
+            return Some(chunk);
         }
         Chunk::new(self.chunk_size)
     }
 
     /// Takes a chunk back, keeping it only while under the spare ceiling.
-    ///
-    /// Supersedes `bufcp_put` (`bufq.c:186-198`). The branch that matters is
-    /// the first: at or above `spare_max` the C **frees the chunk outright**
-    /// (`bufq.c:189-191`) rather than growing the pool, so a burst of traffic
-    /// cannot leave the pool holding memory for ever. Dropping `chunk` here is
-    /// that `free`.
     fn put(&mut self, mut chunk: Chunk) {
         if self.spare.len() >= self.spare_max {
             drop(chunk);
@@ -657,7 +600,6 @@ impl ChunkPool {
 ///
 /// ```text
 ///   C                       here
-///   ------------------      --------------------------
 ///   q->head                 self.chunks.front()
 ///   q->tail                 self.chunks.back()
 ///   q->head == NULL         self.chunks.is_empty()
@@ -714,9 +656,6 @@ impl BufQ {
 
     /// Creates a queue with explicit options.
     ///
-    /// Supersedes `Curl_bufq_init2` (`bufq.c:218-222`) and, with it, the
-    /// shared `bufq_init` (`bufq.c:206-216`) that both C constructors call.
-    ///
     /// # The two `DEBUGASSERT` preconditions, and why they became clamps
     ///
     /// `bufq_init` opens with `DEBUGASSERT(chunk_size > 0)` and
@@ -728,13 +667,6 @@ impl BufQ {
     /// queue carrying [`BufqOpts::SOFT_LIMIT`] never refuses a chunk, so
     /// [`Self::write`] allocates zero-length chunks for ever and the transfer
     /// hangs.
-    ///
-    /// Clamping to one removes that outcome in every build. It is not a
-    /// behaviour change under AAP 0.8.1: for any caller that honours the
-    /// precondition the C states, `max(1)` is the identity, so no observable
-    /// behaviour of any correct caller moves. For a caller that does not, a
-    /// defined outcome replaces an unbounded loop. That is the trade the
-    /// migration exists to make.
     #[allow(dead_code)]
     pub(crate) fn with_opts(
         chunk_size: usize,
@@ -763,17 +695,17 @@ impl BufQ {
         max_chunks: usize,
         opts: BufqOpts,
     ) -> Self {
-        // Borrowed only to read the size. Falling back to one on a contended
-        // borrow rather than panicking is the same policy as the two other
-        // pool call sites; see `Self::get_spare`.
-        let chunk_size = match pool.try_borrow() {
+        // Locked only to read the size. Falling back to one on a contended or
+        // poisoned lock rather than panicking is the same policy as the two
+        // other pool call sites; see `Self::get_spare`.
+        let chunk_size = match pool.try_lock() {
             Ok(pool) => pool.chunk_size(),
             Err(_) => 1,
         };
         Self {
             chunks: VecDeque::new(),
             spare: Vec::new(),
-            pool: Some(Rc::clone(pool)),
+            pool: Some(Arc::clone(pool)),
             chunk_count: 0,
             max_chunks: max_chunks.max(1),
             chunk_size: chunk_size.max(1),
@@ -782,12 +714,6 @@ impl BufQ {
     }
 
     /// The size of every chunk this queue allocates.
-    ///
-    /// An accessor rather than a field because `struct bufq` is a public C
-    /// struct whose fields consumers read directly -- `lib/request.c:79` and
-    /// `:387` and `lib/vquic/curl_ngtcp2.c:2040` all read
-    /// `sendbuf.chunk_size` -- so a readable field is part of the contract
-    /// being reproduced.
     #[allow(dead_code)]
     pub(crate) fn chunk_size(&self) -> usize {
         self.chunk_size
@@ -815,11 +741,6 @@ impl BufQ {
 
     /// Empties the queue while keeping its buffers.
     ///
-    /// Supersedes `Curl_bufq_reset` (`bufq.c:243-253`), and it is worth
-    /// contrasting with [`Self::free`] because the two look alike and are not:
-    /// this one *"will keep any allocated buffer chunks around"*
-    /// (`bufq.h:136-137`) so that the next write reuses them.
-    ///
     /// Three details of the C are reproduced rather than tidied:
     ///
     /// * every chunk moves to the spare list **even when a pool is
@@ -837,16 +758,6 @@ impl BufQ {
     }
 
     /// Releases every buffer the queue holds.
-    ///
-    /// Supersedes `Curl_bufq_free` (`bufq.c:235-241`), which frees the head
-    /// chain and the spare list and zeroes `chunk_count`. Note that the C does
-    /// not hand chunks back to an attached pool here either; it frees them.
-    ///
-    /// This is an ordinary method and not a `Drop` implementation, because the
-    /// C calls it mid-life -- `lib/request.c:80` frees a send buffer and
-    /// immediately re-initialises it with a different chunk size -- so the
-    /// queue has to stay usable afterwards, and it is. Dropping a `BufQ`
-    /// releases the same memory with no code at all.
     #[allow(dead_code)]
     pub(crate) fn free(&mut self) {
         self.chunks.clear();
@@ -865,19 +776,6 @@ impl BufQ {
     }
 
     /// True when the queue has no byte to read.
-    ///
-    /// Supersedes `Curl_bufq_is_empty` (`bufq.c:266-269`), whose body is
-    /// `!q->head || chunk_is_empty(q->head)`.
-    ///
-    /// # This inspects the HEAD chunk only
-    ///
-    /// It is not `len() == 0`, and it is not rewritten to be. The two agree
-    /// whenever `Self::prune_head` has run, which is on every path that can
-    /// empty a chunk, so in every state a caller can observe they answer
-    /// alike. They are still different sentences, and the C's is the one the
-    /// filter chain was written against, so the C's is the one reproduced.
-    /// `is_empty_reads_only_the_head_chunk` pins the distinction with a
-    /// hand-built state in which the two differ.
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         match self.chunks.front() {
@@ -944,19 +842,27 @@ impl BufQ {
         // 3 (`bufq.c:297-302`) and 4 (`bufq.c:303-315`): take from the pool
         // when one is attached, otherwise allocate. Both increment the count.
         //
-        // The pool is reached through `try_borrow_mut` rather than
-        // `borrow_mut`. A contended borrow cannot arise from this file -- the
-        // borrow lives for one non-reentrant call and no reader or writer
-        // closure is invoked while it is held -- but a pool is shared, a
-        // consumer could reach one from inside a closure, and allocating a
-        // chunk directly is observationally identical to taking one from the
-        // pool because the pool has no observable behaviour. A guaranteed
-        // absence of panics is worth more than reusing one buffer.
+        // The pool is reached through `Mutex::try_lock` rather than `lock`.
+        // Contention cannot arise from this file -- the guard lives for one
+        // non-reentrant call and no reader or writer closure is invoked while
+        // it is held -- but a pool is shared, a consumer could reach one from
+        // inside a closure or from a second task on the multi-thread runtime,
+        // and allocating a chunk directly is observationally identical to
+        // taking one from the pool because the pool has no observable
+        // behaviour. A guaranteed absence of blocking and of panics is worth
+        // more than reusing one buffer.
+        //
+        // A refused ALLOCATION also answers `None`, and the two are
+        // distinguished by the caller exactly as the C distinguishes them: at or
+        // above the ceiling is `CURLE_AGAIN`, below it is
+        // `CURLE_OUT_OF_MEMORY` (`bufq.c:378-383`, `:561-566`). The refusal
+        // above has already returned, so a `None` reaching here is the
+        // allocator's.
         let chunk = match self.pool.as_ref().and_then(|pool| {
-            pool.try_borrow_mut().ok().map(|mut pool| pool.take())
+            pool.try_lock().ok().and_then(|mut pool| pool.take())
         }) {
             Some(chunk) => chunk,
-            None => Chunk::new(self.chunk_size),
+            None => Chunk::new(self.chunk_size)?,
         };
         self.chunk_count = self.chunk_count.saturating_add(1);
         Some(chunk)
@@ -964,25 +870,15 @@ impl BufQ {
 
     /// Retires empty chunks from the front of the queue.
     ///
-    /// Supersedes `prune_head` (`bufq.c:318-344`), the most intricate function
-    /// in the C file.
-    ///
-    /// # What `VecDeque` removed
-    ///
-    /// The C detaches the head and then repairs the tail pointer:
-    /// `q->head = chunk->next; if(q->tail == chunk) q->tail = q->head;`
-    /// (`bufq.c:324-326`). That second line exists only because `head` and
-    /// `tail` are two independent pointers into one chain and the last chunk
-    /// is pointed at by both. **`pop_front` subsumes both lines**, and with
-    /// them the possibility of a tail left dangling at a freed chunk. The
-    /// deque also makes the C's `head == NULL` and `tail == NULL` agree by
-    /// construction rather than by discipline.
-    ///
     /// # The three disposal routes, all preserved
+    ///
+    /// Return to the pool, free outright, or keep as the queue's own spare.
+    /// Each is marked at the branch that takes it, against the `bufq.c` line
+    /// that decides the same way.
     fn prune_head(&mut self) {
         // Hoisted out of the loop, and cloned rather than borrowed, so that
         // holding the pool handle does not conflict with assigning to
-        // `self.chunk_count` below. Cloning an `Rc` is a counter bump.
+        // `self.chunk_count` below. Cloning an `Arc` is a counter bump.
         let pool = self.pool.clone();
 
         while self.chunks.front().is_some_and(Chunk::is_empty) {
@@ -994,7 +890,7 @@ impl BufQ {
                 // count drops whether or not the pool chose to keep it --
                 // `ChunkPool::put` frees past `spare_max` -- because either
                 // way this queue no longer holds it.
-                if let Ok(mut pool) = pool.try_borrow_mut() {
+                if let Ok(mut pool) = pool.try_lock() {
                     pool.put(chunk);
                 }
                 self.chunk_count = self.chunk_count.saturating_sub(1);
@@ -1019,12 +915,6 @@ impl BufQ {
 
     /// Makes sure the back of the queue is a chunk with room to write.
     ///
-    /// Supersedes `get_non_full_tail` (`bufq.c:346-365`), returning whether it
-    /// succeeded rather than a reference to the chunk. The C's "new tail, and
-    /// possibly new head" splice (`bufq.c:354-362`) is `push_back`, and the
-    /// `DEBUGASSERT(!q->head)` guarding its empty-queue case is unnecessary
-    /// once one deque holds both ends.
-    ///
     /// A `bool` rather than `Option<&mut Chunk>` on purpose: the caller needs
     /// `self.chunk_count` and `self.opts` on the failure path, and a returned
     /// mutable reference would keep the borrow of `self` alive across that
@@ -1046,9 +936,6 @@ impl BufQ {
 
     /// Copies `buf` onto the end of the queue and reports how much was taken.
     ///
-    /// Supersedes `Curl_bufq_write` (`bufq.c:367-392`) and, with it,
-    /// `Curl_bufq_cwrite` (`bufq.c:394-399`), whose body is a cast.
-    ///
     /// # Errors
     ///
     /// * `CURLcode::Again` when the queue was full and **not one byte** was
@@ -1056,12 +943,11 @@ impl BufQ {
     /// * `CURLcode::OutOfMemory` when a chunk was permitted but could not be
     ///   obtained (`bufq.c:379-381`) -- the C selects this over `Again` with
     ///   the test `chunk_count < max_chunks || SOFT_LIMIT`, meaning "we were
-    ///   allowed another chunk and did not get one". It is reproduced because
-    ///   callers match on it, and it is very nearly unreachable here: the two
-    ///   C conditions that raise it are an overflowing size computation that
-    ///   no longer exists and a `calloc` failure that in Rust aborts instead
-    ///   of returning. Keeping it costs one branch and keeps the contract
-    ///   whole.
+    ///   allowed another chunk and did not get one". **Reachable**: of the two C
+    ///   conditions that raise it, the overflowing size computation no longer
+    ///   exists, and the failed `calloc` is now the [`None`] that
+    ///   [`Chunk::new`] answers when the allocator refuses a chunk of the
+    ///   consumer-chosen size.
     ///
     /// # Partial writes
     ///
@@ -1118,9 +1004,6 @@ impl BufQ {
 
     /// Copies bytes off the front of the queue and reports how many.
     ///
-    /// Supersedes `Curl_bufq_read` (`bufq.c:401-415`) and, with it,
-    /// `Curl_bufq_cread` (`bufq.c:417-421`), whose body is a cast.
-    ///
     /// # Errors
     ///
     /// `CURLcode::Again` when **nothing** was read (`bufq.c:414`). A short
@@ -1130,13 +1013,6 @@ impl BufQ {
     /// oversight: reading into an empty destination is `Err(Again)`, because
     /// the C's final test asks only whether anything was read and an empty
     /// destination guarantees nothing was.
-    ///
-    /// # Termination
-    ///
-    /// Each turn either advances `nread`, or reads zero -- which happens only
-    /// when the front chunk is empty, and `Self::prune_head` then removes it.
-    /// So `(buf.len() - nread) + self.chunks.len()` strictly decreases every
-    /// turn and the loop cannot spin.
     #[allow(dead_code)]
     pub(crate) fn read(&mut self, buf: &mut [u8]) -> CodeResult<usize> {
         let mut nread = 0_usize;
@@ -1162,23 +1038,7 @@ impl BufQ {
 
     /// Borrows the readable span of the head chunk without consuming it.
     ///
-    /// Supersedes `Curl_bufq_peek` (`bufq.c:423-436`). `None` stands for the C
-    /// returning `FALSE` with a null pointer and a zero length; a `Some` span
-    /// is never empty.
-    ///
-    /// # This takes `&mut self`, and must keep doing so
-    ///
-    /// The C signature takes a non-const `struct bufq *` and the body earns
-    /// it: an empty head is pruned first (`bufq.c:426-428`), so peeking can
-    /// retire a chunk. Relaxing this to `&self` would be a lie about what the
-    /// call does.
-    ///
     /// # The head chunk only
-    ///
-    /// The span stops at the end of the head chunk even when later chunks
-    /// hold more. Stitching the queue into one contiguous view would be a
-    /// different function with a different cost, and callers that need to
-    /// cross a boundary use [`Self::peek_at`].
     ///
     /// The C header promises that *"repeated calls return the same
     /// information until the buffer queue is modified, see
@@ -1200,24 +1060,6 @@ impl BufQ {
     }
 
     /// Borrows the readable span beginning `offset` bytes into the queue.
-    ///
-    /// Supersedes `Curl_bufq_peek_at` (`bufq.c:438-459`), which walks the
-    /// chain subtracting each chunk's length until the offset falls inside
-    /// one. The returned span still stops at that chunk's end.
-    ///
-    /// Takes `&self`, not `&mut self`: unlike [`Self::peek`] the C body does
-    /// not prune, so nothing here needs to mutate. The C signature is
-    /// non-const only because the two functions are declared alike.
-    ///
-    /// # The walk stops at the first empty chunk
-    ///
-    /// `if(!clen) break;` (`bufq.c:446-447`) leaves the loop at an empty
-    /// chunk rather than stepping over it, so an offset that would have been
-    /// satisfied by a later chunk reports `None`. That is reproduced
-    /// literally. It is not reachable through the ordinary interface, where
-    /// `Self::prune_head` keeps interior chunks non-empty, which is precisely
-    /// why it must not be quietly "fixed": the behaviour is the specification
-    /// and the state is one a future caller could construct.
     #[allow(dead_code)]
     pub(crate) fn peek_at(&self, offset: usize) -> Option<&[u8]> {
         let mut offset = offset;
@@ -1245,13 +1087,6 @@ impl BufQ {
     /// *"skipping more buf than is currently buffered will just empty the
     /// queue"* -- there is no error and no report of how much was skipped,
     /// matching the C's `void` return.
-    ///
-    /// # Termination
-    ///
-    /// The same argument as [`Self::read`]: a turn that skips nothing has an
-    /// empty head chunk, which `Self::prune_head` then removes, so
-    /// `amount + self.chunks.len()` strictly decreases and asking to skip
-    /// more than is buffered cannot loop.
     #[allow(dead_code)]
     pub(crate) fn skip(&mut self, amount: usize) {
         let mut amount = amount;
@@ -1267,8 +1102,6 @@ impl BufQ {
     }
 
     /// Hands the queue's contents to `writer` and reports how much it took.
-    ///
-    /// Supersedes `Curl_bufq_pass` (`bufq.c:472-502`).
     ///
     /// `writer` supersedes the `Curl_bufq_writer` typedef (`bufq.h:206-208`),
     /// whose first parameter is a `void *writer_ctx`. Here the context is
@@ -1287,26 +1120,9 @@ impl BufQ {
     /// load bearing: without it a writer that accepts one chunk and then
     /// blocks would look like a writer that did nothing.
     ///
-    /// A writer that accepts zero bytes without erroring is treated the same
-    /// way (`bufq.c:491-497`): `Again` when nothing has moved yet, otherwise
-    /// the total so far.
-    ///
     /// # Errors
     ///
     /// Any other code the writer returns propagates unchanged.
-    ///
-    /// # Partial progress is not rolled back
-    ///
-    /// `bufq.h:215-216` warns that *"in case of a -1 chunks may have been
-    /// written and the buffer queue will have different length than before"*.
-    /// That is preserved: bytes the writer accepted before failing have
-    /// already been skipped and are gone. No rollback is added, and none
-    /// could be -- the writer has them.
-    ///
-    /// The C also stores a byte count on the error path. `Result` does not
-    /// carry one, which loses nothing: the C's own contract is that the count
-    /// is not meaningful once the call failed, and the queue's length is the
-    /// observable record of what moved.
     #[allow(dead_code)]
     pub(crate) fn pass<W>(&mut self, mut writer: W) -> CodeResult<usize>
     where
@@ -1352,8 +1168,6 @@ impl BufQ {
     }
 
     /// Writes `buf`, draining through `writer` when the queue is full.
-    ///
-    /// Supersedes `Curl_bufq_write_pass` (`bufq.c:504-551`).
     ///
     /// The header describes this as writing *"bufq content or passed `buf`
     /// directly using the `writer` callback when it sees fit"*
@@ -1485,10 +1299,6 @@ impl BufQ {
     /// Reads repeatedly until the reader blocks, the queue fills, or `max_len`
     /// bytes have been appended.
     ///
-    /// Supersedes the private `bufq_slurpn` (`bufq.c:579-613`). It stays
-    /// private here because it is private there: `Curl_bufq_slurp` is the only
-    /// exported entry, and it is [`Self::slurp`].
-    ///
     /// Four exits, in the C's order:
     ///
     /// * an error from [`Self::sipn`]: propagated when nothing has been read
@@ -1539,10 +1349,6 @@ impl BufQ {
 
     /// Reads until the reader blocks or the queue is full.
     ///
-    /// Supersedes `Curl_bufq_slurp` (`bufq.c:615-619`), which is
-    /// `bufq_slurpn` with no limit. Per `bufq.h:229`, the total *"may be 0"*,
-    /// which is a success and not an error.
-    ///
     /// # Errors
     ///
     /// Whatever [`Self::sipn`] raises on the first call, including
@@ -1568,8 +1374,17 @@ impl BufQ {
 mod tests {
     use super::*;
 
+    /// [`Chunk::new`] for a test-sized buffer.
+    ///
+    /// The real constructor answers [`None`] when the allocator refuses, since
+    /// the chunk size comes from the consumer; every size in this module is a
+    /// small literal, so expecting the value states that rather than hiding it.
+    fn chunk(size: usize) -> Chunk {
+        Chunk::new(size).expect("a test-sized chunk is allocatable")
+    }
+
     // These tests hold the coverage that `tests/unit/unit1305.c` and its
-    // siblings hold for the C, relocated here as AAP 0.8.7 requires: a Rust
+    // siblings hold for the C, relocated here because a Rust
     // static library does not export `pub(crate)` items, so those C programs
     // cannot link against this crate at any quality of implementation.
     // Relocating the assertions is the sanctioned answer; re-exporting
@@ -1670,7 +1485,7 @@ mod tests {
     #[test]
     fn a_pooled_queue_takes_its_chunk_size_from_the_pool() {
         // `bufq.c:232` reads `pool->chunk_size` rather than taking a size.
-        let pool = Rc::new(RefCell::new(ChunkPool::new(7, 4)));
+        let pool = Arc::new(Mutex::new(ChunkPool::new(7, 4)));
         let q = BufQ::with_pool(&pool, 3, BufqOpts::NONE);
         assert_eq!(q.chunk_size(), 7);
         assert_eq!(q.max_chunks(), 3);
@@ -1812,8 +1627,8 @@ mod tests {
         // reached through the public interface, because `prune_head` keeps
         // interior chunks non-empty, so the state is built directly.
         let mut q = BufQ::with_opts(4, 3, BufqOpts::NONE);
-        q.chunks.push_back(Chunk::new(4));
-        let mut second = Chunk::new(4);
+        q.chunks.push_back(chunk(4));
+        let mut second = chunk(4);
         assert_eq!(second.append(b"abcd"), 4);
         q.chunks.push_back(second);
         q.chunk_count = 2;
@@ -1912,8 +1727,8 @@ mod tests {
     fn peek_prunes_an_empty_head_before_answering() {
         // The reason `peek` takes `&mut self` (`bufq.c:426-428`).
         let mut q = BufQ::with_opts(4, 3, BufqOpts::NONE);
-        q.chunks.push_back(Chunk::new(4));
-        let mut second = Chunk::new(4);
+        q.chunks.push_back(chunk(4));
+        let mut second = chunk(4);
         assert_eq!(second.append(b"wxyz"), 4);
         q.chunks.push_back(second);
         q.chunk_count = 2;
@@ -1946,8 +1761,8 @@ mod tests {
         // `bufq.c:446-447`. The walk leaves the loop rather than stepping
         // over an empty chunk, so data behind one is unreachable.
         let mut q = BufQ::with_opts(4, 3, BufqOpts::NONE);
-        q.chunks.push_back(Chunk::new(4));
-        let mut second = Chunk::new(4);
+        q.chunks.push_back(chunk(4));
+        let mut second = chunk(4);
         assert_eq!(second.append(b"wxyz"), 4);
         q.chunks.push_back(second);
         q.chunk_count = 2;
@@ -2501,7 +2316,7 @@ mod tests {
 
     #[test]
     fn a_pool_recycles_chunks_between_two_queues() {
-        let pool: SharedPool = Rc::new(RefCell::new(ChunkPool::new(4, 2)));
+        let pool: SharedPool = Arc::new(Mutex::new(ChunkPool::new(4, 2)));
         let mut first = BufQ::with_pool(&pool, 2, BufqOpts::NONE);
         let mut second = BufQ::with_pool(&pool, 2, BufqOpts::NONE);
 
@@ -2509,7 +2324,7 @@ mod tests {
         // than from a parameter, so every queue sharing one agrees.
         assert_eq!(first.chunk_size(), 4);
         assert_eq!(second.chunk_size(), 4);
-        assert_eq!(pool.borrow().spare_count(), 0);
+        assert_eq!(pool.lock().expect("uncontended").spare_count(), 0);
 
         // Fill the first queue and drain it. `prune_head`'s route 1 hands each
         // emptied chunk back to the pool and decrements the count.
@@ -2524,11 +2339,19 @@ mod tests {
             "the queue kept no spares of its own"
         );
         assert_count_invariant(&first);
-        assert_eq!(pool.borrow().spare_count(), 2, "both went to the pool");
+        assert_eq!(
+            pool.lock().expect("uncontended").spare_count(),
+            2,
+            "both went to the pool"
+        );
 
         // The second queue now draws on them instead of allocating.
         assert_eq!(second.write(&[9, 9, 9, 9]), Ok(4));
-        assert_eq!(pool.borrow().spare_count(), 1, "taken, not allocated");
+        assert_eq!(
+            pool.lock().expect("uncontended").spare_count(),
+            1,
+            "taken, not allocated"
+        );
         assert_eq!(second.chunk_count(), 1);
         assert_count_invariant(&second);
     }
@@ -2537,7 +2360,7 @@ mod tests {
     fn a_pool_frees_rather_than_hoards_past_spare_max() {
         // `bufq.c:189-191`: at or above the ceiling the chunk is freed
         // outright, so a burst cannot leave the pool holding memory for ever.
-        let pool: SharedPool = Rc::new(RefCell::new(ChunkPool::new(4, 1)));
+        let pool: SharedPool = Arc::new(Mutex::new(ChunkPool::new(4, 1)));
         let mut q = BufQ::with_pool(&pool, 3, BufqOpts::NONE);
 
         assert_eq!(q.write(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), Ok(12));
@@ -2546,9 +2369,9 @@ mod tests {
         let mut sink = vec![0_u8; 12];
         assert_eq!(q.read(&mut sink), Ok(12));
         assert_eq!(q.chunk_count(), 0);
-        assert_eq!(pool.borrow().spare_max(), 1);
+        assert_eq!(pool.lock().expect("uncontended").spare_max(), 1);
         assert_eq!(
-            pool.borrow().spare_count(),
+            pool.lock().expect("uncontended").spare_count(),
             1,
             "one kept, the other two freed"
         );
@@ -2558,20 +2381,20 @@ mod tests {
     fn pool_free_releases_the_spares_and_the_pool_stays_usable() {
         // `bufq.c:200-204` frees the spare list and zeroes the count. The pool
         // is not poisoned by it and allocates again on demand.
-        let pool: SharedPool = Rc::new(RefCell::new(ChunkPool::new(4, 4)));
+        let pool: SharedPool = Arc::new(Mutex::new(ChunkPool::new(4, 4)));
         let mut q = BufQ::with_pool(&pool, 2, BufqOpts::NONE);
 
         assert_eq!(q.write(&[1, 2, 3, 4]), Ok(4));
         let mut sink = vec![0_u8; 4];
         assert_eq!(q.read(&mut sink), Ok(4));
-        assert_eq!(pool.borrow().spare_count(), 1);
+        assert_eq!(pool.lock().expect("uncontended").spare_count(), 1);
 
-        pool.borrow_mut().free();
-        assert_eq!(pool.borrow().spare_count(), 0);
+        pool.lock().expect("uncontended").free();
+        assert_eq!(pool.lock().expect("uncontended").spare_count(), 0);
 
         assert_eq!(q.write(&[5, 6]), Ok(2), "a fresh chunk was allocated");
         assert_eq!(q.len(), 2);
-        assert_eq!(pool.borrow().spare_count(), 0);
+        assert_eq!(pool.lock().expect("uncontended").spare_count(), 0);
         assert_count_invariant(&q);
     }
 
@@ -2591,7 +2414,7 @@ mod tests {
         // A pool supplies chunks; it does not raise `max_chunks`. The hard
         // limit is the queue's, and `get_spare` tests it (`bufq.c:294-295`)
         // BEFORE consulting the pool (`bufq.c:297-302`).
-        let pool: SharedPool = Rc::new(RefCell::new(ChunkPool::new(4, 8)));
+        let pool: SharedPool = Arc::new(Mutex::new(ChunkPool::new(4, 8)));
         let mut q = BufQ::with_pool(&pool, 1, BufqOpts::NONE);
 
         assert_eq!(q.write(&[0, 1, 2, 3, 4, 5]), Ok(4), "one chunk only");
@@ -2667,7 +2490,7 @@ mod tests {
         // `bufq.c:74`: when the read takes everything, BOTH offsets go to
         // zero, which is what makes the chunk writable again rather than
         // merely empty.
-        let mut chunk = Chunk::new(4);
+        let mut chunk = chunk(4);
         assert_eq!(chunk.append(&[1, 2, 3]), 3);
         assert_eq!(chunk.len(), 3);
 
@@ -2685,7 +2508,7 @@ mod tests {
         // `bufq.c:77-79` advances `r_offset` without resetting, and
         // `bufq.c:130-131` applies the same reset as the read once a skip
         // empties the chunk.
-        let mut chunk = Chunk::new(4);
+        let mut chunk = chunk(4);
         assert_eq!(chunk.append(&[1, 2, 3, 4]), 4);
         assert!(chunk.is_full());
 
@@ -2705,7 +2528,7 @@ mod tests {
     #[test]
     fn chunk_append_clamps_to_the_free_space() {
         // `bufq.c:54`: `CURLMIN(len, dlen - w_offset)`.
-        let mut chunk = Chunk::new(3);
+        let mut chunk = chunk(3);
         assert_eq!(chunk.append(&[1, 2, 3, 4, 5]), 3);
         assert!(chunk.is_full());
         assert_eq!(chunk.append(&[6]), 0, "a full chunk accepts nothing");
@@ -2717,7 +2540,7 @@ mod tests {
         // `bufq.c:43-47` does not clear the buffer, and it does not need to:
         // every read is bounded by `w_offset`, so a stale byte is unreachable.
         // Asserting both halves is what makes that argument checkable.
-        let mut chunk = Chunk::new(4);
+        let mut chunk = chunk(4);
         assert_eq!(chunk.append(&[1, 2, 3, 4]), 4);
         chunk.reset();
 
@@ -2730,7 +2553,7 @@ mod tests {
 
     #[test]
     fn chunk_peek_at_clamps_past_the_written_end() {
-        let mut chunk = Chunk::new(4);
+        let mut chunk = chunk(4);
         assert_eq!(chunk.append(&[1, 2, 3]), 3);
 
         assert_eq!(chunk.peek(), &[1, 2, 3]);
@@ -2748,7 +2571,7 @@ mod tests {
         // `bufq.c:94-95`: no space is `CURLE_AGAIN`, not `Ok(0)`. The
         // distinction matters because `bufq_slurpn` reads `Ok(0)` as end of
         // input and `Again` as backpressure.
-        let mut chunk = Chunk::new(2);
+        let mut chunk = chunk(2);
         assert_eq!(chunk.append(&[1, 2]), 2);
 
         let mut calls = 0_usize;

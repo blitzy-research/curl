@@ -39,60 +39,6 @@
 //!   `CF_CTX_CALL_DATA` double cast (`:136-137`) that this translation exists
 //!   to remove.
 //!
-//! In the C tree `lib/vtls/` is an abstraction over seven interchangeable
-//! backends: `struct Curl_ssl` carries nineteen entry points and `vtls.c`
-//! dispatches through it to OpenSSL, GnuTLS, mbedTLS, wolfSSL, Schannel,
-//! Secure Transport or rustls-ffi. Here the abstraction is *retained* and the
-//! dispatch collapses to a single implementation, because backend **identity**
-//! is observable through the public ABI -- `curl_version_info` reports it and
-//! `curl_global_sslset` enumerates it -- while backend **choice** is not.
-//!
-//! # The provider caveat, stated honestly
-//!
-//! rustls implements the TLS state machine, the record layer and certificate
-//! verification in Rust. It does **not** implement the cryptographic
-//! primitives: those come from a provider, and the provider pinned here is
-//! `ring`, which itself contains C and assembly. Neither `ring` nor
-//! `aws-lc-rs` is pure Rust, so the constraint this build satisfies is the one
-//! that matters and no more: **no C TLS library is linked.** A claim that the
-//! resulting binary contains no C or assembly whatsoever would be false, and
-//! AAP 0.8.6 ambiguity A7 records it as a disclosure rather than a resolved
-//! question. `ring` is chosen over `aws-lc-rs` because it needs no vendored
-//! CMake or NASM toolchain, which is what makes the cross-compiled
-//! `aarch64-unknown-linux-gnu` leg buildable.
-//!
-//! # There is no `tls` feature, and there must never be one
-//!
-//! This module is declared unconditionally by the crate root. An
-//! off-switchable `tls` feature would permit a build with no TLS at all,
-//! contradicting both "rustls exclusively" and "certificate validation on by
-//! default". Nothing in this directory may be written `#[cfg(feature =
-//! "tls")]`: the manifest declares no such feature, so the expression would
-//! raise `unexpected 'cfg' condition value`, and continuous integration runs
-//! clippy with `-D warnings`.
-//!
-//! # Provider selection is explicit, never defaulted
-//!
-//! `rustls`, `tokio-rustls` and `quinn` are pinned in the workspace manifest
-//! with `default-features = false` and the `ring` provider selected by name.
-//! Nothing here may enable a feature that unions `aws_lc_rs`,
-//! `prefer-post-quantum` or `platform-verifier` back into the graph, and
-//! nothing here installs a process-global provider: a provider value is
-//! *injected*, so two transfers in one process cannot disagree about it and
-//! no test can be perturbed by the order it ran in.
-//!
-//! Cargo unions features across a whole graph, so one stray feature on one
-//! optional dependency relinks a second provider, and three separate defects
-//! follow. `prefer-post-quantum` offers a hybrid key exchange that **changes
-//! the bytes of the ClientHello** relative to curl 8.19.0-DEV, which under the
-//! byte-exact fixture comparison endangers every HTTPS fixture --
-//! `tests/getpart.pm:351-357` joins both sides with `join("")` and compares
-//! them as one string, so nothing about a TLS flight is compared loosely.
-//! `aws-lc-rs` vendors C and assembly and adds CMake and NASM to the build's
-//! requirements. And `platform-verifier` delegates trust decisions to the
-//! operating-system store, which conflicts with `--cacert`, `--capath` and
-//! `--insecure` remaining authoritative.
-//!
 //! # Backend identity: one member whose position is contractual
 //!
 //! [`CurlSslDescriptor`] keeps [`SslBackendInfo`] as its **first** member.
@@ -116,16 +62,6 @@
 //! | [`session_cache`] | `lib/vtls/vtls_scache.c`, `lib/vtls/vtls_spack.c` |
 //! | [`rustls_backend`] | `lib/vtls/rustls.c` |
 //!
-//! All five are declared below because all five exist. Each one arrived
-//! WITH its file, for a measured reason and not a stylistic one:
-//! `mod rustls_backend;` without a `rustls_backend.rs` beside it is rustc
-//! `E0583`, a hard error that would stop this crate compiling and take every
-//! downstream gate with it -- the symbol-parity comparison, the 129 example
-//! compilations and the fixture corpus all need a library that builds. That
-//! is the convention the whole tree follows: `conn/mod.rs` declares six of
-//! its planned children, `protocols/mod.rs` one, `multi/mod.rs` three, and
-//! the crate root records the same for this directory at `lib.rs:725-729`.
-//!
 //! What each child owns is fixed. [`rustls_backend`] owns the one
 //! [`TlsBackend`] implementation, following the mapping `lib/vtls/rustls.c`
 //! already established rather than reinventing it. [`session_cache`] owns the
@@ -133,16 +69,6 @@
 //! is why [`SslPeer::scache_key`] is *supplied* to this module rather than
 //! computed in it: `Curl_ssl_peer_key_make` lives in `vtls_scache.c`, not in
 //! `vtls.c`.
-//!
-//! # Visibility
-//!
-//! `pub(crate)` throughout. `lib/vtls/`'s internal contracts were `extern`
-//! declarations under a `Curl_` prefix -- private by convention and visible to
-//! the linker -- and they become private by enforcement here. Backend identity
-//! reaches C through [`crate::version`], which already carries
-//! `TLS_BACKEND_NAME`, `TLS_BACKEND_ID` and `SSL_VERSION` for `curl-rs-ffi`
-//! to read; widening this directory to expose the same three facts twice would
-//! create two sources of truth for one ABI answer.
 
 /// Cipher-suite name mapping: supersedes `lib/vtls/cipher_suite.c`.
 ///
@@ -162,12 +88,6 @@ pub(crate) mod keylog;
 /// Certificate trust, revocation, hostname checking and certificate
 /// introspection: supersedes `lib/vtls/x509asn1.c` and
 /// `lib/vtls/hostcheck.c`, plus the trust half of `lib/vtls/rustls.c`.
-///
-/// Verification is on by default and `--insecure` is the only switch that
-/// turns it off: the module's default policy enables both the peer-chain and
-/// the hostname check, and one private constructor -- the equivalent of C
-/// `cr_verify_none` -- is the only route to a configuration that verifies
-/// nothing.
 pub(crate) mod verify;
 
 /// The session resumption cache and its serialisation: supersedes
@@ -179,26 +99,13 @@ pub(crate) mod verify;
 /// distinguishes a single-use TLS 1.3 ticket from a reusable pre-1.3 session,
 /// and the HMAC-protected import and export paths behind
 /// `curl_easy_ssls_import` and `curl_easy_ssls_export`.
-///
-/// The `vtls_spack` byte format is a *consumer-visible* contract, not an
-/// internal detail: the command-line tool's `--ssl-sessions` writes it in one
-/// run and reads it in another, possibly across builds. It is therefore
-/// reproduced byte for byte and held there by golden tests.
 pub(crate) mod session_cache;
 
 /// The one [`TlsBackend`] implementation: supersedes `lib/vtls/rustls.c`.
-///
-/// Declared here because the file now exists beside this one, which is the
-/// convention the note above records: `mod rustls_backend;` without
-/// `rustls_backend.rs` is rustc `E0583`, so a declaration arrives with its
-/// file. It owns the native rustls 0.23.42 session -- the configuration, the
-/// connection, the two safe I/O adapters over the filter below, and the
-/// `plain_out_buffered` retry protocol -- and it follows `lib/vtls/rustls.c`'s
-/// existing curl-to-rustls mapping rather than reinventing it.
 pub(crate) mod rustls_backend;
 
 use core::fmt;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use rustls::crypto::{CryptoProvider, SecureRandom};
 
@@ -214,33 +121,9 @@ use crate::trace::{failf, infof, trc_cf, TraceFilter};
 use crate::util::bufq::BufQ;
 use crate::util::timeval::{Clock, CurlTime};
 
-// =========================================================================
 // The capability vocabulary -- `SSLSUPP_*` (`lib/vtls/vtls.h:35-49`)
-// =========================================================================
 
 /// What a TLS backend can be asked to do.
-///
-/// The successor of the fifteen `SSLSUPP_*` macros and of the
-/// `unsigned int supports` member they populate (`lib/vtls/vtls_int.h:147`).
-/// `Curl_ssl_supports` (`lib/vtls/vtls.c`, declared at `vtls.h:231`) tests one
-/// bit of it, and the answer is observable: `curl --version` reports several of
-/// these capabilities, and `tests/runtests.pl` parses that line to decide which
-/// fixtures are eligible. Over-reporting a capability turns a clean skip into a
-/// hard failure, so the bit positions are transcribed rather than inferred.
-///
-/// # A vocabulary, not a claim
-///
-/// This type is the complete set of *questions* that can be asked. What a
-/// particular backend answers yes to is a separate thing, and lives on that
-/// backend's [`CurlSslDescriptor::supports`]. The distinction matters because
-/// the C rustls backend sets `SSLSUPP_ECH` while a native rustls build does
-/// not, so a truthful report cannot be derived from the vocabulary.
-///
-/// # No dependency for this
-///
-/// A newtype over [`u32`] with the four operations that are actually used,
-/// exactly as [`CfType`] does for the filter flags. A bitflag crate would add
-/// a dependency, a macro and a `cargo audit` surface to express fifteen shifts.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 #[allow(dead_code)]
@@ -348,12 +231,6 @@ impl SslSupport {
     }
 
     /// True when every capability in `other` is present.
-    ///
-    /// `Curl_ssl_supports(data, option)` (`vtls.h:226-231`) asks this of one
-    /// bit; asking it of a set costs nothing and reads better where two are
-    /// needed together. An empty `other` is contained by everything, which is
-    /// the arithmetic of `x & 0 == 0` and is what makes
-    /// [`Self::NONE`] a usable neutral element.
     pub(crate) const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
@@ -418,22 +295,9 @@ impl fmt::Debug for SslSupport {
     }
 }
 
-// =========================================================================
 // Protocol versions -- `CURL_IETF_PROTO_*` (`lib/vtls/vtls.h:71-79`)
-// =========================================================================
 
 /// A TLS or DTLS protocol version, as the IETF numbers it.
-///
-/// The eight `CURL_IETF_PROTO_*` macros. These are wire values, not internal
-/// tokens: they are the two bytes a `ClientHello` carries, they are what a
-/// session records so that a resumption can be rejected when the version no
-/// longer matches, and `CURLINFO_TLS_SSL_PTR`'s consumers compare against
-/// them. They are therefore transcribed exactly, including the two DTLS values
-/// whose encoding descends rather than ascends.
-///
-/// A newtype rather than an enumeration: the vocabulary is open. A peer may
-/// name a version this build does not implement, and the honest representation
-/// of that is a value carrying the number, not a conversion that fails.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 #[allow(dead_code)]
@@ -516,21 +380,9 @@ impl IetfProtoVersion {
     }
 }
 
-// =========================================================================
 // Backend identity -- `struct curl_ssl_backend` (`include/curl/curl.h:2825`)
-// =========================================================================
 
 /// Which TLS backend this build is, and what it calls itself.
-///
-/// The successor of `struct curl_ssl_backend { curl_sslbackend id; const char
-/// *name; }` (`include/curl/curl.h:2825-2828`), which is a **public** struct:
-/// `curl_global_sslset` hands the application a `NULL`-terminated array of
-/// pointers to these, and `curl_version_info` reports the same name. So both
-/// members are contract rather than convenience.
-///
-/// The `id` is [`TlsBackendId`], the type `crate::conn::filters` already
-/// defines for exactly this purpose, so the integer 14 is written down once in
-/// this crate and not again here.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(C)]
 #[allow(dead_code)]
@@ -570,23 +422,9 @@ impl SslBackendInfo {
     };
 }
 
-// =========================================================================
 // The backend descriptor -- `struct Curl_ssl` (`lib/vtls/vtls_int.h:141-191`)
-// =========================================================================
 
 /// How one entry point of the backend contract is reached.
-///
-/// Fourteen of `struct Curl_ssl`'s nineteen members take a context pointer --
-/// `struct Curl_easy *`, `struct Curl_cfilter *` or `struct ssl_connect_data
-/// *` -- and those become methods on [`TlsBackend`], because a plain `fn`
-/// pointer could only carry the receiver by erasing it, and erasing the
-/// receiver is precisely the `CF_CTX_CALL_DATA` cast
-/// (`lib/vtls/vtls_int.h:136-137`) that this translation exists to remove.
-///
-/// This type records **which** of those two receivers the C signature named,
-/// so the descriptor still answers the question every dispatch site in
-/// `vtls.c` asks of it -- `if(Curl_ssl->shut_down)`, `if(Curl_ssl->close_all)`,
-/// and so on. [`None`] in a descriptor slot is the C's null pointer.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 #[allow(dead_code)]
@@ -602,12 +440,6 @@ pub(crate) enum TlsOp {
 }
 
 /// One member of [`CurlSslDescriptor`], for ordered inspection.
-///
-/// The nineteen function-pointer members of `struct Curl_ssl` in declaration
-/// order, so that [`CurlSslDescriptor::filled_slots`] can be read against the
-/// header line by line. The three data members that precede them -- `info`,
-/// `supports` and `sizeof_ssl_backend_data` -- are not slots and are not here:
-/// they are always present.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) enum TlsSlot {
@@ -735,12 +567,6 @@ pub(crate) type TlsCertStatusRequestFn = fn() -> bool;
 /// unsigned char *sha256sum, size_t sha256sumlen)`
 /// (`lib/vtls/vtls_int.h:182-183`).
 ///
-/// The only digest in the contract, and the one member with neither a context
-/// parameter nor a return value beyond its code, so it survives as a real
-/// function pointer. The output slice carries its own length, which is the
-/// `sha256sumlen` argument; a slice shorter than 32 bytes is the caller error
-/// the C answers with a code rather than a partial write.
-///
 /// # Errors
 ///
 /// [`CURLcode::BadFunctionArgument`] for an output slice too short to hold a
@@ -749,14 +575,6 @@ pub(crate) type TlsCertStatusRequestFn = fn() -> bool;
 pub(crate) type TlsSha256SumFn = fn(&[u8], &mut [u8]) -> CodeResult<()>;
 
 /// What a TLS backend *is*, in the order `struct Curl_ssl` declares it.
-///
-/// The successor of `struct Curl_ssl` (`lib/vtls/vtls_int.h:141-191`), kept as
-/// an explicit `#[repr(C)]` record rather than folded into [`TlsBackend`]'s
-/// vtable. That separation is deliberate and is the whole point of this type:
-/// Rust makes **no** guarantee about the layout of a trait object's vtable, so
-/// a design that read backend identity out of one would be reading an
-/// unspecified layout. `curl_global_sslset` needs that identity, and needs it
-/// first, so it is written down here where the layout is specified.
 ///
 /// # Why `info` is first
 ///
@@ -767,18 +585,6 @@ pub(crate) type TlsSha256SumFn = fn(&[u8], &mut [u8]) -> CodeResult<()>;
 /// returns the member by value -- but the position is preserved anyway,
 /// because the header states it as a contract and a reader comparing the two
 /// declarations must find them in the same order.
-///
-/// # What the nineteen slots hold
-///
-/// Five are real safe function pointers, and they are exactly the five whose C
-/// signature carries no context parameter: `init`, `cleanup`, `version`,
-/// `cert_status_request` and `sha256sum`. The other fourteen are
-/// [`Option<TlsOp>`], for the reason [`TlsOp`] records. Both forms use
-/// [`Option`] so that an unsupported slot is [`None`], which is what the C's
-/// null pointer means and what every `if(Curl_ssl->x)` in `vtls.c` tests.
-///
-/// No slot is a `void *`, none is [`std::any::Any`], none is reached by a
-/// downcast, and none requires `unsafe` to read.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 #[allow(dead_code)]
@@ -793,15 +599,6 @@ pub(crate) struct CurlSslDescriptor {
     pub(crate) supports: SslSupport,
 
     /// `size_t sizeof_ssl_backend_data` (`:148`).
-    ///
-    /// The C allocates the backend's private area from this
-    /// (`connssl->backend = calloc(1, ssl->sizeof_ssl_backend_data)`), so it
-    /// is load-bearing there. Here the state is a typed field of known type,
-    /// so nothing is sized from this number and it is informational: it
-    /// records what the backend's state costs, which is what a memory report
-    /// wants and what a `<limits>` fixture would have measured.
-    /// [`TlsBackend::state_size`] is where a backend fills it in, from
-    /// [`core::mem::size_of`], so it cannot drift from the type it describes.
     pub(crate) sizeof_ssl_backend_data: usize,
 
     /// `int (*init)(void)` (`:150`).
@@ -903,12 +700,6 @@ impl CurlSslDescriptor {
     }
 
     /// Which of the nineteen slots this backend fills, in declaration order.
-    ///
-    /// The successor of reading `struct Curl_ssl` member by member and testing
-    /// each against null, which `vtls.c` does at fourteen separate dispatch
-    /// sites. Returning the whole row at once makes the descriptor inspectable
-    /// as a unit, which is what a `curl_global_sslset`-style enumeration and
-    /// this module's own tests both want.
     pub(crate) const fn filled_slots(&self) -> [bool; 19] {
         [
             self.init.is_some(),
@@ -940,14 +731,6 @@ impl CurlSslDescriptor {
     }
 
     /// A descriptor with `info`, no capabilities, no state and no slot filled.
-    ///
-    /// The successor of a zero-initialised `struct Curl_ssl`, and the base a
-    /// concrete backend or a test double starts from so that adding a
-    /// twentieth member to this struct does not have to be reflected at every
-    /// construction site. Not a placeholder: a descriptor in this state is a
-    /// truthful description of a backend that implements nothing, and
-    /// `vtls.c`'s dispatch sites all have a defined answer for that -- which
-    /// is exactly what [`TlsBackend`]'s defaults reproduce.
     pub(crate) const fn empty(info: SslBackendInfo) -> Self {
         Self {
             info,
@@ -976,10 +759,8 @@ impl CurlSslDescriptor {
     }
 }
 
-// =========================================================================
 // ALPN -- the bytes, the bounds and the order
 // (`lib/vtls/vtls_int.h:39-79`, `lib/vtls/vtls.c:131-177`, `:1927-2069`)
-// =========================================================================
 
 /// `ALPN_HTTP_1_0` (`lib/vtls/vtls_int.h:41`).
 #[allow(dead_code)]
@@ -1018,13 +799,6 @@ pub(crate) const ALPN_H3: &str = "h3";
 pub(crate) const ALPN_H3_LENGTH: usize = 2;
 
 /// `ALPN_NAME_MAX` = 10 (`lib/vtls/vtls_int.h:52`).
-///
-/// The C's comment explains the number: "conservative sizes on the ALPN
-/// entries and count we are handling, we can increase these if we ever feel
-/// the need or have to accommodate ALPN strings from the 'outside'." It is the
-/// size of one `entries[i]` cell, and because the C stores a NUL-terminated
-/// string in it the longest usable name is **nine** bytes -- which is why
-/// every length check in `vtls.c` is `len >= ALPN_NAME_MAX` and not `>`.
 #[allow(dead_code)]
 pub(crate) const ALPN_NAME_MAX: usize = 10;
 
@@ -1084,44 +858,10 @@ pub(crate) const VTLS_INFOF_ALPN_DEFERRED: &str =
 
 /// The protocols to offer, in the order to offer them.
 ///
-/// The successor of `struct alpn_spec` (`lib/vtls/vtls_int.h:56-59`), and the
-/// fixed shape is kept deliberately: `[[u8; 10]; 3]` plus a count, not a
-/// `Vec<String>`. Three reasons, and the first is the one that matters.
-///
-/// **The order reaches the wire.** ALPN is offered in the order the entries
-/// appear, that order is visible in the `ClientHello`, and
-/// `tests/getpart.pm:351-357` compares a captured flight against its
-/// expectation as one joined string. A container that sorted, de-duplicated or
-/// re-ordered its contents -- or a formatter that decided to -- would change
-/// bytes that a fixture checks. A fixed array cannot.
-///
 /// **The bounds are the C's bounds.** A name of ten bytes or more and a fourth
 /// entry are both rejected here exactly where the C rejects them, so a caller
 /// that would have received `CURLE_FAILED_INIT` from curl 8.19.0-DEV receives
 /// it here.
-///
-/// **It is [`Copy`], as the C struct is.** `Curl_alpn_copy` is a `memcpy`
-/// (`vtls.c:1995-2001`) and callers rely on the cheapness; a heap container
-/// would make every copy an allocation for no gain.
-///
-/// # The cell contents
-///
-/// Each cell holds the name's bytes followed by zeroes, because the C stores a
-/// NUL-terminated string there and reads it back with `strlen`. A name of
-/// exactly ten bytes would leave no room for the terminator, which is why
-/// [`ALPN_NAME_MAX`] bounds the length exclusively.
-///
-/// # Equality is over the offered list, not over the thirty bytes
-///
-/// [`PartialEq`], [`Eq`] and [`Hash`] are written by hand rather than derived,
-/// and the reason is measurable: `Curl_alpn_restrict_to` (`vtls.c:1985-1993`)
-/// writes `entries[0]` and sets `count = 1` **without touching `entries[1]`**,
-/// so a spec narrowed from `[h2, http/1.1]` to `[h3]` still carries
-/// `http/1.1` in its second cell. Nothing ever reads a cell past `count`, so
-/// those bytes are unreachable residue -- but a derived comparison would see
-/// them and report two specs offering `[h3]` as different. Comparing the
-/// offered list instead makes equality mean what a caller means by it, and
-/// [`Hash`] is written from the same bytes so the two stay consistent.
 #[derive(Clone, Copy, Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct AlpnSpec {
@@ -1132,12 +872,6 @@ pub(crate) struct AlpnSpec {
 }
 
 /// Equal when the same protocols are offered in the same order.
-///
-/// See [`AlpnSpec`]'s own documentation for why this is not derived. The
-/// comparison walks [`AlpnSpec::iter`], which stops at `count` and trims each
-/// cell at its terminator, so unreachable residue in a cell past the count --
-/// which `restrict_to` legitimately leaves behind -- cannot make two equal
-/// specs compare unequal.
 impl PartialEq for AlpnSpec {
     fn eq(&self, other: &Self) -> bool {
         self.count == other.count && self.iter().eq(other.iter())
@@ -1173,10 +907,6 @@ impl AlpnSpec {
     };
 
     /// A spec offering `names`, in the order given.
-    ///
-    /// The successor of the C's aggregate initialisers at `vtls.c:133-149`, and
-    /// the only way to build a populated spec, so the two bounds are checked
-    /// once rather than at every construction site.
     ///
     /// # Errors
     ///
@@ -1231,12 +961,6 @@ impl AlpnSpec {
     }
 
     /// The `index`th protocol as text, or [`None`] past [`Self::count`].
-    ///
-    /// Always [`Some`] for an in-range index built through
-    /// [`Self::from_names`], because the bytes came from a [`str`]. A spec
-    /// assembled any other way could hold non-UTF-8, and this reports [`None`]
-    /// for it rather than losing the distinction -- the byte form remains
-    /// available through [`Self::entry`], which is what the wire encoding uses.
     pub(crate) fn name(&self, index: usize) -> Option<&str> {
         core::str::from_utf8(self.entry(index)?).ok()
     }
@@ -1259,19 +983,6 @@ impl AlpnSpec {
     }
 
     /// `Curl_alpn_restrict_to` (`vtls.c:1985-1993`): offer only `proto`.
-    ///
-    /// Used where a filter has committed to one protocol and must not let the
-    /// server pick another -- the HTTP/3 path does exactly this.
-    ///
-    /// # The C's failure mode is preserved, and it is silent
-    ///
-    /// The C guards the copy with `if(plen < sizeof(spec->entries[0]))` after a
-    /// `DEBUGASSERT` of the same condition, so in a *release* build an
-    /// over-long protocol leaves the spec **completely unchanged** -- neither
-    /// restricted nor emptied -- and reports nothing. This returns whether the
-    /// restriction was applied so that a caller can react, while behaving
-    /// identically for a caller that ignores the value. Widening it to an
-    /// error would change what curl 8.19.0-DEV does.
     pub(crate) fn restrict_to(&mut self, proto: &str) -> bool {
         let bytes = proto.as_bytes();
         debug_assert!(
@@ -1292,12 +1003,6 @@ impl AlpnSpec {
     }
 
     /// `Curl_alpn_to_proto_buf` (`vtls.c:1927-1948`): the wire encoding.
-    ///
-    /// One length byte followed by that many protocol bytes, per entry, in
-    /// offer order. This is the `ProtocolNameList` of RFC 7301 and it is
-    /// exactly what appears in the `ClientHello`, so the encoding is written
-    /// here rather than delegated: no formatter, no allocator and no
-    /// serialisation helper gets to decide any part of it.
     ///
     /// # Errors
     ///
@@ -1348,10 +1053,6 @@ impl AlpnSpec {
 
     /// `Curl_alpn_to_proto_str` (`vtls.c:1950-1971`): the display encoding.
     ///
-    /// Comma separated, **no spaces**, in offer order, NUL terminated. This is
-    /// what `ALPN: curl offers %s` prints, so it appears in `--verbose` output
-    /// and in `--trace` output, both of which a fixture may compare.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::FailedInit`] for a name of [`ALPN_NAME_MAX`] bytes or more,
@@ -1396,12 +1097,6 @@ impl AlpnSpec {
 }
 
 /// `Curl_alpn_copy` (`vtls.c:1995-2001`): `src` if there is one, else zeroed.
-///
-/// A free function rather than a method because the C's first parameter is the
-/// destination and its second is nullable, and that nullability is the whole
-/// content of the function: `Curl_alpn_copy(dest, NULL)` is how a caller says
-/// "offer nothing". [`Option`] carries it exactly, and [`AlpnSpec`] being
-/// [`Copy`] makes the `memcpy` arm a plain move.
 #[allow(dead_code)]
 pub(crate) fn alpn_copy(src: Option<&AlpnSpec>) -> AlpnSpec {
     match src {
@@ -1412,12 +1107,6 @@ pub(crate) fn alpn_copy(src: Option<&AlpnSpec>) -> AlpnSpec {
 
 /// `Curl_alpn_contains_proto` (`vtls.c:1973-1983`) with both of the C's
 /// parameters nullable.
-///
-/// The C accepts a null spec *and* a null protocol and answers `FALSE` for
-/// either, and `Curl_on_session_reuse` relies on both arms: it passes the
-/// filter's `alpns`, which may be absent, and the cached session's `alpn`,
-/// which may be absent too. [`AlpnSpec::contains_proto`] is the method for a
-/// caller holding both.
 #[allow(dead_code)]
 pub(crate) fn alpn_contains_proto(
     spec: Option<&AlpnSpec>,
@@ -1430,17 +1119,6 @@ pub(crate) fn alpn_contains_proto(
 }
 
 /// An encoded ALPN list: either the wire form or the display form.
-///
-/// The successor of `struct alpn_proto_buf` (`lib/vtls/vtls_int.h:61-64`),
-/// keeping both members' shapes -- `[u8; 33]` and a signed length. The length
-/// is [`i32`] because the C member is `int` and
-/// `Curl_alpn_to_proto_str` assigns `(int)off` to it; every write here goes
-/// through a checked conversion instead of a cast, so a bound raised past
-/// [`i32::MAX`] would report rather than wrap.
-///
-/// One type for two encodings, as in the C. They never coexist for one spec:
-/// the wire form goes to the provider and the display form goes to a
-/// diagnostic, and each call produces one of them.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct AlpnProtoBuf {
@@ -1482,19 +1160,6 @@ impl AlpnProtoBuf {
     }
 
     /// The encoded bytes as text, or [`None`] when they are not UTF-8.
-    ///
-    /// Meaningful for a buffer from [`AlpnSpec::to_proto_str`], which is
-    /// comma-separated text by construction.
-    ///
-    /// It does **not** distinguish the two encodings, and that was measured
-    /// rather than assumed: a wire buffer's length bytes are small integers,
-    /// every byte below `0x80` is valid UTF-8, so `\x02h2` converts
-    /// successfully and renders as a control character followed by `h2`. A
-    /// length byte of `0x80` or more would fail -- but no ALPN name is that
-    /// long, so the failing case is unreachable through this module. Callers
-    /// wanting the wire form use [`Self::as_bytes`], and
-    /// [`fmt::Debug`] shows the escaped form so the control byte is visible
-    /// rather than silent.
     pub(crate) fn as_str(&self) -> Option<&str> {
         core::str::from_utf8(self.as_bytes()).ok()
     }
@@ -1529,9 +1194,6 @@ impl fmt::Debug for AlpnProtoBuf {
 /// HTTP module and the HTTP modules construct one of these when they ask for a
 /// spec. The alternative -- reaching into `crate::protocols::http2` from the
 /// TLS layer to learn a bit value -- is the cycle this whole design avoids.
-///
-/// The bit positions are the C's, because the same numbers reach
-/// `CURLOPT_HTTP_VERSION` handling and appear in trace output.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 #[allow(dead_code)]
@@ -1617,13 +1279,6 @@ impl AlpnSpec {
     pub(crate) const H11: Self = Self::from_entries(&[ALPN_HTTP_1_1]);
 
     /// `ALPN_SPEC_H10_H11` (`vtls.c:136-138`): `[http/1.0, http/1.1]`.
-    ///
-    /// The compatibility case, and the C's comment is the whole justification:
-    /// "If HTTP/1.0 is the wanted protocol then use ALPN http/1.0 and
-    /// http/1.1. This is for compatibility reasons since some HTTP/1.0 servers
-    /// with old ALPN implementations understand ALPN http/1.1 but not
-    /// http/1.0." Note that it offers **two** protocols even though only one
-    /// was asked for, and that `http/1.0` comes first.
     pub(crate) const H10_H11: Self =
         Self::from_entries(&[ALPN_HTTP_1_0, ALPN_HTTP_1_1]);
 
@@ -1655,17 +1310,6 @@ impl AlpnSpec {
     pub(crate) const H3: Self = Self::from_entries(&[ALPN_H3]);
 
     /// The `const` constructor the five constants above are built with.
-    ///
-    /// A `const fn` because [`Self::from_names`] cannot be: it reports its
-    /// bounds through [`Result`], and `?` is not available in a `const`
-    /// context on the pinned toolchain. The bounds are still enforced --
-    /// through [`assert!`], which in a `const` evaluation is a **compile**
-    /// error rather than a run-time panic, so an over-long or over-full
-    /// literal here cannot reach a binary at all.
-    ///
-    /// Private, deliberately. Every caller outside this file has runtime input
-    /// and belongs on [`Self::from_names`], which reports rather than refuses
-    /// to compile.
     const fn from_entries(names: &[&str]) -> Self {
         assert!(
             names.len() <= ALPN_ENTRIES_MAX,
@@ -1695,20 +1339,6 @@ impl AlpnSpec {
 }
 
 /// `alpn_get_spec` (`vtls.c:153-177`): which protocols to offer.
-///
-/// A direct transcription, arm for arm, and the arms are ordered as the C
-/// orders them because they overlap: a transfer that wants both HTTP/1.x and
-/// HTTP/2 while `only_http_10` is set takes the **first** arm and offers
-/// `[http/1.0, http/1.1]`, never `[h2, http/1.1]`.
-///
-/// [`None`] when ALPN is switched off, which is the C's `if(!use_alpn) return
-/// NULL` and is distinct from an empty spec: a null `alpn` member means "send
-/// no ALPN extension at all", while an empty spec would mean "send an empty
-/// list".
-///
-/// `preferred` is consulted only in the one arm where it can matter -- both
-/// HTTP/1.x and HTTP/2 wanted -- and there it selects between two specs that
-/// differ only in order.
 #[allow(dead_code)]
 pub(crate) fn alpn_get_spec(
     wanted: HttpMajors,
@@ -1735,17 +1365,9 @@ pub(crate) fn alpn_get_spec(
     Some(AlpnSpec::H11)
 }
 
-// =========================================================================
 // The three state machines (`lib/vtls/vtls_int.h:82-103`)
-// =========================================================================
 
 /// Where the non-blocking handshake has got to.
-///
-/// `ssl_connect_state` (`lib/vtls/vtls_int.h:82-87`). The C's comment names it
-/// exactly: "enum for the nonblocking SSL connection state machine". Four
-/// states, and the three numbered ones are backend-defined steps rather than
-/// protocol phases -- a backend that needs fewer simply never reports the
-/// middle ones.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) enum SslConnectState {
@@ -1762,13 +1384,6 @@ pub(crate) enum SslConnectState {
 }
 
 /// What the session as a whole is.
-///
-/// `ssl_connection_state` (`lib/vtls/vtls_int.h:89-94`). Distinct from
-/// [`SslConnectState`], and the distinction is load-bearing:
-/// [`Self::Deferred`] is a session whose filter reports **connected** while its
-/// handshake has not finished, because early data is waiting to go out with it.
-/// `ssl_cf_connect` tests for exactly that at `vtls.c:1327` before it will
-/// short-circuit.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) enum SslConnectionState {
@@ -1811,13 +1426,6 @@ pub(crate) enum SslEarlydataState {
 }
 
 /// What the TLS layer needs from the socket before it can make progress.
-///
-/// The `CURL_SSL_IO_NEED_*` bits (`lib/vtls/vtls_int.h:105-107`) and the `int
-/// io_need` member they populate. A TLS session is not readable when the
-/// socket is readable: a handshake step may need to *write* before the
-/// application's read can proceed, and this is how the session says so.
-/// [`tls_adjust_pollset`] is the only consumer that matters, and the
-/// precedence it applies is the C's.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 #[allow(dead_code)]
@@ -1892,18 +1500,10 @@ impl fmt::Debug for SslIoNeed {
 }
 
 /// `CURL_SSL_EARLY_MAX` = 64 KiB (`lib/vtls/vtls_int.h:110`).
-///
-/// The C's comment is "Max earlydata payload we want to send", and the word
-/// *want* is the point: it is curl's own bound, applied on top of whatever the
-/// server advertised, so `min(server_max, this)` is the amount that actually
-/// goes out. Early data is replayable by definition, so a local cap limits how
-/// much a replay can carry regardless of what a peer claims to accept.
 #[allow(dead_code)]
 pub(crate) const EARLYDATA_MAX: usize = 64 * 1024;
 
-// =========================================================================
 // The peer -- `struct ssl_peer` (`lib/vtls/vtls.h:81-95`)
-// =========================================================================
 
 /// What kind of name the peer was reached by.
 ///
@@ -1926,17 +1526,6 @@ pub(crate) enum SslPeerType {
 #[allow(dead_code)]
 impl SslPeerType {
     /// `get_peer_type` (`vtls.c:1204-1221`): classify a host string.
-    ///
-    /// IPv4 is tried first and IPv6 second, in the C's order, because the two
-    /// grammars are disjoint but the order is what a reader compares. Anything
-    /// that parses as neither is a name.
-    ///
-    /// `curlx_inet_pton(AF_INET, ...)` accepts only the four-part dotted form
-    /// -- not `127.1`, not an octal part -- and Rust's [`std::net::Ipv4Addr`]
-    /// parser has accepted exactly that same grammar since 1.53, so the two
-    /// agree without a hand-written scanner. Nothing here is imported from
-    /// `crate::util::inet`: that module is not a declared dependency of this
-    /// one, and the standard library answers the question.
     pub(crate) fn classify(hostname: &str) -> Self {
         if hostname.is_empty() {
             return Self::Dns;
@@ -1966,19 +1555,6 @@ impl SslPeerType {
 const SNI_LEN_MAX: usize = u16::MAX as usize;
 
 /// Who the TLS session is talking to.
-///
-/// The successor of `struct ssl_peer` (`lib/vtls/vtls.h:87-95`) with every
-/// member owned rather than pointed at, which removes the four `Curl_safefree`
-/// calls of `Curl_ssl_peer_cleanup` and the aliasing the C relies on -- there,
-/// `dispname` is *the same pointer* as `hostname` when the two are equal
-/// (`vtls.c:1268`), and the cleanup has to know not to free it twice.
-///
-/// The C's comment on why the hostname is copied at all is worth keeping,
-/// because it explains why this is not simply readable from the connection:
-/// "We need the hostname for SNI negotiation. Once handshaked, this remains the
-/// SNI hostname for the TLS connection. When the connection is reused, the
-/// settings in `cf->conn` might change. We keep a copy of the hostname we use
-/// for SNI."
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct SslPeer {
@@ -1997,12 +1573,6 @@ pub(crate) struct SslPeer {
     /// [`SNI_LEN_MAX`]; the C expresses both as a null pointer.
     sni: Option<String>,
     /// `char *scache_key` -- the session cache lookup key.
-    ///
-    /// Supplied by the caller rather than computed here.
-    /// `Curl_ssl_peer_key_make` lives in `lib/vtls/vtls_scache.c`, so it
-    /// belongs to the `session_cache` module; computing a second version of it
-    /// here would create two spellings of one cache key and silently halve the
-    /// resumption rate.
     scache_key: String,
     /// `ssl_peer_type type`.
     kind: SslPeerType,
@@ -2022,16 +1592,6 @@ pub(crate) struct SslPeer {
 impl SslPeer {
     /// `Curl_ssl_peer_init` (`vtls.c:1223-1294`), with the parts that read the
     /// connection lifted into parameters.
-    ///
-    /// The C reaches into `cf->conn` for the host, the display name and the
-    /// port, choosing between the origin and the proxy according to
-    /// `Curl_ssl_cf_is_proxy(cf)`. That choice belongs to the caller here --
-    /// the filter knows its own role -- which is what lets this function be
-    /// tested without a connection.
-    ///
-    /// `dispname` of [`None`] means "same as the hostname", which is the C's
-    /// `if(!edispname || !strcmp(ehostname, edispname))` collapsed into the
-    /// type.
     ///
     /// # Errors
     ///
@@ -2077,10 +1637,6 @@ impl SslPeer {
     ///    **ASCII-only**. [`str::to_ascii_lowercase`] is the same operation;
     ///    Rust's Unicode-aware `to_lowercase` is not, and using it would fold
     ///    non-ASCII bytes that curl leaves alone.
-    ///
-    /// A name at or above [`SNI_LEN_MAX`] yields [`None`], matching the C's
-    /// `if(len < USHRT_MAX)` guard: the extension cannot carry it, so none is
-    /// sent.
     fn normalise_sni(hostname: &str, kind: SslPeerType) -> Option<String> {
         if !kind.allows_sni() {
             return None;
@@ -2129,19 +1685,12 @@ impl SslPeer {
 
     /// Replaces the session cache key, as `session_cache` will once it has
     /// computed one.
-    ///
-    /// Separate from [`Self::new`] because the two happen at different times:
-    /// the peer is built when the filter is created and the key depends on the
-    /// backend's version string, which `ssl_cf_connect` does not have until it
-    /// runs (`vtls.c:1357-1363`).
     pub(crate) fn set_scache_key(&mut self, key: String) {
         self.scache_key = key;
     }
 }
 
-// =========================================================================
 // The typed call context -- `struct cf_call_data` and its double cast
-// =========================================================================
 
 /// The re-entrancy depth of the current call into this filter.
 ///
@@ -2222,22 +1771,9 @@ impl TlsCallData {
     const DEPTH_MAX: u32 = 2;
 }
 
-// =========================================================================
 // The transport seam -- what a backend is allowed to see below itself
-// =========================================================================
 
 /// The bytes below the TLS session, and nothing else.
-///
-/// The successor of the `struct Curl_cfilter *cf` that every session-bound
-/// member of `struct Curl_ssl` takes. In the C that one pointer grants a
-/// backend the whole chain, the whole connection and -- through
-/// `CF_CTX_CALL_DATA` -- the easy handle as well. A backend needs none of that:
-/// it needs to move ciphertext to and from the filter beneath it, and to know
-/// which descriptor that filter is on so a pollset can name it.
-///
-/// Narrowing the seam to those three things is what keeps `rustls_backend` from
-/// being able to reach a protocol, a transfer or a global, and it is why a
-/// backend can be exercised against a fake filter with no socket in sight.
 ///
 /// # Lifetimes
 ///
@@ -2284,10 +1820,6 @@ impl<'f, 'ctx, 'trc> TlsTransport<'f, 'ctx, 'trc> {
 
     /// Reads ciphertext from the filter below.
     ///
-    /// Zero is end of stream, not "try again"; a layer with nothing available
-    /// yet reports [`CURLcode::Again`], which a backend must propagate rather
-    /// than treat as a closed connection.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::RecvError`] when there is no filter below; otherwise
@@ -2326,8 +1858,6 @@ impl<'f, 'ctx, 'trc> TlsTransport<'f, 'ctx, 'trc> {
 
     /// Drives the layer below towards being connected, returning whether it is.
     ///
-    /// `cf->next->cft->do_connect(cf->next, data, done)` (`vtls.c:1338`).
-    ///
     /// # Errors
     ///
     /// Whatever the layer below reports. [`CURLcode::FailedInit`] when there is
@@ -2360,30 +1890,9 @@ impl<'f, 'ctx, 'trc> TlsTransport<'f, 'ctx, 'trc> {
     }
 }
 
-// =========================================================================
 // The backend contract -- `struct Curl_ssl`'s members as trait methods
-// =========================================================================
 
 /// What one handshake step achieved.
-///
-/// The successor of `do_connect`'s `bool *done` out-parameter *plus* every
-/// member of `ssl_connect_data` that a C backend writes through its `cf->ctx`
-/// pointer on the way past: `io_need`, `negotiated.alpn`, `earlydata_max`, and
-/// the three state enumerations. In the C the backend owns those transitions --
-/// `rustls.c` sets `connssl->state = ssl_connection_complete` itself, and sets
-/// `earlydata_state` from the server's verdict -- so they have to be
-/// expressible from a backend here too.
-///
-/// Returning them rather than handing a backend a mutable reference to the
-/// session is what keeps the session's fields owned by the session: a backend
-/// **describes** what happened and the filter applies it, so there is no path
-/// by which a backend can put the session into a state the filter has not seen.
-///
-/// The three state fields are [`Option`]s, and [`None`] means "unchanged"
-/// rather than "reset". That is the C's semantics exactly: a backend that does
-/// not assign to `connssl->state` leaves whatever was there, which is what lets
-/// a deferred session stay deferred across a handshake step that made no
-/// progress.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct HandshakeProgress {
@@ -2396,12 +1905,6 @@ pub(crate) struct HandshakeProgress {
     /// [`tls_adjust_pollset`] turns into poll flags.
     pub(crate) io_need: SslIoNeed,
     /// `connssl->state`, when this step changed it.
-    ///
-    /// A step that reports `done` must set this to
-    /// [`SslConnectionState::Complete`] or [`SslConnectionState::Deferred`];
-    /// anything else is a backend defect and is caught by the debug assertion
-    /// in [`ConnFilter::connect`], which is the C's own `DEBUGASSERT` at
-    /// `vtls.c:1373-1374`.
     pub(crate) connection_state: Option<SslConnectionState>,
     /// `connssl->connecting_state`, when this step changed it.
     pub(crate) connecting_state: Option<SslConnectState>,
@@ -2414,11 +1917,6 @@ pub(crate) struct HandshakeProgress {
     pub(crate) earlydata_state: Option<SslEarlydataState>,
     /// The protocol the server selected, when the handshake reached the point
     /// of knowing.
-    ///
-    /// Raw bytes, because ALPN is a length-prefixed byte string on the wire and
-    /// a server may return something that is not UTF-8. [`None`] means "not
-    /// negotiated yet"; `Some(&[])` means "the server agreed on nothing", and
-    /// the two produce different diagnostics.
     pub(crate) alpn: Option<Vec<u8>>,
     /// How much early data the peer said it would accept, in bytes.
     ///
@@ -2470,11 +1968,22 @@ pub(crate) struct HandshakeProgress {
 /// corresponding pointer is null, which is recorded per method. So a minimal
 /// implementation is small, and the C's fallbacks are stated once here instead
 /// of at fourteen dispatch sites.
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
 #[allow(dead_code)]
-pub(crate) trait TlsBackend: fmt::Debug {
+pub(crate) trait TlsBackend: fmt::Debug + Send + Sync {
     /// The backend's per-session state -- the successor of `void *backend`.
     ///
-    /// Two bounds, and each is required by something concrete rather than
+    /// Three bounds, and each is required by something concrete rather than
     /// chosen:
     ///
     /// * [`fmt::Debug`], so that a filter holding one can derive [`Debug`],
@@ -2487,7 +1996,13 @@ pub(crate) trait TlsBackend: fmt::Debug {
     ///   lives. The bound costs nothing, because a backend whose state machine
     ///   genuinely needs pinning boxes it, and a boxed future is itself
     ///   [`Unpin`]. `rustls::ClientConnection` is [`Unpin`] already.
-    type State: fmt::Debug + Unpin;
+    /// * [`Send`], because a session lives inside a `Box<dyn ConnFilter>` in
+    ///   the connection pool, `struct Curl_share` holds that pool by value
+    ///   (`lib/curl_share.h:52`), and [`crate::share::Share`] statically
+    ///   asserts `Send + Sync` so that one `CURLSH` is usable from two threads.
+    ///   `rustls::ClientConnection` is [`Send`] already, so this bound costs
+    ///   the only implementation nothing.
+    type State: fmt::Debug + Unpin + Send;
 
     /// This backend's descriptor, whose first member is its identity.
     ///
@@ -2499,23 +2014,9 @@ pub(crate) trait TlsBackend: fmt::Debug {
 
     /// `size_t (*version)(char *buffer, size_t size)`
     /// (`vtls_int.h:153`): the text `curl --version` prints for this backend.
-    ///
-    /// Required rather than defaulted because it is not merely cosmetic:
-    /// `ssl_cf_connect` passes it to `Curl_ssl_peer_init` as the `tls_id`
-    /// (`vtls.c:1358-1360`), where it becomes part of the session cache key. A
-    /// backend without one would share cache entries with a different backend.
     fn version(&self) -> &'static str;
 
     /// A fresh session state for `peer`, offering `alpn`.
-    ///
-    /// The successor of the C's `connssl->backend = calloc(1,
-    /// ssl->sizeof_ssl_backend_data)` followed by whatever `do_connect`'s first
-    /// step initialises. Doing it in one fallible call means a session either
-    /// has usable state or does not exist, rather than existing in a
-    /// half-initialised form the way a `calloc`ed struct does.
-    ///
-    /// `alpn` of [`None`] means send no ALPN extension at all, which is
-    /// distinct from an empty spec.
     ///
     /// # Errors
     ///
@@ -2530,11 +2031,6 @@ pub(crate) trait TlsBackend: fmt::Debug {
 
     /// `CURLcode (*do_connect)(cf, data, done)` (`vtls_int.h:167-168`): one
     /// step of the handshake.
-    ///
-    /// Called repeatedly until [`HandshakeProgress::done`] is true. The
-    /// [`SslIoNeed`] returned each time is what the pollset is built from, so a
-    /// backend that returns [`SslIoNeed::NONE`] while it is still waiting will
-    /// be polled for the wrong thing and the transfer will stall.
     ///
     /// # Errors
     ///
@@ -2551,9 +2047,6 @@ pub(crate) trait TlsBackend: fmt::Debug {
     /// `CURLcode (*send_plain)(cf, data, mem, len, pnwritten)`
     /// (`vtls_int.h:186-187`): encrypt and send.
     ///
-    /// Returns how many bytes of `buf` were accepted, which may be fewer than
-    /// were offered.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::SendError`] for a write that failed and
@@ -2568,9 +2061,6 @@ pub(crate) trait TlsBackend: fmt::Debug {
 
     /// `CURLcode (*recv_plain)(cf, data, buf, len, pnread)`
     /// (`vtls_int.h:184-185`): receive and decrypt.
-    ///
-    /// Zero means end of stream. A session with nothing decrypted yet reports
-    /// [`CURLcode::Again`].
     ///
     /// # Errors
     ///
@@ -2620,10 +2110,6 @@ pub(crate) trait TlsBackend: fmt::Debug {
 
     /// `CURLcode (*random)(data, entropy, length)` (`vtls_int.h:162-164`).
     ///
-    /// [`CURLcode::NotBuiltIn`] by default, which is exactly what
-    /// `Curl_ssl_random` returns for a null pointer (`vtls.c:685-688`).
-    /// [`ProviderRng`] is what a real backend fills this with.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::NotBuiltIn`] when the backend has no generator;
@@ -2653,11 +2139,6 @@ pub(crate) trait TlsBackend: fmt::Debug {
     /// `CURLcode (*shut_down)(cf, data, send_shutdown, done)`
     /// (`vtls_int.h:154-155`): close the session cleanly.
     ///
-    /// Returns the C's `*done`. `true` by default with nothing sent, which is
-    /// how `ssl_cf_shutdown` behaves when the pointer is null: it sets `*done =
-    /// TRUE` up front and only overwrites it if there is an implementation to
-    /// call (`vtls.c:1561-1572`).
-    ///
     /// # Errors
     ///
     /// [`CURLcode::SendError`] for a `close_notify` that could not be written.
@@ -2679,11 +2160,6 @@ pub(crate) trait TlsBackend: fmt::Debug {
     fn close_all(&self) {}
 
     /// `CURLcode (*set_engine)(data, engine)` (`vtls_int.h:178`).
-    ///
-    /// [`CURLcode::NotBuiltIn`] by default, the code `Curl_ssl_set_engine`
-    /// returns for a null pointer (`vtls.c:574-579`). Crypto engines are an
-    /// OpenSSL concept; a rustls build has none, and saying so with the C's own
-    /// code is what lets `--engine` fail the way it always has.
     ///
     /// # Errors
     ///
@@ -2714,11 +2190,6 @@ pub(crate) trait TlsBackend: fmt::Debug {
     /// `CURLcode (*sha256sum)(input, inputlen, sha256sum, len)`
     /// (`vtls_int.h:182-183`).
     ///
-    /// [`CURLcode::NotBuiltIn`] by default. The C treats a null pointer as
-    /// "without sha256 support, this cannot match" and abandons public-key
-    /// pinning (`vtls.c:776-779`), so the default must be a code the pinning
-    /// path can recognise rather than a wrong digest.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::NotBuiltIn`] when the backend has no digest;
@@ -2732,13 +2203,6 @@ pub(crate) trait TlsBackend: fmt::Debug {
 
     /// `CURLcode (*get_channel_binding)(data, sockindex, binding)`
     /// (`vtls_int.h:189-190`).
-    ///
-    /// Appends the `tls-server-end-point` channel binding, prefix included.
-    /// Leaves `binding` untouched and succeeds by default, which is the C's
-    /// documented contract for an unsupporting backend: "If channel binding is
-    /// not supported, binding stays empty and CURLE_OK is returned"
-    /// (`vtls.h:198-205`). `Curl_ssl_get_channel_binding` returns `CURLE_OK`
-    /// for a null pointer too (`vtls.c:535-538`).
     ///
     /// # Errors
     ///
@@ -2756,23 +2220,12 @@ pub(crate) trait TlsBackend: fmt::Debug {
 
     /// Whether this backend has a context handle distinct from its session
     /// handle.
-    ///
-    /// The one thing `CF_QUERY_SSL_INFO` and `CF_QUERY_SSL_CTX_INFO` differ by.
-    /// `false` by default and `false` for rustls, which is the "does not
-    /// differentiate" case `lib/cfilters.h:156-158` describes; it reaches a
-    /// caller as [`TlsSessionInfo::distinguishes_context`].
     fn distinguishes_context(&self) -> bool {
         false
     }
 }
 
 /// `SSL_CB_MAX_SIZE` = 85 (`lib/vtls/vtls.h:196`).
-///
-/// The C's comment carries the derivation: "The maximum size of the SSL channel
-/// binding is 85 bytes, as defined in RFC 5929, Section 4.1. The
-/// 'tls-server-end-point:' prefix is 21 bytes long, and SHA-512 is the longest
-/// supported hash algorithm, with a digest length of 64 bytes. The maximum size
-/// of the channel binding is therefore 21 + 64 = 85 bytes."
 #[allow(dead_code)]
 pub(crate) const SSL_CB_MAX_SIZE: usize = 85;
 
@@ -2799,9 +2252,7 @@ pub(crate) const CURL_X509_STR_MAX: usize = 100_000;
 #[allow(dead_code)]
 pub(crate) const MAX_ALLOWED_CERT_AMOUNT: usize = 100;
 
-// =========================================================================
 // The session -- `struct ssl_connect_data` (`lib/vtls/vtls_int.h:113-134`)
-// =========================================================================
 
 /// What a resumable session offers, as far as this module needs to know.
 ///
@@ -2830,7 +2281,7 @@ pub(crate) struct ReusedSession {
 ///
 /// | C member | here |
 /// |----------|------|
-/// | `const struct Curl_ssl *ssl_impl` | [`Self::backend`], an [`Rc<B>`] |
+/// | `const struct Curl_ssl *ssl_impl` | [`Self::backend`], an [`Arc<B>`] |
 /// | `struct ssl_peer peer` | [`Self::peer`], owned |
 /// | `const struct alpn_spec *alpn` | [`Self::alpn`], by value |
 /// | `void *backend` | [`Self::state`], typed as `B::State` |
@@ -2851,7 +2302,7 @@ pub(crate) struct ReusedSession {
 /// Nothing is a `void *`, so `CF_CTX_CALL_DATA` has nothing to cast and does
 /// not exist. Nothing is [`std::any::Any`] and nothing is downcast.
 ///
-/// # Why the backend is an `Rc` and not a `&'static`
+/// # Why the backend is an `Arc` and not a `&'static`
 ///
 /// The C's `ssl_impl` points at a process-wide `static const struct Curl_ssl`,
 /// which is only possible because a C backend keeps no state of its own -- all
@@ -2865,16 +2316,10 @@ pub(crate) struct ReusedSession {
 #[allow(dead_code)]
 pub(crate) struct SslConnectData<B: TlsBackend> {
     /// `const struct Curl_ssl *ssl_impl`: "TLS backend for this filter".
-    backend: Rc<B>,
+    backend: Arc<B>,
     /// `struct ssl_peer peer`: "peer the filter talks to".
     peer: SslPeer,
     /// `const struct alpn_spec *alpn`: "ALPN to use or NULL for none".
-    ///
-    /// By value, because [`AlpnSpec`] is [`Copy`] and 33 bytes; the C points at
-    /// one of five file-scope `static const` tables and needs the indirection
-    /// for that reason alone.
-    /// [`None`] keeps the C's distinction between "send no extension" and
-    /// "send an empty list".
     alpn: Option<AlpnSpec>,
     /// `void *backend`: "vtls backend specific props" -- now typed.
     state: B::State,
@@ -2922,23 +2367,11 @@ pub(crate) struct SslConnectData<B: TlsBackend> {
 impl<B: TlsBackend> SslConnectData<B> {
     /// A fresh session over `backend`, talking to `peer`, offering `alpn`.
     ///
-    /// The successor of `cf_ctx_new` (`vtls.c:505-520`), including its
-    /// `Curl_bufq_init2(&ctx->earlydata, CURL_SSL_EARLY_MAX, 1,
-    /// BUFQ_OPT_NO_SPARES)` at `:513`: one chunk of [`EARLYDATA_MAX`] bytes,
-    /// which is what makes [`EARLYDATA_MAX`] a hard local bound rather than an
-    /// advisory one -- the queue physically cannot hold more.
-    ///
-    /// The C's `BUFQ_OPT_NO_SPARES` is not carried across, and the reason is
-    /// measured rather than assumed: with `max_chunks == 1` there is never a
-    /// second chunk to keep as a spare, so the option cannot change the
-    /// queue's behaviour. `crate::util::bufq::BufQ::new` is the two-argument
-    /// form and expresses the same queue.
-    ///
     /// # Errors
     ///
     /// Whatever [`TlsBackend::new_state`] reports.
     pub(crate) fn new(
-        backend: Rc<B>,
+        backend: Arc<B>,
         peer: SslPeer,
         alpn: Option<AlpnSpec>,
     ) -> CurlResult<Self> {
@@ -2966,14 +2399,14 @@ impl<B: TlsBackend> SslConnectData<B> {
 
     /// The backend, shared.
     ///
-    /// Returns a new [`Rc`] handle rather than a borrow, and the reason is a
+    /// Returns a new [`Arc`] handle rather than a borrow, and the reason is a
     /// borrow-checker fact rather than a preference: a caller needs
     /// `&self.backend` and `&mut self.state` at the same time, which one
     /// structure cannot lend simultaneously. A refcount bump costs nothing and
     /// keeps the two borrows independent, so no field has to be moved out and
     /// no split-borrow helper is needed.
-    pub(crate) fn backend(&self) -> Rc<B> {
-        Rc::clone(&self.backend)
+    pub(crate) fn backend(&self) -> Arc<B> {
+        Arc::clone(&self.backend)
     }
 
     /// This backend's descriptor -- `connssl->ssl_impl` read for identity.
@@ -3093,12 +2526,6 @@ impl<B: TlsBackend> SslConnectData<B> {
     }
 
     /// Records how much early data the peer will accept, capped locally.
-    ///
-    /// The cap is [`EARLYDATA_MAX`] and it is applied **here**, once, so
-    /// that no caller can bypass it: the C's
-    /// `if(blen > connssl->earlydata_max) blen = connssl->earlydata_max` at
-    /// `vtls.c:1395-1396` bounds a write against this member, so bounding the
-    /// member bounds every write.
     pub(crate) fn set_earlydata_max(&mut self, advertised: usize) {
         self.earlydata_max = advertised.min(EARLYDATA_MAX);
     }
@@ -3129,24 +2556,11 @@ impl<B: TlsBackend> SslConnectData<B> {
     }
 
     /// Stamps the handshake completion time from the injected clock.
-    ///
-    /// `connssl->handshake_done = *Curl_pgrs_now(data)` (`vtls.c:1370`), which
-    /// the C reaches only when the state is
-    /// [`SslConnectionState::Complete`] -- a *deferred* session has not
-    /// finished handshaking, so stamping it then would report a completion that
-    /// has not happened. That condition is the caller's, exactly as in the C.
     pub(crate) fn set_handshake_done(&mut self, at: CurlTime) {
         self.handshake_done = at;
     }
 
     /// Buffers up to [`Self::earlydata_max`] bytes of `buf` as early data.
-    ///
-    /// `ssl_cf_set_earlydata` (`vtls.c:1384-1404`). Returns how many bytes were
-    /// taken, which the caller records through [`Self::set_earlydata_skip`].
-    /// The C's two `DEBUGASSERT`s -- that the state is
-    /// [`SslEarlydataState::Await`] and that the queue is empty -- are kept as
-    /// debug assertions, so a misuse is caught while testing and is a bounded
-    /// short write in a release build rather than an abort mid-transfer.
     ///
     /// # Errors
     ///
@@ -3186,12 +2600,6 @@ impl<B: TlsBackend> SslConnectData<B> {
 
     /// Consumes `count` bytes of the accepted early-data payload, reporting how
     /// many of them the caller must still account for.
-    ///
-    /// The bookkeeping of `ssl_cf_send` (`vtls.c:1497-1510`): while
-    /// [`Self::earlydata_skip`] is non-zero, the bytes the caller is offering
-    /// have already gone out as early data, so they are reported as written
-    /// without being sent again. Returns how many of `count` were swallowed,
-    /// which is `count` itself while the whole offering is covered.
     pub(crate) fn consume_earlydata_skip(&mut self, count: usize) -> usize {
         let swallowed = self.earlydata_skip.min(count);
         self.earlydata_skip -= swallowed;
@@ -3221,10 +2629,6 @@ impl<B: TlsBackend> SslConnectData<B> {
     /// Releases the session's own resources -- `cf_ctx_free`'s
     /// `Curl_bufq_free(&ctx->earlydata)` (`vtls.c:526`) and the backend's
     /// `close`.
-    ///
-    /// Rust's [`Drop`] frees the memory; this is for the effects a destructor
-    /// cannot have and for returning the session to a state it can be connected
-    /// from again, which `lib/cfilters.h:424-425` requires of a closed filter.
     pub(crate) fn close(&mut self) {
         let backend = self.backend();
         backend.close(&mut self.state);
@@ -3245,8 +2649,6 @@ impl<B: TlsBackend> SslConnectData<B> {
 /// `Curl_alpn_set_negotiated` (`vtls.c:2003-2069`): accept, or refuse to
 /// continue.
 ///
-/// Two paths, and the first is a security decision rather than bookkeeping.
-///
 /// **A pinned protocol must be confirmed byte for byte.** When
 /// [`SslConnectData::negotiated_alpn`] is already set -- which happens on
 /// session reuse, where the cached ALPN is pinned before the handshake so that
@@ -3259,20 +2661,10 @@ impl<B: TlsBackend> SslConnectData<B> {
 /// Accepting a different protocol would leave an HTTP/2 filter stack talking to
 /// an HTTP/1.1 server, or the reverse.
 ///
-/// **A fresh protocol is recorded, having been checked.** A value containing a
-/// NUL is refused: the C stores it with `curlx_memdup0` and every later reader
-/// treats it as a C string, so an embedded NUL would truncate it and the
-/// connection would proceed under a protocol nobody selected.
-///
 /// The four diagnostics are `vtls.h:59-69` verbatim -- see
 /// [`VTLS_INFOF_ALPN_ACCEPTED`] and its siblings -- and which of them is
 /// emitted depends on [`SslConnectionState::Deferred`], because a deferred
 /// handshake has not confirmed anything yet and must not claim to have.
-///
-/// `proto` empty means the server agreed on nothing, which is legitimate on the
-/// fresh path and fatal on the pinned one. The C's `cf` parameter is
-/// `(void)cf;` at `:2010` -- unused -- so it is absent here rather than
-/// threaded through and ignored.
 ///
 /// # Errors
 ///
@@ -3373,18 +2765,6 @@ pub(crate) fn alpn_set_negotiated<B: TlsBackend>(
 ///    through [`alpn_set_negotiated`] so that the server will have to confirm
 ///    it byte for byte.
 ///
-/// The order of the last two operations matters and is the C's: the state is
-/// set to deferred *before* the protocol is pinned, so the diagnostic
-/// [`alpn_set_negotiated`] emits is the deferred one.
-///
-/// The 64 KiB local bound is applied here, through
-/// [`SslConnectData::set_earlydata_max`], so a peer advertising more does not
-/// get more.
-///
-/// `role` and `sockindex` are what the C reads out of its `cf` parameter for
-/// `CURL_TRC_CF`: they select the trace identity and the index the three lines
-/// are attributed to.
-///
 /// # Errors
 ///
 /// Whatever [`alpn_set_negotiated`] reports. The C mirrors it into
@@ -3453,9 +2833,7 @@ pub(crate) fn on_session_reuse<B: TlsBackend>(
     }
 }
 
-// =========================================================================
 // TLS version preferences -- `ssl_prefs_check` (`vtls.c:1064-1086`)
-// =========================================================================
 
 /// `CURL_SSLVERSION_LAST` = 8 (`include/curl/curl.h:2374`).
 ///
@@ -3476,9 +2854,9 @@ const CURL_SSLVERSION_MAX_DEFAULT: i64 = 1 << 16;
 /// The minimum and maximum TLS versions a transfer asked for.
 ///
 /// The two members of `struct ssl_primary_config` that `ssl_prefs_check`
-/// (`vtls.c:1064-1086`) validates, carried as a pair so that the validation can
-/// happen where the C performs it -- inside the filter's connect, once per
-/// session -- without the filter reaching for an easy handle.
+/// (`vtls.c:1064-1086`) validates, carried as a pair so the validation can
+/// happen where the C performs it: inside the filter's connect, once per
+/// session, without the filter reaching for an easy handle.
 ///
 /// Both keep their C representation exactly, because both are `CURLOPT_*`
 /// values that an application supplied and that `--tlsv1.x` and
@@ -3519,11 +2897,6 @@ impl TlsPrefs {
     ///    them is not an optimisation: `MAX_DEFAULT` is
     ///    `CURL_SSLVERSION_TLSv1 << 16`, which shifts down to 1 and would
     ///    wrongly reject any minimum above TLS 1.0.
-    ///
-    /// The shift is arithmetic on a signed value in the C, so a negative
-    /// `version_max` shifts down to a negative number and compares below any
-    /// minimum -- which rejects it. Rust's `>>` on [`i64`] is the same
-    /// arithmetic shift, so the behaviour carries over without a special case.
     pub(crate) fn check(self) -> Result<(), &'static str> {
         if self.version >= CURL_SSLVERSION_LAST {
             return Err(
@@ -3540,18 +2913,11 @@ impl TlsPrefs {
     }
 }
 
-// =========================================================================
 // The mandatory pollset helper -- `Curl_ssl_adjust_pollset`
 // (`lib/vtls/vtls.c:546-570`)
-// =========================================================================
 
 /// `Curl_ssl_adjust_pollset` (`vtls.c:546-570`): what to wait for while the
 /// session cannot progress.
-///
-/// The generic implementation of the `adjust_pollset` member the header calls
-/// **mandatory**, and the one every backend can point at. Written as a free
-/// function, as the C writes it, so that a backend with its own needs can call
-/// it rather than reimplement it.
 ///
 /// Three cases, and the precedence is the whole content of the function:
 ///
@@ -3566,23 +2932,6 @@ impl TlsPrefs {
 ///   are gone, so polling for readability as well would wake the transfer for
 ///   work it cannot do.
 /// * **Otherwise RECV** -- `POLLIN` **only**.
-///
-/// "Only" is exact: the C calls `Curl_pollset_set_out_only` and
-/// `Curl_pollset_set_in_only`, which add one flag and *remove* the other, and
-/// those are the two functions called here.
-///
-/// # Insertion order is preserved
-///
-/// The socket is taken from the filter **below** --
-/// `Curl_conn_cf_get_socket(cf->next, data)` -- and the pollset entry for it
-/// is created or updated in place, so a descriptor another filter registered
-/// first keeps its position. An invalid
-/// descriptor is skipped entirely, which is the C's `if(sock !=
-/// CURL_SOCKET_BAD)`: a session whose transport has not produced a socket yet
-/// has nothing to wait on, and that is a successful no-op rather than an error.
-///
-/// The trace line is emitted **after** the pollset call and its result is
-/// returned even when the call failed, both as the C does.
 ///
 /// # Errors
 ///
@@ -3639,13 +2988,6 @@ pub(crate) fn tls_adjust_pollset(
 }
 
 /// The HTTP version an exactly matching ALPN name implies, or [`None`].
-///
-/// `ssl_cf_cntrl` (`vtls.c:1643-1650`) compares with `strcmp` against exactly
-/// three names, and `strcmp` is what makes this total: a fourth protocol, a
-/// differently cased name or `http/1.0` all leave the connection's recorded
-/// version alone rather than guessing. `http/1.0` is genuinely absent from the
-/// C's list even though it is an ALPN name curl offers, and it is absent here
-/// too.
 #[allow(dead_code)]
 pub(crate) fn alpn_to_http_version(alpn: &str) -> Option<u8> {
     match alpn {
@@ -3656,10 +2998,8 @@ pub(crate) fn alpn_to_http_version(alpn: &str) -> Option<u8> {
     }
 }
 
-// =========================================================================
 // The TLS connection filter -- `Curl_cft_ssl` and `Curl_cft_ssl_proxy`
 // (`lib/vtls/vtls.c:1667-1701`)
-// =========================================================================
 
 /// Which of the two TLS filters this instance is.
 ///
@@ -3721,26 +3061,14 @@ impl TlsFilterRole {
 
 /// TLS, as one link of a connection filter chain.
 ///
-/// The successor of `Curl_cft_ssl` and `Curl_cft_ssl_proxy` together with the
-/// eleven `ssl_cf_*` functions they point at (`vtls.c:1290-1701`). Generic over
-/// the backend, which is what carries the typed session state all the way to
-/// the chain without erasing it: `B::State` is a field of a field, so nothing
-/// on the path from [`ConnFilter`] down to the provider is a `void *`, an
-/// [`std::any::Any`] or a downcast.
-///
 /// # What is injected, and therefore what is not global
 ///
 /// * the backend, and through it the cryptographic provider -- shared as an
-///   [`Rc`], never installed process-wide;
+///   [`Arc`], never installed process-wide;
 /// * the clock, which arrives on every call inside [`CallCtx`];
 /// * the transport below, which arrives as [`FilterBase`]'s link;
 /// * the TLS version preferences, checked once per session;
 /// * the ALPN specification, by value.
-///
-/// There is no static provider, no static RNG, no static session cache, no
-/// static key-log destination and no recovered "current handle" anywhere in
-/// this type. That is the property AAP section 0.6.9 requires and the reason
-/// two transfers in one process cannot perturb each other.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct TlsConnFilter<B: TlsBackend> {
@@ -3755,13 +3083,6 @@ pub(crate) struct TlsConnFilter<B: TlsBackend> {
     prefs: TlsPrefs,
     /// The HTTP version the negotiated protocol implies, once
     /// [`CfControl::ConnInfoUpdate`] has been delivered.
-    ///
-    /// The successor of `cf->conn->httpversion_seen = 11` and its two siblings
-    /// (`vtls.c:1645-1649`). The C writes through the filter into the
-    /// connection; a filter here cannot reach the connection, so the value is
-    /// recorded and read back through [`Self::observed_http_version`] by the
-    /// same code that delivered the event. Nothing is lost and no upward
-    /// pointer is introduced.
     observed_http_version: Option<u8>,
 }
 
@@ -3769,20 +3090,13 @@ pub(crate) struct TlsConnFilter<B: TlsBackend> {
 impl<B: TlsBackend> TlsConnFilter<B> {
     /// A filter for `role` on `sockindex`, over `backend`, talking to `peer`.
     ///
-    /// The successor of `cf_ssl_create` and `cf_ssl_proxy_create`
-    /// (`vtls.c:1725-1740`, `:1785-1800`) with `Curl_cf_create` folded in: the
-    /// C allocates the filter, allocates the context, points the context at the
-    /// global backend and then hands both to `Curl_cf_create`. Here the state
-    /// arrives with the value, which is what `crate::conn::filters::link`'s
-    /// documentation means by "there is no `void *ctx` to store".
-    ///
     /// # Errors
     ///
     /// Whatever [`TlsBackend::new_state`] reports.
     pub(crate) fn new(
         role: TlsFilterRole,
         sockindex: SocketIndex,
-        backend: Rc<B>,
+        backend: Arc<B>,
         peer: SslPeer,
         alpn: Option<AlpnSpec>,
         prefs: TlsPrefs,
@@ -3819,17 +3133,6 @@ impl<B: TlsBackend> TlsConnFilter<B> {
 
     /// The deferred-handshake step of `ssl_cf_connect_deferred`
     /// (`vtls.c:1406-1453`).
-    ///
-    /// Reached from [`ConnFilter::send`] with the caller's payload and from
-    /// [`ConnFilter::recv`] with nothing, which is the C's own asymmetry: a
-    /// read cannot contribute early data, so it passes `NULL, 0`.
-    ///
-    /// While the state is [`SslEarlydataState::Await`], `buf` is buffered --
-    /// bounded by [`SslConnectData::earlydata_max`], itself bounded by
-    /// [`EARLYDATA_MAX`] -- the state advances to
-    /// [`SslEarlydataState::Sending`], and the amount buffered is recorded as
-    /// the skip count. Then the handshake runs, and once it finishes the
-    /// server's verdict is reported with the C's own two lines.
     ///
     /// # Errors
     ///
@@ -3914,12 +3217,6 @@ impl<B: TlsBackend> TlsConnFilter<B> {
 
     /// Finishes a deferred handshake before a read or a write may proceed.
     ///
-    /// The shared prologue of `ssl_cf_send` (`vtls.c:1485-1495`) and
-    /// `ssl_cf_recv` (`:1535-1545`): both refuse to touch the session until it
-    /// is [`SslConnectionState::Complete`], and both report
-    /// [`CURLcode::Again`] rather than blocking when the handshake needs
-    /// another turn.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::Again`] when the handshake has not finished, and whatever
@@ -3996,11 +3293,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
     ///    starting a handshake unless it finished.
     /// 4. Preferences unchecked -- validate once,
     ///    [`CURLcode::SslConnectError`] if incoherent, and remember.
-    ///
-    /// On completion the filter is marked connected, and the handshake
-    /// timestamp is taken from the **injected** clock -- and only when the
-    /// session is [`SslConnectionState::Complete`], because a deferred session
-    /// has not finished and must not report a completion time.
     ///
     /// # Errors
     ///
@@ -4133,11 +3425,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
 
     /// `ssl_cf_close` (`vtls.c:1307-1317`): close this session, then pass the
     /// close down.
-    ///
-    /// Chains, and must: `Curl_conn_close` calls only the head and relies on
-    /// each implementation to forward. The filter stays in place and may be
-    /// connected again afterwards, which is why this clears state rather than
-    /// releasing the session.
     fn close(&mut self, cx: &mut CallCtx<'_, '_>) {
         self.close_self();
         if let Some(next) = self.base.next_mut() {
@@ -4146,17 +3433,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
     }
 
     /// `ssl_cf_shutdown` (`vtls.c:1554-1574`): close the session cleanly.
-    ///
-    /// The C's guard is four conditions and all four are preserved: the filter
-    /// must be connected, the session must be
-    /// [`SslConnectionState::Complete`], the filter must not have shut down
-    /// already, and the backend must implement it. Anything else reports done
-    /// immediately -- there is no `close_notify` to send for a handshake that
-    /// never completed.
-    ///
-    /// `cf->shutdown = (result || *done)` is the C's own line: a **failed**
-    /// shutdown also marks the filter shut down, because retrying a failed
-    /// `close_notify` on a connection being torn down would only stall it.
     ///
     /// # Errors
     ///
@@ -4227,13 +3503,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
     }
 
     /// `ssl_cf_data_pending` (`vtls.c:1455-1470`): are decrypted bytes waiting?
-    ///
-    /// The backend is asked first and the layer below second, and the
-    /// short-circuit is the C's: a session holding a decrypted record must be
-    /// read even when the socket has nothing, which is exactly what the
-    /// header's comment on the member describes -- "it wants to get called
-    /// again to drain internal buffers and deliver data instead of waiting for
-    /// the socket to get readable".
     fn data_pending(&mut self, cx: &CallCtx<'_, '_>) -> bool {
         if self.session.backend.data_pending(&self.session.state) {
             return true;
@@ -4257,10 +3526,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
     /// 3. What remains is encrypted -- and a zero-length remainder is skipped
     ///    entirely, because, in the C's words, "OpenSSL and maybe other TLS
     ///    libs do not like 0-length writes".
-    ///
-    /// `eos` is `(void)eos` in the C and is forwarded to the backend here,
-    /// which is strictly more information and changes nothing for a backend
-    /// that ignores it.
     ///
     /// # Errors
     ///
@@ -4298,10 +3563,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
 
     /// `ssl_cf_recv` (`vtls.c:1525-1552`): read and decrypt.
     ///
-    /// A deferred handshake is finished first, with **nothing** offered as
-    /// early data -- the C passes `NULL, 0`, because a read has no payload to
-    /// contribute.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::Again`] while a deferred handshake is outstanding, and
@@ -4326,10 +3587,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
 
     /// `ssl_cf_cntrl` (`vtls.c:1632-1654`): record the negotiated HTTP version.
     ///
-    /// One event is handled and every other is a successful no-op, exactly as
-    /// in the C -- and does **not** chain, because the driver distributes the
-    /// event to every filter itself.
-    ///
     /// Three conditions gate the recording and all three are the C's:
     ///
     /// * the event must be [`CfControl::ConnInfoUpdate`];
@@ -4337,15 +3594,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
     /// * the filter must be on the **primary** socket -- `!cf->sockindex` --
     ///   because a secondary chain does not carry the request whose version is
     ///   being recorded.
-    ///
-    /// And a fourth applies to this type rather than to the C's function: the
-    /// **proxy** filter does not do this at all. `Curl_cft_ssl_proxy` points
-    /// its `cntrl` member at `Curl_cf_def_cntrl` (`vtls.c:1698`), so the
-    /// protocol negotiated with a proxy never becomes the connection's
-    /// observed HTTP version.
-    ///
-    /// The comparison is exact: [`alpn_to_http_version`] matches three names
-    /// and nothing else.
     ///
     /// # Errors
     ///
@@ -4371,12 +3619,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
     }
 
     /// `cf_ssl_is_alive` (`vtls.c:1656-1665`): ask the layer below.
-    ///
-    /// Identical to the trait's own default, and written out anyway because the
-    /// C writes it out: `Curl_cft_ssl` names `cf_ssl_is_alive` rather than a
-    /// default, and a reader comparing the two tables should find the same
-    /// entry in both. The C's comment is "pessimistic in absence of data",
-    /// which is `crate::conn::filters::Liveness::DEAD`.
     fn is_alive(&mut self, cx: &mut CallCtx<'_, '_>) -> Liveness {
         match self.base.next_mut() {
             Some(next) => next.is_alive(cx),
@@ -4385,10 +3627,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
     }
 
     /// `Curl_cf_def_conn_keep_alive` (`vtls.c:1699`): pass down.
-    ///
-    /// Both registered TLS filter types name the **default** here, so this is
-    /// the default's behaviour spelled out: TLS has nothing of its own to do to
-    /// keep a connection alive.
     ///
     /// # Errors
     ///
@@ -4420,9 +3658,6 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
     ///   differentiate" case `lib/cfilters.h:156-158` describes.
     /// * [`CfQuery::AlpnNegotiated`] -- the confirmed protocol, with the C's
     ///   own trace line.
-    ///
-    /// When the proxy filter declines a question it falls through to the chain,
-    /// which is the C's `break` out of the `switch` rather than a `return`.
     ///
     /// # Errors
     ///
@@ -4478,18 +3713,9 @@ impl<B: TlsBackend> ConnFilter for TlsConnFilter<B> {
     }
 }
 
-// =========================================================================
 // The injected factory -- the one place a backend type is erased
-// =========================================================================
 
 /// What a chain builder needs to know to install a TLS filter.
-///
-/// The parameters of `Curl_cf_ssl_insert_after` and
-/// `Curl_cf_ssl_proxy_insert_after` (`vtls.h:215-223`) once the easy handle and
-/// the connection are gone: the C reads all of this out of `cf->conn` and
-/// `data->set`, and a caller here supplies it. Grouped into a struct because it
-/// crosses one call and because seven separate parameters would sit on
-/// `clippy::too_many_arguments`.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct TlsFilterRequest {
@@ -4506,28 +3732,8 @@ pub(crate) struct TlsFilterRequest {
 }
 
 /// Builds TLS filters without naming a backend type.
-///
-/// The seam that keeps `crate::conn` from importing rustls, and the **only**
-/// place a backend's type is erased. `conn/mod.rs` holds one of these as a
-/// `dyn TlsFilterFactory`, calls [`Self::create`] and receives a
-/// `crate::conn::filters::FilterLink` -- a `Pin<Box<dyn ConnFilter>>` -- with
-/// the concrete `B` already sealed inside a [`TlsConnFilter<B>`]. So the
-/// erasure happens once, at a boundary that was going to be dynamic anyway,
-/// and no session state is behind an untyped pointer at any point.
-///
-/// Object-safe: no method is generic and none carries an associated type. That
-/// is what [`TlsBackend`] cannot be, and why the two traits are separate rather
-/// than one.
-///
-/// # Why the descriptor is on this trait as well
-///
-/// `curl_global_sslset` and `curl_version_info` ask for backend identity
-/// *before* any connection exists, so there is no filter to ask. A factory is
-/// available at that point, and it can answer from the same descriptor its
-/// filters would report -- which is what makes the two answers necessarily
-/// equal.
 #[allow(dead_code)]
-pub(crate) trait TlsFilterFactory: fmt::Debug {
+pub(crate) trait TlsFilterFactory: fmt::Debug + Send + Sync {
     /// The descriptor of the backend this factory builds filters over.
     fn descriptor(&self) -> &'static CurlSslDescriptor;
 
@@ -4542,7 +3748,7 @@ pub(crate) trait TlsFilterFactory: fmt::Debug {
 /// The generic [`TlsFilterFactory`]: one backend, shared by every filter it
 /// builds.
 ///
-/// Holding the backend as an [`Rc`] is the injection: the backend was
+/// Holding the backend as an [`Arc`] is the injection: the backend was
 /// constructed by whoever built this factory -- with its provider, its trust
 /// store and its key-log destination already chosen -- and every filter gets a
 /// handle to that one value. Nothing is read from a process-global, so two
@@ -4552,19 +3758,19 @@ pub(crate) trait TlsFilterFactory: fmt::Debug {
 #[allow(dead_code)]
 pub(crate) struct BackendFilterFactory<B: TlsBackend> {
     /// The injected backend.
-    backend: Rc<B>,
+    backend: Arc<B>,
 }
 
 #[allow(dead_code)]
 impl<B: TlsBackend> BackendFilterFactory<B> {
     /// A factory over `backend`.
-    pub(crate) fn new(backend: Rc<B>) -> Self {
+    pub(crate) fn new(backend: Arc<B>) -> Self {
         Self { backend }
     }
 
     /// The backend, shared.
-    pub(crate) fn backend(&self) -> Rc<B> {
-        Rc::clone(&self.backend)
+    pub(crate) fn backend(&self) -> Arc<B> {
+        Arc::clone(&self.backend)
     }
 }
 
@@ -4593,32 +3799,9 @@ impl<B: TlsBackend + 'static> TlsFilterFactory for BackendFilterFactory<B> {
     }
 }
 
-// =========================================================================
 // The provider-random adapter -- `crypto::rand::Rng` over the pinned provider
-// =========================================================================
 
 /// The crate's [`Rng`], backed by the pinned cryptographic provider.
-///
-/// This is the adapter `crate::crypto::rand` anticipates in as many words: "a
-/// `tls/`-owned implementation backed by the pinned provider's generator is the
-/// intended production source". It exists so that entropy flows **downwards by
-/// injection**: `crate::crypto` cannot import `crate::tls` -- the digests are
-/// below TLS in the module graph and one of TLS's own dependencies -- so a
-/// caller that wants provider entropy is handed one of these as a `&mut dyn
-/// Rng`, and the direction of dependency stays acyclic.
-///
-/// It also fills [`CurlSslDescriptor::random`], which is the `CURLcode
-/// (*random)(data, entropy, length)` member of `struct Curl_ssl`
-/// (`vtls_int.h:162-164`): in the C the TLS backend *is* one of curl's entropy
-/// sources, and this is that relationship with the global removed.
-///
-/// # No global, at any level
-///
-/// The provider arrives as a value. Nothing here calls
-/// `CryptoProvider::install_default`, `CryptoProvider::get_default` or any
-/// `default_provider()` of its own accord, so no process-wide state is written
-/// and the order tests run in cannot matter. [`Self::from_provider`] takes what
-/// it is given.
 ///
 /// # Why there is a second generator inside
 ///
@@ -4628,13 +3811,6 @@ impl<B: TlsBackend + 'static> TlsFilterFactory for BackendFilterFactory<B> {
 /// fallible.
 /// Squaring the two by panicking is not acceptable, and neither is returning
 /// zeroes -- that would be a silent, catastrophic loss of entropy in a nonce.
-///
-/// So a second cryptographically secure generator is built once, in the
-/// constructor, and used only if the provider ever refuses. It is
-/// `crate::crypto::rand::SystemRng` -- ChaCha12 seeded from the operating
-/// system -- so the fallback is a CSPRNG and not a degradation, and
-/// [`Self::fallback_draws`] counts how often it was reached so that a silent
-/// switch is still an observable one.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct ProviderRng {
@@ -4649,12 +3825,6 @@ pub(crate) struct ProviderRng {
 #[allow(dead_code)]
 impl ProviderRng {
     /// A generator over `provider`'s `secure_random`.
-    ///
-    /// The provider is probed once here rather than trusted, so a provider that
-    /// cannot deliver is reported at construction -- which is where
-    /// `crate::crypto::rand::SystemRng::new` reports the same condition, and
-    /// for the same reason: it is the last point at which reporting is
-    /// possible.
     ///
     /// # Errors
     ///
@@ -4717,12 +3887,6 @@ impl Rng for ProviderRng {
     }
 
     /// Fills `dest` in the byte order `lib/rand.c:200-214` produces.
-    ///
-    /// Derived from [`Self::next_u32`], four bytes per draw with the low byte
-    /// of each draw first and the final group truncated to whatever remains.
-    /// `crate::crypto::rand` keeps that loop private, so it is reproduced here
-    /// rather than approximated: a bulk fill straight from the provider would
-    /// group the bytes differently, and the difference would land on the wire.
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         for group in dest.chunks_mut(4) {
             let drawn = self.next_u32().to_le_bytes();
@@ -4741,15 +3905,13 @@ mod tests {
     use super::*;
     use crate::conn::filters::link;
     use crate::conn::select::PollAction;
+    use crate::util::sync_cell::SyncCell;
     use crate::util::timeval::TestClock;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
-    // ------------------------------------------------------------------
     // Test doubles. Everything this module needs is injected, so no test
     // opens a socket, contacts a peer or touches process state, and the
     // order the tests run in cannot matter.
-    // ------------------------------------------------------------------
 
     /// What a [`FakeBackend`] should do on its next handshake step, and what it
     /// recorded while doing it.
@@ -4788,16 +3950,10 @@ mod tests {
     }
 
     /// A [`TlsBackend`] that performs no cryptography at all.
-    ///
-    /// The whole point of the [`TlsBackend`] seam: the filter's control flow --
-    /// the deferred handshake, the early-data skip, the pollset precedence, the
-    /// ALPN confirmation -- is exercised without a provider, a certificate or a
-    /// peer. Nothing here is a stub standing in for missing work; it is the
-    /// injectable double the abstraction exists to permit.
     #[derive(Debug)]
     struct FakeBackend {
         /// Shared with the test so assertions can read what happened.
-        shared: Rc<RefCell<FakeBackendState>>,
+        shared: Arc<SyncCell<FakeBackendState>>,
         /// The descriptor this backend reports.
         descriptor: &'static CurlSslDescriptor,
     }
@@ -4839,20 +3995,20 @@ mod tests {
     }
 
     impl FakeBackend {
-        fn new() -> (Rc<Self>, Rc<RefCell<FakeBackendState>>) {
+        fn new() -> (Arc<Self>, Arc<SyncCell<FakeBackendState>>) {
             Self::with_descriptor(&FAKE_DESCRIPTOR)
         }
 
         fn with_descriptor(
             descriptor: &'static CurlSslDescriptor,
-        ) -> (Rc<Self>, Rc<RefCell<FakeBackendState>>) {
-            let shared = Rc::new(RefCell::new(FakeBackendState {
+        ) -> (Arc<Self>, Arc<SyncCell<FakeBackendState>>) {
+            let shared = Arc::new(SyncCell::new(FakeBackendState {
                 done: true,
                 shutdown_done: true,
                 ..FakeBackendState::default()
             }));
-            let backend = Rc::new(Self {
-                shared: Rc::clone(&shared),
+            let backend = Arc::new(Self {
+                shared: Arc::clone(&shared),
                 descriptor,
             });
             (backend, shared)
@@ -4986,12 +4142,12 @@ mod tests {
     #[derive(Debug)]
     struct Below {
         base: FilterBase,
-        shared: Rc<RefCell<BelowState>>,
+        shared: Arc<SyncCell<BelowState>>,
     }
 
     impl Below {
-        fn new(socket: Option<i32>) -> (Self, Rc<RefCell<BelowState>>) {
-            let shared = Rc::new(RefCell::new(BelowState {
+        fn new(socket: Option<i32>) -> (Self, Arc<SyncCell<BelowState>>) {
+            let shared = Arc::new(SyncCell::new(BelowState {
                 socket,
                 connects_to: true,
                 http_version: 11,
@@ -5002,7 +4158,7 @@ mod tests {
             (
                 Self {
                     base,
-                    shared: Rc::clone(&shared),
+                    shared: Arc::clone(&shared),
                 },
                 shared,
             )
@@ -5090,10 +4246,10 @@ mod tests {
     /// A TLS filter with `below` linked beneath it, ready to be driven.
     fn stack(
         role: TlsFilterRole,
-        backend: Rc<FakeBackend>,
+        backend: Arc<FakeBackend>,
         alpn: Option<AlpnSpec>,
         socket: Option<i32>,
-    ) -> (TlsConnFilter<FakeBackend>, Rc<RefCell<BelowState>>) {
+    ) -> (TlsConnFilter<FakeBackend>, Arc<SyncCell<BelowState>>) {
         let (below, below_state) = Below::new(socket);
         let mut filter = TlsConnFilter::new(
             role,
@@ -5108,9 +4264,7 @@ mod tests {
         (filter, below_state)
     }
 
-    // ==================================================================
     // Phase 3 -- the support vocabulary and the protocol identifiers
-    // ==================================================================
 
     /// Every `SSLSUPP_*` bit, at the position `lib/vtls/vtls.h:35-49` gives it.
     ///
@@ -5197,9 +4351,7 @@ mod tests {
         assert_eq!(IetfProtoVersion::from_bits(0x0304).name(), Some("TLSv1.3"));
     }
 
-    // ==================================================================
     // Phase 2 -- the descriptor's order, identity and slot presence
-    // ==================================================================
 
     /// The identity is `{ CURLSSLBACKEND_RUSTLS, "rustls" }`, with 14 taken
     /// from the existing ABI type rather than written again.
@@ -5347,9 +4499,7 @@ mod tests {
         assert_eq!(CURL_X509_STR_MAX, 100_000);
         assert_eq!(MAX_ALLOWED_CERT_AMOUNT, 100);
     }
-    // ==================================================================
     // Phase 4 -- the ALPN bytes, the bounds and the order
-    // ==================================================================
 
     /// The four names and their lengths, exactly as `vtls_int.h:40-47` gives
     /// them, plus the agreement between each pair.
@@ -5732,12 +4882,6 @@ mod tests {
     }
 
     /// The two `restrict_to` refusals, checked without the debug assertion.
-    ///
-    /// `restrict_to` carries a `debug_assert!` mirroring the C's
-    /// `DEBUGASSERT(plen < sizeof(spec->entries[0]))`, so a debug build would
-    /// abort before the release-build behaviour could be observed. The refusal
-    /// is therefore checked on the *release* semantics only, which is where the
-    /// C's silent no-change lives.
     #[test]
     #[cfg(not(debug_assertions))]
     fn restrict_to_refuses_an_over_long_name_without_changing_anything() {
@@ -5764,9 +4908,7 @@ mod tests {
         assert_eq!(alpn_to_http_version("h2c"), None);
     }
 
-    // ==================================================================
     // Phase 5 -- states, the peer, the typed context, session reuse
-    // ==================================================================
 
     /// The three state machines start where the C's zeroed struct starts.
     #[test]
@@ -6091,9 +5233,7 @@ mod tests {
         );
     }
 
-    // ==================================================================
     // ALPN confirmation -- the security decision, both outcomes
-    // ==================================================================
 
     /// A fresh handshake records what the server chose and reports the accepted
     /// line.
@@ -6241,9 +5381,7 @@ mod tests {
         assert_eq!(error.code(), CURLcode::SslConnectError);
     }
 
-    // ==================================================================
     // Session reuse -- `Curl_on_session_reuse`, all three arms
-    // ==================================================================
 
     /// A ticket that forbids early data yields none, and changes no state.
     #[test]
@@ -6385,9 +5523,7 @@ mod tests {
         assert_eq!(error.code(), CURLcode::SslConnectError);
     }
 
-    // ==================================================================
     // Phase 6 -- the pollset helper, the filter, the factory, the queries
-    // ==================================================================
 
     /// No need is a successful no-op that leaves the pollset untouched.
     #[test]
@@ -7387,7 +6523,7 @@ mod tests {
         let clock = TestClock::new(CurlTime::new(1, 0));
         let mut cx = CallCtx::new(&clock);
         let (backend, _shared) = FakeBackend::new();
-        let factory = BackendFilterFactory::new(Rc::clone(&backend));
+        let factory = BackendFilterFactory::new(Arc::clone(&backend));
         // The object-safe form: this is how `conn/mod.rs` holds it, and the
         // reason it can build TLS filters without naming rustls.
         let injected: &dyn TlsFilterFactory = &factory;
@@ -7410,7 +6546,7 @@ mod tests {
         // And the erased filter still behaves: with nothing below it, it
         // refuses to connect for the right reason.
         assert_eq!(coded(chain.connect(&mut cx)), Err(CURLcode::FailedInit));
-        assert!(Rc::ptr_eq(&factory.backend(), &backend));
+        assert!(Arc::ptr_eq(&factory.backend(), &backend));
     }
 
     /// A factory over a backend that cannot build state reports the failure.
@@ -7472,7 +6608,7 @@ mod tests {
             }
         }
 
-        let factory = BackendFilterFactory::new(Rc::new(Refusing));
+        let factory = BackendFilterFactory::new(Arc::new(Refusing));
         let injected: &dyn TlsFilterFactory = &factory;
         let outcome = injected.create(TlsFilterRequest {
             role: TlsFilterRole::Origin,
@@ -7487,9 +6623,7 @@ mod tests {
         );
     }
 
-    // ==================================================================
     // The provider-random adapter
-    // ==================================================================
 
     /// The adapter satisfies `crate::crypto::rand::Rng` over an injected
     /// provider, and installs nothing globally.
@@ -7559,9 +6693,7 @@ mod tests {
         );
     }
 
-    // ==================================================================
     // Phase 8 -- the source-level policy this file must hold to
-    // ==================================================================
 
     /// This file's own text, for the three policy checks below.
     ///
@@ -7617,13 +6749,6 @@ mod tests {
     }
 
     /// `feature = "tls"` appears nowhere.
-    ///
-    /// TLS is unconditional: the manifest declares no `tls` feature, so the
-    /// expression would raise `unexpected 'cfg' condition value` under
-    /// `-D warnings` -- and it would also mean a build with no TLS at all,
-    /// contradicting "rustls exclusively, validation on by default". Checked
-    /// against the text rather than left to the compiler so that the intent is
-    /// recorded where a reader will find it.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn no_tls_feature_gate_appears_in_this_file() {
@@ -7644,12 +6769,6 @@ mod tests {
     }
 
     /// The `unsafe` keyword appears nowhere as code.
-    ///
-    /// The crate root carries `#![deny(unsafe_code)]` and grants its single
-    /// exemption to `mod ffi`, so an `unsafe` block here would not compile.
-    /// This checks the stronger property -- that the keyword is absent from the
-    /// text outside prose and string literals -- so that the file cannot
-    /// acquire one behind an `#[allow]` that a future edit adds.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn the_unsafe_keyword_appears_only_in_prose() {
@@ -7668,16 +6787,6 @@ mod tests {
 
     /// No forbidden cryptographic provider is named, and no process-global
     /// provider is installed or fetched.
-    ///
-    /// `aws_lc_rs` and its spellings would link a second provider;
-    /// `prefer-post-quantum` would change the bytes of the `ClientHello`;
-    /// `platform-verifier` would take trust decisions away from `--cacert`,
-    /// `--capath` and `--insecure`. And `install_default` or `get_default`
-    /// would make the provider process-wide, which is exactly the global this
-    /// module exists without -- a single injected value instead.
-    ///
-    /// The module documentation names every one of these on purpose, so the
-    /// check is against code only.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn no_forbidden_provider_or_global_install_appears_in_code() {
@@ -7709,12 +6818,6 @@ mod tests {
     }
 
     /// The provider actually reached at run time is `ring`.
-    ///
-    /// The manifest pins it, and this confirms the pin took effect rather than
-    /// trusting the manifest: `ring`'s `SecureRandom` is not FIPS-validated
-    /// while `aws-lc-rs`'s can be, and `ring`'s default suite list does not
-    /// begin with a post-quantum hybrid group. Both would change if a second
-    /// provider were unioned into the graph.
     #[test]
     #[cfg_attr(
         miri,

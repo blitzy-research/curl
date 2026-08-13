@@ -24,9 +24,18 @@ produces a running executable; what that executable cannot yet do is accept an
 option. Every invocation, `--version` included, exits after reporting that no
 command-line option can be honoured by this build. Since every test case here
 passes options, none of them can pass yet, and nothing in this file has been
-run against the `Rust` binary. The distinction matters when reading a failure:
-the missing piece is the option parser and the transfer engine behind it, not
-an entry point.
+run against the `Rust` binary.
+
+Be precise about which piece is missing, because a wrong diagnosis sends a
+reader to the wrong file. The option parser is **not** the gap:
+`curl-rs/src/cli/args.rs` holds the frozen option inventory, the `clap` surface
+derived from it and the per-option parsing rules, and it is tested. What is
+absent is the production wiring on either side of it -- `main.rs` never calls
+into the parser, the configuration and operation layers that would carry a
+parsed option into a transfer are not on disk -- and, behind that, the `HTTP`
+transfer engine itself. A failure here therefore means "nothing invokes the
+parser and no request is built", never "there is no parser" and never "there is
+no entry point".
 
 # Usage
 
@@ -263,8 +272,16 @@ arrangement is unaffected. For the specified target, rustls is the sole TLS
 implementation at every configuration and certificate validation is on by
 default. The warning that `--insecure` prints on stderr before the transfer
 proceeds is delivered in `curl-rs`, and no verbosity option suppresses it,
-`--silent` included; what is still absent is the option parsing that would
-reach it and the TLS backend whose verification it reports on.
+`--silent` included.
+
+The TLS layer is likewise further along than an earlier revision of this page
+said. `curl-rs-lib/src/tls/` holds the backend abstraction, the `rustls`
+implementation behind it, certificate and hostname verification, the session
+cache, cipher-suite name mapping and key logging, each with its own tests. What
+remains missing is the same wiring named above -- no command line reaches the
+`--insecure` or `--cacert` options, and no connection filter negotiates a
+session -- so the capability is withheld from the advertised feature set and
+none of this suite exercises it yet.
 
 ### What does not change
 

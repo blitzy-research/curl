@@ -24,73 +24,14 @@
 
 //! Persisted client state: the cookie jar, `.netrc`, HSTS and Alt-Svc.
 //!
-//! This file has two jobs. It is the module root for `src/cookies/`, and it
-//! is the cookie engine itself: the successor of `lib/cookie.c` (1,638
-//! lines) and `lib/cookie.h` (143 lines), including the **Netscape
-//! cookie-jar file format**.
-//!
 //! The five children of this directory share a module because every one of
 //! them reads and writes a file on the user's disk whose format is FROZEN. A
 //! jar written by curl 8.19.0-DEV must be readable here and one written here
 //! must be readable there, and the same obligation applies to the HSTS and
-//! Alt-Svc caches and to `.netrc`. That is why the jar is implemented
-//! natively rather than delegated to a general-purpose cookie crate -- no
-//! such crate commits to the Netscape on-disk shape -- and why
-//! `publicsuffix` is used for nothing but the domain-matching rules that
-//! libpsl previously supplied. AAP 0.5.1 records the omission as
-//! deliberate.
-//!
-//! `pub(crate)`: no exported symbol of `lib/libcurl.def` resolves a name
-//! here. The cookie engine, the caches and `.netrc` are all reached through
-//! an easy handle's option surface -- `CURLOPT_COOKIE` (10022),
-//! `CURLOPT_COOKIEFILE` (10031), `CURLOPT_COOKIEJAR` (10082),
-//! `CURLOPT_COOKIESESSION` (96), `CURLOPT_COOKIELIST` (10135) and
-//! `CURLINFO_COOKIELIST`. Those identifiers are listed for cross-reference
-//! only; the enumeration itself belongs to `curl-rs-ffi/src/ffi/opts.rs` and
-//! is not redefined here.
-//!
-//! # TWO BYTE-LEVEL CONTRACTS MEET IN THIS FILE
-//!
-//! 1. **The jar file.** `tests/data/test1920`, `test31`, `test46` and
-//!    `test1160` compare a saved jar against literal bytes, so every tab,
-//!    every `TRUE`, the `#HttpOnly_` prefix, the Mozilla-style leading dot
-//!    and the trailing blank line of the header are the specification.
-//! 2. **The `Cookie:` request header, content AND order.** AAP 0.6.7:
-//!    `compareparts` joins both sides into a single string and compares them
-//!    whole, with no per-line matching and no normalization, across 1,476 of
-//!    the 1,914 fixtures. `tests/data/test8` pins the exact bytes, and 51
-//!    fixtures gate on the `cookies` label.
-//!
-//! Neither contract tolerates an improvement. AAP 0.8.2: *a refactor that
-//! produces different-but-arguably-better output has failed.* Performance is
-//! a non-goal (AAP 0.1.1), so where a faster design and a more faithful one
-//! disagree, the faithful one wins. Every deliberately preserved wart below
-//! carries a comment naming its `lib/cookie.c` line.
-//!
-//! # FOUR DIFFERENT STRING-COMPARISON POLICIES COEXIST HERE
-//!
-//! Getting any one of them wrong is a silent behaviour change, so the table
-//! is stated once, here, with the C function each row reproduces.
-//!
-//! | What is compared | C function | Policy |
-//! |---|---|---|
-//! | name against name, in `replace_existing` | `strcmp` (`:834`, `:875`) | **case-SENSITIVE** |
-//! | domain against domain, in `replace_existing` | `curl_strequal` (`:839`, `:879`) | case-INsensitive |
-//! | path against path, in `replace_existing` | `curl_strequal` (`:891`) | case-INsensitive |
-//! | cookie path against URI path, in `pathmatch` | `strncmp` (`:139`) | **case-SENSITIVE** |
-//! | domain tail, in `cookie_tailmatch` | `curl_strnequal` (`:82`) | case-INsensitive |
-//! | `__Secure-` / `__Host-` in a HEADER | `strncmp` (`:501`, `:503`) | **case-SENSITIVE** |
-//! | `__Secure-` / `__Host-` in a JAR LINE | `curl_strnequal` (`:744`, `:746`) | case-INsensitive |
-//!
-//! The C comments the fourth row itself: *"not using checkprefix() because
-//! matching should be case-sensitive"*. The asymmetry between the last two
-//! rows is deliberate and is preserved; see `parse_netscape`.
-//!
-//! The insensitive rows go through [`crate::util::strcase`], which folds the
-//! 26 ASCII letter pairs and nothing else, whatever the process locale says.
-//! `char::to_lowercase` is never used: it is Unicode-aware and
-//! locale-shaped, and a Turkish dotless i would change which cookies are
-//! sent.
+//! Alt-Svc caches and to `.netrc`. That is why the jar is implemented natively
+//! rather than delegated to a general-purpose cookie crate -- no such crate
+//! commits to the Netscape on-disk shape -- and why `publicsuffix` is used for
+//! nothing but the domain-matching rules that libpsl previously supplied.
 //!
 //! # Bytes, not text
 //!
@@ -109,98 +50,23 @@
 //! behaviour at the ABI boundary. Every length and every byte is treated as
 //! hostile.
 //!
-//! # The clock is injected
-//!
-//! `lib/cookie.c` calls `time(NULL)` at `:284`, `:590`, `:626` and through
-//! `cap_expires`, which is the WALL clock. Every one of those becomes
-//! `Clock::epoch_secs`, supplied by the caller (AAP 0.3.3 pattern P12).
-//! `SystemTime::now` is never called here.
-//!
-//! The injection is faithful rather than invented: the C tree already
-//! substitutes its own clock for testability, at `lib/hsts.c:50-64` and
-//! `lib/altsvc.c:431-447`, where a `#if defined(DEBUGBUILD) ||
-//! defined(UNITTESTS)` shim reads the `CURL_TIME` environment variable and
-//! then `#define`s `time` away. That mechanism is NOT reproduced -- reading
-//! an environment variable to decide what year it is has no place in
-//! shipped code -- but it settles the question of whether displacing the
-//! clock is a liberty. It is not.
-//!
-//! # `share/` owns the locking, and this module owns none of it
-//!
-//! `Curl_cookie_loadfiles` (`:1157`), `Curl_cookie_list` (`:1583`),
-//! `Curl_flush_cookies` (`:1605`) and `Curl_cookie_run` (`:1630`) each take
-//! `CURL_LOCK_DATA_COOKIE` with `CURL_LOCK_ACCESS_SINGLE`
-//! (`include/curl/curl.h:3033`) around their whole body, and
-//! `lib/setopt.c`'s `cookielist()` does the same for all four command words.
-//! `crate::share` does not exist at this commit, so the contract is written
-//! down here rather than guessed at later:
-//!
-//! * **Exclusive access is required** for `CookieInfo::add`,
-//!   `CookieInfo::load`, `CookieInfo::loadfiles`,
-//!   `CookieInfo::getlist` (it prunes), `CookieInfo::list` (it prunes),
-//!   `CookieInfo::clearall`, `CookieInfo::clearsess`,
-//!   `CookieInfo::run` and `CookieInfo::save`. Every one of those takes
-//!   `&mut self`, so the requirement is in the signature and not only in
-//!   this paragraph.
-//! * **Shared access suffices** for the read accessors and for
-//!   `CookieInfo::write_to`, which takes `&self`.
-//! * `Curl_flush_cookies` saves the jar only when a `CURLOPT_COOKIEJAR` name
-//!   is set AND `running` is true, and it tears the store down **only when
-//!   the store is not shared** -- `if(cleanup && (!data->share ||
-//!   (data->cookies != data->share->cookies)))` at `:1647`. That ownership
-//!   question is `share/`'s to answer, so `CookieInfo::flush` reports what
-//!   it did and does not destroy anything.
-//!
-//! One hazard is worth recording before `share/` is written, because the
-//! compiler will state it as a puzzle rather than as advice. `lib.rs`
-//! declares `pub mod share;` but `pub(crate) mod cookies;`, so a `pub`
-//! signature in `share/` that names `CookieInfo` is
-//! `error[E0446]: private type in public interface`. The resolution is
-//! `share/`'s: keep the store behind its own opaque `pub` wrapper, which is
-//! what the C does -- `CURLSH` is literally `typedef void CURLSH` -- or add
-//! a curated `pub use` at the crate root. These types stay effectively
-//! `pub(crate)` and must not be widened from here.
-//!
 //! # Where the `Cookie:` header line is actually assembled
 //!
 //! `Curl_cookie_getlist` selects and orders the cookies; the header line is
-//! built by `http_cookies` at `lib/http.c:2543-2586`. That is
-//! `protocols/http1.rs`'s file, and it does not exist yet, so
-//! `CookieInfo::cookie_header_value` reproduces the composition here --
-//! the `MAX_COOKIE_HEADER_LEN` cap is declared in `lib/cookie.h:97` and the
-//! selection rules are this module's -- and `http1.rs` is expected to call
-//! it rather than re-derive it. The boundary is stated on that function:
-//! everything from the `Cookie: ` prefix outwards, including the `CRLF` and
-//! the `CURLOPT_COOKIE` tail, stays with the request writer.
+//! built by `http_cookies` at `lib/http.c:2543-2586`. The boundary is stated
+//! on that function: everything from the `Cookie: ` prefix outwards, including
+//! the `CRLF` and the `CURLOPT_COOKIE` tail, stays with the request writer.
 
 // The four children of this directory. A `mod` line without its file is
 // `error[E0583]`, which no attribute can suppress, so each declaration lands
 // with the file it names.
 
 /// The Alt-Svc cache (RFC 7838), behind `--alt-svc <file>`.
-///
-/// Supersedes `lib/altsvc.c` and `lib/altsvc.h`, and backs `CURLOPT_ALTSVC`
-/// (10287) and `CURLOPT_ALTSVC_CTRL` (286).
-///
-/// **Gated on `altsvc`**, the successor of C's `CURL_DISABLE_ALTSVC`. The C
-/// additionally gates the file on `CURL_DISABLE_HTTP` (`lib/altsvc.c:30`);
-/// there is no counterpart, because the crate's capability vocabulary is
-/// closed at fifteen names and none of them switches HTTP off.
-///
-/// It carries two things beyond the cache itself, and both are recorded here
-/// so that a later module imports rather than redeclares them: `AlpnId`, the
-/// successor of `enum alpnid` (`lib/hostip.h:49-54`), whose eventual home is
-/// `crate::dns`; and the two name conversions of `lib/connect.c:73-95`, whose
-/// eventual home is `crate::conn`. Neither module provides them at this
-/// commit. The child's own header states the contract for moving them.
 #[cfg(feature = "altsvc")]
 pub(crate) mod altsvc;
 
 /// `.netrc` credential lookup, behind `--netrc`, `--netrc-file` and
 /// `--netrc-optional`.
-///
-/// Supersedes `lib/netrc.c` and `lib/netrc.h`, and backs `CURLOPT_NETRC`
-/// (51) and `CURLOPT_NETRC_FILE` (10118).
 ///
 /// **Declared unconditionally, and it must stay that way.** The C has
 /// `#ifndef CURL_DISABLE_NETRC` (`lib/netrc.h:28`), but credential lookup
@@ -215,56 +81,22 @@ pub(crate) mod netrc;
 
 /// The Public Suffix List -- may this host set a cookie for this domain, or
 /// would that be a "super cookie" set at registry level?
-///
-/// Supersedes `lib/psl.c` and `lib/psl.h`, replacing the `libpsl` binding
-/// with the `publicsuffix` crate. Its two consumers are [`is_public_suffix`]
-/// in this file, the port of `lib/cookie.c:774-819`, and
-/// [`crate::version`], which must report the `PSL` capability truthfully
-/// rather than assume it.
-///
-/// **Gated on `cookies`**, unlike [`netrc`] above, and the reason is
-/// mechanical rather than stylistic: the public-suffix rules are the one
-/// child of this module that reaches an external crate, and `publicsuffix`
-/// is declared `optional` in `curl-rs-lib/Cargo.toml` with
-/// `cookies = ["dep:publicsuffix"]` as its only activator, so an
-/// unconditional declaration would fail to RESOLVE the crate under
-/// `--no-default-features` rather than merely compile a larger tree.
-///
-/// Availability is therefore a RUN-TIME property inside the module as well
-/// as a compile-time one: the list source is injected, so "configured but
-/// unloadable" fails closed exactly as the C's `USE_LIBPSL` arm with a null
-/// list does, while "never configured" reproduces the `#ifndef USE_LIBPSL`
-/// arm in which no cookie is dropped on public-suffix grounds.
 #[cfg(feature = "cookies")]
 pub(crate) mod psl;
 
 /// The HTTP Strict Transport Security cache, behind `--hsts <file>`.
 ///
-/// Supersedes `lib/hsts.c` and `lib/hsts.h`, and backs `CURLOPT_HSTS`
-/// (10300), `CURLOPT_HSTS_CTRL` (299) and the four callback options
-/// `CURLOPT_HSTSREADFUNCTION` (20301), `CURLOPT_HSTSREADDATA` (10302),
-/// `CURLOPT_HSTSWRITEFUNCTION` (20303) and `CURLOPT_HSTSWRITEDATA` (10304).
-///
-/// **Gated on `hsts`**, matching the C's `CURL_DISABLE_HSTS`. The C
-/// additionally requires HTTP -- `#if !defined(CURL_DISABLE_HTTP) &&
-/// !defined(CURL_DISABLE_HSTS)` at `lib/hsts.c:30` -- which has no
-/// counterpart here because HTTP/1.1 is unconditional in this crate and the
-/// capability vocabulary is closed at fifteen names in
-/// `curl-rs-lib/Cargo.toml`, none of which is an HTTP switch.
-///
-/// Its on-disk format is a frozen, consumer-visible contract and is NOT this
+/// The cache's on-disk format is a frozen, consumer-visible contract and is NOT this
 /// file's: the HSTS header carries no trailing blank line where the jar's
 /// does. Three files in this directory write three different headers and the
 /// three are deliberately not shared.
 #[cfg(feature = "hsts")]
 pub(crate) mod hsts;
 
-// ---------------------------------------------------------------------------
 // Everything below is the cookie engine, and every item carries
 // `#[cfg(feature = "cookies")]`. The FILE carries no top-level gate, because
 // `lib.rs` declares `pub(crate) mod cookies;` unconditionally and `netrc`
 // above must remain reachable under `--no-default-features`.
-// ---------------------------------------------------------------------------
 
 #[cfg(feature = "cookies")]
 use core::fmt;
@@ -279,6 +111,12 @@ use std::path::Path;
 
 #[cfg(feature = "cookies")]
 use crate::error::{CURLcode, CodeResult};
+// The two open flags for the jar's hardened save, from the one directory in
+// this crate allowed to name `libc`. They are injected into
+// `crate::util::fopen`, which may not import `crate::ffi` itself -- see that
+// module's hardening section and `crate::util`'s layering rule.
+#[cfg(feature = "cookies")]
+use crate::ffi::{O_CLOEXEC, O_NOFOLLOW};
 #[cfg(feature = "cookies")]
 use crate::util::dynbuf::DynBuf;
 #[cfg(feature = "cookies")]
@@ -293,6 +131,8 @@ use crate::util::llist;
 use crate::util::memrchr::memrchr;
 #[cfg(feature = "cookies")]
 use crate::util::parsedate::{self, Outcome};
+#[cfg(feature = "cookies")]
+use crate::util::redact::{Lossy, Redacted, RedactedOpt};
 #[cfg(feature = "cookies")]
 use crate::util::slist::SList;
 #[cfg(feature = "cookies")]
@@ -309,9 +149,7 @@ use crate::util::timeval::Clock;
 #[cfg(feature = "cookies")]
 use crate::util::CurlOffT;
 
-// ---------------------------------------------------------------------------
 // The limits -- `lib/cookie.h:66-102` and `lib/cookie.c:44`, `:372`.
-// ---------------------------------------------------------------------------
 
 /// `COOKIE_HASH_SIZE` -- `lib/cookie.h:54`.
 ///
@@ -334,11 +172,6 @@ pub(crate) const MAX_COOKIE_LINE: usize = 5000;
 
 /// `MAX_NAME` -- `lib/cookie.h:84`.
 ///
-/// RFC 6265 section 6.1 asks for *"at least 4096 bytes per cookie"*, and the
-/// 6265bis draft phrases it as a hard limit: *"If the sum of the lengths of
-/// the name string and the value string is more than 4096 octets, abort these
-/// steps and ignore the set-cookie-string entirely."*
-///
 /// The C applies it as three separate tests, not one, and the asymmetry is
 /// real: each of the name and the value must be **strictly less than**
 /// `MAX_NAME - 1`, while their sum must not **exceed** `MAX_NAME`
@@ -347,34 +180,14 @@ pub(crate) const MAX_COOKIE_LINE: usize = 5000;
 pub(crate) const MAX_NAME: usize = 4096;
 
 /// `MAX_DATE_LENGTH` -- `lib/cookie.c:372`.
-///
-/// The ceiling on an `Expires` attribute's length. The C's comment: *"The
-/// standard date formats are within the 30 bytes range. This adds an extra
-/// margin just to make sure it realistically works with what is used out
-/// there."* A longer value makes the whole attribute unrecognised, which
-/// leaves the cookie a session cookie rather than dropping it.
 #[cfg(feature = "cookies")]
 pub(crate) const MAX_DATE_LENGTH: usize = 80;
 
 /// `MAX_SET_COOKIE_AMOUNT` -- `lib/cookie.h:89`.
-///
-/// *"Maximum number of `Set-Cookie:` lines accepted in a single response. If
-/// more such header lines are received, they are ignored."* The C adds a
-/// constraint on the value itself -- *"This value must be less than 256 since
-/// an unsigned char is used to count"* -- and asserts it at
-/// `lib/cookie.c:952`. The counter is `u32` here, so the ceiling is not
-/// forced by a type; the assertion is kept as a test instead, because the
-/// value is part of the observable behaviour either way.
 #[cfg(feature = "cookies")]
 pub(crate) const MAX_SET_COOKIE_AMOUNT: u32 = 50;
 
 /// `MAX_COOKIE_HEADER_LEN` -- `lib/cookie.h:97`.
-///
-/// *"Maximum size for an outgoing cookie line libcurl will use in an http
-/// request. This is the default maximum length used in some versions of
-/// Apache httpd."* Applied by
-/// [`CookieInfo::cookie_header_value`], which is where the C applies it too
-/// -- at `lib/http.c:2559`, not in `lib/cookie.c`.
 #[cfg(feature = "cookies")]
 pub(crate) const MAX_COOKIE_HEADER_LEN: usize = 8190;
 
@@ -409,37 +222,16 @@ pub(crate) const COOKIE_PREFIX_SECURE: u32 = 1 << 0;
 pub(crate) const COOKIE_PREFIX_HOST: u32 = 1 << 1;
 
 /// `COOKIE_PIECES` -- `lib/cookie.c:379`.
-///
-/// The four spans `parse_cookie_header` accumulates before it commits any of
-/// them: `COOKIE_NAME` 0, `COOKIE_VALUE` 1, `COOKIE_DOMAIN` 2 and
-/// `COOKIE_PATH` 3 (`:374-377`). This implementation names the four fields of
-/// [`CookiePieces`] instead of indexing an array, so the count is here for
-/// provenance and is asserted against that struct by test.
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Provenance for CookiePieces; asserted by test.
 pub(crate) const COOKIE_PIECES: usize = 4;
 
 /// `CURL_OFF_T_MAX` for the 64-bit `curl_off_t` of all four mandated targets.
-///
-/// Used as the "no expiry information yet" sentinel for
-/// [`CookieInfo::next_expiration`] (`lib/cookie.c:1077`) and as the ceiling
-/// `curlx_str_number` is given for both `Max-Age` and the jar's expiry field.
-/// `TIME_T_MAX` in `cap_expires` is the same value on these targets, and the
-/// C uses both spellings for it.
 #[cfg(feature = "cookies")]
 pub(crate) const CURL_OFF_T_MAX: CurlOffT = CurlOffT::MAX;
 
 /// The three comment lines and the blank line that open a saved jar --
 /// `lib/cookie.c:1488-1491`, one `fputs`.
-///
-/// **Written unconditionally**, before any cookie and even when there are
-/// none at all: `tests/data/test1160` saves a jar from an empty store and
-/// requires exactly these bytes and nothing more.
-///
-/// **The trailing blank line is unique to the jar.** `hsts.rs` and
-/// `altsvc.rs` each write a two-line header with no blank line after it. Three
-/// files in this directory, three headers, deliberately not shared -- see the
-/// module header.
 #[cfg(feature = "cookies")]
 #[rustfmt::skip]
 pub(crate) const FILE_HEADER: &[u8] =
@@ -449,13 +241,6 @@ pub(crate) const FILE_HEADER: &[u8] =
       \n";
 
 /// The `#HttpOnly_` marker that opens a jar line for an `HttpOnly` cookie.
-///
-/// Read at `lib/cookie.c:672` with a **case-sensitive** `strncmp` and written
-/// at `:1436`. The C explains the format at `:667-671`: *"In 2008, Internet
-/// Explorer introduced HTTP-only cookies to prevent XSS attacks. Cookies
-/// marked httpOnly are not accessible to JavaScript. In Firefox's cookie
-/// files, they are prefixed `#HttpOnly_` and the rest remains as usual, so we
-/// skip 10 characters of the line."*
 #[cfg(feature = "cookies")]
 #[rustfmt::skip]
 const HTTPONLY_PREFIX: &[u8] = b"#HttpOnly_";
@@ -476,16 +261,6 @@ const TRUE_WORD: &[u8] = b"TRUE";
 const FALSE_WORD: &[u8] = b"FALSE";
 
 /// What the writer emits for a cookie with no domain -- `lib/cookie.c:1444`.
-///
-/// Reachable only for a cookie set from a `Set-Cookie:` header that carried
-/// no `Domain` attribute AND was added with no default domain, which is what
-/// `CURLOPT_COOKIELIST` and a header line inside a loaded cookie file both
-/// do. A cookie read from a jar line always has a domain, possibly the empty
-/// one, because `parse_netscape` assigns field 0 unconditionally.
-///
-/// Note that such a cookie is skipped by both the jar writer (`:1508-1509`)
-/// and `CURLINFO_COOKIELIST` (`:1573-1574`), so this literal is reached only
-/// through a direct call to [`get_netscape_format`].
 #[cfg(feature = "cookies")]
 #[rustfmt::skip]
 const UNKNOWN_DOMAIN: &[u8] = b"unknown";
@@ -498,12 +273,6 @@ const ROOT_PATH: &[u8] = b"/";
 
 /// The bytes that end a name in a `Set-Cookie:` header --
 /// `lib/cookie.c:457`, `curlx_str_cspn(&ptr, &name, ";\t\r\n=")`.
-///
-/// **The TAB is in this set and is NOT in [`VALUE_DELIMITERS`].** The
-/// difference is why a TAB inside a value survives as far as the explicit
-/// rejection at `:493-497`, and why `tests/data/test8`'s `cookie9` -- whose
-/// value is `junk--` followed by a TAB -- is accepted with the TAB trimmed
-/// off rather than rejected.
 #[cfg(feature = "cookies")]
 #[rustfmt::skip]
 const NAME_DELIMITERS: &[u8] = b";\t\r\n=";
@@ -537,24 +306,9 @@ const PREFIX_SECURE_NAME: &[u8] = b"__Secure-";
 #[rustfmt::skip]
 const PREFIX_HOST_NAME: &[u8] = b"__Host-";
 
-// ---------------------------------------------------------------------------
 // Small helpers that stand in for a C idiom rather than for a named function.
-// ---------------------------------------------------------------------------
 
 /// The `const char *` view of `bytes`: everything up to the first zero.
-///
-/// Every scan in `lib/cookie.c` runs over a NUL-terminated string, so a zero
-/// byte ends the input for `strlen` at `:443`, for `strcspn` at `:688`, for
-/// `curlx_str_cspn` at `:457` and for the `while(len && *p)` of
-/// `invalid_octets` at `:357`. Truncating once, at each entry point, makes
-/// every scan below total without a terminator emulation in each of them.
-///
-/// A cookie line therefore cannot contain a zero byte, which matches the way
-/// one arrives: `Curl_get_line` already truncates a jar line at the first
-/// zero (`lib/curl_get_line.c:46`), and a header value comes from a
-/// NUL-terminated buffer. `hsts.rs` and `netrc.rs` each solve the same
-/// problem the same way; the three helpers are independent because no module
-/// may widen its surface for another.
 #[cfg(feature = "cookies")]
 fn c_string(bytes: &[u8]) -> &[u8] {
     match bytes.iter().position(|&byte| byte == 0) {
@@ -566,52 +320,12 @@ fn c_string(bytes: &[u8]) -> &[u8] {
 /// `Curl_host_is_ipnum(host)` -- declared `lib/hostip.h:75`, and defined as
 /// exactly `Curl_inet_pton(AF_INET, host, &t) > 0 || Curl_inet_pton(AF_INET6,
 /// host, &t) > 0`.
-///
-/// Written out here, over [`crate::util::inet`], rather than reached for
-/// through `crate::dns`: the C's definition lives in `lib/hostip.c` and the
-/// cookie engine has no other reason to know about name resolution, so
-/// borrowing three lines is cheaper than a dependency edge this module would
-/// otherwise carry for the life of the crate.
-///
-/// **curl's `pton4` is strict**, which is load-bearing rather than
-/// incidental. It requires exactly four dotted octets, rejects a leading
-/// zero, and accepts no hexadecimal, octal or shorthand form -- so `127.1` is
-/// NOT an ipnum here even though a browser and `crate::url`'s
-/// `ipv4_normalize` both accept it, and `01.2.3.4` is not one either.
-/// `std::net::Ipv4Addr::from_str` has its own rules and is deliberately not
-/// used. `pton6` likewise rejects a zone identifier.
-///
-/// Two consumers depend on the strictness: [`cookiehash`], where every
-/// ipnum-shaped domain lands in bucket 0, and the `Domain` attribute check in
-/// [`parse_cookie_header`], where an ipnum host demands an exact domain match
-/// instead of a tail match. `tests/data/test8` turns on it -- `domain=.0.0.1`
-/// against host `127.0.0.1` must NOT match, and it does not, because `0.0.1`
-/// is not an ipnum while `127.0.0.1` is.
 #[cfg(feature = "cookies")]
 fn host_is_ipnum(host: &[u8]) -> bool {
     pton4(host).is_some() || pton6(host).is_some()
 }
 
 /// `Curl_getdate_capped` over a byte span.
-///
-/// [`crate::util::parsedate::getdate_capped`] is the designated successor of
-/// `Curl_getdate_capped` (`lib/parsedate.c:581-585`) and takes a [`str`],
-/// because its shape is a settled cross-crate contract that
-/// `curl-rs-ffi/src/ffi/misc.rs` produces a `&str` for. A `Set-Cookie:`
-/// header is not required to be valid text and this module never requires it
-/// to be, so the byte-native engine is called directly -- exactly what
-/// `parsedate.rs` documents `parsedate` as being `pub(crate)` for. The two
-/// map [`Outcome`] identically, and a test asserts they agree on every input
-/// that is valid text.
-///
-/// `Outcome::Later` is a SUCCESS, carrying `TIME_T_MAX`: the C's body is
-/// `return (rc == PARSEDATE_FAIL);`, so only a genuinely unparsable string is
-/// an error. The `-1`-to-`0` adjustment of the exported `curl_getdate` is NOT
-/// applied here, because this entry point reports failure out of band and
-/// needs no sentinel.
-///
-/// `hsts.rs` and `altsvc.rs` each carry the same three-line helper for the
-/// same reason.
 #[cfg(feature = "cookies")]
 fn getdate_capped(date: &[u8]) -> Option<CurlOffT> {
     match parsedate::parsedate(date) {
@@ -620,32 +334,41 @@ fn getdate_capped(date: &[u8]) -> Option<CurlOffT> {
     }
 }
 
-/// Writes `bytes` whole, mapping any failure to `CURLE_WRITE_ERROR`.
+/// Writes `bytes` whole, discarding a write failure exactly as the C does.
 ///
-/// The C ignores what `fputs` at `lib/cookie.c:1488` and `curl_mfprintf` at
-/// `:1524` return, so a full disk produces a truncated jar and a save that
-/// reports success. **This propagates instead**, and the divergence is
-/// recorded rather than buried:
+/// # Why the failure is discarded
 ///
-/// * No byte of a SUCCESSFUL save differs. The two behaviours are
-///   distinguishable only when the underlying write fails.
-/// * `cookie_output` already handles the error it cannot currently receive:
-///   the `error:` block at `:1547-1554` closes the handle and unlinks the
-///   temporary file, and the dropped return values are exactly what makes
-///   that block unreachable from a write failure. Propagating makes the C's
-///   own intent reachable rather than inventing new behaviour.
-/// * The alternative costs data. Ignoring the error renames a truncated
-///   temporary over the jar; propagating removes the temporary and leaves the
-///   jar as `Curl_fopen` left it.
-/// * No fixture can reach either path, because no fixture can make a write
-///   fail.
+/// `lib/cookie.c:1488` calls `fputs` and `:1524` calls `curl_mfprintf`, and
+/// **neither return value is read**. A full disk therefore produces a
+/// truncated jar and a save that reports success. That is the observable
+/// behaviour of curl 8.19.0-DEV, so it is the behaviour here.
 ///
-/// Contrast the warts listed in the module header, which ARE reproduced. Each
-/// of those is reachable from a test and observable in output; this one is
-/// neither. `hsts.rs` reaches the same conclusion for the same reason.
+/// An earlier revision of this function mapped the failure to
+/// `CURLE_WRITE_ERROR` and argued that doing so made `cookie_output`'s own
+/// `error:` block reachable and so preserved the C's intent. The argument was
+/// wrong on the only ground that matters: AAP 0.8.2 forbids a behaviour change
+/// justified by improvement -- *"a refactor that produces different-but-arguably-better
+/// output has failed"* -- and a save that returns `CURLE_WRITE_ERROR` where
+/// curl returns `CURLE_OK` changes an exit status the fixture corpus compares.
+/// It also changed what is left on disk: propagating unlinks the temporary
+/// file, so the jar stays as `Curl_fopen` truncated it, where the C renames the
+/// truncated temporary over it.
+///
+/// # What still propagates, and why that is not the same thing
+///
+/// `cookie_output`'s error channel is not empty; it just does not carry write
+/// failures. The C reaches its `error:` block from three places, and all three
+/// are reproduced: `Curl_fopen` failing (`:1483-1486`), the `calloc` of the
+/// sort array failing (`:1499-1503`), and `get_netscape_format` returning NULL
+/// (`:1519-1523`, `CURLE_OUT_OF_MEMORY`). See [`CookieInfo::write_to`].
+///
+/// `hsts.rs` reaches the same conclusion from the same reading of
+/// `lib/hsts.c`.
 #[cfg(feature = "cookies")]
-fn emit<W: Write>(out: &mut W, bytes: &[u8]) -> CodeResult<()> {
-    out.write_all(bytes).map_err(|_| CURLcode::WriteError)
+fn emit<W: Write>(out: &mut W, bytes: &[u8]) {
+    // `fputs`/`curl_mfprintf` evaluated as statements: the C does not look at
+    // the result, so neither does this.
+    let _ = out.write_all(bytes);
 }
 
 /// `strncmp(literal, span, span.len()) == 0` for a NUL-terminated literal.
@@ -660,41 +383,14 @@ fn emit<W: Write>(out: &mut W, bytes: &[u8]) -> CodeResult<()> {
 /// * `len > k` compares the literal's terminator against a real span byte and
 ///   differs, so a longer span never matches.
 /// * `len <= k` compares `len` bytes and no terminator is reached.
-///
-/// An EMPTY span therefore matches every literal, which is precisely how the
-/// jar's optional path field is absorbed -- see [`parse_netscape`] field 2.
-/// Spelling that out as `literal.starts_with(span)` is the whole function, and
-/// it is a named function so the call site can be read against the C without
-/// re-deriving the argument order.
 #[cfg(feature = "cookies")]
 fn strncmp_prefix(literal: &[u8], span: &[u8]) -> bool {
     literal.starts_with(span)
 }
 
-// ---------------------------------------------------------------------------
 // The diagnostic sink -- the successor of `infof`.
-// ---------------------------------------------------------------------------
 
 /// Where this module's diagnostics go.
-///
-/// `lib/cookie.c` calls `infof(data, ...)` at `:477`, `:490`, `:497`, `:522`,
-/// `:568`, `:802`, `:806`, `:868`, `:1029` and `:1109`, and `infof` is a
-/// macro that tests `Curl_trc_is_verbose(data)` BEFORE formatting anything
-/// (`lib/curl_trc.h:138-142`). The successor of that macro is
-/// [`crate::trace`], which is not among this file's declared dependencies, so
-/// the sink is injected -- the same shape [`psl`] uses for its list source,
-/// [`netrc`] for its home directory and `altsvc.rs` for its own four
-/// messages.
-///
-/// The argument is [`fmt::Arguments`] precisely so that the C's ordering
-/// survives: nothing is formatted unless an implementation chooses to look at
-/// it, so a transfer that is not verbose pays for no message here either.
-///
-/// The strings are reproduced verbatim because `--verbose` output is
-/// observable behaviour and AAP 0.8.1 freezes it. Two of them are compared by
-/// a fixture: `tests/data/test1105` expects `Restricted outgoing cookies due
-/// to header size` and `tests/data/test1160` the oversize report, so the
-/// wording is not merely conventional.
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Implemented by the transfer layer's trace bridge.
 pub(crate) trait CookieLog {
@@ -704,11 +400,6 @@ pub(crate) trait CookieLog {
 
 /// The sink that discards -- `lib/curl_trc.h:212-215`, the arm C compiles
 /// when tracing is disabled entirely.
-///
-/// Zero-sized, so passing it costs nothing. `altsvc.rs` declares a sibling of
-/// the same name for its own trait; the two are distinct paths and neither
-/// may reach for the other, because `altsvc` is gated on a different
-/// capability than this file's engine.
 #[cfg(feature = "cookies")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)] // Passed by a caller that is not tracing.
@@ -720,14 +411,6 @@ impl CookieLog for NoLog {
 }
 
 /// A byte span as text, for a diagnostic only.
-///
-/// The C prints cookie names, values and domains with `%s`, and those are raw
-/// bytes that no part of this module requires to be valid text. The one place
-/// they have to become text substitutes the replacement character for each
-/// invalid sequence, exactly as [`String::from_utf8_lossy`] does.
-///
-/// This affects a diagnostic and nothing else: no stored byte, no byte
-/// written to the jar and no byte on the wire passes through here.
 #[cfg(feature = "cookies")]
 struct Text<'a>(&'a [u8]);
 
@@ -739,12 +422,6 @@ impl fmt::Display for Text<'_> {
 }
 
 /// An optional byte span as text, printing `(nil)` for an absent one.
-///
-/// `lib/cookie.c:1029` hands `co->domain` and `co->path` to `infof` with
-/// `%s`, and either can be a null pointer at that point -- a cookie set from
-/// `CURLOPT_COOKIELIST` with no `Domain` attribute has both. glibc's printf
-/// renders a null `%s` as `(nil)`, which is what a curl built against it
-/// prints, so that is what this renders. It is a diagnostic only.
 #[cfg(feature = "cookies")]
 struct OptText<'a>(Option<&'a [u8]>);
 
@@ -760,12 +437,6 @@ impl fmt::Display for OptText<'_> {
 
 /// The header name a cookie file line may carry, and the 11 bytes both
 /// readers skip past it.
-///
-/// `checkprefix("Set-Cookie:", lineptr)` at `lib/cookie.c:1123` is
-/// case-INsensitive, and `lib/setopt.c`'s `cookielist()` uses the same
-/// predicate. The two then differ, and the difference is preserved: the file
-/// reader passes blanks afterwards (`:1126`) and `CURLOPT_COOKIELIST` does
-/// not.
 #[cfg(feature = "cookies")]
 #[rustfmt::skip]
 const SET_COOKIE_HEADER: &[u8] = b"Set-Cookie:";
@@ -780,19 +451,15 @@ const SET_COOKIE_HEADER: &[u8] = b"Set-Cookie:";
 #[allow(dead_code)] // Applied by the option surface, which is later code.
 pub(crate) const CURL_MAX_INPUT_LENGTH: usize = 8_000_000;
 
-// ---------------------------------------------------------------------------
 // `struct Cookie` -- `lib/cookie.h:30-45`.
-// ---------------------------------------------------------------------------
 
 /// One stored cookie.
 ///
 /// The C's fields one for one, minus the two intrusive list nodes: `node` for
 /// the bucket it lives in and `getnode` for the temporary list
-/// `Curl_cookie_getlist` builds. Both disappear because a Rust collection
-/// owns its elements rather than threading links through them, which is what
-/// AAP 0.6.9 replaces the intrusive lists with. The `getnode` in particular
-/// let the C put one cookie on two lists at once; [`CookieInfo::getlist`]
-/// returns borrowed references instead, so nothing is threaded anywhere.
+/// `Curl_cookie_getlist` builds. The `getnode` in particular let the C put one
+/// cookie on two lists at once; [`CookieInfo::getlist`] returns borrowed
+/// references instead, so nothing is threaded anywhere.
 ///
 /// # `None` and empty are DIFFERENT, and the difference is observable
 ///
@@ -809,20 +476,8 @@ pub(crate) const CURL_MAX_INPUT_LENGTH: usize = 8_000_000;
 /// * A cookie with **no value** is skipped by the header writer
 ///   (`lib/http.c:2551`); a cookie with an EMPTY value is sent as
 ///   `name=`. `tests/data/test46` requires exactly that: `Cookie: empty=;`.
-///
-/// So `value`, `path` and `domain` are `Option<Vec<u8>>` and `strstore`'s rule
-/// -- a zero length stores `""`, not a null pointer (`:265-268`) -- is
-/// reproduced where the C applies it and nowhere else.
-///
-/// `name` is not optional. `parse_cookie_header` refuses an empty one
-/// (`:474`) and `parse_netscape` cannot reach seven fields without assigning
-/// it, so the C's `co->name ? strlen(co->name) : 0` in `cookie_sort` (`:1200`)
-/// is defensive rather than reachable -- and `get_netscape_format` prints it
-/// with no fallback at all (`:1451`), which would be undefined if it could be
-/// null. An EMPTY name is reachable, from a jar line whose field 5 is empty,
-/// and is stored as such.
 #[cfg(feature = "cookies")]
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct Cookie {
     /// `char *name` -- *"`<this>` = value"*.
     name: Vec<u8>,
@@ -861,6 +516,56 @@ pub(crate) struct Cookie {
     prefix_secure: bool,
     /// `BIT(prefix_host)` -- the name began `__Host-`.
     prefix_host: bool,
+}
+
+/// The value is redacted; everything that decides matching is not.
+///
+/// # Why this is not `#[derive(Debug)]`
+///
+/// A cookie value IS a credential in the cases that matter. Session
+/// identifiers and authentication tokens are delivered as cookies, which is
+/// why `docs/cmdline-opts/cookie-jar.md` exists and why the jar this module
+/// writes is the file a user is told to protect. A derived formatter would
+/// render `value` verbatim, and this type is reachable from [`CookieInfo`],
+/// from the option surface and from every error path that mentions a jar, so
+/// any `{:?}` on a parent would have written a session cookie into a log.
+///
+/// Redacting at the LEAF is deliberate: a parent may derive `Debug` freely and
+/// still cannot disclose the value, because this is the only formatter that
+/// sees it. Auditing every parent instead would fail the first time somebody
+/// adds one.
+///
+/// # What renders, and why each is safe
+///
+/// `name`, `path`, `domain`, the expiry, the creation counter and all six
+/// flags render in full. They are the fields that decide whether a cookie
+/// matches a request (`lib/cookie.c:1253-1354`), so they are what a reader is
+/// debugging, and none of them authenticates anything: a name is chosen by the
+/// server and is routinely public, and a domain and path are visible on the
+/// wire in the request they scope.
+///
+/// Nothing about the stored bytes changes. [`Self::value`] still returns them
+/// verbatim, [`CookieInfo::get_list`] still composes the exact `Cookie:` header
+/// the C composes, and the jar written by [`CookieInfo::save_to_path`] is still
+/// byte-compatible with `lib/cookie.c`'s Netscape format.
+#[cfg(feature = "cookies")]
+impl fmt::Debug for Cookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cookie")
+            .field("name", &Lossy(&self.name))
+            .field("value", &RedactedOpt(self.value.as_deref()))
+            .field("path", &self.path.as_deref().map(Lossy))
+            .field("domain", &self.domain.as_deref().map(Lossy))
+            .field("expires", &self.expires)
+            .field("creationtime", &self.creationtime)
+            .field("tailmatch", &self.tailmatch)
+            .field("secure", &self.secure)
+            .field("livecookie", &self.livecookie)
+            .field("httponly", &self.httponly)
+            .field("prefix_secure", &self.prefix_secure)
+            .field("prefix_host", &self.prefix_host)
+            .finish()
+    }
 }
 
 #[cfg(feature = "cookies")]
@@ -943,9 +648,7 @@ impl Cookie {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The helper functions of `lib/cookie.c`, in the order the C declares them.
-// ---------------------------------------------------------------------------
 
 /// Caps an expiry at 400 days into the future -- `cap_expires`
 /// (`lib/cookie.c:52-61`).
@@ -960,14 +663,6 @@ impl Cookie {
 /// }
 /// ```
 ///
-/// The ceiling is *from RFC6265bis draft-19*, and the C states why the result
-/// is rounded: *"For the sake of easier testing, align the capped time to an
-/// even 60 second boundary."* The `+30` before the truncating division is what
-/// makes that alignment round to the NEAREST minute rather than down, so a
-/// fixture can assert a stable value whatever second it runs in --
-/// `tests/data/test31` and `test46` both use the harness's `%days[400]`
-/// substitution and depend on it.
-///
 /// Three details are easy to lose and each one is reproduced deliberately:
 ///
 /// * A session cookie is exempt. `co->expires && ...` leaves `0` alone, so
@@ -978,11 +673,6 @@ impl Cookie {
 ///   branch that is about to overwrite the expiry. So the cap actually applied
 ///   is `((now + COOKIES_MAXAGE + 30) / 60) * 60`, which can exceed
 ///   `now + COOKIES_MAXAGE` by up to 29 seconds.
-///
-/// The arithmetic is `saturating` throughout. The guard already excludes
-/// overflow on these targets, so saturation is unreachable rather than a
-/// behaviour change -- it is there because a signed overflow is a panic in a
-/// debug build, and a panic in this file could unwind into a C caller.
 #[cfg(feature = "cookies")]
 fn cap_expires(now: CurlOffT, expires: &mut CurlOffT) {
     // `:54` -- `co->expires &&` first, so a session cookie is untouched.
@@ -1013,11 +703,6 @@ fn cap_expires(now: CurlOffT, expires: &mut CurlOffT) {
 /// Whether `cookie_domain` tail-matches `hostname` -- `cookie_tailmatch`
 /// (`lib/cookie.c:73-100`).
 ///
-/// The C cites RFC 6265 4.1.2.3: *"For example, if the value of the Domain
-/// attribute is `example.com`, the user agent will include the cookie in the
-/// Cookie header when making HTTP requests to example.com, www.example.com,
-/// and www.corp.example.com."*
-///
 /// Three conditions, in the C's order:
 ///
 /// 1. The host must be at least as long as the domain (`:80-81`).
@@ -1027,13 +712,6 @@ fn cap_expires(now: CurlOffT, expires: &mut CurlOffT) {
 /// 3. Either the lengths are equal, or the byte immediately before the tail is
 ///    a dot (`:95-98`). That last clause is what stops `evilexample.com`
 ///    matching `example.com` while allowing `www.example.com` to.
-///
-/// The stored domain never carries a leading dot -- both parsers strip one --
-/// so condition 3 is not defeated by a `.example.com` spelling.
-///
-/// The byte before the tail is reached as the last byte of the head rather
-/// than by indexing `at - 1`, so no subtraction appears here and the check is
-/// total for every possible split point.
 #[cfg(feature = "cookies")]
 fn cookie_tailmatch(cookie_domain: &[u8], hostname: &[u8]) -> bool {
     // `:80-81`
@@ -1062,27 +740,21 @@ fn cookie_tailmatch(cookie_domain: &[u8], hostname: &[u8]) -> bool {
 /// Whether `cookie_path` matches `uri_path` -- `pathmatch`
 /// (`lib/cookie.c:106-156`), *"RFC6265 5.1.4 Paths and Path-Match"*.
 ///
-/// The C deviates from the RFC on purpose and says so at `:126-134`: the
-/// algorithm would truncate the URI path at its last `/`, but *"URL path
-/// /hoge?fuga=xxx means /hoge/index.cgi?fuga=xxx in some site without
-/// redirect. Ignore this algorithm because /hoge is uri path for this case"*.
-/// The truncation is therefore NOT performed here either.
-///
 /// * A cookie path of exactly one byte matches everything (`:112-116`). The
 ///   C's comment says *"cookie_path must be `/`"*, and a stored path always
 ///   is, because [`sanitize_cookie_path`] refuses anything that does not start
 ///   with one.
 /// * An empty URI path, or one that does not begin with `/`, is treated as
-///   `"/"` (`:118-119`). Fragments are already gone: *"#-fragments are already
+///   `"/"` (`:119-121`). Fragments are already gone: *"#-fragments are already
 ///   cut off!"*
-/// * A URI path shorter than the cookie path cannot match (`:138-139`).
+/// * A URI path shorter than the cookie path cannot match (`:135-136`).
 /// * The prefix comparison is **case-SENSITIVE**, and the C comments the
 ///   reason on the line itself: *"not using checkprefix() because matching
-///   should be case-sensitive"* (`:141-142`). `tests/data/test8` depends on
+///   should be case-sensitive"* (`:138-139`). `tests/data/test8` depends on
 ///   it: a cookie for `/WE` is not sent for `/we/want/8`.
-/// * Equal lengths match (`:145-148`); otherwise the URI path must have a `/`
+/// * Equal lengths match (`:143-146`); otherwise the URI path must have a `/`
 ///   at the cookie path's length, so `/login` matches `/login/en` but not
-///   `/loginhelper` (`:151-154`).
+///   `/loginhelper` (`:149-152`).
 #[cfg(feature = "cookies")]
 fn pathmatch(cookie_path: &[u8], uri_path: &[u8]) -> bool {
     // `:112-116`
@@ -1090,29 +762,29 @@ fn pathmatch(cookie_path: &[u8], uri_path: &[u8]) -> bool {
         return true;
     }
 
-    // `:118-119`
+    // `:119-121`
     let uri_path = if uri_path.is_empty() || uri_path.first() != Some(&b'/') {
         ROOT_PATH
     } else {
         uri_path
     };
 
-    // `:138-139`
+    // `:135-136`
     if uri_path.len() < cookie_path.len() {
         return false;
     }
 
-    // `:141-142` -- `strncmp`, case-sensitive, over `cookie_path_len` bytes.
+    // `:138-139` -- `strncmp`, case-sensitive, over `cookie_path_len` bytes.
     if !uri_path.starts_with(cookie_path) {
         return false;
     }
 
-    // `:145-148`
+    // `:143-146`
     if cookie_path.len() == uri_path.len() {
         return true;
     }
 
-    // `:151-154` -- `uri_path[cookie_path_len] == '/'`. The index is known to
+    // `:149-152` -- `uri_path[cookie_path_len] == '/'`. The index is known to
     // be inside the slice by the length test above, but it is still reached
     // through `get` so that no arithmetic here can ever be the reason this
     // file panics.
@@ -1122,19 +794,6 @@ fn pathmatch(cookie_path: &[u8], uri_path: &[u8]) -> bool {
 /// The last two labels of `domain` -- `get_top_domain`
 /// (`lib/cookie.c:161-180`), *"Return the top-level domain, for optimal
 /// hashing."*
-///
-/// Two backward searches for a dot: the last one, then the last one before
-/// that. The span returned starts one byte after the second dot, so
-/// `www.corp.example.com` yields `example.com` and `example.com` yields
-/// itself. A domain with no dot at all, or with exactly one, is returned
-/// whole.
-///
-/// **Used only for hashing.** No matching decision consults it, so the fact
-/// that it collapses `a.example.com` and `b.example.com` onto one bucket is
-/// the point rather than a loss of precision.
-///
-/// `memchr::memrchr` is [`crate::util::memrchr`], the successor of the C's
-/// own `memrchr` fallback at `lib/curl_memrchr.c`.
 #[cfg(feature = "cookies")]
 fn get_top_domain(domain: &[u8]) -> &[u8] {
     // `:169` -- `last = memrchr(domain, '.', len);`
@@ -1177,16 +836,6 @@ fn get_top_domain(domain: &[u8]) -> &[u8] {
 /// bucket, which would reorder `CURLINFO_COOKIELIST` -- an output a fixture
 /// compares. So it is implemented here, privately, and `crate::util::hash` is
 /// a context-only dependency of this file.
-///
-/// `h` is `size_t` in the C, which is 64 bits on all four mandated targets, so
-/// the accumulator is `u64` here. The C's `h += h << 5` overflows silently and
-/// is expected to; `wrapping_shl`-free `wrapping_add` and `wrapping_shl` say
-/// so explicitly, because a debug build would otherwise panic on the same
-/// input a release build hashes happily.
-///
-/// The upper-case fold is [`crate::util::strcase::raw_toupper`], the
-/// successor of `Curl_raw_toupper` the C calls here; it folds the 26 ASCII
-/// letters and nothing else, whatever the locale.
 #[cfg(feature = "cookies")]
 fn cookie_hash_domain(domain: &[u8]) -> usize {
     let mut h: u64 = 5381;
@@ -1214,13 +863,6 @@ fn cookie_hash_domain(domain: &[u8]) -> usize {
 /// top = get_top_domain(domain, &len);
 /// return cookie_hash_domain(top, len);
 /// ```
-///
-/// **Every ipnum-shaped domain lands in bucket 0, and so does every cookie
-/// with no domain at all.** That is not a degenerate case to be improved: it
-/// is what makes a lookup by host work, because a request to `127.0.0.1`
-/// hashes to bucket 0 too and would otherwise never find its own cookies.
-/// [`host_is_ipnum`] records why the strictness of curl's `pton4` is
-/// load-bearing here.
 #[cfg(feature = "cookies")]
 fn cookiehash(domain: Option<&[u8]>) -> usize {
     // `:217-218`
@@ -1285,22 +927,6 @@ fn sanitize_cookie_path(cookie_path: &[u8]) -> Vec<u8> {
 /// ```text
 /// cookie-octet = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
 /// ```
-///
-/// *"But Firefox and Chrome as of June 2022 accept space, comma and
-/// double-quotes fine. The prime reason for filtering out control bytes is
-/// that some HTTP servers return 400 for requests that contain such."* So
-/// what is actually rejected is `\x01` through `\x1f` **except `\x09` (TAB)**,
-/// plus `\x7f`, and **space, comma and double-quote are accepted**. Every
-/// byte at or above `\x80` is accepted too, which `tests/data/test31` relies
-/// on: it sets a cookie whose name and value are both non-UTF-8 and requires
-/// them in the saved jar.
-///
-/// The C's loop is `while(len && *p)`, so a zero byte ends the scan and any
-/// byte after it goes unexamined. Every span reaching here has already been
-/// through [`c_string`], so there is no zero to stop at and the two agree.
-///
-/// TAB being accepted here is why the value gets a SEPARATE rejection at
-/// `:493-497`; the name needs none, because a TAB terminates a name.
 #[cfg(feature = "cookies")]
 fn invalid_octets(span: &[u8]) -> bool {
     span.iter().any(|&byte| {
@@ -1326,13 +952,6 @@ fn invalid_octets(span: &[u8]) -> bool {
 /// return TRUE;
 /// ```
 ///
-/// **`#ifndef USE_LIBPSL` only.** The C's comment states the purpose:
-/// *"Without PSL we do not know when the incoming cookie is set on a TLD or
-/// otherwise `protected` suffix. To reduce risk, we require a dot OR the exact
-/// hostname being `localhost`."* So this is the no-list arm's whole defence,
-/// and `docs/HTTP-COOKIES.md` is candid about how thin it is: without a list
-/// curl *"has no ability to stop super cookies"*.
-///
 /// Two measured details:
 ///
 /// * The dot found is the FIRST one, and *"that dot must not be a trailing
@@ -1341,9 +960,6 @@ fn invalid_octets(span: &[u8]) -> bool {
 ///   which `tests/data/test46` depends on.
 /// * The `localhost` test is exact and length-gated, so `localhost.` and
 ///   `mylocalhost` both fall through to the dot rule.
-///
-/// [`is_public_suffix`] decides at run time which of the two C arms applies;
-/// see there for the mapping.
 #[cfg(feature = "cookies")]
 fn bad_domain(domain: &[u8]) -> bool {
     // `:330-331` -- exact length nine, folded case.
@@ -1362,40 +978,10 @@ fn bad_domain(domain: &[u8]) -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
 // `struct CookieInfo` -- `lib/cookie.h:56-64`. The jar.
-// ---------------------------------------------------------------------------
 
 /// The cookie store.
-///
-/// The C's fields one for one, with `struct Curl_llist cookielist[63]`
-/// becoming an array of [`VecDeque`] of the same length.
-///
-/// # It is an ARRAY, and it must never become a map
-///
-/// `cookie_list` (`lib/cookie.c:1568-1590`) backs `CURLINFO_COOKIELIST` by
-/// walking the buckets in index order and, within each, in insertion order,
-/// emitting one formatted line per cookie **without sorting anything**. So the
-/// order of that list is a function of the bucket count, of
-/// [`cookie_hash_domain`], and of the order cookies arrived in -- all three of
-/// which are reproduced exactly. A [`std::collections::HashMap`] keyed by
-/// domain would iterate in an order randomised per process and would change
-/// that output run to run; `HashMap::retain` additionally has the opposite
-/// polarity to the C's removal predicates. Neither substitution is available
-/// here.
-///
-/// [`VecDeque`] rather than [`Vec`] is the shape [`crate::util::llist`]
-/// supersedes `Curl_llist` with, and its helpers are used for the removals so
-/// that the C's disposal ORDER is explicit at the call site rather than
-/// inherited from drop glue.
-///
-/// # Locking
-///
-/// Every method that takes `&mut self` requires `CURL_LOCK_DATA_COOKIE` with
-/// `CURL_LOCK_ACCESS_SINGLE`; see the module header for the full transition
-/// contract that `crate::share` is to implement.
 #[cfg(feature = "cookies")]
-#[derive(Debug)]
 pub(crate) struct CookieInfo {
     /// `struct Curl_llist cookielist[COOKIE_HASH_SIZE]` -- *"linked lists of
     /// cookies we know of"*.
@@ -1422,6 +1008,34 @@ pub(crate) struct CookieInfo {
     newsession: bool,
 }
 
+/// Counts and flags, never the jar's contents.
+///
+/// A derived formatter would render all 63 lists, which is every cookie this
+/// process holds -- the single largest credential disclosure available in this
+/// crate, and one a `{:?}` in an unrelated error path would have produced.
+/// [`Cookie`]'s own formatter already redacts each value, so this could safely
+/// have listed them; it does not, because a jar of a thousand cookies makes a
+/// diagnostic unreadable, and the counts are what a reader of a store-level
+/// message actually wants. A caller that genuinely needs one cookie can format
+/// that cookie.
+#[cfg(feature = "cookies")]
+impl fmt::Debug for CookieInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CookieInfo")
+            .field("lists", &self.cookielist.len())
+            .field(
+                "held",
+                &self.cookielist.iter().map(VecDeque::len).sum::<usize>(),
+            )
+            .field("next_expiration", &self.next_expiration)
+            .field("numcookies", &self.numcookies)
+            .field("lastct", &self.lastct)
+            .field("running", &self.running)
+            .field("newsession", &self.newsession)
+            .finish()
+    }
+}
+
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Constructed by the option surface, which is later code.
 impl Default for CookieInfo {
@@ -1443,10 +1057,12 @@ impl CookieInfo {
     /// translation, because a Rust collection owns its elements and a cookie
     /// moved out of one is not freed by the move.
     ///
-    /// The C returns NULL on out of memory, which has no counterpart: an
-    /// allocation failure aborts in Rust, and the option surface that calls
-    /// this is the layer that maps a construction failure to
-    /// `CURLE_OUT_OF_MEMORY` in the C.
+    /// The C returns NULL on out of memory, which has no counterpart: the
+    /// `calloc` it guards is a FIXED-SIZE allocation, whose size this module chooses rather than a caller, and which has no stable fallible spelling at the declared minimum Rust version (`Box::try_new` is unstable), and
+    /// the option surface that calls this is the layer that maps a construction
+    /// failure to `CURLE_OUT_OF_MEMORY` in the C. This is deliberately not the
+    /// same case as the externally sized allocations
+    /// [`crate::util::fallible`] covers.
     pub(crate) fn new() -> Self {
         Self {
             // `:1071-1072` -- all 63, in order. `vec!` rather than an array
@@ -1492,24 +1108,12 @@ impl CookieInfo {
     }
 
     /// Sets the `newsession` flag.
-    ///
-    /// The C writes it inside `cookie_load` from the argument
-    /// `data->set.cookiesession` (`lib/cookie.c:1099`), so a store loaded
-    /// with no file never has it set. [`Self::load`] does the same; this
-    /// setter exists for the option surface, which must be able to record
-    /// `CURLOPT_COOKIESESSION` before any file is named.
     pub(crate) fn set_newsession(&mut self, newsession: bool) {
         self.newsession = newsession;
     }
 
     /// Marks the store as running -- `Curl_cookie_run`
     /// (`lib/cookie.c:1630-1636`).
-    ///
-    /// The C's whole body, inside the cookie lock, is
-    /// `if(data->cookies) data->cookies->running = TRUE;`. From here on a
-    /// `secure` cookie arriving in a header requires a secure context, and a
-    /// `secure` cookie arriving from a file is accepted -- the inversion the
-    /// two parsers document.
     pub(crate) fn run(&mut self) {
         self.running = true;
     }
@@ -1524,11 +1128,6 @@ impl CookieInfo {
     }
 
     /// Drops every cookie -- `Curl_cookie_clearall` (`lib/cookie.c:1361-1377`).
-    ///
-    /// All 63 buckets, and `numcookies` back to zero. `next_expiration` is
-    /// **not** reset, which is the C's behaviour and not an oversight: the
-    /// field is a lower bound on when a scan becomes worthwhile, and leaving
-    /// it where it was only ever costs one unnecessary scan of an empty store.
     ///
     /// [`llist::dispose_tail_first`] rather than [`VecDeque::clear`] because
     /// the C disposes through `Curl_node_remove` in list order and the helper
@@ -1545,13 +1144,6 @@ impl CookieInfo {
 
     /// Drops every session cookie -- `Curl_cookie_clearsess`
     /// (`lib/cookie.c:1384-1405`).
-    ///
-    /// A session cookie is one with `expires == 0`, and the count is
-    /// decremented per removal rather than recomputed. The C walks with a
-    /// look-ahead pointer *"in case the node is removed, get it early"*; here
-    /// the walk runs backwards over indices instead, which needs no
-    /// look-ahead because removing at a higher index cannot disturb a lower
-    /// one.
     pub(crate) fn clearsess(&mut self) {
         for bucket in &mut self.cookielist {
             // `:1391-1403`
@@ -1571,24 +1163,11 @@ impl CookieInfo {
 
     /// Tears the store down -- `Curl_cookie_cleanup`
     /// (`lib/cookie.c:1412-1417`).
-    ///
-    /// The C's body is `Curl_cookie_clearall(ci); free(ci);`. The free has no
-    /// counterpart -- dropping the value is the free -- so what remains is the
-    /// clear, and this method exists so that a caller holding the store behind
-    /// a shared handle can empty it without dropping it. That is exactly the
-    /// case `Curl_flush_cookies` distinguishes at `:1647`.
     pub(crate) fn cleanup(&mut self) {
         self.clearall();
     }
 
     /// Removes expired cookies -- `remove_expired` (`lib/cookie.c:281-323`).
-    ///
-    /// The C's own description: *"Remove expired cookies from the hash by
-    /// inspecting the expires timestamp on each cookie in the hash, freeing
-    /// and deleting any where the timestamp is in the past. If the cookiejar
-    /// has recorded the next timestamp at which one or more cookies expire,
-    /// then processing will exit early in case this timestamp is in the
-    /// future."*
     ///
     /// Four details, each reproduced as written:
     ///
@@ -1604,8 +1183,6 @@ impl CookieInfo {
     /// * **Session cookies are exempt.** The outer `if(co->expires)` (`:307`)
     ///   skips them, so they neither expire nor contribute to the next
     ///   deadline.
-    ///
-    /// The clock is the WALL clock -- the C's `time(NULL)` at `:284`.
     pub(crate) fn remove_expired(&mut self, clock: &dyn Clock) {
         // `:284`
         let now = clock.epoch_secs();
@@ -1650,23 +1227,11 @@ impl CookieInfo {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The `Set-Cookie:` parser -- `lib/cookie.c:374-648`.
-// ---------------------------------------------------------------------------
 
 /// The four spans `parse_cookie_header` accumulates before committing any of
 /// them -- `struct Curl_str cookie[COOKIE_PIECES]` (`lib/cookie.c:444`) with
 /// the four indices of `:374-377`.
-///
-/// Named fields rather than an array, because the C's indices are only ever
-/// used as literals and a named field cannot be confused for a neighbour. The
-/// C's `memset` initialisation -- with the comment *"memset instead of
-/// initializer because gcc 4.8.1 is silly"* -- becomes [`Default`].
-///
-/// Accumulating rather than assigning as it goes is what makes the attributes
-/// LAST-WINS: `domain=a; domain=b` stores `b`, because the second assignment
-/// simply overwrites the field. `tests/data/test8` and `test31` both send a
-/// doubled `domain` attribute and depend on it.
 #[cfg(feature = "cookies")]
 #[derive(Clone, Copy, Debug, Default)]
 struct CookiePieces<'a> {
@@ -1686,11 +1251,6 @@ struct CookiePieces<'a> {
 /// Commits the four accumulated spans onto the cookie -- `storecookie`
 /// (`lib/cookie.c:381-423`).
 ///
-/// The name and the value are stored through the C's `strstore`, whose rule is
-/// that **a zero length stores `""` rather than a null pointer**
-/// (`:263-266`). So a `Set-Cookie: a=` yields an EMPTY value, not an absent
-/// one, and is later sent as `a=`.
-///
 /// The path is the interesting one (`:388-407`):
 ///
 /// * A non-empty `Path` attribute is used as given.
@@ -1707,9 +1267,13 @@ struct CookiePieces<'a> {
 /// The domain is the same shape: the attribute if it has one, else the default
 /// host if there is one, else absent (`:409-419`).
 ///
-/// The C returns `CURLE_OUT_OF_MEMORY` from every one of these stores. There
-/// is no counterpart: a Rust allocation failure aborts rather than returning,
-/// so this function cannot fail and does not pretend to.
+/// The C returns `CURLE_OUT_OF_MEMORY` from every one of these stores, each of
+/// which is a `strdup` of a field already parsed out of the header -- bytes that
+/// are already resident, with no amplification -- and string duplication has no
+/// stable fallible spelling at the declared minimum Rust version. So this
+/// function cannot fail and does not pretend to. The externally sized
+/// allocations on the cookie path, the ones [`crate::util::fallible`] covers,
+/// are the jar's buffer growth.
 #[cfg(feature = "cookies")]
 fn storecookie(
     cookie: &mut Cookie,
@@ -1755,13 +1319,6 @@ fn storecookie(
 }
 
 /// The inputs `Curl_cookie_add` carries besides the line itself.
-///
-/// The C passes them as five separate parameters (`lib/cookie.c:935-943`) plus
-/// a read of `data->req.setcookies`. They are bundled because the successor of
-/// `data` is not one object here -- the store, the clock, the diagnostic sink
-/// and the public-suffix list are all injected separately -- and because
-/// eleven parameters on one function is a lint failure under this workspace's
-/// `too-many-arguments-threshold`.
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Built by every caller of `CookieInfo::add`.
 #[derive(Clone, Copy, Debug)]
@@ -1795,12 +1352,6 @@ pub(crate) struct AddContext<'a> {
 /// Parses one `Set-Cookie:` header value -- `parse_cookie_header`
 /// (`lib/cookie.c:427-648`).
 ///
-/// `true` means the C's `*okay`: the pieces were committed and the caller may
-/// proceed. `false` is every one of the C's `return CURLE_OK` refusals, each of
-/// which leaves nothing stored. The C additionally returns
-/// `CURLE_OUT_OF_MEMORY` from `storecookie`; there is no counterpart, so there
-/// is no error channel here.
-///
 /// # The pair loop
 ///
 /// ```text
@@ -1815,11 +1366,6 @@ pub(crate) struct AddContext<'a> {
 ///   }
 /// } while(!curlx_str_single(&ptr, ';'));
 /// ```
-///
-/// `sep` records whether an `=` was consumed, which is how a stand-alone word
-/// such as `secure` is told from an attribute with an empty value. The two
-/// delimiter sets differ by one byte and the difference is load-bearing: see
-/// [`NAME_DELIMITERS`].
 ///
 /// # Preserved warts, each with its line
 ///
@@ -1849,12 +1395,11 @@ pub(crate) struct AddContext<'a> {
 ///
 /// # Every unrecognised attribute is ignored, `SameSite` included
 ///
-/// The dispatch chain ends without an `else`, so anything it does not
-/// recognise falls out of the loop and is forgotten. `SameSite` is one of
-/// those: `grep -rin samesite lib/` over curl 8.19.0-DEV returns **zero**
-/// hits, so it is not implemented at all and must not be implemented here.
-/// Honouring it would change which cookies are sent, which is a behaviour
-/// change AAP 0.8.2 forbids outright.
+/// The dispatch chain ends without an `else`, so anything it does not recognise
+/// falls out of the loop and is forgotten. `SameSite` is one of those: it has
+/// no implementation anywhere in curl 8.19.0-DEV's `lib/`, so it must not be
+/// implemented here. Honouring it would change which cookies are sent, which is
+/// a behaviour change.
 #[cfg(feature = "cookies")]
 fn parse_cookie_header(
     cookie: &mut Cookie,
@@ -2053,9 +1598,6 @@ fn parse_cookie_header(
 ///   The C's comment: *"we always do that if the domain name was given"*. So
 ///   an ipnum domain is stored with `tailmatch` FALSE and is written to the
 ///   jar without a leading dot.
-///
-/// The `USE_LIBPSL` arm is selected at run time from `use_libpsl`; see
-/// [`is_public_suffix`] for the whole mapping.
 #[cfg(feature = "cookies")]
 fn parse_domain_attribute<'a>(
     cookie: &mut Cookie,
@@ -2130,12 +1672,6 @@ fn parse_domain_attribute<'a>(
 }
 
 /// The `Max-Age` attribute -- `lib/cookie.c:574-601`.
-///
-/// The C quotes RFC 2109: *"Optional. The Max-Age attribute defines the
-/// lifetime of the cookie, in seconds. The delta-seconds value is a decimal
-/// non-negative integer. After delta-seconds seconds elapse, the client should
-/// discard the cookie. A value of zero means the cookie should be discarded
-/// immediately."*
 ///
 /// ```text
 /// if(*maxage == '\"') maxage++;                 /* ONE leading quote */
@@ -2213,10 +1749,6 @@ fn parse_max_age(
 
 /// The `Expires` attribute -- `lib/cookie.c:602-627`.
 ///
-/// The C's comment: *"Let max-age have priority. If the date cannot get parsed
-/// for whatever reason, the cookie will be treated as a session cookie."* The
-/// priority is enforced by the caller's `!co->expires` guard, not here.
-///
 /// ```text
 /// if(!Curl_getdate_capped(dbuf, &date)) {
 ///   if(!date) date++;
@@ -2227,18 +1759,6 @@ fn parse_max_age(
 /// if(!now) now = time(NULL);
 /// cap_expires(now, co);
 /// ```
-///
-/// `if(!date) date++` is what keeps a date that genuinely falls on the epoch
-/// from being mistaken for the session-cookie marker, and it is the mirror of
-/// the `-1`-to-`0` adjustment the exported `curl_getdate` makes for its own
-/// sentinel. A date far in the future arrives here already saturated at
-/// `TIME_T_MAX` by [`getdate_capped`], and [`cap_expires`] then pulls it back
-/// to 400 days out.
-///
-/// The C copies the span into an 81-byte stack buffer to terminate it; the
-/// caller's `strlen(val) < MAX_DATE_LENGTH` guard is what makes that copy
-/// safe. The guard is preserved, the buffer is not needed, and the byte span
-/// goes straight to the parser.
 #[cfg(feature = "cookies")]
 fn parse_expires(
     cookie: &mut Cookie,
@@ -2262,30 +1782,10 @@ fn parse_expires(
     cap_expires(*now, &mut cookie.expires);
 }
 
-// ---------------------------------------------------------------------------
 // The jar reader -- `parse_netscape` (`lib/cookie.c:650-772`).
-// ---------------------------------------------------------------------------
 
 /// Parses one line of a Netscape cookie jar -- `parse_netscape`
 /// (`lib/cookie.c:650-772`).
-///
-/// `true` means the C's `*okay`. The C's own framing: *"This line is NOT an
-/// HTTP header style line, we do offer support for reading the odd netscape
-/// cookies-file format here."*
-///
-/// Seven TAB-separated fields, split with `len = strcspn(ptr, "\t\r\n")` and
-/// `next = (ptr[len] == '\t' ? &ptr[len + 1] : NULL)`. So a line ending in a
-/// TAB has one more field -- an empty one -- than a line that does not, which
-/// is exactly how `tests/data/test46`'s `empty` cookie gets an empty value.
-///
-/// # THE ORDER OF THE FIRST TWO TESTS MATTERS
-///
-/// `#HttpOnly_` is looked for FIRST (`:672-675`) and only then is a leading
-/// `#` treated as a comment (`:677-679`). Reversing them would make every
-/// `HttpOnly` line a comment and silently lose those cookies on every load.
-/// The prefix test is `strncmp`, so it is **case-sensitive**;
-/// `docs/HTTP-COOKIES.md` says the same: `#` lines are comments *"An exception
-/// is lines that start with `#HttpOnly_`"*.
 ///
 /// # What each field does, and which ones can drop the line
 ///
@@ -2298,9 +1798,6 @@ fn parse_expires(
 /// | 4 | expires | a number-parse failure DROPS the line |
 /// | 5 | name | the two prefix tests, **case-INsensitive** here |
 /// | 6 | value | stored |
-///
-/// Then `fields == 6` supplies an empty value and counts it, and `fields != 7`
-/// drops the line (`:753-765`).
 ///
 /// # The three counter-intuitive readings, each measured from the C
 ///
@@ -2328,12 +1825,6 @@ fn parse_expires(
 /// deliberate.** A jar being read into a store that is already running is
 /// trusted with its `secure` cookies; a header on an insecure connection is
 /// not. Both are reproduced verbatim and neither is harmonised.
-///
-/// # The prefix asymmetry
-///
-/// `:744` and `:746` use `curl_strnequal`, so `__secure-` in a jar file sets
-/// the prefix bit where `__secure-` in a header does not. Deliberate, and
-/// preserved.
 #[cfg(feature = "cookies")]
 fn parse_netscape(
     cookie: &mut Cookie,
@@ -2504,11 +1995,6 @@ fn parse_netscape(
 ///     return CURLE_OK;
 /// }
 /// ```
-///
-/// Written as a function only because field 2 falls through into it, and a
-/// `match` arm cannot fall through to the next. **The gate is `secure ||
-/// running`, with no negation** -- the header parser's is `secure ||
-/// !running`. See [`parse_netscape`].
 #[cfg(feature = "cookies")]
 fn parse_netscape_secure(
     cookie: &mut Cookie,
@@ -2532,24 +2018,12 @@ fn parse_netscape_secure(
     true
 }
 
-// ---------------------------------------------------------------------------
 // The public-suffix check -- `is_public_suffix` (`lib/cookie.c:774-819`).
-// ---------------------------------------------------------------------------
 
 /// The public-suffix list, injected.
 ///
 /// `lib/psl.c` reaches its list through `data->multi->psl` or
-/// `data->share->psl` and its own `Curl_psl_use`/`Curl_psl_release` pair. The
-/// successor of that ownership question is `crate::share`, which does not
-/// exist yet, so the two halves a check needs -- the cache to consult and the
-/// source to refresh it from -- are handed in together.
-///
-/// **`None` is not the same as a `Some` that cannot load.** `None` is the C's
-/// `#ifndef USE_LIBPSL` build: there is no list and there never was going to
-/// be one, so no cookie is dropped on public-suffix grounds and
-/// [`bad_domain`] is the only defence. A `Some` whose source cannot produce a
-/// list is the `#ifdef` arm with a null list, and that FAILS CLOSED. See
-/// [`is_public_suffix`].
+/// `data->share->psl` and its own `Curl_psl_use`/`Curl_psl_release` pair.
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Built by `crate::share`, which is later code.
 pub(crate) struct PslContext<'a> {
@@ -2617,24 +2091,6 @@ impl fmt::Debug for PslContext<'_> {
 ///   is [`psl::is_cookie_domain_acceptable`]'s.
 /// * **`psl` is `Some` and no list loads** -- the `#ifdef` arm with a null
 ///   `psl_ctx_t`. **Fails closed**, with the C's exact message.
-///
-/// # The 256-byte buffers drop a long domain in SILENCE
-///
-/// The C lowers both names into fixed `char[256]` stack buffers, and when
-/// either is too long it **skips the check with `acceptable` still FALSE** --
-/// so the cookie is dropped, and the length is not mentioned in any
-/// diagnostic. That is reproduced, using [`psl::MAX_PSL_DOMAIN_LEN`] so that
-/// the two files cannot disagree about the number. Note the C's `dlen <
-/// sizeof(lcase)` is strict, because `Curl_strntolower` is asked for
-/// `dlen + 1` bytes to copy the terminator too.
-///
-/// # The guard, term by term
-///
-/// `data` has no counterpart. `domain` is the default domain, so a cookie
-/// added with no request host -- from a file, or from `CURLOPT_COOKIELIST` --
-/// is NEVER checked; the C's own `CURLOPT_COOKIELIST` manual page warns about
-/// that. `co->domain` absent means nothing to check. And an ipnum cookie
-/// domain is exempt, because a bare address has no public suffix.
 #[cfg(feature = "cookies")]
 fn is_public_suffix(
     psl: Option<&mut PslContext<'_>>,
@@ -2703,9 +2159,7 @@ fn is_public_suffix(
     false
 }
 
-// ---------------------------------------------------------------------------
 // Supersession -- `replace_existing` (`lib/cookie.c:822-924`).
-// ---------------------------------------------------------------------------
 
 /// What [`replace_existing`] decided.
 #[cfg(feature = "cookies")]
@@ -2726,46 +2180,7 @@ enum Replacement {
 /// Removes any cookie the new one supersedes -- `replace_existing`
 /// (`lib/cookie.c:822-924`).
 ///
-/// **One walk over the bucket, two independent tests.** The C's single loop
-/// body contains two `if(!strcmp(clist->name, co->name))` blocks that do
-/// different jobs, and only the second is guarded by `!replace_n` -- so the
-/// first runs against EVERY cookie in the bucket even after a replacement
-/// candidate has been found.
-///
-/// # Test A -- a non-secure cookie may not overlay a secure one
-///
-/// `:836-873`, and the C states the rule with an example: *"A non-secure
-/// cookie may not overlay an existing secure cookie. For an existing cookie
-/// `a` with path `/login`, refuse a new cookie `a` with for example path
-/// `/login/en`, while the path `/loginhelper` is ok."*
-///
-/// It applies when the names are equal (`strcmp`, **case-sensitive**), the
-/// domains are equal (`curl_strequal`, case-insensitive, or both absent), BOTH
-/// have paths, and `clist->secure && !co->secure && !secure`. The prefix
-/// length compared is the offset of the **second** `/` in the existing path --
-/// `strchr(clist->path + 1, '/')` -- or the whole path when there is no second
-/// one. `docs/HTTP-COOKIES.md` records that this protection is implemented.
-///
-/// # Test B -- the replacement candidate
-///
-/// `:875-908`. Names equal; domains equal **and `tailmatch` equal**, or both
-/// domains absent; then paths must be equal (`curl_strequal`) and an
-/// absent-against-present path disqualifies (`!clist->path != !co->path`).
-///
-/// The last condition is the one worth naming: `if(replace_old &&
-/// !co->livecookie && clist->livecookie) return FALSE;` -- **a cookie read
-/// from a file never replaces a live cookie received in a header.** The C
-/// explains it at `:896-901` and `CURLOPT_COOKIELIST`'s manual page repeats it:
-/// *"A live cookie is not replaced by one read from a file."*
-///
 /// # The retained creation time
-///
-/// `:912-913` -- *"when replacing, creationtime is kept from old"*. This is
-/// load-bearing for BOTH orders this module produces: the jar's
-/// descending-creation-time order and the fourth tiebreak of the `Cookie:`
-/// header. `tests/data/test31` pins it -- an `overwrite` cookie replaced by a
-/// later `Set-Cookie:` keeps its original position in the saved jar rather
-/// than moving to the front.
 ///
 /// The C removes the superseded cookie here, inside this function, and the
 /// caller then appends. This returns the decision and the inherited time
@@ -2894,9 +2309,7 @@ fn replace_existing(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The orchestrator -- `Curl_cookie_add` (`lib/cookie.c:934-1045`).
-// ---------------------------------------------------------------------------
 
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Called by the response-header path, which is later code.
@@ -2904,28 +2317,7 @@ impl CookieInfo {
     /// Adds one cookie line to the store -- `Curl_cookie_add`
     /// (`lib/cookie.c:934-1045`).
     ///
-    /// The C's own note: *"Add a single cookie line to the cookie keeping
-    /// object. Be aware that sometimes we get an IP-only hostname, and that
-    /// might also be a numerical IPv6 address."*
-    ///
-    /// `Ok(true)` means the cookie was stored. `Ok(false)` is every one of the
-    /// C's `goto fail` paths, all of which it reports as `CURLE_OK` with
-    /// nothing stored -- a malformed cookie is not a transfer error.
-    ///
-    /// # When the caller must increment its own counter
-    ///
-    /// `data->req.setcookies++` at `:1041-1042` sits on the success path only;
-    /// the `fail:` label returns without it. So the counter passed in
-    /// [`AddContext::setcookies`] is to be incremented by the caller exactly
-    /// when this returns `Ok(true)` for a header line. The counter lives on the
-    /// request rather than on the store because it resets per response.
-    ///
     /// # The fourteen steps, in the C's order
-    ///
-    /// The order is behaviour, not style: step 6 stamps the creation time
-    /// BEFORE steps 8 and 9 can refuse the cookie, so a refusal still consumes
-    /// a counter value, and step 7 sweeps the store BEFORE the supersession
-    /// test, so an expired cookie cannot be the one that is replaced.
     ///
     /// 1. `:953-954` -- at or past [`MAX_SET_COOKIE_AMOUNT`], *"silently
     ///    ignore"*. No diagnostic at all.
@@ -2957,10 +2349,11 @@ impl CookieInfo {
     ///
     /// # Errors
     ///
-    /// None are reachable. The C returns `CURLE_OUT_OF_MEMORY` from
-    /// `strstore`, from the heap copy at `:1007` and from
-    /// `Curl_cookie_getlist`'s array, and a Rust allocation failure aborts
-    /// instead of returning. The `Result` is retained because
+    /// None are reachable. The C returns `CURLE_OUT_OF_MEMORY` from `strstore`,
+    /// from the heap copy at `:1007` and from `Curl_cookie_getlist`'s array --
+    /// all three duplicating bytes already resident, with no amplification and
+    /// no stable fallible spelling for a duplication at the declared minimum
+    /// Rust version. The `Result` is retained because
     /// `lib/http.c:3554` and `lib/setopt.c:1616` both propagate a `CURLcode`
     /// from this call and their successors must have one to propagate; AAP
     /// 0.4.2 fixes that shape for an internal `CURLcode` function.
@@ -3098,11 +2491,9 @@ impl CookieInfo {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Selecting and ordering what to send -- `Curl_secure_context` and
 // `Curl_cookie_getlist` (`lib/cookie.c:1234-1354`), plus the header line that
 // `http_cookies` builds from them (`lib/http.c:2523-2592`).
-// ---------------------------------------------------------------------------
 
 /// Whether this request counts as a secure origin -- `Curl_secure_context`
 /// (`lib/cookie.c:1234-1240`).
@@ -3114,29 +2505,12 @@ impl CookieInfo {
 ///   !strcmp(host, "::1");
 /// ```
 ///
-/// **Four tests, and they do not all use the same comparison.** `localhost` is
-/// matched case-INsensitively with `curl_strequal`; the two literal addresses
-/// are matched case-SENSITIVELY with `strcmp`. That distinction is invisible
-/// for `127.0.0.1`, which has no letters, and visible for `::1` only in that
-/// there is nothing to fold -- so the two policies happen to coincide on these
-/// inputs. They are reproduced separately anyway, because the C wrote them
-/// separately and a later change to either literal would make the difference
-/// real.
-///
-/// `docs/HTTP-COOKIES.md` gives the intent: curl *"considers
-/// `http://localhost` to be a secure context, meaning that it allows and uses
-/// cookies marked with the `secure` keyword even when done over plain HTTP for
-/// this host. curl does this to match how popular browsers work with secure
-/// cookies."*
-///
 /// # `tls_scheme` rather than a connection
 ///
-/// The first term reads the `CURLPROTO_*` bit off the scheme table, which is
-/// `crate::protocols`' to own and does not exist yet. `crate::url`'s
-/// `SchemeInfo` deliberately omits the same bit for the same reason and injects
-/// scheme facts at the consumer, so the caller passes the answer: `true`
-/// exactly when the scheme is `https` or `wss`. Reproducing the mask here would
-/// mean redeclaring public ABI constants that belong to
+/// `crate::url`'s `SchemeInfo` deliberately omits the same bit for the same
+/// reason and injects scheme facts at the consumer, so the caller passes the
+/// answer: `true` exactly when the scheme is `https` or `wss`. Reproducing the
+/// mask here would mean redeclaring public ABI constants that belong to
 /// `curl-rs-ffi/src/ffi/opts.rs`.
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Called by the response-header path, which is later code.
@@ -3151,28 +2525,6 @@ pub(crate) fn secure_context(tls_scheme: bool, host: &[u8]) -> bool {
 }
 
 /// The sort key of `cookie_sort` (`lib/cookie.c:1190-1218`).
-///
-/// Four levels, **every one of them descending**, and the C's own comment says
-/// why: *"Helper function to sort cookies such that the longest path gets
-/// before the shorter path. Path, domain and name lengths are considered in
-/// that order, with the creationtime as the tiebreaker. The creationtime is
-/// guaranteed to be unique per cookie, so we know we will get an ordering at
-/// that point."*
-///
-/// An absent path, domain or name counts as length zero (`:1194-1195`,
-/// `:1201-1202`, `:1208-1209`), which is not the same as a present-but-empty
-/// one only in that the C cannot store an empty path or an empty name from a
-/// header. `tests/data/test8` exercises the difference directly: a cookie with
-/// no path at all sorts last, behind one whose path is `"/"`.
-///
-/// [`std::cmp::Reverse`] over a tuple gives exactly the C's ordering, and the
-/// sort applied to it is a STABLE one. The C's `qsort` is not stable, which
-/// costs it nothing because creation times are unique -- `++ci->lastct` -- so
-/// the comparator never reports equality for two distinct cookies. Using a
-/// stable sort therefore cannot differ from the C on any reachable input, and
-/// it removes the one way an unstable sort could: two cookies sharing a
-/// creation time, which only a replacement can produce and which cannot
-/// coexist because the replacement removes the original.
 #[cfg(feature = "cookies")]
 fn cookie_sort_key(
     cookie: &Cookie,
@@ -3196,15 +2548,9 @@ fn cookie_sort_key(
 }
 
 /// The composed `Cookie:` header line, and what the caller still has to know.
-///
-/// The C keeps these three in locals of `http_cookies` (`lib/http.c:2526-2546`)
-/// and appends straight into the request buffer. They are returned together
-/// here because the request writer -- `protocols/http1.rs` -- does not exist
-/// yet, and because `linecap` changes what that writer does with
-/// `CURLOPT_COOKIE`.
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Read by the request writer, which is later code.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct CookieHeader {
     /// The `name=value` pairs, joined by `"; "` and with no prefix and no
     /// terminator. Empty when nothing was included.
@@ -3219,23 +2565,29 @@ pub(crate) struct CookieHeader {
     pub(crate) linecap: bool,
 }
 
+/// The composed header line is redacted; the two decisions are not.
+///
+/// This is the `Cookie:` request header about to go on the wire -- every
+/// session identifier the request carries, concatenated. It is the single
+/// value in this module that most needs redacting, so `value` renders as a
+/// byte count while `count` and `linecap`, which are what a caller of
+/// [`CookieInfo::get_list`] is deciding on, render in full.
+#[cfg(feature = "cookies")]
+impl fmt::Debug for CookieHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CookieHeader")
+            .field("value", &Redacted(&self.value))
+            .field("count", &self.count)
+            .field("linecap", &self.linecap)
+            .finish()
+    }
+}
+
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Called by the request writer, which is later code.
 impl CookieInfo {
     /// The cookies to send, in the order to send them --
     /// `Curl_cookie_getlist` (`lib/cookie.c:1253-1354`).
-    ///
-    /// The C's contract: *"For a given host and path, return a linked list of
-    /// cookies that the client should send to the server if used now. The
-    /// secure boolean informs the cookie if a secure connection is achieved or
-    /// not. It shall only return cookies that have not expired."*
-    ///
-    /// # The early return happens BEFORE the sweep
-    ///
-    /// `:1271-1272` returns when the selected bucket is empty, so
-    /// `remove_expired` does not run at all for a host with no cookies. That is
-    /// measurable -- a store whose only expired cookie lives in another bucket
-    /// keeps it -- and it is reproduced.
     ///
     /// # The matching tests, in the C's order
     ///
@@ -3250,17 +2602,6 @@ impl CookieInfo {
     ///   matches everything.
     /// * `:1304-1309` -- stop at [`MAX_COOKIE_SEND_AMOUNT`], with a
     ///   diagnostic.
-    ///
-    /// Only the bucket [`cookiehash`] selects is scanned, which is why an
-    /// ipnum host and every ipnum cookie domain share bucket 0.
-    ///
-    /// # The C's `*okay` has no counterpart
-    ///
-    /// It is `TRUE` whenever the bucket was non-empty and `FALSE` on the two
-    /// early returns, and its only reader is `lib/http.c:2544`'s
-    /// `if(!result && okay)` guarding a loop over the list. An empty list makes
-    /// that loop run zero times, so the flag cannot be observed and an empty
-    /// [`Vec`] carries the same information.
     pub(crate) fn getlist(
         &mut self,
         host: &[u8],
@@ -3340,18 +2681,6 @@ impl CookieInfo {
     /// The complete `Cookie:` request header line -- `http_cookies`
     /// (`lib/http.c:2523-2592`).
     ///
-    /// **This is wire-parity-critical.** AAP 0.6.7's comparison joins the whole
-    /// request into one string, so the separator, the casing and the order are
-    /// all frozen. `tests/data/test8` pins the exact bytes:
-    ///
-    /// ```text
-    /// Cookie: name with space=is weird but; trailingspace=removed; \
-    /// cookie=perhaps; cookie=yes; foobar=name; blexp=yesyes; cookie9=junk--
-    /// ```
-    ///
-    /// `None` means no header line at all, which is the C's `if(count)` at
-    /// `:2585` deciding not to terminate a line it never began.
-    ///
     /// # The composition, term by term
     ///
     /// * `:2546` -- the running length starts at **8**, the width of the
@@ -3370,9 +2699,6 @@ impl CookieInfo {
     ///   the same separator, **and only when `linecap` is clear**. The C
     ///   additionally requires that the application has not set its own
     ///   `Cookie` header (`:2531-2533`), which is the caller's test to make.
-    ///
-    /// `addcookies` is `CURLOPT_COOKIE` (10022). It is appended without any
-    /// parsing or validation, exactly as the C appends it.
     pub(crate) fn cookie_header_line(
         &mut self,
         host: &[u8],
@@ -3412,11 +2738,6 @@ impl CookieInfo {
 
     /// The `name=value` pairs of a `Cookie:` header, with the cap applied --
     /// the inner loop of `http_cookies` (`lib/http.c:2548-2572`).
-    ///
-    /// Split out from [`Self::cookie_header_line`] so that the cap and the
-    /// separator can be tested without a `CURLOPT_COOKIE` string in the way,
-    /// and so that a caller wanting the pieces -- the count, or `linecap` --
-    /// need not re-derive them from the line.
     pub(crate) fn cookie_header(
         &mut self,
         host: &[u8],
@@ -3475,19 +2796,11 @@ impl CookieInfo {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The jar writer -- `get_netscape_format` and `cookie_output`
 // (`lib/cookie.c:1427-1556`).
-// ---------------------------------------------------------------------------
 
 /// One jar line, WITHOUT its newline -- `get_netscape_format`
 /// (`lib/cookie.c:1427-1451`).
-///
-/// The C's own note: *"Formats a string for Netscape output file, w/o a newline
-/// at the end."* The caller adds it, with `curl_mfprintf(out, "%s\n", ...)` at
-/// `:1524`. Both consumers do -- the jar writer and `CURLINFO_COOKIELIST` --
-/// and `docs/HTTP-COOKIES.md` is explicit that *"A valid line must end with a
-/// newline character"*.
 ///
 /// ```text
 /// "%s"               /* httponly preamble */
@@ -3499,10 +2812,6 @@ impl CookieInfo {
 /// "%s\t"             /* name */
 /// "%s"               /* value */
 /// ```
-///
-/// **Seven TAB-separated fields**, and `docs/HTTP-COOKIES.md` numbers them: 0
-/// domain, 1 include-subdomains, 2 path, 3 HTTPS-only, 4 expires *"seconds
-/// since Jan 1st 1970, or 0"*, 5 name, 6 value.
 ///
 /// * The `#HttpOnly_` preamble when the cookie is `HttpOnly` (`:1435`).
 /// * Then a leading `.` **iff `tailmatch && domain && domain[0] != '.'`**
@@ -3519,9 +2828,6 @@ impl CookieInfo {
 ///   unguarded.
 /// * The expiry is printed as a bare `curl_off_t`, so `0` is written as `0` and
 ///   means a session cookie.
-///
-/// **Tabs, not spaces**, and this is a file-format contract rather than
-/// formatting: `#[rustfmt::skip]` keeps a formatter from touching any of it.
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Reached through the jar writer and CURLINFO_COOKIELIST.
 #[rustfmt::skip]
@@ -3576,13 +2882,6 @@ pub(crate) fn get_netscape_format(cookie: &Cookie) -> Vec<u8> {
 }
 
 /// A `curl_off_t` as the C's `FMT_OFF_T` renders it.
-///
-/// `core::fmt`'s `Display` for `i64` produces exactly what `%` `PRId64` does --
-/// an optional `-` and then decimal digits, with no padding, no grouping and no
-/// locale -- so this is one call. It is a named function so that the jar
-/// writer's use of it reads as "the C's expiry format" rather than as an
-/// incidental conversion, and so there is one place to look if the two ever
-/// have to differ.
 #[cfg(feature = "cookies")]
 fn itoa(value: CurlOffT) -> String {
     value.to_string()
@@ -3602,12 +2901,6 @@ fn itoa(value: CurlOffT) -> String {
 ///   `tests/libtest/lib3103.c` both rely on it.
 /// * The name `"-"` means standard input for a load and standard output for a
 ///   save. `docs/libcurl/opts/CURLOPT_COOKIEJAR.md` documents the second.
-///
-/// A [`Path`] rather than bytes for the third variant, following
-/// `crate::cookies::netrc`: the byte-to-path conversion belongs to the option
-/// surface, which already holds an operating-system string, and pushing it here
-/// would make this module choose an encoding for a filename it only ever
-/// forwards.
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Built by the option surface, which is later code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3630,17 +2923,6 @@ impl CookieInfo {
     /// The jar's bytes -- the whole of `cookie_output` except the sweep and the
     /// file handling (`lib/cookie.c:1488-1529`).
     ///
-    /// Generic over [`Write`] so that byte-exactness is asserted in memory: the
-    /// tests compare against the literal contents of `tests/data/test1920`,
-    /// `test31`, `test46` and `test1160` without touching a filesystem, which
-    /// is also what makes them runnable under Miri.
-    ///
-    /// # The header is unconditional
-    ///
-    /// One `fputs` of [`FILE_HEADER`] at `:1488-1491`, before any cookie and
-    /// even when there are none. `tests/data/test1160` requires exactly those
-    /// bytes from an empty store -- three comment lines and a blank line.
-    ///
     /// # Which cookies, and in which order
     ///
     /// * `:1493` -- the whole collection is skipped when `numcookies` is zero.
@@ -3655,21 +2937,16 @@ impl CookieInfo {
     ///   is written ABOVE one loaded from the file beforehand.
     /// * `:1516-1527` -- one line per cookie, each with a trailing newline.
     ///
-    /// The C's comparator is a strict two-way test with no equality case, so it
-    /// is not a valid total order and `qsort` may do anything with a tie. There
-    /// are none: `++ci->lastct` makes every creation time unique, and a
-    /// replacement inherits a time only after removing the cookie that held
-    /// it. A STABLE sort is used here so that the behaviour is defined even if
-    /// that invariant is ever broken, and on every reachable input it agrees
-    /// with the C exactly.
-    ///
     /// # Errors
     ///
-    /// `CURLcode::WriteError` from [`emit`]; see there for why this propagates
-    /// where the C discards the same failure.
+    /// None reachable from writing. [`emit`] discards a write failure because
+    /// `fputs` and `curl_mfprintf` do, and the two allocation failures the C
+    /// reports here -- the sort array at `:1499-1503` and
+    /// `get_netscape_format` at `:1519-1523` -- are the whole of the error
+    /// channel. The signature keeps the [`CodeResult`] those two need.
     pub(crate) fn write_to<W: Write>(&self, out: &mut W) -> CodeResult<()> {
         // `:1488-1491`
-        emit(out, FILE_HEADER)?;
+        emit(out, FILE_HEADER);
 
         // `:1493`
         if self.numcookies == 0 {
@@ -3689,26 +2966,14 @@ impl CookieInfo {
 
         // `:1516-1527`
         for cookie in valid {
-            emit(out, &get_netscape_format(cookie))?;
-            emit(out, b"\n")?;
+            emit(out, &get_netscape_format(cookie));
+            emit(out, b"\n");
         }
         Ok(())
     }
 
     /// Writes the jar to a file or to standard output -- `cookie_output`
     /// (`lib/cookie.c:1461-1556`).
-    ///
-    /// # The sweep comes first
-    ///
-    /// `:1474-1475` -- *"at first, remove expired cookies"*, before the file is
-    /// even opened, so an expired cookie is never written.
-    ///
-    /// # Standard output bypasses everything
-    ///
-    /// `:1477-1481` sets `out = stdout` and `use_stdout = TRUE`, and every
-    /// later `if(!use_stdout)` skips the close, the rename and the unlink
-    /// (`:1531`, `:1548`). There is no temporary file on that path and the
-    /// handle is not closed.
     ///
     /// # The atomic replace, and the truncation that is not atomic
     ///
@@ -3723,19 +2988,6 @@ impl CookieInfo {
     ///   including the `CURLE_WRITE_ERROR` a failed rename produces. The
     ///   `error:` block's `unlink(tempstore)` at `:1548-1554` is
     ///   [`crate::util::fopen::OpenedFile::discard`].
-    ///
-    /// **THE TARGET IS TRUNCATED BEFORE THE TEMPORARY FILE EXISTS.**
-    /// `Curl_fopen` opens the target with `"w"` in order to `fstat` it
-    /// (`lib/curl_fopen.c:99`), so the original jar is already gone before any
-    /// replacement has been created, and a save that fails afterwards has
-    /// destroyed it. Measured C behaviour, preserved, and not quietly improved.
-    ///
-    /// # `rand_suffix`
-    ///
-    /// The randomness for the temporary file's name, injected into
-    /// [`crate::util::fopen::open_for_write`] rather than drawn here -- see that
-    /// module for the contract. It is called at most once, and not at all for
-    /// standard output or a non-regular target.
     ///
     /// # Errors
     ///
@@ -3781,9 +3033,24 @@ impl CookieInfo {
     where
         F: FnOnce() -> CodeResult<String>,
     {
-        // `:1484` -- `Curl_fopen(data, filename, &out, &tempstore)`. See the
-        // truncation note on [`Self::save`].
-        let mut opened = fopen::open_for_write(path, rand_suffix)?;
+        // `:1484` -- `Curl_fopen(data, filename, &out, &tempstore)`.
+        //
+        // `StoreClass::Credential` is the jar's classification and the only
+        // one of the three consumers that carries it: a jar holds live session
+        // credentials, so it is created and written at 0600 rather than at the
+        // umask-derived mode the C leaves it at. `crate::util::fopen`'s
+        // hardening section argues the deviation; the classification is made
+        // here because this is the module that knows what the file contains.
+        //
+        // `NoFollow` carries the platform's `O_NOFOLLOW` from `crate::ffi`,
+        // which `crate::util` may not name for itself -- the layering rule in
+        // that module's documentation -- so the value is injected from here.
+        let mut opened = fopen::open_for_write(
+            path,
+            fopen::StoreClass::Credential,
+            fopen::NoFollow::new(O_NOFOLLOW | O_CLOEXEC),
+            rand_suffix,
+        )?;
 
         // `:1488-1529`
         match self.write_to(opened.file_mut()) {
@@ -3809,28 +3076,6 @@ impl CookieInfo {
     ///           data->set.str[STRING_COOKIEJAR], curl_easy_strerror(result));
     /// }
     /// ```
-    ///
-    /// The C's comment explains the second conjunct: *"only save the cookie
-    /// file if a transfer was started (`cookies->running` is set), as otherwise
-    /// the cookies were not completely initialized and there might be cookie
-    /// files that were not loaded so saving the file is the wrong thing."*
-    ///
-    /// `None` means no save was attempted -- no jar name, or the store is not
-    /// running. `Some` carries the outcome, and the warning has already been
-    /// emitted for a failure. **The failure is not propagated**, which is the C
-    /// swallowing it into a diagnostic; the value is returned so that a caller
-    /// and a test can see what happened.
-    ///
-    /// # What this deliberately does NOT do
-    ///
-    /// `:1647-1650` -- *"`if(cleanup && (!data->share || (data->cookies !=
-    /// data->share->cookies)))`"* then destroys the store. **That ownership
-    /// question is `crate::share`'s**, not this module's: whether the store is
-    /// shared is knowable only where the share handle is, and a store this
-    /// method tore down would leave a dangling handle behind. So nothing is
-    /// destroyed here, and the module header records the rule `share/` has to
-    /// apply. `tests/libtest/lib506.c` and `lib586.c` exercise exactly that
-    /// path with a shared cookie store.
     pub(crate) fn flush<F>(
         &mut self,
         jar: Option<CookieFile<'_>>,
@@ -3864,12 +3109,6 @@ impl CookieInfo {
 }
 
 /// A [`CookieFile`] as the C's `%s` renders the name behind it.
-///
-/// `lib/cookie.c:1618-1619` prints `data->set.str[STRING_COOKIEJAR]`, which is
-/// the name as the application supplied it. [`Path`] is shown through
-/// [`Path::display`], which is lossy for a name that is not valid text and is
-/// the only total rendering available; the two stream names are shown as the
-/// `"-"` the application would have passed. Used in a diagnostic only.
 #[cfg(feature = "cookies")]
 struct JarName<'a>(CookieFile<'a>);
 
@@ -3884,33 +3123,14 @@ impl fmt::Display for JarName<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Loading -- `cookie_load` and `Curl_cookie_loadfiles`
 // (`lib/cookie.c:1090-1174`).
-// ---------------------------------------------------------------------------
 
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Called by the option surface, which is later code.
 impl CookieInfo {
     /// Reads cookies from an already-open stream -- the `if(fp)` body of
     /// `cookie_load` (`lib/cookie.c:1114-1149`).
-    ///
-    /// Generic over [`BufRead`] so that the reader's tolerances can be asserted
-    /// in memory, which is also what makes those tests runnable under Miri.
-    ///
-    /// # What each line is parsed as
-    ///
-    /// `checkprefix("Set-Cookie:", lineptr)` (`:1123`) is
-    /// **case-INsensitive**. On a match, 11 bytes are skipped and
-    /// `curlx_str_passblanks` runs (`:1124-1127`), and the line goes to the
-    /// HEADER parser; otherwise it goes to the JAR parser. So a cookie file may
-    /// hold either format, or both, which is what
-    /// `docs/libcurl/opts/CURLOPT_COOKIEFILE.md` documents -- while advising
-    /// against the header form.
-    ///
-    /// **`CURLOPT_COOKIELIST` skips the same 11 bytes but does NOT pass
-    /// blanks** (`lib/setopt.c`'s `cookielist()`). The difference is preserved;
-    /// see [`cookie_command`].
     ///
     /// # The arguments the C fixes here
     ///
@@ -3987,32 +3207,6 @@ impl CookieInfo {
 
     /// Reads one cookie file -- `cookie_load` (`lib/cookie.c:1090-1151`).
     ///
-    /// The C's contract: *"Reads cookies from a local file. This is always
-    /// called before any cookies are set. If file is `-` then STDIN is read. If
-    /// `newsession` is TRUE, discard all session cookies on read from file."*
-    ///
-    /// # `running` is false during the read and true afterwards
-    ///
-    /// `:1100` clears it -- *"this is not running, this is init"* -- and
-    /// `:1147` sets it, **on every path**, including the one where no file was
-    /// opened at all. So `CURLOPT_COOKIEFILE ""` activates the engine and marks
-    /// it running without reading anything, which is exactly what
-    /// [`CookieFile::Inactive`] expresses, and `:1146`'s
-    /// `data->state.cookie_engine = TRUE` is the caller's flag to set.
-    ///
-    /// # A missing file is a WARNING, not an error
-    ///
-    /// `:1108-1109` -- `infof(data, "WARNING: failed to open cookie file
-    /// \"%s\"", file)` and then nothing: no error is returned and the load
-    /// continues. Note the quotes are part of the message.
-    ///
-    /// # The mode is `"rb"`, spelled out
-    ///
-    /// `:1107` opens with a literal `"rb"` rather than with `FOPEN_READTEXT`,
-    /// which is the macro every other reader in the C tree uses. The two are
-    /// identical on the four mandated targets and neither performs any
-    /// translation here, so the distinction is recorded rather than acted on.
-    ///
     /// # Errors
     ///
     /// Only what [`Self::read_from`] propagates. An unopenable file is not one.
@@ -4063,28 +3257,6 @@ impl CookieInfo {
     /// Reads every configured cookie file, in order --
     /// `Curl_cookie_loadfiles` (`lib/cookie.c:1157-1174`).
     ///
-    /// The C walks `data->state.cookielist`, which is the
-    /// `CURLOPT_COOKIEFILE` slist, from head to tail and **stops at the first
-    /// error** (`:1170-1171`). Order is the contract, not an accident: a cookie
-    /// read from an earlier file is already present when a later file is read,
-    /// so it wins the `livecookie` comparison in [`replace_existing`] only if
-    /// the earlier read was live -- and it wins the identity comparison
-    /// outright, because a duplicate is skipped rather than replacing.
-    /// `crate::util::slist` preserves that order exactly: it appends at the
-    /// tail, and it neither sorts, deduplicates nor trims.
-    ///
-    /// The whole body runs under `CURL_LOCK_DATA_COOKIE` with
-    /// `CURL_LOCK_ACCESS_SINGLE` (`:1163`, `:1176`); see the module header.
-    ///
-    /// # A slice rather than an [`SList`]
-    ///
-    /// The C's slist holds `char *` names and `cookie_load` classifies each one
-    /// itself. Here the classification is the caller's, for the reason
-    /// [`CookieFile`] gives: converting a filename from bytes to a [`Path`]
-    /// means choosing an encoding, and the option surface already holds an
-    /// operating-system string that needs no choosing. The order of the slice
-    /// is the order of the slist.
-    ///
     /// # Errors
     ///
     /// The first failure any [`Self::load`] reports, with the remaining files
@@ -4107,28 +3279,6 @@ impl CookieInfo {
 
     /// Every cookie as a jar line -- `cookie_list` (`lib/cookie.c:1558-1595`),
     /// which backs `CURLINFO_COOKIELIST`.
-    ///
-    /// # The order is bucket order, then insertion order, and NOTHING is sorted
-    ///
-    /// `:1570-1572` walks the 63 buckets by index and each bucket from its
-    /// head. That makes the output a function of [`cookie_hash_domain`], of the
-    /// bucket count and of the order cookies arrived in -- which is why the
-    /// store is an array of ordered lists and can never become a map. See
-    /// [`CookieInfo`].
-    ///
-    /// `:1573-1574` skips a cookie with no domain, exactly as the jar writer
-    /// does.
-    ///
-    /// # `None` for an empty result, matching the C's NULL
-    ///
-    /// `:1566-1567` returns NULL when `numcookies` is zero -- **before the
-    /// sweep**, so a store holding nothing but expired cookies is reported as
-    /// empty without being swept. And a store whose every cookie lacks a domain
-    /// leaves the C's `list` pointer NULL too, which is the same answer by a
-    /// different route. Both are `None` here.
-    ///
-    /// `tests/libtest/lib1549.c` prints this list and counts it, which is the
-    /// coverage this reproduces.
     pub(crate) fn list(&mut self, clock: &dyn Clock) -> Option<SList> {
         // `:1566-1567` -- before the sweep.
         if self.numcookies == 0 {
@@ -4159,9 +3309,7 @@ impl CookieInfo {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The `CURLOPT_COOKIELIST` command words -- `lib/setopt.c`'s `cookielist()`.
-// ---------------------------------------------------------------------------
 
 /// What a `CURLOPT_COOKIELIST` string asks for.
 ///
@@ -4191,11 +3339,6 @@ pub(crate) enum CookieCommand {
     /// parser. The `bool` here is that prefix test's answer, and the length
     /// check belongs to the option surface because it returns a `CURLcode` that
     /// this function has no channel for.
-    ///
-    /// **The header path skips exactly 11 bytes and does NOT pass blanks**,
-    /// unlike [`CookieInfo::read_from`], which does. `parse_cookie_header`
-    /// trims the name anyway, so the two agree on every input -- but the
-    /// difference is real and is preserved rather than tidied.
     Add {
         /// Whether the string carried a `Set-Cookie:` prefix, which
         /// [`AddContext::httpheader`] is then set from.
@@ -4205,13 +3348,6 @@ pub(crate) enum CookieCommand {
 
 /// Classifies a `CURLOPT_COOKIELIST` string -- `lib/setopt.c`'s
 /// `cookielist()`.
-///
-/// The four command words are compared with `curl_strequal`, so the match is
-/// **case-INsensitive and whole-string**: `all` is the command, `ALLOW` is a
-/// cookie. `checkprefix` is case-insensitive too.
-///
-/// `None` has no counterpart here: the C's `if(!ptr) return CURLE_OK;` guards a
-/// null pointer, which is the option surface's concern.
 #[cfg(feature = "cookies")]
 #[allow(dead_code)] // Called by the option surface, which is later code.
 pub(crate) fn cookie_command(text: &[u8]) -> CookieCommand {
@@ -4255,19 +3391,8 @@ pub(crate) fn strip_set_cookie_prefix(text: &[u8]) -> &[u8] {
 // `Expires` over a shared store). Those seven link a debug static libcurl and
 // call internal `Curl_*` symbols, which a Rust static library does not export,
 // so their coverage relocates here rather than being made to link -- a
-// documented deviation (AAP 0.8.7), not a defect to work around, and NOT a
-// reason to re-export anything.
-//
-// THE EXPECTATIONS BELOW ARE AN ORACLE, NOT A RESTATEMENT. Every jar and every
-// `Cookie:` header compared here was transcribed from a fixture under
-// `tests/data/`, which is to say from bytes curl 8.19.0-DEV actually emitted:
-// `test1160` (an empty jar), `test1920` (the writer's order), `test31` (17
-// entries and every attribute quirk), `test8` (the definitive `Cookie:` header)
-// and `test46` (the creation-time tiebreak, six-field lines and empty values).
-// A disagreement means this implementation is wrong, which is the only useful
-// direction for a parity test to point.
-//
-// Every test injects its clock, so no assertion depends on when it runs.
+// documented deviation, not a defect to work around, and NOT a reason to
+// re-export anything.
 
 #[cfg(all(test, feature = "cookies"))]
 mod tests {
@@ -4276,9 +3401,7 @@ mod tests {
     use super::*;
     use crate::util::timeval::TestClock;
 
-    // -----------------------------------------------------------------------
     // Fixtures
-    // -----------------------------------------------------------------------
 
     /// A clock whose WALL reading is `secs`.
     ///
@@ -4399,13 +3522,6 @@ mod tests {
     }
 
     /// The one cookie a store holds, for a test that stored exactly one.
-    ///
-    /// The count is asserted first, so the fallback below is unreachable --
-    /// which is how this reads a value out of an [`Option`] without an
-    /// `unwrap`, a policy this module holds even in its tests because a panic
-    /// unwinding toward a C caller through `curl-rs-ffi` is undefined
-    /// behaviour and the grep gate that forbids one does not know which side
-    /// of a `#[cfg(test)]` it is looking at.
     fn only(jar: &CookieInfo) -> Cookie {
         let mut found: Vec<Cookie> = jar.cookies().cloned().collect();
         assert_eq!(found.len(), 1, "exactly one cookie must be stored");
@@ -4423,9 +3539,7 @@ mod tests {
         jar.cookies().next().cloned()
     }
 
-    // -----------------------------------------------------------------------
     // The limits, and the one constraint the C asserts about them.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_limits_are_the_c_headers() {
@@ -4472,9 +3586,7 @@ mod tests {
         assert_eq!(CookieInfo::default().numcookies(), 0);
     }
 
-    // -----------------------------------------------------------------------
     // `cap_expires` -- `lib/cookie.c:52-61`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn cap_expires_leaves_a_session_cookie_alone() {
@@ -4525,9 +3637,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // `cookie_tailmatch` -- `lib/cookie.c:73-100`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn cookie_tailmatch_reproduces_rfc6265_4_1_2_3() {
@@ -4577,9 +3687,7 @@ mod tests {
         assert!(cookie_tailmatch(b".tld", b"domain..tld"));
     }
 
-    // -----------------------------------------------------------------------
     // `pathmatch` -- `lib/cookie.c:106-156`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn pathmatch_reproduces_rfc6265_5_1_4_with_curls_deviation() {
@@ -4616,9 +3724,7 @@ mod tests {
         assert!(pathmatch(b"/hoge", b"/hoge"));
     }
 
-    // -----------------------------------------------------------------------
     // `get_top_domain`, `cookie_hash_domain`, `cookiehash`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn get_top_domain_keeps_the_last_two_labels() {
@@ -4732,9 +3838,7 @@ mod tests {
         assert!(!host_is_ipnum(b"fe80::1%eth0"));
     }
 
-    // -----------------------------------------------------------------------
     // `sanitize_cookie_path` -- `lib/cookie.c:226-248`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn sanitize_cookie_path_reproduces_every_arm() {
@@ -4757,9 +3861,7 @@ mod tests {
         assert_eq!(sanitize_cookie_path(b"/\xff\xfe"), b"/\xff\xfe");
     }
 
-    // -----------------------------------------------------------------------
     // `invalid_octets` -- `lib/cookie.c:354-365`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn invalid_octets_rejects_the_control_bytes_and_nothing_else() {
@@ -4788,9 +3890,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // `bad_domain` -- `lib/cookie.c:327-342`. TRUE means BAD.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn bad_domain_requires_a_dot_or_exactly_localhost() {
@@ -4820,9 +3920,7 @@ mod tests {
         assert!(!bad_domain(b"a.b."));
     }
 
-    // -----------------------------------------------------------------------
     // `strncmp_prefix` -- the direction that makes field 2 fall through.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn strncmp_prefix_matches_the_cs_argument_order() {
@@ -4839,9 +3937,7 @@ mod tests {
         assert!(!strncmp_prefix(FALSE_WORD, b"FALSEHOOD"));
     }
 
-    // -----------------------------------------------------------------------
     // `Curl_secure_context` -- `lib/cookie.c:1234-1240`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn secure_context_has_four_terms() {
@@ -4866,10 +3962,8 @@ mod tests {
         assert!(!secure_context(false, b""));
     }
 
-    // -----------------------------------------------------------------------
     // The jar writer: `get_netscape_format` (`lib/cookie.c:1427-1451`) and
     // `cookie_output` (`:1461-1556`).
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_jar_header_is_three_comments_and_one_blank_line() {
@@ -5180,9 +4274,7 @@ mod tests {
         assert_eq!(bytes.iter().filter(|&&b| b == b'\n').count(), 5);
     }
 
-    // -----------------------------------------------------------------------
     // The jar reader: `parse_netscape` (`lib/cookie.c:650-772`).
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_httponly_prefix_is_tested_before_the_comment_rule() {
@@ -5524,13 +4616,7 @@ mod tests {
         assert_eq!(only(&jar).value(), Some(&b"v"[..]));
     }
 
-    // -----------------------------------------------------------------------
     // THE ROUND TRIP -- the single most important test in this directory.
-    //
-    // The bytes below are `tests/data/test46`'s paired input and expected
-    // jars, which is to say bytes curl 8.19.0-DEV wrote and bytes it read.
-    // Nothing here is derived from this implementation.
-    // -----------------------------------------------------------------------
 
     /// `tests/data/test46`'s `injar46`, with the canonical header substituted
     /// for the one that fixture happens to carry (any `#` line is a comment,
@@ -5727,9 +4813,7 @@ bytes.example\tFALSE\t/\tFALSE\t1099511627776\t\xe5\xe4\xf6\t\xf6\xe4\xe5\n";
         assert!(!saved_text.contains("UID"));
     }
 
-    // -----------------------------------------------------------------------
     // `Set-Cookie:` parsing -- `parse_cookie_header` (`lib/cookie.c:427-648`).
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_first_pair_is_the_cookie_and_blanks_are_trimmed() {
@@ -6072,12 +5156,10 @@ bytes.example\tFALSE\t/\tFALSE\t1099511627776\t\xe5\xe4\xf6\t\xf6\xe4\xe5\n";
             assert!(only(&jar).httponly(), "{}", text(spelling));
         }
 
-        // The branch is guarded by `else if(!sep)` at `:508`, so a `secure`
-        // or `httponly` attribute that carries an `=` is NOT the standalone
-        // word: it falls past `path`, past `domain`, past `max-age`, past
-        // `expires`, and is discarded like any unrecognised attribute. A
-        // server writing `Secure=TRUE` therefore gets an insecure cookie, and
-        // that is curl's behaviour rather than an oversight here.
+        // The branch is guarded by `else if(!sep)` at `:508`, so a `secure` or
+        // `httponly` attribute that carries an `=` is NOT the standalone word:
+        // it falls past `path`, past `domain`, past `max-age`, past `expires`,
+        // and is discarded like any unrecognised attribute.
         let mut jar = CookieInfo::new();
         assert!(add_header(
             &mut jar,
@@ -6491,11 +5573,7 @@ bytes.example\tFALSE\t/\tFALSE\t1099511627776\t\xe5\xe4\xf6\t\xf6\xe4\xe5\n";
         let now = 1_700_000_000;
         let clock = clock_at(now);
 
-        // curl 8.19.0-DEV does not implement `SameSite` -- `grep -rin samesite
-        // lib/` returns ZERO hits -- so it falls out of the dispatch chain
-        // like any other unknown attribute. Honouring it would change which
-        // cookies are sent, which AAP 0.8.2 forbids. This test exists to
-        // assert the ABSENCE of a behaviour.
+        // This test exists to assert the ABSENCE of a behaviour.
         for attribute in [
             &b"samesite=strict"[..],
             b"SameSite=Lax",
@@ -6551,21 +5629,11 @@ bytes.example\tFALSE\t/\tFALSE\t1099511627776\t\xe5\xe4\xf6\t\xf6\xe4\xe5\n";
         }
     }
 
-    // -----------------------------------------------------------------------
     // The `Cookie:` request header -- `Curl_cookie_getlist`
     // (`lib/cookie.c:1253-1354`) and `http_cookies` (`lib/http.c:2523-2592`).
-    //
-    // WIRE-PARITY-CRITICAL. AAP 0.6.7's comparison joins the whole request
-    // into ONE string, so the order, the separator and the casing are frozen.
-    // -----------------------------------------------------------------------
 
     /// `tests/data/test8`'s `heads8.txt`, with `%HOSTIP` resolved to
     /// `127.0.0.1` and every `%hex[..]hex%` escape expanded.
-    ///
-    /// It is a HEADER-format cookie file, which `cookie_load` detects line by
-    /// line with `checkprefix("Set-Cookie:", ...)`. The four response lines at
-    /// the top are not cookies and reach the JAR parser, where they fail the
-    /// seven-field test and are discarded -- which is itself worth exercising.
     fn test8_cookie_file() -> Vec<u8> {
         #[rustfmt::skip]
         let mut file: Vec<u8> = b"\
@@ -7100,9 +6168,7 @@ blexp=yesyes; cookie9=junk--\r\n";
         assert_eq!(jar.numcookies(), 5);
     }
 
-    // -----------------------------------------------------------------------
     // Supersession -- `replace_existing` (`lib/cookie.c:822-924`).
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_matching_cookie_replaces_and_inherits_the_old_creation_time() {
@@ -7559,9 +6625,7 @@ blexp=yesyes; cookie9=junk--\r\n";
         );
     }
 
-    // -----------------------------------------------------------------------
     // `Curl_cookie_add`'s fourteen steps (`lib/cookie.c:934-1045`).
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_set_cookie_count_silences_the_fifty_first_header() {
@@ -7729,9 +6793,7 @@ blexp=yesyes; cookie9=junk--\r\n";
         assert_eq!(jar.next_expiration(), 2000);
     }
 
-    // -----------------------------------------------------------------------
     // `remove_expired` (`lib/cookie.c:281-323`).
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_sweep_uses_a_strict_comparison_at_the_boundary() {
@@ -7818,9 +6880,7 @@ blexp=yesyes; cookie9=junk--\r\n";
         assert!(jar.cookies().next().is_none());
     }
 
-    // -----------------------------------------------------------------------
     // `CURLINFO_COOKIELIST` -- `cookie_list` (`lib/cookie.c:1558-1595`).
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_cookie_list_is_bucket_order_then_insertion_order_and_unsorted() {
@@ -7944,10 +7004,8 @@ blexp=yesyes; cookie9=junk--\r\n";
         assert_eq!(jar.numcookies(), 1);
     }
 
-    // -----------------------------------------------------------------------
     // Clearing -- `Curl_cookie_clearall` (`:1361`), `_clearsess` (`:1384`)
     // and `_cleanup` (`:1412`).
-    // -----------------------------------------------------------------------
 
     #[test]
     fn clearsess_removes_exactly_the_session_cookies() {
@@ -8023,9 +7081,7 @@ blexp=yesyes; cookie9=junk--\r\n";
         assert_eq!(fresh.next_expiration(), CURL_OFF_T_MAX);
     }
 
-    // -----------------------------------------------------------------------
     // `CURLOPT_COOKIELIST`'s command words -- `lib/setopt.c`'s `cookielist()`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_four_command_words_are_matched_case_insensitively_and_whole() {
@@ -8115,10 +7171,8 @@ blexp=yesyes; cookie9=junk--\r\n";
         assert_eq!(CURLcode::BadFunctionArgument as i32, 43);
     }
 
-    // -----------------------------------------------------------------------
     // Public-suffix checking -- `is_public_suffix` (`lib/cookie.c:774-819`)
     // through `crate::cookies::psl`.
-    // -----------------------------------------------------------------------
 
     /// The mini list `crate::cookies::psl`'s own tests use, transcribed from
     /// the shapes the real Public Suffix List contains: a plain rule, a
@@ -8347,11 +7401,6 @@ blexp=yesyes; cookie9=junk--\r\n";
         // HOST then the cookie domain. Both orders are plausible from the name
         // alone, and swapping them silently INVERTS the check, so the direction
         // is asserted through the engine rather than by reading the call.
-        //
-        // The discriminating case: a host being given a cookie for its own
-        // registrable parent is acceptable, while the reverse -- a parent
-        // setting a cookie for a name BELOW it -- is not. Under a swap the
-        // assertion below would refuse the cookie.
         let clock = clock_at(BEFORE_EXPIRY);
         let source = psl::MemoryPslSource::builtin(MINI_PSL);
         let mut cache = psl::PslCache::new();
@@ -8383,24 +7432,19 @@ blexp=yesyes; cookie9=junk--\r\n";
         // would make it acceptable. The two tests together pin the order from
         // both sides.
     }
-    // -----------------------------------------------------------------------
-    // Coverage relocated from the C test programs (AAP 0.8.7).
-    //
-    // These seven link a debug static libcurl and call internal `Curl_*`
-    // symbols, which a Rust static library does not export. What each one
-    // actually asserts about the cookie engine is reproduced here; nothing is
-    // re-exported to make them link, because that would defeat the
-    // encapsulation the zero-`unsafe` guarantee rests on.
-    // -----------------------------------------------------------------------
+    // The C programs that cover this engine link a debug static libcurl and
+    // call internal `Curl_*` symbols, which a Rust static library does not
+    // export. What each one actually asserts about the cookie engine is
+    // reproduced here; nothing is re-exported to make them link, because that
+    // would defeat the encapsulation the zero-`unsafe` guarantee rests on.
 
     #[test]
     fn one_store_accumulates_cookies_from_several_transfers() {
-        // `tests/libtest/lib506.c` (370 lines) and `lib586.c` (240) drive four
-        // easy handles that SHARE one cookie store, through
-        // `CURLSHOPT_SHARE`/`CURL_LOCK_DATA_COOKIE` and, in lib586's case, with
-        // user-supplied lock callbacks. The locking is `crate::share`'s to
-        // build -- see the module header's transition contract -- so what
-        // relocates here is the store behaviour those tests depend on: every
+        // `tests/libtest/lib506.c` and `lib586.c` drive four easy handles that
+        // SHARE one cookie store, through
+        // `CURLSHOPT_SHARE`/`CURL_LOCK_DATA_COOKIE` and, in lib586's case,
+        // with user-supplied lock callbacks. The locking belongs to
+        // `crate::share`, so what this test covers is the store behaviour: every
         // transfer's cookies land in the one store, none is lost, and
         // `CURLINFO_COOKIELIST` enumerates them all.
         let clock = clock_at(BEFORE_EXPIRY);
@@ -8501,12 +7545,11 @@ blexp=yesyes; cookie9=junk--\r\n";
 
     #[test]
     fn a_cookie_with_neither_max_age_nor_expires_is_a_session_cookie() {
-        // `tests/libtest/lib3103.c` (64 lines) injects exactly
-        // `Set-Cookie: c1=v1; domain=localhost` through `CURLOPT_COOKIELIST`
-        // into a SHARED store and performs a transfer. What it is guarding is
-        // that a cookie with no expiry is stored as a session cookie and is
-        // then sent -- the bug it was written for being a crash on the
-        // shared-store path.
+        // `tests/libtest/lib3103.c` injects exactly `Set-Cookie: c1=v1;
+        // domain=localhost` through `CURLOPT_COOKIELIST` into a SHARED store
+        // and performs a transfer. What it is guarding is that a cookie with
+        // no expiry is stored as a session cookie and is then sent -- the bug
+        // it was written for being a crash on the shared-store path.
         let clock = clock_at(BEFORE_EXPIRY);
         let mut jar = CookieInfo::new();
         assert_eq!(
@@ -8568,10 +7611,10 @@ blexp=yesyes; cookie9=junk--\r\n";
 
     #[test]
     fn a_jar_survives_a_handle_reset() {
-        // `tests/libtest/lib1920.c` (55 lines) loads a jar, performs a
-        // transfer, calls `curl_easy_reset` and only then cleans up, checking
-        // that the jar still holds both cookies afterwards. The engine is what
-        // has to survive; here that is the store outliving the request.
+        // `tests/libtest/lib1920.c` loads a jar, performs a transfer, calls
+        // `curl_easy_reset` and only then cleans up, checking that the jar
+        // still holds both cookies afterwards. The engine is what has to
+        // survive; here that is the store outliving the request.
         let clock = clock_at(BEFORE_EXPIRY);
         let mut jar = CookieInfo::new();
         let mut input: &[u8] = b"# Netscape HTTP Cookie File\n\
@@ -8609,11 +7652,6 @@ blexp=yesyes; cookie9=junk--\r\n";
 
     /// Binds a scratch directory, failing loudly if the environment cannot
     /// provide one.
-    ///
-    /// A macro rather than a function because the failure arm has to leave the
-    /// *test*. Modelled on the helper of the same name in
-    /// [`crate::util::fopen`] and in `crate::cookies::hsts`, so that a reader
-    /// who knows one knows all three.
     macro_rules! scratch {
         ($name:ident) => {
             let $name = tempfile::tempdir();
@@ -8699,8 +7737,7 @@ blexp=yesyes; cookie9=junk--\r\n";
         let log = Recorder::default();
 
         // `:1108-1110` -- *"WARNING: failed to open cookie file"*, and
-        // `CURLE_OK`. The engine still ends up running, which is what lets an
-        // application name a jar that does not exist yet.
+        // `CURLE_OK`.
         let mut jar = CookieInfo::new();
         assert_eq!(
             jar.load(CookieFile::Path(&path), false, &clock, &log, None),
@@ -8905,21 +7942,25 @@ blexp=yesyes; cookie9=junk--\r\n";
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
-    fn a_failed_save_has_already_truncated_the_target() {
+    fn a_failed_save_leaves_the_previous_jar_intact() {
         scratch!(dir);
         let path = dir.path().join("jar.txt");
         let clock = clock_at(BEFORE_EXPIRY);
 
         // `Curl_fopen` opens the target `"w"` in order to `fstat` it
         // (`lib/curl_fopen.c:99-102`), which TRUNCATES it before the temporary
-        // file exists. So a save that fails after that point has already
-        // destroyed the jar it was asked to replace. Measured C behaviour, and
-        // preserved rather than tidied -- see the note on
-        // `CookieInfo::save`.
+        // file exists, so in the C a save that fails after that point has
+        // already destroyed the jar it was asked to replace.
+        //
+        // `crate::util::fopen` no longer passes `O_TRUNC` -- see the hardening
+        // section of that module -- so the previous jar survives a failed save.
+        // This test asserted `Some(0)` and now asserts the full length; the
+        // earlier expectation was an accurate description of a defect, and it
+        // is replaced rather than deleted so the change is on the record.
         //
         // The failure is arranged by making the temporary-name provider fail,
-        // which is the first thing after the truncation (`:109-111`), and which
-        // needs no permissions and no root-bypass probe.
+        // which is the first thing after the open (`:109-111`), and which needs
+        // no permissions and no root-bypass probe.
         assert!(std::fs::write(&path, JAR_ASCENDING).is_ok());
         assert_eq!(
             std::fs::read(&path).map(|b| b.len()).ok(),
@@ -8938,8 +7979,104 @@ blexp=yesyes; cookie9=junk--\r\n";
             Err(CURLcode::OutOfMemory)
         );
 
-        // And the original jar is gone.
-        assert_eq!(std::fs::read(&path).map(|bytes| bytes.len()).ok(), Some(0));
+        // And the original jar is still there, byte for byte.
+        assert_eq!(
+            std::fs::read(&path).ok().as_deref(),
+            Some(JAR_ASCENDING),
+            "a failed save must not destroy the jar it was replacing"
+        );
+    }
+
+    /// A saved jar is readable only by its owner, end to end through `save`.
+    ///
+    /// `crate::util::fopen`'s own tests prove the helper honours
+    /// `StoreClass::Credential`. This one proves the JAR IS WIRED TO IT: it goes
+    /// through the public `save` path, so a future edit that passed
+    /// `StoreClass::Public` from `save_to_path` would fail here even though
+    /// every test in `util::fopen` still passed.
+    ///
+    /// The C leaves a first-ever jar at `0666 & ~umask`, normally `0644`, and
+    /// then clones that mode on every subsequent save -- so session cookies are
+    /// readable by every local user for the life of the file. `0o600` is
+    /// asserted literally because `OpenOptionsExt::mode` is a ceiling the umask
+    /// can only narrow.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
+    fn a_saved_jar_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        scratch!(dir);
+        let path = dir.path().join("jar.txt");
+        let clock = clock_at(BEFORE_EXPIRY);
+        let mut jar = load_text(JAR_ASCENDING, &clock);
+
+        assert_eq!(
+            jar.save(CookieFile::Path(&path), fixed_suffix, &clock),
+            Ok(())
+        );
+
+        let mode = std::fs::metadata(&path)
+            .map(|meta| meta.permissions().mode() & 0o7777);
+        assert_eq!(
+            mode.ok(),
+            Some(0o600),
+            "a jar of session cookies must not be readable by other users"
+        );
+
+        // And a SECOND save over the now-existing jar keeps it private rather
+        // than cloning whatever mode it found -- the case the C cannot escape.
+        let permissive = std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o644),
+        );
+        assert!(permissive.is_ok(), "the test needs to loosen the mode");
+        assert_eq!(
+            jar.save(CookieFile::Path(&path), fixed_suffix, &clock),
+            Ok(())
+        );
+        let repaired = std::fs::metadata(&path)
+            .map(|meta| meta.permissions().mode() & 0o7777);
+        assert_eq!(
+            repaired.ok(),
+            Some(0o600),
+            "a jar inherited at 0644 is repaired by the next save"
+        );
+    }
+
+    /// A jar path whose final component is a symbolic link is refused.
+    ///
+    /// CWE-59, end to end through `save`, and the companion to the mode test
+    /// above: it proves the injected `O_NOFOLLOW` reaches the open from THIS
+    /// call site. The link's target keeps its contents, which is the CWE-22
+    /// half -- in the C the target would have been truncated to zero before the
+    /// temporary file was even named.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri's isolation refuses symlink")]
+    fn a_symlinked_jar_path_is_refused_and_its_target_untouched() {
+        scratch!(dir);
+        let victim = dir.path().join("victim.txt");
+        const PRECIOUS: &[u8] = b"a file the attacker cannot write\n";
+        assert!(std::fs::write(&victim, PRECIOUS).is_ok());
+
+        let link = dir.path().join("jar.txt");
+        assert!(
+            std::os::unix::fs::symlink(&victim, &link).is_ok(),
+            "the test needs to plant a symlink"
+        );
+
+        let clock = clock_at(BEFORE_EXPIRY);
+        let mut jar = load_text(JAR_ASCENDING, &clock);
+
+        assert_eq!(
+            jar.save(CookieFile::Path(&link), fixed_suffix, &clock),
+            Err(CURLcode::WriteError),
+            "a symlinked jar path must be refused, not followed"
+        );
+        assert_eq!(
+            std::fs::read(&victim).ok().as_deref(),
+            Some(PRECIOUS),
+            "and the link's target is neither truncated nor written"
+        );
     }
 
     #[test]
@@ -9066,13 +8203,20 @@ blexp=yesyes; cookie9=junk--\r\n";
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not model /dev/full")]
-    fn a_write_that_fails_midway_reports_it_and_cleans_up() {
-        // The one way a save can fail AFTER `Curl_fopen` has succeeded, which
-        // is the C's `if(result && tempstore) unlink(tempstore)` arm at
-        // `:1548-1554`. `/dev/full` accepts an open and answers `ENOSPC` to
-        // every write, and being a character device it takes `Curl_fopen`'s
-        // `!S_ISREG` path -- so there is no temporary to remove and the device
-        // node is not replaced.
+    fn a_write_that_fails_midway_is_reported_as_success_exactly_as_c_does() {
+        // A save whose WRITES fail after `Curl_fopen` succeeded. `/dev/full`
+        // accepts an open and answers `ENOSPC` to every write, and being a
+        // character device it takes `Curl_fopen`'s `!S_ISREG` path -- so there
+        // is no temporary to remove and the device node is not replaced.
+        //
+        // C reports `CURLE_OK` here, and so does this. `fputs` at `:1488` and
+        // `curl_mfprintf` at `:1524` are evaluated as statements, so `error`
+        // stays `CURLE_OK`, `:1540-1546`'s comment -- "If we reach here we have
+        // successfully written a cookie file" -- is reached on a jar that was
+        // not written at all, and `:1548-1554`'s unlink arm is unreachable from
+        // a write failure. An earlier revision of `emit` propagated
+        // `CURLE_WRITE_ERROR` here; AAP 0.8.2 does not permit that improvement,
+        // because the exit status is observable.
         let full = Path::new("/dev/full");
         if !full.exists() {
             return;
@@ -9082,21 +8226,20 @@ blexp=yesyes; cookie9=junk--\r\n";
 
         assert_eq!(
             jar.save(CookieFile::Path(full), fixed_suffix, &clock),
-            Err(CURLcode::WriteError)
+            Ok(()),
+            "lib/cookie.c reads neither fputs nor curl_mfprintf"
         );
         let metadata = std::fs::metadata(full);
         assert_eq!(metadata.map(|m| m.is_file()).ok(), Some(false));
-        // The store is untouched by a failed save.
+        // The store is untouched by a save, however the writes went.
         assert_eq!(jar.numcookies(), 5);
     }
 
-    // -----------------------------------------------------------------------
     // The remaining branches, each reached deliberately rather than left to
     // chance. Together with everything above these bring the file's own line
     // coverage to the high nineties; the handful that stay unvisited are
     // defensive arms whose C originals are equally unreachable, and each is
     // named in the comment beside it.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_line_is_truncated_at_the_first_zero_byte() {
@@ -9583,44 +8726,39 @@ blexp=yesyes; cookie9=junk--\r\n";
     }
 
     #[test]
-    fn a_write_failure_partway_through_the_entries_is_propagated() {
+    fn a_write_failure_partway_through_is_discarded_exactly_as_c_does() {
         let clock = clock_at(BEFORE_EXPIRY);
         let jar = load_text(JAR_ASCENDING, &clock);
 
-        // The C ignores every `curl_mfprintf` result in `cookie_output` and
-        // reports success for a jar it only half wrote; this propagates
-        // instead, and the divergence is documented on `emit`. A sink that
-        // takes the header and the first entry and then refuses reaches the
-        // entry loop's error arm rather than the header's.
+        // `cookie_output` reads NEITHER `fputs` at `:1488` NOR `curl_mfprintf`
+        // at `:1524`, so a sink that refuses everything past the header still
+        // produces `CURLE_OK` -- and a truncated jar. This test used to assert
+        // `Err(CURLcode::WriteError)`; it asserted an improvement over the C
+        // that AAP 0.8.2 forbids, and it is the reason the improvement went
+        // unnoticed.
         let header_and_one = FILE_HEADER.len() + 40;
         let mut sink = ShortSink {
             budget: header_and_one,
             written: Vec::new(),
         };
-        assert_eq!(jar.write_to(&mut sink), Err(CURLcode::WriteError));
+        assert_eq!(jar.write_to(&mut sink), Ok(()));
         assert!(sink.written.starts_with(FILE_HEADER));
+        // Truncated, and silently so: this is the data loss the C accepts.
         assert_eq!(sink.written.len(), header_and_one);
 
-        // And a sink that refuses the header itself fails at the first call.
+        // A sink that refuses the header itself is equally silent, and writes
+        // nothing at all.
         let mut sink = ShortSink {
             budget: 0,
             written: Vec::new(),
         };
-        assert_eq!(jar.write_to(&mut sink), Err(CURLcode::WriteError));
+        assert_eq!(jar.write_to(&mut sink), Ok(()));
         assert!(sink.written.is_empty());
 
-        // A sink with room for everything agrees with the in-memory writer.
-        let mut sink = ShortSink {
-            budget: usize::MAX,
-            written: Vec::new(),
-        };
-        assert_eq!(jar.write_to(&mut sink), Ok(()));
-        assert_eq!(text(&sink.written), text(JAR_DESCENDING));
-
-        // And the line TERMINATOR is a write of its own -- `:1524` is one
-        // `curl_mfprintf("%s\n", line)` in the C, split here so that the entry
-        // and its newline are separate `emit` calls -- so a sink with room for
-        // exactly the header and the first entry fails on the newline.
+        // The entry loop keeps going after a refused write rather than
+        // stopping, because there is no error to stop on: a sink with room for
+        // the header and the first entry but not its newline still receives
+        // every LATER entry that fits.
         let body: &[u8] =
             JAR_DESCENDING.get(FILE_HEADER.len()..).unwrap_or_default();
         let first_len =
@@ -9630,9 +8768,18 @@ blexp=yesyes; cookie9=junk--\r\n";
             budget: FILE_HEADER.len() + first_len,
             written: Vec::new(),
         };
-        assert_eq!(jar.write_to(&mut sink), Err(CURLcode::WriteError));
+        assert_eq!(jar.write_to(&mut sink), Ok(()));
         assert_eq!(sink.written.len(), FILE_HEADER.len() + first_len);
         assert!(!sink.written.ends_with(b"\n"));
+
+        // A sink with room for everything agrees with the in-memory writer, so
+        // the success path is unchanged: no byte of a successful save differs.
+        let mut sink = ShortSink {
+            budget: usize::MAX,
+            written: Vec::new(),
+        };
+        assert_eq!(jar.write_to(&mut sink), Ok(()));
+        assert_eq!(text(&sink.written), text(JAR_DESCENDING));
     }
 
     #[test]
@@ -9644,17 +8791,6 @@ blexp=yesyes; cookie9=junk--\r\n";
         // the terminating zero in its `fit` (`lib/curlx/dynbuf.c:72`). So
         // `Curl_get_line` refuses a longer line and `:1137`'s `while(!result &&
         // !eof)` ends the read.
-        //
-        // This is the ONLY way a load reports an error at all: a malformed line
-        // never does, which the C says outright at `:1133-1134` -- *"File
-        // reading cookie failures are not propagated back to the caller because
-        // there is no way to do that"*. Note the contrast with the HEADER
-        // parser, where an over-long line is discarded in silence and the
-        // caller is told nothing.
-        // `total` counts the NEWLINE, because `Curl_get_line` keeps it in the
-        // buffer -- it is how the function knows the line is complete
-        // (`lib/curl_get_line.c:54-58`) -- so it is charged against the
-        // ceiling like any other byte.
         let prefix: &[u8] = b"example.com\tFALSE\t/\tFALSE\t0\tn\t";
         let jar_line = |total: usize| -> Vec<u8> {
             let mut line = prefix.to_vec();
@@ -9697,5 +8833,52 @@ blexp=yesyes; cookie9=junk--\r\n";
         let mut input = both.as_slice();
         assert!(jar.read_from(&mut input, &clock, &NoLog, None).is_err());
         assert_eq!(jar.numcookies(), 0);
+    }
+
+    /// A cookie value cannot appear in a formatted cookie, store or header.
+    ///
+    /// All three levels in one test, because the redaction is at the leaf and
+    /// the point is that no level can undo it. The value is what a session
+    /// cookie IS, so its absence is the whole assertion.
+    #[test]
+    fn a_cookie_value_cannot_reach_any_formatted_representation() {
+        const SECRET: &str = "abc123deadbeefsession";
+
+        let clock = clock_at(0);
+        let jar = load_text(
+            format!(".example.com\tTRUE\t/\tFALSE\t0\tsid\t{SECRET}\n")
+                .as_bytes(),
+            &clock,
+        );
+
+        // The leaf.
+        let cookie = only(&jar);
+        let leaf = format!("{cookie:?}");
+        assert!(!leaf.contains(SECRET), "the value leaked: {leaf}");
+        assert!(
+            leaf.contains(&format!("<redacted, {} bytes>", SECRET.len())),
+            "{leaf}"
+        );
+        // The name, domain and path survive: they are what matching turns on.
+        assert!(leaf.contains("sid"), "{leaf}");
+        assert!(leaf.contains("example.com"), "{leaf}");
+
+        // The store, which reports counts rather than contents.
+        let store = format!("{jar:?}");
+        assert!(!store.contains(SECRET), "the value leaked: {store}");
+        assert!(store.contains("held: 1"), "{store}");
+
+        // The composed request header.
+        let header = CookieHeader {
+            value: format!("sid={SECRET}").into_bytes(),
+            count: 1,
+            linecap: false,
+        };
+        let line = format!("{header:?}");
+        assert!(!line.contains(SECRET), "the header leaked: {line}");
+        assert!(line.contains("count: 1"), "{line}");
+
+        // The stored bytes are unchanged: a formatting change only.
+        assert_eq!(cookie.value(), Some(SECRET.as_bytes()));
     }
 }

@@ -24,173 +24,9 @@
 
 //! Shell-style wildcard matching, for FTP directory listings.
 //!
-//! Supersedes `lib/curl_fnmatch.c` (385 lines) and `lib/curl_fnmatch.h` (46),
-//! which AAP 0.4.1 maps onto this file. The whole of the C is wrapped in
-//! `#ifndef CURL_DISABLE_FTP` (`lib/curl_fnmatch.c:26`), so the whole of this
-//! module carries `#[cfg(feature = "ftp")]`, written as an inner attribute
-//! below for the same reason `src/ffi/gss.rs` writes its own that way: the
-//! gate belongs with the code it governs, and the parent then declares the
-//! module unconditionally.
-//!
-//! # The one consumer, and why the result is not a `bool`
-//!
-//! Exactly one call site exists in the C tree. `lib/ftplistparser.c:321-323`
-//! chooses the comparator for a wildcard FTP download:
-//!
-//! ```text
-//! compare = data->set.fnmatch;          /* CURLOPT_FNMATCH_FUNCTION */
-//! if(!compare)
-//!   compare = Curl_fnmatch;             /* this module */
-//! ```
-//!
-//! and then admits a listed file only when the comparator returns zero
-//! (`:327-328`). The user may supply that comparator through
-//! `CURLOPT_FNMATCH_FUNCTION` (`lib/setopt.c:2729`), so the three integers
-//! `curl_fnmatch_callback` returns are part of the public ABI, not an
-//! internal convention: `CURL_FNMATCH_MATCH` 0, `CURL_FNMATCH_NOMATCH` 1 and
-//! `CURL_FNMATCH_FAIL` 2 (`lib/curl_fnmatch.h:26-28`). [`FnMatch`] therefore
-//! pins all three discriminants explicitly, for the reason AAP 0.6.1 gives
-//! for `CURLcode`: a caller compiled against curl 8.19.0-DEV holds the
-//! numbers, not the names. Collapsing the enumeration to a `bool` would erase
-//! a third outcome that a user callback is entitled to return.
-//!
-//! At this call site `NOMATCH` and `FAIL` are indistinguishable -- both are
-//! non-zero, so both exclude the file. They are still kept apart, because the
-//! callback contract distinguishes them and this module's job is to reproduce
-//! that contract rather than the one call site's use of it.
-//!
-//! # The C ships TWO matchers, and this is a port of the one that does not
-//!
-//! `lib/curl_fnmatch.c` splits at `:30` on `HAVE_FNMATCH`:
-//!
-//! * `#ifndef HAVE_FNMATCH` -- curl's own recursive-backtracking matcher,
-//!   `:32-358`, about 320 lines.
-//! * `#else` -- a 25-line shim, `:359-382`, delegating to the system
-//!   `fnmatch(3)` and mapping `0` to `MATCH`, `FNM_NOMATCH` to `NOMATCH` and
-//!   anything else to `FAIL`.
-//!
-//! `HAVE_FNMATCH` is detected on all four mandated targets: `configure.ac`
-//! lists `fnmatch` among its checked functions at `:4177`, and `CMakeLists.txt`
-//! runs `check_function_exists("fnmatch" HAVE_FNMATCH)` at `:1580`. Linux and
-//! macOS both provide it, so **the shipping C binary uses the system
-//! `fnmatch(3)` on every target this workspace builds for.**
-//!
-//! This module nevertheless ports curl's own matcher. Three reasons, in order
-//! of weight:
-//!
-//! 1. Rust's standard library has no `fnmatch`, and the crate set is closed
-//!    -- no `glob`, `globset`, `wildmatch` or `regex` may be added, and none
-//!    of them reproduces the semantics recorded below in any case.
-//! 2. Reaching the platform function would need `unsafe`, which AAP 0.8.2
-//!    confines to `mod ffi`; `libc` is not a dependency of this layer.
-//! 3. Curl's own matcher is the behaviour its header documents
-//!    (`lib/curl_fnmatch.h:30-42`) and the one upstream ships wherever
-//!    `fnmatch(3)` is absent. It is a supported configuration, exactly as
-//!    AAP 0.8.7 treats unversioned symbol export.
-//!
-//! The escalation path, recorded and deliberately not taken: were an eligible
-//! fixture ever to fail on this difference, the remedy is to route through
-//! the platform `fnmatch(3)` from `src/ffi/sys.rs`, the sanctioned `unsafe`
-//! island -- never to weaken the pure-Rust matcher to meet a fixture.
-//!
-//! # The divergence, measured rather than described
-//!
-//! `tests/unit/unit1307.c` is the authoritative account of where the two
-//! matchers part company, because each of its rows can carry up to three
-//! expectations. `LINUX_DIFFER` is `0x80` with a shift of 8 and `MAC_DIFFER`
-//! is `0x40` with a shift of 16 (`:39-49`); the runner applies a shift only
-//! for the matching platform and then masks with `0x03` regardless
-//! (`:293-299`), so **the un-shifted low two bits are the `SYSTEM_CUSTOM`
-//! expectation -- the one this port must satisfy.**
-//!
-//! The table holds **157 rows** (measured, not the round number the migration
-//! notes carry), of which **11** declare a platform difference:
-//!
-//! | `unit1307.c` | pattern | string | custom | linux | mac |
-//! |---|---|---|---|---|---|
-//! | 78 | 200 bytes, mostly `[` | 200 `[` | `NOMATCH` | same | `FAIL` |
-//! | 87 | `[` | `[` | `NOMATCH` | `MATCH` | `FAIL` |
-//! | 88 | `[]` | `[]` | `NOMATCH` | `MATCH` | `FAIL` |
-//! | 130 | `[\xFF]` | `\xFF` | `MATCH` | `FAIL` | `FAIL` |
-//! | 152 | `[!\xFF]` | empty | `NOMATCH` | `FAIL` | same |
-//! | 153 | `[!\xFF]` | `\xFF` | `NOMATCH` | `FAIL` | `FAIL` |
-//! | 154 | `[!\xFF]` | `a` | `MATCH` | `FAIL` | `FAIL` |
-//! | 186 | `[[:foo:]]` | `bar` | `NOMATCH` | same | `FAIL` |
-//! | 187 | `[[:foo:]]` | `f]` | `MATCH` | `NOMATCH` | `FAIL` |
-//! | 225 | `\` | `\` | `MATCH` | `NOMATCH` | same |
-//! | 264 | 103 bytes, `*` and `[` | `a` | `NOMATCH` | `FAIL` | same |
-//!
-//! Two further measurements were taken rather than assumed, by extracting
-//! `lib/curl_fnmatch.c:32-358` verbatim into a standalone C harness and
-//! running both branches over all 157 rows:
-//!
-//! * curl's own matcher agrees with the custom column on **157 of 157** rows.
-//!   The port below is differential-tested against that same corpus.
-//! * On a glibc host, curl's matcher and `fnmatch(3)` actually disagree on
-//!   only **4** rows -- 87, 88, 187 and 225 -- and on those four the platform
-//!   answer is the one the linux column declares. The `FAIL` expectations for
-//!   the `\xFF` rows and for row 264 are stale: this glibc returns the same
-//!   answer as curl's own matcher there. So 11 rows are declared divergent
-//!   and 4 are divergent in practice; both numbers are stated because a
-//!   reader checking the table against a modern platform would otherwise
-//!   conclude the table is wrong.
-//!
-//! Every one of the 11 needs a pathological pattern: an unmatched or empty
-//! `[`, a `0xFF` byte inside a bracket expression, an unknown keyword, or a
-//! lone trailing backslash.
-//!
-//! # What the divergence costs, quantified
-//!
-//! Nothing that any fixture observes, and that is measured too.
-//!
-//! Seven `tests/data` fixtures exercise wildcard matching: `test574`,
-//! `test575`, `test576` (`*.txt` and `*` over a UNIX listing), `test1113` and
-//! `test1114` (the same over a DOS listing), and `test1162` and `test1163`.
-//! The last two DO use pathological patterns -- `[*\s-'tl` and `*[][`, both
-//! unterminated bracket expressions -- so the migration notes' claim that
-//! none is pathological is inaccurate; the conclusion nevertheless holds, for
-//! a better reason. Each of those two asserts only
-//! `<errorcode>78</errorcode>`, `CURLE_REMOTE_FILE_NOT_FOUND`, meaning no
-//! filename matched, and every comparator answer other than zero produces
-//! that outcome at `lib/ftplistparser.c:327`. Neither pattern sits on a
-//! divergent row. An eighth file, `test1458`, matches a search for
-//! "wildcard" only because it exercises `--resolve` with a wildcard host.
-//!
-//! The ninth is `test1307`, the unit driver -- and it is listed in
-//! `tests/data/DISABLED:46-47` under the comment "fnmatch differences are
-//! just too common to make testing them sensible". Upstream disables it, so
-//! the harness never runs it against any implementation, and AAP 0.8.7's
-//! relocation of its coverage into the `#[cfg(test)]` module at the foot of
-//! this file is the only place that coverage can live. All 157 rows are
-//! ported there, taking the custom column for every one.
-//!
-//! # The documented feature set, from `lib/curl_fnmatch.h:30-42`
-//!
-//! Reproduced because it is the specification of what follows, and its
-//! omissions are as load-bearing as its inclusions:
-//!
-//! > Implemented with recursive backtracking, if you want to use
-//! > `Curl_fnmatch`, please note that there is not implemented UTF/Unicode
-//! > support.
-//! >
-//! > Implemented features:
-//! > `'?'` notation, does not match UTF characters;
-//! > `'*'` can also work with UTF string;
-//! > `[a-zA-Z0-9]` enumeration support
-//! >
-//! > keywords: `alnum`, `digit`, `xdigit`, `alpha`, `print`, `blank`,
-//! > `lower`, `graph`, `space` and `upper` (use as `"[[:alnum:]]"`)
-//!
-//! So `'?'` matches exactly one **byte**, not one Unicode scalar value, and
-//! `'*'` is incidentally UTF-8-safe because it matches any run of bytes.
-//! There are ten keywords and no more; an eleventh spelling is a syntax
-//! error. Everything here operates on `&[u8]` for that reason -- never
-//! `&str`, which would make four rows of `unit1307` unrepresentable.
-//!
 //! # Two frozen quirks that read like defects
 //!
-//! Both are reproduced deliberately. AAP 0.8.1 freezes observable behaviour,
-//! and "the C is probably wrong here" is not a licence to differ.
+//! Both are reproduced deliberately.
 //!
 //! ## `[[:space:]]` matches only space and tab
 //!
@@ -202,57 +38,6 @@
 //! oversight, verified against the extracted C rather than inferred, and
 //! frozen. It also makes the `space` and `blank` flags behave identically;
 //! both are still parsed and stored, so the parse side stays faithful.
-//!
-//! ## Three effective stars can report a non-match
-//!
-//! `maxstars` starts at 2 (`lib/curl_fnmatch.c:357`) and is spent once per
-//! `'*'` that enters the backtracking scan. When it reaches zero a further
-//! `'*'` returns `NOMATCH` immediately (`:263-264`), so a pattern with three
-//! effective stars can be reported as a non-match even where it plainly
-//! matches: `*a*b*c` against `aXbYc` is `NOMATCH`, while `a*b*c` against the
-//! same string, and `*a*b` against `aXb`, both match. This is a deliberate
-//! guard against catastrophic backtracking. The budget, and the point at
-//! which it is spent, are reproduced exactly; raising it, or replacing the
-//! recursion with a dynamic-programming or automaton matcher, would change
-//! the answer on the pathological rows. Performance is an explicit non-goal
-//! (AAP 0.1.1), so no memoisation is added either.
-//!
-//! One reassurance follows from the same budget: the recursion below is
-//! provably at most three frames deep, because the only recursive call is the
-//! star scan and it passes a strictly smaller budget. The scan itself is a
-//! loop.
-//!
-//! # NUL, empty, and the shape of the signature
-//!
-//! The C walks four `const unsigned char *` cursors and reads the NUL
-//! terminator as an ordinary byte, one past the last content byte. Every read
-//! here is `slice.get(i).copied().unwrap_or(0)` instead -- the idiom
-//! `util/strcase.rs` already uses -- so index `len()` yields exactly the zero
-//! the C would have read there, and no read can run off the end. The deepest
-//! lookahead in the C is three bytes past the cursor, in the range parser,
-//! and it is reached only when the intervening bytes were non-NUL, so this
-//! model reproduces it without ever needing a byte beyond the virtual
-//! terminator.
-//!
-//! Two consequences worth stating:
-//!
-//! * A zero byte **inside** either slice terminates it, exactly as it would
-//!   have terminated the C string. `("a\0b", "a")` matches, because the C
-//!   pattern would have been `a`.
-//! * `Curl_fnmatch` returns `FAIL` for a NULL pattern or string
-//!   (`lib/curl_fnmatch.h`'s prototype takes pointers;
-//!   `lib/curl_fnmatch.c:353-355`). A `&[u8]` cannot be null, so that check
-//!   has no place here: it belongs at the C boundary, where a pointer still
-//!   exists. An **empty** slice is a different thing entirely and is matched
-//!   normally -- `("", "")` matches and `("", "a")` does not. `FAIL` is
-//!   consequently never returned by [`fnmatch`]; the variant exists because
-//!   the callback contract has it.
-//!
-//! The `void *ptr` first parameter of the C signature exists only to satisfy
-//! the callback prototype and is unused (`lib/curl_fnmatch.c:351-352`), so it
-//! is absent here. The dispatch that chooses between this function and a
-//! user-supplied callback still needs it, and that dispatch belongs to
-//! `protocols/ftp/listparser.rs`.
 //!
 //! # Conventions
 //!
@@ -268,19 +53,6 @@
 #![cfg(feature = "ftp")]
 
 /// The three outcomes of a wildcard comparison.
-///
-/// Supersedes the three macros at `lib/curl_fnmatch.h:26-28`. Every
-/// discriminant is written out; none is left to Rust's implicit "previous plus
-/// one", for the reason AAP 0.6.1 records for `CURLcode`. `#[repr(i32)]`
-/// because `curl_fnmatch_callback` returns C `int`, and a user-supplied
-/// `CURLOPT_FNMATCH_FUNCTION` therefore hands these exact integers back across
-/// the boundary.
-///
-/// [`Fail`](FnMatch::Fail) is unreachable from [`fnmatch`], whose arguments are
-/// slices and so cannot be null. It is part of the type because it is part of
-/// the callback contract: the C returns it for a null pointer
-/// (`lib/curl_fnmatch.c:353-355`), and the FFI layer that still holds pointers
-/// is where that check belongs.
 // The whole module is unreferenced until `protocols/ftp/listparser.rs` lands
 // and calls this from its comparator dispatch -- the single consumer measured
 // at `lib/ftplistparser.c:321-323`. The allowance is per item, as this
@@ -302,39 +74,6 @@ pub(crate) enum FnMatch {
 }
 
 // THE CHARACTER PREDICATES -- `lib/curl_ctype.h`, transcribed range by range.
-//
-// These are curl's own ASCII tables, not `<ctype.h>`, so they are
-// locale-independent by construction -- which is the whole point of the header
-// existing. The standard library's Unicode-aware `char` classification
-// methods -- the alphanumeric, alphabetic, case and whitespace family -- would
-// answer differently for every byte from 0x80 up, so not one of them is named
-// anywhere in this file; each predicate below is an explicit byte range
-// instead. `unit1307` rows 130 and 152-154 feed a raw 0xFF and would change
-// answer under a Unicode predicate.
-//
-// Two of them are unusual enough to be worth naming here rather than leaving
-// to a reader's assumption: ISPRINT and ISGRAPH both include the control range
-// 9..=0x0d, by way of ISLOWPRINT, so `[[:print:]]` matches a tab and a
-// carriage return while `[[:graph:]]` matches a tab but not a space.
-//
-// The C spells each range as two comparisons, `((x) >= 'A') && ((x) <= 'Z')`.
-// An inclusive range's `contains` is that same test, byte for byte, and is
-// what `clippy::manual_range_contains` asks for; the two forms are
-// interchangeable here because every bound below is a `u8` constant, so no
-// widening or signedness question arises.
-//
-// Three of the ten -- ISUPPER, ISLOWER and ISDIGIT -- coincide exactly with a
-// standard-library ASCII helper, and `clippy::manual_is_ascii_check` asks for
-// the helper. Each of the three carries a targeted allowance instead, because
-// the other seven have no such counterpart: four are compositions, ISBLANK is
-// a two-byte set, and ISPRINT and ISGRAPH differ from every helper on offer.
-// The ASCII-graphic helper in particular is `0x21..=0x7e` and would SILENTLY
-// DROP the 9..=0x0d control range that curl's ISGRAPH admits. Spelling three
-// of a ten-macro family with helpers and seven with ranges would invite a
-// later reader to finish the job and reach for that one; keeping all ten in a
-// single shape that diffs against `lib/curl_ctype.h` line by line is worth
-// more than three shorter function bodies. The sibling `util/strcase.rs:239`
-// resolves the same tension the same way.
 
 /// `ISUPPER` -- `lib/curl_ctype.h:42`.
 // Uniform with the other nine: see the note above the family.
@@ -439,16 +178,6 @@ fn charclass(c: u8) -> CharClass {
 }
 
 /// A POSIX character class named inside a bracket expression.
-///
-/// The C has no such enumeration: it stores these as flags at indices past the
-/// end of the byte range in one 271-byte array, so that a class and a literal
-/// byte can share a single lookup table. Those indices are recorded here so a
-/// reader can still grep `lib/curl_fnmatch.c`, and the layout note below
-/// explains why this port does not reproduce the trick.
-///
-/// Declared in the order of the C's constants (`lib/curl_fnmatch.c:37-46`),
-/// which is NOT the order in which they are consulted; see [`CASCADE`] for
-/// that.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PosixClass {
     /// `CURLFNM_ALNUM` = 257, that is `CURLFNM_CHARSET_LEN + 1`.
@@ -474,29 +203,9 @@ enum PosixClass {
 }
 
 /// The number of POSIX classes, and so the width of the class-flag array.
-///
-/// Ten, matching the ten keywords the header documents. The C reserves fifteen
-/// slots past the byte range -- `CURLFNM_CHSET_SIZE` is
-/// `CURLFNM_CHARSET_LEN + 15` (`lib/curl_fnmatch.c:33`) -- and uses eleven of
-/// them: one for the negation flag and ten for these. The remaining four are
-/// spare in the C and have no counterpart here.
 const CLASS_COUNT: usize = 10;
 
 /// The contents of one bracket expression.
-///
-/// Supersedes the `unsigned char charset[CURLFNM_CHSET_SIZE]` of
-/// `lib/curl_fnmatch.c:256`, a 271-byte array in which indices 0..=255 are
-/// literal bytes, index 256 (`CURLFNM_NEGATE`) is the negation flag and indices
-/// 257..=266 are the ten class flags. Splitting it into three fields is the
-/// point of the migration: the C's "index past the end of the byte range"
-/// convention is exactly the kind of arithmetic that a typed field removes, and
-/// it removes it without changing a single answer, because the byte index and
-/// the flag indices never overlap in the C either -- a byte is at most 255.
-///
-/// The C's `memset(charset, 0, CURLFNM_CHSET_SIZE)` at the head of
-/// [`setcharset`] (`:165`) exists because `loop` declares one array and reuses
-/// it for every bracket expression it meets. Here each call constructs its own
-/// value, so the clear is structural.
 struct CharSet {
     /// One flag per literal byte. `charset[c]` in the C.
     bytes: [bool; 256],
@@ -538,29 +247,11 @@ impl CharSet {
 }
 
 /// The byte at `index`, or the terminator the C would have read past the end.
-///
-/// The C walks NUL-terminated strings and reads the terminator as an ordinary
-/// byte; `&[u8]` carries no terminator, so index `len()` and beyond yield the
-/// zero that read would have produced. Every byte access in this module goes
-/// through here, which is what makes an out-of-bounds read impossible while
-/// still reproducing the C's lookahead exactly.
 fn byte_at(bytes: &[u8], index: usize) -> u8 {
     bytes.get(index).copied().unwrap_or(0)
 }
 
 /// Parses a `[:keyword:]` class name and records it in `set`.
-///
-/// Supersedes `parsekeyword` (`lib/curl_fnmatch.c:69-122`). `at` enters
-/// pointing just past the `[:` and, on success, leaves pointing just past the
-/// closing `]` of the `:]` pair -- the C's `*pattern = p` at `:98`. Returns
-/// `true` for the C's `SETCHARSET_OK`, whose value is 1 while `SETCHARSET_FAIL`
-/// is 0 (`:66-67`); the polarity reads like an error code and is not one, so
-/// the C's `if(parsekeyword(...))` means "if it succeeded".
-///
-/// On failure nothing has been recorded in `set`: the C writes its flag only
-/// after the name has been recognised, so a rejected keyword cannot leave a
-/// half-parsed expression behind. That matters at the call site, which reuses
-/// the same set for the literal `[` it falls back to.
 ///
 /// Two details of the C's bound check are reproduced rather than tidied:
 ///
@@ -691,12 +382,6 @@ fn setcharorrange(pattern: &[u8], at: &mut usize, set: &mut CharSet) {
     }
 
     // `while(c++ != endrange) if(charclass(c) == cc) charset[c] = 1;`
-    //
-    // The comparison uses the value BEFORE the increment and the body the value
-    // after, so the bytes added are `c + 1` through `endrange` inclusive, and
-    // the start byte itself was already added above. `endrange >= c` is
-    // established, so the counter reaches `endrange` exactly and cannot
-    // overflow.
     while c != endrange {
         c += 1;
         if charclass(c) == cc {
@@ -707,23 +392,6 @@ fn setcharorrange(pattern: &[u8], at: &mut usize, set: &mut CharSet) {
 }
 
 /// Parses a whole bracket expression.
-///
-/// Supersedes `setcharset` (`lib/curl_fnmatch.c:159-249`). `at` enters pointing
-/// just past the opening `[` and, on success, leaves pointing AT the `]` that
-/// closed the expression -- the C never advances over it, which is why its
-/// caller resumes at `pp + 1` (`:331`).
-///
-/// `Some` is the C's `SETCHARSET_OK` and `None` its `SETCHARSET_FAIL`.
-/// Returning the set rather than filling a caller-owned buffer is what makes
-/// "a failed parse yields no set" structural: the C's caller keeps a separate
-/// cursor for the same reason, and simply discards it (`:298`). On failure `at`
-/// is left wherever the scan stopped, which is harmless for exactly that
-/// reason.
-///
-/// The state machine is `setcharset_state` (`:48-52`) and its three states are
-/// transcribed branch for branch. The two non-default states exist only to
-/// handle a `]` that appears FIRST, where POSIX makes it a literal member
-/// rather than the terminator.
 fn setcharset(pattern: &[u8], at: &mut usize) -> Option<CharSet> {
     // `CURLFNM_SCHS_DEFAULT`, `_RIGHTBR` and `_RIGHTBRLEFTBR` -- the second is
     // entered only after a leading literal `]`, and the third only after a `[`
@@ -852,25 +520,11 @@ fn setcharset(pattern: &[u8], at: &mut usize) -> Option<CharSet> {
 
 /// The order in which a bracket expression's class flags are consulted.
 ///
-/// This is the `else if` chain of `lib/curl_fnmatch.c:305-324`, as data. **The
-/// order is significant and the chain is not a set of independent tests:** only
-/// the FIRST flag that is set is consulted, so an expression naming two classes
-/// silently ignores the second. `[[:alnum:][:space:]]` therefore does NOT match
-/// a space -- `alnum` wins the chain and answers no -- which is measurably
-/// different from the `||` of every flag that a reader might assume.
-///
 /// Written as a table for two reasons. It keeps that ordering visible as the
 /// single thing it is, so a later edit cannot quietly turn the chain into a
 /// disjunction; and the `space` and `blank` rows have identical predicates, so
 /// an `if`/`else if` chain would draw `clippy::if_same_then_else` and invite
 /// exactly the collapse that would erase the quirk below.
-///
-/// **`space` is tested with `ISBLANK`, not `ISSPACE`** (`:315-316`). That is
-/// almost certainly an upstream oversight -- `[[:space:]]` consequently matches
-/// only a space and a tab, never a newline, carriage return, vertical tab or
-/// form feed -- and it is frozen behaviour under AAP 0.8.1. Do not "fix" it.
-/// Both flags are kept even though they now behave identically, so that the
-/// parse side stays faithful to the ten documented keywords.
 #[rustfmt::skip]
 const CASCADE: [(PosixClass, fn(u8) -> bool); CLASS_COUNT] = [
     (PosixClass::Alnum,  is_alnum),   // CURLFNM_ALNUM  -- :305-306
@@ -918,14 +572,6 @@ fn matches_set(set: &CharSet, byte: u8) -> bool {
 const MAX_STARS: u32 = 2;
 
 /// The matcher.
-///
-/// Supersedes `loop` (`lib/curl_fnmatch.c:251-344`), transcribed arm for arm.
-/// `maxstars` is the remaining recursion budget; the only recursive call is the
-/// star scan and it passes a strictly smaller one, so the depth is at most
-/// `MAX_STARS + 1` frames -- three -- however long the pattern is. The scan
-/// itself is a loop, and the C's own `charset` array -- declared once per frame
-/// at `:256` and cleared per bracket expression -- becomes a value returned by
-/// [`setcharset`].
 fn match_loop(pattern: &[u8], string: &[u8], maxstars: u32) -> FnMatch {
     let mut p = 0usize;
     let mut s = 0usize;
@@ -1058,13 +704,6 @@ fn match_loop(pattern: &[u8], string: &[u8], maxstars: u32) -> FnMatch {
 /// pattern syntax, for the two frozen quirks the C carries, and for why this is
 /// a port of curl's own matcher rather than of the `fnmatch(3)` shim beside it.
 ///
-/// The C's first parameter, `void *ptr`, exists only to satisfy the
-/// `curl_fnmatch_callback` prototype and is unused (`:351-352`), so it has no
-/// counterpart here; the comparator dispatch that needs it lives with the FTP
-/// listing parser. The C's null-pointer check (`:353-355`) has none either: a
-/// slice cannot be null, and an EMPTY slice is a different thing, matched
-/// normally. [`FnMatch::Fail`] is therefore never returned.
-///
 /// # Examples
 ///
 /// ```text
@@ -1073,38 +712,14 @@ fn match_loop(pattern: &[u8], string: &[u8], maxstars: u32) -> FnMatch {
 /// fnmatch(b"[a-bA-Z9]*",  b"Zero")      == FnMatch::Match
 /// fnmatch(b"[[:digit:]]", b"7")         == FnMatch::Match
 /// ```
-// Unreferenced until the FTP listing parser lands; see the note on [`FnMatch`].
 #[allow(dead_code)]
 pub(crate) fn fnmatch(pattern: &[u8], string: &[u8]) -> FnMatch {
     match_loop(pattern, string, MAX_STARS)
 }
 
-// ---------------------------------------------------------------------------
 // The relocated unit test
-// ---------------------------------------------------------------------------
 
 /// `tests/unit/unit1307.c`, relocated, plus the cases that pin the quirks.
-///
-/// AAP 0.8.7 records that `tests/unit/*.c` cannot link against a Rust
-/// `staticlib` -- a `pub(crate)` item is genuinely absent from the symbol
-/// table rather than merely hidden -- and that the coverage of those C
-/// programs is relocated into `#[cfg(test)]` modules such as this one.
-/// `unit1307.c` is the only unit test that covers `Curl_fnmatch`, and all
-/// 157 of its rows are reproduced here: 155 inline in [`TABLE`], and the
-/// 200-byte and 103-byte pathological rows as dedicated tests, because byte
-/// runs that long read better built than quoted.
-///
-/// Every row is taken at its *un-shifted* `SYSTEM_CUSTOM` expectation
-/// (`tests/unit/unit1307.c:265-320`), which is the answer curl's own matcher
-/// gives and therefore the answer this port must give. The eleven rows whose
-/// declared Linux or macOS expectation differs carry a comment naming that
-/// difference, so a later reader can see it is known and deliberate rather
-/// than wonder whether a row was mistranscribed.
-///
-/// The expectations of the targeted tests below were measured, not reasoned
-/// about: `lib/curl_fnmatch.c`'s `#ifndef HAVE_FNMATCH` branch was compiled
-/// as a standalone oracle and queried for each one, so every assertion in
-/// this module is the C's own answer to the same question.
 #[cfg(test)]
 mod tests {
     use super::FnMatch::{Fail, Match, NoMatch};
@@ -1124,13 +739,6 @@ mod tests {
     }
 
     /// The 155 inline rows of `tests/unit/unit1307.c:68-262`.
-    ///
-    /// The C's own section comments are kept as landmarks, and its
-    /// duplicated rows are kept duplicated rather than tidied: `[[[[]`
-    /// against `[` appears at :93 and :94, `[[:print:]]` against `\x08` at
-    /// :174 and :175, and the empty pattern against the empty string at :217
-    /// and :259. This table is the specification for this module, so it is
-    /// transcribed, not curated.
     #[rustfmt::skip]
     const TABLE: &[(&[u8], &[u8], FnMatch)] = &[
         // brackets syntax -- unit1307.c:77
@@ -1372,12 +980,10 @@ mod tests {
 
     /// The star budget starts at 2 and a third effective star is refused.
     ///
-    /// `lib/curl_fnmatch.c:357` passes 2, and :265 returns `NOMATCH` the
-    /// moment the budget is gone -- before any scanning. A pattern with
-    /// three effective stars can therefore be reported as a non-match even
-    /// when it plainly matches. This is curl's catastrophic-backtracking
-    /// guard and it is frozen behaviour under AAP 0.8.1: it is not to be
-    /// raised, removed, or worked around with memoisation.
+    /// `lib/curl_fnmatch.c:357` passes 2, and:265 returns `NOMATCH` the moment
+    /// the budget is gone -- before any scanning. A pattern with three
+    /// effective stars can therefore be reported as a non-match even when it
+    /// plainly matches.
     #[test]
     fn the_third_effective_star_is_refused() {
         assert_eq!(MAX_STARS, 2);
@@ -1426,13 +1032,6 @@ mod tests {
     }
 
     /// A trailing backslash matches a literal backslash.
-    ///
-    /// `lib/curl_fnmatch.c:284` advances past the backslash only when a byte
-    /// follows it (`if(p[1]) p++;`), so at the end of a pattern the cursor
-    /// still points at the backslash and the comparison on :285 tests it
-    /// against itself. `unit1307.c:225` records that Linux `fnmatch(3)`
-    /// answers `NOMATCH` here; curl's own matcher answers `MATCH`, and that
-    /// is the behaviour this port reproduces.
     #[test]
     fn a_trailing_backslash_matches_a_literal_backslash() {
         assert_eq!(fnmatch(b"\\", b"\\"), Match);
@@ -1478,11 +1077,9 @@ mod tests {
     /// `[[:space:]]` matches only space and tab.
     ///
     /// `lib/curl_fnmatch.c:315-316` tests `CURLFNM_SPACE` with `ISBLANK`
-    /// rather than `ISSPACE`, so the carriage return, line feed, vertical
-    /// tab and form feed that `lib/curl_ctype.h:46` would admit are all
-    /// non-matches. This is almost certainly an upstream defect. It is
-    /// frozen behaviour under AAP 0.8.1 and must not be "fixed": the
-    /// observable behaviour is the contract, defect and all.
+    /// rather than `ISSPACE`, so the carriage return, line feed, vertical tab
+    /// and form feed that `lib/curl_ctype.h:46` would admit are all
+    /// non-matches. This is almost certainly an upstream defect.
     #[test]
     fn the_space_class_is_tested_with_isblank() {
         assert_eq!(fnmatch(b"[[:space:]]", b" "), Match);
@@ -1503,12 +1100,6 @@ mod tests {
     }
 
     /// Only the first class flag set in a bracket expression is consulted.
-    ///
-    /// `lib/curl_fnmatch.c:307-327` is an `else if` chain, not a set of
-    /// independent tests, so a pattern that names two classes silently
-    /// ignores the second. The chain order is fixed by the code, not by the
-    /// pattern, which is why writing the classes the other way round changes
-    /// nothing.
     #[test]
     fn only_the_first_class_flag_in_a_set_is_consulted() {
         // ALNUM (:309) precedes SPACE (:315), so the space class is never
@@ -1529,13 +1120,6 @@ mod tests {
     }
 
     /// A range needs both endpoints in one character class.
-    ///
-    /// `lib/curl_fnmatch.c:146-153`: the start byte must be alphanumeric,
-    /// the two endpoints must share a `char_class`, and each intermediate
-    /// byte is added only if it too belongs to that class -- the C's own
-    /// comment explains that "Chars in class may be not consecutive." When
-    /// the range is refused the caller's cursor has advanced by exactly one
-    /// byte, so the expression degrades into literals instead of failing.
     #[test]
     fn a_range_keeps_both_endpoints_in_one_character_class() {
         // `[A-z]` is not a span. 'A' is upper and 'z' is lower, so the range
@@ -1590,12 +1174,6 @@ mod tests {
     }
 
     /// Negation takes `!` or `^`, and only in the leading position.
-    ///
-    /// `lib/curl_fnmatch.c:196-206` is a three-way branch: the byte negates
-    /// the set only when nothing has been found yet *and* the negate flag is
-    /// not already set; otherwise it is a literal. `[!!x]` therefore negates
-    /// once and then matches a literal `!`, which is why `x` -- a member of
-    /// the negated set -- is a non-match.
     #[test]
     fn negation_takes_bang_or_caret_in_the_leading_position() {
         assert_eq!(fnmatch(b"[!abc]", b"d"), Match);
@@ -1635,14 +1213,6 @@ mod tests {
     }
 
     /// An unknown POSIX keyword degrades the `[` to a literal.
-    ///
-    /// `parsekeyword` returns failure for a keyword outside the ten it
-    /// knows, and `lib/curl_fnmatch.c:188-194` then treats the `[` as an
-    /// ordinary member instead of failing the whole expression. That is why
-    /// `[[:foo:]]` matches the two-byte string `f]`: the set becomes
-    /// {'[', ':', 'f', 'o'}, one member matches `f`, and the trailing `]` of
-    /// the pattern matches the `]` of the string. `unit1307.c:187` records
-    /// that Linux `fnmatch(3)` answers `NOMATCH` and macOS answers `FAIL`.
     #[test]
     fn an_unknown_posix_keyword_degrades_the_bracket_to_a_literal() {
         assert_eq!(fnmatch(b"[[:foo:]]", b"f]"), Match);
@@ -1655,12 +1225,6 @@ mod tests {
     }
 
     /// A POSIX keyword is bounded and lower-case only.
-    ///
-    /// The C's buffer is ten bytes and the bound is checked before the store
-    /// (`lib/curl_fnmatch.c:87-88`), while the body accepts only
-    /// `ISLOWER` bytes (:96). Every over-long or wrongly-cased keyword takes
-    /// the same route as an unknown one: the keyword fails, the `[` becomes
-    /// a literal, and the set swallows the keyword text.
     #[test]
     fn a_posix_keyword_is_bounded_and_lower_case_only() {
         assert_eq!(fnmatch(b"[[:abcdefghij:]]", b"a]"), Match);
@@ -1715,12 +1279,6 @@ mod tests {
     }
 
     /// Bytes above ASCII are matched literally, inside brackets and out.
-    ///
-    /// The predicates in `lib/curl_ctype.h` are ASCII-only and
-    /// locale-independent, so a byte above 0x7f belongs to no class and is
-    /// only ever a literal. `unit1307.c:130` and :152-154 record that both
-    /// Linux and macOS `fnmatch(3)` answer `FAIL` for these rows, where
-    /// curl's own matcher answers plainly.
     #[test]
     fn bytes_above_ascii_are_matched_literally() {
         assert_eq!(fnmatch(b"[\xff]", b"\xff"), Match);
@@ -1732,12 +1290,6 @@ mod tests {
     }
 
     /// The empty pattern and the empty string.
-    ///
-    /// `lib/curl_fnmatch.c:279-280`: an exhausted pattern matches only an
-    /// exhausted string. A NULL pattern or string is a third case,
-    /// `CURL_FNMATCH_FAIL` (:353), which cannot arise here because the
-    /// arguments are slices -- it belongs at the FFI boundary, where a C
-    /// caller can still pass NULL.
     #[test]
     fn the_empty_pattern_matches_only_the_empty_string() {
         assert_eq!(fnmatch(b"", b""), Match);
@@ -1750,12 +1302,6 @@ mod tests {
     }
 
     /// An interior NUL ends the pattern and the string.
-    ///
-    /// The C walks NUL-terminated strings, so `"a\0b"` is the two-byte
-    /// C string `"a"` and no C caller can express anything else. `byte_at`
-    /// reproduces that by reading 0 both past the end of a slice and at an
-    /// embedded NUL, which keeps a slice-shaped caller from observing
-    /// behaviour a C caller could not.
     #[test]
     fn an_interior_nul_terminates_the_pattern_and_the_string() {
         assert_eq!(fnmatch(b"a\0b", b"a"), Match);
@@ -1768,11 +1314,9 @@ mod tests {
 
     /// Long inputs do not overflow the stack.
     ///
-    /// The matcher walks the pattern iteratively; only the `'*'` arm
-    /// recurses (`lib/curl_fnmatch.c:277`), and the star budget bounds that
-    /// to three frames however long the input is. AAP 0.1.1 makes
-    /// performance a non-goal, so this asserts termination and depth, not
-    /// speed.
+    /// The matcher walks the pattern iteratively; only the `'*'` arm recurses
+    /// (`lib/curl_fnmatch.c:277`), and the star budget bounds that to three
+    /// frames however long the input is.
     #[test]
     fn long_inputs_do_not_overflow_the_stack() {
         let literal = [b'x'; 10_000];
@@ -1839,9 +1383,8 @@ mod tests {
     /// The three results carry the C's integers.
     ///
     /// `lib/curl_fnmatch.h:26-28`, and ABI-visible through the
-    /// `CURLOPT_FNMATCH_FUNCTION` callback, whose implementations are
-    /// compiled C holding these values in their instruction stream.
-    /// AAP 0.6.1 requires such integers to be pinned rather than inferred.
+    /// `CURLOPT_FNMATCH_FUNCTION` callback, whose implementations are compiled
+    /// C holding these values in their instruction stream.
     #[test]
     fn the_three_results_carry_the_c_integers() {
         assert_eq!(Match as i32, 0);
@@ -1851,12 +1394,6 @@ mod tests {
     }
 
     /// The byte predicates reproduce `lib/curl_ctype.h` exactly.
-    ///
-    /// Restated here as range patterns rather than range containment, so a
-    /// transcription slip in the implementation cannot be mirrored by the
-    /// same slip in the test. Exhaustive over all 256 bytes: these
-    /// predicates are ASCII-only and locale-independent, and Rust's
-    /// Unicode-aware `char` predicates would answer differently above 0x7f.
     // The restatement has to stay a literal range for all ten, or the three
     // that `clippy::manual_is_ascii_check` can rewrite would be checked
     // against the standard library while the other seven are checked against

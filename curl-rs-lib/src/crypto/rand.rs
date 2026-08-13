@@ -21,40 +21,17 @@
 //  * SPDX-License-Identifier: curl
 //  *
 //  ***************************************************************************/
-//! Randomness. Supersedes `lib/rand.c` (284 lines) and `lib/rand.h`
-//! (58 lines) over **`rand 0.8.7`**.
-//!
-//! # Why this is the most consequential file in the directory
-//!
-//! Its output reaches the wire. MIME multipart boundaries
-//! (`lib/mime.c:1191-1194`), HTTP Digest `cnonce` values
-//! (`lib/vauth/digest.c:383` and `:711-718`), the `Sec-WebSocket-Key` header
-//! (`lib/ws.c:1278`) and the WebSocket frame mask (`lib/ws.c:903`) are all
-//! drawn here, and AAP 0.6.7 measures 1,476 of the 1,914 fixtures under
-//! `tests/data/` as comparing the emitted request bytes as one joined
-//! string. The *values* are not observable, but the **lengths, the alphabet
-//! and the order the bytes come out in are**, so each is reproduced from the
-//! C rather than chosen:
-//!
-//! Line references in this table are into `lib/rand.c`.
-//!
-//! | Behaviour | C | Reproduced by |
-//! |---|---|---|
-//! | four bytes per draw, LOW byte first | `:187-216` | [`rand_bytes`] |
-//! | odd size, lowercase, `num - 1` long | `:225-251` | [`rand_hex`] |
-//! | 62-character alphabet, redrawing | `:258-284` | [`rand_alnum`] |
-//! | the `CURL_ENTROPY` counter | `:135-170` | [`TestRng`] |
+//! Randomness. Supersedes `lib/rand.c` and `lib/rand.h` over **`rand 0.8.7`**.
 //!
 //! # The source is injected, never reached for
 //!
 //! Every entry point here takes its randomness as a parameter. That mirrors
-//! the C exactly: each `Curl_rand*` function takes `struct Curl_easy *data`
-//! as its first argument precisely so that `randit` (`lib/rand.c:135-170`)
-//! can reach the TLS backend's generator through the handle
-//! (`lib/rand.c:165-166`, `Curl_ssl_random`). The injected [`Rng`] **is**
-//! that `data` parameter, and it is what AAP 0.3.3's P12 requires.
+//! the C exactly: each `Curl_rand*` function takes `struct Curl_easy *data` as
+//! its first argument precisely so that `randit` (`lib/rand.c:135-170`) can
+//! reach the TLS backend's generator through the handle (`lib/rand.c:165-166`,
+//! `Curl_ssl_random`).
 //!
-//! It is not decoration. AAP 0.8.4 sets a line-coverage gate of at least 80
+//! Injection is not decoration. A line-coverage gate of at least 80
 //! percent over `src/protocols/` and `src/transfer/`, and the paths that
 //! compose a MIME boundary, a Digest challenge response and a WebSocket
 //! handshake all run through this file. A test cannot assert on the bytes
@@ -64,14 +41,6 @@
 //! module's tests can inject it -- `mime/`, `protocols/ws.rs`,
 //! `auth/digest.rs` and `util/fopen.rs` each need it, and a `#[cfg(test)]`
 //! item here would be invisible to all four.
-//!
-//! Note what the requirement does *not* rest on. Nine fixtures force the
-//! generator through the environment -- `test1972`, `test2300` through
-//! `test2304`, `test823`, `test869` and `test907` -- and every one of them
-//! lists `Debug` in its `<features>` block, so all nine skip under AAP
-//! 0.6.6's decision not to advertise that feature. The seam is required by
-//! P12 and the coverage gate regardless, and removing it on the grounds that
-//! those fixtures skip would be a mistake.
 //!
 //! # No global generator, at any level
 //!
@@ -115,35 +84,13 @@
 //! becomes an explicitly constructed [`TestRng::from_entropy_string`], so
 //! the name appears in this file only in prose and in the test module.
 //!
-//! # Where the generator comes from in production
-//!
-//! When TLS is compiled in, the C does not read the operating system itself:
-//! `randit` delegates to `Curl_ssl_random` (`lib/rand.c:165-166`), which for
-//! the rustls backend is `cr_random` (`lib/vtls/rustls.c:1383-1390`) calling
-//! `rustls_default_crypto_provider_random`. The generator is therefore the
-//! TLS provider's, and this crate should end up in the same place: when
-//! `tls/` publishes an accessor for the pinned `ring` provider's generator,
-//! a provider-backed [`Rng`] can be handed to every consumer through this
-//! same seam, with no change to any signature here or to any caller. That is
-//! the whole point of the trait.
-//!
-//! Until then [`SystemRng`] draws from `rand 0.8.7`'s operating-system
-//! source. This file deliberately does **not** name `rustls`: an import here
-//! would create a `crypto` -> `tls` dependency, and `tls/` currently
-//! publishes no such accessor, so inventing one from this side would be
-//! guesswork. The coordination point is recorded rather than decided here.
-//!
 //! # What is deliberately not ported
 //!
-//! `weak_random` (`lib/rand.c:87-129`) has no successor. It exists only
-//! under `#ifndef USE_SSL`, offering `arc4random` where the platform has it
-//! and otherwise the linear congruential fallback
-//! `randseed * 1103515245 + 12345` announced by
-//! `infof(data, "WARNING: using weak random seed")`. TLS is unconditional in
-//! this workspace, so the branch is unreachable and there is no "weak mode"
-//! here to reach for. `Curl_win32_random` (`lib/rand.c:54-84`) is likewise
-//! absent: it is `#ifdef _WIN32`, and the four mandated targets of AAP 0.8.3
-//! are Linux and macOS on x86_64 and aarch64.
+//! It exists only under `#ifndef USE_SSL`, offering `arc4random` where the
+//! platform has it and otherwise the linear congruential fallback `randseed *
+//! 1103515245 + 12345` announced by `infof(data, "WARNING: using weak random
+//! seed")`. TLS is unconditional in this workspace, so the branch is
+//! unreachable and there is no "weak mode" here to reach for.
 //!
 //! The `DEBUGBUILD`-only `allow_env_override` parameter of
 //! `Curl_rand_bytes` (`lib/rand.h:26-30`) is gone too, along with the
@@ -155,90 +102,37 @@
 //! # Version pinning
 //!
 //! `rand` is held at **0.8.7** and must not be advanced, for two independent
-//! reasons. `rand 0.10` declares a minimum supported Rust version of 1.85,
-//! against the 1.75 that AAP 0.8.3 mandates; and `russh` requires
-//! `rand ^0.8`, so moving this crate off the 0.8 series forks the graph
-//! where the two meet. The version is declared once, in the workspace root's
+//! reasons. The version is declared once, in the workspace root's
 //! `[workspace.dependencies]`, and inherited here.
 
 use ::rand::rngs::{OsRng, StdRng};
 use ::rand::{RngCore, SeedableRng};
 
 use crate::error::{CURLcode, CodeResult};
+use crate::util::fallible;
 
 /// The alphabet `Curl_rand_alnum` draws from, transcribed character for
 /// character from `alnum[]` at `lib/rand.c:258-259`.
-///
-/// Sixty-two characters: 26 upper case, then 26 lower case, then 10 digits,
-/// **in that order**. The order is not cosmetic. A draw becomes a character
-/// by indexing this array, so permuting it changes every MIME boundary and
-/// every `cnonce` the library emits -- which AAP 0.8.1 freezes. The sibling
-/// `util::fopen::RAND_ALPHABET` carries the same 62 bytes for the same
-/// reason, and the two must not drift.
-///
-/// Typed as a fixed-size array so that the count is checked by the compiler
-/// rather than by a comment, and marked `#[rustfmt::skip]` because
-/// `rustfmt.toml` leaves `format_strings` off precisely so that no formatter
-/// can rewrite a literal that participates in wire output.
 #[rustfmt::skip]
 const ALNUM: &[u8; 62] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 /// [`ALNUM`]'s length as the [`u32`] the reduction needs -- `alnumspace` at
 /// `lib/rand.c:265`, which the C computes as `sizeof(alnum) - 1`.
-///
-/// Spelled separately from the array's own length because the reduction
-/// happens in [`u32`] and MSRV 1.75 offers no `const` conversion from
-/// [`usize`] that is not a cast. The `const` assertion below is what keeps
-/// the two spellings in step: change the alphabet and the build stops here.
 const ALNUM_SPACE: u32 = 62;
 
 /// The largest draw [`rand_alnum`] will accept, exclusive.
-///
-/// `UINT_MAX - UINT_MAX % alnumspace` at `lib/rand.c:276`. The remainder is
-/// 3, so the threshold is 4,294,967,292 and exactly four draws --
-/// 4,294,967,292 through 4,294,967,295 -- are discarded and redrawn. That
-/// removes the bias a bare `draw % 62` would leave.
-///
-/// Computed rather than written as a literal so that it cannot disagree with
-/// the alphabet, and asserted against the measured value below so that a
-/// wrong computation cannot pass unnoticed.
 const ALNUM_LIMIT: u32 = u32::MAX - u32::MAX % ALNUM_SPACE;
 
 /// The scratch buffer `Curl_rand_hex` declares (`unsigned char buffer[128]`
 /// at `lib/rand.c:228`), and therefore the bound its size check enforces.
-///
-/// A C stack-buffer artefact with no counterpart in a Rust
-/// [`String`] -- and preserved anyway. A caller that asked for more than
-/// this received `CURLE_BAD_FUNCTION_ARGUMENT` from curl 8.19.0-DEV, and
-/// behaviour preservation (AAP 0.8.1) outranks tidying the limit away.
 const HEX_SCRATCH: usize = 128;
 
 /// The number of bytes one draw contributes, `sizeof(unsigned int)` at
 /// `lib/rand.c:202`.
-///
-/// Four, on every platform curl supports and on all four mandated targets.
-/// Named because it sets the group size of the fill loop, which is
-/// observable: it is what makes the group boundaries of the `CURL_ENTROPY`
-/// sequence fall where they do.
 const DRAW_BYTES: usize = 4;
 
 /// The crate's source of randomness, injected rather than reached for.
-///
-/// Supersedes `randit` (`lib/rand.c:135-170`) -- the one function every
-/// `Curl_rand*` entry point funnels through. Consumers take one of these by
-/// reference; none of them reads the operating system itself, and the module
-/// preamble records the grep that checks it.
-///
-/// # Why one draw at a time
-///
-/// [`Self::next_u32`] is the primitive, not [`Self::fill_bytes`], because
-/// `randit` yields exactly one `unsigned int` per call and every C entry
-/// point is built on that shape. `lib/rand.c:200-214` turns draws into bytes
-/// and `lib/rand.c:271-280` turns draws into characters, and both orderings
-/// are observable on the wire, so the byte-level behaviour has to be derived
-/// from the draw sequence rather than left to whatever a bulk fill happens
-/// to do.
 ///
 /// # Object safety
 ///
@@ -248,15 +142,6 @@ const DRAW_BYTES: usize = 4;
 /// directory, so it accepts the generator from its caller; a connection
 /// filter chain holds heterogeneous state and needs the trait-object form;
 /// and a unit test is happier with a concrete [`TestRng`].
-///
-/// # Implementing it elsewhere
-///
-/// Permitted, and anticipated -- a `tls/`-owned implementation backed by the
-/// pinned provider's generator is the intended production source. An
-/// implementation must satisfy one contract: [`Self::next_u32`] returns
-/// uniformly distributed values over the whole of [`u32`]. [`rand_alnum`]'s
-/// rejection sampling depends on it, and so does the absence of bias in the
-/// nonces built on it.
 #[allow(dead_code)]
 pub(crate) trait Rng {
     /// One draw -- the successor of `randit(data, &r, ...)`.
@@ -267,44 +152,11 @@ pub(crate) trait Rng {
 
     /// Fill `dest` completely, in the byte order `lib/rand.c:200-214`
     /// produces.
-    ///
-    /// Four bytes per draw, low byte of each draw first, with the final
-    /// group truncated to whatever is left. Both implementations here
-    /// delegate to the same private helper as [`rand_bytes`], so they cannot
-    /// disagree with it.
     fn fill_bytes(&mut self, dest: &mut [u8]);
 }
 
 /// The production [`Rng`]: a cryptographically secure generator seeded from
 /// the operating system.
-///
-/// # Why the constructor is fallible and the draws are not
-///
-/// Acquiring operating-system entropy can fail, and curl reports that as
-/// `CURLE_FAILED_INIT` (`lib/rand.c:61`, `:70`, `:74`). Doing it once, in
-/// [`Self::new`], is what lets [`Rng`]'s methods stay infallible -- which
-/// matters because they sit under `curl_easy_perform`, where a panic would
-/// cross the C ABI boundary that AAP 0.6.9's safety posture exists to
-/// protect. `rand 0.8.7`'s `OsRng::fill_bytes` panics when the platform
-/// cannot deliver (`rand_core-0.6.4/src/os.rs:61-66`); its `try_fill_bytes`
-/// returns instead, and that is the one used here.
-///
-/// # Why the seed is stretched
-///
-/// `StdRng` is ChaCha12 -- a cryptographically secure generator -- so
-/// expanding a 32-byte operating-system seed with it is sound. What must
-/// never happen is a *non*-cryptographic expansion of the kind
-/// `lib/rand.c:110-128` keeps for builds with no generator at all, and this
-/// is not that.
-///
-/// # Deliberately not [`Clone`] and deliberately not [`Default`]
-///
-/// Cloning a generator duplicates its stream, so two clones would emit
-/// identical nonces -- a defect that would surface as a repeated
-/// `Sec-WebSocket-Key` rather than as a compile error. And a [`Default`]
-/// implementation would have to either panic or fabricate a fixed state,
-/// neither of which is acceptable for this type; [`Self::new`] reports
-/// failure instead.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct SystemRng {
@@ -350,10 +202,6 @@ impl Rng for SystemRng {
 /// A deterministic [`Rng`] reproducing the C's `CURL_ENTROPY` generator
 /// exactly (`lib/rand.c:138-159`).
 ///
-/// Not `#[cfg(test)]`, on purpose: the modules that need to assert on
-/// generated bytes are siblings, and a test-only item here would be
-/// invisible to them. The module preamble explains why that matters.
-///
 /// # The generator being reproduced
 ///
 /// ```c
@@ -388,22 +236,6 @@ pub(crate) struct TestRng {
 
 impl TestRng {
     /// The generator `CURL_ENTROPY=<text>` selects.
-    ///
-    /// The C copies `min(strlen(text), sizeof(unsigned int))` bytes into a
-    /// native-endian `unsigned int` and then applies `ntohl`
-    /// (`lib/rand.c:146-151`). On a little-endian target that reverses the
-    /// ASCII bytes and reverses them back, so the composite effect is simply
-    /// to read the first four characters as a big-endian integer -- and it
-    /// is the composite effect that is reproduced, because reproducing the
-    /// two steps literally would make the result depend on the host's byte
-    /// order, which the C's own behaviour does not.
-    ///
-    /// Text shorter than four bytes is zero-padded on the right, matching a
-    /// partial `memcpy` into a zero-initialised `seed`
-    /// (`lib/rand.c:146`). Text longer than four bytes contributes only its
-    /// first four, so `"12345678"` and `"1234"` are the same generator --
-    /// which is why the eight-character fixture value produces the sequence
-    /// it does.
     #[allow(dead_code)]
     pub(crate) fn from_entropy_string(text: &str) -> Self {
         let mut seed = [0_u8; DRAW_BYTES];
@@ -459,17 +291,6 @@ impl Rng for TestRng {
 /// draws are driven here, and `Rng::fill_bytes` is never called, because an
 /// implementation living outside this file could order its bulk fill
 /// differently and the difference would land on the wire.
-///
-/// # No return value
-///
-/// The C returns `CURLcode` because `randit` can fail when it reaches a TLS
-/// backend that cannot deliver. Here that failure is handled once, where the
-/// generator is constructed -- see [`SystemRng::new`] -- so there is nothing
-/// left for this function to report. An empty `out` is a caller error the C
-/// marks with `DEBUGASSERT(num)` (`lib/rand.c:198`) and answers with
-/// `CURLE_BAD_FUNCTION_ARGUMENT`; with no `CURLcode` to return, it is a
-/// debug assertion here and a no-op in release, never a panic in a shipped
-/// binary.
 #[allow(dead_code)]
 pub(crate) fn rand_bytes(rng: &mut dyn Rng, out: &mut [u8]) {
     debug_assert!(
@@ -501,16 +322,6 @@ fn fill_from_draws(rng: &mut dyn Rng, out: &mut [u8]) {
 
 /// `num - 1` **lowercase** hexadecimal characters: `Curl_rand_hex`
 /// (`lib/rand.c:225-251`).
-///
-/// # The `num` semantics are the C's, terminator included
-///
-/// Callers pass `sizeof(buffer)`, and the C spends one of those bytes on the
-/// terminator: `num--; /* save one for null-termination */`
-/// (`lib/rand.c:243`). A Rust [`String`] carries its own length and has no
-/// terminator, so the returned string is `num - 1` characters -- and `num`
-/// keeps its C meaning so that a call site transcribes unchanged.
-/// `lib/vauth/digest.c:352` declares `char cnonce[33]` and passes
-/// `sizeof(cnonce)` at `:383`, yielding **32** characters.
 ///
 /// # Lowercase, not upper
 ///
@@ -565,17 +376,6 @@ pub(crate) fn rand_hex(rng: &mut dyn Rng, num: usize) -> CodeResult<String> {
 /// `num - 1` alphanumeric characters: `Curl_rand_alnum`
 /// (`lib/rand.c:258-284`).
 ///
-/// # The same terminator accounting as [`rand_hex`]
-///
-/// `num--; /* save one for null-termination */` at `lib/rand.c:269`, so a
-/// caller asking with `sizeof(buffer)` gets one character fewer than the
-/// buffer is bytes. Both live call sites depend on it:
-/// `lib/curl_fopen.c:89` declares `unsigned char randbuf[41]` and passes
-/// `sizeof(randbuf)` at `:109`, so a temporary filename carries **40**
-/// random characters; `lib/mime.c:1191-1194` passes
-/// `MIME_RAND_BOUNDARY_CHARS + 1`, which is 23, for the **22** random
-/// characters that follow a MIME boundary's 24 dashes.
-///
 /// # Rejection sampling, reproduced rather than replaced
 ///
 /// ```c
@@ -601,13 +401,22 @@ pub(crate) fn rand_hex(rng: &mut dyn Rng, num: usize) -> CodeResult<String> {
 /// subtraction turns that into an error and leaves every other input
 /// behaving exactly as the C does -- `num == 1` included, which yields an
 /// empty string.
+///
+/// [`CURLcode::OutOfMemory`] when the output cannot be allocated. `num` is a
+/// size the CALLER declared -- in the C it is the size of the caller's own
+/// buffer, and here it is the length of the string produced -- so this is one
+/// of the externally sized allocations [`crate::util::fallible`] exists for.
+/// The C has no such code here because the caller owns the storage; reporting
+/// it is what replaces that, and it is strictly better than aborting the
+/// process on a `num` the caller mis-derived.
 #[allow(dead_code)]
 pub(crate) fn rand_alnum(rng: &mut dyn Rng, num: usize) -> CodeResult<String> {
     // `num--` at `:269`. Checked, because the C's version is what
     // `DEBUGASSERT(num > 1)` at `:267` is guarding against.
     let characters = num.checked_sub(1).ok_or(CURLcode::BadFunctionArgument)?;
 
-    let mut text = String::with_capacity(characters);
+    let mut text =
+        fallible::string_with_capacity(characters).map_err(fallible::oom)?;
     for _ in 0..characters {
         let mut drawn = rng.next_u32();
         // The `do { } while(r >= limit)` of `:272-276`: draw first, then
@@ -680,11 +489,6 @@ mod tests {
 
     /// The highest-value test in this file: the seed derivation, the
     /// increment rule and the low-byte-first ordering, all at once.
-    ///
-    /// Derivation, from `lib/rand.c:146-156` and `:200-214`:
-    /// `"1234"` read big-endian is `0x31323334`; the draws are
-    /// `0x31323334`, `..35`, `..36`, `..37`; each emitted low byte first
-    /// gives `"4321"`, `"5321"`, `"6321"`, `"7321"`.
     #[test]
     fn the_entropy_vector_of_test2300_is_reproduced() {
         let mut rng = TestRng::from_entropy_string("12345678");
@@ -809,12 +613,6 @@ mod tests {
 
     /// The alphabet here and the one `util/fopen.rs` transcribes for its own
     /// temporary-name check are the same 62 bytes.
-    ///
-    /// Two transcriptions of one C literal are two chances to get it wrong,
-    /// and a mismatch would show up only as a temporary filename drawn from
-    /// an alphabet the consumer then rejects. Carried under the same feature
-    /// gate as the sibling constant, which belongs to the file-writing paths
-    /// of `cookies/`, `altsvc/` and `hsts/`.
     #[test]
     #[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
     fn the_alphabet_matches_the_sibling_transcription() {
@@ -905,6 +703,29 @@ mod tests {
         assert_eq!(rand_alnum(&mut rng, 1), Ok(String::new()));
         assert_eq!(rand_alnum(&mut rng, 0), Err(CURLcode::BadFunctionArgument));
         // The rejected call consumed no draw.
+        assert_eq!(rng.next_u32(), 1);
+    }
+
+    /// A `num` the allocator cannot serve is REPORTED, not fatal.
+    ///
+    /// `num` is a size the caller declared, so it is one of the externally
+    /// sized allocations `crate::util::fallible` exists for. The figure is one
+    /// past the largest expressible `std::alloc::Layout`, which fails inside
+    /// `Layout::array` **without calling the allocator** -- deterministic on
+    /// every target and, unlike a request the allocator merely declines, safe
+    /// under Miri, whose interpreter answers a genuine over-allocation with a
+    /// hard `resource exhaustion` error that no `Result` can carry.
+    #[test]
+    fn a_num_the_allocator_cannot_serve_is_reported_not_fatal() {
+        let mut rng = TestRng::from_seed(1);
+        // `characters` is `num - 1`, so add two to stay past the limit.
+        let unservable = (isize::MAX as usize) + 2;
+        assert_eq!(
+            rand_alnum(&mut rng, unservable),
+            Err(CURLcode::OutOfMemory),
+            "an unservable size is a code, not an abort"
+        );
+        // And the refusal happened before any draw was spent.
         assert_eq!(rng.next_u32(), 1);
     }
 
@@ -1059,14 +880,6 @@ mod tests {
 
     /// The production generator satisfies the same trait as the
     /// deterministic one and really produces randomness.
-    ///
-    /// Runs under Miri too, which is worth stating because the obvious
-    /// assumption is that it cannot: Miri intercepts `getrandom` and answers
-    /// it from its own stream, so `OsRng` succeeds and returns different
-    /// bytes on each call there as well. Measured rather than assumed --
-    /// `cargo miri test crypto::rand::tests::the_system_generator` passes --
-    /// so this test is not excluded, and the interchangeability that P12
-    /// depends on is checked under Miri along with everything else.
     #[test]
     fn the_system_generator_is_interchangeable_and_random() {
         let mut first = SystemRng::new().expect("OS entropy is available");

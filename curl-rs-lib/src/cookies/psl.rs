@@ -22,14 +22,8 @@
 //
 //***************************************************************************
 
-//! Public Suffix List integration -- supersedes `lib/psl.c` (102 lines) and
-//! `lib/psl.h` (51 lines), replacing the `libpsl` binding with the
-//! `publicsuffix` crate.
-//!
-//! The module answers exactly one question for the cookie engine: **may this
-//! host set a cookie for this domain, or would that be a "super cookie" set
-//! at registry level?** Everything else here exists to keep the list that
-//! answers it fresh, and to keep the answer honest when there is no list.
+//! Public Suffix List integration -- supersedes `lib/psl.c` and `lib/psl.h`,
+//! replacing the `libpsl` binding with the `publicsuffix` crate.
 //!
 //! Two consumers, and no others:
 //!
@@ -68,83 +62,6 @@
 //!    so every subsequent call retries. That is intentional and is
 //!    preserved.
 //!
-//! `Curl_psl_destroy` (`lib/psl.c:32-40`) frees the dynamic list and resets
-//! the cache to `psl = NULL, dynamic = FALSE`. In Rust the list is an owned
-//! value and `Drop` handles the memory, but [`PslCache::destroy`] is kept
-//! because `Curl_psl_use` calls it at `lib/psl.c:82` before installing a
-//! replacement and because the state reset is observable. Note that the C
-//! leaves `expires` untouched there; so does this port.
-//!
-//! # The semantics the caller must reproduce -- `lib/cookie.c:774-819`
-//!
-//! Recorded here because [`super`] owns that function and these details are
-//! easy to get wrong:
-//!
-//! * The whole check is guarded by
-//!   `data && domain && co->domain && !Curl_host_is_ipnum(co->domain)`, so
-//!   **an IP-numeric cookie domain skips it entirely.** That guard is the
-//!   caller's; this module does not repeat it.
-//! * The C copies both names into fixed `char lcase[256]` and
-//!   `char lcookie[256]` stack buffers and only proceeds when
-//!   `(dlen < sizeof(lcase)) && (clen < sizeof(lcookie))` -- a **strict**
-//!   comparison, so 255 bytes is the longest name that is checked at all.
-//!   When either name is 256 bytes or longer the check is skipped with
-//!   `acceptable` still `FALSE`, which means **the cookie is dropped
-//!   silently, with no log line**. That is observable behaviour and it is
-//!   preserved; [`MAX_PSL_DOMAIN_LEN`] exists so the caller reproduces the
-//!   identical cut-off instead of inventing one.
-//! * Both names are lowered with `Curl_strntolower` before the call
-//!   (`lib/cookie.c:796-797`), which is raw ASCII folding. The caller must
-//!   use [`crate::util::strcase`], never `char`'s own Unicode-aware case
-//!   mapping, which is locale-sensitive and would diverge for bytes at or
-//!   above `0x80`. This module compares bytes exactly, matching `libpsl`'s
-//!   own `strcmp`, and relies on that pre-lowering.
-//! * No list, but one was configured, means log
-//!   `"libpsl problem, rejecting cookie for safety"` and **drop the cookie
-//!   -- fail closed.**
-//! * A rejection logs
-//!   `"cookie '%s' dropped, domain '%s' must not set cookies for '%s'"`.
-//!
-//! # Availability is a run-time property here, not a compile-time one
-//!
-//! In C, `USE_LIBPSL` is an `#ifdef` and `lib/cookie.c` carries two mutually
-//! exclusive arms: with `libpsl`, a `NULL` list fails closed; without it,
-//! `bad_domain` (`lib/cookie.c:327-342`, itself `#ifndef USE_LIBPSL`) is
-//! used and no cookie is ever dropped on public-suffix grounds. Here the
-//! list source is injected, so availability is a run-time fact and the two
-//! arms map onto two **distinguishable** states:
-//!
-//! * **A source is configured but the load failed.** Faithful to
-//!   `#ifdef USE_LIBPSL` with `psl == NULL`. The caller fails closed, with
-//!   the log text above.
-//! * **No source was ever configured.** Faithful to `#ifndef USE_LIBPSL`.
-//!   The caller takes the `bad_domain` arm, and `crate::version` must not
-//!   emit `PSL`.
-//!
-//! [`available`] answers the second question and [`PslCache::use_list`]
-//! answers the first. **Do not collapse them.** Reporting `PSL`
-//! optimistically is the worse error of the two: under-reporting a
-//! capability makes a fixture skip, while over-reporting makes it run and
-//! fail.
-//!
-//! # Why the list data is injected
-//!
-//! `libpsl` offers two list sources -- `psl_builtin()`, compiled in, and
-//! `psl_latest()`, read from disk and refreshable. **The `publicsuffix`
-//! crate offers neither: it ships no list and parses list text supplied to
-//! it.** `curl-rs-lib` has no build script and no Public Suffix List data
-//! file is in scope for this directory, so the bytes cannot be embedded
-//! here. [`PslSource`] is therefore the seam, with one method per `libpsl`
-//! tier, and it is the dependency-injection pattern the specification
-//! mandates rather than a convenience.
-//!
-//! [`MemoryPslSource`] serves both tiers from owned bytes. It is not
-//! `#[cfg(test)]`-gated, following the precedent of
-//! `crate::util::timeval::TestClock`: the configuration layer that owns the
-//! list bytes -- wherever it obtains them -- can inject them through it, and
-//! the tests in this file use the same type, so no test-only code path is
-//! exercised in place of a production one.
-//!
 //! # The clock is injected, and it is the monotonic one
 //!
 //! `lib/psl.c:52` and `lib/psl.c:62` read `Curl_pgrs_now(easy)->tv_sec`,
@@ -167,34 +84,6 @@
 //!
 //! # Locking belongs to `share/`, not here
 //!
-//! The C wraps the whole refresh in `Curl_share_lock(easy,
-//! CURL_LOCK_DATA_PSL, ...)` and performs an unlock/relock dance at
-//! `lib/psl.c:51-93`. This module builds none of it: it exposes an owned
-//! [`PslCache`] with `&mut self` methods that `crate::share` wraps. The
-//! contract that layer has to honour, written down here because
-//! `crate::share` does not exist yet:
-//!
-//! * **Shared phase.** `lib/psl.c:51` takes `CURL_LOCK_DATA_PSL`
-//!   (`include/curl/curl.h:3037`) with `CURL_LOCK_ACCESS_SHARED` and reads
-//!   the clock and the cache under it.
-//! * **Exclusive phase.** When a refresh is needed the shared lock is
-//!   released first (`lib/psl.c:55`, whose comment explains that this gives
-//!   other threads a chance and avoids deadlock) and
-//!   `CURL_LOCK_ACCESS_SINGLE` is taken (`lib/psl.c:58`). The recheck and
-//!   the load happen there. [`PslCache::use_list`] is the whole of that
-//!   critical section, so it must be called with exclusive access held.
-//! * **Downgrade.** `lib/psl.c:88-89` releases the exclusive lock and takes
-//!   a shared one again *before returning*, so the borrowed list stays valid
-//!   for the caller. The returned `&List` borrow expresses the same
-//!   requirement to the compiler.
-//! * **Release.** `Curl_psl_release` (`lib/psl.c:97-100`) is a pure unlock
-//!   with no state change, so it has no counterpart here; dropping the
-//!   borrow is the release.
-//! * `lib/psl.c:48-49`'s `if(!pslcache) return NULL;` is expressed by the
-//!   caller holding an `Option<PslCache>` -- absent means no list. A
-//!   default-constructed [`PslCache`] is the different state "present, never
-//!   loaded", which refreshes on first use.
-//!
 //! One hazard for that layer, recorded so it is not discovered the hard way:
 //! `crate::share` is `pub` while `super` is `pub(crate)`, so naming
 //! [`PslCache`] in a `pub` signature there is
@@ -203,111 +92,6 @@
 //! mirrors the C, where `CURLSH` is literally `typedef void CURLSH` -- or
 //! for the crate root to add a curated re-export. The types here stay
 //! `pub(crate)` deliberately and are not widened to paper over it.
-//!
-//! # The verdict function, measured rather than guessed
-//!
-//! [`is_cookie_domain_acceptable`] reproduces the observable outcome of
-//! `libpsl`'s `psl_is_cookie_domain_acceptable(psl, hostname,
-//! cookie_domain)`. The rules below were measured against `libpsl` 0.21.2
-//! driven over both the full Public Suffix List and the smaller list this
-//! file's tests embed, not inferred from documentation:
-//!
-//! 1. Every leading `.` is stripped from the cookie domain; an empty
-//!    remainder is not acceptable.
-//! 2. An exact, byte-for-byte match of host and cookie domain is **always**
-//!    acceptable -- even when the name is itself a public suffix or a bare
-//!    top-level domain. This is why `tests/data/test1136`'s cookie for
-//!    `z-1.compute-1.amazonaws.com` is stored despite that name being a
-//!    registry-level name: the request host is the same string.
-//! 3. Otherwise the cookie domain must be a strictly shorter suffix of the
-//!    host **at a label boundary** -- the byte before it must be `.`. So
-//!    `o.example.com` is not acceptable for `foo.example.com`.
-//! 4. If the **host** is an IP literal, nothing but the exact match of rule
-//!    2 is acceptable. The test is exactly `inet_pton`'s: a strict dotted
-//!    quad, or a valid IPv6 textual form. `1.2.3.4` therefore may not set a
-//!    cookie for `2.3.4`, while `01.2.3.4`, `1.2.3.256` and `1.2.3.4.5` --
-//!    none of which `inet_pton` accepts -- may.
-//! 5. Otherwise the cookie domain must be **strictly longer** than the part
-//!    of the host nobody can register -- the host's own public suffix, of
-//!    either the ICANN or the private section. Both are label-boundary
-//!    suffixes of the same host, so that is "at least one more label", which
-//!    is the host's registrable domain or something below it.
-//!
-//! Rule 4 is not mentioned in the C, because it lives inside `libpsl`. It is
-//! reproduced because omitting it would accept cookies `libpsl` rejects,
-//! and this module's whole purpose is to reject exactly what `libpsl`
-//! rejects.
-//!
-//! # Fully qualified hosts, where the fixture and the local `libpsl` disagree
-//!
-//! `libpsl` 0.21.2 -- the version installed here -- reports an **empty**
-//! unregistrable domain for a host written with a trailing dot, which makes
-//! every label-boundary suffix of that host longer than it. Measured, that
-//! version allows `www.example.com.` to set a cookie for `com.`,
-//! `www.example.co.uk.` for `co.uk.`, and `firsthost.me.` for `me.`.
-//!
-//! The last of those is decided by curl's own corpus rather than by taste.
-//! `tests/data/test977` -- "URL with trailing dot and receiving a cookie for
-//! the TLD with dot" -- fetches `http://firsthost.me.`, is served
-//! `Set-Cookie: a=b; Domain=.me.;` and requires the saved jar to contain **no
-//! cookie at all**. The fixture does not gate on the `PSL` feature, so it has
-//! to hold in both builds: without a list `bad_domain` refuses the name, and
-//! with one this check must. Nothing earlier in the pipeline drops it --
-//! `cookie_tailmatch` accepts `me.` for `firsthost.me.` because the byte
-//! before the suffix is a dot (`lib/cookie.c:88-99`).
-//!
-//! So this module refuses it, which agrees with the fixture and disagrees
-//! with the locally installed `libpsl`. The disagreement is confined to host
-//! names written with a trailing dot and can only ever refuse a cookie that
-//! version would have allowed. The note beside
-//! [`is_cookie_domain_acceptable`] records it in full.
-//!
-//! # Rule 5 is about the host, and two `publicsuffix` details decide it
-//!
-//! Both of the obvious formulations are measurably wrong, and a differential
-//! run against `libpsl` 0.21.2 over the full list and 34,358 pairs is what
-//! established it.
-//!
-//! **Asking about the cookie domain instead of the host is wrong.** The list
-//! carries `us-east-1.amazonaws.com` and no bare `amazonaws.com`, so
-//! `amazonaws.com` is not a public suffix -- yet a cookie for it from
-//! `www.us-east-1.amazonaws.com` must be refused, because the host's own
-//! public suffix is longer than it. `libpsl` compares against the host's
-//! unregistrable part, so [`unregistrable_domain`] is the primitive here.
-//!
-//! **`Suffix::is_known` is a different question.** It reports whether a
-//! suffix was *explicitly listed*, and a bare unlisted top-level domain is
-//! not: `suffix(b"ck")` yields `ck` with no type at all, yet `ck` **is** a
-//! public suffix, because the algorithm's implicit `*` rule covers every
-//! unlisted label. [`unregistrable_domain`] states that rule outright, which
-//! also settles a label that is not valid UTF-8, and adds the wildcard-parent
-//! case the crate does not cover. Its own documentation gives the three steps
-//! and the evidence for each. The difference is the whole of
-//! `tests/data/test1136`'s third cookie.
-//!
-//! The workspace pins `publicsuffix` with its `anycase` feature, so the
-//! lookup itself folds case while the comparisons here do not. That is
-//! unobservable from curl, which lowers both names first, and where it could
-//! differ it errs toward rejecting -- the safe direction. The same is true of
-//! a host with a label that is not valid UTF-8: the crate declines to classify
-//! it, `libpsl` folds it through its IDN library and carries on, and this
-//! module refuses. A host name that is not text cannot be resolved, so no
-//! fixture reaches that path.
-//!
-//! # Invariants
-//!
-//! The crate root denies the one keyword that lets a module opt out of Rust's
-//! memory guarantees, and this file needs none of it -- nothing here crosses a
-//! language boundary. The crate root's `source_policy` tests prove that by
-//! scanning every source file in the crate, this one included. No `libc`
-//! either, which is reserved for `crate::ffi`.
-//!
-//! No panicking construct anywhere, in test code included: this module parses
-//! untrusted host names and untrusted list data, and a panic could unwind
-//! toward a C caller through `curl-rs-ffi`, which is undefined behaviour at
-//! that boundary. Every length is treated as adversarial, and the tests drive
-//! names of four and eight kilobytes and runs of a thousand separators
-//! through every entry point to prove it.
 
 use core::fmt;
 
@@ -316,55 +100,15 @@ use publicsuffix::{List, Psl};
 use crate::util::timeval::Clock;
 
 /// How long a loaded list is used before it is reloaded, in seconds.
-///
-/// `lib/psl.h:32`: `#define PSL_TTL (72 * 3600)`. Seventy-two hours, and the
-/// `72 * 3600` form is kept so the intent survives the constant folding.
-///
-/// The type is `i64` because `time_t` is `i64` on all four targets the
-/// specification mandates, so `TIME_T_MAX` is [`i64::MAX`] and the C's
-/// overflow guard at `lib/psl.c:72-73` becomes a saturating add.
 #[allow(dead_code)]
 pub(crate) const PSL_TTL: i64 = 72 * 3600;
 
 /// The size of the C's fixed lowering buffers, and therefore the length at
 /// which the public-suffix check is skipped.
-///
-/// `lib/cookie.c:788-789` declares `char lcase[256]` and
-/// `char lcookie[256]`, and `lib/cookie.c:792` only proceeds when both names
-/// are **strictly** shorter than that. A name of 256 bytes or more is
-/// therefore never checked, and because the C leaves `acceptable` at `FALSE`
-/// the cookie is dropped with no log line at all.
-///
-/// This is a faithfully preserved wart, exported so that the caller in
-/// [`super`] reproduces the identical cut-off rather than choosing its own.
-/// The comparison to write is `len < MAX_PSL_DOMAIN_LEN`, not `<=`.
 #[allow(dead_code)]
 pub(crate) const MAX_PSL_DOMAIN_LEN: usize = 256;
 
 /// Where the Public Suffix List text comes from.
-///
-/// One method per `libpsl` tier, mirroring `lib/psl.c:69-79` one for one:
-/// [`Self::latest`] is `psl_latest()` and [`Self::builtin`] is
-/// `psl_builtin()`. Each returns the list *text*, or `None` when that tier
-/// has nothing to offer, and [`PslCache::use_list`] parses it.
-///
-/// The seam exists because the `publicsuffix` crate ships no list; the module
-/// documentation records why the bytes cannot be embedded here instead.
-///
-/// # Why the text and not a parsed list
-///
-/// Because that is what `libpsl` does. `psl_latest()` re-reads and re-parses
-/// its file, which is what makes the 72-hour deadline meaningful: a
-/// refresh that could not fail would need no deadline. Returning owned bytes
-/// also keeps this trait free of `publicsuffix` types, so an implementer
-/// needs no knowledge of the parser, and lets a file-backed implementation
-/// hand over freshly read bytes without interior mutability.
-///
-/// # Why [`fmt::Debug`] is a supertrait
-///
-/// So that a structure holding a source can itself derive [`Debug`], which is
-/// what lets a failing test print the state that produced the failure. The
-/// same reasoning is recorded for `crate::util::timeval::Clock`.
 #[allow(dead_code)]
 pub(crate) trait PslSource: fmt::Debug {
     /// The refreshable list -- the `psl_latest()` analogue
@@ -388,12 +132,6 @@ pub(crate) trait PslSource: fmt::Debug {
 /// owns the list bytes injects them through this type, and the tests in this
 /// file use the same type, so the tests exercise the production path rather
 /// than a parallel one.
-///
-/// Both tiers are independent, so all four `libpsl` configurations are
-/// expressible: a refreshable list only, a built-in list only, both, or
-/// neither. "Neither" is a configured source that cannot load, which is the
-/// fail-closed state the module documentation describes -- distinct from
-/// having no source at all.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct MemoryPslSource {
@@ -450,14 +188,6 @@ impl PslSource for MemoryPslSource {
 }
 
 /// The cached Public Suffix List and its deadline.
-///
-/// The three fields of `struct PslCache` (`lib/psl.h:34-38`), in the same
-/// order and under the same names. `Default` gives the calloc'd C state --
-/// no list, a deadline of zero and not dynamic -- which is stale by
-/// construction and so refreshes on first use.
-///
-/// Plain and unlocked by design: `crate::share` wraps it, as the module
-/// documentation's lock contract sets out.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct PslCache {
@@ -488,15 +218,6 @@ impl PslCache {
     }
 
     /// Releases the cached list -- `Curl_psl_destroy`, `lib/psl.c:32-40`.
-    ///
-    /// The C frees the list only when it is dynamic, because the built-in one
-    /// is static storage; here both are owned values and `Drop` does that
-    /// work. The method survives because the *state reset* is observable and
-    /// because `Curl_psl_use` calls it at `lib/psl.c:82` before installing a
-    /// replacement.
-    ///
-    /// Note what the C does **not** do: `expires` is left untouched. A
-    /// destroyed cache keeps its old deadline, and so does this one.
     pub(crate) fn destroy(&mut self) {
         // C: lib/psl.c:34 -- the whole reset sits behind `if(pslcache->psl)`,
         // so destroying an already-empty cache changes nothing, `dynamic`
@@ -510,24 +231,6 @@ impl PslCache {
 
     /// Returns the cached list, refreshing it first when it is stale --
     /// `Curl_psl_use`, `lib/psl.c:42-95`, minus the locking.
-    ///
-    /// `None` means there is no usable list. The caller must then fail
-    /// closed, exactly as `lib/cookie.c:801-802` does for a `NULL` list:
-    /// log `"libpsl problem, rejecting cookie for safety"` and drop the
-    /// cookie. It must **not** be read as "no public-suffix checking is
-    /// configured"; that question is [`available`]'s.
-    ///
-    /// # Locking
-    ///
-    /// Must be called with `CURL_LOCK_DATA_PSL` held for exclusive access.
-    /// The module documentation gives the full transition sequence the C
-    /// performs around this call.
-    ///
-    /// # Failure leaves the cache alone
-    ///
-    /// A failed refresh keeps the previous list and its already-expired
-    /// deadline (`lib/psl.c:81`), so the next call retries. That retry on
-    /// every call is intentional C behaviour, not an oversight.
     pub(crate) fn use_list(
         &mut self,
         clock: &dyn Clock,
@@ -600,6 +303,24 @@ impl PslCache {
         self.psl.is_some()
     }
 
+    /// The cached list as it stands, refreshing nothing --
+    /// `pslcache->psl` read directly, as `lib/psl.c:91` reads it.
+    ///
+    /// The companion to [`Self::use_list`], and the one the *shared* phase
+    /// needs. `Curl_psl_use` performs its refresh only inside the exclusive
+    /// phase (`lib/psl.c:58-88`) and then re-takes the shared lock before
+    /// reading `pslcache->psl` at `:91` and returning it at `:94`; that final
+    /// read mutates nothing, which is exactly why holding it shared is sound
+    /// in the C. `&self` says the same thing to the compiler, so a caller
+    /// holding no more than a reader can still hand the list out.
+    ///
+    /// [`None`] carries `lib/psl.c:92`'s meaning -- `if(!psl)`, no usable
+    /// list -- and a caller must fail closed, as [`Self::use_list`] records.
+    pub(crate) fn list(&self) -> Option<&List> {
+        // C: lib/psl.c:91 -- `psl = pslcache->psl;`.
+        self.psl.as_ref()
+    }
+
     /// `lib/psl.h:37`'s `dynamic` bit.
     pub(crate) fn is_dynamic(&self) -> bool {
         self.dynamic
@@ -612,28 +333,12 @@ impl PslCache {
 }
 
 /// Parses list text, discarding the reason it failed.
-///
-/// The C has nothing to discard: `psl_latest()` and `psl_builtin()` return a
-/// context or `NULL`, and `lib/psl.c:81` inspects only which. This function
-/// therefore collapses `publicsuffix::Error` -- text that is not UTF-8, a
-/// malformed rule, a list with no rules at all -- to `None`, which the caller
-/// treats exactly as the C treats `NULL`: the previous list stays, its
-/// expired deadline stays, and the next call retries.
-///
-/// A parsed list is never vacuous. `publicsuffix`'s parser rejects a list
-/// with no rules, so `Some` always carries something usable.
 #[allow(dead_code)]
 fn parse_list(text: Vec<u8>) -> Option<List> {
     List::from_bytes(&text).ok()
 }
 
 /// Whether public-suffix checking is genuinely available.
-///
-/// This is the question `crate::version` must ask before emitting the `PSL`
-/// banner token and setting `CURL_VERSION_PSL` (`1<<20`,
-/// `include/curl/curl.h:3200`), and the question the cookie engine must ask
-/// to choose between the `#ifdef USE_LIBPSL` and `#ifndef USE_LIBPSL` arms
-/// of `lib/cookie.c`.
 ///
 /// `None` -- no source configured -- is the `#ifndef USE_LIBPSL` state: the
 /// caller uses `bad_domain` (`lib/cookie.c:327-342`) and `PSL` must not be
@@ -642,11 +347,6 @@ fn parse_list(text: Vec<u8>) -> Option<List> {
 /// list and must fail closed. Reporting `PSL` optimistically converts a
 /// clean fixture skip into a hard failure, so the load is actually attempted
 /// rather than assumed.
-///
-/// Both tiers are tried, because either one satisfies the C. Unlike
-/// [`PslCache::use_list`] there is no `dynamic` condition on the fallback:
-/// that condition exists only to stop a fixed list replacing a fresher one
-/// in a cache, and no cache is involved here.
 #[allow(dead_code)]
 pub(crate) fn available(source: Option<&dyn PslSource>) -> bool {
     match source {
@@ -664,12 +364,6 @@ pub(crate) fn available(source: Option<&dyn PslSource>) -> bool {
 /// The part of `name` that nobody can register -- its public suffix, and the
 /// analogue of `psl_unregistrable_domain`.
 ///
-/// This is the primitive `libpsl` reaches the cookie verdict with, and getting
-/// it from the `publicsuffix` crate takes three steps rather than one. Each
-/// step was added because a differential run against `libpsl` 0.21.2 over the
-/// full Public Suffix List and 34,358 host and cookie-domain pairs showed the
-/// step before it was not enough.
-///
 /// 1. **A lone label is its own public suffix.** The algorithm's implicit `*`
 ///    rule covers every unlisted label, so an unlisted top-level domain is
 ///    one. The crate agrees for a label that is valid UTF-8 and reports
@@ -684,10 +378,6 @@ pub(crate) fn available(source: Option<&dyn PslSource>) -> bool {
 ///    rule for this parent exists. Only the immediate parent is affected, so
 ///    `amazonaws.com` is unaffected by that rule.
 /// 3. Otherwise the crate's own answer.
-///
-/// `None` means the name could not be classified at all, which happens when it
-/// is empty or when one of its labels is not valid UTF-8. Callers treat that
-/// as a refusal rather than as permission.
 #[allow(dead_code)]
 pub(crate) fn unregistrable_domain<'a>(
     list: &List,
@@ -730,28 +420,6 @@ fn spans_whole_name(list: &List, name: &[u8]) -> bool {
 
 /// Whether `cookie_domain` may set cookies for `host` --
 /// `psl_is_cookie_domain_acceptable(psl, hostname, cookie_domain)`.
-///
-/// The five rules, and the evidence for each, are set out in the module
-/// documentation. In brief: leading dots are stripped and an empty remainder
-/// is refused; an exact match always passes; otherwise the cookie domain must
-/// be a strictly shorter suffix of the host at a label boundary, the host
-/// must not be an IP literal, and the cookie domain must not itself be a
-/// public suffix.
-///
-/// # Argument order
-///
-/// Host first, cookie domain second, matching `lib/cookie.c:798`'s
-/// `psl_is_cookie_domain_acceptable(psl, lcase, lcookie)` where `lcase` is
-/// the lowered request host and `lcookie` the lowered cookie domain.
-/// Reversing them silently inverts the check.
-///
-/// # Pre-conditions the caller owns
-///
-/// Both slices must already be ASCII-lowered
-/// (`lib/cookie.c:796-797`), both must be shorter than
-/// [`MAX_PSL_DOMAIN_LEN`], and an IP-numeric *cookie domain* must have been
-/// filtered out before the call (`lib/cookie.c:786`). This function does not
-/// re-check any of the three, because the C does not either.
 #[allow(dead_code)]
 pub(crate) fn is_cookie_domain_acceptable(
     list: &List,
@@ -760,12 +428,6 @@ pub(crate) fn is_cookie_domain_acceptable(
 ) -> bool {
     // libpsl: `while (*cookie_domain == '.') cookie_domain++;` -- every
     // leading dot, not just one.
-    //
-    // No emptiness check follows, deliberately: libpsl has none either, and
-    // the tests below settle an empty cookie domain correctly on their own.
-    // Two empty names compare equal and are accepted, which is measurably
-    // what libpsl does, and an empty cookie domain against a real host fails
-    // the label-boundary test.
     let cookie_domain = strip_leading_dots(cookie_domain);
 
     // libpsl: an exact match is always acceptable, and it is tested before
@@ -789,10 +451,6 @@ pub(crate) fn is_cookie_domain_acceptable(
     // libpsl: `if (*(p - 1) != '.' || strcmp(p, cookie_domain)) return 0;`.
     // The label boundary is what stops `o.example.com` passing for
     // `foo.example.com`, and the comparison is byte-exact.
-    //
-    // The byte before the suffix is reached as the last byte of the prefix
-    // rather than by indexing `at - 1`, so no subtraction appears here at all
-    // and the check is total for every possible `at`.
     if host.get(..at).and_then(|head| head.last()) != Some(&b'.') {
         return false;
     }
@@ -812,14 +470,6 @@ pub(crate) fn is_cookie_domain_acceptable(
     // below the part of the host nobody can register. Both it and that part
     // are label-boundary suffixes of the same host, so "strictly longer" is
     // "at least one more label", which is the registrable domain or deeper.
-    //
-    // This is where the obvious formulation -- asking whether the cookie
-    // domain is itself a public suffix -- is measurably wrong. The list
-    // carries `us-east-1.amazonaws.com` and no bare `amazonaws.com`, so
-    // `amazonaws.com` is not a public suffix, yet a cookie for it from
-    // `www.us-east-1.amazonaws.com` must still be refused, because the host's
-    // own public suffix is longer. The differential run against libpsl found
-    // this as a class rather than as a single case.
     let Some(unregistrable) = unregistrable_domain(list, host) else {
         // A host that cannot be classified is refused rather than trusted.
         return false;
@@ -830,24 +480,6 @@ pub(crate) fn is_cookie_domain_acceptable(
 // Fully qualified hosts: where the corpus and the locally installed libpsl
 // disagree, and why the corpus wins. Recorded beside the code it concerns
 // rather than left for someone to rediscover.
-//
-// libpsl 0.21.2 returns an EMPTY unregistrable domain for a host written with
-// a trailing dot, so every label-boundary suffix of that host is longer than
-// it and that version accepts all of them: `www.example.com.` may set a
-// cookie for `com.`, and `firsthost.me.` for `me.`.
-//
-// tests/data/test977 says otherwise, and it is an immutable input. It fetches
-// `http://firsthost.me.`, is served `Set-Cookie: a=b; Domain=.me.;` and
-// requires the saved jar to hold no cookie. It carries no `PSL` feature gate,
-// so it must hold in both builds -- `bad_domain` refuses the name without a
-// list, and this check has to refuse it with one. Nothing earlier drops it:
-// `cookie_tailmatch` accepts `me.` for `firsthost.me.` (lib/cookie.c:88-99).
-//
-// `unregistrable_domain` therefore reports `me.` for `firsthost.me.`, the
-// lengths are equal, and the cookie is refused -- which is what the fixture
-// requires. The disagreement with libpsl 0.21.2 is confined to host names
-// written with a trailing dot and can only ever refuse a cookie that version
-// would have allowed.
 
 /// `name` with every leading `.` removed.
 ///
@@ -875,13 +507,6 @@ fn host_is_ip_literal(host: &[u8]) -> bool {
 }
 
 /// Whether `text` is a dotted-quad IPv4 literal, by `inet_pton`'s rules.
-///
-/// Strict, and every clause below was confirmed against `libpsl` 0.21.2
-/// linked to glibc: exactly four fields, each one to three decimal digits
-/// with no leading zero, each at most 255. So `1.2.3.4` is an address while
-/// `01.2.3.4`, `1.02.3.4`, `1.2.3.04`, `1.2.3.256`, `999.999.999.999`,
-/// `1.2.3`, `1.2.3.4.5`, `1.2.3.4.` and `1.2.3.0x4` are not. This is
-/// `inet_pton`, not `inet_aton`: no shorthand, no hex, no octal.
 fn pton4(text: &[u8]) -> bool {
     let mut octets = 0_usize;
     for field in text.split(|byte| *byte == b'.') {
@@ -917,23 +542,6 @@ fn pton4(text: &[u8]) -> bool {
 }
 
 /// Whether `text` is an IPv6 literal, by `inet_pton`'s rules.
-///
-/// Groups of one to four hexadecimal digits, in either case, separated by
-/// single colons; at most one `::`; an optional embedded IPv4 address, which
-/// must be the final group and must satisfy [`pton4`] and which counts as two
-/// 16-bit words. Without a `::` there must be exactly eight words; with one
-/// there must be at most seven, because `::` has to stand for at least one
-/// omitted word.
-///
-/// Each clause is measured against `libpsl` 0.21.2: `::ffff:1.2.3.4`,
-/// `fe80::1.2.3.4`, `1:2:3:4:5:6:1.2.3.4` (eight words, no `::`) and
-/// `1:2:3:4:5::1.2.3.4` (seven words with one) are addresses, while
-/// `:::1.2.3.4`, `1::2::3.4.5.6`, `:1.2.3.4`, `1:2:3:4:5:1.2.3.4` (seven
-/// words without a `::`), `1:2:3:4:5:6::1.2.3.4` (eight words with one),
-/// `abcde::1.2.3.4`, `x::1.2.3.4`, `::ffff:1.2.3.256`,
-/// `::ffff:1.2.3.4%eth0` and `[::ffff:1.2.3.4]` are not. A zone identifier
-/// and surrounding brackets are rejected as a side effect of the group
-/// grammar, which is also how `inet_pton` rejects them.
 fn pton6(text: &[u8]) -> bool {
     let fields: Vec<&[u8]> = text.split(|byte| *byte == b':').collect();
     // Splitting always yields at least one field, so fewer than two means
@@ -1018,17 +626,6 @@ mod tests {
 
     /// A Public Suffix List small enough to read and large enough to be
     /// interesting.
-    ///
-    /// Every rule is transcribed from the real list, including the absence of
-    /// a bare `ck` and a bare `kobe.jp`, so that `libpsl` returns the same
-    /// verdict for this text as it does for the full 318-kilobyte file. That
-    /// equivalence was checked, not assumed: for every host and cookie-domain
-    /// pair in [`VECTORS`] and for every name in [`SUFFIXES`], `libpsl`
-    /// 0.21.2 loaded with this text and `libpsl` loaded with
-    /// `/usr/share/publicsuffix/public_suffix_list.dat` agree exactly.
-    ///
-    /// The section markers are load-bearing: the parser assigns no type, and
-    /// therefore stores no rule, until it has seen one.
     const LIST: &str = concat!(
         "// ===BEGIN ICANN DOMAINS===\n",
         "com\n",
@@ -1052,14 +649,6 @@ mod tests {
 
     /// Host, cookie domain and the verdict, measured against `libpsl` 0.21.2
     /// loaded with [`LIST`].
-    ///
-    /// Not hand-reasoned. Each row is a line of that program's output, which
-    /// is why the surprising ones are here: `com` may set a cookie for `com`
-    /// because the names are equal, `z-1.compute-1.amazonaws.com` may set one
-    /// for itself even though it is a registry-level name, `1.2.3.4` may not
-    /// set one for `2.3.4` but `01.2.3.4` may, and `y.kobe.jp` may not
-    /// receive one for itself from `x.y.kobe.jp` because the `*.kobe.jp` rule
-    /// makes it registry-level.
     const VECTORS: &[(&str, &str, bool)] = &[
         // Ordinary registrable domains.
         ("www.example.com", "example.com", true),
@@ -1076,7 +665,6 @@ mod tests {
         ("www.example.com", "..example.com", true),
         ("www.example.com", "", false),
         ("www.example.com", ".", false),
-        // The suffix has to land on a label boundary.
         ("foo.example.com", "o.example.com", false),
         // Wildcard rules, and the exception that undoes one.
         ("www.example.ck", "example.ck", false),
@@ -1185,13 +773,6 @@ mod tests {
 
     /// Names and their `psl_unregistrable_domain`, measured against `libpsl`
     /// 0.21.2 over [`LIST`].
-    ///
-    /// The surprising rows are the point: a lone label is its own suffix
-    /// whether listed or not; `compute-1.amazonaws.com` is its own suffix
-    /// because `*.compute-1.amazonaws.com` exists, while `amazonaws.com` is
-    /// not; `www.ck` and `city.kobe.jp` fall back to their parents because of
-    /// the exception rules; and an IP-shaped name is treated as an ordinary
-    /// name here, the IP rule living in the verdict instead.
     const UNREGISTRABLE: &[(&str, &str)] = &[
         ("com", "com"),
         ("example.com", "com"),
@@ -1284,12 +865,6 @@ mod tests {
 
     /// Parses [`LIST`] the way [`PslCache`] does, for the tests that need a
     /// list without needing a cache.
-    ///
-    /// A parse failure is a defect in [`LIST`] itself, so it is reported as a
-    /// failed assertion on a run-time value rather than with a panicking
-    /// macro, which this module does not use. `unwrap_or_default` then keeps
-    /// the signature infallible without introducing one: the assertion above
-    /// has already failed the test by the time it could matter.
     fn list() -> List {
         let parsed = parse_list(LIST.as_bytes().to_vec());
         assert!(parsed.is_some(), "the embedded list parses");
@@ -1298,11 +873,6 @@ mod tests {
 
     /// `psl_is_public_suffix`, expressed through the primitive this module
     /// publishes.
-    ///
-    /// A name is a public suffix exactly when it is its own unregistrable
-    /// part. That identity was checked against `libpsl` rather than assumed:
-    /// over the full Public Suffix List, `psl_is_public_suffix(x)` and
-    /// `psl_unregistrable_domain(x) == x` agree for every name tried.
     fn is_public_suffix(list: &List, name: &[u8]) -> bool {
         unregistrable_domain(list, name) == Some(name)
     }
@@ -2017,12 +1587,6 @@ mod tests {
     }
 
     /// `tests/data/test977`, and the fully qualified host it turns on.
-    ///
-    /// The fixture fetches `http://firsthost.me.`, is served
-    /// `Set-Cookie: a=b; Domain=.me.;` and requires an empty jar. curl strips
-    /// one leading dot while parsing, so this module is asked about
-    /// `firsthost.me.` and `me.`, and it must refuse. libpsl 0.21.2 accepts
-    /// that pair; the fixture is the authority and it is immutable.
     #[test]
     fn a_fully_qualified_host_still_may_not_set_a_registry_level_cookie() {
         let list = list();

@@ -231,29 +231,36 @@ Having a writer chain as implementation allows protocol handlers with extra
 needs, like HTTP, to add to this for special behavior. The common way of
 writing the actual response data stays the same.
 
-## The specified `Rust` successor
+## The `Rust` successor
 
 The migration to the three-`crate` `Rust` `workspace` specifies successors to
-the four C files named at the top of this page. The tree does already contain
-`Rust` source, in all three `crates`, but no successor to any of those four
-files has been delivered, so each path in the list below is specified target
-state, while those C files remain the reference oracle at runtime. Two names
-mentioned further down are exceptions and are marked as such where they appear:
-`curl-rs/src/output/writeout.rs`, which is a different concern from this chain,
-and `curl-rs/src/bin/curlinfo.rs`, both of which do exist.
+the four C files named at the top of this page. The successor is **partially
+delivered**: two of the engine-side modules are on disk and two groups are not,
+and each entry below says which. Where a module is absent its path is specified
+target state; the C files remain the reference oracle at runtime either way.
 
-- `curl-rs-lib/src/transfer/writeout.rs` succeeds `lib/cw-out.c` and
-  `lib/cw-pause.c`: the client writer at the end of the chain, together with
+- **Delivered.** `curl-rs-lib/src/transfer/writeout.rs` succeeds `lib/cw-out.c`
+  and `lib/cw-pause.c`: the client writer at the end of the chain, together with
   the pause handling.
-- `curl-rs-lib/src/transfer/sendf.rs` succeeds `lib/sendf.c`: the shared send
-  and write plumbing that builds the chain and drives it.
-- `curl-rs-lib/src/transfer/content_encoding.rs` succeeds
-  `lib/content_encoding.c`: the content coding decoders.
-- On the tool side, `curl-rs/src/callbacks/write.rs` succeeds
-  `src/tool_cb_wrt.c`, `curl-rs/src/callbacks/header.rs` succeeds
-  `src/tool_cb_hdr.c` and `curl-rs/src/callbacks/debug.rs` succeeds
+- **Delivered.** `curl-rs-lib/src/transfer/sendf.rs` succeeds `lib/sendf.c`: the
+  shared send and write plumbing that builds the chain and drives it.
+- **Not on disk.** `curl-rs-lib/src/transfer/content_encoding.rs` is to succeed
+  `lib/content_encoding.c`: the content coding decoders. No decoder is installed
+  into the chain until it lands, and the content-encoding capability is withheld
+  from the advertised feature set meanwhile.
+- **Not on disk.** On the tool side, `curl-rs/src/callbacks/write.rs` is to
+  succeed `src/tool_cb_wrt.c`, `curl-rs/src/callbacks/header.rs`
+  `src/tool_cb_hdr.c` and `curl-rs/src/callbacks/debug.rs`
   `src/tool_cb_dbg.c`. Those three hold the callbacks that the curl tool
-  installs, which puts them at the client end of everything described above.
+  installs, which puts them at the client end of everything described above;
+  `curl-rs/src/callbacks/` currently holds only its module root.
+
+Two names mentioned further down are a different concern from this chain and
+both exist: `curl-rs/src/output/writeout.rs` and `curl-rs/src/bin/curlinfo.rs`.
+
+Delivered means the module and its tests are present, not that a transfer runs
+through it. Nothing drives the chain end to end yet, because the protocol layer
+that would feed it is incomplete and the tool cannot accept an option.
 
 One name invites confusion and is worth separating out here.
 `curl-rs/src/output/writeout.rs` is the successor to `src/tool_writeout.c` and

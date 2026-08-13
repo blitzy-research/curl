@@ -181,6 +181,30 @@ jobs:
           # have not been written. The second guard reads the coverage report and
           # catches the different case of a tree that exists but contributes no
           # instrumented line.
+          # WHY A FILE COUNT IS NOT ENOUGH, and what replaced it.
+          #
+          # This guard used to accept any non-empty tree. Measured against this
+          # checkout, that is precisely the state it fails to catch:
+          # curl-rs-lib/src/protocols/ holds mod.rs and ftp/listparser.rs, and
+          # curl-rs-lib/src/transfer/ holds a module-declaration mod.rs and five
+          # of its eight modules - so both trees are "present and hold Rust
+          # source" while not one protocol executor exists and no transfer loop
+          # runs. A scheme registry and a directory-listing parser can carry the
+          # coverage floor to 80% on their own, and the gate would then report a
+          # green tick over a subject that cannot perform a transfer. That is the
+          # measuring-nothing failure this step exists to prevent, one level up.
+          #
+          # So the requirement is the EXACT module inventory AAP 0.4.1 assigns,
+          # named file by file. A tree that is missing any of them fails, and the
+          # message names which - which is the difference between a gate that
+          # tells you what to write and one that tells you a directory is empty.
+          #
+          # The lists are literal rather than derived from a glob, for the same
+          # reason the option table and the export list are: a set that discovers
+          # its own contents cannot notice that something is absent.
+          required_protocols='mod.rs http1.rs http2.rs http3.rs sftp.rs scp.rs file.rs ws.rs stub.rs ftp/mod.rs ftp/pingpong.rs ftp/listparser.rs'
+          required_transfer='mod.rs request.rs sendf.rs writeout.rs progress.rs ratelimit.rs content_encoding.rs chunked.rs'
+
           missing=''
           for tree in ${COVERAGE_TREES}; do
             if [ ! -d "${tree}" ]; then
@@ -194,7 +218,33 @@ jobs:
               missing="${missing} ${tree}"
               continue
             fi
-            echo "  ${tree}: ${n} .rs file(s)"
+
+            # Which inventory applies to this tree. An unrecognised tree is an
+            # error rather than a pass: adding a tree to COVERAGE_TREES without
+            # naming its modules here would restore exactly the count-only check
+            # this block replaced.
+            case "${tree}" in
+              */protocols) want="${required_protocols}" ;;
+              */transfer)  want="${required_transfer}" ;;
+              *)
+                echo "  ${tree}: no module inventory is declared for this tree"
+                missing="${missing} ${tree}"
+                continue
+                ;;
+            esac
+
+            absent=''
+            for module in ${want}; do
+              if [ ! -f "${tree}/${module}" ]; then
+                absent="${absent} ${module}"
+              fi
+            done
+            if [ -n "${absent}" ]; then
+              echo "  ${tree}: ${n} .rs file(s), but these mandated modules are ABSENT:${absent}"
+              missing="${missing} ${tree}"
+              continue
+            fi
+            echo "  ${tree}: ${n} .rs file(s), every mandated module present"
           done
           if [ -n "${missing}" ]; then
             echo ''

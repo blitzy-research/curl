@@ -27,74 +27,23 @@
 //! `lib/vtls/hostcheck.c`, plus the trust-and-client-auth half of
 //! `lib/vtls/rustls.c`.
 //!
-//! Verification is ON by default and `--insecure` is the only switch that
-//! turns it off, which AAP 0.8.1 lists among the preservation mandates and
-//! AAP 0.8.4 makes validation gate ten. Both halves of that sentence are
-//! expressed as types here rather than as prose: [`VerifyPolicy::default`]
-//! enables the peer-chain and the hostname check together, and the single
-//! private constructor named in the next paragraph is the only way to reach
-//! a configuration that does not.
+//! Both halves of that sentence are expressed as types here rather than as
+//! prose: [`VerifyPolicy::default`] enables the peer-chain and the hostname
+//! check together, and the single private constructor named in the next
+//! paragraph is the only way to reach a configuration that does not.
 //!
-//! # The one dangerous path, and why it is one line of code to audit
-//!
-//! `lib/vtls/rustls.c:377-385` defines `cr_verify_none`, a callback that
-//! ignores its parameters and returns `RUSTLS_RESULT_OK`, and
-//! `lib/vtls/rustls.c:1033-1036` installs it through
-//! `rustls_client_config_builder_dangerous_set_certificate_verifier` under
-//! exactly one condition: `if(!conn_config->verifypeer)`. The Rust
-//! equivalent is [`NoVerification`], the only type in this crate that
-//! implements [`ServerCertVerifier`] by asserting rather than checking, and
-//! it is reachable only through
-//! [`ServerVerification::insecure_disable_peer_verification`], which
-//! [`ServerVerification::build`] calls under the same single condition. The
-//! only call to rustls's `dangerous()` API in the workspace lives in
-//! [`ServerVerification::install`], where it is selected by matching the
-//! [`ServerVerifierKind::NoVerification`] variant that only that private
-//! constructor can produce.
-//!
-//! A missing trust root, an unparsable certificate, a hostname mismatch, a
-//! one-sided client-authentication pair and an unsupported `--capath` all
-//! return an error instead. None of them reaches the dangerous path, which
-//! is what makes "validation is on unless the user asked for it off"
-//! checkable by reading three items rather than by auditing the module.
-//!
-//! # Trust comes from where the caller says, never from the platform
-//!
-//! `rustls`'s and `quinn`'s `platform-verifier` features are never enabled
-//! (AAP 0.5.1): delegating the trust decision to the operating-system store
-//! would take `--cacert`, `--capath` and `--insecure` out of the decision,
-//! and those remaining authoritative is the whole point of the option set.
-//! The four trust sources are therefore explicit and typed in
-//! [`TrustSource`], the caller picks one, and a blob beats a file exactly as
-//! `lib/vtls/rustls.c:1014-1017` says it must: "CURLOPT_CAINFO_BLOB
-//! overrides CURLOPT_CAINFO".
-//!
-//! The C's third branch -- `ssl_config->native_ca_store`, which
-//! `lib/vtls/rustls.c:1037-1043` answers with the rustls-ffi platform
-//! verifier -- becomes [`TrustSource::NativeRoots`], which loads the
-//! platform's certificates through `rustls-native-certs` and puts them in an
-//! ordinary root store. The observable trust set is the same; the difference
-//! is that the verification logic stays in `rustls` where the AAP requires
-//! it, rather than moving into an operating-system component.
-//!
-//! # Hostname checking is curl's, not the library's
-//!
-//! `lib/vtls/hostcheck.c:39-125` is reproduced in [`cert_hostcheck`] down to
-//! the order of its tests, because the rules it implements are narrower than
-//! a reader expects: a wildcard counts only when the pattern begins `*.` and
-//! `*` is the whole leftmost label, an IP literal never matches a wildcard,
-//! and a pattern with fewer than two dots falls back to an exact comparison
-//! rather than matching widely. [`verify_hostname`] wraps it with the
-//! certificate-level rules that `lib/vtls/openssl.c:2053-2250` applies
-//! around the same function: subjectAltName entries of the target's own kind
-//! decide the outcome when any exist, an IP target compares raw address
-//! bytes with no wildcard, and the commonName is consulted only when the
-//! certificate carries no dNSName and no iPAddress at all.
-//!
-//! This supplements rustls rather than replacing anything: signature, time,
-//! key-usage and chain verification stay with
-//! [`WebPkiServerVerifier`], and the curl-shaped hostname answer is applied
-//! on top so that curl's observable result is the one that wins.
+//! One reachability fact belongs with that, because the code below implements a
+//! commonName fallback and a reader will want to know when it runs. rustls
+//! REQUIRES a subjectAltName, so a certificate carrying only a commonName fails
+//! the handshake before this module's own check is consulted. That matches the
+//! oracle rather than diverging from it: `Curl_verifyhost` occurs exactly once
+//! in `lib/` -- a declaration at `lib/vtls/x509asn1.h:76` with no definition and
+//! no caller -- `lib/vtls/rustls.c` hands the name to rustls at `:1091` and
+//! keeps its answer, and the commonName fallback lives only in
+//! `lib/vtls/openssl.c:2176-2246`, a backend section 0.2.2 drops. The arm here
+//! is retained because this module owns the whole of that function's shape and
+//! because the same parsing feeds `CURLINFO_CERTINFO`, not because a
+//! commonName-only certificate can reach it through the rustls backend.
 //!
 //! # Certificate introspection is bounded, and the bounds are the C's
 //!
@@ -130,6 +79,17 @@
 //! through the [`PemObject`] trait of `rustls-pki-types 1.15.1`, which is
 //! the same code: `rustls-pemfile 2.2.0` is a thin deprecated shim over it.
 //! Nothing about the accepted inputs or the error mapping differs.
+//!
+//! The reason the crate is absent is not this file's choice and is not a
+//! preference: `RUSTSEC-2025-0134` marks `rustls-pemfile` UNMAINTAINED with no
+//! patched version, and `deny.toml` sets `unmaintained = "all"`, so declaring
+//! it fails AAP 0.8.4's ninth gate -- measured, with `cargo deny check
+//! advisories` reporting `error[unmaintained]` the moment it becomes a live
+//! dependency. The row is therefore a **blocked gate**, declared as one under
+//! `[workspace.metadata.curl-rs.blocked-aap-gates.rustls-pemfile]` in the root
+//! manifest. The capability AAP 0.5.1 describes is delivered here in full; the
+//! package it names is not present, and this file does not describe that as
+//! compliance.
 
 use core::fmt;
 use std::borrow::Cow;
@@ -166,16 +126,14 @@ use crate::util::dynbuf::DynBuf;
 use crate::util::inet;
 use crate::util::strcase;
 
-// =========================================================================
 // Constants: every one measured from the C, none chosen here
-// =========================================================================
 
 /// Largest ASN.1 structure the parser accepts: 256 KiB.
 ///
 /// `#define CURL_ASN1_MAX ((size_t)0x40000)` (`lib/vtls/x509asn1.c:51`).
 /// The guard is applied to the span offered to the parser, so an outer
 /// object larger than this is refused before a single header byte is read.
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) const CURL_ASN1_MAX: usize = 0x40000;
 
 /// Deepest nesting the parser follows: 16.
@@ -183,7 +141,7 @@ pub(crate) const CURL_ASN1_MAX: usize = 0x40000;
 /// `#define CURL_ASN1_MAX_RECURSIONS 16` (`lib/vtls/x509asn1.c:167`). Only
 /// the indefinite-length constructed form recurses, and this is what stops
 /// a certificate built to nest without end.
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) const CURL_ASN1_MAX_RECURSIONS: usize = 16;
 
 /// Ceiling for a client certificate read from a file: 100 KiB.
@@ -206,15 +164,6 @@ const DYN_KEYFILE_SIZE: usize = 100 * 1024;
 const DYN_CRLFILE_SIZE: usize = 400 * 1024 * 1024;
 
 /// Ceiling for a trust bundle read from a file: 400 MiB.
-///
-/// The C reaches `--cacert` through
-/// `rustls_root_cert_store_builder_load_roots_from_file`
-/// (`lib/vtls/rustls.c:724-726`), which reads the file inside rustls-ffi
-/// rather than through a dynbuf, so no curl-side constant covers it. A
-/// system bundle is a concatenation of hundreds of certificates and can
-/// exceed the 100 KiB that fits one, so this matches the revocation-list
-/// ceiling: large enough never to reject a real bundle, finite so that a
-/// pipe or a device node cannot be read without end.
 const DYN_CAFILE_SIZE: usize = 400 * 1024 * 1024;
 
 /// Base64 characters per line of a PEM body.
@@ -225,15 +174,7 @@ const DYN_CAFILE_SIZE: usize = 400 * 1024 * 1024;
 /// a fixture comparing `CURLINFO_CERTINFO` output compares the text.
 const PEM_LINE_WIDTH: usize = 64;
 
-// -------------------------------------------------------------------------
 // ASN.1 universal tags, exactly the set `x509asn1.c:61-88` leaves enabled.
-//
-// The C comments out the tags it does not convert -- OBJECT DESCRIPTOR,
-// REAL, SEQUENCE, SET, VIDEOTEX STRING and the rest -- and so does this
-// list, by not naming them. A tag absent here reaches `asn1_to_str` and
-// leaves with `CURLE_BAD_FUNCTION_ARGUMENT`, which is what the C's
-// unmatched `switch` does.
-// -------------------------------------------------------------------------
 
 /// `CURL_ASN1_BOOLEAN` (`x509asn1.c:61`).
 const ASN1_BOOLEAN: u8 = 1;
@@ -271,15 +212,6 @@ const ASN1_UNIVERSAL_STRING: u8 = 28;
 const ASN1_BMP_STRING: u8 = 30;
 
 /// The ASN.1 OID table, in the C's order.
-///
-/// `static const struct Curl_OID OIDtable[]` (`x509asn1.c:97-150`): 49
-/// entries, each a dotted-numeric OID and the name curl renders it as. The
-/// order is preserved because [`search_oid`] returns the first match and
-/// two entries could in principle collide on the text form.
-///
-/// An OID absent from this table is rendered numerically rather than
-/// rejected (`x509asn1.c:471-475`), so the table is a naming courtesy and
-/// never a filter.
 const OID_TABLE: &[(&str, &str)] = &[
     ("1.2.840.10040.4.1", "dsa"),
     ("1.2.840.10040.4.3", "dsa-with-sha1"),
@@ -348,9 +280,7 @@ const OID_SUBJECT_ALT_NAME: &str = "2.5.29.17";
 /// same reason.
 const OID_COMMON_NAME: &str = "2.5.4.3";
 
-// =========================================================================
 // Bounded ASN.1 parsing: supersedes `lib/vtls/x509asn1.c:163-240`
-// =========================================================================
 
 /// One parsed ASN.1 element.
 ///
@@ -359,13 +289,6 @@ const OID_COMMON_NAME: &str = "2.5.4.3";
 /// keeps one borrowed slice, so the two invariants the C maintains by hand
 /// (`beg <= end`, and both inside the source buffer) are the slice's own and
 /// cannot be violated.
-///
-/// The C's `header` member is not reproduced. It is written by
-/// `getASN1Element_` (`x509asn1.c:187`) and read nowhere in that file; the
-/// only readers in the tree are the public-key pinning paths of
-/// `lib/vtls/schannel.c:1129-1137` and `lib/vtls/wolfssl.c:1570-1577`, and
-/// pinning is `crate::tls`'s concern rather than this module's. Adding a
-/// member that no caller here reads would be scaffolding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Asn1Element<'a> {
     /// The element's content octets: the C's `[beg, end)`.
@@ -381,7 +304,7 @@ pub(crate) struct Asn1Element<'a> {
     constructed: bool,
 }
 
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 impl<'a> Asn1Element<'a> {
     /// The empty element the C writes with `beg = end = ""`.
     ///
@@ -419,13 +342,6 @@ impl<'a> Asn1Element<'a> {
 
 /// Parses one ASN.1 element from the front of `src`.
 ///
-/// Supersedes `getASN1Element` (`lib/vtls/x509asn1.c:236-240`), which is the
-/// level-zero entry point to the recursive worker. Returns the element and
-/// the remainder of `src` that follows it -- the C returns "a pointer in
-/// source string after the parsed element, or NULL if an error occurs"
-/// (`x509asn1.c:177-180`), and a slice pair says the same thing without
-/// leaving the caller to work out where the element ended.
-///
 /// The C's own description is worth keeping in view: this is a lightweight
 /// parser that "does not check for syntactic/lexical errors"
 /// (`x509asn1.c:155-160`). It is deliberately not a validating X.509
@@ -439,18 +355,12 @@ impl<'a> Asn1Element<'a> {
 /// leading zero octet, a span above [`CURL_ASN1_MAX`], a long tag number, a
 /// truncated header, a length above 32 bits, a length that does not fit the
 /// span, and an indefinite length on a primitive element.
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) fn get_asn1_element(src: &[u8]) -> Option<(Asn1Element<'_>, &[u8])> {
     get_asn1_element_at(src, 0)
 }
 
 /// [`get_asn1_element`] with the recursion counter the C threads through.
-///
-/// Supersedes `getASN1Element_` (`lib/vtls/x509asn1.c:169-234`). Only the
-/// indefinite-length branch recurses, and it is the reason the counter
-/// exists: a constructed element of unspecified length is measured by
-/// parsing its children, so a certificate whose children nest without end
-/// would otherwise recurse without end.
 fn get_asn1_element_at(
     src: &[u8],
     level: usize,
@@ -537,8 +447,6 @@ fn get_asn1_element_at(
             accumulated = (accumulated << 8) | u64::from(src[cursor]);
             cursor += 1;
         }
-        // The guard caps `accumulated` below 2^32, which fits `usize` on
-        // every target of specification 0.8.3 -- all four are 64-bit.
         usize::try_from(accumulated).ok()?
     };
 
@@ -568,9 +476,7 @@ fn search_oid(oid: &str) -> Option<&'static (&'static str, &'static str)> {
     })
 }
 
-// =========================================================================
 // ASN.1 to text: supersedes `lib/vtls/x509asn1.c:269-759`
-// =========================================================================
 
 /// A fresh accumulator with the C's ceiling on a rendered string.
 ///
@@ -618,13 +524,6 @@ fn octet_to_str(store: &mut DynBuf, content: &[u8]) -> CurlResult<()> {
 }
 
 /// A bit string as colon-separated hexadecimal.
-///
-/// Supersedes `bit2str` (`x509asn1.c:299-306`), which steps over the leading
-/// "number of unused bits" octet and then renders the rest as octets. The
-/// C's guard is `if(++beg > end)`, which admits an empty content -- stepping
-/// past the end of a zero-length span leaves `beg == end`, and `>` is false
-/// -- so an empty bit string renders as the empty string rather than as an
-/// error. That asymmetry is reproduced rather than tidied.
 fn bit_to_str(store: &mut DynBuf, content: &[u8]) -> CurlResult<()> {
     match content.split_first() {
         Some((_unused_bits, rest)) => octet_to_str(store, rest),
@@ -636,13 +535,6 @@ fn bit_to_str(store: &mut DynBuf, content: &[u8]) -> CurlResult<()> {
 }
 
 /// An integer or enumerated value as text.
-///
-/// Supersedes `int2str` (`x509asn1.c:313-332`): values of at most four
-/// octets are rendered as a single hexadecimal number, sign-extended if the
-/// leading bit is set, and anything longer falls back to
-/// [`octet_to_str`]. The `0x` prefix appears only when the value is at
-/// least ten, which is the C's `val >= 10 ? "0x" : ""` and is what keeps a
-/// small serial number reading as a plain digit.
 ///
 /// # Errors
 ///
@@ -753,16 +645,6 @@ fn utf8_asn1_str(
 
 /// An OID as its dotted-decimal form.
 ///
-/// Supersedes `encodeOID` (`x509asn1.c:424-452`). The first octet carries
-/// two arcs -- `x = octet / 40`, `y = octet - 40x` -- and the rest are
-/// base-128 groups with the continuation bit in the top position.
-///
-/// The C stops rendering, successfully, when an arc would exceed 32 bits
-/// (`x509asn1.c:444-445` returns `CURLE_OK` from inside the loop). That is
-/// reproduced: the arcs decoded so far stay in the buffer and the caller
-/// sees success, because a truncated OID that renders is what the C's
-/// callers already handle.
-///
 /// # Errors
 ///
 /// Only an append failure. An empty content cannot reach here: the one
@@ -803,12 +685,6 @@ fn encode_oid(store: &mut DynBuf, content: &[u8]) -> CurlResult<()> {
 }
 
 /// An OID as its symbolic name when one is known, else numerically.
-///
-/// Supersedes `OID2str` (`x509asn1.c:460-483`). With `symbolic` set, the
-/// numeric form is built first and looked up in [`OID_TABLE`]; a hit is
-/// rendered by name and a miss by number, so an unknown OID always renders
-/// rather than failing. An empty content renders as nothing, exactly as the
-/// C's `if(beg < end)` guard arranges.
 fn oid_to_str(
     store: &mut DynBuf,
     content: &[u8],
@@ -832,11 +708,6 @@ fn oid_to_str(
 
 /// The dotted-decimal form of an OID element, for identity comparisons.
 ///
-/// The C compares an OID by rendering it and calling `strcmp`, which is what
-/// `searchOID` does. [`verify_hostname`] needs the same rendering to find
-/// the subjectAltName extension and the commonName attribute, so it is
-/// factored out here rather than repeated.
-///
 /// # Errors
 ///
 /// Propagates an append failure from [`encode_oid`].
@@ -859,11 +730,6 @@ fn oid_numeric(content: &[u8]) -> CurlResult<String> {
 ///   renders as `.5` and `.000` disappears.
 /// * A `Z` renders as ` GMT`, a signed offset as ` UTC` followed by the
 ///   offset, and anything else as a space followed by the remaining text.
-///
-/// The pieces are appended one at a time rather than through a single format
-/// string. The C's `printf` walks bytes, and the timezone text comes from
-/// the certificate, so passing it through a UTF-8 conversion could change
-/// the bytes that `CURLINFO_CERTINFO` reports.
 ///
 /// # Errors
 ///
@@ -934,18 +800,6 @@ fn gtime_to_str(store: &mut DynBuf, content: &[u8]) -> CurlResult<()> {
 
 /// An ASN.1 UTCTime as text.
 ///
-/// Supersedes `UTime2str` (`x509asn1.c:577-613`). The two-digit year gains a
-/// century by the C's rule `20 - (*beg >= '5')`: years `00` to `49` are
-/// twenty-first century, `50` to `99` twentieth. Seconds are optional -- a
-/// 10-digit run renders as `00` -- and any run that is neither 10 nor 12
-/// digits is an error, as is a value with no timezone at all.
-///
-/// One quirk is reproduced deliberately. For a `Z` the C substitutes `GMT`;
-/// for anything else it advances one octet before measuring the remainder
-/// (`x509asn1.c:605-606`), so a `+0500` offset renders as `0500` with the
-/// sign dropped. That is what curl prints today, and this file exists to
-/// print what curl prints.
-///
 /// # Errors
 ///
 /// [`CURLcode::BadFunctionArgument`] for a digit run that is not 10 or 12
@@ -985,11 +839,6 @@ fn utime_to_str(store: &mut DynBuf, content: &[u8]) -> CurlResult<()> {
 }
 
 /// One ASN.1 element as text, dispatching on its tag.
-///
-/// Supersedes `ASN1tostr` (`x509asn1.c:620-669`). A constructed element is
-/// refused outright -- "No conversion of structured elements" -- and a
-/// `type` of zero means "use the element's own tag", which is how every
-/// caller but [`encode_dn`] invokes it.
 ///
 /// # Errors
 ///
@@ -1108,9 +957,7 @@ fn encode_dn(store: &mut DynBuf, dn: &Asn1Element<'_>) -> CurlResult<()> {
     Ok(())
 }
 
-// =========================================================================
 // X.509 structure: supersedes `lib/vtls/x509asn1.c:769-881`
-// =========================================================================
 
 /// The version an X.509 certificate has when it omits the field: v1.
 ///
@@ -1160,7 +1007,7 @@ pub(crate) struct X509Certificate<'a> {
     extensions: Asn1Element<'a>,
 }
 
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 impl<'a> X509Certificate<'a> {
     /// The whole certificate as DER.
     pub(crate) const fn certificate(&self) -> &'a [u8] {
@@ -1183,14 +1030,6 @@ impl<'a> X509Certificate<'a> {
     }
 
     /// The whole `subjectPublicKeyInfo`, algorithm and key together.
-    ///
-    /// Public-key pinning hashes this element, not the key alone: the C's
-    /// pinning paths take `pubkey->header` through `pubkey->end`
-    /// (`lib/vtls/schannel.c:1129-1137`,
-    /// `lib/vtls/wolfssl.c:1570-1577`), which is the DER of this whole
-    /// structure. `CURLOPT_PINNEDPUBLICKEY` belongs to [`crate::tls`]
-    /// rather than to this module, so the element is exposed rather than
-    /// hashed here.
     pub(crate) const fn subject_public_key_info(&self) -> &Asn1Element<'a> {
         &self.subject_public_key_info
     }
@@ -1215,18 +1054,11 @@ impl<'a> X509Certificate<'a> {
 /// or against a certificate that is only being described, and it is not a
 /// substitute for verification.
 ///
-/// One structural difference is worth recording. At `x509asn1.c:818` the C
-/// reads the inner `signatureAlgorithm` WITHOUT checking the result, and
-/// relies on the following call receiving a null pointer and failing there
-/// instead. Propagating the failure at its own site, as this does, reaches
-/// the same outcome -- a refused certificate -- one step earlier, and no
-/// caller can distinguish the two.
-///
 /// # Errors
 ///
 /// [`CURLcode::PeerFailedVerification`], the code the C's one caller maps
 /// its `-1` to (`x509asn1.c:1100-1101`), for any malformed structure.
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) fn parse_x509(der: &[u8]) -> CurlResult<X509Certificate<'_>> {
     let bad = || Error::new(CURLcode::PeerFailedVerification);
 
@@ -1343,19 +1175,9 @@ pub(crate) fn parse_x509(der: &[u8]) -> CurlResult<X509Certificate<'_>> {
     })
 }
 
-// =========================================================================
 // CURLINFO_CERTINFO: supersedes `lib/vtls/x509asn1.c:887-1258`
-// =========================================================================
 
 /// One `CURLINFO_CERTINFO` record: a label and its value.
-///
-/// Supersedes the pair `Curl_ssl_push_certinfo_len` receives
-/// (`lib/vtls/vtls.c:648-653`), which joins them as `label:value` into the
-/// per-certificate `curl_slist`. The value is kept as bytes and not as a
-/// [`String`] for the reason the C states above that function: "'value' is
-/// NOT a null-terminated string" (`vtls.c:646`). A certificate may carry a
-/// TeletexString, a malformed UTF8String or an embedded zero, and lossy
-/// conversion here would change what `curl_easy_getinfo` reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CertInfoRecord {
     /// The label, always one of the fixed set this module emits.
@@ -1364,7 +1186,7 @@ pub(crate) struct CertInfoRecord {
     value: Vec<u8>,
 }
 
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 impl CertInfoRecord {
     /// Builds a record from a label and the bytes rendered for it.
     fn new(label: &'static str, value: &[u8]) -> Self {
@@ -1396,7 +1218,9 @@ impl CertInfoRecord {
     ///
     /// `curlx_dyn_add(&build, label)`, `":"`, then the value
     /// (`lib/vtls/vtls.c:664-666`).
-    #[allow(dead_code)] // consumer module not landed: easy/getinfo.rs
+    // The only caller is `easy/getinfo.rs`, which does not exist yet, so the
+    // allowance is what keeps this shape next to the citation it comes from.
+    #[allow(dead_code)]
     pub(crate) fn to_slist_entry(&self) -> Vec<u8> {
         let mut entry =
             Vec::with_capacity(self.label.len() + 1 + self.value.len());
@@ -1408,11 +1232,6 @@ impl CertInfoRecord {
 }
 
 /// Renders an AlgorithmIdentifier's name and returns its parameters.
-///
-/// Supersedes `dumpAlgo` (`lib/vtls/x509asn1.c:887-907`). The name is
-/// appended to `store` symbolically; the parameters are the element that
-/// follows the OID, or an empty element when the algorithm takes none --
-/// which is what the C's `param->beg = param->end = end` expresses.
 ///
 /// # Errors
 ///
@@ -1437,10 +1256,6 @@ fn dump_algo<'a>(
 }
 
 /// Renders one public-key field into a record.
-///
-/// Supersedes `do_pubkey_field` (`lib/vtls/x509asn1.c:946-964`). The C's
-/// `certnum` parameter selected between pushing a record and merely tracing
-/// it; tracing belongs to the caller here, so only the record is produced.
 ///
 /// # Errors
 ///
@@ -1469,15 +1284,6 @@ fn pubkey_field(
 /// * `dsa` reports p, q, g and the public value, taking the first three from
 ///   the algorithm parameters.
 /// * `dhpublicnumber` reports p, g and the public value.
-///
-/// The `dhpublicnumber` branch re-parses from the START of the parameters
-/// for `dh(g)` (`x509asn1.c:1057`) where `dsa` advances (`x509asn1.c:1039`),
-/// so `dh(g)` reports the same element as `dh(p)`. That is reproduced
-/// rather than corrected: the values curl prints today are the contract.
-///
-/// Each of the three multi-value branches also stops silently when a field
-/// fails to parse, exactly as the C's nested `if(p)` tests do, so a
-/// truncated parameter block yields fewer records instead of an error.
 ///
 /// # Errors
 ///
@@ -1579,19 +1385,12 @@ fn do_pubkey(
 
 /// A certificate as a PEM block.
 ///
-/// Supersedes the tail of `Curl_extract_certinfo`
-/// (`lib/vtls/x509asn1.c:1215-1247`), whose shape the C documents inline:
-/// `-----BEGIN CERTIFICATE-----\n`, then the base64 body in lines of at
-/// most 64 characters each followed by a newline, then
-/// `-----END CERTIFICATE-----\n`. The final line of the body is newline
-/// terminated like every other, and the END line ends with a newline too.
-///
 /// # Errors
 ///
 /// [`CURLcode::OutOfMemory`] from the base64 encoder, or
 /// [`CURLcode::TooLarge`] if the assembled block would cross
 /// [`CURL_X509_STR_MAX`].
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) fn certificate_pem(der: &[u8]) -> CurlResult<Vec<u8>> {
     let encoded = base64::encode(der).map_err(Error::new)?;
     let mut out = certinfo_buffer();
@@ -1615,11 +1414,6 @@ pub(crate) fn certificate_pem(der: &[u8]) -> CurlResult<Vec<u8>> {
 /// detail records that [`do_pubkey`] contributes for the algorithm in hand,
 /// `Signature`, `Cert`.
 ///
-/// The C emits these only when `CURLOPT_CERTINFO` is set, and its one caller
-/// checks that before calling (`lib/vtls/rustls.c:1196`). This function is
-/// therefore the "certinfo was requested" path in full, and the option check
-/// stays with the caller.
-///
 /// # Errors
 ///
 /// [`CURLcode::PeerFailedVerification`] when the certificate cannot be
@@ -1628,7 +1422,7 @@ pub(crate) fn certificate_pem(der: &[u8]) -> CurlResult<Vec<u8>> {
 /// (`x509asn1.c:1199`) -- and otherwise the specific code the failing
 /// conversion returned. Every one of them carries the C's message,
 /// "Failed extracting certificate chain" (`x509asn1.c:1255`).
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) fn extract_certinfo(der: &[u8]) -> CurlResult<Vec<CertInfoRecord>> {
     certinfo_records(der).map_err(|error| {
         error.context_with("Failed extracting certificate chain")
@@ -1703,16 +1497,12 @@ fn certinfo_records(der: &[u8]) -> CurlResult<Vec<CertInfoRecord>> {
 
 /// Every `CURLINFO_CERTINFO` record for a whole chain.
 ///
-/// Supersedes the loop of `lib/vtls/rustls.c:1196-1236`, including its
-/// ceiling: a chain longer than [`MAX_ALLOWED_CERT_AMOUNT`] is refused
-/// before any of it is parsed, with the C's message and its code.
-///
 /// # Errors
 ///
 /// [`CURLcode::SslConnectError`] for a chain above the ceiling
 /// (`rustls.c:1201-1205`), or whatever [`extract_certinfo`] returns for a
 /// member of the chain.
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) fn extract_certinfo_chain(
     chain: &[CertificateDer<'_>],
 ) -> CurlResult<Vec<Vec<CertInfoRecord>>> {
@@ -1732,30 +1522,15 @@ pub(crate) fn extract_certinfo_chain(
         .collect()
 }
 
-// =========================================================================
 // Hostname matching: supersedes `lib/vtls/hostcheck.c:39-125`
-// =========================================================================
 
 /// True when `hostname` is an IPv4 or IPv6 literal.
-///
-/// Supersedes `Curl_host_is_ipnum` (`lib/hostip.c:786-798`), which tries
-/// `AF_INET` and then `AF_INET6`. [`inet::pton`] is that function pair, and
-/// it is strict in the way this decision needs: a trailing dot, a
-/// three-part address and a leading zero in an octet are all rejected, so
-/// `127.0.0.1.` is NOT an address here -- which matters, because
-/// [`cert_hostcheck`] asks this question about the untrimmed hostname.
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) fn host_is_ipnum(hostname: &[u8]) -> bool {
     inet::pton(hostname).is_some()
 }
 
 /// Compares two byte strings of a given length, case-insensitively.
-///
-/// Supersedes `pmatch` (`lib/vtls/hostcheck.c:41-47`), whose comment states
-/// the constraint that shapes this whole path: "check the two input strings
-/// with given length, but do not assume they end in nul-bytes". Equal
-/// lengths are required first, and then the comparison folds ASCII case
-/// only, never the locale's.
 fn pmatch(hostname: &[u8], pattern: &[u8]) -> bool {
     hostname.len() == pattern.len()
         && strcase::ncasecompare(hostname, pattern, hostname.len())
@@ -1776,19 +1551,6 @@ fn pmatch(hostname: &[u8], pattern: &[u8]) -> bool {
 /// * "Only match on `*` being used for the leftmost label, not `a*`, `a*b`
 ///   nor `*b`" -- which follows from testing the pattern for the two-byte
 ///   prefix `*.` rather than searching it for a star.
-///
-/// A wildcard pattern also needs at least two dots, "to avoid too wide
-/// wildcard match": `*.com` does not match `example.com`, it is compared
-/// literally and fails.
-///
-/// One subtlety is preserved exactly. The C tests the prefix with
-/// `strncmp(pattern, "*.", 2)` on the ORIGINAL pointer, after the trailing
-/// dot has been discounted from the LENGTH only, so the pattern `*.` still
-/// enters the wildcard branch even though its trimmed form is one byte long.
-/// The prefix test here is therefore made against the untrimmed pattern, and
-/// the IP and leading-dot tests against the untrimmed hostname, for the same
-/// reason: those three C tests read through the pointer and ignore the
-/// adjusted length.
 fn hostmatch(hostname: &[u8], pattern: &[u8]) -> bool {
     // "normalize pattern and hostname by stripping off trailing dots"
     // (`hostcheck.c:85-89`).
@@ -1830,16 +1592,7 @@ fn hostmatch(hostname: &[u8], pattern: &[u8]) -> bool {
 }
 
 /// True when a certificate name matches a hostname.
-///
-/// Supersedes `Curl_cert_hostcheck` (`lib/vtls/hostcheck.c:119-125`), the
-/// entry point every backend calls. Both inputs must be non-empty; the C
-/// tests `*match` and `*hostname`, so a value whose first octet is zero
-/// counts as empty here too, which is the behaviour a certificate carrying
-/// an embedded NUL depends on.
-///
-/// The argument order follows the C: the certificate's pattern first, the
-/// hostname being verified second.
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) fn cert_hostcheck(pattern: &[u8], hostname: &[u8]) -> bool {
     if matches!(pattern.first(), None | Some(0))
         || matches!(hostname.first(), None | Some(0))
@@ -1850,12 +1603,6 @@ pub(crate) fn cert_hostcheck(pattern: &[u8], hostname: &[u8]) -> bool {
 }
 
 /// Which certificate field satisfied the hostname check.
-///
-/// The C reports this through `infof` -- "subjectAltName: ... matches" at
-/// `lib/vtls/openssl.c:2145-2146` against "common name: ... (matched)" at
-/// `:2240` -- and a caller needs to know which line to write. Returning it
-/// keeps the tracing decision with the caller and the verification decision
-/// here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostMatch {
     /// A subjectAltName entry of the target's own kind matched.
@@ -1865,12 +1612,6 @@ pub(crate) enum HostMatch {
 }
 
 /// A subjectAltName entry of a kind this module compares.
-///
-/// The GeneralName CHOICE of RFC 5280 has nine alternatives; only two are
-/// ever compared, matching the two the C's `switch(target)` handles
-/// (`lib/vtls/openssl.c:2129-2160`). The rest are counted as neither, so a
-/// certificate carrying only an `otherName` falls through to the commonName
-/// exactly as it does under OpenSSL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GeneralName<'a> {
     /// `dNSName`, context-specific tag 2.
@@ -1890,15 +1631,6 @@ const GENERAL_NAME_IP: u8 = 7;
 const ASN1_CLASS_CONTEXT: u8 = 2;
 
 /// The subjectAltName entries a certificate carries.
-///
-/// The C obtains these with `X509_get_ext_d2i(server_cert,
-/// NID_subject_alt_name, NULL, NULL)` (`lib/vtls/openssl.c:2098`), which
-/// yields NULL both when the extension is absent AND when it cannot be
-/// decoded, and the caller treats those two cases identically. This
-/// reproduces that: any malformed structure yields an empty list, so the
-/// commonName fallback is reached rather than an error being raised. The
-/// alternative -- failing the handshake on a certificate OpenSSL would have
-/// accepted through its commonName -- would be a behaviour change.
 fn subject_alt_names<'a>(cert: &X509Certificate<'a>) -> Vec<GeneralName<'a>> {
     decode_subject_alt_names(cert).unwrap_or_default()
 }
@@ -1964,11 +1696,6 @@ fn decode_subject_alt_names<'a>(
 }
 
 /// The last commonName in a distinguished name, rendered.
-///
-/// The C's comment explains why the LAST one: "we have to look to the last
-/// occurrence of a commonName in the distinguished one to get the most
-/// significant one" (`lib/vtls/openssl.c:2178-2180`), which OpenSSL
-/// implements by walking `X509_NAME_get_index_by_NID` to exhaustion.
 ///
 /// # Errors
 ///
@@ -2051,16 +1778,12 @@ const fn target_noun(kind: SslPeerType) -> &'static str {
 /// 5. Only a certificate with neither reaches the commonName, and the LAST
 ///    one in the subject is the one compared.
 ///
-/// `dispname` appears in the messages and `hostname` is what is compared;
-/// the C keeps the same two, which differ for an internationalised name
-/// where one is the punycode form.
-///
 /// # Errors
 ///
 /// [`CURLcode::PeerFailedVerification`] for every mismatch, with the C's own
 /// message text, and [`CURLcode::OutOfMemory`] for a commonName that cannot
 /// be rendered.
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) fn verify_hostname(
     certificate: &[u8],
     hostname: &str,
@@ -2167,23 +1890,9 @@ pub(crate) fn verify_hostname(
     ))
 }
 
-// =========================================================================
 // Trust sources: supersedes `lib/vtls/rustls.c:698-807` and `:1014-1017`
-// =========================================================================
 
 /// Reads a file into a buffer with a ceiling, or reports failure.
-///
-/// Supersedes `read_file_into` (`lib/vtls/rustls.c:387-410`), including its
-/// signature: the C returns 0 for "could not open", "could not read" and
-/// "would not fit", and every caller maps that single answer to its own
-/// `CURLcode`. [`Option`] carries the same information, so the code stays
-/// with the caller who knows which option was being loaded.
-///
-/// The 256-octet chunk size is the C's `uint8_t buf[256]`, and reading in
-/// chunks rather than with [`fs::read`] is what makes the ceiling effective:
-/// a file far above the ceiling is refused as soon as it crosses it, without
-/// being buffered whole first. That matters because a path may name a pipe
-/// or a device rather than a regular file.
 fn read_file_into(path: &Path, ceiling: usize) -> Option<Vec<u8>> {
     let mut file = fs::File::open(path).ok()?;
     let mut store = DynBuf::new(ceiling);
@@ -2203,29 +1912,12 @@ fn read_file_into(path: &Path, ceiling: usize) -> Option<Vec<u8>> {
 }
 
 /// Where the trust anchors come from.
-///
-/// The C has three branches and a default (`lib/vtls/rustls.c:1032-1053`);
-/// this has four explicit variants, because the AAP's ban on
-/// `platform-verifier` turns the C's platform branch into an ordinary root
-/// store loaded from the platform's files, and because leaving "the
-/// default" implicit is what allows a build to trust something nobody chose.
-///
-/// [`Self::from_curl_options`] applies the precedence, so a caller holding
-/// curl's options never has to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TrustSource {
     /// The compiled-in Mozilla root program, from `webpki-roots 1.0.9`.
-    ///
-    /// The default. Deterministic across the four targets of specification
-    /// 0.8.3, which a platform store is not.
     BundledRoots,
     /// The platform's certificate store, read through
     /// `rustls-native-certs 0.8.4`.
-    ///
-    /// Reached only when the caller asks -- the successor of
-    /// `ssl_config->native_ca_store` (`lib/vtls/rustls.c:1037`). The
-    /// certificates are loaded into an ordinary [`RootCertStore`] and
-    /// verified by rustls; nothing is delegated to the operating system.
     NativeRoots,
     /// `CURLOPT_CAINFO` / `--cacert`: a PEM bundle at a path.
     CaFile(PathBuf),
@@ -2233,16 +1925,9 @@ pub(crate) enum TrustSource {
     CaBlob(Vec<u8>),
 }
 
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 impl TrustSource {
     /// Applies curl's precedence to the three options that select trust.
-    ///
-    /// `CURLOPT_CAINFO_BLOB overrides CURLOPT_CAINFO`
-    /// (`lib/vtls/rustls.c:1015-1017`), which the C implements by nulling
-    /// the filename when a blob is present. The native store is consulted
-    /// only when neither is given, mirroring the branch order at
-    /// `lib/vtls/rustls.c:1037-1046`, and the bundled roots are what remains
-    /// when nothing at all was asked for.
     pub(crate) fn from_curl_options(
         ca_info_blob: Option<Vec<u8>>,
         ca_file: Option<PathBuf>,
@@ -2262,13 +1947,6 @@ impl TrustSource {
 }
 
 /// Collects PEM certificates into a root store, strictly.
-///
-/// The C loads roots with the `strict` flag set -- `add_pem(..., 1)` at
-/// `lib/vtls/rustls.c:711-714` and `load_roots_from_file(..., 1)` at
-/// `:724-726` -- so one unusable certificate fails the whole bundle rather
-/// than being skipped. That is reproduced: `add_parsable_certificates`
-/// would silently drop the bad entry, and silently trusting less than the
-/// user asked for is the failure mode this is guarding against.
 ///
 /// # Errors
 ///
@@ -2367,11 +2045,6 @@ fn build_root_store(policy: &VerifyPolicy) -> CurlResult<RootCertStore> {
 
 /// Loads the revocation lists a policy names.
 ///
-/// Supersedes `init_config_builder_verifier_crl`
-/// (`lib/vtls/rustls.c:667-695`), which reads the file and hands it to
-/// rustls-ffi's PEM-aware `add_crl`, mapping both a read failure and a parse
-/// failure to [`CURLcode::SslCrlBadfile`].
-///
 /// # Errors
 ///
 /// [`CURLcode::SslCrlBadfile`] when the file cannot be read, cannot be
@@ -2406,9 +2079,7 @@ fn load_crls(
     Ok(lists)
 }
 
-// =========================================================================
 // The verification policy: supersedes `lib/vtls/rustls.c:1024-1053`
-// =========================================================================
 
 /// What verification a connection is to perform.
 ///
@@ -2416,16 +2087,6 @@ fn load_crls(
 /// verification -- `verifypeer`, `verifyhost`, `CAfile`, `CApath`,
 /// `ca_info_blob` and `CRLfile` -- as a type whose [`Default`] is the secure
 /// configuration.
-///
-/// # The default is not a convenience, it is the requirement
-///
-/// [`Default::default`] enables the peer-chain check AND the hostname check,
-/// and selects [`TrustSource::BundledRoots`]. A caller who builds a policy
-/// and forgets to configure it therefore gets full verification, and a
-/// self-signed certificate is refused. Making the insecure configuration
-/// the one that has to be asked for -- through
-/// [`Self::with_peer_verification`] and nothing else -- is what AAP 0.8.1
-/// means by validation being on by default.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VerifyPolicy {
     /// `CURLOPT_SSL_VERIFYPEER`: check the chain to a trust anchor.
@@ -2454,7 +2115,7 @@ impl Default for VerifyPolicy {
     }
 }
 
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 impl VerifyPolicy {
     /// The default policy: both checks on, bundled roots.
     ///
@@ -2521,21 +2182,19 @@ impl VerifyPolicy {
     }
 
     /// The recorded `--capath`, if any.
-    #[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+    #[allow(dead_code)] // consumer: tls/rustls_backend.rs
     pub(crate) fn ca_path(&self) -> Option<&Path> {
         self.ca_path.as_deref()
     }
 
     /// The selected revocation list, if any.
-    #[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+    #[allow(dead_code)] // consumer: tls/rustls_backend.rs
     pub(crate) fn crl_file(&self) -> Option<&Path> {
         self.crl_file.as_deref()
     }
 }
 
-// =========================================================================
 // The one dangerous path: supersedes `cr_verify_none`, rustls.c:377-385
-// =========================================================================
 
 /// The certificate verifier that verifies no certificate.
 ///
@@ -2551,37 +2210,8 @@ impl VerifyPolicy {
 ///   return RUSTLS_RESULT_OK;
 /// }
 /// ```
-///
-/// [`Self::verify_server_cert`] ignores the chain, the name, the OCSP
-/// response and the clock, and returns the assertion. That is what
-/// `--insecure` means, and this is the only place in the workspace where it
-/// happens.
-///
-/// # What this still checks, and why that is not a half-measure
-///
-/// The handshake signature IS verified, against the public key in the
-/// certificate the peer presented. Only the question "should this
-/// certificate be trusted" is skipped. The reason is fidelity rather than
-/// caution: `cr_verify_none` replaces rustls-ffi's CERTIFICATE verifier
-/// callback, and rustls-ffi keeps the provider's signature verification
-/// underneath it, so a peer that cannot prove possession of the key in the
-/// certificate it sent still fails the handshake under `--insecure` in curl
-/// today. Asserting the signature as well would make this implementation
-/// weaker than the C rather than equal to it.
-///
-/// # Construction
-///
-/// There is no public constructor. The type is built only by
-/// [`ServerVerification::insecure_disable_peer_verification`], which is
-/// private, and reached only through the one condition
-/// [`ServerVerification::build`] tests.
 #[derive(Debug)]
 struct NoVerification {
-    /// The injected provider, whose algorithms verify the handshake
-    /// signature. Held rather than read from a process-global default: AAP
-    /// 0.5.1 requires provider selection to be explicit, and
-    /// `CryptoProvider::get_default_or_install_from_crate_features` is
-    /// exactly the implicit selection that requirement rules out.
     provider: Arc<CryptoProvider>,
 }
 
@@ -2642,9 +2272,11 @@ impl ServerCertVerifier for NoVerification {
 /// Which verifier a [`ServerVerification`] holds.
 ///
 /// Two variants, because there are exactly two outcomes, and making them a
-/// closed enumeration is what lets [`ServerVerification::install`] be the
-/// single `dangerous()` call site: the choice is a `match` over a type only
-/// this module can construct, not a boolean somebody could flip.
+/// closed enumeration is what lets [`ServerVerification::install`] hold the
+/// only production `dangerous()` call: the choice is a `match` over a type
+/// only this module can construct, not a boolean somebody could flip. Test
+/// fixtures in `tls/rustls_backend.rs` call `dangerous()` too, so the claim
+/// is about production paths, not about the whole crate.
 #[derive(Debug)]
 enum ServerVerifierKind {
     /// Full web-PKI verification, with revocation checking when configured.
@@ -2654,12 +2286,6 @@ enum ServerVerifierKind {
 }
 
 /// A built server-certificate verifier, plus what the caller must report.
-///
-/// The typed result [`crate::tls`]'s backend consumes. It deliberately does
-/// NOT build a [`ClientConfig`]: ALPN, cipher suites, the session cache and
-/// key logging all belong to the backend, and having this module reach into
-/// them would create the dependency cycle AAP 0.3.1's layout exists to
-/// avoid. What crosses the boundary is a verifier and two facts about it.
 #[derive(Debug)]
 pub(crate) struct ServerVerification {
     /// The verifier itself.
@@ -2672,7 +2298,7 @@ pub(crate) struct ServerVerification {
     verify_host: bool,
 }
 
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 impl ServerVerification {
     /// Builds the verifier a policy calls for.
     ///
@@ -2686,12 +2312,6 @@ impl ServerVerification {
     /// }
     /// else if(...) { /* trust sources */ }
     /// ```
-    ///
-    /// `!verify_peer` is the ONLY route to
-    /// [`Self::insecure_disable_peer_verification`]. A missing trust
-    /// anchor, an unparsable bundle, an unreadable revocation list and an
-    /// unsupported `--capath` all return an error from here instead, so no
-    /// failure can be recovered into an unverified connection.
     ///
     /// # Errors
     ///
@@ -2710,12 +2330,6 @@ impl ServerVerification {
     }
 
     /// The verifying path: web-PKI against the policy's trust anchors.
-    ///
-    /// Supersedes `init_config_builder_verifier`
-    /// (`lib/vtls/rustls.c:709-780`). Revocation lists are installed
-    /// through the builder rather than checked afterwards, so rustls
-    /// performs the check itself with the depth and unknown-status policy
-    /// its own defaults set.
     fn web_pki(
         policy: &VerifyPolicy,
         provider: &Arc<CryptoProvider>,
@@ -2751,21 +2365,6 @@ impl ServerVerification {
     }
 
     /// Builds the UNVERIFIED configuration. `--insecure`, and nothing else.
-    ///
-    /// The successor of the one C statement that installs `cr_verify_none`
-    /// (`lib/vtls/rustls.c:1033-1035`). Private, infallible and called from
-    /// exactly one place: the `else` of [`Self::build`]'s single branch on
-    /// `verify_peer`. It sets [`Self::peer_verification_disabled`] at the
-    /// same moment it installs the verifier, so the two can never disagree
-    /// and the caller's warning cannot be printed for a verifying
-    /// connection or omitted for a non-verifying one.
-    ///
-    /// The hostname check is dropped with the chain check. Comparing names
-    /// on a certificate whose issuer was never established is theatre: any
-    /// name at all can appear in a certificate the peer signed itself, so
-    /// the comparison would report success without establishing anything.
-    /// curl does the same -- `--insecure` clears `verifyhost` alongside
-    /// `verifypeer`.
     fn insecure_disable_peer_verification(
         policy: &VerifyPolicy,
         provider: &Arc<CryptoProvider>,
@@ -2783,18 +2382,6 @@ impl ServerVerification {
     }
 
     /// Whether peer verification is switched OFF for this connection.
-    ///
-    /// The one widened item in this module, and the reason it is widened:
-    /// `curl-rs/src/output/msgs.rs` has to write the `--insecure` warning to
-    /// standard error BEFORE the transfer proceeds, which AAP 0.8.1 lists
-    /// among the preservation mandates and AAP 0.8.4 makes validation gate
-    /// ten. The answer is fixed when [`Self::build`] runs and there is no
-    /// method anywhere that changes it, so a caller may print the warning
-    /// knowing the connection cannot quietly become a verifying one
-    /// afterwards -- or a non-verifying one after the warning was skipped.
-    ///
-    /// `false` for every verifying configuration, including one that is
-    /// verifying against a caller-supplied private CA.
     #[must_use]
     pub fn peer_verification_disabled(&self) -> bool {
         self.peer_verification_disabled
@@ -2809,7 +2396,7 @@ impl ServerVerification {
     }
 
     /// The verifier, for a caller assembling a configuration by hand.
-    #[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+    #[allow(dead_code)] // consumer: tls/rustls_backend.rs
     pub(crate) fn verifier(&self) -> Arc<dyn ServerCertVerifier> {
         match &self.kind {
             // The concrete `Arc` is cloned and then coerced to the trait
@@ -2821,13 +2408,6 @@ impl ServerVerification {
     }
 
     /// Installs the verifier into a rustls client configuration builder.
-    ///
-    /// The ONLY call to rustls's `dangerous()` API in this workspace, and it
-    /// is selected by matching [`ServerVerifierKind::NoVerification`] -- a
-    /// variant that only [`Self::insecure_disable_peer_verification`] can
-    /// construct. Auditing "can this build skip verification" is therefore
-    /// reading one `match`, and
-    /// [`the_dangerous_api_is_called_exactly_once`] holds it to that.
     #[must_use]
     pub(crate) fn install(
         &self,
@@ -2844,17 +2424,9 @@ impl ServerVerification {
     }
 }
 
-// =========================================================================
 // Client authentication: supersedes `lib/vtls/rustls.c:833-900`
-// =========================================================================
 
 /// A parsed and validated client certificate with its private key.
-///
-/// The successor of rustls-ffi's `rustls_certified_key`, built by
-/// `init_config_builder_client_auth` (`lib/vtls/rustls.c:833-900`). The
-/// certificate and the key are validated together at load time, so a
-/// mismatch is reported while the options are being applied rather than
-/// during the handshake.
 pub(crate) struct ClientAuth {
     /// The chain and its signing key, already checked for consistency by
     /// rustls.
@@ -2863,12 +2435,6 @@ pub(crate) struct ClientAuth {
 
 impl fmt::Debug for ClientAuth {
     /// Prints the chain length and nothing else.
-    ///
-    /// Written by hand rather than derived. [`CertifiedKey`] derives
-    /// [`Debug`], and while `rustls-pki-types` elides key material in its
-    /// own [`Debug`] implementations, a derived one here would depend on
-    /// that continuing to hold in every type it reaches. Naming what is
-    /// printed makes private-key material impossible to print by accident.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClientAuth")
             .field("chain_length", &self.certified_key.cert.len())
@@ -2876,24 +2442,9 @@ impl fmt::Debug for ClientAuth {
     }
 }
 
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 impl ClientAuth {
     /// Loads `--cert` and `--key`, which must be supplied together.
-    ///
-    /// Supersedes `init_config_builder_client_auth`
-    /// (`lib/vtls/rustls.c:833-900`), whose first act is the pairing check
-    /// at `:844-853`: a certificate without a key and a key without a
-    /// certificate are both [`CURLcode::SslCertproblem`], with the C's own
-    /// two messages. Neither is a reason to fall back to an unauthenticated
-    /// connection, and neither reaches the unverified path.
-    ///
-    /// PKCS#8, PKCS#1 and SEC1 private keys are all accepted, which is what
-    /// `PrivateKeyDer`'s PEM parser recognises and what the `ring` provider
-    /// loads. Consistency between the key and the certificate is checked by
-    /// [`CertifiedKey::from_der`], which loads the key through the injected
-    /// provider and then compares public keys -- the successor of the C's
-    /// `rustls_certified_key_build` followed by
-    /// `rustls_certified_key_keys_match` (`:872-889`).
     ///
     /// # Errors
     ///
@@ -2983,21 +2534,15 @@ impl ClientAuth {
     ///
     /// Certificates are public; the key is not, and is not reachable through
     /// this type at all.
-    #[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+    #[allow(dead_code)] // consumer: tls/rustls_backend.rs
     pub(crate) fn chain(&self) -> &[CertificateDer<'static>] {
         &self.certified_key.cert
     }
 }
 
 /// Completes a client configuration with or without client authentication.
-///
-/// The successor of `rustls_client_config_builder_set_certified_key`
-/// (`lib/vtls/rustls.c:891-897`) and of the C's not calling it. Infallible,
-/// because [`ClientAuth::load`] has already done every check that can fail:
-/// by this point the key is loaded, the chain is parsed and the two are
-/// known to match.
 #[must_use]
-#[allow(dead_code)] // consumer module not landed: tls/rustls_backend.rs
+#[allow(dead_code)] // consumer: tls/rustls_backend.rs
 pub(crate) fn install_client_auth(
     builder: ConfigBuilder<ClientConfig, WantsClientCert>,
     client_auth: Option<&ClientAuth>,
@@ -3018,16 +2563,7 @@ mod tests {
 
     use super::*;
 
-    // -----------------------------------------------------------------
     // Test material
-    //
-    // The certificates below are generated once and embedded rather than
-    // read from `tests/certs/`, for two measured reasons. That directory
-    // holds only `.prm` templates and `genserv.pl`: the certificates
-    // themselves are BUILT, not committed, so a unit test cannot depend on
-    // them being present. Embedding also makes these tests hermetic, which
-    // is what lets the parsing and matching half of this module run under
-    // Miri at all.
     //
     // NO PRIVATE KEY appears here, deliberately. Committing one would put a
     // real key in the repository, which the secret-hygiene requirement
@@ -3039,11 +2575,6 @@ mod tests {
     // installation. That one path belongs to
     // `tests-rs/integration/tls_verify.rs`, which generates a keypair at
     // run time.
-    //
-    // Validity runs from 2026-08-08 to 2126-07-15. Every verification test
-    // passes [`instant`] explicitly instead of reading the clock, so no
-    // test in this module can start failing on a particular date.
-    // -----------------------------------------------------------------
 
     /// A self-signed certificate authority, `CN=curl-rs test CA`.
     const CA_PEM: &str = "\
@@ -3099,7 +2630,7 @@ mod tests {
 
     /// A SELF-SIGNED certificate, `CN=localhost`, with the same three
     /// subjectAltName entries as [`EE_PEM`] and no issuer any public root
-    /// program knows. What gate ten of AAP 0.8.4 requires to be refused.
+    /// program knows.
     const SELF_SIGNED_PEM: &str = "\
         -----BEGIN CERTIFICATE-----\n\
         MIIDfzCCAmegAwIBAgIUGAb0d2Nfy6YcaC8fxfd5OQl0KW4wDQYJKoZIhvcNAQEL\n\
@@ -3212,11 +2743,6 @@ mod tests {
     }
 
     /// An injected `ring` provider.
-    ///
-    /// Built per test rather than installed as the process default, which is
-    /// the same discipline the module itself follows: AAP 0.5.1 requires
-    /// provider selection to be explicit, and a process-global default is
-    /// the implicit selection it rules out.
     fn provider() -> Arc<CryptoProvider> {
         Arc::new(default_provider())
     }
@@ -3248,17 +2774,6 @@ mod tests {
     }
 
     /// A PKCS#8 PEM section whose payload is NOT a key.
-    ///
-    /// The base64 decodes to the five octets `30 03 02 01 00`: a DER
-    /// SEQUENCE holding the INTEGER zero. It is enough to satisfy the PEM
-    /// reader, which only looks at the section kind, and it fails at the
-    /// provider, which is the branch the tests below need.
-    ///
-    /// No real private key appears anywhere in this file. A generated one
-    /// would be a committed secret and a fabricated one would be a lie in
-    /// the place a reader is most likely to copy from, so the tests exercise
-    /// the failure paths with this and leave the successful installation to
-    /// `tests-rs/integration/tls_verify.rs`.
     const NOT_A_KEY_PKCS8: &[u8] =
         b"-----BEGIN PRIVATE KEY-----\nMAMCAQA=\n-----END PRIVATE KEY-----\n";
 
@@ -3282,13 +2797,6 @@ mod tests {
     }
 
     /// `line` with its comment tail AND every string literal removed.
-    ///
-    /// The same helper `mod source_policy` in `lib.rs` needs, and necessary
-    /// for the same two reasons. This file discusses `dangerous`,
-    /// `platform-verifier` and `assertion` at length in prose, so a scan
-    /// that kept comments would flag its own documentation; and the gates
-    /// below search FOR those spellings, so a scan that kept literals would
-    /// flag its own implementation.
     fn code_only(line: &str) -> String {
         let without_comment = line.split("//").next().unwrap_or("");
         let mut kept = String::with_capacity(without_comment.len());
@@ -3313,12 +2821,6 @@ mod tests {
     }
 
     /// True when `code` contains `word` delimited by non-identifier bytes.
-    ///
-    /// The same helper `lib.rs`'s `mentions_word` provides, and needed for
-    /// the same reason: the name of one test below CONTAINS the keyword it
-    /// searches for, and an unanchored search would report its own
-    /// signature as a violation. Rust identifier bytes are `[A-Za-z0-9_]`,
-    /// so `_no_unsafe` is not a use of `unsafe`.
     fn mentions_word(code: &str, word: &str) -> bool {
         let bytes = code.as_bytes();
         let identifier =
@@ -3331,9 +2833,7 @@ mod tests {
         })
     }
 
-    // =================================================================
     // Phase 2: the policy, and the single dangerous path
-    // =================================================================
 
     #[test]
     fn the_default_policy_verifies_both_the_chain_and_the_hostname() {
@@ -3473,11 +2973,6 @@ mod tests {
     #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn no_forbidden_provider_or_verifier_is_activated() {
         let source = own_source();
-        // AAP 0.5.1 and 0.8.2: none of these may be named in code here.
-        // `platform-verifier` would move the trust decision into the
-        // operating system, `aws_lc_rs` would vendor C and assembly, and
-        // `prefer-post-quantum` would change the ClientHello bytes that
-        // AAP 0.6.7's byte-exact fixtures compare.
         for forbidden in [
             "platform_verifier",
             "platform-verifier",
@@ -3535,9 +3030,7 @@ mod tests {
         );
     }
 
-    // =================================================================
     // Phase 3: trust sources, precedence and revocation
-    // =================================================================
 
     #[test]
     fn a_ca_blob_overrides_a_ca_file() {
@@ -3700,9 +3193,7 @@ mod tests {
         }
     }
 
-    // =================================================================
     // Phase 8 gate ten: a self-signed certificate is refused by default
-    // =================================================================
 
     #[test]
     #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
@@ -3751,9 +3242,7 @@ mod tests {
         assert!(built.peer_verification_disabled());
     }
 
-    // =================================================================
     // Phase 4: client authentication
-    // =================================================================
 
     #[test]
     fn neither_a_certificate_nor_a_key_is_simply_no_client_auth() {
@@ -3881,9 +3370,7 @@ mod tests {
         );
     }
 
-    // =================================================================
     // Phase 5: the hostname matcher, `hostcheck.c:39-125`
-    // =================================================================
 
     #[test]
     fn the_hostname_matcher_reproduces_the_c_s_table() {
@@ -3974,9 +3461,7 @@ mod tests {
         assert!(!host_is_ipnum(b""));
     }
 
-    // =================================================================
     // Phase 5: certificate-level name semantics
-    // =================================================================
 
     #[test]
     fn a_dns_alt_name_decides_the_outcome_and_the_common_name_does_not() {
@@ -4076,9 +3561,7 @@ mod tests {
         assert_eq!(error.code(), CURLcode::PeerFailedVerification);
     }
 
-    // =================================================================
     // Phase 6: the ASN.1 parser and its bounds
-    // =================================================================
 
     #[test]
     fn a_definite_length_element_parses_with_its_remainder() {
@@ -4195,9 +3678,7 @@ mod tests {
         );
     }
 
-    // =================================================================
     // Phase 6: the conversions
-    // =================================================================
 
     /// Renders one element the way `ASN1tostr` would, for the tests below.
     fn render(der: &[u8]) -> CurlResult<String> {
@@ -4435,9 +3916,7 @@ mod tests {
         );
     }
 
-    // =================================================================
     // Phase 6: certinfo, its labels and their order
-    // =================================================================
 
     #[test]
     fn certinfo_reports_the_c_s_labels_in_the_c_s_order() {
@@ -4646,9 +4125,7 @@ mod tests {
         assert!(subject_alt_names(&parsed).is_empty());
     }
 
-    // =================================================================
     // Phase 7: error mapping and the narrow public surface
-    // =================================================================
 
     #[test]
     fn every_failure_maps_to_a_curl_code_from_the_one_error_enumeration() {

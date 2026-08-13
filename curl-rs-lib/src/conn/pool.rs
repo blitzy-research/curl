@@ -22,59 +22,7 @@
 //
 //***************************************************************************
 
-//! The connection pool -- supersedes `lib/conncache.c` (910 lines) and
-//! `lib/conncache.h` (167 lines).
-//!
-//! AAP section 0.4.1 states the transformation in one line: *"Intrusive-list
-//! cache becomes an owned pool."* That is AAP pattern P5, Repository plus
-//! object pool, with explicit ownership and the eviction policy written down
-//! rather than inferred; and AAP pattern P12, dependency injection, for the
-//! clock, the dead/reuse predicate and the upkeep action.
-//!
-//! # What is reproduced, and from where
-//!
-//! * `lib/conncache.h:36-165` -- the pool structure, the three
-//!   `CPOOL_LIMIT_*` results, and all four callback contracts including
-//!   *"All callbacks are invoked while the pool's lock is held."*
-//! * `lib/conncache.c:39-228` -- the lock macros, the destination bundle, pool
-//!   initialisation, bundle lookup and removal, and `cpool_discard_conn`.
-//! * `lib/conncache.c:231-498` -- pool destruction, transfer initialisation,
-//!   both oldest-idle scans, the connection-limit check, and the add path.
-//! * `lib/conncache.c:500-758` -- the pool-wide traversal, the
-//!   became-idle path, `find`, connection termination, pruning and upkeep.
-//! * `lib/conncache.c:761-873` -- lookup by identity, the act-on-one-identity
-//!   entry point, and network-change handling.
-//! * `lib/url.c:622-700` -- `conn_maxage` and `Curl_conn_seems_dead`, the
-//!   dead/reuse policy this module INJECTS rather than implements. See
-//!   [`ConnectionHealth`].
-//!
-//! # THE EVICTION POLICY
-//!
-//! AAP pattern P5 requires the policy to be documented explicitly, so it is
-//! stated here in full and the five points are load-bearing:
-//!
-//! 1. **Per-destination limit eviction performs a full scan of that
-//!    destination bundle** for the maximum idle age among connections that
-//!    are **not in use** (`lib/conncache.c:308-334`).
-//! 2. **Pool-wide limit eviction performs a full scan of every bundle** for
-//!    maximum idle age, excluding **in-use, close-marked, and connect-only**
-//!    connections (`:336-368`).
-//! 3. **These exclusion sets intentionally differ.** The bundle scan will
-//!    evict a close-marked or connect-only connection and the pool-wide scan
-//!    will not. The asymmetry is the C's and it is preserved: a destination
-//!    that is over its own limit must be able to give up any idle connection
-//!    it holds, while the pool-wide sweep leaves alone connections another
-//!    layer has already claimed or already decided to discard.
-//! 4. **Selection is age-based and order-independent; this is NOT an LRU
-//!    list.** Nothing is moved to a front or a back when a connection is
-//!    used or becomes idle, and map iteration order is never read as a
-//!    recency signal. Replacing the scan with recency-order movement, an
-//!    intrusive list or queue-front eviction would change WHICH connection
-//!    dies under a limit.
-//! 5. **Shutdown queue eviction is a separate FIFO policy and must not be
-//!    unified with pool eviction.** [`ShutdownQueue`] answers "which arrived
-//!    first"; this module answers "which has been idle longest". The two are
-//!    both spelled "oldest" in the C and they are different questions.
+//! The connection pool -- supersedes `lib/conncache.c` and `lib/conncache.h`.
 //!
 //! # No interior lock: the share layer owns serialisation
 //!
@@ -91,10 +39,6 @@
 //! `CURL_LOCK_DATA_CONNECT` remains an external lock-data identifier that the
 //! owner acquires before entering when sharing is configured; share locking is
 //! `crate::share`'s and is not reimplemented here.
-//!
-//! Preserving *"callbacks are invoked while the pool's lock is held"* is
-//! therefore automatic: [`ConnectionPool::find`] holds `&mut self` for the
-//! whole traversal, so no other caller can observe the pool mid-scan.
 //!
 //! # Generational keys, and two kinds of identity
 //!
@@ -131,10 +75,14 @@
 //!   checker replaces; the second exists so that `Curl_cpool_destroy` can
 //!   tell a zeroed structure from a live one, and a Rust value cannot be
 //!   observed before it is constructed.
-//! * **`CURLE_OUT_OF_MEMORY` from the add path** (`:483`). The C's only
-//!   failure mode is a failed `calloc`; here a failed allocation aborts the
-//!   process before any caller could see a code, so [`ConnectionPool::add`]
-//!   is infallible and says so in its signature.
+//! * **`CURLE_OUT_OF_MEMORY` from the add path** (`:483`). The C's only failure
+//!   mode is a failed `calloc` of ONE FIXED-SIZE bundle -- a figure this module
+//!   chooses, not one a caller supplies -- and a fixed-size allocation has no
+//!   stable fallible spelling at the declared minimum Rust version, so
+//!   [`ConnectionPool::add`] is infallible and says so in its signature. This
+//!   is deliberately not the same case as the externally sized allocations
+//!   `crate::util::fallible` covers, where a caller's own length is what
+//!   decides how much is asked for.
 //!
 //! # One note on the licence banner above
 //!
@@ -160,42 +108,22 @@ use crate::util::timediff::TimeDiff;
 use crate::util::timeval::{timediff_ms, CurlTime};
 use crate::util::CurlOffT;
 
-// =========================================================================
 // Constants the C spells as preprocessor macros
-// =========================================================================
 
 /// How often pruning may run, in milliseconds -- the `1000L` of
 /// `lib/conncache.c:731`.
-///
-/// `Curl_cpool_prune_dead`'s own documentation calls this "at most once per
-/// second" (`lib/conncache.h:131`). The comparison is `elapsed >= 1000`, so a
-/// call at exactly one thousand milliseconds runs; see
-/// [`ConnectionPool::prune_dead`].
 pub(crate) const PRUNE_INTERVAL_MS: TimeDiff = 1000;
 
 /// `PROTOPT_SSL_REUSE` (`lib/urldata.h:555-557`): this scheme may reuse an
 /// existing TLS connection in the same family without itself carrying
 /// `PROTOPT_SSL`.
-///
-/// Carried here because matching consumes it -- a matcher passed to
-/// [`ConnectionPool::find`] reads it off the candidate through
-/// [`PooledConnection::may_reuse_tls`]. The scheme table itself belongs to
-/// `crate::protocols`, so the POLICY that combines these bits is injected and
-/// is not duplicated in this module.
 pub(crate) const PROTOPT_SSL_REUSE: u32 = 1 << 15;
 
 /// `PROTOPT_CONN_REUSE` (`lib/urldata.h:558`): this scheme can reuse
 /// connections at all.
-///
-/// Bit 16, immediately above [`PROTOPT_SSL_REUSE`]. Bit 9 is FREE -- the C
-/// records `/* (1 << 9) was PROTOPT_STREAM, now free */` at
-/// `lib/urldata.h:544` -- and must stay free: reusing it would give a
-/// meaning to a value that older code may still set.
 pub(crate) const PROTOPT_CONN_REUSE: u32 = 1 << 16;
 
-// =========================================================================
 // The connection-limit verdict
-// =========================================================================
 
 /// What [`ConnectionPool::check_limits`] answers.
 ///
@@ -207,12 +135,6 @@ pub(crate) const PROTOPT_CONN_REUSE: u32 = 1 << 16;
 /// #define CPOOL_LIMIT_DEST   1
 /// #define CPOOL_LIMIT_TOTAL  2
 /// ```
-///
-/// The values are pinned as discriminants rather than left to declaration
-/// order, and [`Self::as_i32`] / [`Self::from_i32`] are the checked crossing
-/// for any boundary that still speaks in integers. A caller that only wants
-/// "may I create another connection?" asks [`Self::is_ok`], which is the C's
-/// `result == CPOOL_LIMIT_OK`.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum CpoolLimit {
     /// `CPOOL_LIMIT_OK`: there is room.
@@ -240,11 +162,6 @@ impl CpoolLimit {
 
     /// The inverse of [`Self::as_i32`], admitting only the three defined
     /// values.
-    ///
-    /// Checked rather than transmuted: an integer arriving from outside this
-    /// module has no guarantee of naming a member, and silently accepting a
-    /// fourth value would let "there is room" and "the pool is full" become
-    /// the same answer.
     pub(crate) const fn from_i32(raw: i32) -> Option<Self> {
         match raw {
             0 => Some(Self::Ok),
@@ -255,9 +172,7 @@ impl CpoolLimit {
     }
 }
 
-// =========================================================================
 // The connection-check bitmaps
-// =========================================================================
 
 /// What a protocol's connection check is being asked to do --
 /// `CONNCHECK_*` (`lib/urldata.h:560-563`).
@@ -270,10 +185,6 @@ impl CpoolLimit {
 /// CONNCHECK_ISDEAD    = 1 << 0
 /// CONNCHECK_KEEPALIVE = 1 << 1
 /// ```
-///
-/// Hand-written rather than derived from a bitflag crate: AAP section 0.5.1
-/// pins the dependency set and `bitflags` is not in it, and the five
-/// operations below are the whole of what the C does with these bits.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ConnCheck(u32);
 
@@ -336,12 +247,6 @@ impl ConnCheck {
 /// CONNRESULT_NONE = 0
 /// CONNRESULT_DEAD = 1 << 0
 /// ```
-///
-/// A separate type from [`ConnCheck`] even though the two currently overlap
-/// numerically. They are a REQUEST and an ANSWER, the C keeps them as
-/// separate macro families, and letting one stand for the other is exactly
-/// how `state & CONNRESULT_DEAD` (`lib/url.c:679`) would come to be written
-/// with the wrong constant.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ConnResult(u32);
 
@@ -386,9 +291,7 @@ impl ConnResult {
     }
 }
 
-// =========================================================================
 // The two ABI-visible identities
-// =========================================================================
 
 /// A connection's identity as the application sees it -- C's
 /// `conn->connection_id`, a `curl_off_t` assigned in `Curl_cpool_add`
@@ -403,9 +306,6 @@ impl ConnResult {
 /// * **Never recycled.** Reusing a storage slot does NOT reuse an identity.
 ///   The internal [`PoolKey`] is the thing that gets reused, and that is why
 ///   the two types exist separately.
-/// * **`curl_off_t`-shaped.** The inner type is [`CurlOffT`], which AAP
-///   section 0.6.1's ABI work fixes at [`i64`], so no conversion is needed at
-///   the `getinfo` boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ConnectionId(CurlOffT);
 
@@ -442,17 +342,6 @@ impl ConnectionId {
     }
 
     /// The same identity in the form the filter and shutdown layers use.
-    ///
-    /// [`ConnId`] is a `u64` because `crate::conn::filters` only ever stamps
-    /// it on a chain and prints it, and it has no sentinel. Every identity
-    /// this pool assigns is non-negative, so the conversion is exact for
-    /// every real connection.
-    ///
-    /// [`Self::NONE`] maps to zero, which is deliberate and tested: the
-    /// sentinel is a transfer's "not connected yet" state and is never handed
-    /// to the shutdown layer, so there is no line it can mislabel -- and
-    /// answering a total function is better than a fallible one on a path no
-    /// caller can reach.
     pub(crate) fn as_conn_id(self) -> ConnId {
         ConnId::new(u64::try_from(self.0).unwrap_or(0))
     }
@@ -466,11 +355,6 @@ impl fmt::Display for ConnectionId {
 
 /// A transfer's identity within its pool -- C's `data->id`, assigned in
 /// `Curl_cpool_xfer_init` (`lib/conncache.c:277`).
-///
-/// What `CURLINFO_XFER_ID` reports. The counter lives on the pool rather than
-/// on the transfer because the C puts it there: a transfer joining a SHARED
-/// pool takes its number from the share, so two multi handles over one share
-/// cannot hand out the same transfer identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct TransferId(CurlOffT);
 
@@ -511,9 +395,7 @@ pub(crate) struct XferInit {
     pub(crate) lastconnect_id: ConnectionId,
 }
 
-// =========================================================================
 // Internal storage: a generational slab
-// =========================================================================
 
 /// Where a connection lives inside the pool.
 ///
@@ -528,12 +410,6 @@ pub(crate) struct XferInit {
 ///   (`lib/conncache.c:93-105`). An intrusive node means the collection and
 ///   the element point at each other; a key means only the collection points
 ///   at anything.
-///
-/// The two fields are private: a key is produced by
-/// [`ConnectionPool::add`] and consumed by the pool, and letting a caller
-/// build one out of two integers would hand back exactly the forgery the
-/// generation exists to prevent. [`Self::slot`] and [`Self::generation`] read
-/// them, which is all a diagnostic needs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PoolKey {
     /// Which slot of the slab.
@@ -562,15 +438,6 @@ impl fmt::Display for PoolKey {
 }
 
 /// A [`PoolKey`] that no longer names a connection.
-///
-/// Returned where a caller needs to distinguish "the connection you are
-/// holding a key to has gone" from "there is nothing to do", which the bare
-/// [`None`] of [`ConnectionPool::get`] cannot express. The C has no analogue
-/// because the equivalent situation there is a dangling pointer.
-///
-/// It converts to `CURLE_BAD_FUNCTION_ARGUMENT`: a stale key is a caller
-/// error, and the C code whose argument is a freed connection is a caller
-/// error too -- it simply has no way to say so.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct StaleKey {
     /// The key that failed to resolve, for the diagnostic.
@@ -620,19 +487,6 @@ enum Slot<T> {
 }
 
 /// A vector of slots with a free chain and a generation per slot.
-///
-/// Written here rather than taken from a crate because AAP section 0.5.1 pins
-/// the dependency set and no slab crate is in it. It is deliberately small:
-/// insert, remove, two accessors and a length, which is every operation the
-/// pool performs.
-///
-/// # Why the generation is checked on EVERY access
-///
-/// A cheaper design validates only on removal. That is not enough: the whole
-/// point is that a key outliving its connection must not resolve, and a read
-/// is exactly where that would do damage -- it would hand back a DIFFERENT
-/// connection with the same slot, and the caller would act on it believing it
-/// was the one it asked for.
 #[derive(Debug)]
 struct GenerationalSlab<T> {
     /// Every slot, indexed by [`PoolKey::slot`].
@@ -659,12 +513,6 @@ impl<T> GenerationalSlab<T> {
     }
 
     /// Stores `value` and hands back the key that names it.
-    ///
-    /// A free slot is preferred over growing the vector, and the key carries
-    /// that slot's CURRENT generation -- which [`Self::remove`] already
-    /// advanced when it vacated the slot. So a key from a previous occupant
-    /// of the same slot differs in its generation field and stops resolving,
-    /// which is the property [`PoolKey`] exists for.
     fn insert(&mut self, value: T) -> PoolKey {
         self.len += 1;
         match self.free {
@@ -704,19 +552,6 @@ impl<T> GenerationalSlab<T> {
     }
 
     /// Takes the occupant `key` names, advancing that slot's generation.
-    ///
-    /// [`None`] when the key is stale or names a slot beyond the slab, and
-    /// the slab is left untouched in both cases -- a stale removal must not
-    /// evict whoever legitimately holds the slot now.
-    ///
-    /// # Generation exhaustion
-    ///
-    /// `u32` gives a slot four billion occupants. Wrapping past that would
-    /// make a very old key resolve again, so instead the slot is RETIRED: it
-    /// is not linked into the free chain and is never handed out again. The
-    /// cost is one dead vector element per four billion reuses of one slot;
-    /// the benefit is that staleness detection is total rather than
-    /// probabilistic, and can be stated without a caveat.
     fn remove(&mut self, key: PoolKey) -> Option<T> {
         let slot = self.slots.get_mut(key.slot)?;
         let generation = match slot {
@@ -779,24 +614,9 @@ impl<T> GenerationalSlab<T> {
     }
 }
 
-// =========================================================================
 // What the pool is handed, and what it then owns
-// =========================================================================
 
 /// Everything needed to put a new connection into the pool.
-///
-/// The C has no analogue because there is nothing to describe: a
-/// `struct connectdata` is already fully built when `Curl_cpool_add` is
-/// called, and `add` only fills in `connection_id` (`lib/conncache.c:489`).
-/// Here the identity is assigned by [`ConnectionPool::add`] for exactly the
-/// same reason, so the connection cannot be CONSTRUCTED before it is added --
-/// which is why the parts arrive as a description and leave as a
-/// [`PooledConnection`].
-///
-/// The three injected objects -- the filter chains, the shutdown timer and the
-/// scheme's disconnect handler -- pass straight through to
-/// [`ShuttingDownConnection`], so this module never needs to know what any of
-/// them does.
 pub(crate) struct ConnectionSpec {
     /// C's `conn->destination`: the pool's reuse key, matched by exact bytes.
     destination: String,
@@ -838,12 +658,6 @@ impl fmt::Debug for ConnectionSpec {
 #[allow(dead_code)] // consumer: `crate::protocols`, once schemes land
 impl ConnectionSpec {
     /// A description with every flag clear and no disconnect handler.
-    ///
-    /// `created` is a parameter rather than read from a clock, because the
-    /// instant wanted is when the CONNECTION was created and not when it
-    /// happened to be pooled; the two differ by the whole of the connect
-    /// sequence, and the max-lifetime rule of `lib/url.c:638-647` measures
-    /// against the former.
     pub(crate) fn new(
         destination: impl Into<String>,
         chains: FilterChains,
@@ -901,26 +715,6 @@ impl ConnectionSpec {
 
 /// A connection the pool owns -- C's `struct connectdata` reduced to the
 /// fields the pool and its policies actually read.
-///
-/// # Composition rather than duplication
-///
-/// The teardown half of a connection already has an owner:
-/// [`ShuttingDownConnection`] holds the identity, the destination, both filter
-/// chains, the timer, the disconnect handler and the `aborted`,
-/// `connect_only` and `no_network` flags. Declaring any of those a second time
-/// here would create two places for one fact, so this type OWNS one of those
-/// values and delegates to it. Handing it to the shutdown layer is then
-/// [`Self::into_shutting_down`], a move of the inner value -- which is what
-/// makes "ownership moves out exactly once" a property of the type rather
-/// than of the code that uses it.
-///
-/// One flag is deliberately mirrored rather than delegated: `in_pool`.
-/// [`ShuttingDownConnection`]'s copy can only be set by a builder that
-/// consumes the value, so it cannot be flipped in place while the connection
-/// is alive in the pool; [`Self::in_pool`] is the live one, and
-/// [`Self::into_shutting_down`] stamps the inner copy `false` on the way out
-/// so that the precondition `crate::conn::shutdown::terminate` asserts holds
-/// by construction.
 pub(crate) struct PooledConnection {
     /// C's `conn->connection_id`, assigned by [`ConnectionPool::add`].
     connection_id: ConnectionId,
@@ -1181,17 +975,12 @@ impl PooledConnection {
     ///   argument.
     /// * `in_pool` is stamped `false`, because a connection reaching
     ///   termination must have left the pool already.
-    ///
-    /// Consuming `self` is the point: there is no way to hand the same
-    /// connection over twice, and no way to keep using it afterwards.
     fn into_shutting_down(self, aborted: bool) -> ShuttingDownConnection {
         self.inner.with_aborted(aborted).with_in_pool(false)
     }
 }
 
-// =========================================================================
 // The injected dead/reuse predicate -- AAP pattern P12's seam
-// =========================================================================
 
 /// Why a connection was judged unusable.
 ///
@@ -1251,12 +1040,6 @@ impl DeadVerdict {
 /// Whether a pooled connection may still be used -- the policy of
 /// `Curl_conn_seems_dead` and `conn_maxage` (`lib/url.c:619-711`).
 ///
-/// **This module does not implement that policy and must not.** `lib/url.c`
-/// is superseded by `crate::protocols`, which this module names nowhere: the
-/// dependency runs the other way, because a protocol installs filters into a
-/// connection and a connection is what the pool holds. AAP pattern P12 is the
-/// seam, and this trait is it.
-///
 /// # The contract, measured at `lib/url.c:622-700`
 ///
 /// An implementation MUST behave as follows, in this order:
@@ -1273,30 +1056,12 @@ impl DeadVerdict {
 ///    [`DeadReason::MaxIdleAge`].
 /// 3. **Then the scheme's own check.** When the scheme registers one, invoke
 ///    it with [`ConnCheck::ISDEAD`] and test the answer for
-///    [`ConnResult::DEAD`] (`:668-682`). The C's brief attach/detach around
-///    the call has no successor here: the connection is a parameter.
+///    [`ConnResult::DEAD`] (`:668-682`).
 /// 4. **Otherwise chain liveness, and reject a live connection with pending
 ///    input.** `Curl_conn_is_alive` gives both answers at once
 ///    (`:686-687`); a connection that is alive but has bytes waiting is
 ///    [`DeadReason::InputPending`], because reuse wants a clean state and
 ///    what is waiting may be a TLS close notification (`:688-699`).
-///
-/// # The diagnostics belong to the implementation
-///
-/// These four strings are `infof` output and therefore frozen by AAP section
-/// 0.8.1's preservation mandate. They are emitted by the IMPLEMENTATION, not
-/// here, and are quoted only so that the contract can be checked against the
-/// C:
-///
-/// ```text
-/// "Too old connection (%d ms idle, max idle is %d ms), disconnect it"
-/// "Too old connection (created %d ms ago, max lifetime is %d ms), \
-///  disconnect it"
-/// "connection has input pending, not reusable"
-/// "Connection %d seems to be dead"
-/// ```
-///
-/// The pool receives only the decision and the reason.
 pub(crate) trait ConnectionHealth {
     /// Is `conn` still usable?
     ///
@@ -1311,12 +1076,6 @@ pub(crate) trait ConnectionHealth {
 
 /// A predicate that judges nothing dead -- the behaviour of a scheme with no
 /// age limits, no check of its own and a healthy chain.
-///
-/// Not a stub: it is the exact answer the C gives when
-/// `data->set.conn_max_idle_ms` and `data->set.conn_max_age_ms` are both zero
-/// (their defaults), the scheme registers no `connection_check`, and the chain
-/// reports alive with nothing pending. `crate::multi` needs a predicate before
-/// any scheme is selected, and this is the correct one for that moment.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)] // consumer: `crate::multi`, before a scheme is picked
 pub(crate) struct AssumeHealthy;
@@ -1331,9 +1090,7 @@ impl ConnectionHealth for AssumeHealthy {
     }
 }
 
-// =========================================================================
 // The injected upkeep action
-// =========================================================================
 
 /// What an upkeep pass does to one connection -- `Curl_conn_upkeep`
 /// (`lib/conncache.c:739-746`).
@@ -1360,13 +1117,6 @@ pub(crate) trait UpkeepAction {
 }
 
 /// The production [`UpkeepAction`]: drive the filter chain's keepalive.
-///
-/// `Curl_conn_upkeep` reduces to `Curl_conn_keep_alive(data, conn,
-/// FIRSTSOCKET)`, which walks to the head filter of the primary chain and
-/// calls its `keep_alive` (`lib/cfilters.c:1005-1015`). That is exactly
-/// [`FilterChains::chain_mut`] plus
-/// [`crate::conn::filters::FilterChain::keep_alive`], and an empty chain
-/// succeeds, as the C's `cf ? ... : CURLE_OK` does.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)] // consumer: `crate::multi`'s upkeep entry point
 pub(crate) struct KeepAliveUpkeep;
@@ -1383,17 +1133,9 @@ impl UpkeepAction for KeepAliveUpkeep {
     }
 }
 
-// =========================================================================
 // Parameters and outcomes
-// =========================================================================
 
 /// The two connection limits [`ConnectionPool::check_limits`] enforces.
-///
-/// C reads them off the multi handle at the top of the function
-/// (`lib/conncache.c:383-386`) and re-reads them on every call rather than
-/// caching, because an application may change either at any time. They arrive
-/// as a parameter here for the reason `crate::conn::shutdown`'s
-/// `conns_in_pool` does: the pool holds no handle back to the multi handle.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) struct ConnectionLimits {
     /// `multi->max_host_connections`, `CURLMOPT_MAX_HOST_CONNECTIONS`. Zero
@@ -1422,21 +1164,9 @@ pub(crate) struct IdleLimits {
 
 /// What a pruning pass looked at and what it removed -- C's
 /// `struct cpool_reaper_ctx` (`lib/conncache.c:687-690`).
-///
-/// C zeroes it, fills it in and never reads it. It is returned here because a
-/// test needs to distinguish "the interval gate skipped the pass" from "the
-/// pass ran and found nothing", which are the same observable state
-/// otherwise.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) struct PruneStats {
     /// How many connections the injected predicate was asked about.
-    ///
-    /// C increments this for every connection that was not already an idle
-    /// no-reuse one, INCLUDING connections in use -- `Curl_conn_seems_dead`
-    /// then answers not-dead for those because of its own
-    /// `if(!CONN_INUSE(conn))` gate. Here the pool applies that gate itself
-    /// (see [`ConnectionPool::prune_dead`]), so an in-use connection is never
-    /// counted. The figure is diagnostic in both trees.
     pub(crate) checked: usize,
     /// How many connections were terminated.
     pub(crate) reaped: usize,
@@ -1444,13 +1174,6 @@ pub(crate) struct PruneStats {
 
 /// What became of a connection [`ConnectionPool::terminate`] was asked to
 /// discard.
-///
-/// C's `Curl_conn_terminate` returns `void` and expresses two of these three
-/// outcomes as an early `return` (`lib/conncache.c:649-653`, and the same test
-/// again inside `cpool_discard_conn` at `:200-205`). Naming them is what lets
-/// [`ConnectionPool::conn_now_idle`] and [`ConnectionPool::prune_dead`] tell
-/// whether the connection they chose actually went, which both of them need in
-/// order not to loop.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum TerminateOutcome {
     /// Ownership was consumed: the connection has left the pool and is either
@@ -1497,12 +1220,6 @@ pub(crate) enum MatchVerdict {
 }
 
 /// What [`ConnectionPool::find`] reports.
-///
-/// [`Self::matched`] is the C's `bool` return, after the done callback has had
-/// its chance to override it. The other two fields have no C counterpart
-/// because the C reaches both through the caller's `userdata`: the selected
-/// connection through `match->found`, and the discarded ones not at all --
-/// they are already gone by the time the callback returns.
 pub(crate) struct FindOutcome {
     /// The combined result of the last matcher and the done callback.
     pub(crate) matched: bool,
@@ -1554,13 +1271,6 @@ pub(crate) fn effective_maxconnects(configured: u32, running: u32) -> u32 {
 }
 
 /// Which handle a shutdown step is charged to.
-///
-/// `ShutdownHandle::of` is private to `crate::conn::shutdown`, so the one
-/// decision it makes is repeated here rather than reached for. It is C's
-/// `data->multi && data->multi->admin` (`lib/cshutdn.c:139`), which
-/// [`ShutdownHost::has_admin`] answers whole -- and the pool always charges to
-/// the admin handle when there is one, because every one of its own shutdown
-/// calls passes `cpool->idata` (`lib/conncache.c:222`, `:226`).
 fn admin_handle<H>(host: &H) -> ShutdownHandle
 where
     H: ShutdownHost + ?Sized,
@@ -1572,37 +1282,17 @@ where
     }
 }
 
-// =========================================================================
 // A destination bundle
-// =========================================================================
 
 /// The connections to one destination -- C's `struct cpool_bundle`
 /// (`lib/conncache.c:62-67`).
-///
-/// C's three members become one. `struct Curl_llist conns` becomes a
-/// [`Vec`] of keys; `size_t dest_len` becomes nothing, because a Rust string
-/// carries its own length and the C only kept the figure so that it could
-/// pass it to the hash as a key length; and `char dest[1]`, the
-/// over-allocated trailing array, becomes the [`BTreeMap`] key, so the
-/// destination is stored once rather than once per bundle plus once per
-/// connection.
-///
-/// # Order
-///
-/// Insertion order, and only insertion order. `Curl_llist_append`
-/// (`lib/conncache.c:94`) puts a new connection at the tail and every
-/// traversal starts at the head, so a plain [`Vec`] with `push` and
-/// index-preserving removal reproduces the sequence exactly. Nothing is ever
-/// moved within it: see the module's eviction-policy point 4.
 #[derive(Debug, Default)]
 struct Bundle {
     /// The connections to this destination, oldest INSERTION first.
     order: Vec<PoolKey>,
 }
 
-// =========================================================================
 // The pool
-// =========================================================================
 
 /// The pool of reusable connections -- C's `struct cpool`
 /// (`lib/conncache.h:49-60`).
@@ -1614,25 +1304,6 @@ struct Bundle {
 /// members are added, and both exist because the pool now OWNS its
 /// connections instead of pointing at them: the slab that holds them, and the
 /// identity map that finds one without a full traversal.
-///
-/// # Ownership
-///
-/// Every connection is owned by [`Self::conns`] and referenced from exactly
-/// two places -- its destination bundle and the identity map -- by key, never
-/// by pointer. Removing it clears both references and hands the value out, so
-/// a connection can be terminated once and only once. Dropping the pool drops
-/// every connection it still holds, which releases their filter chains: C's
-/// `Curl_hash_destroy` does the same for its bundles, but only because
-/// `Curl_cpool_destroy` emptied them first, and it LEAKS any connection that
-/// `cpool_discard_conn` declined to take (`lib/conncache.c:245-249`).
-///
-/// # Not a lock, and not a singleton
-///
-/// There is no interior lock; see the module documentation. There is also no
-/// global instance: C selects between three pools by asking the transfer which
-/// one it belongs to (`cpool_get_instance`, `lib/conncache.c:256-267`), and
-/// that selection belongs to whoever owns the pools -- a share, a multi handle
-/// or an easy handle's implicit multi. This type is just the pool.
 #[derive(Debug)]
 pub(crate) struct ConnectionPool {
     /// Every pooled connection, owned. Keyed by [`PoolKey`].
@@ -1657,12 +1328,6 @@ pub(crate) struct ConnectionPool {
     /// silently finding nothing.
     by_id: BTreeMap<ConnectionId, PoolKey>,
     /// C's `size_t num_conn`.
-    ///
-    /// Kept as its own field rather than derived from `conns.len()`, because
-    /// the C keeps it and every trace line and limit comparison reads it. It
-    /// is maintained in lockstep with the slab and a `debug_assert` in
-    /// [`Self::add`] and [`Self::remove`] proves the two agree, so the
-    /// duplication cannot drift silently.
     num_conn: usize,
     /// C's `curl_off_t next_connection_id`.
     next_connection_id: CurlOffT,
@@ -1745,13 +1410,6 @@ impl ConnectionPool {
     ///   cpool->next_easy_id = 0;
     /// data->state.lastconnect_id = -1;
     /// ```
-    ///
-    /// The guard is a WRAP SAFEGUARD, not an error path: `curl_off_t` is
-    /// signed, so a counter that ran past [`i64::MAX`] would go negative and
-    /// start colliding with the `-1` sentinel. C resets it to zero instead,
-    /// and so does this -- using [`CurlOffT::wrapping_add`] so that the
-    /// increment which triggers the guard is defined rather than undefined as
-    /// it is in C.
     pub(crate) fn xfer_init(&mut self) -> XferInit {
         let transfer_id = TransferId::new(self.next_transfer_id);
         self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
@@ -1776,9 +1434,11 @@ impl ConnectionPool {
     /// this takes a [`ConnectionSpec`] and not a built connection.
     ///
     /// **Infallible.** The C returns `CURLcode` and its only failure is a
-    /// failed `calloc` for the bundle (`:483`); a failed allocation aborts
-    /// this process before a caller could observe a code, so there is no
-    /// error to report and no arm no test could cover.
+    /// failed `calloc` for one fixed-size bundle (`:483`). The size is this
+    /// module's own, no caller-supplied length enters it, and a fixed-size
+    /// allocation has no stable fallible spelling at the declared minimum Rust
+    /// version -- so there is no error to report and no arm a test could
+    /// cover. See the module header.
     ///
     /// # Identity exhaustion
     ///
@@ -1826,19 +1486,6 @@ impl ConnectionPool {
 
     /// Takes a connection out of the pool -- `cpool_remove_conn`
     /// (`lib/conncache.c:162-182`).
-    ///
-    /// C unlinks the connection from its bundle, destroys the bundle when
-    /// that leaves it empty, clears `bits.in_cpool` and decrements
-    /// `num_conn`. All four happen here, plus the identity mapping is dropped
-    /// -- and then the connection is handed OUT rather than left behind a
-    /// pointer the caller already had.
-    ///
-    /// That difference is the whole of AAP pattern P5's "explicit ownership":
-    /// after this returns, the pool cannot reach the connection and the caller
-    /// cannot leave it un-terminated by accident, because the value has to go
-    /// somewhere.
-    ///
-    /// [`None`] when `key` is stale, and the pool is then untouched.
     pub(crate) fn remove(&mut self, key: PoolKey) -> Option<PooledConnection> {
         let (destination, id) = {
             let conn = self.conns.get(key)?;
@@ -1858,12 +1505,6 @@ impl ConnectionPool {
     }
 
     /// Takes the connection with the given identity out of the pool.
-    ///
-    /// Validates the mapping before acting on it and, when the mapping has
-    /// outlived its connection, DROPS the mapping rather than answering with
-    /// it. [`Self::remove`] clears both together so the situation cannot
-    /// arise, and the defensive clean-up is here so that it cannot persist if
-    /// it ever did.
     pub(crate) fn remove_by_id(
         &mut self,
         id: ConnectionId,
@@ -1998,12 +1639,6 @@ impl ConnectionPool {
 
     /// Runs `action` against the connection with the given identity --
     /// `Curl_cpool_do_by_id` (`lib/conncache.c:812-826`).
-    ///
-    /// Answers whether there was one, which C cannot: its `cpool_do_conn`
-    /// returns `1` to stop the traversal and `Curl_cpool_do_by_id` discards
-    /// that, so a caller cannot tell a completed action from a missing
-    /// connection. Only the matching live connection is visited, and at most
-    /// one.
     pub(crate) fn do_by_id<F>(&mut self, id: ConnectionId, action: F) -> bool
     where
         F: FnOnce(PoolKey, &mut PooledConnection),
@@ -2021,14 +1656,6 @@ impl ConnectionPool {
     }
 
     /// Every pooled key, in bundle order then insertion order.
-    ///
-    /// The successor of `cpool_foreach`'s two nested walks
-    /// (`lib/conncache.c:512-545`), and of the reason it advances its cursor
-    /// before every callback: "we need to update curr before calling func(),
-    /// because func() might decide to remove the connection". A snapshot makes
-    /// that total rather than one-deep -- a callback may remove ANY
-    /// connection, not just the current one, and the traversal still cannot
-    /// follow a key that is gone because every step re-resolves it.
     fn all_keys(&self) -> Vec<PoolKey> {
         self.dest2bundle
             .values()
@@ -2110,13 +1737,6 @@ impl ConnectionPool {
     /// if(CONN_INUSE(conn) || conn->bits.close || conn->connect_only)
     ///   continue;
     /// ```
-    ///
-    /// The asymmetry is the C's and is preserved rather than tidied away; the
-    /// module's eviction-policy point 3 records why. A connection marked for
-    /// closing is already on its way out and a connect-only connection belongs
-    /// to the application, so neither is the pool's to give up in order to
-    /// make room somewhere else -- whereas a bundle over its OWN limit has no
-    /// other candidate to offer.
     pub(crate) fn oldest_idle(&self, now: CurlTime) -> Option<PoolKey> {
         let mut highscore: TimeDiff = -1;
         let mut oldest_idle = None;
@@ -2145,20 +1765,6 @@ impl ConnectionPool {
     /// Looks for a reusable connection to `destination` -- `Curl_cpool_find`
     /// (`lib/conncache.c:595-633`).
     ///
-    /// The bundle is visited head to tail -- insertion order, which is stable
-    /// and is not a recency order -- and the walk stops at the first
-    /// [`MatchVerdict::Select`]. `done` then runs and may override the answer,
-    /// which is the whole purpose of C's second callback: `url_match_result`
-    /// (`lib/url.c:1303-1330`) turns "nothing matched" into a decision about
-    /// whether to wait for multiplexing.
-    ///
-    /// # "All callbacks are invoked while the pool's lock is held"
-    ///
-    /// `lib/conncache.h:105` states that contract and it is preserved -- by
-    /// construction rather than by a lock. This method holds `&mut self` for
-    /// the whole traversal, so no other caller can observe or mutate the pool
-    /// between two matcher calls.
-    ///
     /// # What a callback may and may not do
     ///
     /// It gets the entry's key and the entry, mutably, so it can inspect it,
@@ -2168,12 +1774,6 @@ impl ConnectionPool {
     /// instead as [`MatchVerdict::DiscardAndContinue`], which unlinks the entry
     /// immediately -- so the scan cannot revisit it -- and moves the owned
     /// connection into [`FindOutcome::discarded`] for the caller to terminate.
-    ///
-    /// `done` additionally receives the SELECTED entry, mutably, which is how
-    /// `url_match_result`'s "attach it now while still under lock, so the
-    /// connection does no longer appear idle and can be reaped"
-    /// (`lib/url.c:1309-1311`) is expressed without the callback needing the
-    /// pool either.
     pub(crate) fn find<M, D>(
         &mut self,
         destination: &str,
@@ -2235,10 +1835,6 @@ impl ConnectionPool {
     /// Has the pool reached its configured limits -- `Curl_cpool_check_limits`
     /// (`lib/conncache.c:370-463`).
     ///
-    /// It does not merely report: it TRIES to make room, by discarding the
-    /// oldest idle connections, and only reports a limit once it has failed
-    /// to.
-    ///
     /// # The two loops
     ///
     /// Both have the same shape and the difference between them is the whole
@@ -2272,14 +1868,6 @@ impl ConnectionPool {
     /// * **The shutdown count is never cached across iterations** (`:425`,
     ///   `:453`). Terminating a connection may ADD one to the queue, so a
     ///   cached figure would be wrong in the direction that matters.
-    ///
-    /// # Pooled and shutting-down connections count together
-    ///
-    /// Both loops add the queue's population to the pool's. This is the same
-    /// invariant `crate::conn::shutdown::ShutdownQueue::add` enforces from the
-    /// other side, and it belongs in both places: a draining connection still
-    /// holds a descriptor and still occupies a slot against the limit the
-    /// application set.
     pub(crate) async fn check_limits<H>(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -2412,28 +2000,6 @@ impl ConnectionPool {
 
     /// A pooled connection has become idle -- `Curl_cpool_conn_now_idle`
     /// (`lib/conncache.c:553-593`).
-    ///
-    /// Returns whether the connection that just became idle is STILL IN THE
-    /// POOL: C's `kept`, documented at `lib/conncache.h:123` as "TRUE if idle
-    /// connection kept in pool, FALSE if closed". It is `false` exactly when
-    /// the pool-wide scan picked that same connection as its victim, which can
-    /// happen because a connection that has this instant become idle has an
-    /// idle age of zero and may still be the oldest in a pool where everything
-    /// else is in use.
-    ///
-    /// # The order of the two steps matters
-    ///
-    /// `conn->lastused` is stamped FIRST (`:572`, "it was used up until now")
-    /// and only then is the cap consulted. Reversing them would score the
-    /// connection against a stale `lastused` and make it look like the oldest
-    /// thing in the pool whatever its real age.
-    ///
-    /// # The cap
-    ///
-    /// [`effective_maxconnects`] computes it, and a cap of zero disables the
-    /// check entirely (`:573`, `maxconnects` in the `&&`). The comparison is
-    /// strictly `>`: a pool holding exactly `maxconnects` connections is at
-    /// its cap, not over it.
     pub(crate) async fn conn_now_idle<H>(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -2461,9 +2027,7 @@ impl ConnectionPool {
             return true;
         }
         // C compares a `size_t` against an `unsigned int`, which the usual
-        // arithmetic conversions widen. Every target of AAP section 0.8.3 is
-        // 64-bit, so this conversion is exact; the fallback exists only so
-        // that the expression is total.
+        // arithmetic conversions widen.
         let cap = usize::try_from(maxconnects).unwrap_or(usize::MAX);
         if self.num_conn <= cap {
             return true;
@@ -2497,11 +2061,6 @@ impl ConnectionPool {
     /// Terminates a pooled connection -- `Curl_conn_terminate`
     /// (`lib/conncache.c:635-685`).
     ///
-    /// C's header says "Takes ownership of `conn`" (`lib/conncache.h:42`).
-    /// Here that is not a comment: [`Self::remove`] moves the connection out
-    /// of the pool and the value is then consumed, so a borrowed free and a
-    /// double free are both unrepresentable.
-    ///
     /// # The three outcomes
     ///
     /// * [`TerminateOutcome::LeftInUse`] -- the connection is in use and this
@@ -2514,24 +2073,6 @@ impl ConnectionPool {
     ///   connection that is already gone is not a case it can detect.
     /// * [`TerminateOutcome::Terminated`] -- the connection has left the pool
     ///   and has been released or handed to the shutdown queue.
-    ///
-    /// # `connect_only` forces an abort
-    ///
-    /// `:668-669`, and the C's comment gives the reason: "treat the connection
-    /// as aborted in CONNECT_ONLY situations, so no graceful shutdown is
-    /// attempted". The application took the socket over, so libcurl does not
-    /// know what state the protocol is in and must not speak on it.
-    ///
-    /// # Two different farewells
-    ///
-    /// With a multi handle the line is `"closing"` or `"shutting down"`
-    /// according to `aborted` and the connection goes to [`Self::discard`],
-    /// which may enqueue it (`:671-676`). Without one, the line is always
-    /// `"closing"` and the connection is terminated on the spot with
-    /// `do_shutdown = !aborted` (`:677-681`) -- note that this is the one path
-    /// where a graceful pass is requested from `terminate` itself, whereas
-    /// [`Self::discard`] always passes `false` because it has already made its
-    /// own attempt.
     pub(crate) async fn terminate<H>(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -2602,40 +2143,6 @@ impl ConnectionPool {
 
     /// Disposes of a connection that has already left the pool --
     /// `cpool_discard_conn` (`lib/conncache.c:184-229`).
-    ///
-    /// Its precondition is `!conn->bits.in_cpool` (`:194`), which
-    /// [`PooledConnection::into_shutting_down`] and [`Self::remove`] between
-    /// them guarantee.
-    ///
-    /// # Why a dead or aborted connection gets no graceful shutdown
-    ///
-    /// `:213-219`, quoting the C: *"We do not shutdown dead connections. The
-    /// term 'dead' can be misleading here, as we also mark errored
-    /// connections/transfers as 'dead'. If we do a shutdown for an aborted
-    /// transfer, the server might think it was successful otherwise (for
-    /// example an ftps: upload). This is not what we want."*
-    ///
-    /// So `aborted` short-circuits the shutdown step: `done` starts `true` and
-    /// the one hopeful pass is skipped entirely. That is not an optimisation
-    /// -- a polite goodbye on a failed upload is a correctness bug on the
-    /// wire.
-    ///
-    /// # Otherwise: one non-blocking attempt, then hand over or queue
-    ///
-    /// `:220-228`. One `run_once` (`:222`), charged to the admin handle
-    /// because every shutdown call the C makes from this file passes
-    /// `cpool->idata`. If it finished, or if there is no multi handle to own
-    /// the background work, the connection is released now; otherwise it joins
-    /// the shutdown queue, which is told the pool's CURRENT population so that
-    /// it can enforce the combined limit.
-    ///
-    /// # The return value
-    ///
-    /// [`Some`] gives the connection BACK, and means the same as C's early
-    /// `return`: it is in use and this was not an abort, so it was not
-    /// disposed of. [`None`] means it was consumed. Handing it back rather
-    /// than leaving it behind a pointer is what stops [`Self::destroy`] from
-    /// reproducing the C's leak at `:245-249`.
     async fn discard<H>(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -2692,10 +2199,6 @@ impl ConnectionPool {
 
     /// Destroys the pool -- `Curl_cpool_destroy`
     /// (`lib/conncache.c:231-254`).
-    ///
-    /// Every remaining connection goes through the same disposal path as any
-    /// other, in the C's order: take the first one out, discard it, repeat.
-    /// The pool is empty afterwards.
     ///
     /// # Differences from the C, both deliberate
     ///
@@ -2757,25 +2260,6 @@ impl ConnectionPool {
 
     /// Reaps dead and unreusable connections -- `Curl_cpool_prune_dead`
     /// (`lib/conncache.c:718-737`).
-    ///
-    /// # The interval gate
-    ///
-    /// At most once per [`PRUNE_INTERVAL_MS`]. The C test is
-    /// `if(elapsed >= 1000L)`, so a call at exactly one thousand milliseconds
-    /// runs and one at nine hundred and ninety-nine does not. When the gate
-    /// closes the pass does nothing at all -- it does not scan, and it does
-    /// not move `last_cleanup`.
-    ///
-    /// # Restart after every removal
-    ///
-    /// `while(cpool_foreach(data, cpool, &reaper, cpool_reap_dead_cb));` --
-    /// the callback returns `1` after terminating ONE connection, which aborts
-    /// the traversal, and the `while` starts a fresh one. The counters carry
-    /// across restarts because C zeroes the reaper context once, outside the
-    /// loop (`:727`).
-    ///
-    /// The loop is finite because a restart happens only after a connection
-    /// has actually left the pool.
     ///
     /// # What the predicate is and is not asked
     ///
@@ -2875,10 +2359,6 @@ impl ConnectionPool {
     /// Runs an upkeep pass over every pooled connection --
     /// `Curl_cpool_upkeep` (`lib/conncache.c:748-759`).
     ///
-    /// Every connection is visited, including connections in use: C's
-    /// `cpool_foreach` applies no filter and `conn_upkeep` returns `0`
-    /// unconditionally so the traversal always completes.
-    ///
     /// # Errors
     ///
     /// The FIRST error any action reported, once the whole pass has finished.
@@ -2919,11 +2399,6 @@ impl ConnectionPool {
     ///    carrying a transfer is not the pool's to interrupt.
     /// 2. **Terminate every IDLE one** (`cpool_reap_no_reuse`, `:851-860`),
     ///    restarting after each removal exactly as pruning does.
-    ///
-    /// The connections left behind stay marked, so each is removed by
-    /// [`Self::prune_dead`] -- or by the very next pass of this function --
-    /// the moment its last transfer detaches. Returns how many were removed;
-    /// C returns nothing.
     pub(crate) async fn network_changed<H>(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -2973,9 +2448,7 @@ impl ConnectionPool {
     }
 }
 
-// =========================================================================
 // Tests
-// =========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -3176,12 +2649,6 @@ mod tests {
     // -- fixtures: a filter that takes several passes to shut down ---------
 
     /// A connected bottom-of-chain filter whose shutdown needs `steps` passes.
-    ///
-    /// The only reason this module needs a filter at all: with an empty chain
-    /// `run_once` reports done on its first pass, so a connection would never
-    /// reach the shutdown queue and
-    /// [`a_graceful_termination_is_handed_to_the_queue`] would have nothing to
-    /// observe.
     #[derive(Debug)]
     struct SlowFilter {
         base: FilterBase,
@@ -3233,11 +2700,6 @@ mod tests {
 
     /// A [`ConnectionHealth`] that follows the documented contract of
     /// `lib/url.c:622-700` exactly, with each of its four inputs settable.
-    ///
-    /// It exists so that all four branches -- maximum idle age, maximum
-    /// lifetime, the scheme's own check and chain liveness -- are exercised
-    /// with no live socket and with `crate::protocols` absent, which is the
-    /// point of AAP pattern P12's seam.
     #[derive(Debug, Default)]
     struct ContractHealth {
         /// `CURLOPT_MAXAGE_CONN`; zero disables the rule, as C's does.
@@ -3425,11 +2887,6 @@ mod tests {
 
     /// Adding links the connection into its destination bundle; removing
     /// unlinks it and destroys the bundle when it empties.
-    ///
-    /// `cpool_bundle_add` / `cpool_bundle_remove` plus `cpool_remove_bundle`
-    /// (`lib/conncache.c:89-106`, `:154-182`). The bundle's disappearance is
-    /// not incidental: [`ConnectionPool::check_limits`] looks the bundle up
-    /// again after a termination precisely because of it.
     #[test]
     fn adding_and_removing_manages_the_destination_bundle() {
         let clock = clock_at(10);
@@ -3824,11 +3281,6 @@ mod tests {
 
     /// Selection is by MAXIMUM IDLE AGE, not by insertion order and not by any
     /// recency ordering.
-    ///
-    /// The connections are added youngest-first and in a destination order
-    /// that puts the winner last in both the bundle map and the insertion
-    /// sequence, so an implementation that answered "the front of the list" or
-    /// "the first bundle" would give a different result.
     #[test]
     fn selection_is_maximum_age_and_not_insertion_order() {
         let clock = clock_at(1_000);
@@ -4968,13 +4420,6 @@ mod tests {
     /// With no multi handle the connection is terminated on the spot, and the
     /// graceful pass is requested by `terminate` itself with
     /// `do_shutdown = !aborted` -- `lib/conncache.c:677-681`.
-    ///
-    /// The observable is the `force ` prefix of the shutdown layer's closing
-    /// line, which that layer chooses from whether the filters ever reported
-    /// themselves finished. A chain that completes in ONE pass therefore
-    /// distinguishes the two cases exactly: with `aborted` false the final pass
-    /// runs and the close is graceful. Nothing is queued either way, because
-    /// there is no owner for background work.
     #[test]
     fn without_a_multi_handle_a_graceful_pass_still_runs() {
         let clock = clock_at(10);
@@ -5492,13 +4937,6 @@ mod tests {
 
     /// The shutdown queue is reached ONLY as a parameter, and its population is
     /// asked for rather than mirrored.
-    ///
-    /// This is the pool's half of the property `crate::conn::shutdown`'s
-    /// `the_pool_is_reached_only_through_the_parameter` test asserts from the
-    /// other side. Together they make the shared
-    /// connection-limit invariant a pair of explicit exchanges rather than a
-    /// cycle: the pool passes its count in, and asks the queue for its counts;
-    /// the queue holds no handle back.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source text, not the program")]
     fn the_pool_and_the_queue_exchange_only_values() {
@@ -5550,10 +4988,6 @@ mod tests {
     /// here: `&mut self` on every entry point makes re-entrancy
     /// unrepresentable, so there is nothing left for a lock or a bit to
     /// protect.
-    ///
-    /// The forbidden spellings are assembled from fragments so that this
-    /// assertion is not itself the occurrence it forbids -- the same discipline
-    /// `crate::conn::shutdown`'s structural tests use.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source text, not the program")]
     fn the_pool_holds_no_interior_lock() {
@@ -5588,13 +5022,6 @@ mod tests {
     }
 
     /// The eviction policy is age-based and is not an ordering structure.
-    ///
-    /// The complement of [`selection_is_maximum_age_and_not_insertion_order`]:
-    /// that test shows the ANSWER is by age, and this one shows there is no
-    /// recency machinery in the module that could give any other answer. A
-    /// bundle is a vector that is only ever appended to and removed from in
-    /// place, so "move to the front on use" is not merely unused -- it is
-    /// absent.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source text, not the program")]
     fn the_module_holds_no_recency_ordering() {
@@ -5651,13 +5078,6 @@ mod tests {
     }
 
     /// This module names no protocol, TLS or transfer layer.
-    ///
-    /// The dead/reuse policy of `lib/url.c:622-700` belongs to
-    /// `crate::protocols`, and importing it would be a cycle: a protocol
-    /// installs filters into a connection, and a connection is what this pool
-    /// holds. The policy arrives as [`ConnectionHealth`] instead, which is AAP
-    /// pattern P12's seam. Assembled from fragments for the reason
-    /// [`the_pool_holds_no_interior_lock`] gives.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source text, not the program")]
     fn the_module_names_no_higher_layer() {
@@ -5695,9 +5115,8 @@ mod tests {
 
     /// The generational slab is written in this file, with no new dependency.
     ///
-    /// AAP section 0.5.1 pins the dependency set, and no slab, index-map,
-    /// bitflag or cache crate is in it. The storage, the free chain and both
-    /// bitmap newtypes are therefore local.
+    /// The storage, the free chain and both bitmap newtypes are therefore
+    /// local.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source text, not the program")]
     fn the_storage_and_bitmaps_are_local() {

@@ -70,9 +70,16 @@ and never a build-time one. There is no unconditional fallback from one to the
 other, and no `platform-verifier` mechanism is enabled that would take the
 decision away from those options.
 
-None of that is observable yet. The `curl-rs-lib` TLS backend and its
-certificate-verification module are not on disk, so this section states target
-rather than behavior a reader can exercise today.
+None of that is observable yet, and the reason is wiring rather than absence.
+The TLS backend, its certificate-verification module, the trust-anchor handling
+and the session cache are all on disk under `curl-rs-lib/src/tls/` and tested
+there. What is missing is everything that would carry this variable to them: the
+executable honours no command-line option, so the --cacert value this variable
+supplies has nothing to reach, and no connection filter opens a TLS session. The
+capability stays withheld from the advertised feature set until that path
+exists, which is why this section states specified behavior rather than
+behaviour a reader can exercise today. The same wiring gap applies to every TLS
+variable below, and it is not repeated for each one.
 
 ## `CURL_HOME <directory>`
 If set, is the first variable curl checks when trying to find its home
@@ -85,11 +92,13 @@ backend has no alternative to select, and curl then keeps using that one
 whatever the variable holds.
 
 Exactly one TLS implementation is specified for this rewrite, `rustls`, so
-this variable selects nothing and no C TLS library is linked. The feature
-table in `curl-rs-lib` already withholds the `MultiSSL` name unconditionally
-and its tests assert that withholding. What is not yet on disk is the
---version output that would show it, along with the parenthesized list of
-further backends that a multiple-backend build prints.
+this variable selects nothing and no C TLS library is linked. That much holds
+today: no manifest in the workspace admits a second backend at any feature
+setting, and the capability table withholds the `MultiSSL` name unconditionally
+with tests asserting the withholding. What is not yet on disk is the printer for
+the --version output that would show it, along with the parenthesized list of
+further backends that a multiple-backend build prints -- so no banner is emitted
+at all, and this variable has no selection to report either way.
 
 ## `HOME <directory>`
 If set, this is used to find the home directory when that is needed. Like when
@@ -117,22 +126,43 @@ If set, it is used as the --capath value, naming a directory that holds CA
 certificates. A CA directory is not among the capabilities the specified TLS
 backend offers: it leaves `SSLSUPP_CA_PATH` out, which makes `CURLOPT_CAPATH`
 and --capath fail with `CURLE_NOT_BUILT_IN`. Point curl at a single CA bundle
-file with --cacert, `CURL_CA_BUNDLE` or `SSL_CERT_FILE` instead. That
-capability set is required target behavior: the backend it belongs to is not
-on disk.
+file with --cacert, `CURL_CA_BUNDLE` or `SSL_CERT_FILE` instead. That capability
+set is a permanent property of the backend rather than a stage of it, and the
+backend declaring it is on disk; the refusal is specified behavior that no
+command line can reach yet.
 
 ## `SSL_CERT_FILE <path>`
 If set, it is used as the --cacert value, naming a CA bundle file. It is
-specified to be recognized for every TLS transfer, once the backend that
-performs those transfers is delivered.
+specified to be recognized for every TLS transfer. The trust-anchor loading it
+feeds is implemented; the transfers are not, so nothing consumes the value at
+present.
 
 ## `SSLKEYLOGFILE <path>`
 If you set this environment variable to a filename, curl stores TLS secrets
 from its connections in that file when invoked to enable you to analyze the
-TLS traffic in real time using network analyzing tools such as Wireshark. The
-key log writer this variable drives is delivered in `curl-rs-lib`, and the one
-specified TLS implementation supports key logging. The TLS session that would
-feed secrets into the log is not on disk yet, so nothing is written today.
+TLS traffic in real time using network analyzing tools such as Wireshark.
+
+**Treat that file as the secret it is.** The key log plus a packet capture is
+enough to decrypt every session it covers, offline and at any later date, so it
+carries the same weight as the private keys involved. Set the variable only for
+the run you are debugging, keep the file on local storage you control, and delete
+it when you are done rather than leaving it in a home directory or a shared
+temporary directory.
+
+curl enforces part of that for you and refuses to write secrets to a file it
+cannot vouch for. A log it creates is created mode `0600`, owner read and write
+and nothing for anyone else, and before writing to any file it checks three
+things: the path must be a regular file, so a FIFO, socket, device or directory
+is refused; it must be owned by the user running curl, since another owner can
+read what is written to it; and it must carry no group or other permission bit,
+read or write. A file failing any of those is not written to, and the refusal is
+silent by design -- nothing is printed and no transfer fails, because a
+diagnostic naming the path would itself end up in logs. If you expect a key log
+and find none, check those three properties first.
+
+The key log writer this variable drives is delivered in `curl-rs-lib`, and the
+one specified TLS implementation supports key logging. The TLS session that
+would feed secrets into the log does not run yet, so nothing is written today.
 
 ## `USERPROFILE <directory>`
 On Windows, this variable is used when trying to find the home directory. If

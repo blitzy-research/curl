@@ -40,78 +40,8 @@
 // other rendering. Both satisfy `reuse`, which reads line 21 and nothing
 // else about the shape, and a reviewer comparing two files side by side in
 // one directory sees consistency rather than a transcription argument.
-//
-// ONE SPELLING CONSTRAINT, measured rather than assumed and recorded at
-// `src/util/mod.rs:33-42`. `reuse` scans every line of a file for the
-// licence-identifier tag in its colon-suffixed form and parses whatever
-// follows as an SPDX licence expression, so a second, PROSE mention becomes a
-// parse error rather than prose. That spelling therefore appears exactly once
-// in this file, on line 21, verbatim; every reference to it below names the
-// tag without the colon.
-//
-// `dead_code` IS NOT ALLOWED FOR THIS MODULE AS A WHOLE. Each item below with
-// no consumer yet carries its own `#[allow(dead_code)]`, written at the item.
-// `src/multi/mod.rs` and `src/multi/events.rs` are the consumers this file was
-// written for, and each allowance is removed when its consumer lands. A
-// module-root `#![allow(dead_code)]` would instead silence the NEXT item
-// somebody adds; the rule and the executable gate that enforces it across the
-// workspace are `no_lint_level_for_dead_code_is_set_on_a_crate_or_module_root`
-// in `src/lib.rs` (`mod source_policy`).
-//
-// NO LEVEL FOR THE `unsafe_code` LINT IS SET HERE, at any level. The crate
-// root carries `#![deny(unsafe_code)]` and grants exactly one exemption, on
-// `mod ffi`. This file contains no `unsafe` block, no raw pointer and no
-// exemption of its own -- the raw `CURL *` and the payload union that the C
-// message carries live in `curl-rs-ffi`, for the reason the module
-// documentation gives below.
-//
-// HOW TO CHECK THESE CLAIMS, because an unanchored search reports a false
-// failure against this file itself: the paragraphs above legitimately NAME the
-// keyword, the attribute and the C scalar spellings, so a bare `grep` matches
-// the prose. `src/lib.rs` settled the anchoring at the crate root and
-// `src/util/mod.rs:100-116` applies it to a directory; applied to this file
-// the expressions are
-//
-//   grep -nE '^[[:space:]]*#!?\[allow\(unsafe_code\)\]' <this file>
-//     -> must print NOTHING
-//   grep -nE '^[^/]*\bunsafe\b' <this file>
-//     -> must print NOTHING
-//   grep -nE '^[^/]*\bc_(int|uint|long)\b' <this file>
-//     -> must print NOTHING
-//   grep -n 'CURLMINFO_OFFT_' <this file>
-//     -> must print NOTHING: that spelling names no identifier in
-//        `include/curl/multi.h`; the real tokens are `CURLMINFO_NONE` and
-//        `CURLMINFO_LASTENTRY`, with no `_OFFT_` infix
-//   grep -nE '^[^/]*\b(Instant|SystemTime)::now\b' <this file>
-//     -> must print NOTHING: nothing here is time-dependent
-//
-// Anchoring past leading whitespace and requiring the token before any slash
-// on the line is what excludes every `//`, `///` and `//!` line: a comment
-// begins with a slash, so it can never match. Measured on this file: all five
-// print nothing. The compiler is the real authority for the first three in
-// any case.
 
 //! The completion-message queue and the notification subsystem.
-//!
-//! Supersedes `lib/multi_ntfy.c` (207 lines) and `lib/multi_ntfy.h` (60),
-//! together with the `curl_multi_info_read`, `curl_multi_get_offt` and
-//! `curl_multi_notify_*` spans of `lib/multi.c`. It is the engine behind
-//! **four** of the 100 exported symbols of `lib/libcurl.def`:
-//!
-//! | Exported symbol | C definition | What this module supplies |
-//! |---|---|---|
-//! | `curl_multi_info_read` | `lib/multi.c:2943-2969` | [`MessageQueue::read`] |
-//! | `curl_multi_get_offt` | `lib/multi.c:3747-3785` | [`get_offt`] |
-//! | `curl_multi_notify_enable` | `lib/multi.c:3982-3989` | [`MultiNotify::enable`] |
-//! | `curl_multi_notify_disable` | `lib/multi.c:3991-3998` | [`MultiNotify::disable`] |
-//!
-//! The last two are worth naming explicitly because they are easy to lose:
-//! `grep -c '^curl_multi_' lib/libcurl.def` is **22**, and
-//! `curl_multi_notify_disable` and `curl_multi_notify_enable` are two of them
-//! (`lib/libcurl.def:60-61`). Omitting either fails the `nm` symbol-parity
-//! gate by one symbol each. `docs/libcurl/symbols-in-versions` is a
-//! *historical superset* that also lists removed symbols and is never the
-//! export list.
 //!
 //! # What lives here and what lives in `curl-rs-ffi`
 //!
@@ -136,22 +66,6 @@
 //!   `curl-rs-ffi/src/ffi/types.rs` likewise owns the C-named `CURLMSG` and
 //!   `CURLMinfo_offt` enumerations and the `curl_notify_callback` typedef.
 //!
-//! The engine-side counterparts [`CurlMsgType`] and [`CurlMInfoOfft`] below
-//! carry the same pinned integers under Rust names, which is the same
-//! two-sided arrangement `error` and `curl-rs-ffi/src/ffi/codes.rs` already
-//! use for the result codes: the ABI crate bridges the two by exhaustive
-//! `match`, so a divergence cannot compile.
-//!
-//! One lifetime rule crosses that boundary and must be honoured or a
-//! well-behaved C consumer reads freed memory. In C the returned pointer is
-//! `&msg->extmsg`, and `struct Curl_message` is embedded in the easy handle
-//! (`lib/multihandle.h:42-46`, filled at `lib/multi.c:2408-2412`), so the
-//! storage outlives the call. [`MessageQueue::read`] instead *moves* the
-//! message out, so **`curl-rs-ffi` must copy it into a scratch `CURLMsg`
-//! owned by the multi handle and return that address**, and that scratch must
-//! stay valid until the next `curl_multi_info_read` on the same multi handle.
-//! A temporary would dangle the moment the shim returned.
-//!
 //! # `u32` rather than a C width, deliberately
 //!
 //! `curl_multi_notify_enable` takes an `unsigned int`, and this module's
@@ -165,54 +79,13 @@
 //! The C entry in `mntfy_entry` is a `uint32_t` in any case
 //! (`lib/multi_ntfy.c:33-36`), so the store below is a transcription.
 //!
-//! # The four behaviours most easily lost to an idiomatic rewrite
-//!
-//! Each is reproduced deliberately, each is cited at its definition, and each
-//! has a test at the foot of this file.
-//!
-//! 1. **`curl_multi_info_read` is O(1) by contract.** Its C doc comment
-//!    (`lib/multi.c:2933-2941`) says the function "MUST" be as fast as
-//!    possible, "MUST NOT scan any lists", must "scale fine to thousands of
-//!    handles and beyond", and that "the current design is fully O(1)".
-//!    [`VecDeque::pop_front`] and [`VecDeque::len`] satisfy it; any variant
-//!    that scans, filters, searches or sorts violates it however idiomatic it
-//!    looks. See [`MessageQueue::read`].
-//! 2. **`msgs_in_queue` is the count AFTER the removal, and it is written
-//!    before any validation.** `lib/multi.c:2948` sets it to zero first, so a
-//!    caller with a bad handle still gets a zero written; `:2964` then sets it
-//!    to the remaining count. Applications loop on that number, so an
-//!    off-by-one is immediately visible.
-//! 3. **`CURLMNOTIFY_INFO_READ` fires only on the empty-to-non-empty edge.**
-//!    `multi_addmsg` tests `if(!Curl_llist_count(&multi->msglist))` *before*
-//!    appending (`lib/multi.c:224-226`), so the second and every later append
-//!    onto a non-empty queue is silent. See [`MessageQueue::push`].
-//! 4. **That notification is attributed to the admin handle, mid 0 -- not to
-//!    the transfer that completed.** `multi_addmsg` passes `multi->admin`
-//!    (`lib/multi.c:225`), and dispatch resolves `e->mid ? get_easy(mid) :
-//!    multi->admin` (`lib/multi_ntfy.c:109`), so mid 0 round-trips back to the
-//!    admin handle. The `CURL *easy` an application receives for an
-//!    `INFO_READ` notification is the admin handle's. Attributing it to the
-//!    completing transfer would hand the application a `CURL *` it never
-//!    created.
-//!
-//! Point 4 rests on a subtlety worth stating rather than tidying away: **mid
-//! 0 is a live, legitimate mid.** The admin handle is assigned it on multi
-//! initialisation -- `lib/multihandle.h:99-100` says so and
-//! `lib/multi.c:278` performs it -- yet `lib/multi_ntfy.c:109` treats `0` as
-//! "no specific transfer". Both readings agree only because the admin handle
-//! *is* mid 0. This module keeps that coincidence intact and does not
-//! introduce a sentinel: `u32::MAX` is a different concept, the "no mid at
-//! all" that `lib/multi.c:2389` and `:3972` test for.
-//!
 //! # The intrusive list, and why teardown order does not matter
 //!
-//! `struct Curl_message` embeds a `Curl_llist_node` (`lib/multihandle.h:43`),
-//! and the plan's section 0.6.9 replaces intrusive lists with owned
-//! collections. `util::llist` records the mapping -- `VecDeque<T>` is what
-//! replaced `Curl_llist`, with no `LList` type to reach for -- so the queue
-//! below is a `VecDeque<CompletionMessage>`, whose `push_back`/`pop_front`
-//! pair is the exact counterpart of the C's append-at-tail
-//! (`lib/multi.c:226`) and take-from-head (`:2957`).
+//! `util::llist` records the mapping -- `VecDeque<T>` is what replaced
+//! `Curl_llist`, with no `LList` type to reach for -- so the queue below is a
+//! `VecDeque<CompletionMessage>`, whose `push_back`/`pop_front` pair is the
+//! exact counterpart of the C's append-at-tail (`lib/multi.c:226`) and
+//! take-from-head (`:2957`).
 //!
 //! One divergence follows and is **unobservable**, which is the conclusion
 //! rather than the question. `Curl_llist_destroy` removes from the tail, so C
@@ -224,38 +97,6 @@
 //! observes the order. `util::llist::dispose_tail_first` exists for a
 //! consumer that ever does need the C order; this module does not, and does
 //! not call it.
-//!
-//! # A latent defect in the C, documented rather than reproduced
-//!
-//! `mnfty_chunk_reset` is `memset(chunk, 0, sizeof(*chunk))`
-//! (`lib/multi_ntfy.c:57-60`), which clears the chunk's own `next` pointer.
-//! `mntfy_chunk_dispatch_all` calls it unconditionally at `:121`, and
-//! `Curl_mntfy_dispatch_all` then reads `chunk->next` at `:194` after
-//! asserting it non-NULL at `:192`. On the multi-chunk path the assertion
-//! fires in a debug build and the remaining chunks leak in a release one.
-//! Reaching it needs more than `CURL_MNTFY_CHUNK_SIZE` = 128 notifications
-//! outstanding in a single dispatch cycle, which is why it has gone unnoticed:
-//! only two notification types exist and one of them is edge-triggered. An
-//! owned collection has no `next` pointer to clear, so the fault has no
-//! expression here and is recorded instead of imitated.
-//!
-//! Its one **observable** consequence is faithfully kept, because it is a
-//! behaviour and not a fault: the reset happens after the dispatch loop
-//! whether or not the loop ran to completion, so entries still undispatched
-//! when a recorded failure stops the loop are **discarded**. See
-//! [`MultiNotify::dispatch_all`].
-//!
-//! # What this module deliberately does not contain
-//!
-//! `CURLMcode` and `CURLcode` belong to [`crate::error`] and are consumed,
-//! never restated. `CurlMstate` belongs to [`super::state`] and is not needed
-//! here. The `CURLMoption` integers, including `CURLMOPT_NOTIFYFUNCTION` and
-//! `CURLMOPT_NOTIFYDATA`, are pinned in `curl-rs-ffi/src/ffi/opts.rs` and are
-//! never named here; what `curl_multi_setopt` records against this module is
-//! reduced to [`MultiNotify::set_callback_installed`]. Socket and timer
-//! plumbing belongs to `super::events`; the transfer table, the four
-//! transfer bitsets and the scheduler belong to `super`. The only bitset owned
-//! here is [`MultiNotify`]'s `enabled`.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -263,9 +104,7 @@ use std::fmt;
 use crate::error::{CURLMcode, CURLcode};
 use crate::util::uint_bset::Uint32Bset;
 
-// ---------------------------------------------------------------------------
 // The message vocabulary
-// ---------------------------------------------------------------------------
 
 /// What a completion message means: `CURLMSG`.
 ///
@@ -279,13 +118,6 @@ use crate::util::uint_bset::Uint32Bset;
 ///   CURLMSG_LAST  /* last, not used */
 /// } CURLMSG;
 /// ```
-///
-/// **Every discriminant is written out**, although the C declaration writes
-/// none of them: a consumer compiled against curl 8.19.0-DEV holds the
-/// number, so `msg->msg == CURLMSG_DONE` is a comparison against `1`.
-/// Inferring the values from declaration order would make a reordering of
-/// this enumeration an ABI break that no test could see, which the plan's
-/// section 0.6.1 forbids.
 ///
 /// `#[repr(i32)]` because the C enumeration is a struct field of `CURLMsg`
 /// and a C `enum` there is `int`-sized on all four targets of the mandated
@@ -349,21 +181,6 @@ impl CurlMsgType {
 }
 
 /// One completed transfer's result, awaiting collection.
-///
-/// The safe counterpart of the public half of `struct Curl_message`
-/// (`lib/multihandle.h:42-46`), whose `extmsg` field is "the part that is
-/// visible to the external user". The C's `Curl_llist_node` has no
-/// counterpart, as the module documentation explains, and the C's
-/// `CURL *easy_handle` becomes a `mid`: this crate holds no raw pointers, and
-/// the identity a `mid` carries is the one the multi handle's transfer table
-/// is keyed on.
-///
-/// The union of `struct CURLMsg` is flattened to its only inhabited member.
-/// `CURLMSG_DONE` is the sole message type curl posts (`lib/multi.c:2410`),
-/// and for it the union is documented as carrying `CURLcode result`; the
-/// `void *whatever` alternative has no writer anywhere in the C tree.
-/// `curl-rs-ffi` restores the union when it marshals this into a scratch
-/// `CURLMsg`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[allow(dead_code)] // consumer: `super`'s `handle_completed` counterpart
 pub struct CompletionMessage {
@@ -392,9 +209,7 @@ impl CompletionMessage {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The message queue
-// ---------------------------------------------------------------------------
 
 /// What [`MessageQueue::read`] hands back: the message and the count left.
 ///
@@ -414,30 +229,15 @@ pub struct MessageRead {
 
 /// The queue of results from completed transfers: strict FIFO.
 ///
-/// Supersedes `struct Curl_llist msglist` (`lib/multihandle.h:97`), described
-/// there as "a list of messages from completed transfers".
-///
 /// The ordering is not a choice. `multi_addmsg` appends at the **tail**
 /// (`Curl_llist_append`, `lib/multi.c:226`) and `curl_multi_info_read` takes
 /// the **head** (`Curl_llist_head`, `lib/multi.c:2957`), so messages are
 /// delivered in completion order and [`VecDeque::push_back`] paired with
 /// [`VecDeque::pop_front`] is the exact counterpart.
-///
-/// The C also holds an unstated invariant this type inherits: **at most one
-/// message per `mid`**. `curl_multi_remove_handle` relies on it, purging the
-/// departing handle's message and stopping at the first match because "there
-/// can only be one from this specific handle" (`lib/multi.c:855-865`). See
-/// [`Self::remove_first_for`].
 #[derive(Clone, Debug, Default)]
 #[allow(dead_code)] // consumer: `super`'s multi handle
 pub(crate) struct MessageQueue {
     /// Head at the front, tail at the back.
-    ///
-    /// `VecDeque` rather than `Vec` because the C removes from the head in
-    /// constant time and this is the container whose costs match. That is a
-    /// fidelity argument and not a performance one -- performance is an
-    /// explicit non-goal of this work -- but it is also what the O(1)
-    /// contract on [`Self::read`] requires, so here the two agree.
     messages: VecDeque<CompletionMessage>,
 }
 
@@ -478,10 +278,6 @@ impl MessageQueue {
 
     /// Appends a message, reporting whether the empty-to-non-empty edge fired.
     ///
-    /// Reproduces `multi_addmsg` (`lib/multi.c:216-227`), whose doc comment is
-    /// "Called when a transfer is completed. Adds the given msg pointer to the
-    /// list kept in the multi handle."
-    ///
     /// ```c
     /// static void multi_addmsg(struct Curl_multi *multi,
     ///                          struct Curl_message *msg)
@@ -492,38 +288,13 @@ impl MessageQueue {
     /// }
     /// ```
     ///
-    /// # The edge is the whole point of the return value
-    ///
-    /// The emptiness test happens **before** the append, so it reports the
-    /// state the queue was in when the caller arrived. `true` therefore means
-    /// "this message took the queue from empty to non-empty", and the caller
-    /// must post `CURLMNOTIFY_INFO_READ` exactly then. Appending onto a
-    /// non-empty queue is silent: an implementation that notified on every
-    /// append would flood an application with redundant callbacks, and one
-    /// that tested after the append would never report `false`.
-    ///
-    /// The edge **re-arms**: once the queue drains -- through [`Self::read`]
-    /// or through [`Self::remove_first_for`] -- the next append reports `true`
-    /// again, because the C derives the answer from the live count rather than
-    /// from a latch.
-    ///
     /// # Why the caller posts the notification rather than this method
-    ///
-    /// The C's `CURLM_NTFY(multi->admin, ...)` names the **admin handle**, not
-    /// the transfer that completed. That handle is the multi's, this queue has
-    /// no access to it, and the attribution is load-bearing -- see the module
-    /// documentation. Returning the edge and leaving the attribution to the
-    /// multi handle keeps the one caller that knows the admin `mid` in charge
-    /// of naming it. The multi handle's line reads
     ///
     /// ```ignore
     /// if queue.push(message) {
     ///     notify.add(ADMIN_MID, CURLMNOTIFY_INFO_READ, tracer);
     /// }
     /// ```
-    ///
-    /// which is `lib/multi.c:224-226` with the order of the two statements
-    /// preserved.
     #[allow(dead_code)] // consumer: `super`'s `handle_completed` counterpart
     pub(crate) fn push(&mut self, message: CompletionMessage) -> bool {
         // Tested BEFORE the push, exactly as `lib/multi.c:224` tests before
@@ -535,24 +306,6 @@ impl MessageQueue {
     }
 
     /// Removes and returns the head message, with the count that remains.
-    ///
-    /// The engine half of `curl_multi_info_read` (`lib/multi.c:2943-2969`).
-    ///
-    /// # The O(1) contract, which is a requirement and not an aspiration
-    ///
-    /// The C carries this doc comment at `lib/multi.c:2933-2941`, and it is
-    /// reproduced because it constrains the implementation: the function is
-    /// the primary way a multi or multi_socket application learns that a
-    /// transfer has ended, it "MUST" be as fast as possible because it is
-    /// polled frequently, it "MUST NOT scan any lists in here to figure out
-    /// things", it must "scale fine to thousands of handles and beyond", and
-    /// "the current design is fully O(1)".
-    ///
-    /// [`VecDeque::pop_front`] and [`VecDeque::len`] are both constant time,
-    /// so the natural implementation satisfies it. Any variant that scans,
-    /// filters, searches or sorts violates the contract however idiomatic it
-    /// reads -- including a `retain` that looked like a tidy way to skip a
-    /// stale entry.
     ///
     /// # Three things the C measures that are easy to get wrong
     ///
@@ -572,10 +325,6 @@ impl MessageQueue {
     ///
     /// # The two guards this method does not perform
     ///
-    /// The C's condition is `GOOD_MULTI_HANDLE(multi) && !multi->in_callback
-    /// && Curl_llist_count(&multi->msglist)`; only the third is a property of
-    /// the queue.
-    ///
     /// * `GOOD_MULTI_HANDLE` is a magic-number check on a raw pointer
     ///   (`0x000bab1e`) and belongs to `curl-rs-ffi`, which is the only crate
     ///   holding the pointer.
@@ -585,9 +334,6 @@ impl MessageQueue {
     ///   deliberately **not** [`MultiNotify::in_callback`], which reproduces
     ///   the separate `in_ntfy_callback` flag of `lib/multihandle.h:181`. The
     ///   caller must check its own flag before calling this.
-    ///
-    /// A message is consumed exactly once and removed. There is no
-    /// peek-without-consume in the public API, and none is added here.
     #[allow(dead_code)] // consumer: `curl-rs-ffi`'s `curl_multi_info_read`
     pub(crate) fn read(&mut self) -> Option<MessageRead> {
         // `pop_front` is the `Curl_llist_head` / `Curl_node_elem` /
@@ -627,22 +373,6 @@ impl MessageQueue {
     ///   }
     /// }
     /// ```
-    ///
-    /// The `break` is transcribed rather than generalised: this removes **at
-    /// most one** message even if the invariant it rests on were ever
-    /// violated, because that is what the C does, and a `retain` that removed
-    /// every match would diverge on exactly the input the comment says cannot
-    /// occur.
-    ///
-    /// This is the one linear walk over the queue, and it is not a breach of
-    /// [`Self::read`]'s O(1) contract: that contract governs
-    /// `curl_multi_info_read`, which is polled on every turn of an
-    /// application's event loop, whereas this runs once per
-    /// `curl_multi_remove_handle` and the C scans there too.
-    ///
-    /// Removing the last message empties the queue, which re-arms
-    /// [`Self::push`]'s notification edge. That follows from the C deriving
-    /// the edge from the live count and is asserted by test.
     #[allow(dead_code)] // consumer: `super`'s `curl_multi_remove_handle`
     pub(crate) fn remove_first_for(&mut self, mid: u32) -> bool {
         let found = self.messages.iter().position(|msg| msg.mid == mid);
@@ -659,54 +389,18 @@ impl MessageQueue {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The notification vocabulary
-// ---------------------------------------------------------------------------
 
 /// `CURLMNOTIFY_INFO_READ` = 0: a result became available to read.
-///
-/// `include/curl/multi.h:530`, under the section comment "Notifications
-/// dispatched by a multi handle, when enabled." Posted by the multi handle
-/// when [`MessageQueue::push`] reports the empty-to-non-empty edge, against
-/// the **admin** handle rather than the transfer that completed
-/// (`lib/multi.c:225`).
-///
-/// A `#define` in C, not an enumerator, which is why it is a constant here
-/// rather than a member of some enumeration. `curl-rs-ffi/build.rs` already
-/// splices both spellings into the generated header as `#define`s
-/// (`curl-rs-ffi/build.rs:1072-1073`), so the generated form matches the
-/// authority exactly and nothing here needs to change to keep it that way.
 pub const CURLMNOTIFY_INFO_READ: u32 = 0;
 
 /// `CURLMNOTIFY_EASY_DONE` = 1: one transfer reached its terminal state.
-///
-/// `include/curl/multi.h:531`. Posted from the state machine, against the
-/// transfer itself: `mstate()` emits it on entry to `MSTATE_DONE`
-/// (`lib/multi.c:173`) and again when a transfer jumps straight to
-/// `MSTATE_COMPLETED` from below `MSTATE_DONE` (`lib/multi.c:175-179`), with
-/// the comment "we sometimes directly jump to COMPLETED, trigger also a
-/// notification in that case".
-///
-/// Also the **highest valid notification type**, which makes it the bound
-/// both [`MultiNotify::enable`] and [`MultiNotify::resize`] are written
-/// against.
 pub const CURLMNOTIFY_EASY_DONE: u32 = 1;
 
 /// How many notification types exist: `CURLMNOTIFY_EASY_DONE + 1` = 2.
-///
-/// `Curl_mntfy_resize` sizes the enabled set with exactly this arithmetic --
-/// `Curl_uint32_bset_resize(&multi->ntfy.enabled, CURLMNOTIFY_EASY_DONE + 1)`
-/// (`lib/multi_ntfy.c:132`) -- and the `+ 1` is reproduced rather than folded
-/// into a literal `2` so that adding a third notification type updates this
-/// automatically instead of silently leaving the set one slot short.
 pub const CURLMNOTIFY_COUNT: u32 = CURLMNOTIFY_EASY_DONE + 1;
 
 /// The `mid` the admin handle holds: 0.
-///
-/// `lib/multihandle.h:99-100` describes `multi->admin` as the "internal easy
-/// handle for admin operations" that "gets assigned `mid` 0 on multi init",
-/// and `lib/multi.c:278` performs that assignment by adding it to the transfer
-/// table first.
 ///
 /// The multi handle *assigns* it; this module only *interprets* it, and the
 /// interpretation is why the constant is declared here. Two sites depend on
@@ -717,39 +411,12 @@ pub const CURLMNOTIFY_COUNT: u32 = CURLMNOTIFY_EASY_DONE + 1;
 /// * Dispatch resolves `e->mid ? Curl_multi_get_easy(multi, e->mid) :
 ///   multi->admin` (`lib/multi_ntfy.c:109`), so a recorded `mid` of 0 comes
 ///   back out as the admin handle.
-///
-/// Those two readings of `0` -- "the admin handle" and "no specific transfer"
-/// -- are different concepts that agree only because the admin handle *is*
-/// mid 0. That coincidence is left intact rather than tidied into a sentinel.
-/// In particular this is **not** `u32::MAX`, which is the genuine "no mid at
-/// all" marker the C tests at `lib/multi.c:2389` and `:3972`.
 pub const ADMIN_MID: u32 = 0;
 
 /// `CURL_MNTFY_CHUNK_SIZE` = 128: entries per chunk in the C's store.
-///
-/// `lib/multi_ntfy.c:38`. Recorded because the chunk model is reproduced
-/// below, and reproduced for a reason that is **not** the reason the C has it:
-/// the C chunks to bound allocation churn, and performance is an explicit
-/// non-goal of this work. What the chunking buys here is behavioural, and it
-/// is the whole justification for keeping it -- see [`MultiNotify`].
 pub const CURL_MNTFY_CHUNK_SIZE: usize = 128;
 
 /// `CURLMinfo_offt`: which numeric value `curl_multi_get_offt` should return.
-///
-/// Transcribed from `include/curl/multi.h:456-474`.
-///
-/// **The spellings have no `_OFFT_` infix.** The tokens are `CURLMINFO_NONE`
-/// and `CURLMINFO_LASTENTRY`, and `CURLMINFO_OFFT_NONE` /
-/// `CURLMINFO_OFFT_LASTENTRY` name nothing in the header. Where a
-/// specification and the repository disagree the repository wins, and a grep
-/// gate at the head of this file pins the correct spellings so they cannot
-/// regress.
-///
-/// Every discriminant is written out. C makes `1` through `5` explicit and
-/// leaves `CURLMINFO_NONE` and `CURLMINFO_LASTENTRY` to declaration order;
-/// both are stated here anyway, because ordinal inference is prohibited and a
-/// half-explicit enumeration invites exactly the reordering that would break
-/// the two implicit ends.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CurlMInfoOfft {
@@ -840,18 +507,9 @@ impl CurlMInfoOfft {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tracing: two frozen lines
-// ---------------------------------------------------------------------------
 
 /// The `printf` format `lib/multi_ntfy.c:171` emits when queueing an entry.
-///
-/// Frozen: trace output is observable, so the text is transcribed rather than
-/// rewritten. Its two arguments are `(type, data->mid)`, in that order, and
-/// the emitting handle is the transfer the notification is *about*.
-///
-/// Kept as a constant beside [`NotifyEvent`]'s renderer so that the C spelling
-/// and the Rust rendering sit on adjacent lines and a test can compare them.
 #[allow(dead_code)] // consumers: the drift test below, and `super`'s tracer
 pub(crate) const TRACE_FORMAT_ADD: &str = "[NTFY] add %u for xfer %u";
 
@@ -912,12 +570,6 @@ impl NotifyEvent {
 
 impl fmt::Display for NotifyEvent {
     /// Renders the frozen text.
-    ///
-    /// The two literals below are the same bytes as [`TRACE_FORMAT_ADD`] and
-    /// [`TRACE_FORMAT_DISPATCH`] with each `%u` replaced by a `{}`. They are
-    /// written out rather than derived from those constants because
-    /// `format_args!` needs a literal, and a test asserts the correspondence
-    /// so the two cannot drift.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Add { notification, mid } => {
@@ -937,9 +589,6 @@ impl fmt::Display for NotifyEvent {
 /// `CURL_TRC_M(multi->admin, ...)` at `:113`. This crate's tracer needs a
 /// configuration and a sink that the multi handle owns, so the dependency is
 /// inverted: this module produces [`NotifyEvent`]s and the caller routes them.
-///
-/// A no-op implementation on `()` is provided, so a caller that is not tracing
-/// -- or a test that does not care -- passes `&mut ()`.
 pub(crate) trait NotifyTracer {
     /// Emits one trace line, or discards it.
     ///
@@ -987,20 +636,6 @@ pub(crate) trait NotifySink: NotifyTracer {
     fn resolves(&self, mid: u32) -> bool;
 
     /// Invokes the application callback for one entry.
-    ///
-    /// `multi->ntfy.ntfy_cb(multi, e->type, data, multi->ntfy.ntfy_cb_data)`
-    /// (`lib/multi_ntfy.c:115`). Returns nothing, because
-    /// `curl_notify_callback` is declared `void`
-    /// (`include/curl/multi.h:536-539`) -- unlike `curl_socket_callback` and
-    /// `curl_multi_timer_callback`, a notify callback **cannot** signal
-    /// failure, so there is no `rc == -1` path to invent.
-    ///
-    /// `notify` is handed back deliberately. The C annotates this call "this
-    /// may cause new notifications to be added!" (`lib/multi_ntfy.c:112` and
-    /// `:186`), and an implementation that could not reach the store would
-    /// make that unrepresentable rather than merely unlikely. Adding through
-    /// [`MultiNotify::add`] from inside this method is supported and is
-    /// covered by test.
     fn deliver(
         &mut self,
         notify: &mut MultiNotify,
@@ -1009,17 +644,9 @@ pub(crate) trait NotifySink: NotifyTracer {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The notification store
-// ---------------------------------------------------------------------------
 
 /// One queued notification: which type, and about which transfer.
-///
-/// `struct mntfy_entry { uint32_t mid; uint32_t type; }`
-/// (`lib/multi_ntfy.c:33-36`). The field order is swapped so the type reads
-/// first, matching the argument order of both trace lines and of
-/// [`MultiNotify::add`]; the struct is internal and its layout is not part of
-/// any contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NtfyEntry {
     /// The `CURLMNOTIFY_*` value.
@@ -1030,9 +657,6 @@ struct NtfyEntry {
 
 /// A bounded run of entries with independent read and write cursors.
 ///
-/// `struct mntfy_chunk` (`lib/multi_ntfy.c:40-45`) without its `next`
-/// pointer, which the owning [`VecDeque`] supplies.
-///
 /// ```c
 /// struct mntfy_chunk {
 ///   struct mntfy_chunk *next;
@@ -1041,12 +665,6 @@ struct NtfyEntry {
 ///   struct mntfy_entry entries[CURL_MNTFY_CHUNK_SIZE];
 /// };
 /// ```
-///
-/// The two cursors are what make the store safe to append to *while it is
-/// being dispatched*, and that -- not the allocation behaviour -- is why the
-/// chunk model is kept. `w_offset` is the count of entries written and
-/// `r_offset` the count already dispatched, so a push during dispatch extends
-/// the run the loop is walking instead of invalidating a position in it.
 #[derive(Clone, Debug)]
 struct NtfyChunk {
     /// Entries in write order. Never longer than [`CURL_MNTFY_CHUNK_SIZE`],
@@ -1059,13 +677,6 @@ struct NtfyChunk {
 
 impl NtfyChunk {
     /// An empty chunk with room reserved for its full run.
-    ///
-    /// `mnfty_chunk_create` is `curlx_calloc(1, sizeof(struct mntfy_chunk))`
-    /// (`lib/multi_ntfy.c:47-50`), a single allocation for the whole chunk
-    /// whose failure the C propagates. [`Vec::try_reserve_exact`] is the
-    /// counterpart that reports failure instead of aborting, which is what
-    /// keeps the `CURLM_OUT_OF_MEMORY` path of `lib/multi_ntfy.c:175`
-    /// reachable rather than turning it into a dead process.
     fn new() -> Result<Self, CURLMcode> {
         let mut entries = Vec::new();
         entries
@@ -1115,13 +726,6 @@ impl NtfyChunk {
     }
 
     /// Discards every entry and rewinds both cursors.
-    ///
-    /// `mnfty_chunk_reset` (`lib/multi_ntfy.c:57-60`), whose `memset` also
-    /// clears the C's `next` pointer -- the latent defect this module's
-    /// documentation records. There is no pointer to clear here, and the
-    /// observable half of that `memset` *is* reproduced: entries not yet
-    /// dispatched are dropped, which is what the C does when a recorded
-    /// failure stops the loop before `r_offset` reaches `w_offset`.
     fn reset(&mut self) {
         self.entries.clear();
         self.read = 0;
@@ -1143,26 +747,6 @@ impl NtfyChunk {
 ///   BIT(has_entries);
 /// };
 /// ```
-///
-/// Field by field: `ntfy_cb` and `ntfy_cb_data` are a C function pointer and
-/// an opaque user pointer, so they live in `curl-rs-ffi`, and what remains
-/// here is the one bit of them this module's logic consults -- whether a
-/// callback is installed at all, which gates both [`Self::add`]
-/// (`lib/multi_ntfy.c:167`) and [`Self::dispatch_all`]
-/// (`lib/multi_ntfy.c:106`). `enabled` is the dense [`Uint32Bset`] of
-/// `util::uint_bset`; the sparse `Uint32SpBset` beside it is the wrong
-/// choice, because the members here are `0` and `1` and the capacity bound is
-/// exactly what [`Self::resize`] relies on. `head` and `tail` become a
-/// [`VecDeque`] of chunks. `failure` and `has_entries` are transcribed.
-///
-/// # Nothing is enabled by default
-///
-/// `Curl_mntfy_init` is `memset(&multi->ntfy, 0, sizeof(multi->ntfy))` plus
-/// `Curl_uint32_bset_init` (`lib/multi_ntfy.c:124-128`), and a zeroed bitset
-/// holds nothing. **No notification type is enabled until the application
-/// calls `curl_multi_notify_enable`**, which is easy to assume the other way
-/// round. A freshly constructed value here matches: the enabled set is empty
-/// and has capacity zero until [`Self::resize`] runs.
 #[derive(Debug)]
 #[allow(dead_code)] // consumer: `super`'s multi handle
 pub(crate) struct MultiNotify {
@@ -1195,46 +779,14 @@ pub(crate) struct MultiNotify {
     has_entries: bool,
     /// True for the duration of a dispatch cycle: the C's
     /// `multi->in_ntfy_callback` (`lib/multihandle.h:181`).
-    ///
-    /// Hosted here rather than on the multi handle because
-    /// [`Self::dispatch_all`] is its only writer, which removes any way for
-    /// the flag and the cycle to disagree. The multi handle reads it through
-    /// [`Self::in_callback`] to return `CURLM_RECURSIVE_API_CALL` from
-    /// `curl_multi_perform` and the three socket entry points
-    /// (`lib/multi.c:2758`, `:3286`, `:3297`, `:3307`).
-    ///
-    /// Distinct from `struct Curl_multi`'s `in_callback`
-    /// (`lib/multihandle.h:180`), which guards the *application* socket and
-    /// timer callbacks and which `curl_multi_info_read` tests
-    /// (`lib/multi.c:2951`). Two flags, two owners; conflating them would let
-    /// a notify callback call `curl_multi_info_read`, which C permits.
     in_callback: bool,
     /// Test-only fault injection for the chunk allocation.
-    ///
-    /// `#[cfg(test)]`, so it does not exist in a release build and cannot be
-    /// reached from anywhere but this file's own tests.
-    ///
-    /// It earns its place because the C's *only* writer of `failure` is
-    /// `mnfty_chunk_create` returning `NULL` (`lib/multi_ntfy.c:170-175`), and
-    /// three measured behaviours hang off that one path: the trace line is
-    /// emitted anyway, `has_entries` is set anyway, and
-    /// [`Self::dispatch_all`] then reports the code once and clears it while
-    /// leaving `has_entries` alone. A real allocation failure cannot be
-    /// provoked in a unit test, and a plain setter for `failure` would test a
-    /// synthetic path instead of the production one. This makes the production
-    /// path run.
     #[cfg(test)]
     fail_chunk_allocation: bool,
 }
 
 impl MultiNotify {
     /// A subsystem with no callback, nothing enabled and nothing queued.
-    ///
-    /// `Curl_mntfy_init` (`lib/multi_ntfy.c:124-128`). The C's `memset`
-    /// leaves `failure` as `CURLM_OK` = 0 and `has_entries` as false, which is
-    /// what this reproduces; [`Self::resize`] must follow before anything can
-    /// be enabled, exactly as `Curl_multi_handle` calls `Curl_mntfy_init`
-    /// (`lib/multi.c:243`) and then `Curl_mntfy_resize` (`:258`).
     #[must_use]
     #[allow(dead_code)] // consumer: `super`'s multi-handle constructor
     pub(crate) fn new() -> Self {
@@ -1282,15 +834,6 @@ impl MultiNotify {
     /// return CURLM_OK;
     /// ```
     ///
-    /// The `+ 1` arithmetic is [`CURLMNOTIFY_COUNT`], so the capacity tracks
-    /// the constant rather than a literal `2`. The error families differ
-    /// either side of the call -- the bitset reports [`CURLcode::OutOfMemory`]
-    /// and this reports [`CURLMcode::OutOfMemory`] -- and the C performs the
-    /// same translation by testing the boolean and returning its own code.
-    ///
-    /// Idempotent: the underlying resize returns early when the slot count is
-    /// already right, so a second call allocates nothing.
-    ///
     /// # Errors
     ///
     /// [`CURLMcode::OutOfMemory`] when the set cannot be grown. The multi
@@ -1315,13 +858,6 @@ impl MultiNotify {
     /// `CURLMOPT_NOTIFYDATA` sets `ntfy_cb_data`, which this module never
     /// reads. Their option integers are pinned in
     /// `curl-rs-ffi/src/ffi/opts.rs` and are deliberately not named here.
-    ///
-    /// Clearing the callback stops both queueing and dispatching, which
-    /// matches the C: `Curl_mntfy_add` tests `multi->ntfy.ntfy_cb`
-    /// (`lib/multi_ntfy.c:167`) and `mntfy_chunk_dispatch_all` tests it again
-    /// (`:106`). Entries already queued are **not** discarded -- the C keeps
-    /// them in their chunks and simply skips the dispatch loop -- so
-    /// reinstalling a callback resumes delivery.
     #[allow(dead_code)] // consumer: `super`'s `curl_multi_setopt`
     pub(crate) fn set_callback_installed(&mut self, installed: bool) {
         self.callback_installed = installed;
@@ -1335,16 +871,6 @@ impl MultiNotify {
     }
 
     /// Whether anything is waiting to be dispatched.
-    ///
-    /// `CURL_MNTFY_HAS_ENTRIES(m)`, which is `((m)->ntfy.has_entries)`
-    /// (`lib/multi_ntfy.h:56`). The cheap test `multi_perform`
-    /// (`lib/multi.c:2785`) and `multi_socket` (`lib/multi.c:3172`) make
-    /// before calling [`Self::dispatch_all`] at all, both spelled
-    /// `if(!result && CURL_MNTFY_HAS_ENTRIES(multi))`.
-    ///
-    /// A flag rather than a derived emptiness test, because the C is a flag
-    /// and the two are **not** equivalent: [`Self::dispatch_all`] leaves this
-    /// set on the failure path so that the next cycle retries.
     #[must_use]
     #[allow(dead_code)] // consumer: `super`'s perform and socket paths
     pub(crate) fn has_entries(&self) -> bool {
@@ -1376,12 +902,6 @@ impl MultiNotify {
     }
 
     /// Whether `notification` is currently enabled.
-    ///
-    /// `Curl_uint32_bset_contains(&multi->ntfy.enabled, type)`. Consulted at
-    /// two separate moments in the C, and the second is the one an
-    /// optimisation would drop: once when queueing (`lib/multi_ntfy.c:168`)
-    /// and again when dispatching (`:111`), the latter commented "only when
-    /// notification has not been disabled in the meantime".
     #[must_use]
     #[allow(dead_code)] // consumer: `super`'s diagnostics
     pub(crate) fn is_enabled(&self, notification: u32) -> bool {
@@ -1421,11 +941,6 @@ impl MultiNotify {
     ///   [`CURLMcode::Ok`]. Translating that boolean into an "already enabled"
     ///   error would invert the branch, since `HashSet::insert`'s boolean has
     ///   the opposite sense.
-    ///
-    /// The `debug_assert!` below records why the discarded boolean is safe to
-    /// discard: [`Self::resize`] gives the set capacity 64 -- one slot,
-    /// rounded up from [`CURLMNOTIFY_COUNT`] -- so every type that passes the
-    /// range test is inside it.
     #[allow(dead_code)] // consumer: `curl-rs-ffi`'s `curl_multi_notify_enable`
     pub(crate) fn enable(&mut self, notification: u32) -> CURLMcode {
         if notification > CURLMNOTIFY_EASY_DONE {
@@ -1441,18 +956,6 @@ impl MultiNotify {
     }
 
     /// Disables a notification type.
-    ///
-    /// The engine half of `curl_multi_notify_disable`
-    /// (`lib/multi.c:3991-3998`) delegating to `Curl_mntfy_disable`
-    /// (`lib/multi_ntfy.c:156-162`). The same range test and the same
-    /// [`CURLMcode::UnknownOption`], and `Curl_uint32_bset_remove` returns
-    /// nothing, so disabling a type that was never enabled is a silent
-    /// success.
-    ///
-    /// Disabling takes effect on entries **already queued**, because dispatch
-    /// re-tests membership per entry (`lib/multi_ntfy.c:111`, "only when
-    /// notification has not been disabled in the meantime"). Such an entry is
-    /// still consumed rather than left behind.
     #[allow(dead_code)] // consumer: `curl-rs-ffi`'s `curl_multi_notify_disable`
     pub(crate) fn disable(&mut self, notification: u32) -> CURLMcode {
         if notification > CURLMNOTIFY_EASY_DONE {
@@ -1463,13 +966,6 @@ impl MultiNotify {
     }
 
     /// Queues a notification about `mid`, if anything wants it.
-    ///
-    /// `Curl_mntfy_add` (`lib/multi_ntfy.c:164-178`), together with the
-    /// `CURLM_NTFY(d, t)` macro that guards every call site
-    /// (`lib/multi_ntfy.h:50-54`). The macro's three-part guard --
-    /// `(d) && (d)->multi && (d)->multi->ntfy.ntfy_cb` -- is subsumed: a
-    /// caller reaching this method has a multi handle by construction, and the
-    /// callback test is the first of the four conditions below.
     ///
     /// ```c
     /// void Curl_mntfy_add(struct Curl_easy *data, unsigned int type)
@@ -1487,33 +983,6 @@ impl MultiNotify {
     ///   }
     /// }
     /// ```
-    ///
-    /// # All four conditions must hold, and nothing happens otherwise
-    ///
-    /// A callback is installed, no failure is latched, and the type is
-    /// enabled. When any fails this is a complete no-op: no entry, no trace
-    /// line, and `has_entries` untouched.
-    ///
-    /// # The trace line comes before the append, and survives its failure
-    ///
-    /// The C emits `"[NTFY] add %u for xfer %u"` between obtaining the tail
-    /// and writing into it (`lib/multi_ntfy.c:170-171`), so it is emitted even
-    /// when the append then fails. Both properties are reproduced below, and
-    /// both are visible in the ordering of the statements.
-    ///
-    /// # `has_entries` is set even when the append fails
-    ///
-    /// The C sets it outside the `if(tail)` (`lib/multi_ntfy.c:176`), so a
-    /// failed append still marks the subsystem as having work. That is what
-    /// gets [`Self::dispatch_all`] called, which is what reports the latched
-    /// failure to the application. Dropping this would swallow the error.
-    ///
-    /// # Where the allocation failure comes from
-    ///
-    /// The C's is `mnfty_chunk_create` returning `NULL`. Here it is
-    /// [`Vec::try_reserve_exact`] in [`NtfyChunk::new`], the same fallible
-    /// reservation `util::uint_bset` uses for its own resize, so the
-    /// `CURLM_OUT_OF_MEMORY` path stays reachable instead of aborting.
     #[allow(dead_code)] // consumer: `super`'s completion and state paths
     pub(crate) fn add(
         &mut self,
@@ -1564,9 +1033,6 @@ impl MultiNotify {
     }
 
     /// Dispatches every queued notification, then reports any latched failure.
-    ///
-    /// `Curl_mntfy_dispatch_all` (`lib/multi_ntfy.c:180-207`) together with
-    /// the per-chunk loop of `mntfy_chunk_dispatch_all` (`:100-122`).
     ///
     /// ```c
     /// CURLMcode Curl_mntfy_dispatch_all(struct Curl_multi *multi)
@@ -1621,12 +1087,6 @@ impl MultiNotify {
     /// in C: this method takes `&mut self`, so a re-entrant call would need a
     /// second exclusive borrow and would not compile. The assertion documents
     /// the invariant; the borrow checker enforces it.
-    ///
-    /// `sink` is consulted for both halves of the C's
-    /// `data = e->mid ? Curl_multi_get_easy(multi, e->mid) : multi->admin;`
-    /// -- see [`NotifySink`]. An entry whose `mid` no longer resolves is
-    /// skipped and still consumed, matching the C's unconditional
-    /// `r_offset++`.
     ///
     /// # Errors
     ///
@@ -1685,17 +1145,6 @@ impl MultiNotify {
     }
 
     /// Dispatches the head chunk, then resets it.
-    ///
-    /// `mntfy_chunk_dispatch_all` (`lib/multi_ntfy.c:100-122`). Split out
-    /// because the C splits it, and because the reset at the end applies
-    /// whether the loop finished or a failure cut it short.
-    ///
-    /// Each iteration re-reads the head through the collection rather than
-    /// holding a borrow across the callback. That is not ceremony: `sink`
-    /// receives `&mut *self` so it can queue further notifications, and a live
-    /// borrow of the chunk would make that impossible to express. The C gets
-    /// the same freedom from raw pointers and pays for it with the aliasing
-    /// this design removes.
     fn dispatch_head(&mut self, sink: &mut (impl NotifySink + ?Sized)) {
         // `if(multi->ntfy.ntfy_cb)` (`lib/multi_ntfy.c:106`): with no callback
         // installed the loop is skipped entirely -- but the reset below still
@@ -1756,9 +1205,7 @@ impl Default for MultiNotify {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `curl_multi_get_offt`
-// ---------------------------------------------------------------------------
 
 /// The counters `curl_multi_get_offt` reports, as already computed.
 ///
@@ -1771,10 +1218,6 @@ impl Default for MultiNotify {
 ///   `process`, `pending` and `msgsent` cardinalities, `xfers_total_ever`, and
 ///   the two admin-handle predicates. It fills this struct and calls
 ///   [`get_offt`].
-///
-/// The split is what keeps the observable behaviour -- which counter, which
-/// adjustment, which error -- in one reviewable place while leaving the
-/// bookkeeping with the code that maintains it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)] // consumer: `super`'s `curl_multi_get_offt`
 pub(crate) struct MultiCounters {
@@ -1791,11 +1234,6 @@ pub(crate) struct MultiCounters {
     pub(crate) process: u32,
     /// `Curl_uint32_bset_contains(&multi->process, multi->admin->mid)`
     /// (`lib/multi.c:3768`).
-    ///
-    /// True in practice for the whole life of the handle, because the admin
-    /// handle is added to `process` at initialisation
-    /// (`lib/multi.c:279`). The C tests membership rather than assuming it,
-    /// and so does this.
     pub(crate) process_has_admin: bool,
     /// `Curl_uint32_bset_count(&multi->pending)` (`lib/multi.c:3773`).
     pub(crate) pending: u32,
@@ -1812,9 +1250,6 @@ pub(crate) struct MultiCounters {
 }
 
 /// Maps a `CURLMinfo_offt` selector onto a number: `curl_multi_get_offt`.
-///
-/// The engine half of `curl_multi_get_offt` (`lib/multi.c:3747-3785`), whose
-/// signature is
 ///
 /// ```c
 /// CURL_EXTERN CURLMcode curl_multi_get_offt(CURLM *multi_handle,
@@ -1833,35 +1268,6 @@ pub(crate) struct MultiCounters {
 /// | `CURLMINFO_XFERS_ADDED` | `xfers_total_ever` | none |
 /// | anything else | `-1` | returns `CURLM_UNKNOWN_OPTION` |
 ///
-/// The two subtractions exist because **the admin handle occupies a table slot
-/// and a `process` membership of its own** (`lib/multi.c:278-279`) and must
-/// not be reported to an application that never created it. Both are guarded
-/// by `if(n && ...)` in the C, so neither can underflow a zero count;
-/// [`u32::saturating_sub`] expresses the same guard without restating it.
-///
-/// # The default arm writes as well as returning
-///
-/// `*pvalue = -1;` **and** `return CURLM_UNKNOWN_OPTION;`
-/// (`lib/multi.c:3781-3783`). Both halves, in that order. Writing `-1` on the
-/// error path is easy to forget and is observable by any caller that inspects
-/// its variable after a failed call.
-///
-/// `CURLMINFO_NONE` reaches that arm. It is not a request for anything -- the
-/// header comments it "first, never use this" -- and the C `switch` has no
-/// `case` for it, so it falls to `default` exactly like an unrecognised
-/// integer. `CURLMINFO_LASTENTRY` does likewise. Verified against the
-/// `switch` at `lib/multi.c:3759-3784`, which names only the five real
-/// selectors.
-///
-/// # `info` is a raw `i32`, deliberately
-///
-/// A C caller can pass any integer, including one outside the enumeration, and
-/// the `default` arm exists precisely to catch it. Taking [`CurlMInfoOfft`]
-/// here would make that input unrepresentable and push the classification into
-/// the ABI shim, where it would be a second place to get the `-1` wrong.
-/// [`CurlMInfoOfft::from_i32`] is available for a caller that has already
-/// classified.
-///
 /// # The two guards this function does not perform
 ///
 /// Both precede the `switch` in C and both concern a raw pointer, so both
@@ -1873,9 +1279,6 @@ pub(crate) struct MultiCounters {
 /// 2. `!pvalue` yields [`CURLMcode::BadFunctionArgument`]
 ///    (`lib/multi.c:3756-3757`) -- note, **not** `CURLM_UNKNOWN_OPTION`. A
 ///    `&mut i64` cannot be null, so this check has no expression here.
-///
-/// Neither writes to `*pvalue`, because both return before the `switch`. A
-/// shim that helpfully zeroed the out-parameter first would diverge.
 ///
 /// # `XFERS_DONE` counts `msgsent`, which is not the queue's length
 ///
@@ -1954,25 +1357,11 @@ pub(crate) fn get_offt(
 }
 
 // TESTS
-//
-// This module has no C unit test to relocate: `lib/multi_ntfy.c` marks nothing
-// `@unittest`, and no file under `tests/unit/` exercises it. What the C tree
-// offers instead is the *definition* of the behaviour, so every assertion below
-// cites the line it was measured from and the tests are organised the way the
-// requirements are: the pinned ABI integers first, then the queue, then the
-// notification edge, then dispatch, then the counter mapping.
-//
-// Two of them read files from the workspace rather than exercising the program,
-// and both are `#[cfg_attr(miri, ignore)]` for the reason `src/lib.rs`'s
-// `mod source_policy` gives: Miri interprets the program and has no business
-// walking the source tree.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---------------------------------------------------------------
     // The pinned ABI integers
-    // ---------------------------------------------------------------
 
     /// `include/curl/multi.h:90-95`. A consumer holds the number, so this is
     /// the assertion that makes reordering the enumeration a test failure
@@ -2129,10 +1518,6 @@ mod tests {
     /// fail all 129 `docs/examples` programs. `core::mem::offset_of!` is
     /// unavailable to this crate in any case: it stabilised in Rust 1.77 and
     /// the MSRV is 1.75, which is why that file computes the offsets itself.
-    ///
-    /// Reading the file is the only way to assert a property of code that is
-    /// not compiled into this crate. It is cheap, it is exact, and it fails
-    /// loudly if somebody moves or deletes the assertion.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn the_curlmsg_layout_assertion_lives_in_the_abi_crate() {
@@ -2153,12 +1538,6 @@ mod tests {
         // The five facts the C struct fixes on a 64-bit target. Matched on the
         // asserted values rather than on whole lines, so reformatting the file
         // cannot break this while a changed number still does.
-        //
-        // The size and the alignment arrive together through that file's
-        // `shape!` helper, and the offsets through its `offset!` helper, which
-        // names the struct as well as the field because it covers seventeen of
-        // them rather than this one alone. Both still carry the numbers
-        // literally, which is the property this test depends on.
         for fragment in [
             "shape!(CURLMsg, 24, 8)",
             "offset!(CURLMsg, msg), 0",
@@ -2174,9 +1553,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // The frozen trace lines
-    // ---------------------------------------------------------------
 
     /// The two format strings are byte-identical to the C's.
     #[test]
@@ -2187,11 +1564,6 @@ mod tests {
 
     /// The rendering is a positional substitution of the frozen format, and
     /// not a paraphrase of it.
-    ///
-    /// Checked structurally rather than by eyeballing two literals: the
-    /// rendered text is compared against the format with each `%u` replaced by
-    /// the corresponding argument, in order. A reworded literal in
-    /// [`fmt::Display`] fails this even if it still reads plausibly.
     #[test]
     fn trace_rendering_substitutes_the_frozen_format_positionally() {
         for event in [
@@ -2238,9 +1610,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // The message queue
-    // ---------------------------------------------------------------
 
     /// A `CURLMSG_DONE` message for `mid`, with a distinguishable result.
     fn message(mid: u32) -> CompletionMessage {
@@ -2379,9 +1749,7 @@ mod tests {
         assert!(queue.push(message(2)), "the edge re-arms after a purge too");
     }
 
-    // ---------------------------------------------------------------
     // The notification subsystem
-    // ---------------------------------------------------------------
 
     /// A [`NotifySink`] that records everything and can queue during dispatch.
     #[derive(Debug, Default)]
@@ -2881,9 +2249,7 @@ mod tests {
         assert!(sink.delivered.is_empty());
     }
 
-    // ---------------------------------------------------------------
     // `curl_multi_get_offt`
-    // ---------------------------------------------------------------
 
     /// Counters resembling a live multi handle: four transfers plus the admin
     /// handle, which occupies a table slot and a `process` membership of its
@@ -3132,18 +2498,10 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
     // Source-policy guards for this file
-    // ---------------------------------------------------------------
 
     /// This file contains no `unsafe`, no C scalar width and no reference to
     /// the misspelt `CURLMINFO_OFFT_` tokens, in code.
-    ///
-    /// The compiler already enforces the first two -- `#![deny(unsafe_code)]`
-    /// with no exemption here, and `mod source_policy`'s island gate -- so
-    /// this exists for the third, which nothing else checks, and to keep the
-    /// anchored expressions documented at the head of this file executable
-    /// rather than aspirational.
     #[test]
     #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn this_file_honours_its_own_grep_gates() {

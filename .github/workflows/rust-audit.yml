@@ -596,7 +596,7 @@ jobs:
           #
           # The answer is that it resolves nothing, deliberately. The feature is
           # a reserved NAME whose engine is absent - curl-rs-lib/src/version.rs
-          # holds `ENGINE_DNS` as `Engine::absent`, so `curl --version` withholds
+          # holds `ENGINE_DNS` as `Engine::inert`, so `curl --version` withholds
           # the resolver token however the feature is set. That is the
           # under-reporting AAP 0.6.5 calls safe, as against the over-reporting
           # it calls fatal, and it is why the feature is neither a silent no-op
@@ -933,6 +933,101 @@ jobs:
           echo 'every advisory-affected crate IS present with the default features and is NOT present'
           echo 'without ssh and http3, so the accepted advisories are confined to those two features'
 
+      - name: 'assert: no accepted advisory has reached a shipped artifact'
+        run: |
+          # THE RELEASE OBLIGATION, MADE EXECUTABLE.
+          #
+          # deny.toml separates three levels of exposure for every accepted
+          # advisory: present in the dependency graph, offered to the linker,
+          # and present in a shipped artifact and callable. The step above
+          # measures level 1. This step measures LEVEL 3, which is the one the
+          # release obligation turns on: the accepted advisories may be carried
+          # while no shipped artifact contains the vulnerable code, and they may
+          # NOT be carried once one does.
+          #
+          # That is not a softening of the acceptances. It is the opposite - it
+          # converts "do not release the HTTP/3 and SSH paths until an
+          # advisory-free dependency strategy exists" from a sentence somebody
+          # has to remember into a build failure. Landing protocols/sftp.rs,
+          # protocols/scp.rs or protocols/http3.rs pulls the affected code into
+          # libcurl.so and the curl executable, and this step fails that build
+          # until the matching deny.toml entry is gone.
+          #
+          # WHY IT READS THE ARTIFACT RATHER THAN THE SOURCES. A grep for `use
+          # russh` answers a question about text; the artifact answers the
+          # question that matters, which is whether the code is in the thing that
+          # ships. It also cannot be defeated by an indirect path: a helper
+          # crate, a macro or a re-export still leaves its origin behind.
+          #
+          # WHAT IS MATCHED, AND WHY NOT SYMBOL NAMES. The first form of this
+          # check grepped `nm` output for the crate names and produced three
+          # FALSE POSITIVES on the first run, because Rust's v0 mangling is
+          # length-prefixed and `h3` is a substring of `core_arch3x86`,
+          # `MetricsBatch30end_...` and `ops5arith3Sub`. Anchoring to the mangled
+          # crate-root form fixes that but introduces the opposite risk: rustls
+          # is used by this workspace and yet contributes ZERO symbols under its
+          # own crate root, because its generic instantiations are named under
+          # the instantiating crate - so a symbol search cannot even see a crate
+          # that is definitely present, and a control built on one would be
+          # unsound.
+          #
+          # What every compiled crate DOES leave behind is its registry source
+          # path, embedded in panic locations - measured, of the form
+          # `/rustls-0.23.42/src/lib.rs`. So the pattern is a leading slash, the
+          # crate name, a hyphen and a digit, which cannot match a mangled
+          # identifier and cannot match a differently named crate.
+          #
+          # The crate list is restated rather than inherited: each `run:` block
+          # is its own shell, so a variable set in the step above is gone here.
+          # It is the same list, and the step above already fails if any member
+          # of it leaves the default graph, which is what keeps the two in step.
+          affected='quinn quinn-proto h3 h3-quinn rsa russh russh-cryptovec'
+          pattern="/($(printf '%s\n' ${affected} | paste -sd'|' -))-[0-9]"
+          echo "looking for ${pattern} in the release artifacts"
+
+          if ! cargo build --locked --release --workspace; then
+            echo 'FAIL: the release build this assertion inspects did not complete.'
+            exit 1
+          fi
+
+          verdict=0
+          for artifact in target/release/libcurl.so target/release/curl target/release/curlinfo; do
+            if [ ! -f "${artifact}" ]; then
+              echo "FAIL: ${artifact} was not produced, so this assertion cannot be made."
+              exit 1
+            fi
+            hits="$(strings -a "${artifact}" | grep -c -E "${pattern}" || true)"
+            echo "${artifact}: ${hits} reference(s) to an advisory-affected crate"
+            if [ "${hits}" -ne 0 ]; then
+              echo "FAIL: ${artifact} now CONTAINS code from a crate whose advisory deny.toml still"
+              echo 'accepts. Level 3 has been reached, so the acceptance is no longer bounded by the'
+              echo 'absence of a caller and the release obligation in deny.toml applies. Resolve the'
+              echo 'advisory - or remove the acceptance if it is stale - before landing this.'
+              strings -a "${artifact}" | grep -o -E "${pattern}[^ ]*" | sort -u | head -20
+              verdict=1
+            fi
+          done
+          if [ "${verdict}" -ne 0 ]; then
+            exit 1
+          fi
+
+          # NON-VACUITY. Finding nothing proves nothing unless the same command
+          # finds something it should. rustls is used by this workspace and is
+          # not advisory-affected, so it is the control: zero hits for it would
+          # mean the artifact carries no embedded source paths at all, and the
+          # loop above would then be passing for the wrong reason.
+          control="$(strings -a target/release/libcurl.so | grep -c -E '/rustls-[0-9]' || true)"
+          echo "control: ${control} rustls reference(s) in libcurl.so"
+          if [ "${control}" -eq 0 ]; then
+            echo 'FAIL: the control crate is absent from the artifact, so the check above is vacuous.'
+            echo 'Either the artifact carries no embedded source paths, or this pattern no longer'
+            echo 'matches the form they take. Fix the pattern; do not weaken the assertion.'
+            exit 1
+          fi
+
+          echo 'no shipped artifact contains code from any advisory-affected crate, so every accepted'
+          echo 'advisory is still bounded by the absence of a caller'
+
       - name: 'assert: no C TLS, compression or SSH library, and ring present'
         run: |
           # WHY THIS STEP AND THE NEXT ONE EXIST
@@ -1259,3 +1354,54 @@ jobs:
           git diff --exit-code -- deny.toml rust-toolchain.toml
           git diff --exit-code -- Cargo.toml curl-rs-lib/Cargo.toml curl-rs/Cargo.toml curl-rs-ffi/Cargo.toml
           echo 'Cargo.lock, deny.toml, rust-toolchain.toml and the four manifests are byte-identical to the committed state'
+
+      - name: 'report: the specification requirements this graph does NOT satisfy'
+        run: |
+          set -eu
+          # THE POINT OF THIS LEG IS NOT ONLY WHAT PASSES.
+          #
+          # Every assertion above is a green result about the dependency graph,
+          # and read alone they add up to a claim this workspace cannot make:
+          # that the frozen dependency inventory of specification 0.5.1 is
+          # implemented as written. It is not. Four rows cannot be implemented
+          # without failing a DIFFERENT requirement of the same specification -
+          # a yanked transitive dependency, an unmaintained-crate advisory, a
+          # wire-format freeze, and an MSRV floor - and each is recorded in
+          # machine-readable form under
+          # [workspace.metadata.curl-rs.blocked-aap-gates] with its evidence and
+          # the owner of the decision that would unblock it.
+          #
+          # This step prints them, next to the passes, so a reader of this leg
+          # cannot come away with the green half alone. It is deliberately a
+          # REPORT and not an assertion: the rows describe decisions nobody in
+          # this repository may take, so failing on their presence would fail
+          # every run for a state that is correctly recorded. Their staleness IS
+          # asserted, on every build, by check_blocked_aap_gates in
+          # curl-rs-ffi/build.rs - the gate that fails if a row stops describing
+          # the pin it names.
+          echo '::group::blocked specification gates'
+          awk '
+            /^\[workspace\.metadata\.curl-rs\.blocked-aap-gates\./ {
+              inrow = 1
+              name = $0
+              sub(/.*blocked-aap-gates\./, "", name)
+              sub(/\]$/, "", name)
+              printf "\n  %s\n", name
+              next
+            }
+            /^\[/ { inrow = 0 }
+            inrow && /^(aap-section|requirement|delivered|blocks|decision-owner) *=/ {
+              printf "    %s\n", $0
+            }
+          ' Cargo.toml
+          echo '::endgroup::'
+
+          rows="$(grep -c '^\[workspace\.metadata\.curl-rs\.blocked-aap-gates\.' Cargo.toml || true)"
+          if [ "${rows}" -eq 0 ]; then
+            echo 'FAIL: no blocked-gate rows are declared. That is either a claim of full'
+            echo 'inventory compliance - which must be stated explicitly rather than implied by'
+            echo 'an absence - or a table that was deleted rather than emptied.'
+            exit 1
+          fi
+          echo "${rows} specification requirement(s) are recorded as BLOCKED; this leg's green"
+          echo 'assertions above cover the graph that was actually built, not the inventory as written.'

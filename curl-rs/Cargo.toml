@@ -216,6 +216,22 @@ path = "src/main.rs"
 # The diagnostic binary, from src/curlinfo.c: it reports which features are
 # disabled that would otherwise exist, which regular `curl -V` output does not
 # show. Not installed, exactly as upstream.
+#
+# THE INSTALLABLE SET OF THIS PACKAGE IS `curl` AND NOTHING ELSE. That is the
+# authority a packaging step is to follow, and it is stated as a rule here
+# rather than left to be inferred from the two [[bin]] blocks, because Cargo has
+# no `noinst` concept: it builds both targets into the same directory and marks
+# neither, so anything assembling a distribution has to be told which one ships.
+# Upstream draws the line explicitly - src/Makefile.am:49 `bin_PROGRAMS = curl`
+# against :51-52 `noinst_PROGRAMS = curlinfo`, and src/CMakeLists.txt:111
+# `add_executable(curlinfo EXCLUDE_FROM_ALL "curlinfo.c")` agrees - so shipping
+# curlinfo would add a binary to /usr/bin that no curl release has ever
+# installed, under a name nothing else claims.
+#
+# It is still BUILT, and must be: tests/runtests.pl:537-546 runs it and folds
+# every `<name>: ON` row into the same %feature map the version banner feeds, so
+# the test suite needs the artifact present in the build tree. Built, used, not
+# installed - which is exactly what `noinst_PROGRAMS` means.
 [[bin]]
 name = "curlinfo"
 path = "src/bin/curlinfo.rs"
@@ -521,7 +537,7 @@ negotiate = ["curl-rs-lib/negotiate"]
 # It forwards to the engine's feature of the same name, and that is all it can
 # do: the engine currently backs the name with NO dependency, so enabling it
 # builds and changes nothing observable. It is not a silent no-op either -- the
-# engine's `ENGINE_DNS` row is absent, so `curl --version` withholds the resolver
+# engine's `ENGINE_DNS` row cannot execute, so `curl --version` withholds the resolver
 # token at every feature setting rather than naming a resolver that is not there.
 # curl-rs-lib/Cargo.toml carries the measurement
 # behind that -- the two open hickory advisories are fixed only in a 0.26 line

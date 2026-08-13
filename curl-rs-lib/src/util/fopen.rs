@@ -25,132 +25,6 @@
 //! Atomic-replace file creation for curl's persisted state files, and the one
 //! cross-platform seek helper.
 //!
-//! Supersedes `lib/curl_fopen.c` (159 lines) with `lib/curl_fopen.h` (32),
-//! which AAP 0.4.1 maps onto this file, together with the cross-platform
-//! residue of `lib/curlx/fopen.c` -- `curlx_fseek` at `:28-39` -- and the
-//! non-Windows half of `lib/curlx/fopen.h` (88 lines).
-//!
-//! # The three consumers, all of them "save a state file safely"
-//!
-//! Measured by reading every call site rather than by inference:
-//!
-//! | Call site | What it saves |
-//! |---|---|
-//! | `lib/cookie.c:1483` | the Netscape cookie jar |
-//! | `lib/altsvc.c:371` | the Alt-Svc cache |
-//! | `lib/hsts.c:349` | the HSTS cache |
-//!
-//! There is no fourth. That is why the C wraps the whole translation unit in
-//!
-//! ```text
-//! #if !defined(CURL_DISABLE_COOKIES) || !defined(CURL_DISABLE_ALTSVC) || \
-//!   !defined(CURL_DISABLE_HSTS)
-//! ```
-//!
-//! at `lib/curl_fopen.c:26-27`, and all three of those knobs map onto real
-//! names in this workspace's fifteen-name feature vocabulary. The
-//! atomic-replace surface below is therefore gated on
-//! `any(feature = "cookies", feature = "altsvc", feature = "hsts")`.
-//!
-//! # Two guards, not one -- and why there is no inner `#![cfg]`
-//!
-//! The obvious way to express that gate is an inner attribute on the whole
-//! file, which is the form `crate::util::fnmatch` uses for its `ftp` gate.
-//! It is **rejected here**, and the reason is a measurement rather than a
-//! preference: the two C translation units this file supersedes carry
-//! **different** guards.
-//!
-//! * `lib/curl_fopen.c` is guarded by the three-knob `#if` quoted above.
-//! * `lib/curlx/fopen.c` is guarded by **nothing at all**. `curlx_fseek` is
-//!   compiled unconditionally, and its consumers are `lib/mime.c:641`,
-//!   `lib/formdata.c:796`, `src/tool_formparse.c:244`,
-//!   `src/tool_operate.c:568` and `src/tool_paramhlp.c:131` -- none of which
-//!   is a cookie, an Alt-Svc or an HSTS consumer.
-//!
-//! An inner `#![cfg]` would delete [`fseek`] along with everything else at
-//! `--no-default-features`, hiding it from `crate::mime`, which is
-//! unconditional. So the gate is written per item: it appears on exactly the
-//! items that came from `lib/curl_fopen.c`, and the seek surface below it
-//! carries none. The repetition is the price of reproducing the C's guard
-//! placement rather than approximating it, and it is greppable:
-//! `grep -c 'feature = "cookies"'` counts the guarded surface.
-//!
-//! # The injected randomness, and why the layering forced it
-//!
-//! The C composes its temporary name from 40 random alphanumeric characters
-//! obtained with `Curl_rand_alnum(data, randbuf, sizeof(randbuf))`
-//! (`lib/curl_fopen.c:109`). `Curl_rand_alnum` lives in `lib/rand.c`, which
-//! AAP 0.4.1 maps onto `crate::crypto::rand` -- a **sibling** of this
-//! directory, not a descendant.
-//!
-//! `crate::util` depends on nothing inside this crate except
-//! [`crate::error`], and every other module here depends on `util`. A `use
-//! crate::crypto::rand` on this line would invert the crate's dependency
-//! graph, so the randomness is **injected**: [`open_for_write`] takes a
-//! provider and calls it. `crate::util`'s own module documentation records
-//! this file as one of the two places where that rule is satisfied by
-//! parameterization rather than by luck.
-//!
-//! The provider is an `FnOnce() -> CodeResult<String>`, and both halves of
-//! that choice are deliberate:
-//!
-//! * **`FnOnce`, not `FnMut`.** The C reaches `Curl_rand_alnum` at most once
-//!   per call, and *not at all* on the not-a-regular-file path, because
-//!   `:103` returns before `:109` is reached. Taking the provider by value
-//!   and simply not calling it reproduces that exactly.
-//! * **Returning `CodeResult`, not `String`.** `Curl_rand_alnum` returns a
-//!   `CURLcode`, and `:110-111` propagates it unchanged. A provider that
-//!   could not fail would silently delete a failure mode the C has.
-//!
-//! The C's `struct Curl_easy *data` parameter existed **only** to reach that
-//! one call, so it is dropped entirely: nothing in this module sees a handle.
-//!
-//! ## The provider's contract, pinned here so the two cannot drift
-//!
-//! Reproducing the alphabet and the length is the provider's job, but the
-//! contract belongs beside the consumer that depends on it. Measured from
-//! `lib/rand.c:258-283`:
-//!
-//! ```text
-//! static const char alnum[] =
-//!   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-//!
-//! CURLcode Curl_rand_alnum(struct Curl_easy *data, unsigned char *rnd,
-//!                          size_t num)
-//! {
-//!   const unsigned int alnumspace = sizeof(alnum) - 1;
-//!   DEBUGASSERT(num > 1);
-//!   num--; /* save one for null-termination */
-//!   while(num) {
-//!     do {
-//!       result = randit(data, &r, TRUE);
-//!       if(result) return result;
-//!     } while(r >= (UINT_MAX - UINT_MAX % alnumspace));
-//!     *rnd++ = (unsigned char)alnum[r % alnumspace];
-//!     num--;
-//!   }
-//!   *rnd = 0;
-//! }
-//! ```
-//!
-//! Four facts follow, and the third is the one that is easy to get wrong:
-//!
-//! 1. The alphabet is [`RAND_ALPHABET`]: 26 upper, 26 lower, 10 digits,
-//!    **62** characters, so `alnumspace` is 62.
-//! 2. Values are drawn with **rejection sampling** to avoid modulo bias:
-//!    `r >= UINT_MAX - UINT_MAX % 62` is redrawn. With `UINT_MAX` at
-//!    4294967295 and `4294967295 % 62 == 3`, the threshold is **4294967292**,
-//!    so exactly the four values `4294967292..=4294967295` are discarded.
-//! 3. The caller declares `unsigned char randbuf[41]` and passes
-//!    `sizeof(randbuf)`, and `Curl_rand_alnum` spends one of those bytes on
-//!    the terminator. **The string is 40 characters long, not 41** --
-//!    [`RAND_SUFFIX_LEN`]. A reading of "41 characters" is wrong and would
-//!    lengthen every temporary name by one.
-//! 4. `DEBUGASSERT(num > 1)` is the C's only check on the length, and it is
-//!    debug-only. [`open_for_write`] mirrors that severity: it
-//!    `debug_assert!`s the returned suffix against both constants and does
-//!    not re-check in a release build.
-//!
 //! # `Curl_fopen`, in the C's own words
 //!
 //! Reproduced verbatim from `lib/curl_fopen.c:78-84`:
@@ -165,16 +39,16 @@
 //!  */
 //! ```
 //!
-//! # NOTE: step one TRUNCATES the target before it reads the mode
+//! # NOTE: step one no longer truncates the target, and that is deliberate
 //!
 //! `lib/curl_fopen.c:99` opens the *target* with `FOPEN_WRITETEXT`, which is
 //! `"w"` on all four mandated targets (`lib/curl_setup.h:1259`; the `"wt"`
 //! spelling at `:1245` is the DOS branch). `"w"` is
-//! `O_WRONLY | O_CREAT | O_TRUNC`, so **the existing file is emptied before
-//! its mode is stat'd** -- and it is emptied on the temporary-file path too,
-//! where it then sits as a zero-length placeholder until the caller's rename
-//! replaces it. If the save fails after that point, the previous contents are
-//! already gone.
+//! `O_WRONLY | O_CREAT | O_TRUNC`, so in the C **the existing file is emptied
+//! before its mode is stat'd** -- and it is emptied on the temporary-file path
+//! too, where it then sits as a zero-length placeholder until the caller's
+//! rename replaces it. If the save fails after that point, the previous
+//! contents are already gone.
 //!
 //! Measured, not inferred: a C probe that wrote `old contents` to a target
 //! with mode `0600`, called `fopen(path, "w")` and then `fstat`ed the
@@ -194,11 +68,87 @@
 //! completeness, because a reader checking the header will find all three
 //! together.
 //!
-//! This is an upstream wart. It is reproduced rather than repaired, because
-//! AAP 0.8.1 freezes observable behaviour and AAP 0.1.1 settles the tie in
-//! favour of faithfulness. The note is prominent because the natural Rust
-//! expression -- a read-only `fs::metadata(path)` call -- would quietly
-//! change it, and nothing in the test corpus would say so.
+//! **`O_TRUNC` is not reproduced here.** It was, and the deviation is recorded
+//! rather than quietly taken -- see [the hardening section](#the-hardening-of-step-one)
+//! immediately below for why, and for the two other things step one now does
+//! that the C does not.
+//!
+//! # The hardening of step one
+//!
+//! Three changes to step one, all of them within the C's *contract* -- which
+//! file is opened and what the caller may then do with it -- and none of them
+//! touching a byte that reaches a socket, a flag the user types, or an
+//! exported signature. AAP 0.8.1 freezes protocol wire behaviour, CLI flag
+//! semantics, libcurl API signatures, test definitions and default option
+//! values; a permission bit on a state file and whether a symbolic link is
+//! followed are none of those five. The precedent is
+//! [`crate::tls::keylog`], which hardens its own open with the same reasoning
+//! recorded in the same way.
+//!
+//! ## 1. No `O_TRUNC`
+//!
+//! Opening the *final target* with `O_CREAT | O_TRUNC` before the protected
+//! temporary file exists is a destructive primitive that a caller cannot opt
+//! out of: any process that can create a name in the output directory can
+//! aim it at a file it could not otherwise write, and a more privileged curl
+//! empties that file on its behalf. CWE-22, and CWE-367 for the window
+//! between the open and the rename.
+//!
+//! Removing it costs nothing observable on the success path. The temporary
+//! file is renamed *over* the target, so the target's previous contents are
+//! replaced wholesale either way -- truncating first only decides whether the
+//! file is briefly empty in between. On the *failure* path the previous
+//! contents now survive, which is the behaviour a reader of
+//! [`OpenedFile::discard`] would expect and the opposite of the wart the C
+//! documents.
+//!
+//! ## 2. `O_NOFOLLOW`, injected
+//!
+//! A final path component that is a symbolic link now makes the open fail
+//! rather than resolve. CWE-59.
+//!
+//! The flag's *value* is injected as [`NoFollow`] rather than named here, and
+//! that is the layering rule of [`crate::util`] rather than a stylistic
+//! choice: `O_NOFOLLOW` is a `libc` integer whose value differs between Linux
+//! and macOS, `crate::ffi` is the only directory in this crate permitted to
+//! name `libc`, and `util` may not import `crate::ffi`. The module
+//! documentation for `crate::util` gives the remedy for exactly this shape of
+//! problem -- "take the value as a parameter instead" -- and this module
+//! already applies it once, to the random suffix.
+//!
+//! What this does *not* refuse is a target that is not a regular file. A
+//! character device, a FIFO and a directory all still reach the early-success
+//! path below, because `--cookie-jar /dev/null` is a documented idiom and
+//! discarding cookies is a legitimate thing to ask for. `O_NOFOLLOW` and the
+//! `S_ISREG` test answer different questions: the first is about a name an
+//! attacker planted, the second about a file the user chose.
+//!
+//! One undocumented spelling is lost and is named here rather than left to be
+//! discovered: `--cookie-jar /dev/stdout` no longer works on Linux, because
+//! `/dev/stdout` is itself a symbolic link to `/proc/self/fd/1`. The
+//! documented route to standard output is the literal `-`
+//! (`docs/cmdline-opts/cookie-jar.md:27`), which `lib/cookie.c:1477-1481`
+//! intercepts before this module is reached, and no fixture in
+//! `tests/data/test*` names `/dev/stdout`.
+//!
+//! ## 3. A private mode for the credential store
+//!
+//! [`StoreClass`] splits the three consumers in two. The Alt-Svc and HSTS
+//! caches are [`StoreClass::Public`] and keep the C's mode handling exactly:
+//! the temporary file is created at `S_IRUSR | S_IWUSR | sb.st_mode`, so an
+//! existing file's mode is cloned. The cookie jar is
+//! [`StoreClass::Credential`] and is created at `0600` regardless -- it holds
+//! session credentials, and `0666 & ~umask` is normally `0644`, which makes a
+//! first-ever jar readable by every local user.
+//!
+//! Forcing the mode rather than refusing an already-permissive jar is
+//! deliberate. Refusing would fail a command the user typed, which *is* CLI
+//! behaviour; forcing repairs a `0644` jar left behind by a C curl on the next
+//! save and never fails. It also removes the need to compare the target's
+//! owner against this process's effective user id, which would have broken
+//! `sudo curl -c ~/.cookies` -- where the file legitimately belongs to
+//! somebody other than the caller -- and which would have required a second
+//! injected value for no gain.
 //!
 //! # NOTE: the early-success path is the entire reason step one exists
 //!
@@ -399,16 +349,6 @@
 //!
 //! ## The excluded Windows surface, named so the exclusion is visible
 //!
-//! `lib/curlx/fopen.c` is 508 lines and its `#ifdef _WIN32` opens at `:41` and
-//! runs to the end of the file, so roughly 467 lines are excluded by the
-//! four-target boundary of AAP 0.2.2 rather than migrated. Named in full:
-//! `curlx_CreateFile`, `curlx_win32_fopen`, `curlx_win32_freopen`,
-//! `curlx_win32_stat`, `curlx_win32_open`, `curlx_win32_rename`, the
-//! `_fstati64` and `struct _stati64` aliases, `_close`, `_fdopen`,
-//! `_O_WRONLY | _O_CREAT | _O_EXCL` with `_S_IREAD | _S_IWRITE`, and the
-//! `_SH_DENYNO` share mode from `<share.h>`. `_fseeki64` goes with them; see
-//! [`fseek`].
-//!
 //! Two further C branches are excluded by the same boundary and are recorded
 //! because they are the *only* places the C's own logic differs by platform:
 //! the `MSDOS`/`OS2` separator branch at `lib/curl_fopen.c:47-49`, where
@@ -429,12 +369,18 @@
 //! # Conventions this file holds itself to
 //!
 //! No `unsafe` and no `libc`. The two extension traits this module needs --
-//! [`std::os::unix::fs::OpenOptionsExt`] for the cloned mode and
-//! [`std::os::unix::ffi::OsStrExt`] for the byte view of a path -- are
-//! ordinary safe traits, so the crate root's `#![deny(unsafe_code)]` needs no
-//! exemption here and none is taken. Both are `#[cfg(unix)]`, and all four
-//! mandated targets are Unix, so no configuration guard is written --
-//! consistent with `crate::tls::keylog`, which names the same omission.
+//! [`std::os::unix::fs::OpenOptionsExt`] for the cloned mode, the private mode
+//! and the injected open flag, and [`std::os::unix::ffi::OsStrExt`] for the
+//! byte view of a path -- are ordinary safe traits, so the crate root's
+//! `#![deny(unsafe_code)]` needs no exemption here and none is taken. Both are
+//! `#[cfg(unix)]`, and all four mandated targets are Unix, so no configuration
+//! guard is written -- consistent with `crate::tls::keylog`, which names the
+//! same omission.
+//!
+//! `O_NOFOLLOW` is the one platform constant this module needs and cannot
+//! name, which is why it arrives as [`NoFollow`]; see
+//! [the hardening section](#the-hardening-of-step-one). Nothing else about the
+//! import list changes: no `libc`, and no `crate::ffi`.
 //!
 //! Blocking I/O, with no `async` and no `tokio::fs`. Saving a state file is
 //! synchronous in curl and stays synchronous here; the asynchrony in this
@@ -442,8 +388,9 @@
 //! write would change when it happens relative to teardown.
 //!
 //! Imports are `std`, [`crate::error`] and [`crate::util::dynbuf`], and
-//! nothing else -- in particular not `crate::crypto`, for the reason given
-//! above. Every item is `pub(crate)`: nothing here backs an exported symbol,
+//! nothing else -- in particular not `crate::crypto` and not `crate::ffi`, for
+//! the reasons given above. Every item is `pub(crate)`: nothing here backs an
+//! exported symbol,
 //! `grep -i fopen lib/libcurl.def` finds nothing, and per AAP 0.8.7 no
 //! internal is widened to make `tests/unit` or `tests/libtest` link. The C
 //! stems are kept so that a grep against `lib/curl_fopen.c` still lands.
@@ -480,14 +427,6 @@ use crate::error::{CURLcode, CodeResult};
 use crate::util::dynbuf::{DynBuf, DYN_APRINTF};
 
 /// The path separator this module appends, as bytes.
-///
-/// `PATHSEP` at `lib/curl_fopen.c:51`, the `#else` branch of the three-way
-/// split at `:44-53`. The other two branches -- `_WIN32` at `:45` and
-/// `MSDOS`/`OS2` at `:48` -- both spell it as a backslash and both are outside
-/// the four-target boundary, so this is the only value that can arise.
-///
-/// A byte slice rather than a `char`, because the whole of `dirslash` works in
-/// bytes and the C appends it with `curlx_dyn_addn(&out, PATHSEP, 1)`.
 #[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
 const PATHSEP: &[u8] = b"/";
 
@@ -501,55 +440,19 @@ const PATHSEP: &[u8] = b"/";
 const TEMP_SUFFIX: &[u8] = b".tmp";
 
 /// `CURL_MAX_INPUT_LENGTH`, the ceiling `dirslash` gives its dynbuf.
-///
-/// `8000000` at `lib/urldata.h:131`, passed at `lib/curl_fopen.c:60`. Eight
-/// million exactly, not eight mebibytes -- the C literal is decimal.
-///
-/// Held as a file-local constant rather than imported, matching
-/// `crate::util::bufref`, which transcribes the same value for the same
-/// reason: it belongs to `lib/urldata.h`, which has no single Rust successor,
-/// so each consumer of it carries its own transcription with its own citation.
 #[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
 const MAX_INPUT_LENGTH: usize = 8_000_000;
 
 /// The length, in characters, of the random component of a temporary name.
-///
-/// **Forty, not forty-one.** The caller declares `unsigned char randbuf[41]`
-/// and passes `sizeof(randbuf)` (`lib/curl_fopen.c:89`, `:109`), and
-/// `Curl_rand_alnum` opens with `num--; /* save one for null-termination */`
-/// (`lib/rand.c:269`), so one of the 41 bytes is the terminator that a Rust
-/// `String` does not have.
-///
-/// Published because the provider passed to [`open_for_write`] has to satisfy
-/// it and lives in a different directory; keeping the number here is what
-/// stops the two from drifting apart silently.
 #[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
 pub(crate) const RAND_SUFFIX_LEN: usize = 40;
 
 /// The alphabet the random component is drawn from.
-///
-/// Transcribed character for character from `alnum[]` at `lib/rand.c:258-259`.
-/// Sixty-two characters: 26 upper case, then 26 lower case, then 10 digits,
-/// in that order. The count is what `lib/rand.c:265` calls `alnumspace`, and
-/// it is what sets the rejection threshold recorded in the module
-/// documentation, so the length of this array is load-bearing rather than
-/// incidental.
-///
-/// Typed as a fixed-size array so that the 62 is checked by the compiler
-/// rather than by a comment.
 #[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
 pub(crate) const RAND_ALPHABET: &[u8; 62] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 /// True when `byte` is a path separator on the four mandated targets.
-///
-/// `IS_SEP` at `lib/curl_fopen.c:52`, which on the `#else` branch tests
-/// against `'/'` and nothing else. The `_WIN32` branch at `:46` accepts a
-/// backslash as well; that branch is out of scope, so a backslash here is an
-/// ordinary filename character -- which is why `dirslash(b"a\\b")` is `""` and
-/// not `"a\\"`.
-///
-/// A `const fn` so that it reads as the macro it replaces.
 #[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
 const fn is_sep(byte: u8) -> bool {
     byte == b'/'
@@ -557,11 +460,6 @@ const fn is_sep(byte: u8) -> bool {
 
 /// Returns the directory component of `path`, up to *and including* one final
 /// separator, or an empty vector when `path` has no directory component.
-///
-/// Supersedes `dirslash` (`lib/curl_fopen.c:55-76`). The C's own description
-/// of it, and the sixteen-row table of measured outputs including the one
-/// corrected row, are in the module documentation above; this comment covers
-/// the mechanism.
 ///
 /// The C is four lines of index arithmetic and this is a line-for-line
 /// reading of it:
@@ -660,19 +558,6 @@ pub(crate) fn dirslash(path: &[u8]) -> CodeResult<Vec<u8>> {
 /// }
 /// ```
 ///
-/// The composition order is part of the behaviour and is preserved literally:
-/// the directory component *including* its trailing separator, then the
-/// forty random characters, then `.tmp`. When the directory component is empty
-/// -- a bare filename, or the corrected root case -- the name is relative and
-/// the file lands in the process's current working directory.
-///
-/// The buffer is given [`DYN_APRINTF`] rather than [`MAX_INPUT_LENGTH`],
-/// because that is the ceiling `curl_maprintf` actually imposes:
-/// `curl_mvaprintf` initialises its own dynbuf with it at
-/// `lib/mprintf.c:1144`. The two happen to be the same number, and they are
-/// still kept distinct, because they are different constants that could be
-/// changed independently upstream.
-///
 /// # Errors
 ///
 /// Either ceiling, surfaced as the buffer's own code. [`open_for_write`]
@@ -696,26 +581,14 @@ fn temp_name(filename: &Path, rand_suffix: &str) -> CodeResult<PathBuf> {
 
 /// A state file opened for writing, and whether it still needs a rename.
 ///
-/// Supersedes the pair of out-parameters `FILE **fh` and `char **tempname`
-/// that `Curl_fopen` writes through (`lib/curl_fopen.c:85-86`). The C's
-/// contract is carried entirely by whether `*tempname` came back `NULL`, and
-/// its own summary comment says so: *"if 'tempname' is non-NULL, it needs a
-/// rename after the file is written."*
-///
-/// An `(File, Option<PathBuf>)` tuple would reproduce that literally. This is
-/// an enumeration instead, for one reason: a tuple lets a caller ignore the
-/// `None` and reach for a rename anyway, whereas [`Self::Direct`] has no path
-/// to rename *from*. The distinction is not cosmetic -- it is what keeps
-/// `--cookie-jar /dev/null` working.
-///
 /// # No `Drop`, deliberately
 ///
 /// A `Drop` implementation that removed an uncommitted temporary file would be
-/// an improvement, and it is not made, because AAP 0.8.1 freezes observable
-/// behaviour: `Curl_fopen` does not unlink on the way out, and all three
-/// consumers unlink for themselves. [`Self::discard`] is that unlink, written
-/// once. `#[must_use]` on [`open_for_write`] is the Rust-shaped nudge that
-/// costs no behaviour.
+/// an improvement, and it is not made, because observable behaviour is frozen:
+/// `Curl_fopen` does not unlink on the way out, and all three consumers unlink
+/// for themselves. [`Self::discard`] is that unlink, written once.
+/// `#[must_use]` on [`open_for_write`] is the Rust-shaped nudge that costs no
+/// behaviour.
 #[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -725,20 +598,29 @@ pub(crate) enum OpenedFile {
     ///
     /// The C's early success at `lib/curl_fopen.c:102-104`: `fstat` failed, or
     /// `S_ISREG` was false. `*fh` is the open target and `*tempname` is
-    /// `NULL`. `/dev/null`, `/dev/stdout`, a FIFO and a character device all
-    /// arrive here -- measured: `/dev/null` reports `st_mode == 020666` with
-    /// `S_ISREG == 0`.
+    /// `NULL`. `/dev/null`, a FIFO and a character device all arrive here --
+    /// measured: `/dev/null` reports `st_mode == 020666` with `S_ISREG == 0`.
+    ///
+    /// `/dev/stdout` no longer arrives here on Linux, because it is a symbolic
+    /// link and step one now passes `O_NOFOLLOW`; see the module
+    /// documentation, which names that consequence and the documented `-`
+    /// spelling that replaces it.
     Direct {
-        /// The target itself, open for writing and already truncated.
+        /// The target itself, open for writing.
+        ///
+        /// **Not** truncated: step one no longer passes `O_TRUNC`. For the
+        /// character devices and FIFOs that reach this variant the flag never
+        /// meant anything anyway, and the module documentation records why it
+        /// is gone for the regular-file path too.
         file: File,
     },
 
     /// The target is a regular file, so write here and then rename over it.
     ///
     /// The C's ordinary path: `*fh` is a fresh descriptor on `tempstore` and
-    /// `*tempname` is that name. The target has *already* been truncated to
-    /// zero length by step one and sits there as a placeholder until the
-    /// rename replaces it.
+    /// `*tempname` is that name. The target still holds its previous contents
+    /// -- step one no longer truncates it -- until the rename replaces it
+    /// wholesale, so a save that fails leaves the old state file intact.
     Temp {
         /// The temporary file, created with `O_EXCL` and the cloned mode.
         file: File,
@@ -766,12 +648,6 @@ impl OpenedFile {
     }
 
     /// The temporary path, or `None` when there is nothing to rename.
-    ///
-    /// The direct reading of the C's `*tempname`, for a caller that needs the
-    /// primitive rather than [`Self::commit`] -- `lib/cookie.c` is one, because
-    /// its `stdout` path at `:1477-1481` bypasses this module entirely and it
-    /// then tests `if(!use_stdout)` and `if(tempstore)` separately at
-    /// `:1530-1537`.
     pub(crate) fn temp_path(&self) -> Option<&Path> {
         match self {
             Self::Direct { .. } => None,
@@ -812,15 +688,6 @@ impl OpenedFile {
     /// * **The unlink's own failure is ignored.** The C does not test
     ///   `unlink`'s return value, so neither does this.
     ///
-    /// `target` is taken as an argument rather than stored, because that is
-    /// the C's shape -- `curlx_rename(tempstore, file)` names the destination
-    /// at the call site -- and all three consumers pass back the same path
-    /// they passed to `Curl_fopen`.
-    ///
-    /// [`Self::Direct`] closes and returns success, performing no rename. That
-    /// is not a special case bolted on: it is the whole reason the two
-    /// variants are distinguished.
-    ///
     /// # Errors
     ///
     /// `CURLcode::WriteError` if the rename fails, matching the C's single
@@ -857,22 +724,181 @@ impl OpenedFile {
     /// unlink(tempstore);` at `lib/hsts.c:365-366`, `lib/altsvc.c:389-390` and
     /// -- with the close folded in -- `lib/cookie.c:1549-1554`.
     ///
-    /// A caller reaches here when the *contents* failed to serialise, which is
-    /// the only way the C's consumers get a non-zero `result` after
-    /// `Curl_fopen` has already succeeded. It is also the home of the one
-    /// cleanup the C performs inside `Curl_fopen` itself, at `:149-152`,
-    /// which has no reachable counterpart in this module: the C arrives there
-    /// only from a failed `fdopen`, and `fdopen` does not exist here.
-    ///
-    /// [`Self::Direct`] closes and does nothing else -- there is no temporary
-    /// file to remove, and removing the *target* would destroy a device node.
-    ///
     /// Returns nothing, because the C ignores `unlink`'s return value.
     pub(crate) fn discard(self) {
         if let Self::Temp { file, temp_path } = self {
             drop(file);
             let _ = fs::remove_file(&temp_path);
         }
+    }
+}
+
+/// Which of the three state files is being written, and therefore how private
+/// its mode must be.
+///
+/// The C makes no such distinction: `Curl_fopen` clones the target's mode for
+/// all three consumers, so a cookie jar that did not previously exist is
+/// created at `0666 & ~umask` -- normally `0644`, readable by every local user
+/// -- and keeps that mode for the rest of its life. The Alt-Svc and HSTS
+/// caches are public knowledge and that is fine for them; a jar of session
+/// cookies is a credential store and it is not.
+///
+/// Splitting the two is what lets the mode policy differ without the caller
+/// having to know a mode number. See
+/// [the hardening section](index.html#the-hardening-of-step-one) of the module
+/// documentation for why this is a permitted deviation from AAP 0.8.1 and why
+/// the jar's mode is *forced* rather than an existing permissive jar refused.
+#[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum StoreClass {
+    /// The Alt-Svc cache (`lib/altsvc.c:371`) and the HSTS cache
+    /// (`lib/hsts.c:349`).
+    ///
+    /// Mode handling is the C's, unchanged: created at `fopen`'s `0666` when
+    /// absent, and the temporary file is created at
+    /// `S_IRUSR | S_IWUSR | sb.st_mode`, cloning whatever the target already
+    /// had. Neither file holds a secret -- an Alt-Svc entry is a hostname the
+    /// server advertised in the clear, and an HSTS entry is a hostname that
+    /// asked for HTTPS -- so there is nothing here to protect from a local
+    /// reader and no reason to diverge.
+    Public,
+
+    /// The Netscape cookie jar (`lib/cookie.c:1483`).
+    ///
+    /// Created at `0600` and written through a temporary file created at
+    /// `0600`, so neither the placeholder nor the finished jar is ever
+    /// readable by another local user, and a `0644` jar inherited from a C
+    /// curl is repaired by the next save rather than cloned forward.
+    Credential,
+}
+
+#[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
+impl StoreClass {
+    /// The mode step one asks for when the target does not yet exist.
+    ///
+    /// `0o666` for [`Self::Public`] is `fopen`'s own default and therefore the
+    /// C's behaviour exactly; `OpenOptions` would have used it anyway, and it
+    /// is written out so that the two classes read as one decision rather than
+    /// as one decision and one omission.
+    ///
+    /// The kernel masks either value with the umask, so both are ceilings.
+    const fn creation_mode(self) -> u32 {
+        match self {
+            Self::Public => 0o666,
+            Self::Credential => PRIVATE_FILE_MODE,
+        }
+    }
+
+    /// The mode step four asks for when creating the temporary file.
+    ///
+    /// `target_mode` is the full `st_mode` word from `fstat`, file-type bits
+    /// included. `open(2)` ignores every bit outside the permission set, so
+    /// passing it through unmasked is safe and is what the C does -- see step
+    /// four.
+    ///
+    /// [`Self::Credential`] ignores `target_mode` entirely. That is the whole
+    /// point: cloning it is how a `0644` jar stays `0644` forever.
+    const fn temp_mode(self, target_mode: u32) -> u32 {
+        match self {
+            Self::Public => PRIVATE_FILE_MODE | target_mode,
+            Self::Credential => PRIVATE_FILE_MODE,
+        }
+    }
+
+    /// Whether an extra hard link to the target is grounds for refusing.
+    ///
+    /// Only for [`Self::Credential`]. A cookie jar with two names is not a
+    /// thing a user creates; it is what an attacker with write access to the
+    /// output directory leaves behind so that a copy of the jar survives under
+    /// a name they control. A legitimate jar has `st_nlink == 1`.
+    ///
+    /// The Alt-Svc and HSTS caches are exempt because there is nothing in them
+    /// worth linking to, and refusing would turn a harmless oddity into a
+    /// failed command.
+    const fn rejects_extra_links(self) -> bool {
+        matches!(self, Self::Credential)
+    }
+}
+
+/// `S_IRUSR | S_IWUSR` -- readable and writable by the owner alone.
+///
+/// Spelled once, as the octal the C's two macros expand to. It appears in
+/// three places: the mode step four unions into a public store's cloned mode
+/// (`lib/curl_fopen.c:135-136`), and the mode a credential store is created
+/// and written at.
+#[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
+/// The `O_NOFOLLOW` bit, injected because this module may not name `libc`.
+///
+/// `crate::util`'s layering rule forbids every file in this directory from
+/// importing `crate::ffi`, which is the only directory in this crate permitted
+/// to name `libc`, and the rule's own remedy is to take the value as a
+/// parameter. [`crate::tls::keylog`] imports the constant directly because
+/// `tls` is not bound by that rule; this module cannot, and hard-coding the
+/// number is worse than either -- it is `0o400000` on Linux/x86-64 and
+/// `0x0100` on macOS, so a literal would be silently wrong on one of the four
+/// mandated targets.
+///
+/// A newtype rather than a bare `i32` parameter, because a bare integer
+/// invites a caller to pass `0` and disable the guard without anything saying
+/// so -- the same shape of defect as a warning function called with literals.
+/// [`Self::new`] is the only way to build one, it refuses zero in a debug
+/// build, and [`Self::DISABLED`] exists so that a test which wants the
+/// unhardened behaviour has to say the word.
+#[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct NoFollow(i32);
+
+#[cfg(any(feature = "cookies", feature = "altsvc", feature = "hsts"))]
+impl NoFollow {
+    /// No guard at all, for the tests that exercise what the C does.
+    ///
+    /// Named rather than spelled `NoFollow::new(0)` so that
+    /// [`Self::new`]'s debug assertion can stay unconditional and so that
+    /// `grep DISABLED` finds every place the guard is deliberately absent.
+    ///
+    /// `#[allow(dead_code)]` and **not** `#[cfg(test)]`: no production caller
+    /// should ever want this, which is the point, but hiding it behind the test
+    /// gate would break the reference to it in this type's own documentation.
+    /// Its only use is [`the_guard_is_what_refuses_a_symlink`], which needs the
+    /// unguarded open in order to prove that the guarded one refuses for the
+    /// reason claimed.
+    ///
+    /// [`the_guard_is_what_refuses_a_symlink`]: index.html#the-hardening-of-step-one
+    #[allow(dead_code)]
+    pub(crate) const DISABLED: Self = Self(0);
+
+    /// Wraps the platform's `O_NOFOLLOW`, and anything else the caller wants
+    /// in the same flag word.
+    ///
+    /// `O_CLOEXEC` may be included and is harmless: [`std::fs::File`] already
+    /// sets it on every descriptor it opens, so passing it changes nothing and
+    /// documents the intent. `O_TRUNC` must **not** be included -- see the
+    /// module documentation -- and neither must `O_CREAT` or an access mode,
+    /// which [`OpenOptions`] owns.
+    ///
+    /// # Panics
+    ///
+    /// In a debug build only, if `flags` is zero, which would silently disable
+    /// the symlink guard. Use [`Self::DISABLED`] to mean that on purpose. A
+    /// release build proceeds, for the same reason the suffix contract below
+    /// is only debug-asserted: this is a wiring mistake, not a runtime
+    /// condition, and refusing to save a state file over it would be worse
+    /// than saving one unhardened.
+    pub(crate) fn new(flags: i32) -> Self {
+        debug_assert!(
+            flags != 0,
+            "NoFollow::new(0) disables the symlink guard; say NoFollow::DISABLED"
+        );
+        Self(flags)
+    }
+
+    /// The flag word, for [`OpenOptionsExt::custom_flags`].
+    const fn bits(self) -> i32 {
+        self.0
     }
 }
 
@@ -883,6 +909,10 @@ impl OpenedFile {
 /// injected-randomness rationale are all in the module documentation; this
 /// comment walks the five steps.
 ///
+/// `class` selects the mode policy: see [`StoreClass`]. `no_follow` carries the
+/// platform's `O_NOFOLLOW`, which this module may not name for itself: see
+/// [`NoFollow`].
+///
 /// `rand_suffix` is the injected randomness. It must return
 /// [`RAND_SUFFIX_LEN`] characters drawn from [`RAND_ALPHABET`], and it is
 /// called **at most once** -- never on the not-a-regular-file path, because
@@ -890,20 +920,28 @@ impl OpenedFile {
 ///
 /// # Steps
 ///
-/// 1. Open the target with `"w"`. **This truncates it.** Stat the descriptor.
-///    If the stat fails or the target is not a regular file, return
-///    [`OpenedFile::Direct`] with that handle -- the C's early `CURLE_OK`.
+/// 1. Open the target for writing, creating it if absent, with `no_follow` and
+///    **without** `O_TRUNC` -- see
+///    [the hardening section](index.html#the-hardening-of-step-one). Stat the
+///    descriptor. If the stat fails or the target is not a regular file,
+///    return [`OpenedFile::Direct`] with that handle -- the C's early
+///    `CURLE_OK`. If it is a regular file with an extra hard link and `class`
+///    refuses those, fail.
 /// 2. Close the target and ask `rand_suffix` for the random component.
 /// 3. Compose `<dirslash(filename)><suffix>.tmp`.
-/// 4. Create that name with `O_WRONLY | O_CREAT | O_EXCL` and mode
-///    `0o600 | <the target's own mode>`.
+/// 4. Create that name with `O_WRONLY | O_CREAT | O_EXCL` and the mode
+///    `class` chooses -- `0o600 | <the target's own mode>` for a public store,
+///    a flat `0o600` for the credential store.
 /// 5. `fdopen` -- eliminated. The [`File`] from step 4 *is* the handle.
 ///
 /// # Errors
 ///
-/// * `CURLcode::WriteError` if the target cannot be opened, or if the
-///   temporary file cannot be created -- which includes the case where the
-///   name already exists, because `O_EXCL` is the point of step 4.
+/// * `CURLcode::WriteError` if the target cannot be opened -- which now
+///   includes the case where its final component is a symbolic link, because
+///   that is what `no_follow` is for -- if a credential store's target has more
+///   than one hard link, or if the temporary file cannot be created, which
+///   includes the case where the name already exists, because `O_EXCL` is the
+///   point of step 4.
 /// * Whatever `rand_suffix` returned, unchanged.
 /// * `CURLcode::OutOfMemory` if the name cannot be composed.
 ///
@@ -918,6 +956,8 @@ impl OpenedFile {
               leaves the temporary file behind"]
 pub(crate) fn open_for_write<F>(
     filename: &Path,
+    class: StoreClass,
+    no_follow: NoFollow,
     rand_suffix: F,
 ) -> CodeResult<OpenedFile>
 where
@@ -928,22 +968,41 @@ where
     // `*fh = curlx_fopen(filename, FOPEN_WRITETEXT);` at `:99`.
     //
     // NOTE: `FOPEN_WRITETEXT` is `"w"` on the mandated targets
-    // (`lib/curl_setup.h:1259`), which is `O_WRONLY | O_CREAT | O_TRUNC`. THE
-    // TARGET IS TRUNCATED HERE, before its mode is read and before anything
-    // has been written. A read-only `fs::metadata(filename)` would look like
-    // the same thing and would not truncate, which is exactly why this is
-    // written out rather than tidied. See the module documentation.
+    // (`lib/curl_setup.h:1259`), which is `O_WRONLY | O_CREAT | O_TRUNC`.
     //
-    // The mode is left at `OpenOptions`' default of 0o666, which is `fopen`'s
-    // own, so a target that does not exist is created with the same
-    // umask-derived permissions the C gives it.
+    // THREE DELIBERATE DIVERGENCES, all justified in the module
+    // documentation's hardening section, which is the single place they are
+    // argued rather than four places they are half-argued:
+    //
+    //   * NO `.truncate(true)`. `O_TRUNC` on the *final target*, before the
+    //     protected temporary file exists, is a destructive primitive aimed by
+    //     whoever can create a name in this directory. Removing it is
+    //     invisible on the success path -- the rename replaces the contents
+    //     wholesale either way -- and on the failure path the old state file
+    //     now survives.
+    //   * `custom_flags(no_follow)` carries `O_NOFOLLOW`, so a symlinked final
+    //     component fails here instead of resolving. The value is injected
+    //     because this module may not name `libc`; see `NoFollow`.
+    //   * `.mode(class.creation_mode())` is `0o666` for a public store, which
+    //     is `fopen`'s own default and therefore no change at all, and `0o600`
+    //     for the credential store so that a jar which did not previously
+    //     exist is never created world-readable.
+    //
+    // A read-only `fs::metadata(filename)` would avoid the truncation too, and
+    // is still not used: it would stat the *path* rather than a descriptor,
+    // reintroducing the time-of-check/time-of-use gap that reading `fstat` off
+    // this handle closes.
     let target = OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .mode(class.creation_mode())
+        .custom_flags(no_follow.bits())
         .open(filename)
         // `if(!*fh) goto fail;` with `result` still holding its initial value
-        // from `:88`.
+        // from `:88`. `ELOOP` from `O_NOFOLLOW` arrives here, and collapses to
+        // the same code as every other reason the target would not open --
+        // which is what the C would report had the open failed for any reason,
+        // so no caller learns a distinction it did not previously have.
         .map_err(|_| CURLcode::WriteError)?;
 
     // `curlx_fstat(fileno(*fh), &sb)` at `:102`. `File::metadata` is `fstat`
@@ -954,16 +1013,6 @@ where
 
         // The `== -1` half of `:102`. EARLY SUCCESS: the handle stays open and
         // there is no temporary file and no rename.
-        //
-        // This arm is reproduced but is not reachable from a test, and so is
-        // the one line of this function that coverage reports as unvisited:
-        // `fstat` on a descriptor that has just been opened successfully does
-        // not fail, and safe Rust offers no way to make it. It is kept because
-        // the C keeps it, and because `EOVERFLOW` on a pathological filesystem
-        // is the one real way to arrive here -- in which case writing the
-        // target directly is exactly the right thing to do. The `!is_file()`
-        // arm immediately below reaches the same variant and IS covered, by
-        // the `/dev/null` and FIFO tests.
         Err(_) => return Ok(OpenedFile::Direct { file: target }),
     };
 
@@ -972,6 +1021,22 @@ where
     // device node and a directory all take this branch.
     if !metadata.is_file() {
         return Ok(OpenedFile::Direct { file: target });
+    }
+
+    // ADDED, not the C's: an extra hard link to a credential store is refused.
+    //
+    // `st_nlink` is read from the same `fstat` as the mode, so this costs no
+    // second syscall and no second race. A legitimate cookie jar has exactly
+    // one name; a second link is how a writer of this directory keeps a copy
+    // of the jar under a name the rename will not disturb. `StoreClass`
+    // decides, because the Alt-Svc and HSTS caches hold nothing worth copying
+    // and refusing would only turn an oddity into a failed command.
+    //
+    // The refusal happens before the temporary file is created, so nothing has
+    // been written and there is nothing to unlink -- the same shape as the C's
+    // `goto fail` before `fd` is valid.
+    if class.rejects_extra_links() && metadata.nlink() > 1 {
+        return Err(CURLcode::WriteError);
     }
 
     // `sb.st_mode`, read BEFORE the close because the descriptor is about to
@@ -1008,12 +1073,6 @@ where
     );
 
     // ---- STEP 3 -------------------------------------------------------------
-    //
-    // `dir = dirslash(filename);` and the `curl_maprintf` at `:113-119`, then
-    // `if(!tempstore) { result = CURLE_OUT_OF_MEMORY; goto fail; }` at
-    // `:121-124`. The C cannot tell a `dirslash` failure from a `maprintf`
-    // failure -- both arrive as a null pointer -- so both collapse to the one
-    // code here, discarding the buffer's more specific `CURLcode::TooLarge`.
     let temp_path =
         temp_name(filename, &suffix).map_err(|_| CURLcode::OutOfMemory)?;
 
@@ -1030,27 +1089,33 @@ where
     // `.create(true).truncate(true)` is `O_CREAT | O_TRUNC` and would lose
     // that, which is why it appears in step 1 and must never appear here.
     //
-    // The mode clones the target's, unioned with `S_IRUSR | S_IWUSR`:
+    // The mode is `StoreClass`'s decision, and the two arms differ:
     //
-    //   * `0o600` is `S_IRUSR | S_IWUSR`, spelled as the octal the C's macros
-    //     expand to.
+    //   * `StoreClass::Public` is `S_IRUSR | S_IWUSR | sb.st_mode` -- the C's
+    //     expression, unchanged, so an Alt-Svc or HSTS cache keeps cloning
+    //     whatever mode its target already had.
+    //   * `StoreClass::Credential` is a flat `0o600`, ignoring `target_mode`.
+    //     Cloning is precisely how a `0644` jar stays `0644` for ever: because
+    //     step 1 CREATES a target that did not exist, `target_mode` on a
+    //     first-ever save is whatever the creation mode produced, and under the
+    //     C's `0o666` that is `0o666 & ~umask`, normally 0o644. Forcing the
+    //     mode here also repairs a jar inherited from a C curl on its next
+    //     save, which refusing to write it would not.
+    //
+    // Two properties hold for both arms:
+    //
     //   * `target_mode` still carries `S_IFREG` (0o100000). `open(2)` ignores
-    //     every bit outside the permission set, so the effective request is
-    //     `0o600 | <permission bits>` -- measured: a request of 0o100600
-    //     produced a file at 0o600.
-    //   * Because step 1 CREATES a target that did not exist, `target_mode` on
-    //     a first-ever save is `0o666 & ~umask`, typically 0o644. So a brand
-    //     new cookie jar ends up 0o644 and NOT 0o600. That is upstream
-    //     behaviour and it is not "hardened" here -- measured, and asserted by
-    //     test against the process's actual umask rather than against a
-    //     guessed 0o644.
-    //   * `open(2)` masks this request with the umask, and so does
+    //     every bit outside the permission set, so a request of 0o100600 is
+    //     effectively 0o600 -- measured, and the reason the word is passed
+    //     through unmasked rather than anded with 0o777.
+    //   * `open(2)` masks the request with the umask, and so does
     //     `OpenOptionsExt::mode`, because it is the same syscall with the same
-    //     argument. Nothing extra is needed to reproduce it.
+    //     argument. Both arms are therefore ceilings; a umask can only remove
+    //     bits, so `0o600` cannot become more permissive than it says.
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600 | target_mode)
+        .mode(class.temp_mode(target_mode))
         .open(&temp_path)
         // `if(fd == -1) goto fail;`. `fd` is still -1 at that point, so the C
         // does NOT unlink -- and nothing was created, so there is nothing to
@@ -1058,40 +1123,10 @@ where
         .map_err(|_| CURLcode::WriteError)?;
 
     // ---- STEP 5 -------------------------------------------------------------
-    //
-    // `*fh = curlx_fdopen(fd, FOPEN_WRITETEXT); if(!*fh) goto fail;` at
-    // `:141-143`, and `*tempname = tempstore;` at `:145`.
-    //
-    // ELIMINATED. `fdopen` wraps a descriptor in a `FILE *` and can fail;
-    // `OpenOptions::open` already returned the handle, so there is no second
-    // step, no second failure mode, and no window in which a live descriptor
-    // has to be closed and its file unlinked. That is the C's `:149-152`
-    // cleanup gone, and it is the reason `discard` documents where it went.
-    //
-    // Text mode is a no-op on Unix, so nothing is lost by there being no mode
-    // string here: `FOPEN_WRITETEXT` is plain `"w"`, not `"wt"`, on all four
-    // mandated targets.
     Ok(OpenedFile::Temp { file, temp_path })
 }
 
 /// Where a seek measures its offset from.
-///
-/// Supersedes the `int whence` parameter of `curlx_fseek`
-/// (`lib/curlx/fopen.c:28`), which is one of C's `SEEK_SET`, `SEEK_CUR` or
-/// `SEEK_END`.
-///
-/// The three discriminants are written out and `#[repr(i32)]` is not
-/// decorative, for the reason AAP 0.6.1 gives for `CURLcode`: these integers
-/// are **ABI-visible**. `curl_seek_callback` hands a user-supplied function an
-/// `int origin` holding exactly these values, so a program compiled against
-/// curl 8.19.0-DEV holds the numbers rather than the names, and 0, 1 and 2 are
-/// what it will compare against. A [`SeekFrom`] alone cannot carry them --
-/// it is a Rust enumeration with no stable representation -- which is why this
-/// type exists rather than the helper below simply taking a `SeekFrom`.
-///
-/// The translation *at* the ABI boundary belongs to `curl-rs-ffi`; this is the
-/// engine-internal counterpart, so that a module needing to seek does not have
-/// to reach across the boundary for a constant.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
@@ -1110,11 +1145,6 @@ pub(crate) enum Whence {
 impl Whence {
     /// Reads the `origin` integer a C caller supplies, or `None` if it names
     /// nothing.
-    ///
-    /// `Option` rather than a `CURLcode`, because the C never converts this
-    /// value: `curlx_fseek` passes it straight to `fseeko`, which reports
-    /// `EINVAL` for anything else. Inventing a curl code here would be a
-    /// finer-grained answer than curl gives.
     pub(crate) fn from_origin(origin: i32) -> Option<Self> {
         match origin {
             0 => Some(Self::Set),
@@ -1151,8 +1181,8 @@ impl Whence {
 /// Seeks `stream` to `offset`, measured from `whence`.
 ///
 /// Supersedes `curlx_fseek` (`lib/curlx/fopen.c:28-39`), the only
-/// cross-platform function in that 508-line file. The C is a three-branch
-/// preprocessor ladder over a portability problem that does not exist in Rust:
+/// cross-platform function in that file. The C is a three-branch preprocessor
+/// ladder over a portability problem that does not exist in Rust:
 ///
 /// ```text
 /// #ifdef _WIN32
@@ -1165,19 +1195,6 @@ impl Whence {
 ///   return fseek(stream, (long)offset, whence);
 /// #endif
 /// ```
-///
-/// All three branches collapse. [`Seek::seek`] takes an `i64` offset and
-/// returns a `u64` position on every platform, so `_fseeki64` is unnecessary,
-/// `fseeko` is what remains on the mandated targets anyway -- both
-/// `configure.ac` and `CMakeLists.txt` detect it on Linux and macOS -- and the
-/// `LONG_MAX` guard of the last branch is guarding against a 32-bit `long`
-/// that none of the four mandated targets has. The one thing the ladder did
-/// carry forward is the `whence` integer, which is why [`Whence`] exists.
-///
-/// This function is deliberately **outside** the feature gate that covers the
-/// rest of this module: `lib/curlx/fopen.c` has no `#if` around it, and its
-/// consumers -- `lib/mime.c:641`, `lib/formdata.c:796` and three call sites
-/// under `src/` -- have nothing to do with cookies, Alt-Svc or HSTS.
 ///
 /// # Errors
 ///
@@ -1321,18 +1338,13 @@ mod tests {
         use std::path::{Path, PathBuf};
 
         use super::super::{
-            dirslash, open_for_write, temp_name, OpenedFile, RAND_ALPHABET,
-            RAND_SUFFIX_LEN,
+            dirslash, open_for_write, temp_name, NoFollow, OpenedFile,
+            StoreClass, RAND_ALPHABET, RAND_SUFFIX_LEN,
         };
         use crate::error::{CURLcode, CodeResult};
 
         /// Binds a scratch directory, failing the test loudly if the
         /// environment cannot provide one.
-        ///
-        /// A macro rather than a function because the failure arm has to leave
-        /// the *test*; the `let ... else` arm is unreachable because the
-        /// assertion above it has already failed. Modelled on the same helper
-        /// in `crate::tls::keylog`, so that a reader who knows one knows both.
         macro_rules! scratch {
             ($name:ident) => {
                 let $name = tempfile::tempdir();
@@ -1345,14 +1357,34 @@ mod tests {
             };
         }
 
-        /// A deterministic stand-in for `Curl_rand_alnum`.
+        /// `O_NOFOLLOW | O_CLOEXEC`, spelled here because the tests cannot
+        /// import them either.
         ///
-        /// Satisfies the injected provider's contract exactly -- exactly
-        /// [`RAND_SUFFIX_LEN`] characters, every one of them from
-        /// [`RAND_ALPHABET`] -- while being reproducible, so a test can compute
-        /// the temporary path in advance and assert on it. `seed` merely
-        /// rotates the alphabet, which is enough to make two calls in one test
-        /// produce different names.
+        /// The production callers take these from `crate::ffi`, which is the
+        /// one directory allowed to name `libc`. This module may not, and
+        /// neither may its test module, so the two numbers are written out --
+        /// and they are the *only* hard-coded platform constants in this file.
+        ///
+        /// A wrong value here would be caught rather than tolerated:
+        /// [`a_symlinked_target_is_refused`] passes only if the flag really is
+        /// `O_NOFOLLOW` on the host, and
+        /// [`the_guard_is_what_refuses_a_symlink`] pins the converse by
+        /// repeating the same open with [`NoFollow::DISABLED`] and observing
+        /// that it succeeds. So the constants are validated by behaviour rather
+        /// than trusted.
+        #[cfg(target_os = "linux")]
+        const GUARD_FLAGS: i32 = 0o400_000 | 0o2_000_000;
+        /// The macOS spellings of the same two flags.
+        #[cfg(target_os = "macos")]
+        const GUARD_FLAGS: i32 = 0x0100 | 0x0100_0000;
+
+        /// The guard every test passes unless it is specifically testing its
+        /// absence.
+        fn guard() -> NoFollow {
+            NoFollow::new(GUARD_FLAGS)
+        }
+
+        /// A deterministic stand-in for `Curl_rand_alnum`.
         fn fixed_suffix(seed: usize) -> String {
             RAND_ALPHABET
                 .iter()
@@ -1400,14 +1432,6 @@ mod tests {
         }
 
         /// The mode a freshly created file gets in `dir`: `0o666 & ~umask`.
-        ///
-        /// Measured rather than assumed. The umask is a property of the
-        /// process, it is not readable through any safe standard-library call,
-        /// and hard-coding the usual `0o644` would make the mode-cloning tests
-        /// fail on a machine configured differently -- for a reason that has
-        /// nothing to do with this module. Creating a probe with
-        /// `File::create`, whose mode is `OpenOptions`' default of `0o666`,
-        /// measures it directly.
         fn default_creation_mode(dir: &Path) -> Option<u32> {
             let probe = dir.join("umask-probe");
             drop(fs::File::create(&probe).ok()?);
@@ -1430,15 +1454,6 @@ mod tests {
         // -- dirslash, the sixteen measured rows ----------------------------
 
         /// Every row of the table in the module documentation, asserted.
-        ///
-        /// The expectations are not derived from reading the C a second time:
-        /// they were produced by compiling a literal transliteration of
-        /// `lib/curl_fopen.c:55-76` and running it, which is how the `"/c"`
-        /// row came to be corrected from `"/"` to `""`.
-        ///
-        /// Pure bytes, no filesystem, so this stays visible under Miri -- and
-        /// it is the assertion that matters most, because a `Path`-based
-        /// rewrite would change several of these rows at once.
         #[test]
         fn dirslash_reproduces_every_measured_row() {
             let rows: &[(&[u8], &[u8])] = &[
@@ -1484,12 +1499,6 @@ mod tests {
         }
 
         /// The empty result is a value, not a failure.
-        ///
-        /// The C returns a pointer to an allocated empty string, never `NULL`,
-        /// for a path with no directory component -- `dyn_addn(&out, path, 0)`
-        /// succeeds. Distinguishing the two matters: the caller turns `NULL`
-        /// into `CURLE_OUT_OF_MEMORY`, so getting this wrong would turn every
-        /// bare filename into an allocation failure.
         #[test]
         fn dirslash_returns_an_empty_value_rather_than_an_error() {
             let outcome = dirslash(b"jar.txt");
@@ -1514,12 +1523,6 @@ mod tests {
         }
 
         // -- the CURL_MAX_INPUT_LENGTH ceiling ------------------------------
-        //
-        // The buffer's contract is `content + 1 > ceiling` fails -- the `+ 1`
-        // is the C's terminator, and it is part of the ceiling contract -- so
-        // the largest directory component that fits is 7,999,999 bytes. Both
-        // sides of that line are asserted, because a ceiling only tested from
-        // one side is a ceiling that could be off by one.
 
         /// A directory component past the ceiling is the C's `NULL`.
         #[test]
@@ -1570,13 +1573,6 @@ mod tests {
         }
 
         /// An empty directory component leaves the name relative.
-        ///
-        /// This is the observable half of the corrected `"/c"` row and of the
-        /// bare-filename row: with nothing before the suffix, the temporary
-        /// file is created in the process's current working directory. Asserted
-        /// on the composed name rather than by creating the file, so the test
-        /// stays hermetic -- changing the working directory would race every
-        /// other test in this binary.
         #[test]
         fn an_empty_directory_component_yields_a_relative_name() {
             let suffix = fixed_suffix(1);
@@ -1684,8 +1680,12 @@ mod tests {
             let suffix = fixed_suffix(0);
             let expected = dir.path().join(format!("{suffix}.tmp"));
 
-            let (file, temp_path) =
-                temp_parts(open_for_write(&target, || Ok(suffix.clone())));
+            let (file, temp_path) = temp_parts(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(suffix.clone()),
+            ));
             drop(file);
 
             assert_eq!(temp_path, expected, "the name lands beside the target");
@@ -1710,59 +1710,89 @@ mod tests {
             assert!(fs::create_dir(&nested).is_ok(), "the test needs a subdir");
             let target = nested.join("hsts.txt");
 
-            let file = opened(open_for_write(&target, || Ok(fixed_suffix(2))));
+            let file = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(2)),
+            ));
 
             let parent = file.temp_path().and_then(Path::parent);
             assert_eq!(parent, Some(nested.as_path()));
             file.discard();
         }
 
-        // -- the truncation wart -------------------------------------------
+        // -- the truncation the C performs and this module does not ---------
 
-        /// NOTE: reproduced C behaviour. The target is emptied immediately.
+        /// The target keeps its contents until the rename replaces them.
         ///
-        /// `lib/curl_fopen.c:99` opens the target with `FOPEN_WRITETEXT`, which
-        /// is `"w"` on the mandated targets (`lib/curl_setup.h:1259`), so the
-        /// previous contents are destroyed before the mode is even read -- and
-        /// destroyed on the temporary-file path too, where the target then sits
-        /// empty until the caller's rename. If the save fails after this point
-        /// the old contents are already gone.
+        /// A DELIBERATE DIVERGENCE from `lib/curl_fopen.c:99`, which opens the
+        /// target with `FOPEN_WRITETEXT` -- `"w"`, and therefore `O_TRUNC` --
+        /// and so destroys the previous contents before the mode is even read.
+        /// The module documentation's hardening section argues it; this test is
+        /// what holds it.
         ///
-        /// This test exists to make that a deliberate, asserted property. A
-        /// future change to a read-only `fs::metadata` call would look
-        /// harmless, would be an improvement on its own terms, and would break
-        /// exactly this assertion -- which is the point.
+        /// Two properties, and the second is the one that matters:
+        ///
+        /// 1. The target still holds its old bytes while the temporary file is
+        ///    open, so a save that fails leaves the previous state file intact
+        ///    rather than empty.
+        /// 2. Nothing was written *through* the target handle. That is the whole
+        ///    of CWE-22 here: `O_TRUNC` on a name somebody else chose is a
+        ///    destructive primitive they aim, and a curl running with more
+        ///    privilege than they have empties the file on their behalf.
+        ///
+        /// The inverse of this test used to exist and asserted `Some(0)`. It was
+        /// not wrong about the C; it pinned a defect. It is replaced rather than
+        /// deleted, and this paragraph is the record of that.
         #[test]
         #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
-        fn the_target_is_truncated_before_anything_is_written() {
+        fn the_target_is_not_truncated_before_anything_is_written() {
             scratch!(dir);
             let target = dir.path().join("altsvc.txt");
             seed_file(&target, b"old contents");
             assert_eq!(len_of(&target), Some(12), "the seed is in place");
 
-            let file = opened(open_for_write(&target, || Ok(fixed_suffix(3))));
+            let file = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(3)),
+            ));
 
             assert!(file.needs_rename(), "a regular file takes the temp path");
             assert_eq!(
                 len_of(&target),
-                Some(0),
-                "the previous contents are already gone -- upstream behaviour"
+                Some(12),
+                "the previous contents survive until the rename -- no O_TRUNC"
             );
             assert_eq!(
                 file.temp_path().and_then(len_of),
                 Some(0),
                 "and the temporary file is empty, not a copy"
             );
+
+            // The failure path is why this matters: discarding leaves the old
+            // state file exactly as it was.
             file.discard();
+            assert_eq!(
+                len_of(&target),
+                Some(12),
+                "a failed save no longer destroys the previous state file"
+            );
         }
 
-        // -- the cloned mode -----------------------------------------------
+        // -- the cloned mode, for a PUBLIC store ---------------------------
 
-        /// The temporary file's mode is `0o600` unioned with the target's.
+        /// A public store's temporary file is `0o600` unioned with the target's.
         ///
-        /// Two pre-existing modes, because one would not distinguish "cloned"
-        /// from "always 0o600". `0o640` is the interesting one: the group-read
-        /// bit is preserved, which a hardened implementation would drop.
+        /// The C's expression, `S_IRUSR | S_IWUSR | sb.st_mode`, reproduced
+        /// exactly -- and it is [`StoreClass::Public`] that keeps it. Two
+        /// pre-existing modes, because one would not distinguish "cloned" from
+        /// "always 0o600". `0o640` is the interesting one: the group-read bit is
+        /// PRESERVED here, which is correct for an Alt-Svc or HSTS cache and is
+        /// exactly what [`a_credential_store_never_clones_a_permissive_mode`]
+        /// asserts does *not* happen to a cookie jar.
         #[test]
         #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
         fn the_temporary_file_clones_the_targets_mode() {
@@ -1777,8 +1807,12 @@ mod tests {
                 assert!(set.is_ok(), "the test needs to set mode {seeded:o}");
                 assert_eq!(mode_of(&target), Some(seeded), "seeded mode");
 
-                let file =
-                    opened(open_for_write(&target, || Ok(fixed_suffix(4))));
+                let file = opened(open_for_write(
+                    &target,
+                    StoreClass::Public,
+                    guard(),
+                    || Ok(fixed_suffix(4)),
+                ));
 
                 assert_eq!(
                     file.temp_path().and_then(mode_of),
@@ -1789,13 +1823,17 @@ mod tests {
             }
         }
 
-        /// A first-ever save ends up at the umask-derived mode, NOT `0o600`.
+        /// A first-ever PUBLIC save ends up at the umask-derived mode.
         ///
         /// Because step one CREATES a target that did not exist, `sb.st_mode`
-        /// is whatever `fopen` just produced -- `0o666 & ~umask`, typically
-        /// `0o644` -- and the union with `0o600` changes nothing. So a brand
-        /// new cookie jar is group- and world-readable. That is upstream
-        /// behaviour and it is not hardened here.
+        /// is whatever the creation mode produced -- for
+        /// [`StoreClass::Public`] that is the C's `0o666 & ~umask`, typically
+        /// `0o644` -- and the union with `0o600` changes nothing. So an Alt-Svc
+        /// or HSTS cache is group- and world-readable, which is upstream
+        /// behaviour and is deliberately kept: neither file holds a secret.
+        ///
+        /// The credential store is the one that had to change, and
+        /// [`a_first_ever_credential_store_is_private`] is its counterpart.
         ///
         /// The expectation is measured from the process's actual umask rather
         /// than written as `0o644`, so the test says something true on a
@@ -1809,7 +1847,12 @@ mod tests {
             };
             let target = dir.path().join("cookies.txt");
 
-            let file = opened(open_for_write(&target, || Ok(fixed_suffix(5))));
+            let file = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(5)),
+            ));
 
             assert_eq!(
                 file.temp_path().and_then(mode_of),
@@ -1824,27 +1867,280 @@ mod tests {
             file.discard();
         }
 
+        // -- the credential store's private mode (M-16) --------------------
+
+        /// A cookie jar that did not previously exist is created `0600`.
+        ///
+        /// The counterpart of
+        /// [`a_first_ever_save_takes_the_umask_derived_mode`], and the reason
+        /// [`StoreClass`] exists. Both the temporary file the jar is written
+        /// into and the placeholder step one creates are private, so at no
+        /// point between the open and the rename is there a readable file at
+        /// either name.
+        ///
+        /// The assertion is a literal `0o600` rather than a umask-derived
+        /// value, and that is the point: `OpenOptionsExt::mode` is a ceiling
+        /// that the umask can only narrow, so `0o600` is what a jar gets on any
+        /// machine. A umask of `0o077` would still produce `0o600`; a umask of
+        /// `0o777` would produce `0o000`, which is unreadable rather than
+        /// over-shared, so the direction of any surprise is safe.
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
+        fn a_first_ever_credential_store_is_private() {
+            scratch!(dir);
+            let target = dir.path().join("cookies.txt");
+
+            let file = opened(open_for_write(
+                &target,
+                StoreClass::Credential,
+                guard(),
+                || Ok(fixed_suffix(19)),
+            ));
+
+            assert_eq!(
+                file.temp_path().and_then(mode_of),
+                Some(0o600),
+                "the jar is written into a file no other local user can read"
+            );
+            assert_eq!(
+                mode_of(&target),
+                Some(0o600),
+                "and the placeholder step one created is private too"
+            );
+
+            // And the mode survives the rename, which is what the user ends up
+            // with. `commit` consumes the handle, so this is the last step.
+            let committed = file.commit(&target);
+            assert!(committed.is_ok(), "the rename must succeed");
+            assert_eq!(
+                mode_of(&target),
+                Some(0o600),
+                "the finished jar is 0600 -- the whole point of the class"
+            );
+        }
+
+        /// A jar inherited at `0644` is repaired, not cloned forward.
+        ///
+        /// This is the case the C cannot escape: it clones `sb.st_mode`, so a
+        /// jar created world-readable once stays world-readable for every
+        /// subsequent save. `StoreClass::Credential` ignores the target's mode
+        /// entirely, so the next save fixes it.
+        ///
+        /// Repairing rather than refusing is deliberate. Refusing to write a
+        /// jar the user asked for would fail their command, which is CLI
+        /// behaviour that AAP 0.8.1 freezes; forcing the mode costs them
+        /// nothing and closes the exposure. `0o640` is included because a
+        /// group-readable jar is the case a `umask 027` machine produces, and
+        /// it is exactly the mode
+        /// [`the_temporary_file_clones_the_targets_mode`] proves a *public*
+        /// store still preserves.
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
+        fn a_credential_store_never_clones_a_permissive_mode() {
+            for inherited in [0o644_u32, 0o640, 0o666, 0o604] {
+                scratch!(dir);
+                let target = dir.path().join("cookies.txt");
+                seed_file(&target, b"# Netscape HTTP Cookie File\n");
+                let set = fs::set_permissions(
+                    &target,
+                    fs::Permissions::from_mode(inherited),
+                );
+                assert!(set.is_ok(), "the test needs mode {inherited:o}");
+                assert_eq!(mode_of(&target), Some(inherited), "seeded");
+
+                let file = opened(open_for_write(
+                    &target,
+                    StoreClass::Credential,
+                    guard(),
+                    || Ok(fixed_suffix(20)),
+                ));
+
+                assert_eq!(
+                    file.temp_path().and_then(mode_of),
+                    Some(0o600),
+                    "a jar inherited at {inherited:o} is rewritten at 0600"
+                );
+                file.discard();
+            }
+        }
+
+        // -- the symlink guard (M-15) --------------------------------------
+
+        /// A symlinked final component is refused outright.
+        ///
+        /// CWE-59. `O_NOFOLLOW` arrives as [`NoFollow`] because this module may
+        /// not name `libc`; this test is also what validates that the injected
+        /// number really is `O_NOFOLLOW` on the host, since a wrong value would
+        /// let the open succeed and fail this assertion.
+        ///
+        /// The refusal is `CURLcode::WriteError`, which is what the C reports
+        /// for every other reason the target will not open, so no caller learns
+        /// a distinction it did not previously have.
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri's isolation refuses symlink")]
+        fn a_symlinked_target_is_refused() {
+            for class in [StoreClass::Public, StoreClass::Credential] {
+                scratch!(dir);
+                let victim = dir.path().join("victim.txt");
+                seed_file(&victim, b"data an attacker cannot write");
+                let link = dir.path().join("cookies.txt");
+                let made = std::os::unix::fs::symlink(&victim, &link).is_ok();
+                assert!(made, "the test needs to plant a symlink");
+
+                let outcome = open_for_write(&link, class, guard(), || {
+                    panic!("the provider must not be reached")
+                });
+
+                assert_eq!(
+                    outcome.err(),
+                    Some(CURLcode::WriteError),
+                    "{class:?}: a symlinked target must not be opened"
+                );
+                assert_eq!(
+                    len_of(&victim),
+                    Some(29),
+                    "{class:?}: and the link's target is untouched"
+                );
+            }
+        }
+
+        /// The guard is what refuses it -- the converse, so the test is not
+        /// passing for an unrelated reason.
+        ///
+        /// With [`NoFollow::DISABLED`] the very same open succeeds, which
+        /// proves the refusal above comes from the flag rather than from the
+        /// scratch directory, the class or the provider. It also documents
+        /// precisely what the C does here, since the C passes no such flag.
+        ///
+        /// Even unguarded, the victim is **not truncated**: that is the
+        /// `O_TRUNC` removal doing its own half of the work, and it is why the
+        /// two mitigations are independent rather than redundant.
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri's isolation refuses symlink")]
+        fn the_guard_is_what_refuses_a_symlink() {
+            scratch!(dir);
+            let victim = dir.path().join("victim.txt");
+            seed_file(&victim, b"data an attacker cannot write");
+            let link = dir.path().join("cookies.txt");
+            assert!(
+                std::os::unix::fs::symlink(&victim, &link).is_ok(),
+                "the test needs to plant a symlink"
+            );
+
+            let file = opened(open_for_write(
+                &link,
+                StoreClass::Public,
+                NoFollow::DISABLED,
+                || Ok(fixed_suffix(21)),
+            ));
+
+            assert!(
+                file.needs_rename(),
+                "unguarded, the link resolves to a regular file"
+            );
+            assert_eq!(
+                len_of(&victim),
+                Some(29),
+                "and even then O_TRUNC's removal keeps the victim intact"
+            );
+            file.discard();
+        }
+
+        /// An extra hard link to a credential store is refused; a public store
+        /// tolerates one.
+        ///
+        /// A second name for a cookie jar is not something a user creates. It
+        /// is what a writer of the output directory leaves behind so that a
+        /// copy of the jar survives under a name the rename will not disturb --
+        /// the rename replaces one link, and the other keeps whatever the file
+        /// held.
+        ///
+        /// The Alt-Svc and HSTS caches are exempt because there is nothing in
+        /// them worth copying, and refusing would turn an oddity into a failed
+        /// command. Both halves are asserted, because a check that fired for
+        /// every class would be a behaviour change nobody asked for.
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
+        fn an_extra_hard_link_is_refused_only_for_a_credential_store() {
+            for (class, tolerated) in
+                [(StoreClass::Public, true), (StoreClass::Credential, false)]
+            {
+                scratch!(dir);
+                let target = dir.path().join("store.txt");
+                seed_file(&target, b"x");
+                let second = dir.path().join("attacker-holds-this");
+                assert!(
+                    fs::hard_link(&target, &second).is_ok(),
+                    "the test needs a second link"
+                );
+
+                let outcome = open_for_write(&target, class, guard(), || {
+                    Ok(fixed_suffix(22))
+                });
+
+                if tolerated {
+                    let file = opened(outcome);
+                    assert!(
+                        file.needs_rename(),
+                        "{class:?}: an extra link is not this class's concern"
+                    );
+                    file.discard();
+                } else {
+                    assert_eq!(
+                        outcome.err(),
+                        Some(CURLcode::WriteError),
+                        "{class:?}: an extra link must refuse the save"
+                    );
+                }
+            }
+        }
+
+        /// `--cookie-jar /dev/null` still works, class notwithstanding.
+        ///
+        /// The one behaviour the hardening most plausibly threatened, asserted
+        /// for the credential class specifically. `/dev/null` is a character
+        /// device and **not** a symbolic link -- measured, `crw-rw-rw-` -- so
+        /// `O_NOFOLLOW` lets it through, and the `S_ISREG` test then routes it
+        /// to the early-success path exactly as `lib/curl_fopen.c:102-104`
+        /// does. Discarding cookies is a legitimate request and it still
+        /// succeeds.
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri does not model /dev/null")]
+        fn a_credential_store_at_dev_null_still_writes_directly() {
+            let called = Cell::new(false);
+
+            let file = opened(open_for_write(
+                Path::new("/dev/null"),
+                StoreClass::Credential,
+                guard(),
+                || {
+                    called.set(true);
+                    Ok(fixed_suffix(23))
+                },
+            ));
+
+            assert!(!file.needs_rename(), "a device takes the direct path");
+            assert!(!called.get(), "and no temporary name was ever generated");
+            file.discard();
+        }
+
         // -- the early-success path ----------------------------------------
 
         /// A target that is not a regular file is written directly.
-        ///
-        /// `/dev/null` reports `st_mode == 020666` with `S_ISREG == 0`, so
-        /// `lib/curl_fopen.c:102-104` returns `CURLE_OK` with the plain handle
-        /// open and `*tempname` still `NULL`. That is what makes
-        /// `--cookie-jar /dev/null` work.
-        ///
-        /// The strongest available evidence that no temporary file was created
-        /// anywhere is that the provider was never asked for a name, so there
-        /// was never a name to create one under. That is asserted directly.
         #[test]
         #[cfg_attr(miri, ignore = "Miri does not model /dev/null")]
         fn a_character_device_is_written_directly() {
             let called = Cell::new(false);
 
-            let file = opened(open_for_write(Path::new("/dev/null"), || {
-                called.set(true);
-                Ok(fixed_suffix(6))
-            }));
+            let file = opened(open_for_write(
+                Path::new("/dev/null"),
+                StoreClass::Public,
+                guard(),
+                || {
+                    called.set(true);
+                    Ok(fixed_suffix(6))
+                },
+            ));
 
             assert!(!file.needs_rename(), "no rename for a device node");
             assert_eq!(file.temp_path(), None, "*tempname stays NULL");
@@ -1859,10 +2155,12 @@ mod tests {
         #[test]
         #[cfg_attr(miri, ignore = "Miri does not model /dev/null")]
         fn the_direct_handle_accepts_writes() {
-            let mut file =
-                opened(open_for_write(Path::new("/dev/null"), || {
-                    Ok(fixed_suffix(7))
-                }));
+            let mut file = opened(open_for_write(
+                Path::new("/dev/null"),
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(7)),
+            ));
 
             assert!(
                 file.file_mut().write_all(b"# Your HSTS cache.\n").is_ok(),
@@ -1875,10 +2173,6 @@ mod tests {
         }
 
         /// A FIFO takes the same path, which is the case a device cannot prove.
-        ///
-        /// `/dev/null` is a character device; a FIFO is a different `S_IFMT`
-        /// value reaching the same branch, and it is the one a user is most
-        /// likely to point `--cookie-jar` at deliberately.
         ///
         /// Two environmental dependencies, both handled by reporting a gap
         /// rather than by failing, because the property under test belongs to
@@ -1913,10 +2207,15 @@ mod tests {
             };
 
             let called = Cell::new(false);
-            let file = opened(open_for_write(&fifo, || {
-                called.set(true);
-                Ok(fixed_suffix(8))
-            }));
+            let file = opened(open_for_write(
+                &fifo,
+                StoreClass::Public,
+                guard(),
+                || {
+                    called.set(true);
+                    Ok(fixed_suffix(8))
+                },
+            ));
 
             assert!(!file.needs_rename(), "S_ISREG is false for a FIFO");
             assert_eq!(file.temp_path(), None, "*tempname stays NULL");
@@ -1927,13 +2226,6 @@ mod tests {
         // -- O_EXCL, the atomicity guarantee --------------------------------
 
         /// A name that already exists is refused, and left untouched.
-        ///
-        /// `O_EXCL` is why step four uses `create_new(true)` and not
-        /// `create(true).truncate(true)`. It is what turns a name collision --
-        /// and a symlink planted at the predicted name -- into an error rather
-        /// than a write into somebody else's file. The pre-existing file's
-        /// contents are asserted afterwards, because a lost `O_EXCL` would show
-        /// up as a truncation rather than as a failure.
         #[test]
         #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
         fn an_existing_temporary_name_is_refused_and_not_overwritten() {
@@ -1948,7 +2240,10 @@ mod tests {
             };
             seed_file(&collision, b"someone else was here first");
 
-            let outcome = open_for_write(&target, || Ok(suffix.clone()));
+            let outcome =
+                open_for_write(&target, StoreClass::Public, guard(), || {
+                    Ok(suffix.clone())
+                });
 
             assert_eq!(
                 outcome.err(),
@@ -1975,8 +2270,12 @@ mod tests {
             let target = dir.path().join("hsts.txt");
             seed_file(&target, b"stale");
 
-            let mut file =
-                opened(open_for_write(&target, || Ok(fixed_suffix(10))));
+            let mut file = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(10)),
+            ));
             let Some(temp_path) = file.temp_path().map(Path::to_path_buf)
             else {
                 panic!("a regular file takes the temporary path");
@@ -1994,19 +2293,18 @@ mod tests {
         }
 
         /// A failed rename reports `CURLE_WRITE_ERROR` and cleans up.
-        ///
-        /// The C's `if(!result && tempstore && curlx_rename(...)) result =
-        /// CURLE_WRITE_ERROR;` followed by `if(result && tempstore)
-        /// unlink(tempstore);`. The rename is made to fail by naming a
-        /// destination inside a directory that does not exist, which is
-        /// `ENOENT` and does not depend on the process's privileges.
         #[test]
         #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
         fn a_failed_commit_reports_a_write_error_and_removes_the_temporary() {
             scratch!(dir);
             let target = dir.path().join("cookies.txt");
 
-            let file = opened(open_for_write(&target, || Ok(fixed_suffix(11))));
+            let file = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(11)),
+            ));
             let Some(temp_path) = file.temp_path().map(Path::to_path_buf)
             else {
                 panic!("a regular file takes the temporary path");
@@ -2032,7 +2330,12 @@ mod tests {
             scratch!(dir);
             let target = dir.path().join("altsvc.txt");
 
-            let file = opened(open_for_write(&target, || Ok(fixed_suffix(12))));
+            let file = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(12)),
+            ));
             let Some(temp_path) = file.temp_path().map(Path::to_path_buf)
             else {
                 panic!("a regular file takes the temporary path");
@@ -2058,9 +2361,12 @@ mod tests {
         #[test]
         #[cfg_attr(miri, ignore = "Miri does not model /dev/null")]
         fn discarding_a_direct_file_removes_nothing() {
-            let file = opened(open_for_write(Path::new("/dev/null"), || {
-                Ok(fixed_suffix(13))
-            }));
+            let file = opened(open_for_write(
+                Path::new("/dev/null"),
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(13)),
+            ));
 
             file.discard();
 
@@ -2084,10 +2390,11 @@ mod tests {
             let target = dir.path().join("no-such-dir").join("cookies.txt");
             let called = Cell::new(false);
 
-            let outcome = open_for_write(&target, || {
-                called.set(true);
-                Ok(fixed_suffix(14))
-            });
+            let outcome =
+                open_for_write(&target, StoreClass::Public, guard(), || {
+                    called.set(true);
+                    Ok(fixed_suffix(14))
+                });
 
             assert_eq!(outcome.err(), Some(CURLcode::WriteError));
             assert!(!called.get(), "the C never reaches :109 from here");
@@ -2104,21 +2411,15 @@ mod tests {
         fn a_directory_as_the_target_is_a_write_error() {
             scratch!(dir);
 
-            let outcome = open_for_write(dir.path(), || Ok(fixed_suffix(15)));
+            let outcome =
+                open_for_write(dir.path(), StoreClass::Public, guard(), || {
+                    Ok(fixed_suffix(15))
+                });
 
             assert_eq!(outcome.err(), Some(CURLcode::WriteError));
         }
 
         /// A directory with no write permission is a `CURLE_WRITE_ERROR`.
-        ///
-        /// The mode is restored before the assertions so that the scratch
-        /// directory can be cleaned up whatever the outcome.
-        ///
-        /// A process that bypasses the directory's mode -- root in a
-        /// container, which is how this suite is often run -- cannot observe
-        /// the property at all, so it is detected by probing and reported as a
-        /// gap. Probing rather than asking for the effective user identity,
-        /// which would need `libc` and does not belong in this module.
         #[test]
         #[cfg_attr(miri, ignore = "Miri's isolation refuses mkdir")]
         fn an_unwritable_directory_is_a_write_error() {
@@ -2130,9 +2431,12 @@ mod tests {
             assert!(set.is_ok(), "the test needs to drop the write bit");
 
             let bypassed = fs::File::create(locked.join("dac-probe")).is_ok();
-            let outcome = open_for_write(&locked.join("cookies.txt"), || {
-                Ok(fixed_suffix(16))
-            });
+            let outcome = open_for_write(
+                &locked.join("cookies.txt"),
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(16)),
+            );
 
             let restored =
                 fs::set_permissions(&locked, fs::Permissions::from_mode(0o700));
@@ -2160,7 +2464,10 @@ mod tests {
             scratch!(dir);
             let target = dir.path().join("cookies.txt");
 
-            let outcome = open_for_write(&target, || Err(CURLcode::FailedInit));
+            let outcome =
+                open_for_write(&target, StoreClass::Public, guard(), || {
+                    Err(CURLcode::FailedInit)
+                });
 
             assert_eq!(
                 outcome.err(),
@@ -2170,7 +2477,10 @@ mod tests {
             assert_eq!(
                 len_of(&target),
                 Some(0),
-                "and the target has already been truncated by step one"
+                "step one created the placeholder, so it exists and is empty \
+                 -- empty because it is NEW, not because it was truncated; \
+                 the_target_is_not_truncated_before_anything_is_written covers \
+                 the case where the target already had contents"
             );
         }
 
@@ -2182,10 +2492,15 @@ mod tests {
             let target = dir.path().join("cookies.txt");
             let calls = Cell::new(0_u32);
 
-            let file = opened(open_for_write(&target, || {
-                calls.set(calls.get() + 1);
-                Ok(fixed_suffix(17))
-            }));
+            let file = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(fixed_suffix(17))
+                },
+            ));
 
             assert_eq!(calls.get(), 1, "once, as the C calls it once");
             file.discard();
@@ -2203,10 +2518,19 @@ mod tests {
             scratch!(dir);
             let target = dir.path().join("cookies.txt");
 
-            let first = opened(open_for_write(&target, || Ok(fixed_suffix(0))));
+            let first = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(0)),
+            ));
             let first_path = first.temp_path().map(Path::to_path_buf);
-            let second =
-                opened(open_for_write(&target, || Ok(fixed_suffix(1))));
+            let second = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(1)),
+            ));
             let second_path = second.temp_path().map(Path::to_path_buf);
 
             assert!(first_path.is_some() && second_path.is_some());
@@ -2226,7 +2550,12 @@ mod tests {
             scratch!(dir);
             let target = dir.path().join("cookies.txt");
 
-            let file = opened(open_for_write(&target, || Ok(fixed_suffix(18))));
+            let file = opened(open_for_write(
+                &target,
+                StoreClass::Public,
+                guard(),
+                || Ok(fixed_suffix(18)),
+            ));
 
             assert!(file.needs_rename());
             assert!(file.temp_path().is_some());

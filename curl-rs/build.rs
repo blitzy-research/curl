@@ -244,6 +244,31 @@ const ENV_SOURCE_DATE_EPOCH: &str = "SOURCE_DATE_EPOCH";
 /// anywhere but its own `OUT_DIR`.
 const ENV_STAGING_DIR: &str = "CURL_RS_STAGING_DIR";
 
+/// Every environment variable this script's behaviour depends on.
+///
+/// ONE list, read by both the `rerun-if-env-changed` emitter and the self-check
+/// that validates the keys, because two lists are how a key comes to be read
+/// without being tracked. That is not hypothetical: `CURL_RS_STAGING_DIR` was
+/// read by `stage_completion` and named in neither list, so a build that had
+/// already run would NOT re-run when the variable was set, changed or cleared --
+/// cargo would serve the cached script output and the new staging root would
+/// simply never be written. A packaging step that set the variable and then
+/// found an empty tree had no way to tell that from a build script that had
+/// silently declined.
+///
+/// Emitting even one `rerun-if-changed`/`rerun-if-env-changed` directive
+/// disables cargo's default "re-run on any change in the package" behaviour, so
+/// an incomplete list here does not degrade tracking, it removes it. That is why
+/// the list is a single constant rather than a literal repeated at each use.
+const TRACKED_ENV_KEYS: [&str; 6] = [
+    ENV_PERL,
+    ENV_ASCIIPAGE,
+    ENV_CA_EMBED,
+    ENV_MAKETGZ_VERSION,
+    ENV_SOURCE_DATE_EPOCH,
+    ENV_STAGING_DIR,
+];
+
 // Artifact names inside OUT_DIR -- the contract with the consuming modules
 //
 // Written down here because other files include these by name, and a
@@ -251,7 +276,8 @@ const ENV_STAGING_DIR: &str = "CURL_RS_STAGING_DIR";
 // can consume safely.
 //
 //   $OUT_DIR/hugehelp.rs            pub(crate) const MANUAL: &[&str]
-//   $OUT_DIR/ca_embed.rs            pub(crate) const CA_EMBED: &[u8]
+//   $OUT_DIR/ca_embed.rs            pub(crate) const CA_EMBED_CONFIGURED: bool
+//                                   pub(crate) const CA_EMBED: &[u8]
 //   $OUT_DIR/ca_embed.bin           raw bundle bytes behind CA_EMBED
 //   $OUT_DIR/completions/_curl      zsh completion, `#compdef curl`
 //   $OUT_DIR/completions/curl.fish  fish completion, `complete -c curl`
@@ -984,13 +1010,7 @@ fn self_check_directive_channel() -> io::Result<()> {
     // Every key this script names in a directive, checked here as well as at
     // the point of use so that editing the list badly fails immediately and
     // with a message about the list rather than about one build.
-    for key in [
-        ENV_PERL,
-        ENV_ASCIIPAGE,
-        ENV_CA_EMBED,
-        ENV_MAKETGZ_VERSION,
-        ENV_SOURCE_DATE_EPOCH,
-    ] {
+    for key in TRACKED_ENV_KEYS {
         checked_directive_value("a rerun-if-env-changed key", key)?;
     }
 
@@ -1396,13 +1416,7 @@ fn emit_rerun_directives(
     // compile-time constants, so the check can only fail if this list is
     // edited badly -- which is precisely why it is checked rather than
     // trusted, and why `self_check_directive_channel` pins it too.
-    for key in [
-        ENV_PERL,
-        ENV_ASCIIPAGE,
-        ENV_CA_EMBED,
-        ENV_MAKETGZ_VERSION,
-        ENV_SOURCE_DATE_EPOCH,
-    ] {
+    for key in TRACKED_ENV_KEYS {
         emit_directive("rerun-if-env-changed", key)?;
     }
 
@@ -1933,13 +1947,30 @@ fn push_unicode_escape(out: &mut String, character: char) {
 /// THE CONTRACT:
 ///
 /// ```text
+/// pub(crate) const CA_EMBED_CONFIGURED: bool;
 /// pub(crate) const CA_EMBED: &[u8];
 /// ```
 ///
-/// The bundle's bytes, or an empty slice when none is configured. Emptiness
-/// is the signal that embedding is off; there is no separate flag and no
-/// `cfg` for it, so `curl-rs/src/ca_embed.rs` can include this file
-/// unconditionally.
+/// The first says whether the builder named a bundle at all; the second is that
+/// bundle's bytes, or an empty slice when none was named. **The two are
+/// independent, and that is the point.** `configure.ac:2127` reads
+/// `AM_CONDITIONAL(CURL_CA_EMBED_SET, test -n "$CURL_CA_EMBED")` -- a test on the
+/// *variable*, not on the file's size -- so in C a zero-byte bundle is
+/// configured-and-empty: `src/mk-file-embed.pl` emits
+/// `const unsigned char curl_ca_embed[] = { 0 };`, `src/tool_help.c:361` still
+/// appends the `CAcert` feature token, and `src/config2setopts.c:307` still
+/// applies a blob of `strlen == 0`.
+///
+/// An earlier revision of this script inferred absence from emptiness and made a
+/// configured zero-byte file **fatal**, which was neither of C's two answers. Two
+/// booleans and no inference is the fix; it is a generated `const`, not a `cfg`,
+/// so the reason this script gives elsewhere for refusing to emit a `cfg` does
+/// not apply. `curl-rs/src/ca_embed.rs` still includes this file unconditionally.
+///
+/// An **unreadable** file remains fatal, and that is C's behaviour too rather
+/// than a policy of this script's own: `src/Makefile.am:195` runs
+/// `@PERL@ $(MK_FILE_EMBED) --var curl_ca_embed < $(CURL_CA_EMBED)`, and a shell
+/// redirect from a file that cannot be opened fails the recipe.
 ///
 /// The bytes live in a sibling `.bin` reached through `include_bytes!` instead
 /// of being spelled out as a literal. That keeps the generated Rust a fixed
@@ -1961,42 +1992,35 @@ fn generate_ca_embed(
     // below is the faithful equivalent of the C stub at
     // src/Makefile.am:197-199. No diagnostic, because nothing is wrong.
     //
-    // UNUSABLE is fatal, and both flavours below are security-relevant rather
-    // than cosmetic. `CURL_CA_EMBED` names the trust anchors compiled into the
-    // binary; `src/config2setopts.c:307` and `:319` hand them to
-    // `CURLOPT_CAINFO_BLOB`. Degrading to an empty bundle would leave a build
-    // that was ASKED to carry its own trust store carrying none, and because
-    // AAP section 0.8.1 keeps certificate verification on by default, the
-    // resulting binary would fail to verify hosts it was built to trust -- or,
-    // worse, silently fall back to a different store. That is a change in
-    // security posture, so it ends the build.
+    // UNREADABLE is fatal, and it is security-relevant rather than cosmetic.
+    // `CURL_CA_EMBED` names the trust anchors compiled into the binary;
+    // `src/config2setopts.c:307` and `:319` hand them to `CURLOPT_CAINFO_BLOB`.
+    // Degrading to an empty bundle would leave a build that was ASKED to carry
+    // its own trust store carrying none, and because AAP section 0.8.1 keeps
+    // certificate verification on by default, the resulting binary would fail to
+    // verify hosts it was built to trust -- or, worse, silently fall back to a
+    // different store. That is a change in security posture, so it ends the
+    // build, which is also what the C recipe's `< $(CURL_CA_EMBED)` redirect
+    // does.
+    //
+    // A configured file that is EMPTY is NOT fatal and is NOT normalised to
+    // absence. `configure.ac:2127` tests the variable, so C's answer for it is
+    // "configured, and zero bytes long" -- the `CAcert` token is emitted and a
+    // zero-length blob is applied. The `configured` flag below is what carries
+    // that answer across, and it is the whole of this generator's F8-05 fix.
+    let configured = ca_bundle.is_some();
     let bytes = match ca_bundle {
-        Some(path) => {
-            let bytes = fs::read(path).map_err(|err| {
-                io::Error::other(format!(
-                    "{ENV_CA_EMBED} points at {}, which cannot be read: \
-                     {err}. The file names the trust anchors to compile into \
-                     the binary, so building without them would produce a \
-                     binary that trusts something other than what was \
-                     requested. Fix the path, or unset {ENV_CA_EMBED} to build \
-                     without an embedded bundle",
-                    path.display()
-                ))
-            })?;
-            if bytes.is_empty() {
-                return Err(io::Error::other(format!(
-                    "{ENV_CA_EMBED} points at {}, which is empty. An empty \
-                     bundle contains no trust anchors, so it is \
-                     indistinguishable in effect from not embedding one -- but \
-                     it was asked for explicitly, which means the intent and \
-                     the outcome disagree. Supply a bundle, for example one \
-                     produced by scripts/mk-ca-bundle.pl, or unset \
-                     {ENV_CA_EMBED}",
-                    path.display()
-                )));
-            }
-            bytes
-        }
+        Some(path) => fs::read(path).map_err(|err| {
+            io::Error::other(format!(
+                "{ENV_CA_EMBED} points at {}, which cannot be read: \
+                 {err}. The file names the trust anchors to compile into \
+                 the binary, so building without them would produce a \
+                 binary that trusts something other than what was \
+                 requested. Fix the path, or unset {ENV_CA_EMBED} to build \
+                 without an embedded bundle",
+                path.display()
+            ))
+        })?,
         None => Vec::new(),
     };
 
@@ -2009,14 +2033,19 @@ fn generate_ca_embed(
     text.push_str("// minus the trailing NUL: a Rust slice is length-\n");
     text.push_str("// delimited, and both C consumers read strlen() bytes.\n");
     text.push_str("//\n");
-    if bytes.is_empty() {
-        text.push_str("// STUB: CURL_CA_EMBED is unset, so the slice is\n");
-        text.push_str("// empty, mirroring src/Makefile.am:197-199.\n");
-        text.push_str("// A SET but unusable CURL_CA_EMBED does not reach\n");
-        text.push_str("// here; it fails the build instead.\n");
+    if configured {
+        text.push_str("// CURL_CA_EMBED named a file, so the flag is true.\n");
+        text.push_str("// The bytes are that file verbatim, in the sibling\n");
+        text.push_str("// .bin -- INCLUDING the zero-byte case, which\n");
+        text.push_str("// configure.ac:2127 also treats as configured.\n");
     } else {
-        text.push_str("// Bundle bytes, verbatim, in the sibling .bin file.\n");
+        text.push_str("// STUB: CURL_CA_EMBED is unset, so the flag is\n");
+        text.push_str("// false and the slice is empty, mirroring the C\n");
+        text.push_str("// stub at src/Makefile.am:197-199.\n");
     }
+    text.push_str("pub(crate) const CA_EMBED_CONFIGURED: bool = ");
+    text.push_str(if configured { "true" } else { "false" });
+    text.push_str(";\n");
     text.push_str("pub(crate) const CA_EMBED: &[u8] = include_bytes!(\n");
     text.push_str("    concat!(env!(\"OUT_DIR\"), \"/");
     text.push_str(OUT_CA_EMBED_BIN);
@@ -2273,7 +2302,92 @@ fn generate_completions(corpus: &Corpus, out_dir: &Path) -> io::Result<()> {
     // The product copies above are what `curl-rs/src/cli/completions.rs`
     // includes. These are the install copies -- see `stage_completion`.
     stage_completion(out_dir, INSTALL_ZSH, zsh.as_bytes())?;
-    stage_completion(out_dir, INSTALL_FISH, fish.as_bytes())
+    stage_completion(out_dir, INSTALL_FISH, fish.as_bytes())?;
+
+    // Both, present, in every destination that was written to. A packaging step
+    // copies a DIRECTORY, so it cannot tell "this build staged one completion"
+    // from "this build staged two" -- it just ships what it finds, and a
+    // shipped install set missing `curl.fish` looks exactly like a build that
+    // was never configured for fish. Asserting here is what turns that into a
+    // build failure at the point the artifact was supposed to appear.
+    verify_completions_staged(out_dir)
+}
+
+/// Every root a staged install copy is written beneath, in write order.
+///
+/// The single derivation of that set, so [`stage_completion`] and
+/// [`verify_completions_staged`] cannot disagree about where an artifact was
+/// supposed to land -- a verifier checking a different path from the writer
+/// would pass while the packaging step still found nothing.
+///
+/// `OUT_DIR/staging` is always present and is per-target and per-feature-set,
+/// which is what makes it a deterministic destination rather than a shared one:
+/// two targets built in the same tree stage into two different roots and cannot
+/// overwrite each other's artifacts. `CURL_RS_STAGING_DIR` adds an explicit
+/// out-of-tree root when set, and is opt-in for the reason it exists: a build
+/// writes outside its own `OUT_DIR` only when told where, so the default build
+/// cannot touch the source tree at all. It is tracked through
+/// [`TRACKED_ENV_KEYS`], so setting, changing or clearing it re-runs this
+/// script; without that the second root would be decided by whichever build
+/// happened to populate cargo's cache first.
+///
+/// `OUT_DIR` arrives as an argument rather than being re-read here: the caller
+/// already holds it, and it is deliberately NOT in [`TRACKED_ENV_KEYS`] because
+/// cargo owns that variable and re-runs the script itself when it changes.
+fn staging_roots(out_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut roots = vec![out_dir.join("staging")];
+
+    if let Some(explicit) = env::var_os(ENV_STAGING_DIR) {
+        if explicit.is_empty() {
+            return Err(io::Error::other(format!(
+                "{ENV_STAGING_DIR} is set but empty. An empty value would \
+                 resolve every staged path to a relative one under whatever \
+                 directory Cargo happened to run this script in, which is the \
+                 source tree; unset it instead"
+            )));
+        }
+        roots.push(PathBuf::from(explicit));
+    }
+
+    Ok(roots)
+}
+
+/// Assert that both install copies exist and are non-empty, everywhere they
+/// were written.
+///
+/// Checks the same destination set [`stage_completion`] writes, derived the same
+/// way, so the two cannot disagree about where the artifacts should be. Content
+/// is checked only for non-emptiness: the completions' correctness is already
+/// established by `verify_zsh_file` and `verify_fish_file` above, and repeating
+/// that here would be a second opinion rather than a second check. What is NOT
+/// already established is that the bytes reached the install layout.
+fn verify_completions_staged(out_dir: &Path) -> io::Result<()> {
+    for root in staging_roots(out_dir)? {
+        for relative in [INSTALL_ZSH, INSTALL_FISH] {
+            let path = root.join(relative);
+            let length = fs::metadata(&path)
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "{} was not staged: {err}. Both completions are \
+                         generated together and must be staged together, or a \
+                         packaging step that copies the staging tree ships an \
+                         incomplete install set with nothing to distinguish it \
+                         from a complete one",
+                        path.display()
+                    ))
+                })?
+                .len();
+            if length == 0 {
+                return Err(io::Error::other(format!(
+                    "{} was staged but is empty, so a shell sourcing it would \
+                     silently get no completions at all",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Where `make install` puts the zsh completion, relative to the prefix.
@@ -2314,19 +2428,10 @@ fn stage_completion(
     install_relative: &str,
     contents: &[u8],
 ) -> io::Result<()> {
-    let mut destinations = vec![out_dir.join("staging").join(install_relative)];
-
-    if let Some(explicit) = env::var_os(ENV_STAGING_DIR) {
-        if explicit.is_empty() {
-            return Err(io::Error::other(format!(
-                "{ENV_STAGING_DIR} is set but empty. An empty value would \
-                 resolve every staged path to a relative one under whatever \
-                 directory Cargo happened to run this script in, which is the \
-                 source tree; unset it instead"
-            )));
-        }
-        destinations.push(PathBuf::from(explicit).join(install_relative));
-    }
+    let destinations: Vec<PathBuf> = staging_roots(out_dir)?
+        .into_iter()
+        .map(|root| root.join(install_relative))
+        .collect();
 
     for destination in &destinations {
         let parent = destination.parent().ok_or_else(|| {

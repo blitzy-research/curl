@@ -167,24 +167,23 @@ env:
   # is most likely to go unnoticed, since `negotiate` is the crate's entire
   # GSS-API binding and `memdebug` is a `#[global_allocator]`.
 
-  # CURL_RS_A4_VARIADIC_DECISION IS DELIBERATELY NOT SET HERE.
+  # CURL_RS_A4_VARIADIC_DECISION MUST NOT BE SET HERE, AND SETTING IT NOW FAILS.
   #
-  # curl-rs-ffi's build script refuses to run when it is targeting
-  # aarch64-apple-darwin and no A4 decision is on record, and `cargo clippy
-  # --workspace` does run that build script. This job, though, is
-  # linux/x86_64-hosted and passes no `--target`, so the refusal's condition is
-  # never met: measured, the variable is entirely inert here - zero warnings,
-  # byte-identical output set or unset.
+  # curl-rs-ffi's build script refuses to build aarch64-apple-darwin
+  # unconditionally, and `cargo clippy --workspace` does run that build script.
+  # This job is linux/x86_64-hosted and passes no `--target`, so that refusal's
+  # condition is never met here - but the variable is no longer inert on any
+  # target: the script refuses outright when it is set, because the acceptance
+  # path it used to name has been removed. So a leftover setting would now break
+  # this job rather than being ignored by it, which is the intended direction.
   #
-  # It was previously set to 'accept-unsupported-varargs' anyway, to keep the
-  # gate working "if the runner ever changes". That is exactly backwards. If this
-  # job were ever moved to an Apple arm64 runner, a pre-set acceptance would let
-  # it lint an artifact whose variadic ABI is known-wrong and report a clean
-  # verdict, whereas an unset variable makes it stop and say so. Specification
-  # 0.8.6 escalates A4 to whoever set the requirements; a lint workflow is not
-  # the place a decision of that kind gets recorded, least of all as a
-  # contingency for a host change nobody has made. rust-build.yml's env block
-  # enumerates the three options that are actually available.
+  # It was previously set to 'accept-unsupported-varargs' to keep the gate
+  # working "if the runner ever changes". That was exactly backwards: on an Apple
+  # arm64 runner a pre-set acceptance would have linted an artifact whose
+  # variadic ABI is known-wrong and reported a clean verdict. It cannot do that
+  # any more, and the setting is gone from here as well. Specification 0.8.6
+  # escalates A4 to whoever set the requirements; rust-build.yml's env block
+  # enumerates the two options that remain.
 
 jobs:
   clippy:

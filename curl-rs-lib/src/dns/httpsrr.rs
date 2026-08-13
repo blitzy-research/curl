@@ -31,13 +31,6 @@
 //! (`lib/httpsrr.c:71-132`); and the ALPN list decoder is [`decode_alpn`],
 //! superseding the file-local `httpsrr_decode_alpn` (`:34-69`).
 //!
-//! Every claim below is cited, per AAP 0.7 (*"Claims are evidenced, not
-//! asserted"*). The C lines this module was measured against are
-//! `lib/httpsrr.c:34-150`, `lib/httpsrr.h:34-35`, `:39-57` and `:71-77`,
-//! `lib/connect.c:71-88`, `lib/hostip.h:49-54`, `lib/doh.c:1104-1156` and
-//! `:1167`, `lib/urlapi.c:223-239`, `lib/version.c:454-455` and `:492-493`,
-//! `CMakeLists.txt:2008` and `:2034`, and `configure.ac:4990-4997`.
-//!
 //! # Where this module ends and `doh.rs` begins
 //!
 //! `Curl_httpsrr_set` is a **per-SvcParam** setter. Nothing in
@@ -55,86 +48,11 @@
 //!   `doh_decode_rdata_name`), and calls
 //!   [`set_param`](HttpsRrInfo::set_param) inside its loop.
 //!
-//! **This module must never `use crate::dns::doh`.** Two reasons, and the
-//! second is the binding one. It would make the import graph
-//! `httpsrr -> doh -> httpsrr`, and `doh` is a Cargo feature: a
-//! `--no-default-features` build has no `doh` module at all, and this module
-//! is compiled unconditionally, so an import of it would not even resolve.
-//! The dependency runs one way, from the record walk down to the setter.
-//!
-//! ## The record-level invariants, documented where the setter lives
-//!
-//! [`set_param`](HttpsRrInfo::set_param) is `pub(crate)` and therefore
-//! directly callable, so the conditions its only production caller
-//! establishes are recorded here rather than left implicit in another file.
-//! From `doh_resp_decode_httpsrr` (`lib/doh.c:1104-1156`):
-//!
-//! * `len <= 2` is rejected with `CURLE_BAD_FUNCTION_ARGUMENT` before
-//!   anything is allocated (`:1116-1117`).
-//! * [`priority`](HttpsRrInfo::priority) is the big-endian `u16` in the
-//!   first two bytes (`:1121`), after which those two bytes are consumed.
-//! * [`target`](HttpsRrInfo::target) comes from `doh_decode_rdata_name` and
-//!   is then screened by `Curl_junkscan(dnsname, &olen, FALSE)`; rejection
-//!   is `CURLE_WEIRD_SERVER_REPLY` (`:1127-1131`). `Curl_junkscan`
-//!   (`lib/urlapi.c:223-239`, commented *"scan for byte values <= 31, 127
-//!   and sometimes space"*) sets `control = 0x20` when `allowspace` is
-//!   false, so **every byte `<= 0x20` -- the space included -- and every
-//!   byte `== 127` is rejected**, as is a name longer than
-//!   `CURL_MAX_INPUT_LENGTH`. ⚠️ That function lives in `lib/urlapi.c`,
-//!   whose successor `crate::url` does not carry it, so **`doh.rs` must
-//!   implement the check locally** rather than reach for a module that does
-//!   not provide it.
-//! * [`port`](HttpsRrInfo::port) is set to "not yet set" before the loop
-//!   (`lhrr->port = -1; /* until set */`, `:1132`).
-//! * The loop is `while(len >= 4)`, reading `pcode` and `plen` as two
-//!   big-endian `u16`s and consuming four bytes (`:1133-1137`).
-//! * ⚠️ `if(pcode < expected_min_pcode || plen > len)` is
-//!   `CURLE_WEIRD_SERVER_REPLY`, with `expected_min_pcode = pcode + 1` after
-//!   each parameter (`:1138-1147`). That enforces **strictly ascending
-//!   SvcParam keys**, which RFC 9460 requires and which means a duplicate
-//!   key can never reach this module from the DoH path. The
-//!   replace-not-append semantics documented on
-//!   [`set_param`](HttpsRrInfo::set_param) is therefore unreachable through
-//!   that caller -- and is still implemented faithfully, because the setter
-//!   is callable without it.
-//! * `DEBUGASSERT(!len)` follows the loop (`:1149`): a trailing one-to-three
-//!   byte remainder is *tolerated* in a release build. The faithful analogue
-//!   is `debug_assert!`, not a hard error.
-//!
-//! # Compiled unconditionally, advertised conditionally
-//!
-//! C wraps the whole file in `#ifdef USE_HTTPSRR` (`lib/httpsrr.c:26`,
-//! `lib/httpsrr.h:32`), which `configure.ac:4990-4997` defines **by
-//! default** -- `--disable-httpsrr` is the opt-out -- and which enabling ECH
-//! forces on (`lib/version.c:469-470` makes the inconsistent combination a
-//! `#error`).
-//!
-//! There is no `httpsrr` Cargo feature: the fifteen are `http2`, `http3`,
-//! `ftp`, `ssh`, `websockets`, `cookies`, `hsts`, `altsvc`, `doh`, `brotli`,
-//! `zstd`, `gzip`, `negotiate`, `hickory-dns` and `memdebug`. **This module
-//! therefore carries no `cfg` at all.** Inventing one would be worse than
-//! useless: `#[cfg(feature = "httpsrr")]` on a feature that does not exist
-//! silently deletes the code it guards, with no diagnostic anywhere.
-//!
 //! ## The reciprocal contract with `crate::version`
 //!
 //! Whether the `Features:` banner says `HTTPSRR` is
 //! `curl-rs-lib/src/version.rs`'s decision, not this module's, and the two
 //! must not drift -- so the condition is written down in both places.
-//!
-//! AAP 0.6.5 measures the asymmetry that settles it: the test harness parses
-//! that line and uses it to choose which fixtures to run, so
-//! **over-reporting turns a clean skip into a hard failure while
-//! under-reporting merely skips**. The determinant is that, with c-ares
-//! dropped (AAP 0.5.2), `Curl_httpsrr_from_ares` is gone and the **only**
-//! surviving producer of an [`HttpsRrInfo`] is the DoH path
-//! (`lib/doh.c:1104-1156`, reaching `dns->hinfo` at `:1274`). HTTPS RR is
-//! consequently functional only when a record walk exists behind the `doh`
-//! feature. It does not yet, and `version.rs` withholds the name for exactly
-//! that reason; the name becomes truthful when that producer lands, and not
-//! before. The measured cost of withholding is nil: `HTTPSRR` appears in one
-//! fixture only, `tests/data/test2100:72`, and there as an in-fixture
-//! `%if HTTPSRR` conditional rather than a `<features>` gate.
 //!
 //! Two C precedents differ from each other, so which one is followed is
 //! stated rather than assumed. `lib/version.c:492-493` emits
@@ -144,18 +62,6 @@
 //! is the one this workspace follows**, because it is the stricter of the
 //! two and stricter is the safe direction here; TLS is unconditional in this
 //! crate, so the clause that decides the row is the presence of a producer.
-//!
-//! ## `asyn-rr` can never be emitted
-//!
-//! `lib/version.c:454-455` gates that name on
-//! `USE_ARES && CURLRES_THREADED && USE_HTTPSRR`, and `CMakeLists.txt:2008`
-//! agrees. c-ares is dropped, so the conjunction can never hold -- which
-//! independently confirms the resolver's decision to withhold it. ⚠️ More
-//! sharply: `tests/runtests.pl:611-613` matches `/ares/i` **anywhere** in
-//! the libcurl banner and switches the whole harness into c-ares mode, so
-//! nothing this module contributes may ever put that substring into
-//! `curl --version` output. The word appears in this file only in prose
-//! explaining the removal.
 //!
 //! # Two C functions that vanish rather than move
 //!
@@ -172,78 +78,19 @@
 //! the language already guarantees, and a `cleanup` that left a
 //! partially-emptied value behind would reintroduce precisely the state the
 //! C `memset` exists to erase. The absence is a decision, not an omission.
-//!
-//! `Curl_httpsrr_from_ares` (`:167-205`) and its helper `httpsrr_opt`
-//! (`:154-165`) are dropped with c-ares, along with the only two trace
-//! strings that mention a target or a priority. Those strings are
-//! consequently **absent from this module by design** -- the DoH path has
-//! its own, differently spelled, and they belong to `doh.rs`.
-//!
-//! # Attacker-controlled input
-//!
-//! Every byte reaching [`decode_alpn`] or
-//! [`set_param`](HttpsRrInfo::set_param) came off the network in a DNS
-//! response. A panic here unwinds toward a C caller through `curl-rs-ffi`,
-//! so this module contains **no `unwrap`, no `expect`, no `panic!`, no
-//! indexing that could be out of bounds, and no unchecked arithmetic**
-//! outside `#[cfg(test)]`. Slice patterns, `split_first`, `split_at` behind
-//! a proven bound, `get` and `get_mut` do the work that C does with a
-//! pointer and a decrementing length. The release profile sets
-//! `overflow-checks = true`, so a wrapping subtraction would panic there
-//! too, not merely in a debug build.
 
 use super::AlpnId;
 use crate::error::{CURLcode, CodeResult};
 use crate::trace::{trc_feat, TraceFeature, Tracer};
 
 /// The longest host name curl will accept, `253` bytes.
-///
-/// `#define CURL_MAXLEN_host_name 253` (`lib/httpsrr.h:34`). Spelled in
-/// Rust's constant case; C's mixed-case identifier is quoted here so the
-/// grep from one tree to the other still lands.
-///
-/// The number is the DNS presentation-format limit: 255 octets of wire
-/// format less the leading length byte and the root label's terminating
-/// zero. Nothing in `lib/httpsrr.c` reads it -- the header defines it beside
-/// the record because the record's `target` is a host name -- so it is
-/// carried here for the same reason, as the bound a consumer of
-/// [`HttpsRrInfo::target`] measures against.
-// No consumer yet; doh.rs bounds the decoded target name with it.
 #[allow(dead_code)]
 pub(crate) const CURL_MAXLEN_HOST_NAME: usize = 253;
 
 /// How many ALPN identifiers one HTTPS RR may contribute, `4`.
-///
-/// `#define MAX_HTTPSRR_ALPNS 4` (`lib/httpsrr.h:35`), sizing
-/// `unsigned char alpns[MAX_HTTPSRR_ALPNS]` (`:52`).
-///
-/// # Why four, when only three identifiers exist
-///
-/// [`AlpnId`] has exactly three storable values -- `H1`, `H2` and `H3`;
-/// `None` is the absence of one -- and [`decode_alpn`] deduplicates, so at
-/// most three can ever be stored. The fourth slot is what guarantees room
-/// for the `ALPN_none` terminator described on [`decode_alpn`]. That is not
-/// a spare: it is the reason the terminator is always written today, and it
-/// is why the array is four bytes rather than three.
 pub(crate) const MAX_HTTPSRR_ALPNS: usize = 4;
 
 // THE SEVEN SvcParam CODE POINTS
-//
-// `lib/httpsrr.h:71-77`, under the comment "Code points for DNS wire format
-// SvcParams as per RFC 9460" (`:68-70`).
-//
-// Plain `u16` constants rather than an enumeration, and the choice is
-// forced rather than stylistic: `Curl_httpsrr_set`'s `default:` arm accepts
-// ANY unrecognised key and reports it (`lib/httpsrr.c:127-129`), so the
-// parameter type has to be the wire type. An enumeration would demand a
-// fallible conversion at the call site to buy nothing, and would put the
-// failure in the wrong place -- an unknown code point is a normal event
-// that the sender is entitled to send, not a decoding error.
-//
-// Each value is written explicitly and each carries `#[rustfmt::skip]` so
-// that no formatter can renormalise a frozen wire constant out of the
-// hexadecimal spelling the RFC and the C header both use. The values are
-// never inferred from declaration order.
 
 /// `HTTPS_RR_CODE_MANDATORY 0x00` (`lib/httpsrr.h:71`), RFC 9460 `mandatory`.
 #[rustfmt::skip]
@@ -311,63 +158,18 @@ pub(crate) const HTTPS_RR_CODE_IPV6: u16 = 0x06;
 /// };
 /// ```
 ///
-/// Field order is C's declaration order, so the two can be read side by
-/// side. Three shapes change, each for a stated reason.
-///
-/// # The three `*_len` companions disappear
-///
-/// C pairs every byte buffer with an explicit length, and the pair can
-/// disagree: `Curl_httpsrr_set` assigns the pointer and the length in
-/// separate statements (`lib/httpsrr.c:95` and `:98`, and likewise for ECH
-/// and IPv6). A `Vec<u8>` carries its own length, so the two cannot
-/// disagree, and the three `size_t` fields have no counterpart.
-///
-/// # `Default` is C's `calloc`, and `None` is C's `-1`
-///
-/// `doh_resp_decode_httpsrr` obtains its record from
-/// `curlx_calloc(1, sizeof(struct Curl_https_rrinfo))` (`lib/doh.c:1118`),
-/// so every field starts zeroed -- which [`Default`] reproduces exactly,
-/// including `alpns` starting as four `ALPN_none` bytes.
-///
-/// The one field where zero is *not* the right start is `port`: C
-/// immediately overwrites it with `lhrr->port = -1; /* until set */`
-/// (`lib/doh.c:1132`), because port zero is a value a record could legally
-/// carry and so cannot double as "absent". [`Option<u16>`] expresses that
-/// distinction in the type instead, and `None` -- which is what
-/// [`Default`] yields -- **is** C's `-1`. The sentinel is gone; the meaning
-/// is not.
-///
 /// # No `cleanup`, and no `Drop`
 ///
 /// See the module documentation: `Curl_httpsrr_cleanup`
 /// (`lib/httpsrr.c:143-150`) and `Curl_httpsrr_dup_move` (`:134-141`) are
 /// both subsumed by ownership, and neither is reproduced.
-///
-/// [`Option<u16>`]: Option
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-// No consumer yet; doh.rs produces it and conn/ reads it, as the C pair
-// `lib/doh.c:1274` and `lib/cf-https-connect.c:670` do.
 #[allow(dead_code)]
 pub(crate) struct HttpsRrInfo {
     /// C's `rrname`, whose comment reads *"if NULL, the same as the URL
     /// hostname"* (`lib/httpsrr.h:40`).
-    ///
-    /// [`None`] is that `NULL`: the record was queried for the host the URL
-    /// already names, so there is nothing extra to record. Only the c-ares
-    /// path ever set it (`lib/asyn-ares.c:809`,
-    /// `lib/asyn-thrdd.c:376`) and it was cleared again on the way out
-    /// (`lib/httpsrr.c:203`), so with c-ares dropped no producer in this
-    /// crate populates it today. It is carried because it is part of the
-    /// superseded struct and because a future producer that queries a
-    /// different name has nowhere else to say so.
     pub(crate) rrname: Option<String>,
     /// C's `target`: the host name the record points at.
-    ///
-    /// Mandatory per RFC 9460 section 14.3.2, as C's own comment says
-    /// (`lib/httpsrr.h:41-44`) -- yet the C field is a nullable pointer, so
-    /// [`Option`] is the faithful shape. The record-level decoder does
-    /// always set it before returning success (`lib/doh.c:1126`), which is
-    /// how the mandatory field and the nullable pointer coexist.
     pub(crate) target: Option<String>,
     /// C's `ipv4hints` plus `ipv4hints_len`, keytag `4`
     /// ([`HTTPS_RR_CODE_IPV4`]).
@@ -377,12 +179,6 @@ pub(crate) struct HttpsRrInfo {
     pub(crate) ipv4hints: Option<Vec<u8>>,
     /// C's `echconfiglist` plus `echconfiglist_len`, keytag `5`
     /// ([`HTTPS_RR_CODE_ECH`]).
-    ///
-    /// Stored verbatim and **not interpreted**. Encrypted Client Hello is
-    /// not among this crate's features, so there is deliberately no consumer
-    /// -- the bytes are preserved so that adding one later needs no change
-    /// here. `CURLE_ECH_REQUIRED` exists in [`CURLcode`] and is never raised
-    /// from this module.
     pub(crate) echconfiglist: Option<Vec<u8>>,
     /// C's `ipv6hints` plus `ipv6hints_len`, keytag `6`
     /// ([`HTTPS_RR_CODE_IPV6`]).
@@ -394,42 +190,14 @@ pub(crate) struct HttpsRrInfo {
     /// C's `alpns`, keytag `1` ([`HTTPS_RR_CODE_ALPN`]), whose comment reads
     /// *"store parsed alpnid entries in the array, end with ALPN_none"*
     /// (`lib/httpsrr.h:52-53`).
-    ///
-    /// **The fixed array is kept, and so is the byte representation.** Each
-    /// entry is an [`AlpnId`] discriminant as a single byte, which is what
-    /// makes the deduplication in [`decode_alpn`] a byte search and what
-    /// makes the terminator convention expressible at all. A `Vec` would
-    /// look tidier and would quietly change the boundary semantics
-    /// [`decode_alpn`] documents, and `lib/doh.c:1167` reads `alpns[0]`
-    /// directly to decide whether to print anything.
-    ///
-    /// Read it through [`alpns`](Self::alpns), which applies that
-    /// convention.
     pub(crate) alpns: [u8; MAX_HTTPSRR_ALPNS],
     /// C's `port`, keytag `3` ([`HTTPS_RR_CODE_PORT`]), whose comment reads
     /// *"-1 means not set"* (`lib/httpsrr.h:54`).
-    ///
-    /// C declares an `int` purely to have a value outside the port range to
-    /// use as a sentinel, then stores `(unsigned short)` into it
-    /// (`lib/httpsrr.c:124`). [`None`] is that sentinel and `u16` is the
-    /// range actually stored.
     pub(crate) port: Option<u16>,
     /// C's `priority`: the record's `SvcPriority`.
-    ///
-    /// Mandatory per RFC 9460, and not a SvcParam -- it is the first two
-    /// bytes of the record's RDATA, so the record walk sets it
-    /// (`lib/doh.c:1121`) and [`set_param`](Self::set_param) never touches
-    /// it. **Zero is meaningful**: RFC 9460 gives priority zero to AliasMode,
-    /// where the record redirects rather than describes, which is why this is
-    /// a plain `u16` with no sentinel.
     pub(crate) priority: u16,
     /// C's `BIT(no_def_alpn)`, keytag `2`
     /// ([`HTTPS_RR_CODE_NO_DEF_ALPN`]).
-    ///
-    /// A one-bit bitfield in C, a `bool` here. Set by the presence of the
-    /// parameter, never by its contents: RFC 9460 gives `no-default-alpn` an
-    /// empty value, and [`set_param`](Self::set_param) rejects a non-empty
-    /// one.
     pub(crate) no_def_alpn: bool,
 }
 
@@ -444,22 +212,6 @@ const ALPN_TERMINATOR: u8 = AlpnId::None.as_u8();
 impl HttpsRrInfo {
     /// The ALPN identifiers this record advertises, in the order it listed
     /// them.
-    ///
-    /// Applies the terminator convention [`decode_alpn`] establishes: the
-    /// walk stops at the first [`ALPN_TERMINATOR`], or after
-    /// [`MAX_HTTPSRR_ALPNS`] entries if there is no terminator to find. A
-    /// full list and a terminated list are therefore both valid ends, and a
-    /// caller does not have to know which it has.
-    ///
-    /// A byte that is not an [`AlpnId`] discriminant is skipped rather than
-    /// reported. [`decode_alpn`] cannot produce one -- it only ever stores
-    /// [`AlpnId::as_u8`] results -- but the field is reachable, and silently
-    /// ignoring an uninterpretable entry is what
-    /// `Curl_alpn2alpnid`'s own contract does with an unrecognised protocol
-    /// name (`lib/connect.c:87`, commented *"unknown, probably rubbish
-    /// input"*).
-    // No consumer yet; conn/ reads it where `lib/cf-https-connect.c:670`
-    // reads the C array.
     #[allow(dead_code)]
     pub(crate) fn alpns(&self) -> impl Iterator<Item = AlpnId> + '_ {
         self.alpns
@@ -479,11 +231,6 @@ impl HttpsRrInfo {
     ///                           uint16_t rrkey, const uint8_t *val,
     ///                           size_t vlen);
     /// ```
-    ///
-    /// The `data` handle becomes the `tracer` this crate threads for the
-    /// same purpose, `hi` becomes the receiver, and the `val`/`vlen` pointer
-    /// pair becomes one slice -- which is also what removes every
-    /// opportunity for the two to disagree.
     ///
     /// # The validation rules are deliberately asymmetric
     ///
@@ -531,9 +278,11 @@ impl HttpsRrInfo {
     ///
     /// # The three `CURLE_OUT_OF_MEMORY` arms have no counterpart
     ///
-    /// C's `:97`, `:107` and `:117` each report a failed `curlx_memdup`. Rust
-    /// aborts on allocation failure rather than returning it, so there is
-    /// nothing to report and **no such path is fabricated here**. The
+    /// C's `:97`, `:107` and `:117` each report a failed `curlx_memdup` of a
+    /// record field already resident in the response buffer -- no amplification,
+    /// and no stable fallible spelling for a duplication at the declared minimum
+    /// Rust version -- so there is nothing to report and **no such path is
+    /// fabricated here**. The
     /// enumerator itself still exists in [`CURLcode`], reachable from the
     /// places that genuinely can run out.
     ///
@@ -545,8 +294,6 @@ impl HttpsRrInfo {
     /// particular code.
     ///
     /// [`Option<Vec<u8>>`]: Option
-    // No consumer yet; doh.rs calls it once per SvcParam, exactly where
-    // `lib/doh.c:1142` calls the C function.
     #[allow(dead_code)]
     pub(crate) fn set_param(
         &mut self,
@@ -670,10 +417,6 @@ impl HttpsRrInfo {
 
 /// Decodes an RFC 9460 `alpn` SvcParamValue into `alpns`.
 ///
-/// Supersedes the file-local `httpsrr_decode_alpn` (`lib/httpsrr.c:34-69`),
-/// and is private for the same reason C's is `static`: only
-/// [`HttpsRrInfo::set_param`] has any business calling it.
-///
 /// C's own description of the wire format, which is the specification this
 /// implements (`:37-42`):
 ///
@@ -683,8 +426,6 @@ impl HttpsRrInfo {
 /// > fill the SvcParamValue; otherwise, the SvcParamValue is malformed.
 ///
 /// # Five behaviours that look like defects and are not
-///
-/// Each was measured, and each is preserved.
 ///
 /// 1. **A truncated length octet is
 ///    [`CURLE_BAD_CONTENT_ENCODING`](CURLcode::BadContentEncoding)**
@@ -706,30 +447,10 @@ impl HttpsRrInfo {
 ///    protocols this client does not know, returns
 ///    [`CURLE_OK`](CodeResult) with the list left empty (`:68`).
 ///
-/// # The terminator is written only when there is room
-///
-/// `if(idnum < MAX_HTTPSRR_ALPNS) alpns[idnum] = ALPN_none;` (`:66-67`). A
-/// **full list therefore carries no terminator**, and any reader has to treat
-/// "[`MAX_HTTPSRR_ALPNS`] entries" and "terminated" as equally valid ends --
-/// which [`HttpsRrInfo::alpns`] does. A `Vec`-based rewrite would look
-/// tidier and would silently change that boundary, and `lib/doh.c:1167`
-/// tests `hrr->alpns[0] != ALPN_none` directly.
-///
 /// ## Both of those branches are unreachable today, and both are kept
-///
-/// A measured consequence of `Curl_alpn2alpnid` (`lib/connect.c:73-88`)
-/// having only **three** non-`None` results: with deduplication, `idnum`
-/// cannot exceed three, so
 ///
 /// * the `break` at (3) above never fires, and
 /// * the terminator is *always* written, at index three at the very worst.
-///
-/// That is not an argument for deleting either. It is the reason
-/// [`MAX_HTTPSRR_ALPNS`] is four rather than three -- the fourth slot is the
-/// terminator's -- and both branches become live the moment a fourth
-/// identifier joins the enumeration, which is a change to
-/// `lib/hostip.h:49-54`'s successor and not to this file. Removing them
-/// would put a latent overflow one enumerator away.
 ///
 /// # Errors
 ///

@@ -33,26 +33,8 @@
 // three siblings and its licence tag stays on line 21:
 //
 // SPDX-FileCopyrightText: Linus Nielsen Feltzing, <linus@haxx.se>
-//
-// No attribution is lost by that placement: REUSE reads
-// `SPDX-FileCopyrightText` anywhere in the file, and the collective
-// "et al." of the banner covers the same contributor in any case.
 
 //! The graceful-shutdown queue: connections that are finished but not closed.
-//!
-//! Supersedes `lib/cshutdn.c` (534 lines) and `lib/cshutdn.h` (106 lines),
-//! whose declared surface is `lib/cshutdn.h:35-104` and whose three bodies of
-//! behaviour are `lib/cshutdn.c:41-164` (run one step, terminate one
-//! connection), `:167-317` (the FIFO, the wait and the multi-driven pass) and
-//! `:319-533` (init and destroy, the counts, the add, and the three readiness
-//! exports). Two neighbouring files supply behaviour this module depends on
-//! and are cited throughout: `lib/cfilters.c:144-210` -- `Curl_conn_close` and
-//! `Curl_conn_shutdown`, already delivered as
-//! [`close_and_clear`](super::filters::FilterChain::close_and_clear) and
-//! [`shutdown`](super::filters::FilterChain::shutdown) on
-//! [`FilterChain`](super::filters::FilterChain) -- and
-//! `lib/connect.c:144-205`, the five shutdown-timer helpers whose successor is
-//! the INJECTED [`ShutdownTimer`] interface rather than anything stored here.
 //!
 //! # What a shutting-down connection is
 //!
@@ -86,11 +68,6 @@
 //! no `Curl_llist_node`, no intrusive link, and no manual destructor
 //! discipline.
 //!
-//! Access is exclusive (`&mut self`) throughout. There is no global queue and
-//! no interior mutability: the owning multi layer serialises access, which is
-//! the same arrangement C relies on and one fewer lock than a shared queue
-//! would need.
-//!
 //! ## The ordering is FIFO, and that is NOT the pool's policy
 //!
 //! Additions go to the **tail** (`Curl_llist_append`, `lib/cshutdn.c:420`) and
@@ -103,72 +80,6 @@
 //! full scan for the greatest idle age. Both are called "oldest" in the C and
 //! they mean different things. Changing either to the other's rule would
 //! change which connection dies under a connection limit.
-//!
-//! # The seams, and why every one of them is injected
-//!
-//! This module names no protocol, no TLS type, no multi handle and no
-//! connection pool. Five things it genuinely needs arrive through traits, so
-//! that the queue can be exercised in isolation and so that no cycle appears in
-//! the module graph:
-//!
-//! * [`ProtocolDisconnect`] -- the scheme's disconnect handler,
-//! `conn->scheme->run->disconnect` (`lib/cshutdn.c:62`). A typed trait object,
-//! not a stored function pointer. * [`ShutdownTimer`] -- the per-connection
-//! deadline, whose storage belongs to `conn/mod.rs` and is deliberately NOT
-//! duplicated here. This module adds only the combination rule,
-//! [`ConnShutdownTimer::conn_time_left_ms`]. * [`ShutdownHost`] -- the multi
-//! handle: the admin handle substitution, the socket-event assessment, the
-//! connection-changed notification, the timer registration and the
-//! total-connection limit. * `Clock` -- reached through [`CallCtx::now`], never
-//! from the host clock, so that every deadline in this file is testable without
-//! waiting in real time. * The pooled-connection count -- an ordinary `usize`
-//! PARAMETER to [`ShutdownQueue::add`]. The queue holds no handle back into the
-//! pool, and that is load-bearing: it is what makes it provable that
-//! terminating a connection cannot re-enter the queue.
-//!
-//! # What deliberately vanished
-//!
-//! * **The whole broken-pipe signal apparatus.** C brackets every shutdown in
-//!   a saved-then-restored process signal disposition -- a context struct and
-//!   three helpers from one small header, called at `lib/cshutdn.c:183-189`,
-//!   `:243`, `:272`, `:278` and `:316` -- because an OpenSSL write to a socket
-//!   the peer has closed would otherwise kill the process outright. No C TLS
-//!   library is linked here (AAP 0.8.2), and `rustls` over `tokio` surfaces a
-//!   broken pipe as an ordinary error return, so there is no process-wide
-//!   disposition to save and restore and nothing here has to leave safe Rust
-//!   in order to save it.
-//! * **Attach and detach.** `Curl_attach_connection` and
-//!   `Curl_detach_connection` exist so that a function reached with only
-//!   `struct Curl_easy *data` can find the connection through `data->conn`.
-//!   Every function here receives the connection as a parameter, so there is
-//!   nothing to attach, nothing to detach, and no window in which `data->conn`
-//!   disagrees with the connection actually being shut down.
-//! * **`NUM_POLLS_ON_STACK`.** `lib/cshutdn.c:205` sizes a stack array of ten
-//!   `struct pollfd` to avoid an allocation. [`PollFds`] owns a vector; the
-//!   hint has nothing left to hint at.
-//! * **The descriptor-set marshalling.** `Curl_cshutdn_setfds` (`:434-472`)
-//!   writes descriptor bits into a libc descriptor set for
-//!   `curl_multi_fdset`. That is an exported C API, so its marshalling belongs
-//!   to `curl-rs-ffi`; [`ShutdownQueue::sockets`] hands out typed
-//!   `(`[`Socket`]`, `[`PollAction`]`)` pairs instead, and this file names no
-//!   libc type and no libc macro.
-//!
-//! # Provenance of the constraints this file is held to
-//!
-//! `review_rules` reports that **no user-specified rules were provided** for
-//! this project, so nothing here is present to satisfy a rule and no rule is
-//! cited. The constraints that shape this file -- the preservation mandate over
-//! observable behaviour, the prohibition on raw memory operations outside the
-//! FFI island, the minimal-change mandate -- are AAP REQUIREMENTS originating
-//! in the user's request (AAP 0.8) and are cited as such. AAP 0.7 is explicit
-//! that restating them as rules would misrepresent where they came from.
-//!
-//! One consequence is worth stating plainly, because it reads as a defect
-//! until its provenance is known: the expiry arithmetic of
-//! [`ShutdownQueue::perform_once`] contradicts the intent its own C comment
-//! states. It is reproduced exactly, because observable behaviour is frozen
-//! (AAP 0.8.1) and a change justified as an improvement is prohibited
-//! (AAP 0.8.2). See the `NOTE` beside it.
 
 use core::fmt;
 use std::collections::VecDeque;
@@ -184,85 +95,28 @@ use crate::trace::{infof, trc_feat, TimerId, TraceFeature};
 use crate::util::timediff::{mstotv, TimeDiff};
 use crate::util::timeval::timediff_ms;
 
-// =========================================================================
 // Constants, borrowed rather than restated
-// =========================================================================
 
 /// `DEFAULT_SHUTDOWN_TIMEOUT_MS` (`lib/connect.h:45`): two seconds.
-///
-/// Re-exported from [`crate::conn::filters`] rather than declared a second
-/// time. Two `const` items with the same value in two modules is exactly the
-/// drift the single-source-of-truth rule exists to prevent, and this constant
-/// has three consumers -- the timer's default when `Curl_shutdown_start` is
-/// passed zero (`lib/connect.c:151-154`), the cap this module puts on a
-/// blocking disconnect handler (`lib/cshutdn.c:52`), and the filter chain's
-/// own shutdown deadline.
 pub(crate) use crate::conn::filters::DEFAULT_SHUTDOWN_TIMEOUT_MS;
 
 /// `FIRSTSOCKET` = 0 (`lib/urldata.h:493`), re-exported for the callers that
 /// speak in raw indices.
-///
-/// The queue itself uses [`SocketIndex`], which cannot hold an invalid value;
-/// an `i32` arriving from outside becomes one through
-/// [`SocketIndex::from_i32`], which reports
-/// [`BadFunctionArgument`](crate::error::CURLcode::BadFunctionArgument) for
-/// anything that is neither 0 nor 1 -- C's `CONN_SOCK_IDX_VALID` test at
-/// `lib/cfilters.c:165-166`.
-///
-/// `#[allow(unused_imports)]` because a re-export exists for CALLERS: the raw
-/// integers are what `curl-rs-ffi` and the tests below speak, while this
-/// module's own code speaks [`SocketIndex`] throughout and never needs them.
 #[allow(unused_imports)]
 pub(crate) use crate::conn::filters::FIRSTSOCKET;
 
 /// `SECONDARYSOCKET` = 1 (`lib/urldata.h:494`).
-///
-/// The second chain is not an afterthought here. Only [`FIRSTSOCKET`] starts
-/// the shutdown timer (`lib/cshutdn.c:79-81`) yet the deadline covers both
-/// chains, and the close order at the end of a connection's life is
-/// **secondary first** (`lib/cshutdn.c:153-154`) -- the reverse of the order
-/// in which `Curl_conn_free` then discards their filters (`lib/url.c`). Both
-/// orders are preserved.
-///
-/// `#[allow(unused_imports)]` for the reason [`FIRSTSOCKET`] gives.
 #[allow(unused_imports)]
 pub(crate) use crate::conn::filters::SECONDARYSOCKET;
 
 /// `EXPIRE_SHUTDOWN` = **14** (`lib/urldata.h:901`).
-///
-/// The `expire_id` this module registers with the multi handle's timer list.
-/// Its value is positional -- `expire_id` declares no explicit discriminant, so
-/// `EXPIRE_SHUTDOWN` is the fifteenth enumerator -- and it is INDEX-ALIGNED
-/// with `Curl_trc_timer_names[14] == "SHUTDOWN"` (`lib/curl_trc.c:281-296`).
-/// Getting the number wrong would therefore not merely arm the wrong timer, it
-/// would also mislabel every trace line that names one.
-///
-/// Taken from [`TimerId::Shutdown`] rather than written as a literal, for the
-/// reason [`DEFAULT_SHUTDOWN_TIMEOUT_MS`] is re-exported: the enumeration in
-/// `crate::trace` is where the number and the name are kept in step, and
-/// `TimerId::Shutdown as i32` is checked against 14 by a test in this module.
-///
-/// This module's own code arms the timer by NAME, through
-/// [`ShutdownHost::expire`], which takes a [`TimerId`] and cannot be handed a
-/// number that denotes nothing. The integer is published because the layers
-/// that speak integers need it -- `crate::multi`'s timer list and, beyond it,
-/// the C ABI -- and because pinning it is how a reordering of `expire_id` gets
-/// caught here rather than in a trace log.
 #[allow(dead_code)] // consumers: `crate::multi` and this module's tests
 pub(crate) const EXPIRE_SHUTDOWN: i32 = TimerId::Shutdown.as_i32();
 
 /// The longest a single graceful-drain wait may last: **1000 ms**.
-///
-/// `CURLMIN(timeout_ms, 1000)` (`lib/cshutdn.c:221`), where `timeout_ms` is
-/// the time still remaining. The cap makes the drain loop re-examine the queue
-/// at least once a second even when the caller allowed much longer, so that a
-/// connection which finished for a reason no descriptor reported -- an expired
-/// deadline, for instance -- is noticed promptly.
 const WAIT_SLICE_MAX_MS: TimeDiff = 1000;
 
-// =========================================================================
 // Which handle the work runs against
-// =========================================================================
 
 /// Whose handle a piece of shutdown work is charged to.
 ///
@@ -274,20 +128,6 @@ const WAIT_SLICE_MAX_MS: TimeDiff = 1000;
 /// if(data->multi && data->multi->admin)
 ///   admin = data->multi->admin;
 /// ```
-///
-/// and its comment gives the reason: *"Some protocol will try to mess with
-/// `data` during shutdown and we do not want that with a `data` from the
-/// application."* Protocol cleanup mutates handle state -- FTP rewrites the
-/// command state, HTTP/2 touches stream bookkeeping -- and doing that to a
-/// handle the application still owns is how a completed transfer acquires
-/// fields belonging to a connection it has already finished with.
-///
-/// The substitution is NOT total, and reproducing which side of it each step
-/// falls on is the whole point of naming the two. In `lib/cshutdn.c:142-164`
-/// the protocol handler, the final shutdown attempt, the close of both socket
-/// chains and the release of the connection all run against `admin`, while the
-/// two multi-handle notifications are gated on `data->multi` and the
-/// connection-changed trace is charged to `data`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)] // consumer: `crate::multi`, once it owns a queue
 pub(crate) enum ShutdownHandle {
@@ -316,17 +156,9 @@ impl ShutdownHandle {
     }
 }
 
-// =========================================================================
 // The injected protocol disconnect handler
-// =========================================================================
 
 /// What [`ProtocolDisconnect::disconnect`] returns.
-///
-/// A boxed future rather than an `async fn` in the trait: an `async fn` in a
-/// trait is not object safe, and this handler MUST be reachable as
-/// `dyn ProtocolDisconnect` because a connection stores whichever one its
-/// scheme registered. Boxing costs one allocation per connection teardown,
-/// which is the least significant allocation in the whole sequence.
 pub(crate) type DisconnectFuture<'a> =
     Pin<Box<dyn Future<Output = CurlResult<()>> + 'a>>;
 
@@ -355,8 +187,18 @@ pub(crate) type DisconnectFuture<'a> =
 /// result so that an implementation can report a failure honestly and so that
 /// the trace records it, and this module then discards it exactly as C does.
 /// A shutdown has no caller left to fail.
+///
+/// # The `Send` supertrait
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`) and the pool holds these as boxed trait objects, so
+/// [`crate::share::Share`] can only be `Send + Sync` -- which it statically
+/// asserts, because one `CURLSH` is usable from two threads
+/// (`tests/libtest/lib506.c`, `lib3207.c`) -- if this is `Send`. `Sync` is
+/// deliberately NOT required: the pool exposes mutation through `&mut self`
+/// alone and is never aliased, so `Mutex<T>: Sync` needs only `T: Send`.
 #[allow(dead_code)] // consumer: `crate::protocols`, once its schemes land
-pub(crate) trait ProtocolDisconnect: core::fmt::Debug {
+pub(crate) trait ProtocolDisconnect: core::fmt::Debug + Send {
     /// Tear the protocol down. `dead` suppresses any farewell exchange.
     fn disconnect<'a>(
         &'a mut self,
@@ -366,9 +208,7 @@ pub(crate) trait ProtocolDisconnect: core::fmt::Debug {
     ) -> DisconnectFuture<'a>;
 }
 
-// =========================================================================
 // The injected multi handle
-// =========================================================================
 
 /// Everything the owning multi handle supplies to the shutdown queue.
 ///
@@ -378,8 +218,6 @@ pub(crate) trait ProtocolDisconnect: core::fmt::Debug {
 /// owned queue holding `&mut Multi` would alias the multi handle that owns the
 /// queue, which is a cycle Rust will not express. Naming the eleven operations
 /// the queue actually performs on its owner turns the cycle into a parameter.
-///
-/// Every method cites the C it stands for. None of them is a convenience.
 #[allow(dead_code)] // consumer: `crate::multi`, once it owns a queue
 pub(crate) trait ShutdownHost {
     // -- the handle substitution ------------------------------------------
@@ -400,21 +238,10 @@ pub(crate) trait ShutdownHost {
     // -- the handle's own state -------------------------------------------
 
     /// C's `data->state.internal` (`lib/cshutdn.c:51`).
-    ///
-    /// True for the multi handle's admin handle and for the connection pool's
-    /// `idata`, which between them are every caller the C has
-    /// (measured: `lib/multi.c:315`, `:1258`, `:1304`, `:1391`, `:2457`,
-    /// `:2887` and `lib/conncache.c:222`, `:226`, `:228`, `:680`). It is the
-    /// condition under which a blocking disconnect handler is capped.
     fn is_internal(&self, handle: ShutdownHandle) -> bool;
 
     /// C's `data->set.timeout = DEFAULT_SHUTDOWN_TIMEOUT_MS`
     /// (`lib/cshutdn.c:52`).
-    ///
-    /// Caps the handle's OVERALL operation timeout, which is what a blocking
-    /// disconnect handler consults through `Curl_timeleft`. Without it, C's
-    /// comment records, `FTP`/`IMAP`/`SMTP` and `SFTP` handlers *"hang for the
-    /// default 120 seconds"*.
     fn set_operation_timeout_ms(
         &mut self,
         handle: ShutdownHandle,
@@ -422,12 +249,6 @@ pub(crate) trait ShutdownHost {
     );
 
     /// C's `Curl_pgrsTime(data, TIMER_STARTOP)` (`lib/cshutdn.c:53`).
-    ///
-    /// Restarts the operation clock, so that the cap
-    /// [`Self::set_operation_timeout_ms`] just set is measured from now rather
-    /// than from whenever the finished transfer began. The two calls are
-    /// useless apart: a fresh cap against a stale start instant is already
-    /// expired.
     fn restart_operation_timing(&mut self, handle: ShutdownHandle);
 
     // -- the socket-event layer -------------------------------------------
@@ -442,15 +263,6 @@ pub(crate) trait ShutdownHost {
 
     /// C's `Curl_multi_ev_assess_conn` (`lib/multi_ev.h:59`), reached through
     /// `cshutdn_update_ev` (`lib/cshutdn.c:380-393`).
-    ///
-    /// *"Assess the connection by getting its current pollset."* A connection
-    /// in this queue has no transfer driving it, so its readiness comes from
-    /// its filter chains, which is why they are passed: the event layer must
-    /// call `Curl_conn_adjust_pollset` itself in order to diff the result
-    /// against what it previously told the application.
-    ///
-    /// A non-[`CURLMcode::Ok`] answer makes [`ShutdownQueue::add`] discard the
-    /// connection rather than enqueue it.
     fn assess_conn(
         &mut self,
         handle: ShutdownHandle,
@@ -461,13 +273,6 @@ pub(crate) trait ShutdownHost {
 
     /// C's `Curl_multi_ev_conn_done` (`lib/multi_ev.h:76`,
     /// `lib/cshutdn.c:158`).
-    ///
-    /// Tells the event layer that this connection's sockets are about to stop
-    /// existing, so that the application is sent the removals before the
-    /// descriptors are closed and possibly reused for something else.
-    ///
-    /// Charged to [`ShutdownHandle::Caller`] by the C -- `data`, not `admin`
-    /// -- and gated on [`Self::has_multi`].
     fn conn_done(
         &mut self,
         handle: ShutdownHandle,
@@ -507,19 +312,7 @@ pub(crate) trait ShutdownHost {
     fn max_total_connections(&self) -> usize;
 }
 
-// =========================================================================
 // THE SHUTDOWN-TIMER CONTRACT WITH `conn/mod.rs`
-// =========================================================================
-//
-// The five helpers of `lib/connect.c:144-207` are the deadline mechanism a
-// graceful shutdown runs on, and they are SPLIT across two files: `conn/mod.rs`
-// owns the storage and the four per-index primitives, this module owns the rule
-// that combines two indices into one answer, and `crate::conn::filters` is the
-// third participant. Nothing here stores a start instant or a budget -- every
-// reading is taken through the injected `ShutdownTimer` -- so the
-// contract below
-// is the whole of what the two files agree on, written out so that the
-// implementation and its only caller cannot drift.
 //
 // `Curl_shutdown_start(data, sockindex, timeout_ms)` (`:144-160`)
 //     Records "now" for `sockindex` and resolves the budget ONCE for the
@@ -528,53 +321,9 @@ pub(crate) trait ShutdownHost {
 //         explicit > 0            ? explicit
 //         : configured > 0        ? configured   (`CURLOPT_SHUTDOWN_TIMEOUT`)
 //         : DEFAULT_SHUTDOWN_TIMEOUT_MS          (2000)
-//
-//     So passing zero -- which both callers do, `lib/cshutdn.c:80` and
-//     `lib/cfilters.c:180` -- asks for the configured budget or, failing that,
-//     two seconds. It ALSO arms `EXPIRE_SHUTDOWN`, but only when the handle is
-//     an application transfer (C's `if(data->mid)`, `:156-157`): the admin
-//     handle is not in the multi handle's timer list, and this module arms the
-//     timer for it separately in `ShutdownQueue::perform_once`.
-//
-// `Curl_shutdown_started(data, sockindex)` (`:200-207`)
-//     True when EITHER the seconds or the microseconds of the recorded instant
-//     is non-zero. Both halves matter: a start instant landing exactly on a
-//     second boundary has zero microseconds, and one in the first microsecond
-//     after the clock's epoch has zero seconds.
-//
-// `Curl_shutdown_timeleft(data, conn, sockindex)` (`:162-176`)
-//     Zero for "not started" or "no limit"; otherwise
-//     `budget - elapsed`, returned as `left != 0 ? left : -1` -- so landing
-//     exactly ON the deadline reports expiry rather than being mistaken for
-//     "unlimited". Negative therefore means expired, and
-//     `crate::conn::filters`'s chain shutdown turns it into
-//     `CURLE_OPERATION_TIMEDOUT` (`lib/cfilters.c:183-188`).
-//
-// `Curl_conn_shutdown_timeleft(data, conn)` (`:178-192`)
-//     The minimum NON-ZERO reading across both socket indices, zero when
-//     neither has one. Implemented HERE, as `ConnShutdownTimer` below, because
-//     this module is its only caller.
-//
-// `Curl_shutdown_clear(data, sockindex)` (`:194-198`)
-//     Forgets the recorded instant for one index. Invoked from
-//     `crate::conn::filters` rather than from here: it is the second half of
-//     `Curl_conn_close` (`lib/cfilters.c:154`), so it happens wherever a chain
-//     is closed, which for this module means inside
-//     `FilterChain::close_and_clear` during a termination.
 
 /// `Curl_conn_shutdown_timeleft` (`lib/connect.c:178-192`): the deadline
 /// across BOTH socket chains.
-///
-/// An extension over [`ShutdownTimer`] rather than a member of it, and the
-/// split is where the two files' responsibilities lie. `conn/mod.rs` owns the
-/// STORAGE -- C's `conn->shutdown.start[2]` and `conn->shutdown.timeout_ms`
-/// (`lib/urldata.h:651-654`) -- and therefore owns the four per-index
-/// primitives. The rule for combining two indices into one answer belongs to
-/// the caller that needs it, which is this module and only this module: the
-/// filter chain works one index at a time and never asks.
-///
-/// Blanket-implemented, so every [`ShutdownTimer`] has it and no
-/// implementation can get it wrong.
 #[allow(dead_code)] // consumer: `Self::conn_time_left_ms`'s own callers
 pub(crate) trait ConnShutdownTimer: ShutdownTimer {
     /// The smallest NON-ZERO remaining time over both socket indices, or zero
@@ -592,8 +341,6 @@ pub(crate) trait ConnShutdownTimer: ShutdownTimer {
     ///
     /// # Why this is not a `min` over the two values
     ///
-    /// C's loop is
-    ///
     /// ```c
     /// for(i = 0; conn->shutdown.timeout_ms && (i < 2); ++i) {
     ///   if(!conn->shutdown.start[i].tv_sec)
@@ -603,18 +350,6 @@ pub(crate) trait ConnShutdownTimer: ShutdownTimer {
     ///     left_ms = ms;
     /// }
     /// ```
-    ///
-    /// and its two guards are both already inside
-    /// [`ShutdownTimer::time_left_ms`]: that function returns zero when
-    /// `timeout_ms <= 0` and zero when the index has not started
-    /// (`lib/connect.c:168-170`). So skipping every zero reading is exactly
-    /// the C's outer condition and its `continue` together, and the
-    /// `!left_ms ||` clause is what makes the first non-zero reading win
-    /// outright instead of losing to the zero the accumulator started at.
-    ///
-    /// That last detail is the difference between this function and the
-    /// arithmetic in [`ShutdownQueue::perform_once`], which has no such clause
-    /// and is frozen without it.
     fn conn_time_left_ms(&self) -> TimeDiff {
         let mut left_ms: TimeDiff = 0;
         for sockindex in SocketIndex::ALL {
@@ -629,18 +364,9 @@ pub(crate) trait ConnShutdownTimer: ShutdownTimer {
 
 impl<T> ConnShutdownTimer for T where T: ShutdownTimer + ?Sized {}
 
-// =========================================================================
 // One connection on its way out
-// =========================================================================
 
 /// A connection being shut down, owned by value.
-///
-/// The fields are the subset of `struct connectdata` (`lib/urldata.h`) that a
-/// shutdown reads or writes, and every one of them is a TYPED field where the C
-/// keeps a bit in a `BIT()` bitfield. That is not cosmetic: the two latches
-/// below are the only thing standing between "the protocol said goodbye once"
-/// and "the protocol said goodbye twice", and a mistyped bit name in C is a
-/// silent behaviour change where a mistyped field name here is a compile error.
 ///
 /// # The two latches
 ///
@@ -660,14 +386,6 @@ impl<T> ConnShutdownTimer for T where T: ShutdownTimer + ?Sized {}
 ///   an immediate "already done" short circuit on the next step (`:85-88`),
 ///   and read a third time to decide whether the final close is announced as
 ///   graceful or as forced (`:150-152`).
-///
-/// # Ownership and the `Drop` guarantee
-///
-/// Nothing here is borrowed, so dropping the value releases everything it
-/// holds: the filter chains destroy their filters, the boxed timer and handler
-/// are freed, and the destination string is freed. That is what makes
-/// [`ShutdownQueue`]'s `Drop` a safe net rather than a leak -- see
-/// [`ShutdownQueue::drop`].
 #[allow(dead_code)] // consumers: `crate::conn::pool` and `crate::multi`
 pub(crate) struct ShuttingDownConnection {
     /// C's `conn->connection_id`, the number every trace line carries.
@@ -701,23 +419,12 @@ pub(crate) struct ShuttingDownConnection {
     in_pool: bool,
     /// C's `conn->scheme->flags & PROTOPT_NONETWORK`, the `else` branch of
     /// `Curl_conn_is_connected` (`lib/cfilters.c:611-612`).
-    ///
-    /// A scheme that uses no network -- `file://` -- counts as connected with
-    /// no filter chain installed at all. The flag travels on the connection
-    /// because the scheme table belongs to `crate::protocols` and this module
-    /// names nothing from it.
     no_network: bool,
 }
 
 impl fmt::Debug for ShuttingDownConnection {
     /// Deliberately partial: the two injected objects are reported by
     /// PRESENCE.
-    ///
-    /// A timer's contents are the multi handle's business and a handler's are
-    /// the scheme's; printing either would make a failing assertion in this
-    /// module's tests harder to read rather than easier. Everything a test does
-    /// assert on -- the identity, the destination and all five flags -- is
-    /// here.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ShuttingDownConnection")
             .field("id", &self.id)
@@ -889,13 +596,6 @@ impl ShuttingDownConnection {
     }
 
     /// `Curl_conn_is_connected(conn, sockindex)` (`lib/cfilters.c:601-613`).
-    ///
-    /// The index cannot be invalid, because [`SocketIndex`] cannot hold an
-    /// invalid value -- C's `CONN_SOCK_IDX_VALID` guard at `:604-605` has
-    /// nothing left to reject, and the
-    /// [`BadFunctionArgument`](crate::error::CURLcode::BadFunctionArgument) it
-    /// stands for is reported by [`SocketIndex::from_i32`] at the boundary
-    /// where a raw index arrives instead.
     pub(crate) fn is_connected(&self, sockindex: SocketIndex) -> bool {
         self.chains.chain(sockindex).is_connected(self.no_network)
     }
@@ -905,38 +605,7 @@ impl ShuttingDownConnection {
     /// `cshutdn_run_conn_handler` (`lib/cshutdn.c:41-66`): give the scheme its
     /// one chance to say goodbye.
     ///
-    /// Returns immediately when the latch is already set, so this is safe --
-    /// and deliberately cheap -- to call on every path that could be the last
-    /// one. Both callers do exactly that: a shutdown step calls it (`:83`) and
-    /// so does a termination (`:144`), which means a connection terminated
-    /// without ever being stepped still gets its farewell.
-    ///
-    /// # The latch is set unconditionally, and that is the point
-    ///
-    /// `conn->bits.shutdown_handler = TRUE` sits at `:65`, OUTSIDE the
-    /// `if(conn->scheme && conn->scheme->run->disconnect)` at `:46`. A scheme
-    /// with no disconnect handler still latches. See the field documentation on
-    /// [`ShuttingDownConnection`] for why `Curl_conn_free` makes that
-    /// load-bearing rather than merely tidy.
-    ///
     /// # The cap on a blocking handler
-    ///
-    /// C's comment at `:47-50` states the problem: *"Some disconnect handlers
-    /// do a blocking wait on server responses. FTP/IMAP/SMTP and SFTP are among
-    /// them. When using the internal handle, set an overall short timeout so we
-    /// do not hang for the default 120 seconds."* Its remedy is two statements
-    /// against the handle -- `data->set.timeout = DEFAULT_SHUTDOWN_TIMEOUT_MS`
-    /// and `Curl_pgrsTime(data, TIMER_STARTOP)` -- which together give the
-    /// handler's own `Curl_timeleft` loop a two-second budget measured from
-    /// now.
-    ///
-    /// Both are reproduced through [`ShutdownHost`], because a handler that
-    /// consults its handle must see what C's handler would see. The budget is
-    /// then ALSO enforced from the outside with `tokio::time::timeout`, which
-    /// is what makes the cap real rather than advisory: an injected handler
-    /// that ignores its handle cannot hang the multi handle. There is no
-    /// blocking sleep anywhere in this path -- the cap is a timer on the
-    /// reactor, and a handler that finishes early costs nothing.
     ///
     /// Cancelling a future is not identical to a handler returning
     /// `CURLE_OPERATION_TIMEDOUT`: work in flight is abandoned at its last
@@ -977,13 +646,6 @@ impl ShuttingDownConnection {
                 host.restart_operation_timing(handle);
             }
 
-            // `:57-59`. C wraps this in `DEBUGF()`, so the line exists only in
-            // a debug build; the migration does not advertise `Debug` (AAP
-            // 0.6.6) and the diagnostic is kept unconditionally instead,
-            // because `infof` is already gated on the transfer being verbose
-            // and a shutdown that goes wrong is exactly what a user runs
-            // `--verbose` to see. `aborted` is printed as C's `%d` prints a
-            // bit: 0 or 1.
             let dead = self.aborted;
             let id = self.id;
             if let Some(tracer) = cx.tracer_mut() {
@@ -1052,11 +714,6 @@ impl ShuttingDownConnection {
     /// termination's final attempt calls this one (`:148`) -- so a forced close
     /// emits no `shutdown, done=` line. That asymmetry is easy to lose and it
     /// changes what a `--verbose` log contains.
-    ///
-    /// C opens with `DEBUGASSERT(data->conn == conn)`, an assertion that the
-    /// handle is attached to the connection it is about to shut down. There is
-    /// nothing to assert here: the connection arrives as `&mut self`, so it
-    /// cannot be a different connection from the one the caller meant.
     async fn run_once_inner<H>(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -1091,9 +748,6 @@ impl ShuttingDownConnection {
         // * `connect_only` -- the application took the socket over through
         //   `CURLOPT_CONNECT_ONLY` and libcurl must not write to it.
         // * not connected -- there is nothing established to shut down.
-        //
-        // Either way the C sets `rN = CURLE_OK; doneN = TRUE`, which is why
-        // this reads as `(no error, done)` below.
         let mut failed = false;
         let mut all_done = true;
         for sockindex in SocketIndex::ALL {
@@ -1123,17 +777,6 @@ impl ShuttingDownConnection {
         //
         //   /* we are done when any failed or both report success */
         //   *done = (r1 || r2 || (done1 && done2));
-        //
-        // An error on EITHER chain is terminal and is not retried: there is no
-        // caller left to report it to and nothing a second attempt could fix.
-        // Absent an error, BOTH chains must report themselves done.
-        //
-        // The latch is then set on ANY completion, an ERROR INCLUDED, and that
-        // has a consequence worth naming because it looks like a defect: the
-        // `force ` prefix of the closing trace is chosen from this same latch
-        // (`:151`), so a shutdown that FAILED is announced exactly like one
-        // that succeeded. Frozen as measured (AAP 0.8.1) and pinned by
-        // `an_expired_primary_deadline_ends_the_shutdown_inside_the_chain`.
         let done = failed || all_done;
         if done {
             self.shutdown_filters = true;
@@ -1149,11 +792,6 @@ impl ShuttingDownConnection {
     /// (`:115`, `:118`) has no successor: the connection is a parameter, so
     /// there is no window in which `data->conn` names something else and no
     /// bookkeeping to undo on the way out.
-    ///
-    /// `lib/conncache.c:222` calls this on a connection that is NOT in the
-    /// queue -- the pool's first, hopeful attempt before it decides whether to
-    /// enqueue -- which is why it is a method on the connection rather than on
-    /// [`ShutdownQueue`].
     ///
     /// # Panics
     ///
@@ -1185,10 +823,6 @@ impl ShuttingDownConnection {
 
     /// The part of `Curl_conn_free` (`lib/url.c`) that this value owns.
     ///
-    /// C's function does three things: it re-runs the disconnect handler when
-    /// `!conn->bits.shutdown_handler`, it discards both filter chains, and it
-    /// frees a long list of owned strings before freeing the connection itself.
-    ///
     /// * The **re-run** is unreachable from here, and provably so:
     ///   [`terminate`] always calls [`Self::run_conn_handler`] first, which
     ///   latches unconditionally. The guard exists in the C for callers that
@@ -1200,30 +834,16 @@ impl ShuttingDownConnection {
     /// * The **string frees** have no successor. Every one of them is a field
     ///   of this value, so dropping the value frees them, in declaration order,
     ///   with no possibility of missing one.
-    ///
-    /// Consumes the connection: after this there is nothing left to free.
     fn release(mut self, cx: &mut CallCtx<'_, '_>) {
         self.chains.discard_everything(cx);
         drop(self);
     }
 }
 
-// =========================================================================
 // Termination: the end of a connection's life
-// =========================================================================
 
 /// `Curl_cshutdn_terminate` (`lib/cshutdn.c:121-165`): close and destroy a
 /// connection, optionally trying one last graceful step first.
-///
-/// # It consumes the connection, and that is the design
-///
-/// C's declaration says *"Takes ownership of `conn`"* (`lib/cshutdn.h:46`) and
-/// then relies on every caller to honour it: five call sites remove the
-/// connection from a list first, and one that forgot would leave a freed
-/// pointer linked. Here the ownership transfer is the signature. Terminating
-/// twice, terminating a connection still in the queue, or re-queueing one that
-/// has been terminated are not mistakes this function has to detect -- they are
-/// programs that do not compile.
 ///
 /// # Preconditions
 ///
@@ -1238,15 +858,6 @@ impl ShuttingDownConnection {
 ///   unrepresentable: a `ShuttingDownConnection` moved into this function
 ///   cannot simultaneously be borrowed by a transfer, so the type system
 ///   enforces what the C can only check.
-///
-/// # Which handle does what
-///
-/// The substitution at `:135-140` is partial, and the split is reproduced
-/// literally. Against [`ShutdownHandle::Admin`] (when there is one): the
-/// protocol handler, the final shutdown attempt, the closing trace, both chain
-/// closes and the release. Against [`ShutdownHandle::Caller`] and gated on
-/// [`ShutdownHost::has_multi`]: the `conn_done` notification, the connchanged
-/// trace and the connchanged notification.
 ///
 /// # Panics
 ///
@@ -1304,12 +915,6 @@ pub(crate) async fn terminate<H>(
 
     // `:153-154`. SECONDARY FIRST, then primary.
     //
-    // The order is not arbitrary and it is not the order the chains are
-    // discarded in a moment later. A secondary chain is a subordinate of the
-    // primary one -- FTP's data connection to its control connection -- and
-    // closing the primary first would drop the channel over which the
-    // secondary's own teardown is coordinated.
-    //
     // `close_and_clear` is `Curl_conn_close` in full
     // (`lib/cfilters.c:144-155`):
     // the head filter's close, then `Curl_shutdown_clear` for that index. The
@@ -1350,19 +955,9 @@ pub(crate) async fn terminate<H>(
 
 // ========================================================================= The
 // queue
-// =========================================================================
 
 /// The multi handle's FIFO of connections being shut down -- C's
 /// `struct cshutdn` (`lib/cshutdn.h:51-58`).
-///
-/// C's struct has three members and this has one. `struct Curl_llist list`
-/// becomes the [`VecDeque`]; `struct Curl_multi *multi` becomes the
-/// [`ShutdownHost`] parameter, for the reason that trait's documentation gives;
-/// and `BIT(initialised)` becomes nothing at all, because `Curl_cshutdn_init`'s
-/// only job is to set it (`lib/cshutdn.c:319-327`) and a Rust value cannot be
-/// observed before it is constructed. `Curl_cshutdn_init` therefore has no
-/// successor beyond [`Self::new`], and its `int` return -- a value that is only
-/// ever the literal `0` (`:326`, commented "good") -- has none either.
 ///
 /// # Ordering
 ///
@@ -1385,17 +980,6 @@ impl ShutdownQueue {
 
     /// How many connections are being shut down -- `Curl_cshutdn_count`
     /// (`lib/cshutdn.c:353-360`).
-    ///
-    /// C guards on `data && data->multi` and answers zero when either is
-    /// missing, because that pair is HOW it reaches the queue
-    /// (`&data->multi->cshutdn`). An owned queue reached through `&self` has
-    /// nothing left to guard, so the zero answer is reachable only by the queue
-    /// genuinely being empty. The same reasoning applies to
-    /// [`Self::destination_count`] and [`Self::close_oldest`].
-    ///
-    /// `crate::conn::pool` reads this on every turn of its limit-eviction loop
-    /// -- `lib/conncache.c:434` and `:453` re-read it rather than caching --
-    /// because closing one connection changes the answer.
     pub(crate) fn count(&self) -> usize {
         self.queue.len()
     }
@@ -1408,18 +992,6 @@ impl ShutdownQueue {
 
     /// How many connections to `destination` are being shut down --
     /// `Curl_cshutdn_dest_count` (`lib/cshutdn.c:362-378`).
-    ///
-    /// The destination is REQUIRED, and that is C's contract rather than a
-    /// tightening: the loop body is `if(!strcmp(destination,
-    /// conn->destination))` with no null guard on `destination`, so passing
-    /// NULL would dereference it. [`Self::close_oldest`] is the one that
-    /// accepts "any destination", and it takes an [`Option`] precisely because
-    /// it is the one that means it.
-    ///
-    /// Exact byte equality, and a linear scan. `lib/conncache.c:397` and `:425`
-    /// call this while deciding whether a new connection to the same host may
-    /// be created, so it is asked at most once per connection attempt over a
-    /// queue that is empty in the common case.
     pub(crate) fn destination_count(&self, destination: &str) -> usize {
         self.queue
             .iter()
@@ -1430,23 +1002,6 @@ impl ShutdownQueue {
     /// `cshutdn_destroy_oldest` / `Curl_cshutdn_close_oldest`
     /// (`lib/cshutdn.c:167-203`): force one connection closed, returning
     /// whether there was one to close.
-    ///
-    /// `destination` of [`None`] means "any", and then the OLDEST connection is
-    /// simply the one at the head: C's scan breaks on its first element when
-    /// `!destination` (`:177`). With a destination it is the first element from
-    /// the head whose destination matches exactly -- so still FIFO, just
-    /// filtered.
-    ///
-    /// # No graceful pass
-    ///
-    /// `do_shutdown` is `FALSE` (`:188`). This is the path taken when a
-    /// connection limit is in the way, and spending time on a polite farewell
-    /// for a connection that is being closed to make room would defeat the
-    /// purpose -- the caller is blocked waiting for the room.
-    ///
-    /// The C brackets the termination with a saved-then-restored process signal
-    /// disposition (`:183-189`). Nothing replaces it; see the module
-    /// documentation.
     ///
     /// # Panics
     ///
@@ -1462,11 +1017,6 @@ impl ShutdownQueue {
     {
         // `:174-180`: from the head, stopping at the first match. `None` makes
         // the predicate true immediately, which is the C's `!destination`.
-        //
-        // `map_or(true, ..)` rather than `Option::is_none_or`, which reads
-        // better and says the same thing but was stabilised in 1.82 -- above
-        // the 1.75 floor of AAP 0.8.3. `clippy.toml` records that floor, so the
-        // lint that would suggest the newer spelling stays quiet.
         let found = self.queue.iter().position(|conn| {
             destination.map_or(true, |wanted| conn.destination == wanted)
         });
@@ -1501,34 +1051,6 @@ impl ShutdownQueue {
     /// if max_total > 0 && max_total <= conns_in_pool + shutdown_queue.len()
     ///     force-close the oldest shutdown connection
     /// ```
-    ///
-    /// **Pooled and shutting-down connections count together.** A connection
-    /// that is draining still holds a descriptor and still holds a slot against
-    /// `CURLMOPT_MAX_TOTAL_CONNECTIONS`, so a queue allowed to grow freely
-    /// would let an application exceed a limit it explicitly set merely by
-    /// finishing transfers quickly.
-    ///
-    /// It is an `if` and not a `while`: exactly one connection is discarded,
-    /// and the new one is then admitted even if that leaves the total one over
-    /// the limit. Reproduced as written -- iterating here would change which
-    /// connections survive a burst.
-    ///
-    /// `conns_in_pool` is a plain `usize`. The queue holds no handle back into
-    /// the pool, and that is what makes it PROVABLE that terminating a
-    /// connection cannot re-enter the queue: [`terminate`] is handed no queue
-    /// borrow and no pool, so the removal-safety argument in
-    /// [`Self::perform_once`] rests on the type signature rather than on
-    /// inspection.
-    ///
-    /// # The event-assessment failure path
-    ///
-    /// When a socket callback is installed, the event layer is told about the
-    /// connection's sockets before it is enqueued (`:411-418`). If that fails
-    /// there is no safe way to keep the connection: the application's idea of
-    /// which descriptors it should watch would no longer match libcurl's, and a
-    /// draining connection nobody polls would never finish. So the connection
-    /// is discarded instead -- and, being consumed, cannot be enqueued
-    /// afterwards by mistake.
     ///
     /// # Panics
     ///
@@ -1615,10 +1137,6 @@ impl ShutdownQueue {
     /// `cshutdn_perform` / `Curl_cshutdn_perform` (`lib/cshutdn.c:228-264`,
     /// `:426-431`): one non-blocking step over every queued connection.
     ///
-    /// This is what the multi handle calls on each turn of `curl_multi_perform`
-    /// (`lib/multi.c:2457`). Connections that finish are terminated; the rest
-    /// stay and the shutdown timer is re-armed for them.
-    ///
     /// # Removal safety
     ///
     /// C captures `enext = Curl_node_next(e)` BEFORE running the step
@@ -1630,12 +1148,6 @@ impl ShutdownQueue {
     /// reorder it. The only mutation during the walk is this function's own
     /// removal, and not advancing the index after a removal lands on the
     /// element that shifted down -- exactly where C's `e = enext` lands.
-    ///
-    /// A finished connection is terminated **inside** the loop, interleaved
-    /// with the remaining steps, because that is where C does it (`:249-250`).
-    /// Collecting the finished ones and terminating them afterwards would
-    /// produce the same final state and a different sequence of trace lines and
-    /// host callbacks, and the sequence is observable.
     ///
     /// # Panics
     ///
@@ -1689,28 +1201,6 @@ impl ShutdownQueue {
                 // Starting at zero means positive future deadlines do not lower
                 // the value; only already-expired negative values schedule this
                 // path. Do not "fix" without changing curl parity.
-                //
-                // C's own comment above these lines states the opposite intent
-                // -- "idata has one timer list, but maybe more than one
-                // connection. Set EXPIRE_SHUTDOWN to the smallest time left for
-                // all." -- and the code does not implement it: `next_expire_ms`
-                // is initialised to 0 (`:235`) and the test is
-                // `if(ms && ms < next_expire_ms)` (`:256`) with no
-                // `!next_expire_ms ||` clause of the sort
-                // `Curl_conn_shutdown_timeleft` does have
-                // (`lib/connect.c:188`). A positive `ms` is therefore never
-                // less than 0 and never wins, so the timer is armed only when
-                // some connection reports a NEGATIVE remaining time.
-                //
-                // Reproduced exactly, because observable behaviour is frozen
-                // (AAP 0.8.1) and a change justified as an improvement is
-                // prohibited (AAP 0.8.2). Arming the timer as the comment
-                // intends would add timer callbacks and `[TIMER] [SHUTDOWN]`
-                // trace lines that curl 8.19.0-DEV does not emit.
-                //
-                // The three readings, per `ConnShutdownTimer`: NEGATIVE means
-                // the deadline has passed, ZERO means no limit or not started,
-                // POSITIVE means that much time remains.
                 if ms != 0 && ms < next_expire_ms {
                     next_expire_ms = ms;
                 }
@@ -1728,20 +1218,6 @@ impl ShutdownQueue {
 
     /// Walks every queued connection's pollset -- the shared body of all three
     /// readiness exports (`lib/cshutdn.c:434-533`).
-    ///
-    /// One [`EasyPollset`] is created and RESET between connections rather than
-    /// one being constructed per connection, which is what all three C loops do
-    /// (`Curl_pollset_init` before the loop at `:443`, `:487`, `:514`;
-    /// `Curl_pollset_reset` inside it at `:449`, `:490`, `:517`). The
-    /// difference is not merely allocation: a reset pollset keeps its capacity,
-    /// so a queue of many connections pays for its widest one only once.
-    ///
-    /// `body` is infallible because both aggregation buffers are: their C
-    /// counterparts could only fail by failing to allocate, and a Rust vector
-    /// aborts rather than reporting that. The only failure left is
-    /// `adjust_pollset`'s, and what it does to the walk is the caller's choice
-    /// -- see [`OnAdjustError`], which is a real difference between the three
-    /// exports and not a generalisation.
     fn for_each_pollset<F>(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -1783,31 +1259,6 @@ impl ShutdownQueue {
     /// belongs to `curl-rs-ffi`, which is the crate whose job is the C ABI, and
     /// this function hands out typed pairs instead. No libc type, no libc
     /// macro and no `maxfd` appears anywhere in this file.
-    ///
-    /// `maxfd` is not a loss. It is the highest descriptor number that
-    /// `select(2)` must be told about, which is an artefact of `select`'s
-    /// interface rather than information about the connection; a caller that
-    /// needs it computes it from these pairs, and one that does not never has
-    /// to think about it. C's `FDSET_SOCK(sock)` skip (`:459-460`) is the same
-    /// bound test in disguise, and it likewise belongs where the descriptor set
-    /// does.
-    ///
-    /// # What the pairs mean
-    ///
-    /// Exactly what the pollset said: every socket the connection's filter
-    /// chains asked to watch, with the union of the actions they asked for. C
-    /// then keeps only [`PollAction::IN`] and [`PollAction::OUT`]
-    /// (`:461-464`); that projection is the descriptor set's business too,
-    /// because a pair carrying neither is meaningless in a descriptor set and
-    /// perfectly meaningful to a caller counting what a connection is up to.
-    ///
-    /// Duplicate descriptors are NOT folded here, deliberately: folding is a
-    /// property of a buffer being built ([`PollFds::add_ps`] and
-    /// [`WaitFds::add_ps`] both do it), and a caller receiving raw pairs may
-    /// want to know that two connections named the same descriptor.
-    ///
-    /// A connection whose `adjust_pollset` fails contributes nothing and does
-    /// not stop the walk -- C's `if(result) continue;` at `:454-455`.
     pub(crate) fn sockets(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -1825,24 +1276,6 @@ impl ShutdownQueue {
     /// `Curl_cshutdn_add_waitfds` (`lib/cshutdn.c:475-501`): record every
     /// queued connection's descriptors in the APPLICATION's array and return
     /// how many entries were NEEDED.
-    ///
-    /// The count, not the number stored: `curl_multi_wait` reports it through
-    /// `numfds`, which is how an application discovers that the array it passed
-    /// was too small. [`WaitFds`] reproduces that -- including its counting
-    /// mode for a caller with no storage at all, and including the folding that
-    /// keeps a descriptor named by two connections from being counted twice.
-    /// Both live in `crate::conn::select` where the rest of the aggregation
-    /// lives, and neither is re-implemented here.
-    ///
-    /// The multi handle's own wakeup descriptor is deliberately absent from
-    /// this path. It goes into a [`PollFds`] through `PollFds::add_sock`
-    /// (`lib/multi.c:1436`) and never into a [`WaitFds`], so `numfds` never
-    /// counts it and the application never learns it exists.
-    ///
-    /// A connection whose `adjust_pollset` fails contributes nothing and does
-    /// not stop the walk -- C's `if(!result)` at `:495`, which simply omits the
-    /// addition. The sum saturates rather than wrapping, as
-    /// [`WaitFds::add_ps`] does.
     pub(crate) fn add_waitfds(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -1859,12 +1292,6 @@ impl ShutdownQueue {
 
     /// `Curl_cshutdn_add_pollfds` (`lib/cshutdn.c:503-534`): buffer every
     /// queued connection's descriptors for an internal wait.
-    ///
-    /// The INTERNAL buffer, not the application's: `lib/multi.c:1391` fills it
-    /// on the way into `curl_multi_poll`, and the multi handle's own wakeup
-    /// descriptor goes into the same buffer (`lib/multi.c:1436`) where it is
-    /// invisible to the caller. [`PollFds::add_ps`] folds a descriptor named by
-    /// two connections into one entry with the union of their interests.
     ///
     /// # Errors
     ///
@@ -1896,27 +1323,30 @@ impl ShutdownQueue {
     /// 1000)` at `:221` -- so that the drain loop re-examines the queue at
     /// least once a second.
     ///
-    /// # The count is discarded; a failure is not
+    /// # Both the count AND a failure are discarded -- exactly as in C
     ///
-    /// C discards how many descriptors were ready, and this does too: the
-    /// answer changes nothing, because the next thing that happens is a
-    /// shutdown step on every connection regardless.
+    /// `Curl_poll(cpfds.pfds, cpfds.n, CURLMIN(timeout_ms, 1000));` at `:221`
+    /// is a bare STATEMENT: neither the number of ready descriptors nor a `-1`
+    /// is read. The count changes nothing, because the next thing that happens
+    /// is a shutdown step on every connection regardless; and a failed wait
+    /// returns instantly, so the drain loop keeps passing over the queue until
+    /// its own deadline expires and reports `timeout`.
     ///
-    /// C ALSO discards a failure -- `Curl_poll(...)` at `:221` is evaluated as
-    /// a statement, so its `-1` is lost and the drain loop keeps calling a
-    /// broken wait, which returns instantly, until its own deadline expires.
-    /// Here a [`CURLcode::UnrecoverablePoll`] is propagated instead, which ends
-    /// the graceful loop through the same path an `add_pollfds` failure takes.
-    /// The reasons for the difference, stated plainly rather than buried:
+    /// An earlier revision propagated [`CURLcode::UnrecoverablePoll`] here, on
+    /// the argument that the final state is identical and only one trace word
+    /// differs. AAP 0.8.2 does not allow that trade: the trace text is
+    /// observable output, `--trace`/`--trace-ascii` put it where a fixture can
+    /// compare it, and `aborted` where curl says `timeout` is a behaviour
+    /// change justified by improvement.
     ///
-    /// * The FINAL STATE is identical. Both breaks fall through to the same
-    ///   force-termination of everything remaining, so no connection survives
-    ///   one route and dies on the other.
-    /// * The only observable difference is one trace word -- `aborted` where C
-    ///   would eventually say `timeout` -- in a case C itself names
-    ///   *unrecoverable*.
-    /// * The alternative is a spin at full speed until the deadline, which is
-    ///   not a behaviour worth reproducing for its own sake.
+    /// # What is still propagated
+    ///
+    /// [`Self::add_pollfds`] failing. That is NOT symmetric with the poll, and
+    /// the asymmetry is the C's: `:217-219` is
+    /// `result = Curl_cshutdn_add_pollfds(...); if(result) goto out;`, so an
+    /// `adjust_pollset` failure ends the wait with a code while the poll's own
+    /// failure does not. A blanket "discard everything here" would have been
+    /// wrong in the other direction.
     ///
     /// # Panics
     ///
@@ -1928,38 +1358,16 @@ impl ShutdownQueue {
     ) -> CurlResult<()> {
         // `:211-215`. `NUM_POLLS_ON_STACK` has nothing left to size.
         let mut pfds = PollFds::new();
+        // `:217-219` -- this one propagates.
         self.add_pollfds(cx, &mut pfds)?;
-        // `:221`, with the count discarded as C discards it.
-        let _ready = pfds.poll(timeout_ms.min(WAIT_SLICE_MAX_MS)).await?;
+        // `:221` -- evaluated as a statement, so both the count and any failure
+        // are dropped here as the C drops them.
+        let _ = pfds.poll(timeout_ms.min(WAIT_SLICE_MAX_MS)).await;
         Ok(())
     }
 
     /// `cshutdn_terminate_all` (`lib/cshutdn.c:266-317`): drain the queue,
     /// gracefully for as long as `timeout_ms` allows and forcibly thereafter.
-    ///
-    /// # `timeout_ms` of zero means exactly one pass
-    ///
-    /// This is the default and it is not a degenerate case; it is the whole of
-    /// what `curl_multi_cleanup` does. The first check after the first pass is
-    /// `spent_ms >= timeout_ms` (`:293`), and elapsed time is never negative,
-    /// so zero is satisfied immediately: one non-blocking pass, the
-    /// `best effort done` line, and then force-termination of everything left.
-    /// A caller closing a multi handle does not want to wait on servers, and a
-    /// connection whose farewell has not completed is closed unceremoniously.
-    ///
-    /// # A positive timeout
-    ///
-    /// The loop alternates a pass with a wait of `min(remaining, 1000)` ms
-    /// until the queue empties, the budget runs out, or a wait fails. The four
-    /// exits emit four distinct lines and every one of them is preserved:
-    /// `cleanly`, `timeout`, `best effort done` and `aborted`.
-    ///
-    /// # The force-termination tail is unconditional
-    ///
-    /// `:306-313` runs after every exit including the clean one, where it finds
-    /// nothing to do. C then asserts the queue is empty (`:314`); the assertion
-    /// is kept, and here it also documents that the drain cannot be re-entered,
-    /// since [`terminate`] holds no queue borrow.
     ///
     /// # Panics
     ///
@@ -2048,9 +1456,6 @@ impl ShutdownQueue {
     /// `Curl_cshutdn_destroy` (`lib/cshutdn.c:329-351`): the owner's
     /// end-of-life call, with C's default budget of zero.
     ///
-    /// `curl_multi_cleanup` reaches this (`lib/multi.c:2887`) and so does the
-    /// failure path of `curl_multi_init` (`:315`).
-    ///
     /// # Panics
     ///
     /// As [`Self::destroy_with_timeout`].
@@ -2068,28 +1473,6 @@ impl ShutdownQueue {
     /// [`Self::destroy`] with an explicit budget.
     ///
     /// # This parameter replaces an environment variable, deliberately
-    ///
-    /// C's budget is a local initialised to zero and then, in a debug build
-    /// only, overwritten from `getenv("CURL_GRACEFUL_SHUTDOWN")` (`:335-344`)
-    /// -- a hook whose own comment says *"Just for testing, run graceful
-    /// shutdown"*.
-    ///
-    /// Reading the process environment is the wrong mechanism here for two
-    /// independent reasons. It is invisible to the type system, so a caller
-    /// cannot tell that the function's behaviour is configurable at all; and it
-    /// is process-wide, so two multi handles in one process cannot be given
-    /// different budgets. The parameter is visible, per-queue, and available in
-    /// a release build -- which matters, because the migration does not
-    /// advertise `Debug` (AAP 0.6.6) and a debug-only hook would therefore be
-    /// dead code in every configuration this workspace ships.
-    ///
-    /// Nothing is lost: a test asks for a graceful drain by passing a budget,
-    /// which is exactly what setting the variable achieved.
-    ///
-    /// C's `if(cshutdn->initialised && data)` guard (`:332`) has no successor,
-    /// for the reason [`Self::new`] gives, and neither does `cshutdn->multi =
-    /// NULL` (`:350`): the host is a parameter, so there is no back pointer to
-    /// clear.
     ///
     /// # Panics
     ///
@@ -2126,11 +1509,6 @@ enum OnAdjustError {
     /// The connection contributes nothing and the walk continues --
     /// `Curl_cshutdn_setfds` (`lib/cshutdn.c:454-455`) and
     /// `Curl_cshutdn_add_waitfds` (`:495`).
-    ///
-    /// Both of these answer "what should be watched"; one connection that
-    /// cannot say is not a reason to stop asking the others, and the caller has
-    /// no error channel to report it through in any case --
-    /// `Curl_cshutdn_setfds` returns `void` and `_add_waitfds` returns a count.
     Skip,
     /// The buffer is emptied and the error is returned --
     /// `Curl_cshutdn_add_pollfds` (`:524-528`).
@@ -2144,31 +1522,6 @@ enum OnAdjustError {
 impl Drop for ShutdownQueue {
     /// A non-blocking safety net. It cannot leak and it cannot double-free, and
     /// it deliberately does not attempt what [`ShutdownQueue::destroy`] does.
-    ///
-    /// C's counterpart is `Curl_llist_destroy` on a list built with a NULL
-    /// destructor (`lib/cshutdn.c:324`), which unlinks the nodes and frees
-    /// nothing -- so a C multi handle destroyed without calling
-    /// `Curl_cshutdn_destroy` first leaks every queued connection. That is why
-    /// `curl_multi_cleanup` calls it (`lib/multi.c:2887`).
-    ///
-    /// Here the queue owns its connections, so dropping it frees them: every
-    /// filter releases whatever it holds through its own `Drop`, including the
-    /// descriptor. Nothing leaks, and nothing can be freed twice, because
-    /// [`terminate`] consumed anything it touched.
-    ///
-    /// What `Drop` CANNOT do is the graceful part. A protocol farewell needs to
-    /// `.await`, and `Drop` cannot; a `block_on` here would be worse than
-    /// useless, since it panics inside a `tokio` runtime -- which is precisely
-    /// where a multi handle is dropped. So the owner calls
-    /// [`ShutdownQueue::destroy`] and this runs afterwards over an empty queue.
-    /// No assertion enforces that: a panic while unwinding aborts the process,
-    /// and turning a missed call into an abort would be a worse failure than
-    /// the abrupt close it is trying to report.
-    ///
-    /// The `clear` is explicit rather than implicit so that the disposal ORDER
-    /// is stated: front to back, which is the direction `Curl_llist_destroy`
-    /// walks. It happens to be what dropping the field would do anyway, and
-    /// saying so is how a reader knows it was chosen.
     fn drop(&mut self) {
         self.queue.clear();
     }
@@ -2178,8 +1531,8 @@ impl Drop for ShutdownQueue {
 mod tests {
     use super::*;
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use crate::util::sync_cell::SyncCell;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use crate::conn::filters::{link, ConnFilter, FilterBase};
@@ -2188,19 +1541,17 @@ mod tests {
     use crate::trace::{TraceConfig, TraceState, Tracer, WriterSink};
     use crate::util::timeval::{Clock, CurlTime, TestClock};
 
-    // =====================================================================
     // Scaffolding
-    // =====================================================================
 
     /// A shared, ordered log of everything the injected seams were asked to do.
     ///
     /// The only way to observe a trait object's behaviour once it has been
     /// boxed into a connection, which is the same reason `conn/filters.rs`'s
     /// own tests keep one.
-    type EventLog = Rc<RefCell<Vec<String>>>;
+    type EventLog = Arc<SyncCell<Vec<String>>>;
 
     fn new_log() -> EventLog {
-        Rc::new(RefCell::new(Vec::new()))
+        Arc::new(SyncCell::new(Vec::new()))
     }
 
     fn events(log: &EventLog) -> Vec<String> {
@@ -2236,22 +1587,15 @@ mod tests {
     }
 
     /// An injected clock a TEST FILTER can advance.
-    ///
-    /// The drain measures elapsed time with [`CallCtx::now`], so a fixed clock
-    /// would make a positive budget never expire and the loop never end. This
-    /// shares one reading between the context and a filter, which lets a pass
-    /// "cost" a chosen number of milliseconds and the budget run out
-    /// deterministically -- with no real time spent and no dependence on how
-    /// fast the machine is.
     #[derive(Clone, Debug)]
     struct SharedClock {
-        at: Rc<RefCell<CurlTime>>,
+        at: Arc<SyncCell<CurlTime>>,
     }
 
     impl SharedClock {
         fn new(secs: i64) -> Self {
             Self {
-                at: Rc::new(RefCell::new(CurlTime::new(secs, 0))),
+                at: Arc::new(SyncCell::new(CurlTime::new(secs, 0))),
             }
         }
 
@@ -2263,7 +1607,7 @@ mod tests {
 
     impl Clock for SharedClock {
         fn now(&self) -> CurlTime {
-            *self.at.borrow()
+            *self.at.borrow_mut()
         }
 
         /// Wall-clock seconds are only used for formatting a trace timestamp,
@@ -2274,12 +1618,6 @@ mod tests {
     }
 
     /// A readable trace destination for an `async` test.
-    ///
-    /// [`multi_trace`] takes a synchronous closure, which is right for a plain
-    /// `#[test]` and wrong for one that needs a runtime: nesting a blocking
-    /// wait inside `tokio` panics the moment the future touches a timer. This
-    /// keeps the same configuration -- `MULTI` verbose -- and lets the caller
-    /// `.await` in place.
     struct TraceCapture {
         config: TraceConfig,
         sink: WriterSink<Vec<u8>>,
@@ -2311,12 +1649,6 @@ mod tests {
     }
 
     /// Drives a future to completion with no `tokio` runtime at all.
-    ///
-    /// Sound for every path that cannot reach `tokio::time::timeout` -- which
-    /// is every connection with no protocol handler, and every handler reached
-    /// through a handle that is not internal. It is what lets a trace assertion
-    /// live in a plain `#[test]`, where [`multi_trace`]'s synchronous closure
-    /// belongs, instead of nesting a blocking wait inside a runtime.
     fn drive<F: Future>(future: F) -> F::Output {
         futures::executor::block_on(future)
     }
@@ -2339,20 +1671,20 @@ mod tests {
     /// A recording [`ShutdownTimer`], standing in for `conn/mod.rs`'s.
     #[derive(Debug)]
     struct TestTimer {
-        state: Rc<RefCell<TimerState>>,
+        state: Arc<SyncCell<TimerState>>,
     }
 
-    type TimerHandle = Rc<RefCell<TimerState>>;
+    type TimerHandle = Arc<SyncCell<TimerState>>;
 
     impl TestTimer {
         /// Not `new`: it hands back a trait object and a handle on its state,
         /// so naming it `new` would misdescribe the return type.
         fn boxed() -> (Box<dyn ShutdownTimer>, TimerHandle) {
             let state: TimerHandle =
-                Rc::new(RefCell::new(TimerState::default()));
+                Arc::new(SyncCell::new(TimerState::default()));
             (
                 Box::new(Self {
-                    state: Rc::clone(&state),
+                    state: Arc::clone(&state),
                 }),
                 state,
             )
@@ -2393,7 +1725,7 @@ mod tests {
         /// Not `new`, for the reason [`TestTimer::boxed`] gives.
         fn boxed(log: &EventLog) -> Box<dyn ProtocolDisconnect> {
             Box::new(Self {
-                log: Rc::clone(log),
+                log: Arc::clone(log),
                 blocks_for: None,
             })
         }
@@ -2404,7 +1736,7 @@ mod tests {
             span: Duration,
         ) -> Box<dyn ProtocolDisconnect> {
             Box::new(Self {
-                log: Rc::clone(log),
+                log: Arc::clone(log),
                 blocks_for: Some(span),
             })
         }
@@ -2448,7 +1780,7 @@ mod tests {
         /// callback and no connection limit.
         fn new(log: &EventLog) -> Self {
             Self {
-                log: Rc::clone(log),
+                log: Arc::clone(log),
                 has_admin: true,
                 has_multi: true,
                 internal: true,
@@ -2554,7 +1886,7 @@ mod tests {
         closes: usize,
     }
 
-    type FilterHandle = Rc<RefCell<FilterState>>;
+    type FilterHandle = Arc<SyncCell<FilterState>>;
 
     /// A minimal bottom-of-chain filter: no transport, only bookkeeping.
     #[derive(Debug)]
@@ -2572,7 +1904,7 @@ mod tests {
             sockindex: SocketIndex,
             log: &EventLog,
         ) -> (Self, FilterHandle) {
-            let state: FilterHandle = Rc::new(RefCell::new(FilterState {
+            let state: FilterHandle = Arc::new(SyncCell::new(FilterState {
                 socket: CURL_SOCKET_BAD,
                 ..FilterState::default()
             }));
@@ -2580,9 +1912,9 @@ mod tests {
             base.set_connected(true);
             let filter = Self {
                 base,
-                state: Rc::clone(&state),
+                state: Arc::clone(&state),
                 name,
-                log: Rc::clone(log),
+                log: Arc::clone(log),
             };
             (filter, state)
         }
@@ -2703,9 +2035,7 @@ mod tests {
         (conn, timer, first_state, second_state)
     }
 
-    // =====================================================================
     // 19. The timer identity
-    // =====================================================================
 
     /// `EXPIRE_SHUTDOWN` is **14**, and it is the same 14 the trace table uses.
     ///
@@ -2742,9 +2072,7 @@ mod tests {
         assert_eq!(WAIT_SLICE_MAX_MS, 1000);
     }
 
-    // =====================================================================
     // 1-3. The protocol disconnect handler
-    // =====================================================================
 
     /// A handler-less scheme still latches, and the latch is what stops
     /// `Curl_conn_free` running a handler that does not exist.
@@ -2810,12 +2138,6 @@ mod tests {
     }
 
     /// A blocking handler on the INTERNAL handle is cut off at exactly 2000 ms.
-    ///
-    /// `tokio`'s clock is PAUSED, so the budget is spent in virtual time and
-    /// the measurement is exact rather than approximate. It is measured by
-    /// RACING rather than by reading a clock: an outer bound of 1999 ms must
-    /// win and one of 2001 ms must lose, which pins the cap to 2000 from both
-    /// sides without this test naming a clock at all.
     #[tokio::test(start_paused = true)]
     async fn the_internal_handler_budget_is_two_thousand_milliseconds() {
         // Just under: the outer bound wins, so the cap is not shorter.
@@ -2893,9 +2215,7 @@ mod tests {
         );
     }
 
-    // =====================================================================
     // 4-8. One shutdown step
-    // =====================================================================
 
     /// Only the PRIMARY index starts the queue's timer, and it asks for the
     /// timer's own default by passing zero.
@@ -3109,18 +2429,10 @@ mod tests {
         assert!(text.contains("[SHUTDOWN] closing connection #11"));
     }
 
-    // =====================================================================
     // 9-11. Termination
-    // =====================================================================
 
     /// Termination CONSUMES the connection, and the proof is that everything it
     /// owned is dropped.
-    ///
-    /// `lib/cshutdn.h:46` says "Takes ownership of `conn`" and leaves five call
-    /// sites to honour it. Here the move is the signature, so the only thing
-    /// left to demonstrate is that the value really is released: both filters
-    /// run their destructors, which cannot happen while anyone still holds the
-    /// connection.
     #[test]
     fn termination_consumes_the_connection_and_releases_everything() {
         let log = new_log();
@@ -3130,16 +2442,16 @@ mod tests {
         let (conn, _timer, first, second) =
             wired_conn(&mut cx, 12, "example.com:443", &log);
         // Two outstanding handles on the filter state, one of them ours.
-        assert_eq!(Rc::strong_count(&first), 2);
+        assert_eq!(Arc::strong_count(&first), 2);
 
         drive(terminate(&mut cx, &mut host, conn, false));
 
         assert_eq!(
-            Rc::strong_count(&first),
+            Arc::strong_count(&first),
             1,
             "the primary filter was dropped, so the connection was consumed"
         );
-        assert_eq!(Rc::strong_count(&second), 1);
+        assert_eq!(Arc::strong_count(&second), 1);
         let seen = events(&log);
         assert!(seen.contains(&"first:drop".to_string()), "{seen:?}");
         assert!(seen.contains(&"second:drop".to_string()), "{seen:?}");
@@ -3147,11 +2459,6 @@ mod tests {
 
     /// The close order is SECONDARY then PRIMARY, and the chains are then
     /// discarded in the opposite order.
-    ///
-    /// `lib/cshutdn.c:153-154` closes secondary first; `Curl_conn_free`
-    /// (`lib/url.c`) then walks `conn->cfilter[]` by index, so it destroys
-    /// primary first. Both orders are the C's and both are asserted, because
-    /// unifying them would look like tidying and would change what a peer sees.
     #[test]
     fn the_close_order_is_secondary_then_primary() {
         let log = new_log();
@@ -3295,9 +2602,7 @@ mod tests {
         );
     }
 
-    // =====================================================================
     // 12-16. The FIFO, the counts and the combined limit
-    // =====================================================================
 
     /// A helper: enqueue `n` bare connections numbered from `first_id`.
     fn fill(
@@ -3420,10 +2725,6 @@ mod tests {
     /// Pooled and shutting-down connections count TOGETHER against
     /// `CURLMOPT_MAX_TOTAL_CONNECTIONS`, and the pooled figure arrives as a
     /// parameter.
-    ///
-    /// `lib/cshutdn.c:404-409`. This is the invariant `crate::conn::pool`
-    /// shares with this queue, and the parameter is why the queue needs no
-    /// handle back into the pool.
     #[test]
     fn the_connection_limit_counts_the_pool_and_the_queue_together() {
         let clock = clock_at(1);
@@ -3526,7 +2827,7 @@ mod tests {
         );
         assert!(queue.is_empty());
         assert_eq!(
-            Rc::strong_count(&first),
+            Arc::strong_count(&first),
             1,
             "discarded means terminated, not leaked"
         );
@@ -3567,9 +2868,7 @@ mod tests {
         assert!(events(&log).contains(&"assess(Admin,#20)".to_string()));
     }
 
-    // =====================================================================
     // 17-18. The multi-driven pass
-    // =====================================================================
 
     /// A connection with one connected filter on the PRIMARY chain only.
     ///
@@ -3592,19 +2891,6 @@ mod tests {
     }
 
     /// A connection whose only filter is on the SECONDARY chain.
-    ///
-    /// The construction the expiry test needs, and the reason is worth
-    /// recording. `run_once` starts the PRIMARY timer before touching a chain
-    /// (`lib/cshutdn.c:79-81`), so `Curl_conn_shutdown` on the primary index
-    /// always finds the timer started and always takes its deadline check
-    /// (`lib/cfilters.c:182-189`) -- which turns a negative primary reading
-    /// into `CURLE_OPERATION_TIMEDOUT` and ends the shutdown before any
-    /// deadline is reported upward. With the work on the secondary chain
-    /// instead, that index's timer is started BY the chain on this very pass,
-    /// so the check is skipped, the connection is retained, and the combined
-    /// reading reaches `perform_once`. That is also how the negative case
-    /// arises in production: one chain still working while the other's deadline
-    /// has passed.
     fn secondary_queued_conn(
         cx: &mut CallCtx<'_, '_>,
         id: u64,
@@ -3728,13 +3014,6 @@ mod tests {
 
     /// **The frozen expiry arithmetic.** A POSITIVE remaining time never arms
     /// the timer; only a NEGATIVE one does; zero never does.
-    ///
-    /// `next_expire_ms` starts at 0 and the test is `ms && ms < next_expire_ms`
-    /// (`lib/cshutdn.c:235`, `:256`) with no `!next_expire_ms ||` clause. This
-    /// contradicts the intent C's own comment states and is reproduced exactly
-    /// per AAP 0.8.1 and 0.8.2. If this test ever "fails" because the
-    /// arithmetic
-    /// was improved, the improvement is the defect.
     #[test]
     fn the_expiry_arithmetic_ignores_positive_deadlines() {
         // (primary remaining, secondary remaining) -> expected armed value
@@ -3820,13 +3099,6 @@ mod tests {
     }
 
     /// An expired PRIMARY deadline is caught inside the filter chain, not here.
-    ///
-    /// `Curl_conn_shutdown` takes its deadline check whenever the index's timer
-    /// is already running (`lib/cfilters.c:182-189`), and `run_once` always
-    /// starts the primary's first -- so a negative primary reading becomes
-    /// `CURLE_OPERATION_TIMEDOUT`, which is an error on one chain and therefore
-    /// ends the shutdown. The connection is force-closed rather than waited on
-    /// again.
     #[test]
     fn an_expired_primary_deadline_ends_the_shutdown_inside_the_chain() {
         let log = new_log();
@@ -3869,11 +3141,10 @@ mod tests {
         // And the close is announced as GRACEFUL, not forced -- which is
         // surprising enough to pin. `*done = (r1 || r2 || (done1 && done2));
         // if(*done) conn->bits.shutdown_filters = TRUE;`
-        // (`lib/cshutdn.c:105-107`)
-        // sets the latch on ANY completion, an error included, and the `force `
-        // prefix is chosen from that same latch (`:151`). So a shutdown that
-        // timed out reads in the log exactly like one that succeeded. Frozen as
-        // measured (AAP 0.8.1).
+        // (`lib/cshutdn.c:105-107`) sets the latch on ANY completion, an error
+        // included, and the `force ` prefix is chosen from that same latch
+        // (`:151`). So a shutdown that timed out reads in the log exactly like
+        // one that succeeded. Frozen as measured.
         assert!(
             text.contains("[SHUTDOWN] closing connection #1"),
             "got {text:?}"
@@ -3881,9 +3152,7 @@ mod tests {
         assert!(!text.contains("force closing"), "got {text:?}");
     }
 
-    // =====================================================================
     // 20-22. The drain
-    // =====================================================================
 
     /// The default budget of zero performs EXACTLY ONE pass and then forces
     /// everything closed.
@@ -4039,16 +3308,6 @@ mod tests {
 
     /// The wait between passes is exactly [`WAIT_SLICE_MAX_MS`], even when far
     /// more budget remains.
-    ///
-    /// A budget of 60 seconds and a connection that costs 30 seconds of engine
-    /// time per pass: two passes end it, with ONE wait in between. That wait
-    /// must last a second and not the 30 seconds still unspent, which is what
-    /// `CURLMIN(timeout_ms, 1000)` (`lib/cshutdn.c:221`) is for -- the queue
-    /// has to be re-examined even when nothing on a descriptor happens.
-    ///
-    /// Raced from both sides under a paused clock, as
-    /// [`the_internal_handler_budget_is_two_thousand_milliseconds`] is: 999 ms
-    /// must not be enough and 1001 ms must be.
     #[tokio::test(start_paused = true)]
     async fn the_wait_between_passes_is_capped_at_one_second() {
         /// One connection that never finishes and spends 30 s of engine time
@@ -4186,9 +3445,7 @@ mod tests {
         assert!(!text.contains("perform on"), "got {text:?}");
     }
 
-    // =====================================================================
     // 23-24. Readiness
-    // =====================================================================
 
     /// A connection watching `socket` on its primary chain.
     fn watching_conn(
@@ -4244,11 +3501,6 @@ mod tests {
     /// A descriptor named by TWO connections is folded once into the
     /// application's array and counted once, and counting mode needs no
     /// storage.
-    ///
-    /// Both behaviours belong to `crate::conn::select` and are exercised here
-    /// only to prove the delegation: `Curl_waitfds_add_ps` is called once per
-    /// connection over one shared array, which is what makes the fold reach
-    /// across connections at all.
     #[test]
     fn the_application_array_folds_and_counts_through_select() {
         let log = new_log();
@@ -4325,9 +3577,7 @@ mod tests {
         );
     }
 
-    // =====================================================================
     // 25-28. Structural properties
-    // =====================================================================
 
     /// This module's own source, for the two structural assertions below.
     ///
@@ -4336,13 +3586,6 @@ mod tests {
     const OWN_SOURCE: &str = include_str!("shutdown.rs");
 
     /// No descriptor-set type and no libc anywhere in this file.
-    ///
-    /// `curl_multi_fdset` is an exported C API, so its marshalling belongs to
-    /// `curl-rs-ffi`; this module hands out typed pairs
-    /// ([`the_readiness_pairs_span_the_whole_queue`]) and names no libc type.
-    ///
-    /// The forbidden spellings are assembled from fragments so that this test
-    /// does not itself become the occurrence it forbids.
     #[test]
     fn this_module_names_no_descriptor_set_and_no_libc() {
         for forbidden in [
@@ -4364,8 +3607,8 @@ mod tests {
     ///
     /// C brackets every shutdown in a saved-then-restored broken-pipe
     /// disposition because an OpenSSL write to a closed socket would kill the
-    /// process. No C TLS library is linked (AAP 0.8.2) and `rustls` over
-    /// `tokio` returns a broken pipe as an error, so there is nothing to save.
+    /// process. No C TLS library is linked and `rustls` over `tokio` returns a
+    /// broken pipe as an error, so there is nothing to save.
     #[test]
     fn this_module_masks_no_signal() {
         for forbidden in [
@@ -4383,15 +3626,6 @@ mod tests {
 
     /// The queue's eviction is INSERTION ORDER, and it holds nothing that could
     /// support the connection pool's maximum-age rule.
-    ///
-    /// The two policies are both called "oldest" in the C and they are
-    /// different
-    /// questions: this queue answers "which arrived first", while
-    /// `crate::conn::pool` answers "which has been idle longest". Unifying them
-    /// would change which connection dies under a limit. What makes the
-    /// distinction structural rather than conventional is that no age is stored
-    /// here at all -- so the pool's rule is not merely unused, it is
-    /// unexpressible.
     #[test]
     fn the_queues_policy_is_insertion_order_and_holds_no_age() {
         let log = new_log();
@@ -4439,15 +3673,6 @@ mod tests {
 
     /// The pooled-connection count is a PARAMETER: the queue holds no handle
     /// back into the pool.
-    ///
-    /// That is what makes the removal-safety argument in
-    /// [`ShutdownQueue::perform_once`] provable rather than inspected --
-    /// [`terminate`] is handed no queue and no pool, so it cannot re-enter
-    /// either. The observable form of the property is that the limit decision
-    /// changes with the parameter alone, over identical queue state, which
-    /// [`the_connection_limit_counts_the_pool_and_the_queue_together`]
-    /// demonstrates; here the complement is asserted -- the queue never reads a
-    /// pool.
     #[test]
     fn the_pool_is_reached_only_through_the_parameter() {
         // IMPORTS, not mentions: the documentation names `crate::conn::pool`
@@ -4497,12 +3722,12 @@ mod tests {
             let mut queue = ShutdownQueue::new();
             let (conn, state) = watching_conn(&mut cx, 1, 7, &log);
             drive(queue.add(&mut cx, &mut host, conn, 0));
-            assert_eq!(Rc::strong_count(&state), 2);
+            assert_eq!(Arc::strong_count(&state), 2);
             state
         };
 
         assert_eq!(
-            Rc::strong_count(&first),
+            Arc::strong_count(&first),
             1,
             "the queue went out of scope and took the connection with it"
         );

@@ -62,17 +62,6 @@
 //! [`super::handle`](super::handle::Curl_URL) and is imported here, never
 //! redeclared.
 //!
-//! # `CURLUPart` has eleven members and NO sentinel
-//!
-//! `urlapi.h:70-82` ends at `CURLUPART_ZONEID /* added in 7.65.0 */`. **There
-//! is no `CURLUPART_LAST` and none may be invented.** Adding one would change
-//! no existing integer but would add a public enumerant curl 8.19.0-DEV does
-//! not have, which is why `cbindgen.toml` sets `add_sentinel = false` and why
-//! this enumeration is one of the cases that proves the setting necessary. The
-//! same trap applies to `CURLHcode` (`header.h:47-56`) and `CURLSTScode`
-//! (`curl.h:1056-1060`). `CURLUcode`, by contrast, DOES carry a bound --
-//! `CURLUE_LAST` = 32 at `urlapi.h:67` -- and it is a bound, not a value.
-//!
 //! # The `const` asymmetry is deliberate and ABI-visible
 //!
 //! `curl_url_dup` takes `const CURLU *` and `curl_url_get` takes `const CURLU
@@ -165,10 +154,6 @@ use super::panic_boundary::{guard, guard_ptr, guard_tx, guard_void, Poison};
 /// owns the pairing, which is the right place for it anyway -- poisoning
 /// describes a fault in the C ABI's use of the handle, not a state the parser
 /// has.
-///
-/// A consumer never sees this type. `CURLU` is an incomplete type in the header
-/// (`urlapi.h:107`), so the only thing that crosses the boundary is a pointer,
-/// and its width is the only ABI-visible property it has.
 struct UrlHandle {
     /// The parsed URL. Every part, flag and quirk belongs to the engine.
     url: Url,
@@ -183,13 +168,6 @@ struct UrlHandle {
 
 impl UrlHandle {
     /// An empty handle bound to the process-wide scheme table.
-    ///
-    /// The counterpart of `curl_url`'s whole body, `curlx_calloc(1,
-    /// sizeof(struct Curl_URL))` (`lib/urlapi.c:1290`): every part absent,
-    /// a zero port, all three bits clear. The registry is the one thing a
-    /// `calloc` cannot supply, and [`scheme_registry`] is where the engine's
-    /// documented wiring contract says to get it -- `curl_url()` takes no
-    /// arguments, so there is nowhere else it could come from.
     fn new() -> Self {
         Self {
             url: Url::new(scheme_registry()),
@@ -212,38 +190,22 @@ impl UrlHandle {
 /// `build.rs`'s `URLAPI_H_POST` so that the header still says `CURLUPart`, and
 /// the narrowing happens in the engine's `get_by_id` and `set_by_id` -- which
 /// exist for precisely this reason and say so.
-///
-/// This is the crate's established policy rather than a local invention:
-/// `curl_version_info(stamp: c_int)` is declared `CURLversion` verbatim at
-/// `build.rs:2379`, `curl_url_strerror(error: c_int)` is declared `CURLUcode`
-/// verbatim, and `curl_easy_option_by_id(id: c_int)` is declared `CURLoption`
-/// verbatim at `build.rs:1208`.
-///
-/// The function exists to give that reasoning one home and one name; the
-/// conversion itself is the identity, because `c_int` and the engine's `i32`
-/// are the same type on every target Rust supports.
 const fn part_id(what: c_int) -> i32 {
     what
 }
 
 /// Reads a caller's `unsigned int flags` argument.
 ///
-/// `urlapi.h:84-105` spells all sixteen bits WITHOUT an `L` suffix, so each is
-/// an `int` and the parameter that receives them is an `unsigned int` --
+/// `include/curl/urlapi.h:89-110` spells all sixteen bits WITHOUT an `L`
+/// suffix, so each is an `int` and the parameter that receives them is an `unsigned int` --
 /// `c_uint`, never `c_long`. (Contrast `CURLOPT_WS_OPTIONS`' bits, which use
 /// `1L <<`; that literal-suffix distinction is an ABI distinction throughout
 /// the headers and not a typo.)
-///
-/// Unknown bits are preserved rather than rejected, which is the C's behaviour:
-/// it tests individual bits and never validates the mask. [`UrlFlags`] is
-/// documented to do the same.
 fn url_flags(flags: c_uint) -> UrlFlags {
     UrlFlags::from_bits(flags)
 }
 
-// ---------------------------------------------------------------------------
 // The five exported entry points.
-// ---------------------------------------------------------------------------
 
 /// Creates a new, empty URL handle.
 ///
@@ -252,11 +214,16 @@ fn url_flags(flags: c_uint) -> UrlFlags {
 /// release with [`curl_url_cleanup`], or null.
 ///
 /// Null means the same thing it means in C: no handle was produced. The C
-/// reaches it through a failed `curlx_calloc`; here the only route is a
-/// contained panic, because Rust's allocator aborts rather than reporting. A
-/// caller that already tests the return value -- and every correct one does,
-/// since `curl_url` has been documented as able to return null since 7.62.0 --
-/// cannot tell the two apart, which is the property that matters.
+/// reaches it through a failed `curlx_calloc` of one fixed-size handle; the Rust
+/// equivalent is `Box::new`, which has no stable fallible spelling at the
+/// declared minimum Rust version, so the only route to null here is a contained
+/// panic. The caller-sized allocations behind this handle -- the percent-encoding
+/// in `curl_url_get`, which is three times the caller's own length -- DO report:
+/// they go through `curl_rs_lib::util::fallible` and surface as
+/// `CURLUE_OUT_OF_MEMORY`. A caller that already tests the return value -- and
+/// every correct one does, since `curl_url` has been documented as able to
+/// return null since 7.62.0 -- cannot tell the two apart, which is the property
+/// that matters.
 ///
 /// Takes no arguments, so unlike its four siblings it is not an `unsafe fn`:
 /// there is no caller obligation to state.
@@ -267,20 +234,9 @@ pub extern "C" fn curl_url() -> *mut CURLU {
 
 /// Frees a URL handle.
 ///
-/// Supersedes `curl_url_cleanup` (`lib/urlapi.c:1293-1299`), declared at
-/// `include/curl/urlapi.h:120`. Returns `void`, so it has **no error channel at
-/// all**: a null handle is a silent no-op, exactly as the C's `if(u)` guard
-/// makes it, and a contained panic is a silent return. Whatever it learns about
-/// a fault, it keeps to itself.
-///
 /// Strings previously handed out by [`curl_url_get`] are NOT freed --
 /// `urlapi.h:117-118` says so explicitly -- because they belong to the
 /// application and are released with `curl_free`. The handle owns none of them.
-///
-/// A poisoned handle is still freed. That is the documented exception to
-/// [`guard_tx`](super::panic_boundary::guard_tx)'s short-circuit: refusing to
-/// release a handle that a contained panic had marked would turn one absorbed
-/// defect into a permanent leak.
 ///
 /// # Safety
 ///
@@ -304,20 +260,6 @@ pub unsafe extern "C" fn curl_url_cleanup(handle: *mut CURLU) {
 
 /// Duplicates a URL handle.
 ///
-/// Supersedes `curl_url_dup` (`lib/urlapi.c:1310-1332`), declared at
-/// `include/curl/urlapi.h:126`. The copy is independently owned and is released
-/// with [`curl_url_cleanup`] exactly as [`curl_url`]'s result is, so it is
-/// allocated through the same path.
-///
-/// The copy is DEEP: the C duplicates its ten strings through a `DUP` macro and
-/// then copies three scalars, and the engine's [`Url::dup`] reproduces that
-/// field for field -- including the one omission that is easy to mistake for an
-/// oversight. `guessed_scheme` is **not** among the three scalars the C copies,
-/// so a duplicate behaves as though its scheme had been given explicitly, and
-/// `CURLU_NO_GUESS_SCHEME` therefore answers differently for the original and
-/// the copy. That is reproduced deliberately; the engine documents and tests
-/// it.
-///
 /// # A null input is answered rather than dereferenced
 ///
 /// `curl_url_dup(NULL)` is UNDEFINED in C: the `DUP` macro reads `(src)->name`
@@ -327,9 +269,6 @@ pub unsafe extern "C" fn curl_url_cleanup(handle: *mut CURLU) {
 /// correct caller already handles. That is a deliberate divergence from an
 /// UNDEFINED behaviour, not from a defined one, and no fixture can depend on a
 /// crash.
-///
-/// A poisoned input also yields null, because the state a contained panic left
-/// behind must not be propagated into a second handle.
 ///
 /// # Safety
 ///
@@ -367,14 +306,6 @@ pub unsafe extern "C" fn curl_url_dup(input: *const CURLU) -> *mut CURLU {
 /// `include/curl/urlapi.h:133-134`. On success `*part` receives a
 /// NUL-terminated buffer that **the caller releases with `curl_free`**, and the
 /// return is `CURLUE_OK`.
-///
-/// The buffer is allocated through [`super::memory`], libcurl's five
-/// replaceable hooks, and not through `CString::into_raw`. That is mandatory
-/// rather than tidy: an application may replace the allocator wholesale with
-/// `curl_global_init_mem`, and it may release this buffer with a plain `free`,
-/// which applications do against libcurl. A mismatch between this allocation
-/// and `curl_free`'s release is heap corruption rather than a wrong answer,
-/// which is why the pairing is asserted by test.
 ///
 /// # The order of the two argument checks is load-bearing
 ///
@@ -475,10 +406,6 @@ pub unsafe extern "C" fn curl_url_get(
 
 /// Sets one part of the URL.
 ///
-/// Supersedes `curl_url_set` (`lib/urlapi.c:1805-1997`), declared at
-/// `include/curl/urlapi.h:141-142`. The string is **copied**, so the caller may
-/// free or reuse its own buffer the moment this returns.
-///
 /// # A null `part` CLEARS the component; it is not an error
 ///
 /// `:1819-1821` is `if(!part) /* setting a part to NULL clears it */ return
@@ -492,16 +419,6 @@ pub unsafe extern "C" fn curl_url_get(
 /// Note the asymmetry with [`curl_url_get`], which is real and is preserved: a
 /// null `char **part` there IS `CURLUE_BAD_PARTPOINTER`, because it is an
 /// out-pointer with nowhere to write rather than a value with a meaning.
-///
-/// # `CURLUPART_URL` re-parses; every other part mutates in place
-///
-/// `:1871-1872` delegates `CURLUPART_URL` to `set_url`, which replaces the
-/// contents with an absolute URL or applies a RELATIVE one to what is already
-/// there -- including the case of an empty string, which is a valid relative
-/// URL that changes nothing when the handle already holds a complete one. That
-/// relative behaviour is what redirect following is built on, so it is
-/// preserved exactly. Everything about it, and about the sixteen flag bits,
-/// belongs to [`Url::set_by_id`].
 ///
 /// # Safety
 ///
@@ -574,6 +491,8 @@ mod tests {
     use crate::ffi::handle::CURLU;
     use crate::ffi::memory;
     use crate::ffi::types::CURLUPart;
+
+    use curl_rs_lib::scheme_registry;
 
     use core::ffi::{c_char, c_int, c_uint};
     use core::ptr;
@@ -1075,8 +994,44 @@ mod tests {
         // list is the whole enumeration, which is what makes the count of
         // eleven and the absence of a sentinel assertions rather than claims.
         let handle = parsed("https://example.com/p");
+
+        // `CURLUPART_SCHEME` is the one part whose acceptance depends on the
+        // engine rather than on syntax: `set_url_scheme` requires a registered
+        // implementation (`lib/urlapi.c:1646`, `lib/url.c:1473-1475`), and this
+        // build carries none -- `curl_rs_lib::scheme_registry()`'s executor table
+        // is empty, exactly as a C curl with every `CURL_DISABLE_<PROTO>` reports.
+        // So the flag that overrides that requirement is the one C documents for
+        // this situation, and it is used here. The expectation is DERIVED from the
+        // registry rather than written as a literal, so this test needs no edit
+        // when the first protocol engine lands: the plain form starts succeeding
+        // and the assertion follows it.
+        let scheme_needs_override = !scheme_registry()
+            .lookup(b"http")
+            .is_some_and(|info| info.runnable);
+        assert_eq!(
+            set(handle, CURLUPart::CURLUPART_SCHEME, Some("http"), 0),
+            if scheme_needs_override {
+                CURLUcode::CURLUE_UNSUPPORTED_SCHEME
+            } else {
+                CURLUcode::CURLUE_OK
+            },
+            "setting a scheme without the override flag"
+        );
+        assert_eq!(
+            set(
+                handle,
+                CURLUPart::CURLUPART_SCHEME,
+                Some("http"),
+                curlu_flags::CURLU_NON_SUPPORT_SCHEME
+            ),
+            CURLUcode::CURLUE_OK
+        );
+        assert_eq!(
+            get(handle, CURLUPart::CURLUPART_SCHEME, 0).expect("scheme"),
+            b"http".to_vec()
+        );
+
         let values = [
-            (CURLUPart::CURLUPART_SCHEME, "http", "http"),
             (CURLUPart::CURLUPART_USER, "u", "u"),
             (CURLUPart::CURLUPART_PASSWORD, "p", "p"),
             (CURLUPart::CURLUPART_HOST, "[fe80::1]", "[fe80::1]"),

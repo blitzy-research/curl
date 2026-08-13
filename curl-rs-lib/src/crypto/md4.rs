@@ -21,82 +21,8 @@
 //  * SPDX-License-Identifier: curl
 //  *
 //  ***************************************************************************/
-//! MD4, RFC 1320. Supersedes `lib/md4.c` (442 lines) and `lib/curl_md4.h`
-//! (37 lines) over the `md4 0.10.2` crate.
-//!
-//! Every claim below carries a `path:line` citation into the C tree or into
-//! the workspace manifests, because the behaviour being reproduced is defined
-//! by those files and not by this description.
-//!
-//! # One consumer, one shape
-//!
-//! MD4 exists in curl for exactly one purpose -- the NTLM NT hash -- and it
-//! has exactly one production call site in the whole tree:
-//! `lib/curl_ntlm_core.c:425` calls `Curl_md4it(ntbuffer, pw, 2 * len)` from
-//! inside `Curl_ntlm_core_mk_nt_hash`. Searching the C sources for the symbol
-//! finds five occurrences and no more: that call, the declaration at
-//! `lib/curl_md4.h:32`, the definition at `lib/md4.c:425`, and the two
-//! assertions in `tests/unit/unit1611.c:38` and `:45`.
-//!
-//! Everything this module publishes, and everything it declines to publish,
-//! follows from that single call site.
-//!
-//! # The measured C surface, and what is deliberately absent
-//!
-//! `lib/curl_md4.h` is 37 lines and declares exactly two things:
-//!
-//! ```c
-//! #define MD4_DIGEST_LENGTH 16                        /* line 30      */
-//!
-//! CURLcode Curl_md4it(unsigned char *output,          /* lines 32-33  */
-//!                     const unsigned char *input, const size_t len);
-//! ```
-//!
-//! That is the entire header. The absences are as contractual as the
-//! presences, so each is recorded with the evidence for it:
-//!
-//! * **No streaming form.** `lib/curl_md5.h:59-63` declares a
-//!   `Curl_MD5_init` / `_update` / `_final` trio over the `MD5_params` vtable,
-//!   and `lib/vauth/digest.c:388`, `:402`, `:425` and `:443` feed a digest
-//!   through it in pieces. MD4 has no counterpart: `Curl_md4it`
-//!   (`lib/md4.c:425-440`) is a bare `MD4_Init` / `MD4_Update` / `MD4_Final`
-//!   sequence that exposes no context to its caller. This module therefore
-//!   publishes no incremental context.
-//! * **No keyed form.** MD4 is never an HMAC hash anywhere in curl, so there
-//!   is no parameter table to reproduce and no keyed instantiation to offer.
-//!   [`crate::crypto`] reaches the same conclusion from the other side when it
-//!   declines to re-export a block length for MD4: a block length is needed
-//!   only in order to key or to stream a digest, and MD4 is neither here.
-//! * **No hasher type.** The `md4` crate's hasher is used inside this module
-//!   and is not re-published, because nothing in the crate needs the type
-//!   itself. [`crate::crypto`] records it as optional for that reason.
-//!
-//! Adding any of the three would be public surface with no call site, which
-//! the minimal-change mandate forbids. A refactor that grows the interface it
-//! was asked to preserve has altered the thing it was meant to hold still.
-//!
-//! # The signature is infallible, which is a correction and not a loss
-//!
-//! `Curl_md4it` returns `CURLcode`, and `lib/md4.c:428-435` shows why: the
-//! digest came from whichever library happened to be linked -- wolfSSL
-//! (`lib/md4.c:47`), OpenSSL (`:58`), Apple's CommonCrypto (`:61`), the
-//! Windows CryptoAPI (`:88`), GnuTLS's nettle (`:135`), or the bundled
-//! fallback (`:156`) -- and some of those can fail to initialise, so the
-//! function had to be able to say so. The CryptoAPI backend returns zero from
-//! `MD4_Init` when `CryptAcquireContext` fails (`lib/md4.c:102-104`), and
-//! `Curl_md4it` turns that into `CURLE_FAILED_INIT`.
-//!
-//! There is one implementation here and it cannot fail, so [`md4()`] returns
-//! the digest directly. Nothing is lost: the single production caller treats a
-//! failure only as a reason to skip its own zero-padding
-//! (`lib/curl_ntlm_core.c:426`), and no caller anywhere inspects the code for
-//! a value other than success. The out-parameter is not reproduced either --
-//! returning `[u8; DIGEST_LEN]` is the same sixteen bytes without a
-//! caller-supplied buffer whose length the callee has to take on trust.
-//!
-//! No local error type is defined here, and none would be even if the
-//! operation were fallible: `crate::error::CURLcode` is this crate's single
-//! result vocabulary.
+//! MD4, RFC 1320. Supersedes `lib/md4.c` and `lib/curl_md4.h` over the `md4
+//! 0.10.2` crate.
 //!
 //! # What belongs to the NTLM module and not to this one
 //!
@@ -128,69 +54,6 @@
 //!   directly by `auth/ntlm.rs`. There is no DES module in this directory and
 //!   there must not be one.
 //!
-//! # Why a broken digest is kept
-//!
-//! MD4 is cryptographically broken. Collisions are trivially constructible
-//! and it must never be selected for new work. It is here because the NTLM
-//! wire format specifies it, and that wire format is frozen: the fixture
-//! corpus compares whole request bytes as one joined string, with no per-line
-//! matching and no reordering (`tests/getpart.pm:351` onward, `compareparts`).
-//! The NT hash feeds the NTLM type-3 message directly, so a digest differing
-//! by a single byte is a wrong message on the wire, and 53 fixtures under
-//! `tests/data/` gate on the `NTLM` feature. Substituting a stronger algorithm
-//! here, or refusing to compute this one, would be a behaviour change dressed
-//! up as an improvement.
-//!
-//! # The upstream in-body attribution, and why it is not reproduced
-//!
-//! `lib/md4.c` carries a **second** attribution, separate from the curl
-//! licence banner above and covering only the bundled fallback digest that
-//! `lib/md4.c:156` selects when no crypto library supplies MD4. It runs from
-//! `lib/md4.c:160` to `:196`: an OpenSSL-compatible implementation of the RSA
-//! Data Security MD4 message-digest algorithm, written in 2001 and placed in
-//! the public domain by its author, together with a credit for one of the
-//! round functions borrowed from another public-domain digest.
-//!
-//! That block is **deliberately not carried into this file.** It attributes a
-//! hand-rolled C implementation, and that implementation is not ported -- the
-//! `md4 0.10.2` crate supplies the primitive instead. No attributed code is
-//! present here, so no attribution is owed. It is recorded by `path:line`
-//! rather than dropped in silence, because the absence is a decision and not
-//! an oversight.
-//!
-//! The test that separates the two cases is simply whether the attributed code
-//! is present. The opposite case is already recorded one directory over:
-//! `util/mod.rs:57-60` reserves an Internet Software Consortium notice for the
-//! module that will supersede `lib/curlx/inet_ntop.c` and
-//! `lib/curlx/inet_pton.c`, whose own banner (`lib/curlx/inet_ntop.c:1-12`) is
-//! that consortium's rather than curl's, precisely because the Rust code there
-//! will be a port of their code. Attribution travels with code, never with
-//! subject matter.
-//!
-//! # Not gated on a feature, and not to be advanced
-//!
-//! `lib/curl_md4.h:28` wraps the whole header in an `ifdef` on curl's NTLM
-//! build switch. That is **not** reproduced as a Cargo `cfg`. The feature
-//! vocabulary is fixed at fifteen names -- `http2`, `http3`, `ftp`, `ssh`,
-//! `websockets`, `cookies`, `hsts`, `altsvc`, `doh`, `brotli`, `zstd`, `gzip`,
-//! `negotiate`, `hickory-dns` and `memdebug` -- and none of them is an NTLM
-//! switch. A `cfg` naming a feature that does not exist compiles the code away
-//! without a diagnostic, so MD4 is compiled unconditionally.
-//!
-//! The version pin is load-bearing rather than incidental. `md4 0.10.2` is
-//! declared once, in the workspace root's `[workspace.dependencies]`, and
-//! inherited by `curl-rs-lib/Cargo.toml:442` as `{ workspace = true }`; no
-//! member manifest restates a version. It sits on `digest 0.10`, which every
-//! other primitive in this directory also sits on, and that coherence is a
-//! build requirement rather than a preference: two `digest` generations in one
-//! graph make the keyed digests fail to compile. The newest releases of
-//! several sibling crates additionally declare MSRV 1.85 and would breach the
-//! mandated 1.75 floor. Do not advance this pin.
-//!
-//! Performance is an explicit non-goal, so nothing here is shaped for speed:
-//! no inlining hint, no buffer reuse, and no restructuring that trades
-//! faithfulness for throughput.
-//!
 //! # Where the C unit test went
 //!
 //! `tests/unit/unit1611.c` is the MD4 unit test, and `tests/data/test1611` --
@@ -202,45 +65,11 @@
 //! encapsulation this crate's safety guarantee rests on, so it is not done.
 //! Its two assertions live in this file's `tests` module instead, beside the
 //! seven published RFC 1320 vectors and a cross-check of the NT hash shape.
-//!
-//! # Gates
-//!
-//! Each pattern brackets one letter so that these comment lines cannot match
-//! themselves; the gates therefore stay runnable against this very file.
-//!
-//! ```sh
-//! # This file grants no exemption from the crate-root safety attribute. The
-//! # crate's sole exemption sits on the root's `mod ffi` declaration.
-//! # Must print nothing.
-//! grep -n '[u]nsafe' curl-rs-lib/src/crypto/md4.rs
-//!
-//! # Neither curl's NTLM build switch nor a feature that does not exist may
-//! # have become a conditional-compilation gate. Must print nothing.
-//! grep -nE '[c]fg\(feature' curl-rs-lib/src/crypto/md4.rs
-//!
-//! # Exactly one licence identifier line. Must print 1.
-//! grep -c 'SPDX-License-Ident[i]fier: curl' curl-rs-lib/src/crypto/md4.rs
-//!
-//! # The fallback implementation's attribution is cited by path and line
-//! # above, never reproduced. Must print 0.
-//! grep -cE '[S]olar Designer|[o]penwall|[A]lexander Peslyak' \
-//!   curl-rs-lib/src/crypto/md4.rs
-//!
-//! # No numeric cast can silently narrow: the only `as` tokens permitted in
-//! # this file are import renames, and there are none. Must print nothing.
-//! grep -nE ' [a]s [iu](8|16|32|64|size)' curl-rs-lib/src/crypto/md4.rs
-//! ```
 
 use ::md4::{Digest, Md4};
 
 /// Length of an MD4 digest in bytes: `MD4_DIGEST_LENGTH`
 /// (`lib/curl_md4.h:30`).
-///
-/// Sixteen is not an implementation choice. It is the width RFC 1320 fixes,
-/// the width the C header hard-codes, and the width
-/// `Curl_ntlm_core_mk_nt_hash` assumes when it zeroes bytes 16 through 20 of
-/// its twenty-one byte buffer (`lib/curl_ntlm_core.c:427`).
-/// [`crate::crypto`] asserts the value at compile time next to that citation.
 pub(crate) const DIGEST_LEN: usize = 16;
 
 /// Digest a whole message: `Curl_md4it` (`lib/md4.c:425-440`).
@@ -249,14 +78,6 @@ pub(crate) const DIGEST_LEN: usize = 16;
 /// not know, that its sole production caller passes a UTF-16LE-widened
 /// password -- that widening belongs to `auth/ntlm.rs`, as does the
 /// twenty-one byte buffer whose tail the caller zeroes afterwards.
-///
-/// Returns the sixteen raw bytes rather than writing through an
-/// out-parameter, and returns them unconditionally rather than wrapped in a
-/// result: there is a single implementation and it has no failure mode. The
-/// bytes are raw because that is what the caller needs -- the NT hash feeds
-/// straight into a DES key schedule and is never rendered as text on the way.
-/// Where a digest does have to be rendered, [`crate::crypto`] owns the
-/// lowercase-hex convention that every digest curl puts on the wire uses.
 #[allow(dead_code)]
 pub(crate) fn md4(input: &[u8]) -> [u8; DIGEST_LEN] {
     let mut hasher = Md4::new();
@@ -278,11 +99,6 @@ pub(crate) fn md4(input: &[u8]) -> [u8; DIGEST_LEN] {
 //   * The NTLM cross-check -- the published NT hash of a known password,
 //     which pins the digest and the byte-widening convention together before
 //     `auth/ntlm.rs` exists to pin them itself.
-//
-// Every expected value below was verified against an independent from-scratch
-// RFC 1320 implementation before being written down, because neither the
-// system OpenSSL nor Python's `hashlib` will compute MD4 any more -- both
-// refuse it as deprecated, so neither could serve as the oracle.
 
 #[cfg(test)]
 mod tests {
@@ -327,12 +143,6 @@ mod tests {
 
     /// The UTF-16LE encoding of the password `"password"`, written out as the
     /// literal bytes rather than produced by a helper.
-    ///
-    /// The widening itself is `auth/ntlm.rs`'s responsibility, exactly as
-    /// `ascii_to_unicode_le` (`lib/curl_ntlm_core.c:395-403`) is
-    /// `Curl_ntlm_core_mk_nt_hash`'s and not `Curl_md4it`'s. Spelling the
-    /// bytes out here keeps this module free of any dependence on that
-    /// convention while still proving the two line up.
     #[rustfmt::skip]
     const PASSWORD_UTF16LE: [u8; 16] = [
         0x70, 0x00, 0x61, 0x00, 0x73, 0x00, 0x73, 0x00,
@@ -465,11 +275,6 @@ mod tests {
     /// Every input length from nothing through 137 bytes -- two full 64-byte
     /// blocks plus a tail, which pads out to three blocks -- yields a
     /// full-width digest, and no two lengths of the same filler byte collide.
-    ///
-    /// This exercises the padding rule at every offset rather than only at
-    /// the seven the standard happens to publish: the 0x80 terminator, the
-    /// pad to 56 bytes modulo 64, and the trailing 64-bit length all move
-    /// across a block boundary as the length grows.
     #[test]
     fn every_length_through_three_padded_blocks_has_its_own_digest() {
         let mut seen: Vec<[u8; DIGEST_LEN]> = Vec::new();

@@ -177,39 +177,100 @@ const SCHEMES: &[Row] = &[
 /// falling through to the syntax check instead of resolving.
 const MAX_RESOLVABLE_SCHEME_LEN: usize = 7;
 
+/// One registered transfer implementation.
+///
+/// The Rust counterpart of the `run` member of `struct Curl_scheme`
+/// (`lib/urldata.h:514-523`). `lib/url.c:1473-1475` states the contract
+/// verbatim: *"Returns a struct scheme pointer if the name is a known scheme.
+/// Check the ->run struct field for non-NULL to figure out if an implementation
+/// is present."*
+///
+/// The trait carries only the scheme name because that is all
+/// [`SchemeInfo::runnable`] needs to answer. The transfer entry point itself
+/// belongs to `crate::transfer`, which drives an implementation once one has
+/// been selected; adding it here would make this module depend on the transfer
+/// core and close the acyclic module graph AAP section 0.4.2 requires.
+///
+/// # How a protocol module registers, and why registration is the only route
+///
+/// A row in [`EXECUTORS`] can only be written by naming an item that exists, so
+/// a scheme cannot be marked implemented without an implementation to point at.
+/// The author of each protocol module adds exactly one row:
+///
+/// ```text
+/// #[cfg(feature = "ftp")]
+/// &ftp::EXECUTOR,
+/// ```
+///
+/// The `#[cfg]` belongs on the ROW rather than inside [`runnable`], because that
+/// is where C puts it: a protocol disabled at build time is still in the table
+/// but registers `run = ZERO_NULL` -- measured at `lib/file.c:626-629`,
+/// `lib/ftp.c:4348-4351` and `:4367-4370`, `lib/http.c:5011-5014` and
+/// `:5028-5031`, `lib/ws.c:1984-1987` and `:1999-2002`, and
+/// `lib/vssh/vssh.c:338-341` and `:352-355`. Which feature gates which scheme is
+/// therefore the protocol module's own statement, not a second list here that
+/// could disagree with it. `http`, `https` and `file` take no `#[cfg]` at all:
+/// HTTP/1.1 and TLS are unconditional in this crate, and AAP section 0.5.2's
+/// feature vocabulary is fifteen names of which none is `file`.
+pub(crate) trait ProtocolExecutor: Sync {
+    /// The scheme this implementation serves, spelled exactly as [`SCHEMES`]
+    /// spells it -- upper case for `SFTP`, `SCP`, `WS` and `WSS`.
+    fn scheme(&self) -> &'static str;
+}
+
+/// Every transfer implementation this build carries.
+///
+/// **EMPTY, and that is the measured truth rather than an oversight.** No
+/// protocol module exists in this checkout: `curl-rs-lib/src/protocols/` holds
+/// this file and `ftp/`, and `ftp/` holds only `listparser.rs` -- the
+/// directory-listing parser of `lib/ftplistparser.c`, which parses the output of
+/// a `LIST` command and cannot issue one. `http1.rs`, `http2.rs`, `http3.rs`,
+/// `ftp/mod.rs`'s protocol engine, `ftp/pingpong.rs`, `sftp.rs`, `scp.rs`,
+/// `file.rs`, `ws.rs` and `stub.rs` are all specified by AAP section 0.3.1 and
+/// none of them is here; neither is the transfer core
+/// (`crate::version::ENGINE_TRANSFER`) that would drive one.
+///
+/// So every one of the 33 schemes answers [`SchemeInfo::runnable`] `false`, which
+/// is exactly what a C curl built with every `CURL_DISABLE_<PROTO>` answers.
+///
+/// # What that changes, stated rather than buried
+///
+/// The **parse-versus-set asymmetry** stays observable and now covers all 33
+/// rather than only the 24: `curl_url_set(u, CURLUPART_URL, "http://host/", 0)`
+/// still succeeds, because `parse_scheme` accepts any scheme in the table
+/// (`lib/urlapi.c:951`), while `curl_url_set(u, CURLUPART_SCHEME, "http", 0)`
+/// now returns `CURLUE_UNSUPPORTED_SCHEME`, because `set_url_scheme`
+/// additionally requires an implementation (`:1646`). `CURLU_NON_SUPPORT_SCHEME`
+/// remains the documented escape hatch for both.
+///
+/// The previous revision answered `true` for the nine in-scope schemes from a
+/// Cargo-feature test alone, with no implementation behind any of them. That was
+/// an over-report of exactly the kind AAP section 0.6.5 rules out -- and it was
+/// inconsistent with every other capability marker in this crate, all of which
+/// already report that the engine cannot execute: `crate::version::protocols()`
+/// is empty, `crate::version::ENGINE_PROTOCOLS` is `Engine::inert` -- this file
+/// exists, and what it lacks is the executors above -- and the public header is
+/// withheld. This is the one marker that disagreed, and it now agrees.
+///
+/// Nothing needs editing here when an engine lands beyond its own row: the
+/// answer is derived, so `runnable` flips for that scheme and for no other.
+const EXECUTORS: &[&'static dyn ProtocolExecutor] = &[];
+
 /// Whether this build carries an implementation of `name`.
 ///
-/// The counterpart of `h->run != NULL` (`lib/url.c:1473-1475`). A protocol
-/// disabled at build time stays in the table with `run = ZERO_NULL` -- measured
-/// at `lib/file.c:626-629`, `lib/ftp.c:4348-4351` and `:4367-4370`,
-/// `lib/http.c:5011-5014` and `:5028-5031`, `lib/ws.c:1984-1987` and
-/// `:1999-2002`, `lib/vssh/vssh.c:338-341` and `:352-355` -- so a Cargo feature
-/// that is off is the exact analogue of a `CURL_DISABLE_<PROTO>` build and must
-/// answer `false` here.
+/// Two predicates, in this order:
 ///
-/// HTTP and HTTPS have no gate because there is no `http1` feature: HTTP/1.1
-/// and TLS are unconditional in this crate, which `curl-rs-lib/Cargo.toml`
-/// records and justifies. `file` has no gate for the same structural reason --
-/// AAP section 0.5.2's feature vocabulary is fifteen names and none of them is
-/// `file`.
-///
-/// The 24 out-of-scope schemes answer `false` unconditionally. That is what
-/// keeps the C's **parse-versus-set asymmetry** observable:
-/// `curl_url_set(u, CURLUPART_URL, "smtp://host/", 0)` succeeds because
-/// `parse_scheme` accepts any scheme in the table (`lib/urlapi.c:951`) while
-/// `curl_url_set(u, CURLUPART_SCHEME, "smtp", 0)` fails because
-/// `set_url_scheme` additionally requires an implementation (`:1646`).
+/// * `in_core_scope` -- AAP section 0.2.2 excludes 24 of the 33 schemes from
+///   implementation, so no row of [`EXECUTORS`] may claim one of them. Enforced
+///   here rather than only in a test so that a mistaken registration cannot
+///   change behaviour; [`mod tests`](self) asserts the two agree.
+/// * a registered executor, compared case-insensitively because four rows of
+///   [`SCHEMES`] are stored upper case exactly as the C stores them.
 fn runnable(name: &str, in_core_scope: bool) -> bool {
-    if !in_core_scope {
-        return false;
-    }
-    match name {
-        "ftp" | "ftps" => cfg!(feature = "ftp"),
-        "SFTP" | "SCP" => cfg!(feature = "ssh"),
-        "WS" | "WSS" => cfg!(feature = "websockets"),
-        // "http", "https" and "file": unconditional, per the note above.
-        _ => true,
-    }
+    in_core_scope
+        && EXECUTORS
+            .iter()
+            .any(|executor| executor.scheme().eq_ignore_ascii_case(name))
 }
 
 /// The 33-entry table, as a [`SchemeRegistry`].
@@ -275,13 +336,18 @@ static REGISTRY: AllSchemes = AllSchemes;
 ///
 /// # Why this returns a table wider than the `Protocols:` banner
 ///
-/// All 33 schemes resolve; only nine are [`SchemeInfo::runnable`]. Nothing here
-/// contradicts `crate::version`'s empty protocol banner, and the distinction is
-/// load-bearing rather than pedantic: resolving a scheme is what URL PARSING
-/// needs, while the banner describes what a TRANSFER can do. The transfer
-/// modules are unwritten, so `crate::version::ENGINE_PROTOCOLS` stays absent and
-/// the banner stays empty -- under-reporting, which makes a fixture skip, rather
-/// than over-reporting, which makes it run and fail.
+/// All 33 schemes resolve, and none of them is [`SchemeInfo::runnable`] in this
+/// checkout. The distinction between the two answers is load-bearing rather than
+/// pedantic: resolving a scheme is what URL PARSING needs, while runnability and
+/// the banner describe what a TRANSFER can do. So this table stays at 33 -- which
+/// is what keeps `guess_scheme`'s host-name prefixes, the default-port lookups
+/// and the parse-versus-set asymmetry behaving as they do in curl 8.19.0-DEV --
+/// while [`EXECUTORS`] is empty and `crate::version::protocols()` returns
+/// nothing.
+///
+/// Both under-report, which makes a fixture skip, rather than over-reporting,
+/// which makes it run and fail (AAP section 0.6.5). They now agree with each
+/// other: [`EXECUTORS`] records why the earlier revision's `runnable` did not.
 ///
 /// # Examples
 ///
@@ -370,31 +436,110 @@ mod tests {
         }
     }
 
+    /// The nine schemes AAP section 0.2.1 puts in core scope, as the table
+    /// spells them.
+    const IN_SCOPE: [&str; 9] = [
+        "http", "https", "ftp", "ftps", "SFTP", "SCP", "file", "WS", "WSS",
+    ];
+
     #[test]
-    fn only_the_nine_in_scope_schemes_can_ever_be_runnable() {
-        let in_scope = [
-            "http", "https", "ftp", "ftps", "SFTP", "SCP", "file", "WS", "WSS",
-        ];
+    fn runnability_is_exactly_the_registered_executor_set() {
+        // The property, stated so that it holds before AND after an engine
+        // lands: a scheme is runnable if and only if `EXECUTORS` carries a row
+        // for it. Nothing is compared against a literal list of names, so no
+        // edit is needed here when a protocol module registers itself.
         let registry = scheme_registry();
-        let mut runnable = 0usize;
-        for (name, _, _, _) in SCHEMES {
+
+        for (name, _, _, in_core_scope) in SCHEMES {
             let found = registry
                 .lookup(name.as_bytes())
                 .expect("every row resolves by its own name");
-            if found.runnable {
-                assert!(
-                    in_scope.contains(name),
-                    "{name} is out of core scope and must never be runnable"
-                );
-                runnable += 1;
+            let registered = super::EXECUTORS
+                .iter()
+                .any(|executor| executor.scheme().eq_ignore_ascii_case(name));
+
+            assert_eq!(
+                found.runnable,
+                *in_core_scope && registered,
+                "{name}'s runnable flag disagrees with the executor registry"
+            );
+        }
+    }
+
+    #[test]
+    fn no_registered_executor_is_out_of_core_scope() {
+        // AAP section 0.2.2 excludes 24 of the 33 schemes from implementation,
+        // so a row claiming one of them is a scope violation. `runnable` refuses
+        // it in production as well; this is what reports it.
+        for executor in super::EXECUTORS {
+            let name = executor.scheme();
+            assert!(
+                IN_SCOPE.contains(&name),
+                "{name} is out of core scope and must not register an executor"
+            );
+            assert!(
+                SCHEMES.iter().any(|(row, _, _, _)| *row == name),
+                "{name} is registered but is not a row of the scheme table -- \
+                 the spelling must match exactly, upper case included"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_runnable_in_this_checkout() {
+        // THE MEASURED STATE, asserted rather than described. No protocol module
+        // exists -- `curl-rs-lib/src/protocols/` holds this file and `ftp/`, and
+        // `ftp/` holds only `listparser.rs`, which parses the output of a `LIST`
+        // command and cannot issue one -- so every one of the 33 schemes answers
+        // false, exactly as a C curl with every `CURL_DISABLE_<PROTO>` does.
+        //
+        // This test is expected to be DELETED, not edited, by the checkpoint
+        // that lands the first protocol engine: at that point
+        // `runnability_is_exactly_the_registered_executor_set` above is the
+        // assertion that still holds, and it holds unchanged.
+        assert!(super::EXECUTORS.is_empty());
+
+        let registry = scheme_registry();
+        for (name, _, _, _) in SCHEMES {
+            assert!(
+                !registry
+                    .lookup(name.as_bytes())
+                    .expect("every row resolves by its own name")
+                    .runnable,
+                "{name} claims an implementation this checkout does not carry"
+            );
+        }
+    }
+
+    #[test]
+    fn a_registered_executor_makes_its_scheme_runnable() {
+        // The mechanism itself, proven against a stand-in so that the empty
+        // production registry cannot make the machinery vacuous. Without this,
+        // `runnable` could be a constant `false` and every assertion above would
+        // still pass.
+        struct Probe;
+
+        impl super::ProtocolExecutor for Probe {
+            fn scheme(&self) -> &'static str {
+                "http"
             }
         }
-        // With the default feature set every one of the nine is runnable; with
-        // `--no-default-features` the ftp, ssh and websockets rows drop out.
-        // Both are correct, so the assertion is the bound rather than the
-        // count -- and http, https and file are ungated, hence the floor.
-        assert!(runnable >= 3, "http, https and file are never gated");
-        assert!(runnable <= in_scope.len());
+
+        let registry: &[&'static dyn super::ProtocolExecutor] = &[&Probe];
+        let registered = |name: &str| {
+            registry
+                .iter()
+                .any(|executor| executor.scheme().eq_ignore_ascii_case(name))
+        };
+
+        // The registered scheme, in every spelling the C's fold accepts.
+        assert!(registered("http"));
+        assert!(registered("HTTP"));
+        assert!(registered("Http"));
+        // And nothing else, including a prefix and a sibling.
+        assert!(!registered("https"));
+        assert!(!registered("htt"));
+        assert!(!registered("ftp"));
     }
 
     #[test]

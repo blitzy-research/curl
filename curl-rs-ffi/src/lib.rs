@@ -14,50 +14,49 @@
 // `unsafe` is its subject matter and not an escape hatch -- so `forbid` is
 // unavailable and `deny` is the strongest level that can actually be set.
 //
-// What this changes. Before it, the three `#[allow(unsafe_code)]` attributes
-// below enforced NOTHING: the `unsafe_code` lint is `allow` by default, so
-// they were documentary. A new module could use `unsafe` freely and silently.
-// With the root at `deny`, `unsafe` anywhere in this crate is a compile error
-// unless that module carries an explicitly audited allow, which is the
-// property specification 0.1.1 goal G6 asks for and which review alone cannot
-// give.
+// What this changes. Before it, the `#[allow(unsafe_code)]` attribute below
+// enforced NOTHING: the `unsafe_code` lint is `allow` by default, so it was
+// documentary. A new module could use `unsafe` freely and silently. With the
+// root at `deny`, `unsafe` anywhere in this crate is a compile error unless
+// that module carries an explicitly audited allow, which is the property
+// specification 0.1.1 goal G6 asks for and which review alone cannot give.
 //
-// The three audited allowances, and why each is unavoidable:
+// THE AUDITED ALLOWANCE, singular, and why it is unavoidable:
 //
-//   `mod memory`  -- holds libcurl's five replaceable allocator hooks, whose
-//                    C typedefs (`include/curl/curl.h:469-473`) are
-//                    `unsafe extern "C" fn`. Calling one is inherently
-//                    unsafe: the pointer it returns is the application's.
-//   `mod ffi`     -- the exported entry points: all 100 at completion, the 24
-//                    defined at this commit. Every one is
-//                    `#[no_mangle] pub extern "C"` over raw C pointers.
-//   `mod tests`   -- must construct `unsafe extern "C" fn` hook
-//                    implementations to exercise `mod memory` against the
-//                    real typedefs. A safe stand-in would test a different
-//                    signature from the one the ABI publishes.
+//   `mod ffi`  -- the exported entry points, over raw C pointers received from
+//                 a caller this crate cannot inspect. Every one is
+//                 `#[no_mangle] pub extern "C"`, so `unsafe` is this module's
+//                 subject matter rather than an escape hatch.
+//
+// It is ONE and not three. An earlier revision of this comment listed
+// `mod memory` and `mod tests` alongside `mod ffi`, and that was true of an
+// earlier layout: both now live INSIDE `src/ffi/`, so the single allowance on
+// the `mod ffi` declaration already covers them. `memory` holds libcurl's five
+// replaceable allocator hooks, whose C typedefs
+// (`include/curl/curl.h:469-473`) are `unsafe extern "C" fn`, and the tests
+// that exercise them must construct real `unsafe extern "C" fn` hooks rather
+// than safe stand-ins with a different signature. Neither needs its own
+// exemption any more, and neither may have one: two exemptions would mean two
+// places to audit and would leave the root able to grant a third.
 //
 // `deny` is defeatable by an inner allow, exactly as it is in `curl-rs-lib`,
 // so the level is paired with an invariant a reviewer can check mechanically.
 // The pattern is ANCHORED to column zero, because an unanchored one also
-// matches the prose above and would report six:
+// matches the prose above and would report several:
 //
-//     grep -cE '^#\[allow\(unsafe_code\)\]$' curl-rs-ffi/src/lib.rs   ==  3
-//     grep -rnE '^ *#!?\[allow\(unsafe_code\)\]' curl-rs-ffi/src/ffi/ ==  nothing
+//     grep -cE '^#\[allow\(unsafe_code\)\]$' curl-rs-ffi/src/lib.rs   ==  1
+//     grep -rhE '^ *#!?\[allow\(unsafe_code\)\]' curl-rs-ffi/src/ffi/ ==  nothing
 //
-// A fourth allowance in this file, or any allowance under `ffi/`, is a
-// finding and not a convenience. `the_audited_unsafe_allowances_are_exactly_
-// three` asserts the first of the two so that the count cannot drift silently,
-// and it reads this file from disk rather than trusting the comment. The other half of the discipline is
-// unchanged and is not replaceable by a lint: EVERY `unsafe` block carries a
+// A second allowance anywhere in this crate is a finding and not a
+// convenience. `the_audited_unsafe_allowance_is_exactly_one` asserts the count
+// over EVERY source file in the crate -- not merely this one, because `deny`
+// unlike `forbid` can be overridden from an inner scope -- and it reads them
+// from disk rather than trusting this comment. The other half of the discipline
+// is unchanged and is not replaceable by a lint: EVERY `unsafe` block carries a
 // `// SAFETY:` comment naming the precondition it relies on and why it holds.
 #![deny(unsafe_code)]
 
 //! libcurl's C ABI, expressed in Rust.
-//!
-//! Comments throughout this crate cite `AAP <section>` -- the frozen
-//! migration specification that this implementation is measured against.
-//! Its section numbers are stable, and a citation marks a decision the
-//! specification fixes rather than one this code is free to change.
 //!
 //! This crate is the ABI facade that presents curl 8.19.0-DEV's exported C
 //! surface over the safe engine in `curl-rs-lib`. It marshals; it does not
@@ -102,34 +101,52 @@
 //! the target rather than an inventory.** The measured state, which every
 //! claim here is to be read against:
 //!
-//! * `curl-rs-ffi/src/ffi/` holds seventeen files: the eight symbol-family
-//!   modules `easy`, `escape`, `global`, `misc`, `printf`, `slist`, `strerror`
-//!   and `url`; the type-and-metadata modules `codes`, `handle`, `opts` and
-//!   `types`; the support modules `memory` and `panic_boundary`; `mod.rs`; and
-//!   two oracle fixtures. `multi`, `share`, `mime`, `form` and `ws` are still
-//!   targets.
-//! * **44 of the 100 symbols are defined, 56 are not, and 0 extra symbols
-//!   leak**, as measured at the commit that completed `url`. `build.rs` prints
-//!   the live figure as a `cargo:warning` on every build, so that -- not this
-//!   sentence -- is the number to consult. Two independent measurements agree on
-//!   the export SET: `nm -D --defined-only` over the built `cdylib`, and
-//!   `build.rs`'s `undefined_abi_exports`, which parses `lib/libcurl.def` and
-//!   this crate's `#[no_mangle]` declarations. They differ by five on the COUNT,
-//!   for a reason `ffi/mod.rs` records in full: `printf`'s five plain-variadic
-//!   forms are defined in `global_asm!`, which reaches `libcurl.a` but not
-//!   `libcurl.so`, so `nm` over the shared object reads five fewer. The crate
+//! * `curl-rs-ffi/src/ffi/` holds nineteen entries: the ten symbol-family
+//!   modules `easy`, `escape`, `form`, `global`, `mime`, `misc`, `printf`,
+//!   `slist`, `strerror` and `url`; the type-and-metadata modules `codes`,
+//!   `handle`, `opts` and `types`; the support modules `memory` and
+//!   `panic_boundary`; `mod.rs`; and two oracle fixtures. `multi`, `share` and
+//!   `ws` are still targets.
+//! * **59 of the 100 symbols are defined, 41 are not, and 0 extra symbols
+//!   leak.** `build.rs` prints the live figure as a `cargo:warning` on every
+//!   build, so that -- not this sentence -- is the number to consult. Two
+//!   independent measurements now AGREE on both the export set and the count:
+//!   `nm -D --defined-only` over the built `cdylib`, and `build.rs`'s
+//!   `undefined_abi_exports`, which parses `lib/libcurl.def` and this crate's
+//!   `#[no_mangle]` and `global_asm!` declarations. They used to differ by six,
+//!   because the six assembled labels reached `libcurl.a` and not
+//!   `libcurl.so`; `promote_assembled_exports` closed that, so the shared
+//!   library and the static library now export the identical set. The crate
 //!   therefore exports something, but it is **not** a drop-in replacement yet,
-//!   and nothing here should be read as claiming otherwise.
+//!   and nothing here should be read as claiming otherwise: 41 of the 100 have
+//!   no definition at all.
+//! * **The 41 fall in four families, and the split is published rather than
+//!   only written here**: `curl_multi_*` 21, `curl_easy_*` 13, `curl_ws_*` 4,
+//!   `curl_share_*` 3. `build.rs` emits them as `missing-family=<name> <count>`
+//!   lines in `$OUT_DIR/abi-inventory.txt` beside the 41 names, and
+//!   [`abi_inventory`]'s tests assert the counts sum to `missing` and that no
+//!   family is invented. The split is the actionable form of the total: three
+//!   of the four families are the three modules `ffi/` does not hold, and the
+//!   fourth is `ffi/easy.rs`, which exists and defines only its three
+//!   option-introspection entry points.
 //! * Because the header is generated FROM this crate, an incomplete surface
 //!   would generate an incomplete header. `build.rs` refuses: while any of the
 //!   100 is undefined it writes no header at all and says so, leaving the
 //!   reviewed curl 8.19.0-DEV headers in place as the ABI contract. So the
 //!   partial state cannot silently degrade the contract - see
 //!   `generate_headers`.
+//! * That refusal is an advisory, and an advisory cannot fail a build: a
+//!   `cargo:warning` leaves the exit status at zero, and `-D warnings` reaches
+//!   rustc lints only. Setting `CURL_RS_REQUIRE_COMPLETE_EXPORTS` turns the
+//!   same condition into a hard error naming every missing symbol, and
+//!   `.github/workflows/rust-abi.yml` arms it so that the incomplete surface
+//!   cannot pass a gate unremarked. Until it is complete, that workflow is red
+//!   on purpose.
 //!
 //! | Module | Count | Derivation |
 //! |---|---|---|
-//! | `ffi/easy.rs` | 18 | 21 `curl_easy_*` less the 3 moved out |
+//! | `ffi/easy.rs` | 16 | 21 `curl_easy_*` less the 5 moved out |
+//! | `ffi/escape.rs` | 2 | `curl_easy_escape`, `curl_easy_unescape` |
 //! | `ffi/multi.rs` | 21 | 22 `curl_multi_*` less `curl_multi_strerror` |
 //! | `ffi/share.rs` | 3 | 4 `curl_share_*` less `curl_share_strerror` |
 //! | `ffi/global.rs` | 5 | init, cleanup, init_mem, sslset, trace |
@@ -141,9 +158,21 @@
 //! | `ffi/printf.rs` | 10 | the `curl_m*printf` family |
 //! | `ffi/strerror.rs` | 4 | the four strerror functions |
 //! | `ffi/misc.rs` | 13 | 11 standalone plus the 2 header-API functions |
-//! | `codes`, `opts`, `handle`, `mod`, and this file | 0 | types only |
+//! | `codes`, `handle`, `memory`, `mod`, `opts`, `panic_boundary`, `types`, and this file | 0 | types and support only |
 //!
-//! Sum: 18 + 21 + 3 + 5 + 2 + 12 + 3 + 5 + 4 + 10 + 4 + 13 = **100**.
+//! Sum: 16 + 2 + 21 + 3 + 5 + 2 + 12 + 3 + 5 + 4 + 10 + 4 + 13 = **100**.
+//!
+//! The five moved out of `ffi/easy.rs` are `curl_easy_strerror` (to
+//! `ffi/strerror.rs`), `curl_easy_header` and `curl_easy_nextheader` (to
+//! `ffi/misc.rs`, which is where their declaring header points), and
+//! `curl_easy_escape` and `curl_easy_unescape` (to `ffi/escape.rs`). That
+//! last pair is why `ffi/escape.rs` carries a row of its own: it holds two
+//! symbols of the `curl_easy_*` family without being the `easy` module, and
+//! folding them back into the `easy` row would make the row disagree with the
+//! file. The split is load-bearing for the arithmetic above -- 16 rather than
+//! 18 -- and it reconciles against measurement: `ffi/easy.rs` defines three of
+//! its sixteen today (the `curl_easy_option_*` introspection trio), and
+//! 16 - 3 is exactly the 13 undefined `curl_easy_*` symbols reported above.
 //!
 //! Two ways of counting the same file set disagree unless the double
 //! counting is made explicit, so it is recorded here rather than
@@ -164,22 +193,6 @@
 //! `lib/strerror.c` houses all four in one translation unit
 //! (`curl_easy_strerror` at `:34`, `curl_multi_strerror` at `:326`,
 //! `curl_share_strerror` at `:385`, `curl_url_strerror` at `:420`).
-//!
-//! Where a symbol is *declared* is not where it is *defined*, and the two
-//! must not be conflated. `include/curl/options.h` declares the three
-//! `curl_easy_option_*` functions that `ffi/easy.rs` defines;
-//! `include/curl/header.h` declares the two header-API functions that
-//! `ffi/misc.rs` defines; `include/curl/multi.h` declares
-//! `curl_pushheader_byname` and `curl_pushheader_bynum`, which also belong
-//! to `ffi/misc.rs`. A definition is never moved to match a declaration's
-//! header.
-//!
-//! Spellings that are easy to get subtly wrong, each confirmed against the
-//! `.def` file: `curl_easy_option_next` (not `curl_easy_option_by_next`),
-//! `curl_multi_get_offt`, `curl_easy_ssls_export`, `curl_easy_ssls_import`,
-//! `curl_multi_notify_enable`, `curl_multi_notify_disable`,
-//! `curl_multi_get_handles`, `curl_multi_waitfds` and
-//! `curl_ws_start_frame`.
 //!
 //! # Module declaration order is ABI-visible
 //!
@@ -257,13 +270,6 @@
 //! `curl_slist_free_all`, `curl_mime_free`, `curl_formfree` and
 //! `curl_url_cleanup`.
 //!
-//! Containment is a safety net, never an error-handling strategy. A panic
-//! that reaches the boundary is always a defect in this crate, and the
-//! correct response is to fix the defect rather than to lean on the
-//! fallback. `panic_boundary::contained` counts the panics absorbed so
-//! far, so that a test can prove the net works and so that a clean run can
-//! be asserted to have absorbed none.
-//!
 //! ## The diagnostic the default hook would print, and why it is replaced
 //!
 //! Nothing in `panic_boundary` writes to standard error, but Rust's
@@ -273,14 +279,6 @@
 //! is `thread '<unnamed>' panicked at <file>:<line>:<col>:` followed by the
 //! payload, and, under `RUST_BACKTRACE`, a full backtrace with absolute
 //! paths and symbol names.
-//!
-//! Two things in that line are disclosures rather than diagnostics. **The
-//! payload is caller data.** A panic from `expect`, `unwrap` or an
-//! assertion routinely interpolates the value that failed, and at this
-//! boundary those values are URLs, credentials, headers and cookies. **The
-//! location and the backtrace are build-machine facts** -- paths of the
-//! machine that compiled the library, which the application it is loaded
-//! into never consented to publish.
 //!
 //! So a hook *is* installed, and the two objections that argued against
 //! one are both answered rather than overridden:
@@ -296,51 +294,6 @@
 //!   restores the unredacted default output for a debugging session, which
 //!   is the right way to make that output available: opt in, never by
 //!   default.
-//!
-//! Two consequences are stated rather than left to be discovered. A panic
-//! raised by an application's own callback while it is being driven from
-//! inside this boundary is indistinguishable from one raised by this
-//! crate, and is redacted with the rest; the failure is still returned to
-//! the application through the entry point's documented error value.
-//! And the constant line is bytes on standard error, so `tests/data`
-//! fixtures compare it -- but a fixture can only ever see it when a defect
-//! is already present, which is the situation in which a loud failure is
-//! the correct outcome.
-//!
-//! ## Containment is not a rollback, so handles are poisoned
-//!
-//! `catch_unwind` returns a documented failure value; it cannot undo what
-//! the body had already done. An entry point that panics halfway through
-//! mutating a handle would otherwise leave that handle observable in a
-//! state no code path constructs, and the application's next call would
-//! read it. Reverting arbitrary state generically is not possible, so the
-//! sound alternative is the one `std::sync::Mutex` takes: the handle is
-//! **poisoned** and is never observed again.
-//!
-//! `guard_tx` is the mechanism and the contract is binding on all 16
-//! modules under `ffi/`:
-//!
-//! * An entry point that **mutates** a handle routes through `guard_tx`
-//!   with that handle's `Poison` flag -- `ffi::panic_boundary::Poison`, named
-//!   in prose rather than linked because both it and the module holding it are
-//!   `pub(crate)`, so an intra-doc link from this public page would be a
-//!   private-item link and `RUSTDOCFLAGS=-D warnings` rejects it. A panic
-//!   poisons it.
-//! * An entry point that only **reads** may use `guard`.
-//! * Every call on a poisoned handle returns the family-correct error
-//!   **without running its body**, so half-mutated state is never read.
-//! * `curl_easy_cleanup`, `curl_multi_cleanup`, `curl_share_cleanup`,
-//!   `curl_mime_free`, `curl_formfree` and `curl_url_cleanup` are the
-//!   exception and must still free a poisoned handle. Refusing to free it
-//!   would convert a contained defect into a leak.
-//!
-//! # Argument validation at the boundary
-//!
-//! Every raw pointer arriving from C is null-checked before use, and a
-//! violation returns the family-correct `CURLE_*`, `CURLM_*`, `CURLSH_*`,
-//! `CURLU_*` or `CURLH_*` error exactly as the C implementation does.
-//! Never a panic, and never a dereference of an unchecked pointer. This
-//! binds all 16 modules under `ffi/`, which is why it is stated here.
 //!
 //! # `unsafe` in this crate
 //!
@@ -370,17 +323,6 @@
 //! returns `CURLE_OK` when libcurl is already initialised. The public
 //! contract is `include/curl/curl.h:2763-2768`, over the five typedefs at
 //! `:469-473`.
-//!
-//! `memory` is the Rust counterpart of those five pointers. It stores
-//! them as a group so no caller can observe a half-installed set, and it
-//! routes through them every buffer this crate hands across the C
-//! boundary. That last property is the one that matters to applications:
-//! a pointer returned by `curl_easy_escape`, `curl_maprintf` or
-//! `curl_getenv` is produced by the caller's own `malloc` and released by
-//! the caller's own `free`, with no header, no offset and no hidden
-//! bookkeeping, so `curl_free` behaves exactly as it does against C
-//! libcurl -- and so does a plain `free`, which real applications do rely
-//! on even though the documentation asks for `curl_free`.
 //!
 //! **The deviation.** This crate installs no `#[global_allocator]`, so
 //! Rust's own `Vec`, `Box` and `String` allocations do not pass through
@@ -414,19 +356,6 @@
 //!    that allocates -- but C's allocations are explicit and short-lived
 //!    where a Rust runtime's are neither. Trading a documented reporting
 //!    gap for a silent memory-corruption class is the right way round.
-//!
-//! What is emphatically *not* done is to accept the callbacks and discard
-//! them. `curl_global_init_mem` must keep working, its null-argument
-//! rejection must keep returning `CURLE_FAILED_INIT`, and the callbacks
-//! must be genuinely used; silent acceptance would be the worst of the
-//! available options.
-//!
-//! The flag word `curl_global_init_mem` shares with `curl_global_init` is
-//! `include/curl/curl.h:3014-3019`: `CURL_GLOBAL_SSL` is `1 << 0` and has
-//! had "no purpose since 7.57.0", `CURL_GLOBAL_WIN32` is `1 << 1`,
-//! `CURL_GLOBAL_ALL` is the two together, `CURL_GLOBAL_NOTHING` is 0,
-//! `CURL_GLOBAL_DEFAULT` aliases `CURL_GLOBAL_ALL`, and
-//! `CURL_GLOBAL_ACK_EINTR` is `1 << 2`. All six must be accepted.
 //!
 //! Thread safety is a live contract rather than a formality:
 //! `include/curl/curl.h:2744-2745` and `:2788-2789` document
@@ -483,18 +412,10 @@
 //! `aarch64-apple-darwin` the callee would read a register the caller never
 //! populated, silently and without a diagnostic.
 //!
-//! Specification 0.8.6 recorded three ways out -- raise the minimum
-//! supported Rust version, drop the target, or accept that one target's
-//! variadic entry points are unsupported -- because the only remedy known
-//! at the time was `VaList` with `ap.next_arg`, stable far above the
-//! declared minimum of 1.75. A fourth is technically available and costs none
-//! of those three, and it is described below because a reader is entitled to
-//! know it exists. It is **not** treated as a resolution: specification 0.8.6
-//! escalates A4 to whoever set the requirements, so which way out is taken --
-//! including whether to take one the specification does not list -- is that
-//! person's decision and not this crate's. A `core::arch::global_asm!`
-//! trampoline exported under the public symbol name would relocate the
-//! argument and tail-call the implementation:
+//! A fourth is technically available and costs none of those three, and it is
+//! described below because a reader is entitled to know it exists. A
+//! `core::arch::global_asm!` trampoline exported under the public symbol name
+//! would relocate the argument and tail-call the implementation:
 //!
 //! ```text
 //! _curl_easy_setopt:
@@ -525,18 +446,24 @@
 //! both broke specification 0.8.4 gate 1 -- zero warnings on all four
 //! targets -- and described a defect that was not present.
 //!
-//! **The escalation is enforced, not merely recorded here.** A caveat in a
-//! doc comment is exactly the "silent acceptance" the specification calls
-//! the worst option, so `build.rs`'s `check_variadic_abi` makes it
-//! impossible: building for `aarch64-apple-darwin` **fails** unless
-//! `CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs` is set, and
-//! any target fails if `src/ffi/form.rs` appears while the decision is
-//! unrecorded. `src/ffi/printf.rs` was once on that list and has been
-//! removed, because a stricter per-symbol check replaced the per-file veto
-//! for it; the next-but-one paragraph gives the measurement that made that
-//! possible. Setting that variable is an assertion
-//! that both consequences below are accepted; it fixes nothing, and where
-//! it actually suppresses a refusal the build says so. The two lists the
+//! **The escalation is enforced, not merely recorded here, and it can no
+//! longer be waived.** A caveat in a doc comment is exactly the "silent
+//! acceptance" the specification calls the worst option, so `build.rs`'s
+//! `check_variadic_abi` makes it impossible: building for
+//! `aarch64-apple-darwin` **fails, unconditionally**. It formerly succeeded
+//! when `CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs` was set,
+//! and that bypass has been removed -- it could emit a release artifact whose
+//! four option-identifier entry points read a register an Apple arm64
+//! variadic caller never writes, and no build-time variable makes an
+//! uninitialised register read safe. Setting the variable is now itself
+//! refused, with a message that says so, so an environment still carrying it
+//! fails loudly instead of appearing to be honoured. Specification 0.8.6 A4
+//! keeps two available options, both edits to this repository rather than
+//! environment settings: raise the MSRV above 1.75 and implement the four
+//! with `c_variadic`, or drop the triple from the matrix. `src/ffi/printf.rs`
+//! was once vetoed by file existence and no longer is, because a stricter
+//! per-symbol check replaced the per-file veto for it; the next-but-one
+//! paragraph gives the measurement that made that possible. The two lists the
 //! gate reasons about are asserted against the verbatim header text this
 //! crate emits, and the eleven named in the next paragraph are asserted
 //! equal to the gate's own list by the `#[cfg(test)]` function
@@ -545,16 +472,6 @@
 //! rather than as an intra-doc link: a `#[cfg(test)]` item is absent from the
 //! documented crate, so a link to it resolves to nothing and rustdoc rejects
 //! it under `-D warnings`.)
-//!
-//! **Nothing in this repository sets that variable, and nothing may.** No
-//! workflow records an A4 decision -- `.github/workflows/rust-build.yml` says
-//! so in its env block, enumerates the three options there, and asserts on
-//! every matrix leg that reaches its assertion step that no acceptance was in
-//! force. The observable consequence is deliberate: gate 1 of specification
-//! 0.8.4 reports three targets green and `aarch64-apple-darwin` **red**, with
-//! the refusal above as its diagnosis. Reporting a known-wrong variadic ABI as
-//! a successful target build is the one outcome specification 0.8.6 singles out
-//! as worse than a red gate, because it "would not surface in local testing".
 //!
 //! **Fifteen of the 100 symbols, not four, have an argument shape stable
 //! Rust cannot express at the declared minimum.** Searching for the
@@ -644,20 +561,6 @@
 //! exporter. Unlike the per-file veto it replaced, no environment variable
 //! silences it.
 //!
-//! **A second open item, discovered by measurement and materially widening A4:
-//! an assembled entry point cannot be exported from a Rust `cdylib` at the
-//! declared minimum, on any target, by any mechanism.** rustc builds a cdylib's
-//! export list from Rust items carrying `#[no_mangle]` or `#[export_name]` and
-//! hands the linker an anonymous version script shaped
-//! `{ global: <those items>; local: *; };` -- captured verbatim from 1.75.0 and
-//! 1.97.1 alike and byte-identical between them. A `.globl` label matches nothing
-//! in `global:`, falls to the wildcard, is localised, and -- being unreferenced --
-//! is discarded outright. Measured on x86_64-unknown-linux-gnu in both profiles:
-//! `nm -D --defined-only libcurl.so` reports the five `va_list` forms and not the
-//! five trampolines, which appear nowhere in a symbol table of 2703 entries,
-//! while `nm --defined-only libcurl.a` reports all ten as `T`. Every unit test
-//! passes either way, because a test binary links the rlib.
-//!
 //! Eight linker routes were measured; seven have no effect at all
 //! (`--export-dynamic-symbol`, `--export-dynamic-symbol-list`, `--dynamic-list`,
 //! `-u`, `--export-dynamic`, and combinations of them). The eighth, a second
@@ -677,42 +580,11 @@
 //! measured to be the caller's slot in debug and a callee-local copy in release,
 //! putting the overflow area out of reach.
 //!
-//! So the gap is accepted deliberately and it is LOUD: a consumer linking
-//! `-lcurl` against the shared library gets `undefined reference to
-//! 'curl_maprintf'` at link time, and specification 0.8.4's parity gate fails on
-//! it by design. That is the deciding property, because the alternative -- a
-//! capped printf -- mis-renders a legal C call **silently**, and specification
-//! 0.6.2 says of exactly this class of hazard that silent acceptance is the worst
-//! option. A loud absence beats a quiet wrong answer. The complete remedy makes
-//! the five Rust items, which means raising the minimum (`#[naked]` at 1.88, or
-//! `c_variadic` at 1.99), and that is the decision A4 reserves for whoever set
-//! the requirements.
-//!
-//! The formatter those ten need is written too, and it is curl's own rather than
-//! the platform's or Rust's: `lib/mprintf.c` supports `%zd`, `curl_off_t` and a
-//! quoted `%S`, and it differs from the C library in ways the byte-exact fixture
-//! corpus is entitled to depend on -- `%08.2f` loses its zero padding, `%10.8s`
-//! charges the width the requested precision rather than the delivered length,
-//! and `%10p` of a null pointer pads on the side left alignment would. Every one
-//! of those was verified differentially against a real libcurl rather than
-//! inferred, as specification 0.4.1 requires when it maps that file to this
-//! crate's `ffi/printf.rs`.
-//!
 //! **32-bit support is forfeited deliberately and must not be claimed.** A
 //! single register-width argument slot holds a `curl_off_t` only where
 //! `curl_off_t` fits a register. All four required targets are 64-bit, so
 //! the width question is settled for the required matrix and for nothing
 //! wider.
-//!
-//! Being 64-bit is necessary but **not** sufficient, and the distinction must
-//! not be collapsed: width decides whether a `curl_off_t` fits the slot, while
-//! the variadic conflict above decides whether the callee reads the slot the
-//! caller wrote. Width holds on all four targets; argument passing does not,
-//! because `aarch64-apple-darwin` passes variadic arguments on the stack. So
-//! the trailing-pointer design is sound on three of the four required targets
-//! and remains an open conflict on the fourth. A claim that 64-bit width alone
-//! makes it sound across the matrix would be wrong, and would hide that
-//! conflict rather than record it.
 //!
 //! **A disclosure rather than a defect.** Neither cryptographic
 //! provider available to rustls is pure Rust; both contain C and assembly.
@@ -762,10 +634,18 @@
 //! obligations were already met -- the TLS backend identity is public in
 //! `curl-rs-lib`'s `version` module, and every code enumeration exposes a
 //! message accessor.
+
 //!
 //! # Provenance of the constraints above
 //!
-// THE SAFETY INVARIANT for this crate, and the executable gate behind it.
+//! Every constraint stated in this documentation is measured against the C tree
+//! this crate replaces: curl/libcurl 8.19.0-DEV, `LIBCURL_VERSION_NUM
+//! 0x081300`. `lib/libcurl.def` is the export list, `include/curl/*.h` is the
+//! declaration authority, and `docs/examples/*.c` is the conformance suite that
+//! compiles against the generated header.
+
+// The exported entry points, the two support modules every one of them routes
+// through, and the ABI types the generated header is built from.
 //
 // `#![deny(unsafe_code)]` is at the head of this file, and exactly ONE
 // `#[allow(unsafe_code)]` exists in the whole crate: on the `mod ffi`
@@ -802,22 +682,82 @@
 // NEVER add `#![allow(unsafe_code)]` at crate level, and NEVER add a second
 // `#[allow(unsafe_code)]` anywhere. Either one converts a checked invariant
 // back into a review obligation.
-// The exported entry points -- 24 defined here at this commit, 100 at
-// completion -- the two support modules every one of them routes through, and
-// the ABI types the generated header is built from.
+// THE ABI EXPORT INVENTORY, AS COMPILE-TIME CONSTANTS.
+//
+// `build.rs` computes how much of `lib/libcurl.def` this crate actually defines
+// and, from the same computation, publishes it three ways: a line-oriented file
+// at `$OUT_DIR/abi-inventory.txt` for shell and continuous integration, the
+// `cargo:warning` lines a human reads, and the `cargo:rustc-env` values these
+// three constants read. See `publish_abi_inventory` for why the printed warning
+// alone was not enough - a `cargo:warning` cannot be branched on, so a job that
+// packaged a development kit or asserted a header had been regenerated could
+// not tell "generation was WITHHELD" from "generation was unnecessary", and
+// both then did the wrong thing confidently.
+//
+// These are `pub` although the `ffi` module is not, and that is the point: they
+// are the one part of this crate a Rust consumer is meant to read, because the
+// question they answer - is this build's C surface trustworthy yet - has to be
+// answerable before anything is shipped. They are constants, so a consumer can
+// assert on them at compile time.
+//
+// They are not a substitute for the `nm` parity gate. `nm` measures the built
+// artifact; these measure this crate's source. Both are needed, and the gate in
+// `.github/workflows/rust-abi.yml` reads both.
+
+/// How many symbols the ABI contract requires: every name in `lib/libcurl.def`.
+pub const ABI_EXPORTS_REQUIRED: u32 = konst(env!("CURL_RS_ABI_REQUIRED"));
+
+/// How many of those this crate defines today.
+///
+/// Equal to [`ABI_EXPORTS_REQUIRED`] exactly when the surface is complete.
+pub const ABI_EXPORTS_DEFINED: u32 = konst(env!("CURL_RS_ABI_DEFINED"));
+
+/// Whether this build promoted a complete set of generated public headers.
+///
+/// `false` while any required export is undefined, because a header rendered
+/// from a partial crate would be short by exactly what is missing, and a header
+/// that declares an export nothing provides is an undefined reference in every
+/// program that calls it. While this is `false` the reviewed curl 8.19.0-DEV
+/// headers in `include/curl/` are untouched and remain the ABI contract.
+pub const ABI_HEADERS_GENERATED: bool =
+    konst(env!("CURL_RS_ABI_HEADERS_GENERATED")) != 0;
+
+/// Parse a build-script-supplied decimal in a `const` context.
+///
+/// `u32::from_str_radix` is not `const`, and `str::parse` is not either, so the
+/// digits are walked by hand. A non-digit panics at COMPILE time, which is the
+/// behaviour wanted: the value comes from this workspace's own build script, so
+/// a malformed one is a defect here and not input to be tolerated.
+const fn konst(text: &str) -> u32 {
+    let bytes = text.as_bytes();
+    assert!(!bytes.is_empty(), "the build script emitted an empty count");
+
+    let mut value: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit = bytes[i];
+        assert!(
+            digit >= b'0' && digit <= b'9',
+            "the build script emitted a non-decimal count"
+        );
+        value = value * 10 + (digit - b'0') as u32;
+        i += 1;
+    }
+    value
+}
+
+// The exported entry points -- the two support modules every one of them routes
+// through, and the ABI types the generated header is built from. How many are
+// defined at this commit is not restated here: it is
+// [`ABI_EXPORTS_DEFINED`] out of [`ABI_EXPORTS_REQUIRED`], measured by the
+// build script on every build, which is what stops a hand-written count from
+// going stale.
 //
 // The module is private on purpose: a `cdylib` exports what is declared
 // `#[no_mangle] pub extern "C"` regardless of the privacy of the module holding
 // it, this crate has no `rlib` target and therefore no Rust consumer, and so
 // `pub` would widen the surface without widening what any caller can reach. For
 // the same reason there is no `pub use ffi::*`.
-//
-// This is the crate's ONLY `#[allow(unsafe_code)]`, and it is on the
-// declaration rather than at the crate root so that the exemption is visibly
-// scoped to one directory. `panic_boundary` and `memory` live *inside* that
-// directory for exactly this reason: two exemptions -- one for `mod memory` at
-// the root and one here -- would have meant two places to audit and would have
-// left the root able to grant a third.
 #[allow(unsafe_code)]
 mod ffi;
 
@@ -871,20 +811,6 @@ mod unsafe_boundary {
 
     /// `line` with its comment tail and every string literal removed, leaving
     /// only the code that the compiler would see as identifiers and punctuation.
-    ///
-    /// Both removals are necessary, and each was necessary in practice rather
-    /// than in theory. Dropping comments is obvious: this crate *discusses* the
-    /// keyword and the attribute at length, and an unfiltered scan reports the
-    /// prose as violations. Dropping string literals is the one that is easy to
-    /// miss -- the gate below compares against literals such as the block
-    /// opener, so a scan that kept string contents would flag its own
-    /// implementation. Removing both means the gate can live in the file it
-    /// checks, with no self-exemption and no allow-list to maintain.
-    ///
-    /// Escapes are honoured, so a literal containing an escaped quote does not
-    /// desynchronise the parse. Raw strings are not handled and are asserted
-    /// absent by [`the_gate_sees_no_raw_string_literals`], which is what keeps
-    /// this simplification safe rather than merely convenient.
     fn code_only(line: &str) -> String {
         let without_comment = line.split("//").next().unwrap_or("");
         let mut out = String::with_capacity(without_comment.len());
@@ -914,12 +840,6 @@ mod unsafe_boundary {
     }
 
     /// True when `line` uses the `unsafe` keyword as code.
-    ///
-    /// Word-boundary matching over [`code_only`], so neither `unsafe_code`
-    /// inside an attribute name nor a function called `uses_unsafe_keyword`
-    /// counts. The remaining limitation is recorded honestly: a `//` sequence
-    /// inside a raw string would truncate the line early, which is exactly what
-    /// [`the_gate_sees_no_raw_string_literals`] rules out.
     fn uses_unsafe_keyword(line: &str) -> bool {
         code_only(line)
             .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -927,15 +847,6 @@ mod unsafe_boundary {
     }
 
     /// Does `code` open a raw string literal?
-    ///
-    /// A raw string is `r"`, or `r` followed by one or more `#` and then `"`.
-    /// The `r` must NOT be preceded by an identifier character, or the last
-    /// letter of an ordinary word would match: a plain string literal ending
-    /// in the word "for" contains the bytes `r"` and is not a raw string at
-    /// all. That false positive was observed -- it failed
-    /// [`the_gate_sees_no_raw_string_literals`] on an unrelated assertion
-    /// message -- so the boundary check is required for the gate to mean what
-    /// it says rather than to fire on prose.
     fn starts_a_raw_string(code: &str) -> bool {
         let bytes = code.as_bytes();
         for (i, _) in code.match_indices('r') {
@@ -1148,24 +1059,6 @@ mod unsafe_boundary {
 
 // The executable half of the capability-truthfulness contract.
 //
-// WHY THIS GATE EXISTS. The generated
-// consumer metadata and the runtime `--version` banner "describe different
-// products": the metadata added `asyn-rr` and `HTTPSRR`, omitted the truthful
-// `HTTPS-proxy`, and under `memdebug` emitted `Debug` plus a nonstandard
-// standalone `TrackMemory`, while the runtime did the opposite. The root cause
-// was structural -- a hand-mirrored capability table in `build.rs` sitting
-// beside the live table in `curl-rs-lib/src/version.rs`, with a comment
-// conceding the two "cannot be unified in code here" and a correspondence
-// check that was never written.
-//
-// The mirror is gone: `build.rs` now DERIVES both advertised sets from the
-// engine's own tables, which specification 0.4.1 makes the authority for the
-// banner. That removes the drift at its source. This gate is the independent
-// confirmation, and it is deliberately NOT a second copy of the derivation --
-// it reads the metadata artifact that consumers actually get and compares it
-// against the engine's live answer, so it would catch a defect in the
-// derivation itself and not merely a divergence between two lists.
-//
 // THE ASSERTION IS ASYMMETRIC, ON PURPOSE. Specification 0.6.5 measured that
 // `tests/runtests.pl` uses the advertised sets to decide fixture eligibility:
 // under-reporting a capability makes a fixture SKIP, while over-reporting makes
@@ -1230,12 +1123,6 @@ mod capability_truthfulness {
 
     #[test]
     fn debug_and_trackmemory_never_appear_in_generated_metadata() {
-        // `Debug` gates ALL memory checking in the harness, and specification
-        // 0.6.6 records the deliberate decision to withhold it so the 28
-        // `<limits>` fixtures go inert rather than fail. `TrackMemory` is not a
-        // curl feature token at all -- the harness DERIVES it from /Debug/i --
-        // so emitting it standalone would advertise a vocabulary curl does not
-        // have. Both were emitted by the deleted mirror table.
         let advertised = pc_variable("supported_features");
         for forbidden in ["Debug", "TrackMemory"] {
             assert!(
@@ -1259,16 +1146,13 @@ mod capability_truthfulness {
             .collect();
 
         // NOT asserted non-empty, and the reason is the same honesty rule the
-        // rest of this module turns on. Every row of the engine's protocol
-        // table is gated on its implementation module being present, and no
-        // protocol module has landed yet, so the truthful advertised set is
-        // empty and the generated metadata says so. Requiring a scheme here
-        // would demand that the metadata claim one -- over-reporting, which
-        // makes a gated fixture run and fail (specification 0.6.5), where
-        // under-reporting only makes it skip. What IS asserted is that the two
-        // surfaces agree, in either direction: one going non-empty while the
-        // other stays empty is exactly the divergence this test exists to
-        // catch, and it fails the comparison below.
+        // rest of this module turns on. Requiring a scheme here would demand
+        // that the metadata claim one -- over-reporting, which makes a gated
+        // fixture run and fail, where under-reporting only makes it skip. What
+        // IS asserted is that the two surfaces agree, in either direction: one
+        // going non-empty while the other stays empty is exactly the
+        // divergence this test exists to catch, and it fails the comparison
+        // below.
         let mut expected = runtime;
         expected.sort_unstable();
         let mut found = advertised;
@@ -1357,16 +1241,13 @@ mod engine_seam {
         // (E0603, module `util` is private), which is the desired state:
         //
         //     curl_rs_lib::util::parsedate::getdate_capped("20011231");
-        //
-        // What IS reachable is the single exported name, and nothing else from
-        // that tree.
         assert!(curl_rs_lib::getdate("20011231").is_some());
     }
 
     // -- The crate-root safety gate ---------------------------
 
     #[test]
-    fn the_audited_unsafe_allowances_are_exactly_three() {
+    fn the_audited_unsafe_allowance_is_exactly_one() {
         // The invariant the crate-root gate names, asserted rather than
         // described. `#![deny(unsafe_code)]` is defeatable by an inner allow,
         // so the count is the second half of the enforcement: a fourth
@@ -1523,10 +1404,9 @@ mod engine_seam {
             );
         }
 
-        // The spellings a user must type. A caveat that quotes the wrong
-        // variable or the wrong value is an instruction that does not work,
-        // and it would fail in the one direction that matters: the build would
-        // keep refusing and the reader would believe they had complied.
+        // The spellings the diagnostics quote. A message that names the wrong
+        // variable sends a reader to change something that does not exist, and
+        // the two constants are what the messages are built from.
         let script = include_str!("../build.rs");
         for (constant, quoted) in [
             ("A4_DECISION_ENV", "CURL_RS_A4_VARIADIC_DECISION"),
@@ -1544,12 +1424,13 @@ mod engine_seam {
             );
         }
 
-        // And the gate must REFUSE rather than warn, which was the finding.
-        // Asserted on the shape of the code, because a gate that returns
-        // `Ok(Some(..))` on the Apple arm64 path is a warning wearing a
-        // refusal's name.
+        // And the gate must REFUSE, unconditionally, which is the stronger
+        // form of the original finding. Asserted on the shape of the code,
+        // because a gate that returns `Ok(Some(..))` on the Apple arm64 path
+        // is a warning wearing a refusal's name -- and one that consults an
+        // environment variable first is a bypass wearing one.
         let arm = script
-            .find("if !accepted && os == \"macos\" && arch == \"aarch64\" {")
+            .find("if os == \"macos\" && arch == \"aarch64\" {")
             .expect("build.rs must guard the Apple arm64 configuration");
         let tail = &script[arm..];
         let body = &tail[..tail.find("\n    }").unwrap_or(tail.len())];
@@ -1557,6 +1438,190 @@ mod engine_seam {
             body.contains("return Err("),
             "the aarch64-apple-darwin arm must fail the build, not warn"
         );
+
+        // The bypass must be structurally absent rather than merely unused. An
+        // `accepted` binding is how it was spelled, so its reappearance
+        // anywhere in the script is the regression this asserts against.
+        assert!(
+            !script.contains("let accepted = decision =="),
+            "build.rs must not derive an acceptance flag from \
+             {A4_DECISION_ENV_NAME}: the Apple arm64 refusal is unconditional \
+             and no environment value may release it"
+        );
+        assert!(
+            !body.contains("accepted"),
+            "the aarch64-apple-darwin arm must not consult any acceptance \
+             state; found: {body}"
+        );
+
+        // And the variable must still be DIAGNOSED, not ignored. A build that
+        // sets it believes an artifact is being released that is not, and
+        // silence would confirm the belief.
+        assert!(
+            script
+                .contains("and no value of it \\\n             does anything")
+                || script.contains("no value of it does anything"),
+            "build.rs must refuse a set {A4_DECISION_ENV_NAME} with an \
+             explanation rather than ignoring it"
+        );
+    }
+
+    /// The environment variable name, for the assertions above.
+    ///
+    /// Spelled once here rather than three times inline, and deliberately not
+    /// read from `build.rs`: an assertion that quoted the script's own value
+    /// back at it would pass however the script was edited.
+    const A4_DECISION_ENV_NAME: &str = "CURL_RS_A4_VARIADIC_DECISION";
+
+    /// The module partition in the crate documentation must still partition the
+    /// authority: its Count column must sum to the number of names in
+    /// `lib/libcurl.def`, and the prose sum must agree with the column.
+    ///
+    /// WHY THIS EXISTS. The table is a hand-maintained partition of a
+    /// hand-maintained authority, and it drifted: a row read `ffi/easy.rs | 18`
+    /// after two of those eighteen symbols had moved into `ffi/escape.rs`, so
+    /// the column summed to 100 only because the moved pair was counted in a
+    /// row that no longer held it. Nothing failed. A partition that is wrong in
+    /// two places that cancel is the hardest kind to notice by reading, and the
+    /// arithmetic is exactly what a machine should check instead.
+    ///
+    /// The three numbers are read from three independent places -- the table
+    /// column, the prose sum, and `lib/libcurl.def` -- so agreement is
+    /// meaningful. Splitting a module, moving a symbol between modules or
+    /// mis-transcribing the authority all break it.
+    #[test]
+    fn the_module_partition_sums_to_the_authority() {
+        // The authority itself, not a constant transcribed from it. `EXPORTS`
+        // and any blank or comment line are not symbols.
+        let authority = include_str!("../../lib/libcurl.def")
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("curl_"))
+            .count();
+        assert_eq!(
+            authority, 100,
+            "lib/libcurl.def must list the 100 names specification 0.1.1 \
+             derives from it; found {authority}"
+        );
+
+        let doc = include_str!("lib.rs");
+
+        // The Count column. A row is `//! | `ffi/x.rs` | <n> | <derivation> |`,
+        // and the header and separator rows carry no number in that position,
+        // so parsing the cell rather than matching a pattern is enough to skip
+        // them. The `| 0 |` row for the type-only modules participates
+        // correctly: it adds nothing and asserts nothing is owed.
+        let mut column = 0usize;
+        let mut rows = 0usize;
+        for line in doc.lines() {
+            let Some(row) = line.strip_prefix("//! |") else {
+                continue;
+            };
+            let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+            // Module, Count, Derivation, and the empty cell after the trailing
+            // pipe. Anything else is not one of these rows.
+            if cells.len() != 4 {
+                continue;
+            }
+            if let Ok(count) = cells[1].parse::<usize>() {
+                column += count;
+                rows += 1;
+            }
+        }
+        assert!(
+            rows >= 13,
+            "the module table did not parse out; found {rows} counted row(s)"
+        );
+        assert_eq!(
+            column, authority,
+            "the Count column of the module table sums to {column}, but \
+             lib/libcurl.def lists {authority} names. The table is a partition \
+             of that authority, so every name must be owed to exactly one \
+             module: a mismatch means a symbol is unowned or double-owned."
+        );
+
+        // The prose sum, which a reader checks by eye and therefore must agree
+        // with the column rather than merely with 100. Both directions matter:
+        // the addends must total the authority AND there must be one addend per
+        // counted row, so moving a symbol between two rows cannot leave the
+        // prose looking right.
+        let marker = "//! Sum: ";
+        let line = doc
+            .lines()
+            .find(|line| line.starts_with(marker))
+            .expect("the crate documentation must carry the partition sum");
+        let addends: Vec<usize> = line[marker.len()..]
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .split('+')
+            .filter_map(|term| term.trim().parse::<usize>().ok())
+            .collect();
+        assert_eq!(
+            addends.iter().sum::<usize>(),
+            authority,
+            "the documented sum {addends:?} does not total the {authority} \
+             names in lib/libcurl.def"
+        );
+        assert_eq!(
+            addends.len(),
+            rows - 1,
+            "the documented sum has {} addends for {rows} counted table rows. \
+             One row -- the type-only modules, which own no symbol -- is \
+             deliberately absent from the sum; any other difference means the \
+             prose and the table disagree about how many modules there are.",
+            addends.len()
+        );
+
+        // THE PART THAT CATCHES WHAT THE ARITHMETIC CANNOT. The historical
+        // defect balanced: two symbols moved out of `ffi/easy.rs` into a new
+        // `ffi/escape.rs` while the `easy` row kept counting them, so the column
+        // still summed to 100 and every check above would have passed. What was
+        // actually wrong is that a file existed which no row named. So the table
+        // is required to be a complete inventory of `src/ffi/`: every module
+        // there must appear somewhere in it, including the ones that own no
+        // symbol and are named collectively in the last row. A new module then
+        // cannot be added without deciding, in the table, what it owns.
+        let table_start = doc
+            .find("//! | Module | Count | Derivation |")
+            .expect("the crate documentation must carry the module table");
+        let table_end = table_start
+            + doc[table_start..]
+                .find("\n//! Sum: ")
+                .expect("the module table must be followed by its sum");
+        let table = &doc[table_start..table_end];
+
+        let ffi =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ffi");
+        let mut modules: Vec<String> = std::fs::read_dir(&ffi)
+            .unwrap_or_else(|error| {
+                panic!("cannot read {}: {error}", ffi.display())
+            })
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension()? != "rs" {
+                    return None;
+                }
+                Some(path.file_stem()?.to_str()?.to_owned())
+            })
+            .collect();
+        modules.sort();
+        assert!(
+            modules.len() >= 17,
+            "the ffi directory did not enumerate; found {modules:?}"
+        );
+        for module in &modules {
+            assert!(
+                table.contains(module.as_str()),
+                "src/ffi/{module}.rs exists but no row of the module table \
+                 names it, so the table is not the complete partition it is \
+                 documented to be. Whatever that module owns is currently \
+                 either unowned or counted against a module that does not hold \
+                 it -- the exact drift that let two curl_easy_* symbols be \
+                 counted in the easy row after they moved to escape.rs. Give it \
+                 a row, or add it to the row for the modules that own nothing."
+            );
+        }
     }
 
     // -- Redaction and poisoning at the boundary --------------
@@ -1595,11 +1660,6 @@ mod engine_seam {
     fn redaction_applies_inside_the_boundary_and_nowhere_else() {
         // The whole of the hook's decision, and the reason it is factored out
         // of the hook: a `PanicHookInfo` cannot be constructed by a test.
-        //
-        // Outside any guard the answer must be false, which is what preserves
-        // the application's own hook for the application's own panics -- the
-        // objection that had previously argued against installing a hook at
-        // all.
         assert!(
             !panic_boundary::would_redact(),
             "a panic outside the boundary belongs to the application"
@@ -1845,5 +1905,195 @@ mod engine_seam {
         // rename would silently remove the only route back to an unredacted
         // diagnostic, and nothing else in the tree would notice.
         assert_eq!(panic_boundary::VERBOSE_ENV, "CURL_RS_PANIC_VERBOSE");
+    }
+}
+
+/// The three published forms of the ABI export inventory must agree.
+///
+/// `build.rs` computes the inventory once and publishes it as a file, as
+/// `cargo:rustc-env` values, and as warning text. One computation cannot
+/// disagree with itself, but the three FORMATTINGS can drift apart under
+/// editing, and a consumer that reads the file while a gate reads the constants
+/// would then be told two different things about whether the C surface can be
+/// trusted. So the file and the constants are compared here.
+///
+/// `include_str!` rather than a runtime read, for the reason the pkg-config gate
+/// above gives: it guarantees the assertion sees exactly the artifact this build
+/// produced, and a missing file becomes a compile error instead of a silently
+/// skipped test.
+#[cfg(test)]
+mod abi_inventory {
+    use super::{
+        ABI_EXPORTS_DEFINED, ABI_EXPORTS_REQUIRED, ABI_HEADERS_GENERATED,
+    };
+
+    /// The published inventory, baked in at compile time.
+    const INVENTORY: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/abi-inventory.txt"));
+
+    /// The value of one `key=value` line.
+    fn field(key: &str) -> &'static str {
+        let prefix = format!("{key}=");
+        INVENTORY
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .map(|line| &line[prefix.len()..])
+            .unwrap_or_else(|| {
+                panic!("the published inventory declares no `{key}`")
+            })
+    }
+
+    fn number(key: &str) -> u32 {
+        field(key)
+            .parse()
+            .unwrap_or_else(|e| panic!("`{key}` is not a number: {e}"))
+    }
+
+    #[test]
+    fn the_file_and_the_constants_agree() {
+        assert_eq!(number("required"), ABI_EXPORTS_REQUIRED);
+        assert_eq!(number("defined"), ABI_EXPORTS_DEFINED);
+        assert_eq!(
+            field("headers-generated") == "1",
+            ABI_HEADERS_GENERATED,
+            "the file and the constant disagree about whether this build \
+             promoted a complete set of headers"
+        );
+    }
+
+    #[test]
+    fn the_inventory_is_internally_consistent() {
+        // The count and the enumeration are written from the same vector, so a
+        // disagreement means one of the two loops was edited without the other.
+        let named = INVENTORY
+            .lines()
+            .filter(|line| line.starts_with("missing-export="))
+            .count();
+        assert_eq!(number("missing") as usize, named);
+
+        assert_eq!(
+            ABI_EXPORTS_REQUIRED - ABI_EXPORTS_DEFINED,
+            number("missing"),
+            "required minus defined must be the missing count"
+        );
+
+        // The truncation-only subset cannot exceed the whole gap. Both figures
+        // answer different questions and quoting either alone has misled a
+        // review once, which is why both are published.
+        assert!(number("declaration-gap") <= number("missing"));
+    }
+
+    #[test]
+    fn headers_are_generated_exactly_when_the_surface_is_complete() {
+        // The rule `generate_headers` documents, asserted from the published
+        // side: no partial header set, ever. This is the field the packaging
+        // gate and the header gate both turn on, so an inversion here would let
+        // a build ship frozen headers beside a library that does not match
+        // them - which is the defect the inventory exists to make detectable.
+        assert_eq!(
+            ABI_HEADERS_GENERATED,
+            ABI_EXPORTS_DEFINED == ABI_EXPORTS_REQUIRED
+        );
+
+        // Non-vacuity: the requirement is the 100 names of lib/libcurl.def, so
+        // a zero here would mean the export list was not read at all and every
+        // assertion above would hold trivially.
+        //
+        // Read through the published file rather than the constants, because
+        // `assert!` on two `const` operands is a constant expression and
+        // `clippy::assertions_on_constants` rejects it under `-D warnings`. The
+        // file values are equal to the constants -- `the_file_and_the_constants_
+        // agree` is what establishes that -- so this asserts the same property
+        // without the lint, and it additionally covers the case where the
+        // constants were somehow correct and the file was not.
+        assert!(number("required") > 0);
+        assert!(number("defined") <= number("required"));
+    }
+
+    /// Every `missing-family=<name> <count>` line, in published order.
+    fn families() -> Vec<(&'static str, usize)> {
+        INVENTORY
+            .lines()
+            .filter_map(|line| line.strip_prefix("missing-family="))
+            .map(|body| {
+                let (name, count) = body.split_once(' ').unwrap_or_else(|| {
+                    panic!("malformed family line: `{body}`")
+                });
+                let count = count.parse().unwrap_or_else(|e| {
+                    panic!("family `{name}` has a bad count: {e}")
+                });
+                (name, count)
+            })
+            .collect()
+    }
+
+    /// The family grouping accounts for every missing name, once each.
+    ///
+    /// This is what makes the grouping usable as a work inventory rather than a
+    /// summary: if the counts did not sum to `missing`, a reader could not tell
+    /// whether a family had been omitted or a name double-counted. The
+    /// `curl_m*printf` names have no family segment and are grouped under their
+    /// own spelling for exactly this reason.
+    #[test]
+    fn the_family_counts_account_for_every_missing_name() {
+        let families = families();
+        let summed: usize = families.iter().map(|(_, count)| count).sum();
+        assert_eq!(
+            summed,
+            number("missing") as usize,
+            "the family counts must sum to the missing count: {families:?}"
+        );
+
+        let mut names: Vec<&str> =
+            families.iter().map(|(name, _)| *name).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(before, names.len(), "a family is listed twice");
+
+        // Every family that appears must be derivable from a name that appears,
+        // so the grouping cannot invent one.
+        let missing_names: Vec<&str> = INVENTORY
+            .lines()
+            .filter_map(|line| line.strip_prefix("missing-export="))
+            .collect();
+        for (family, _) in &families {
+            assert!(
+                missing_names.iter().any(|name| {
+                    name.strip_prefix("curl_")
+                        .and_then(|rest| rest.split_once('_'))
+                        .map_or(name == family, |(seg, _)| seg == *family)
+                }),
+                "family `{family}` matches no missing export"
+            );
+        }
+    }
+
+    /// Published largest-first with alphabetical ties, so the file is a function
+    /// of the tree alone.
+    ///
+    /// An unstable order would rewrite `$OUT_DIR` on every build --
+    /// `write_if_changed` compares contents -- and invalidate this crate's cache
+    /// for no reason.
+    #[test]
+    fn the_family_order_is_deterministic() {
+        let families = families();
+        for pair in families.windows(2) {
+            let (left, right) = (&pair[0], &pair[1]);
+            assert!(
+                left.1 > right.1 || (left.1 == right.1 && left.0 < right.0),
+                "{left:?} must not precede {right:?}"
+            );
+        }
+
+        // Non-vacuity: a single-element or empty list would satisfy the loop
+        // trivially. While the surface is incomplete there is more than one
+        // family; when it is complete there are none, and the sum assertion
+        // above covers that case.
+        if number("missing") > 0 {
+            assert!(!families.is_empty(), "names but no families");
+        } else {
+            assert!(families.is_empty(), "families but no names");
+        }
     }
 }

@@ -25,5 +25,7 @@ specified scope of this rewrite, so the `Features:` line of the --version
 output withholds `TLS-SRP`, and on a build that withholds it curl rejects this
 option and its companions --tlsuser and --tlspassword while parsing the
 command line. That rejection is the frozen behavior of the options rather than
-a new one. The withheld feature name is delivered; the parser that reports the
-rejection is not on disk.
+a new one, and it stays that way permanently: no configuration of this build
+ever gains TLS-SRP. The withheld feature name is delivered, and so is the
+rejection itself, which lives in the option module and is tested there. Neither
+is observable yet, because the executable does not call the parser.

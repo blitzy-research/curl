@@ -24,159 +24,12 @@
 //! NTLM authentication: the three messages, their cryptography, and the
 //! HTTP exchange that carries them.
 //!
-//! Supersedes three C files, 1,780 lines measured with `wc -l`:
+//! plus the two-macro helper header `lib/curl_ntlm_core.h:33-35`.
 //!
-//! ```text
-//!   lib/vauth/ntlm.c        859   the three messages and their layouts
-//!   lib/curl_ntlm_core.c    667   DES, MD4, HMAC-MD5 and the v2 blob
-//!   lib/http_ntlm.c         254   the five-state HTTP exchange
-//!                          ----
-//!                          1780
-//! ```
-//!
-//! plus the two-macro helper header `lib/curl_ntlm_core.h:33-35`. Every
-//! claim below carries a `path:line` citation into the C tree, because the
-//! bytes being reproduced are defined by those files and by the fixture
-//! corpus, not by this description.
-//!
-//! # Every byte here is a wire byte
-//!
-//! NTLM messages are binary structures wrapped in base64. 53 fixtures gate
-//! on the `NTLM` feature and each of them compares the resulting header line
-//! inside a byte-exact `<protocol>` block: `tests/getpart.pm:351+`'s
-//! `compareparts` joins both sides into a single string and compares them
-//! whole, with no per-line matching, no normalisation and no reordering. One
-//! wrong byte, one reordered security buffer or one recomputed constant fails
-//! outright. A mismatch is a defect here and never a reason to edit a
-//! fixture.
-//!
-//! Two consequences run through the whole file. Offsets and lengths are
-//! written as the literals the C writes -- `0x18` stays `0x18` even where a
-//! variable holds the same number -- and every conversion is explicit, so a
-//! width narrowing cannot silently produce a well-formed but wrong message.
-//!
-//! # What is NOT ported, and why
-//!
-//! * **`lib/vauth/ntlm_sspi.c`** (353 lines): the Windows SSPI
-//!   implementation, outside the four-target matrix. `lib/vauth/ntlm.c` is
-//!   already the non-SSPI arm in its entirety -- `:26` opens
-//!   `#if defined(USE_NTLM) && !defined(USE_WINDOWS_SSPI)` and `:859` closes
-//!   it -- so there was no SSPI content in the migration source to strip.
-//!   The SSPI half of `struct ntlmdata` (`lib/vauth/vauth.h:164-179`:
-//!   `credentials`, `context`, `identity`, `token_max`, `output_token`,
-//!   `input_token`, `spn` and the Schannel-binding `sslContext`) is likewise
-//!   absent from [`NtlmData`].
-//! * **The `#if DEBUG_ME` blocks** of `lib/vauth/ntlm.c`, roughly 158 lines.
-//!   `:35` defines `DEBUG_ME 0`, so `ntlm_print_flags` (`:162-226`),
-//!   `ntlm_print_hex` (`:228-237`) and the five `DEBUG_OUT({...})` call sites
-//!   are dead code in every shipped build. They are not ported. The **flag
-//!   constants** those blocks guard are ported, because a flag word arriving
-//!   from a server sets bits regardless of whether curl can print their
-//!   names, and naming them is what makes [`NtlmFlags`]'s formatter useful.
-//! * **Five of the six DES backends.** `lib/curl_ntlm_core.c:59-113`
-//!   dispatches between `USE_OPENSSL_DES` (covering both OpenSSL and
-//!   wolfSSL), `USE_GNUTLS`, `USE_MBEDTLS_DES`, `USE_OS400CRYPTO`,
-//!   `USE_WIN32_CRYPTO` and an `#else` arm that is a hard `#error`. All of it
-//!   collapses to one `des 0.8.1` implementation, because every C TLS backend
-//!   is dropped.
-//! * **The 32-bit `time_t` arm** of `time2filetime`
-//!   (`lib/curl_ntlm_core.c:452-486`, 35 lines of split-shift arithmetic to
-//!   avoid a 64-bit multiply). All four mandated targets are 64-bit, so only
-//!   the `#if SIZEOF_TIME_T > 4` arm at `:448-451` applies.
-//! * **`NTLM_WB`**, the winbind helper. Removed upstream in 8.8.0 and absent
-//!   from all three source files. It is not implemented and, decisively, is
-//!   **never advertised**: the harness reads the `Features:` line of
-//!   `curl --version` to decide which fixtures to run, and over-reporting a
-//!   capability turns a clean skip into a failure. `crate::version` emits no
-//!   `NTLM_WB` token.
-//!
-//! Two preprocessor guards have no Cargo successor. `lib/curl_ntlm_core.c:26`
-//! wraps that file in `#ifdef USE_CURL_NTLM_CORE` and `:434` guards the v2
-//! helpers with `#ifndef USE_WINDOWS_SSPI`; this crate declares exactly
-//! fifteen features and none of them is `ntlm`, while SSPI is out of the
-//! matrix. Everything below is therefore unconditionally present. The same
-//! holds for `CURL_DISABLE_PROXY` at `lib/http_ntlm.c:141-152`: see
-//! [`output_ntlm`].
-//!
-//! # The three message layouts, transcribed
-//!
-//! A `short` is a little-endian 16-bit unsigned value and a `long` a
-//! little-endian 32-bit one. A **security buffer** is the triplet
-//! `lib/vauth/ntlm.c:297-303` describes: a `short` length, a `short`
-//! allocated size, and a `long` offset from the start of the message. All
-//! three messages open with the eight-byte [`NTLMSSP_SIGNATURE`].
-//!
-//! Type-1, `lib/vauth/ntlm.c:431-443`. 32 bytes, always:
-//!
-//! ```text
-//!    0   NTLMSSP Signature      8 bytes ("NTLMSSP" and its NUL)
-//!    8   NTLM Message Type      long (0x01000000)
-//!   12   Flags                  long
-//!  (16)  Supplied Domain        security buffer (*)
-//!  (24)  Supplied Workstation   security buffer (*)
-//!  (32)  OS Version Structure   8 bytes (*)     -- not emitted
-//!                                      (*) -> Optional
-//! ```
-//!
-//! Type-2, `lib/vauth/ntlm.c:341-355`, received:
-//!
-//! ```text
-//!    0   NTLMSSP Signature      8 bytes
-//!    8   NTLM Message Type      long (0x02000000)
-//!   12   Target Name            security buffer
-//!   20   Flags                  long
-//!   24   Challenge              8 bytes
-//!  (32)  Context                8 bytes (two consecutive longs) (*)
-//!  (40)  Target Information     security buffer (*)
-//!  (48)  OS Version Structure   8 bytes (*)
-//!                                      (*) -> Optional
-//! ```
-//!
-//! Type-3, `lib/vauth/ntlm.c:550-566`. A 64-byte header, then the responses
-//! and strings the header points at:
-//!
-//! ```text
-//!    0   NTLMSSP Signature      8 bytes
-//!    8   NTLM Message Type      long (0x03000000)
-//!   12   LM/LMv2 Response       security buffer
-//!   20   NTLM/NTLMv2 Response   security buffer
-//!   28   Target Name            security buffer
-//!   36   username               security buffer
-//!   44   Workstation Name       security buffer
-//!  (52)  Session Key            security buffer (*)
-//!  (60)  Flags                  long (*)
-//!  (64)  OS Version Structure   8 bytes (*)     -- not emitted
-//!                                      (*) -> Optional
-//! ```
-//!
-//! The NTLMv2 response is itself a structure,
-//! `lib/curl_ntlm_core.c:554-567`:
-//!
-//! ```text
-//!    0   HMAC MD5               16 bytes
-//!  ------ BLOB ---------------------------------------------------------
-//!   16   Signature              0x01010000
-//!   20   Reserved               long (0x00000000)
-//!   24   Timestamp              LE 64-bit, tenths of a microsecond since
-//!                               January 1, 1601
-//!   32   Client Nonce           8 bytes
-//!   40   Unknown                4 bytes
-//!   44   Target Info            N bytes (from the type-2 message)
-//! 44+N   Unknown                4 bytes
-//! ```
-//!
-//! # The identity in a type-1 message is empty, and the type-3 hostname is
 //! # a constant. Both are fixture-confirmed.
 //!
 //! This is the most surprising fact in the file and the one most likely to be
 //! "improved" into a defect.
-//!
-//! `Curl_auth_create_ntlm_type1_message` declares `host` and `domain` as
-//! empty strings with all lengths and offsets zero (`lib/vauth/ntlm.c:448-454`)
-//! and then discards all four of its identity parameters outright:
-//! `(void)userp; (void)passwdp; (void)service; (void)hostname;` at `:456-459`.
-//! A type-1 message carries no identity whatsoever, which is why
-//! [`create_type1_message`] takes none.
 //!
 //! The type-3 hostname is `static const char host[] = "WORKSTATION"`
 //! (`lib/vauth/ntlm.c:579-581`) with curl's own justification: *"The fixed
@@ -194,16 +47,6 @@
 //! which appears to make byte-exact comparison impossible. It does not, and
 //! the reasoning is recorded here so that nobody later concludes the NTLM
 //! fixtures are unpassable and starts editing them.
-//!
-//! `tests/data/test1008`'s mock server sends a type-2 whose flag word at
-//! bytes 20 through 23 is `86 82 01 00`, that is `0x0001_8286`. Bit 19,
-//! [`NTLMFLAG_NEGOTIATE_NTLM2_KEY`], is **clear**, so
-//! [`create_type3_message`] takes the version-1 branch
-//! (`lib/vauth/ntlm.c:608`). NTLMv1 is DES over the server-supplied
-//! challenge alone: no client entropy, no timestamp, nothing that varies
-//! between runs. The expected type-3 confirms it -- 24-byte responses,
-//! `userlen` 8 rather than 16 so not Unicode, `hostlen` 11 rather than 22,
-//! and offsets 64, 88, 112, 112, 120.
 //!
 //! Byte-exactness for the NTLM fixtures therefore needs no control over
 //! randomness or the clock. The harness arranges both anyway --
@@ -235,18 +78,6 @@
 //! [`LmHash`] and [`NtHash`] -- carry hand-written formatters that print a
 //! placeholder. A 21-byte key buffer is password-equivalent: it is exactly
 //! what an offline cracker needs.
-//!
-//! The five diagnostics curl does emit are reproduced verbatim, because they
-//! reach the user through `--verbose` and are therefore frozen output.
-//!
-//! # Position in the three orderings
-//!
-//! All three live in [`super`] and none is duplicated here. NTLM is fourth
-//! of six in preference (`PREFERENCE_ORDER`, from `pickoneauth()` at
-//! `lib/http.c:343-364`), third in emission (`EMISSION_ORDER`) and
-//! second in challenge parsing (`CHALLENGE_ORDER`), and the clamp to
-//! HTTP/1.1 that NTLM forces on a connection speaking anything better lives
-//! in `super::auth_act` behind `NTLM_FORCE_HTTP11`.
 
 use core::fmt;
 
@@ -267,9 +98,7 @@ use super::{
     Credentials, HttpAuthMechanism, MechanismSlots, REDACTED_PLACEHOLDER,
 };
 
-// ---------------------------------------------------------------------------
 // Constants. Every one of these is a wire byte or a wire offset.
-// ---------------------------------------------------------------------------
 
 /// The `"NTLMSSP"` signature every message opens with, **eight** bytes.
 ///
@@ -287,11 +116,6 @@ use super::{
 /// documented there as "trailing zero"), and the type-2 validator compares
 /// **eight** bytes with `memcmp(type2, NTLMSSP_SIGNATURE, 8)` (`:364`),
 /// reading the terminator as data.
-///
-/// Declaring the terminator explicitly is therefore not a stylistic choice.
-/// A seven-byte constant here would shift every subsequent field by one and
-/// fail every NTLM fixture, and it would make the type-2 comparison accept a
-/// message whose eighth byte is anything at all.
 #[rustfmt::skip]
 pub(crate) const NTLMSSP_SIGNATURE: [u8; 8] = [
     0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00,
@@ -338,11 +162,6 @@ pub(crate) const RESPONSE_LEN: usize = 0x18;
 
 /// The length of the challenge a type-2 message carries, and of the client
 /// challenge a type-3 message answers with: 8 bytes.
-///
-/// `lib/vauth/vauth.h:182` (`unsigned char nonce[8]`),
-/// `lib/vauth/ntlm.c:372` (`memcpy(ntlm->nonce, &type2[24], 8)`) and
-/// `lib/vauth/ntlm.c:610`, `:617` (`unsigned char entropy[8]`,
-/// `Curl_rand(data, entropy, 8)`).
 pub(crate) const CHALLENGE_LEN: usize = 8;
 
 /// The length of the 21-byte key buffer an LM or NT hash is expanded into.
@@ -354,23 +173,9 @@ pub(crate) const CHALLENGE_LEN: usize = 8;
 /// (`:390`, `:427`), and `Curl_ntlm_core_lm_resp` reads exactly 21
 /// (`:308-310`: *"takes a 21 byte array and treats it as 3 56-bit DES
 /// keys"*).
-///
-/// 21 is the length that is actually contractual, so that is the length
-/// [`LmHash`] and [`NtHash`] have. The C's three spare bytes are an
-/// artefact of sizing two buffers to `0x18` and are not part of any
-/// computation.
 pub(crate) const HASH_KEY_LEN: usize = 21;
 
 /// The `"NTLM"` scheme token, in both directions.
-///
-/// Matched inbound by `checkprefix("NTLM", header)` (`lib/http_ntlm.c:63`,
-/// whose `header += strlen("NTLM")` at `:68` also derives the skip from it)
-/// and written outbound as the scheme of
-/// `"%sAuthorization: NTLM %s\r\n"` (`:207`, `:225`).
-///
-/// [`AuthScheme::Ntlm`]`.header_scheme()` returns the same four bytes and is
-/// what [`output_ntlm`] passes to [`authorization_header`]; this constant
-/// exists for the inbound side, where the C spells the literal directly.
 pub(crate) const NTLM_SCHEME: &str = "NTLM";
 
 /// The default service name: `"HTTP"`.
@@ -381,11 +186,6 @@ pub(crate) const NTLM_SCHEME: &str = "NTLM";
 /// (`lib/vauth/ntlm.c:458`), so it never affects a byte of NTLM output; the
 /// constant is recorded because the option exists and a reader comparing
 /// this file against `lib/http_ntlm.c` should find it accounted for.
-///
-/// The allowance is an inventory entry rather than a suppression: the value
-/// has no consumer BY CONSTRUCTION, because the only function it could reach
-/// discards it. Deleting it instead would leave `CURLOPT_SERVICE_NAME`
-/// unaccounted for in the one module a reader would check for it.
 #[allow(dead_code)]
 pub(crate) const DEFAULT_SERVICE: &str = "HTTP";
 
@@ -442,10 +242,6 @@ const NTLMV2_BLOB_SIGNATURE: [u8; 4] = [0x01, 0x01, 0x00, 0x00];
 ///   0x4B, 0x47, 0x53, 0x21, 0x40, 0x23, 0x24, 0x25 /* i.e. KGS!@#$% */
 /// };
 /// ```
-///
-/// Kept as bytes rather than as `b"KGS!@#$%"` so that it reads against the C
-/// without a mental transliteration, and so that no formatter can reflow it
-/// into something a reviewer cannot check byte by byte.
 #[rustfmt::skip]
 const LM_HASH_MAGIC: [u8; 8] = [
     0x4B, 0x47, 0x53, 0x21, 0x40, 0x23, 0x24, 0x25,
@@ -483,24 +279,10 @@ const FILETIME_EPOCH_BIAS_SECS: u64 = 11_644_473_600;
 /// microsecond since January 1, 1601"*.
 const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
 
-// ---------------------------------------------------------------------------
 // The flag vocabulary. `lib/vauth/ntlm.c:50-159`, in bit order.
-// ---------------------------------------------------------------------------
 
 // The C's own header for this block, `:50-51`, cites its source: "Flag bits
 // definitions based on https://davenport.sourceforge.net/ntlm.html".
-//
-// Seventeen of the twenty-four defined names sit inside `#if DEBUG_ME` blocks
-// (`:64-80`, `:85-104`, `:110-123`, `:129-138`, `:144-159`) and so are absent
-// from every shipped build. They are transcribed here anyway, for a reason
-// that is not symmetry: a type-2 flag word arrives from a server and sets
-// whichever bits it likes, and `NtlmFlags`'s formatter is the only place in
-// this crate that can say which. NO BEHAVIOUR is attached to any of them --
-// `create_type3_message` reads exactly two, UNICODE and NTLM2_KEY, and
-// `decode_type2_message` reads one, TARGET_INFO. The others are vocabulary.
-//
-// The comment on each is curl's own, condensed. The bit positions are not
-// negotiable: they are what a server sends and what a server parses.
 
 /// Unicode strings are supported in security buffer data -- bit 0.
 ///
@@ -658,9 +440,6 @@ pub(crate) const NTLMFLAG_NEGOTIATE_56: u32 = 1 << 31;
 ///             NTLMFLAG_NEGOTIATE_ALWAYS_SIGN)
 /// ```
 ///
-/// Bits 1, 2, 9, 15 and 19: `0x2 | 0x4 | 0x200 | 0x8000 | 0x80000`, which is
-/// `0x0008_8206` and reaches the wire little-endian as `06 82 08 00`.
-///
 /// **Fixture-confirmed.** `tests/data/test1008:108` and
 /// `tests/data/test1021:118` both expect, literally:
 ///
@@ -678,18 +457,6 @@ pub(crate) const TYPE1_FLAGS: u32 = NTLMFLAG_NEGOTIATE_OEM
     | NTLMFLAG_NEGOTIATE_ALWAYS_SIGN;
 
 /// The flag names, paired with their bits, for [`NtlmFlags`]'s formatter.
-///
-/// The table `ntlm_print_flags` (`lib/vauth/ntlm.c:162-226`) is written as a
-/// chain of twenty-nine `if(flags & X) curl_mfprintf(handle, "X ")`
-/// statements inside `#if DEBUG_ME`. As a table it is checkable: a test
-/// asserts that every entry's bit is the constant it names, that the entries
-/// are in ascending bit order, and that no bit appears twice.
-///
-/// The five bits curl lists as "unknown" (3, 8, 10, 24 through 28) are
-/// absent. The C prints them as `NTLMFLAG_UNKNOWN_n`; reproducing that would
-/// mean inventing names for bits nothing defines, and this formatter is a
-/// diagnostic aid rather than frozen output -- the whole `DEBUG_ME` block is
-/// dead code, so no byte of curl's observable behaviour depends on it.
 #[rustfmt::skip]
 const FLAG_NAMES: [(u32, &str); 24] = [
     (NTLMFLAG_NEGOTIATE_UNICODE,              "NEGOTIATE_UNICODE"),
@@ -719,13 +486,6 @@ const FLAG_NAMES: [(u32, &str); 24] = [
 ];
 
 /// An NTLM flag word, with a formatter that names its bits.
-///
-/// A newtype rather than a bare [`u32`] so that a flag word cannot be passed
-/// where an offset, a length or an [`AuthMask`] is expected. The three
-/// vocabularies overlap numerically -- bit 1 means "OEM strings" here and
-/// `CURLAUTH_DIGEST` there -- and the type is what keeps them apart.
-///
-/// [`Copy`] and cheap: this is a wrapped machine word.
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub(crate) struct NtlmFlags(u32);
 
@@ -747,12 +507,6 @@ impl NtlmFlags {
     }
 
     /// Whether **every** bit of `mask` is set.
-    ///
-    /// C tests a single bit at each of its three decision points
-    /// (`lib/vauth/ntlm.c:374`, `:578`, `:608`), so single-bit and
-    /// all-bits-of agree there; the stronger reading is chosen because it is
-    /// the one that does not silently accept a partial match if a future
-    /// caller passes two bits.
     #[must_use]
     pub(crate) const fn contains(self, mask: u32) -> bool {
         self.0 & mask == mask
@@ -789,9 +543,7 @@ impl fmt::Debug for NtlmFlags {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Little-endian splat helpers. `lib/curl_ntlm_core.h:33-35`.
-// ---------------------------------------------------------------------------
 
 /// `SHORTPAIR(x)`: the low sixteen bits of `x`, least significant byte
 /// first.
@@ -801,10 +553,6 @@ impl fmt::Debug for NtlmFlags {
 /// ```c
 /// #define SHORTPAIR(x) ((int)((x) & 0xff)), ((int)(((x) >> 8) & 0xff))
 /// ```
-///
-/// The macro yields **two** `printf` arguments, which is why every security
-/// buffer in the C is written as three `SHORTPAIR`s and a pair of literal
-/// zeroes rather than as one structure. Here it yields two bytes.
 ///
 /// # Why this is not a cast
 ///
@@ -817,10 +565,6 @@ impl fmt::Debug for NtlmFlags {
 /// the size guard at `lib/vauth/ntlm.c:776-780` rejects it. Reproducing the
 /// truncation costs one arm and keeps the two implementations byte-identical
 /// on a path neither of them completes.
-///
-/// Written this way rather than as `(x & 0xffff) as u16` because a masked
-/// cast reads as a cast: the reviewer has to verify the mask to know the
-/// truncation was intended, where a `match` says so.
 fn shortpair(value: usize) -> [u8; 2] {
     match u16::try_from(value) {
         Ok(fits) => fits.to_le_bytes(),
@@ -857,19 +601,6 @@ fn longquartet(value: u32) -> [u8; 4] {
 /// ```c
 /// SHORTPAIR(domlen), SHORTPAIR(domlen), SHORTPAIR(domoff), 0x0, 0x0,
 /// ```
-///
-/// The C writes the pattern out six times in the type-3 header
-/// (`:728-757`) and twice in the type-1 (`:485-492`). Writing it once here
-/// is not a refactor of behaviour: the eight bytes produced are identical and
-/// a test asserts them against the fixture-decoded message.
-///
-/// The trailing zeroes are the high half of the 32-bit offset. C spells them
-/// as literals because `SHORTPAIR` only yields two bytes, so an offset above
-/// 65,535 would be silently lost -- which no NTLM message can reach, since
-/// the whole message is bounded by [`NTLM_BUFSIZE`].
-///
-/// `allocated` is separate from `length` because the layout has two fields,
-/// even though every curl call site passes the same value to both.
 fn security_buffer(length: usize, offset: usize) -> [u8; 8] {
     let len = shortpair(length);
     let allocated = shortpair(length);
@@ -887,12 +618,6 @@ fn security_buffer(length: usize, offset: usize) -> [u8; 8] {
 }
 
 /// A little-endian `u16` read from the first two bytes of `bytes`.
-///
-/// `Curl_read16_le` (`lib/curl_endian.c`), the reader
-/// `lib/vauth/ntlm.c:266` uses for the target-info length. Takes an array
-/// rather than a slice so the length is proved at the call site, where the
-/// bound on the peer's message has just been checked, rather than here where
-/// a failure would have no honest answer.
 fn read16_le(bytes: [u8; 2]) -> u16 {
     u16::from_le_bytes(bytes)
 }
@@ -906,10 +631,8 @@ fn read32_le(bytes: [u8; 4]) -> u32 {
     u32::from_le_bytes(bytes)
 }
 
-// ---------------------------------------------------------------------------
 // String widening. `lib/vauth/ntlm.c:394-403` and
 // `lib/curl_ntlm_core.c:396-404`, which are the same function twice.
-// ---------------------------------------------------------------------------
 
 /// Widens `src` by interleaving a zero after every byte.
 ///
@@ -923,23 +646,6 @@ fn read32_le(bytes: [u8; 4]) -> u32 {
 ///   dest[2 * i + 1] = '\0';
 /// }
 /// ```
-///
-/// # This is not UTF-16, and must not be replaced by UTF-16
-///
-/// It is **naive byte widening**. A source byte at or above `0x80` is copied
-/// through unchanged and paired with a zero, which encodes the Latin-1 code
-/// point of that byte rather than the character the byte meant in whatever
-/// encoding it arrived in. A correct UTF-16 encoder would emit different
-/// bytes for exactly those inputs -- two units for a non-ASCII character, or
-/// a replacement -- and different bytes are a different NTLM message: a
-/// different NT hash, a different response, and a rejected login against
-/// every server that agrees with curl.
-///
-/// So the naivety is the contract. A test asserts that `0xC3` widens to
-/// `C3 00` and not to anything a UTF-16 encoder would produce.
-///
-/// The two names are kept as one function because the two C bodies are
-/// byte-identical and a reader checking either citation lands here.
 fn unicodecpy(src: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len().saturating_mul(2));
     for &byte in src {
@@ -950,14 +656,6 @@ fn unicodecpy(src: &[u8]) -> Vec<u8> {
 }
 
 /// Widens `src` after folding ASCII lower case to upper case.
-///
-/// `ascii_uppercase_to_unicode_le` (`lib/curl_ntlm_core.c:489-497`):
-/// [`unicodecpy`] with `Curl_raw_toupper` applied to each byte. The fold is
-/// ASCII-only and leaves `0x80..=0xFF` untouched, which is exactly what
-/// [`raw_toupper`] does.
-///
-/// Its one caller is [`mk_ntlmv2_hash`], and **only for the username**. See
-/// there for why the asymmetry with the domain matters.
 fn ascii_uppercase_to_unicode_le(src: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len().saturating_mul(2));
     for &byte in src {
@@ -998,10 +696,8 @@ fn pass_blanks(cursor: &[u8]) -> &[u8] {
     rest
 }
 
-// ---------------------------------------------------------------------------
 // State. `struct ntlmdata` (`lib/vauth/vauth.h:163-186`, non-SSPI arm) and
 // `curlntlm` (`lib/urldata.h:312-318`).
-// ---------------------------------------------------------------------------
 
 /// What a connection remembers between the type-2 and type-3 messages.
 ///
@@ -1013,22 +709,6 @@ fn pass_blanks(cursor: &[u8]) -> &[u8] {
 /// unsigned int target_info_len;
 /// void *target_info; /* TargetInfo received in the NTLM type-2 message */
 /// ```
-///
-/// Three fields become three, with one shape change: the `void *` and its
-/// separate length become one `Option<Vec<u8>>`, so the pair cannot disagree
-/// and the cast at every use disappears. `None` and `Some(empty)` are
-/// distinguishable and the distinction is used -- see
-/// [`Self::target_info_len`], which reproduces a C subtlety that depends on
-/// it.
-///
-/// Every SSPI field is excluded; the module documentation lists them.
-///
-/// # `Default` is the `calloc` of `Curl_auth_ntlm_get`
-///
-/// `lib/vauth/vauth.c:160-176` allocates the structure with `calloc` on
-/// first use, so a fresh instance is all zeroes: no flags, a zero challenge,
-/// no target info. `#[derive(Default)]` gives exactly that, which is why
-/// [`MechanismSlots::get_or_default`] is the right accessor for it.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct NtlmData {
     /// The flag word from the type-2 message, or [`NtlmFlags::NONE`].
@@ -1106,21 +786,6 @@ impl NtlmData {
     ///   ntlm->target_info_len = 0;
     /// }
     /// ```
-    ///
-    /// # It clears the target info and nothing else, deliberately
-    ///
-    /// `flags` and `nonce` **survive** a cleanup. That is not an oversight in
-    /// the C and it is load-bearing: [`create_type1_message`] calls cleanup
-    /// before composing its message (`:462`, "Clean up any former leftovers
-    /// and initialise to defaults"), and if that call also reset the flag
-    /// word then a restarted handshake would lose the state a later type-2
-    /// decode overwrites anyway -- while a caller that reads `flags` between
-    /// the two would see a different value than the C shows it. Reproducing
-    /// the narrow clear keeps the observable sequence identical.
-    ///
-    /// [`create_type3_message`] calls this on **both** its success and its
-    /// error paths (`:832-835`), so the block is never carried into a second
-    /// type-3 message.
     pub(crate) fn cleanup(&mut self) {
         self.target_info = None;
     }
@@ -1129,14 +794,6 @@ impl NtlmData {
 impl fmt::Debug for NtlmData {
     /// Prints the flag word, the challenge, and the **length** of the target
     /// info.
-    ///
-    /// Hand-written rather than derived. Nothing in this structure is a
-    /// credential -- the flag word and the challenge both cross the wire in
-    /// clear text, which is what makes them safe to print -- but the target
-    /// info is an attacker-supplied blob of unbounded length, and a derived
-    /// formatter would splice all of it into a diagnostic. Its length is the
-    /// part a reader needs, and it is the part the C's own arithmetic is
-    /// written in terms of.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NtlmData")
             .field("flags", &self.flags)
@@ -1147,12 +804,6 @@ impl fmt::Debug for NtlmData {
 }
 
 /// Renders a byte slice as lowercase hexadecimal for a formatter.
-///
-/// The successor of `ntlm_print_hex` (`lib/vauth/ntlm.c:228-237`), which is
-/// inside `#if DEBUG_ME` and prints `0x` followed by `%02.2x` per byte. Used
-/// only for values that are already public: a server challenge and, in
-/// tests, a message body. It is deliberately **not** implemented for
-/// [`LmHash`] or [`NtHash`].
 struct HexBytes<'a>(&'a [u8]);
 
 impl fmt::Debug for HexBytes<'_> {
@@ -1171,21 +822,6 @@ impl fmt::Debug for HexBytes<'_> {
 /// order, which the C depends on twice: `lib/http_ntlm.c:99` tests
 /// `*state >= NTLMSTATE_TYPE1`, and the `switch` at `:195` relies on
 /// `NTLMSTATE_NONE` reaching `default`.
-///
-/// The ordering is therefore reproduced as [`PartialOrd`] and the comparison
-/// is written as the C writes it. `NTLMSTATE_LAST` is a real state and not a
-/// count sentinel -- `:238` has a `case` for it -- so all five variants are
-/// modelled and none is a placeholder.
-///
-/// # Per connection, and separately per side
-///
-/// C stores two of these on the connection: `conn->http_ntlm_state` and
-/// `conn->proxy_ntlm_state` (`lib/urldata.h:683-684`). That is
-/// [`super::StateScope::Connection`], and the contrast with Digest -- whose
-/// state is per **transfer** on the easy handle -- is visible behaviour: an
-/// NTLM handshake is bound to the TCP connection and is meaningless across a
-/// new one, which is also why NTLM forces HTTP/1.1.
-/// [`NtlmConnection`] holds the pair.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum NtlmState {
     /// `NTLMSTATE_NONE`: nothing has happened yet. The `calloc`ed value, and
@@ -1205,13 +841,6 @@ pub(crate) enum NtlmState {
 
 /// The NTLM state of one connection: two exchange states and two data
 /// blocks.
-///
-/// Supersedes four things at once. The two `curlntlm` fields
-/// (`lib/urldata.h:683-684`) become [`Self::state`] and
-/// [`Self::state_mut`]; the two string-keyed connection metadata entries
-/// that `Curl_auth_ntlm_get` and `Curl_auth_ntlm_remove`
-/// (`lib/vauth/vauth.c:160-176`) manage become a
-/// [`MechanismSlots<NtlmData>`].
 ///
 /// # The metadata keys are not reproduced
 ///
@@ -1267,13 +896,6 @@ impl NtlmConnection {
 
     /// The [`NtlmData`] for one side, creating it if absent:
     /// `Curl_auth_ntlm_get(conn, proxy)`.
-    ///
-    /// C returns `NULL` when either the `calloc` or the metadata insertion
-    /// fails, and both `Curl_input_ntlm` (`lib/http_ntlm.c:65-66`) and
-    /// `Curl_output_ntlm` (`:165-166`) raise `CURLE_OUT_OF_MEMORY` on it.
-    /// Neither can fail here, so this returns a reference rather than an
-    /// `Option` and that error has no path to reach -- which is why neither
-    /// [`input_ntlm`] nor [`output_ntlm`] contains it.
     pub(crate) fn data_mut(&mut self, proxy: bool) -> &mut NtlmData {
         self.data.get_or_default(proxy)
     }
@@ -1287,11 +909,6 @@ impl NtlmConnection {
 
     /// Discards one side's [`NtlmData`]: `Curl_auth_ntlm_remove(conn, proxy)`
     /// (`lib/vauth/vauth.c:171-176`).
-    ///
-    /// The exchange state is **not** touched. `Curl_input_ntlm` calls the
-    /// removal and then assigns the state explicitly, differently in each of
-    /// its two branches (`lib/http_ntlm.c:89-97`), so folding a state change
-    /// in here would produce the wrong one for one of them.
     pub(crate) fn remove(&mut self, proxy: bool) {
         // The taken value is dropped at the end of this statement, which is
         // where C's `Curl_conn_meta_remove` runs the destructor.
@@ -1301,14 +918,9 @@ impl NtlmConnection {
 
 /// The two `data->info.*authpicked` fields.
 ///
-/// `data->info.httpauthpicked` and `data->info.proxyauthpicked`, which
-/// `Curl_output_ntlm`'s `NTLMSTATE_LAST` arm writes directly
-/// (`lib/http_ntlm.c:241-244`) and which the application reads back through
-/// `CURLINFO_HTTPAUTH_USED` and `CURLINFO_PROXYAUTH_USED`.
-///
 /// A pair here, rather than in `easy/getinfo.rs` where `data->info`
-/// ultimately belongs, because that module has not landed and this file has a
-/// writer that must not be dropped: the `LAST` arm emits **no header**, so
+/// ultimately belongs, because this file has a writer that must not be
+/// dropped: the `LAST` arm emits **no header**, so
 /// this field is the only trace it leaves, and losing it would make
 /// `CURLINFO_HTTPAUTH_USED` report nothing on an already-authenticated NTLM
 /// connection. `super::AuthActOutcome` carries the same two values out of
@@ -1358,10 +970,8 @@ impl AuthPickedInfo {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Cryptographic primitives. `lib/curl_ntlm_core.c`, all six DES backends
 // collapsed into one.
-// ---------------------------------------------------------------------------
 
 /// A 21-byte key buffer: three 56-bit DES keys laid end to end.
 ///
@@ -1370,35 +980,11 @@ impl AuthPickedInfo {
 /// (`lib/curl_ntlm_core.c:308-310`, `:353`, `:410`). A newtype rather than a
 /// bare array for one reason that matters more than type safety: **it has a
 /// formatter that prints nothing.**
-///
-/// # This is password-equivalent material
-///
-/// An LM or NT hash is not a password, but it is exactly what an offline
-/// attack needs and exactly what a pass-the-hash attack replays. A derived
-/// [`fmt::Debug`] would splice it into any diagnostic that ever prints a
-/// structure containing one, which is how a secret reaches a log without
-/// anybody deciding that it should. curl never prints these, and neither does
-/// this: [`fmt::Debug`] is hand-written and emits
-/// [`REDACTED_PLACEHOLDER`].
-///
-/// The same reasoning covers `Clone` -- present, because the type is a small
-/// array and a caller needs to key two responses from one hash -- and the
-/// absence of `Display`, `Deref` and any accessor returning the raw bytes to
-/// arbitrary callers. [`Self::key`] hands out one seven-byte DES key at a
-/// time, which is what the algorithm needs and no more.
 #[derive(Clone)]
 pub(crate) struct HashKeys([u8; HASH_KEY_LEN]);
 
 impl HashKeys {
     /// The all-zero buffer, which every constructor starts from.
-    ///
-    /// C declares `unsigned char ntbuffer[0x18]` uninitialised and then
-    /// writes 16 bytes of digest followed by
-    /// `memset(buffer + 16, 0, 21 - 16)` (`lib/curl_ntlm_core.c:390`,
-    /// `:427`). Starting from zero makes the tail zeroing structural instead
-    /// of a step that can be forgotten -- and the tail is not decoration: it
-    /// is the third DES key, so a stale byte there changes the last eight
-    /// bytes of every response.
     const fn zeroed() -> Self {
         Self([0; HASH_KEY_LEN])
     }
@@ -1439,38 +1025,13 @@ impl fmt::Debug for HashKeys {
 pub(crate) type LmHash = HashKeys;
 
 /// An NT hash: `Curl_ntlm_core_mk_nt_hash`'s 21-byte output.
-///
-/// An alias of the same type as [`LmHash`] rather than a second newtype. The
-/// two are genuinely interchangeable as *inputs to DES* -- `lm_resp` takes
-/// either, which is the whole point of its "takes a 21 byte array" comment
-/// (`lib/curl_ntlm_core.c:308`) -- so a distinct type would force a
-/// conversion that says nothing. What matters is the formatter, and both
-/// share it.
 pub(crate) type NtHash = HashKeys;
 
 /// Applies odd parity to all eight bytes.
 ///
-/// `curl_des_set_odd_parity` (`lib/curl_ntlm_core.c:142-158`), which curl
-/// itself describes as a port of the Java `oddParity()` at
-/// davenport.sourceforge.net and compiles only when the crypto backend has no
-/// version of its own (`#ifdef USE_CURL_DES_SET_ODD_PARITY`, enabled for
-/// GnuTLS, OS/400 and Windows). The OpenSSL arm calls
-/// `DES_set_odd_parity` instead (`:189`), which does the same thing.
-///
 /// The rule is C's, transcribed: exclusive-or bits 7 down to 1; if the result
 /// is zero the byte has an even number of set bits among them, so bit 0 is
 /// **set** to make the total odd; otherwise bit 0 is **cleared**.
-///
-/// # It has no effect on the output, and is implemented anyway
-///
-/// DES ignores bit 0 of every key byte -- the key schedule discards it -- so
-/// parity adjustment cannot change a single bit of ciphertext, and
-/// `des 0.8.1` neither adjusts parity nor rejects a weak key, so nothing
-/// downstream requires it. It is here because the C does it, at a point where
-/// the derived key is observable to anybody stepping through either
-/// implementation, and a reader auditing the two against each other must find
-/// the same 64-bit key in both. Removing it would be a silent divergence in
-/// an intermediate value for no gain.
 #[rustfmt::skip]
 fn set_odd_parity(bytes: &mut [u8; 8]) {
     for byte in bytes.iter_mut() {
@@ -1487,11 +1048,6 @@ fn set_odd_parity(bytes: &mut [u8; 8]) {
 
 /// Spreads a 56-bit key over eight bytes, then sets odd parity.
 ///
-/// `extend_key_56_to_64` (`lib/curl_ntlm_core.c:164-174`) followed by the
-/// parity call every `setup_des_key` arm makes (`:186-192` for OpenSSL,
-/// `:199-206` for GnuTLS, and the same shape in the remaining four). The two
-/// are one function here because no caller wants the unadjusted form.
-///
 /// The shift chain is transcribed literally, in C's order:
 ///
 /// ```c
@@ -1504,23 +1060,6 @@ fn set_odd_parity(bytes: &mut [u8; 8]) {
 /// key[6] = (char)(((key_56[5] << 2) & 0xFF) | (key_56[6] >> 6));
 /// key[7] = (char) ((key_56[6] << 1) & 0xFF);
 /// ```
-///
-/// C's `& 0xFF` is what keeps the left shift inside a byte after integer
-/// promotion. Rust's `u8 << n` is already byte-wide -- and, being a shift
-/// rather than an arithmetic operation, discards the bits that leave the top
-/// rather than overflowing -- so the mask is implicit. It is written out
-/// anyway, for the same reason the parity is applied: a reader diffing the
-/// two implementations should find the same eight expressions.
-///
-/// `#[rustfmt::skip]` keeps the chain aligned. Reflowed to 80 columns it
-/// becomes unreviewable against the C.
-///
-/// `clippy::identity_op` fires on each `& 0xFF` and is correct that the mask
-/// changes nothing: a `u8` shift is already byte-wide. The mask is kept
-/// regardless, and the lint allowed at this one item, because the whole value
-/// of this function is that it can be diffed against
-/// `lib/curl_ntlm_core.c:166-173` line for line -- the same trade
-/// `crate::util::parsedate` records at its own transcribed arithmetic.
 #[rustfmt::skip]
 #[allow(clippy::identity_op)]
 fn extend_key_56_to_64(key_56: &[u8; 7]) -> [u8; 8] {
@@ -1543,19 +1082,6 @@ fn extend_key_56_to_64(key_56: &[u8; 7]) -> [u8; 8] {
 }
 
 /// One DES-ECB encryption of one eight-byte block under a 56-bit key.
-///
-/// The single operation all six C backends provide and the only cryptographic
-/// primitive NTLMv1 needs. Compare the arms that collapse into it:
-/// `DES_set_key_unchecked` plus `DES_ecb_encrypt(..., DES_ENCRYPT)` for
-/// OpenSSL and wolfSSL (`lib/curl_ntlm_core.c:181-193`, `:316-329`),
-/// `des_set_key` plus `des_encrypt` for GnuTLS/nettle (`:197-206`,
-/// `:330-337`), and an `encrypt_des` helper for mbedTLS, OS/400 and Windows
-/// (`:338-342`).
-///
-/// Infallible and free of `unsafe`. `des 0.8.1` takes its key as a
-/// fixed-size array, so the key length is proved by the type and
-/// `new_from_slice`'s `Result` never arises; `encrypt_block` works in place
-/// on an eight-byte block, which is why the plaintext is copied first.
 fn des_ecb_encrypt(key_56: &[u8; 7], plaintext: &[u8; 8]) -> [u8; 8] {
     let key = extend_key_56_to_64(key_56);
     let cipher = Des::new(&key.into());
@@ -1567,21 +1093,6 @@ fn des_ecb_encrypt(key_56: &[u8; 7], plaintext: &[u8; 8]) -> [u8; 8] {
 }
 
 /// The 24-byte response: the same plaintext encrypted under all three keys.
-///
-/// `Curl_ntlm_core_lm_resp` (`lib/curl_ntlm_core.c:312-348`), whose own
-/// comment is the specification: *"takes a 21 byte array and treats it as 3
-/// 56-bit DES keys. The 8 byte plaintext is encrypted with each key and the
-/// resulting 24 bytes are stored in the results array."*
-///
-/// Note what it is **not**: three chained encryptions, and not Triple DES.
-/// The same eight bytes go into each of the three independently, and the
-/// three ciphertexts are concatenated. That is why `des 0.8.1`'s `TdesEde3`
-/// is not used here even though it exists -- it would compute something
-/// entirely different.
-///
-/// Called twice per NTLMv1 type-3 message: once keyed by the NT hash for the
-/// NT response and once by the LM hash for the LM response
-/// (`lib/vauth/ntlm.c:655`, `:661`).
 pub(crate) fn lm_resp(
     keys: &HashKeys,
     plaintext: &[u8; CHALLENGE_LEN],
@@ -1614,15 +1125,6 @@ pub(crate) fn lm_resp(
 ///    `pw[7..14]`, into bytes 0 through 15 (`:371-377`). Note the direction:
 ///    the password is the *key* and [`LM_HASH_MAGIC`] is the *plaintext*.
 ///    Reversing them is the second-most-copied bug.
-///
-/// Bytes 16 through 20 are zero, from [`HashKeys::zeroed`], which is C's
-/// `memset(lmbuffer + 16, 0, 21 - 16)` at `:390`.
-///
-/// Infallible where the C returns `CURLcode`: its every path returns
-/// `CURLE_OK` (`:393` is the only `return`), because nothing in it allocates.
-///
-/// The password arrives as bytes rather than as text because it reaches curl
-/// from a URL, an option or a `.netrc` file and is not required to be UTF-8.
 pub(crate) fn mk_lm_hash(password: &[u8]) -> LmHash {
     // `unsigned char pw[14]` (`:356`), pre-zeroed so that step 3 above is
     // structural: what `strntoupper` does not write stays zero.
@@ -1695,10 +1197,6 @@ pub(crate) fn mk_nt_hash(password: &[u8]) -> Result<NtHash, CURLcode> {
 
 /// The NTLMv2 hash: HMAC-MD5 of the widened identity, keyed by the NT hash.
 ///
-/// `Curl_ntlm_core_mk_ntlmv2_hash` (`lib/curl_ntlm_core.c:502-529`), whose
-/// comment states it exactly: *"This creates the NTLMv2 hash by using NTLM
-/// hash as the key and Unicode (uppercase UserName + Domain) as the data"*.
-///
 /// # The username is upper-cased and the domain is not
 ///
 /// `:521-522`, and this asymmetry is the classic NTLMv2 implementation bug:
@@ -1707,15 +1205,6 @@ pub(crate) fn mk_nt_hash(password: &[u8]) -> Result<NtHash, CURLcode> {
 /// ascii_uppercase_to_unicode_le(identity, user, userlen);
 /// ascii_to_unicode_le(identity + (userlen << 1), domain, domlen);
 /// ```
-///
-/// Two different functions, one line apart. Folding the domain as well, or
-/// neither, produces a hash that is wrong in a way no error message reports:
-/// the server simply denies the login. It is transcribed literally and
-/// asserted by test.
-///
-/// The key is the NT hash's **first sixteen bytes** -- `ntlmhash, 16` at
-/// `:524`, not the 21-byte buffer -- because the five trailing zeroes are
-/// DES key padding and are not part of the digest.
 ///
 /// # Errors
 ///
@@ -1748,8 +1237,6 @@ pub(crate) fn mk_ntlmv2_hash(
 /// The LMv2 response: HMAC-MD5 over the two challenges, then the client
 /// challenge again.
 ///
-/// `Curl_ntlm_core_mk_lmv2_resp` (`lib/curl_ntlm_core.c:641-663`).
-///
 /// # The server challenge comes first
 ///
 /// `:650-651`, and the order is the whole content of the function:
@@ -1758,17 +1245,6 @@ pub(crate) fn mk_ntlmv2_hash(
 /// memcpy(&data[0], challenge_server, 8);
 /// memcpy(&data[8], challenge_client, 8);
 /// ```
-///
-/// Reversing them yields a well-formed 24-byte response that authenticates
-/// nothing. The parameters are named for the C's, but note that the C's own
-/// documentation block at `:634-637` labels the third parameter
-/// `challenge_client` twice -- a copy-paste slip in the comment, not in the
-/// code, and the signature at `:641-644` is the authority. The order here
-/// follows the code.
-///
-/// The result is the 16-byte digest followed by the eight-byte client
-/// challenge (`:659-660`), which is what makes the response verifiable: the
-/// server learns the client's contribution from the response itself.
 pub(crate) fn mk_lmv2_resp(
     ntlmv2_hash: &[u8; 16],
     challenge_client: &[u8; CHALLENGE_LEN],
@@ -1789,11 +1265,6 @@ pub(crate) fn mk_lmv2_resp(
 
 /// A Windows FILETIME: tenths of a microsecond since 1601-01-01, split into
 /// two 32-bit halves.
-///
-/// `struct ms_filetime` (`lib/curl_ntlm_core.c:440-443`), whose comment gives
-/// the unit and MS-DTYP section 2.3.3 as the reference. The split is not an
-/// implementation detail of the C: the blob writes the two halves as two
-/// separate `LONGQUARTET`s (`:601-602`), so the pair is the wire shape.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MsFiletime {
     /// `dwLowDateTime`: bits 0 through 31.
@@ -1831,11 +1302,6 @@ impl MsFiletime {
 /// #else
 /// ```
 ///
-/// The 32-bit `#else` arm (`:452-486`) is 35 lines of split-shift arithmetic
-/// that exists solely to avoid a 64-bit multiply on a platform with a 32-bit
-/// `time_t`. All four mandated targets are 64-bit, so it is excluded and the
-/// exclusion is deliberate rather than an omission.
-///
 /// # Arithmetic
 ///
 /// C computes in `curl_off_t`, a signed 64-bit type, and the product
@@ -1846,10 +1312,6 @@ impl MsFiletime {
 /// and a reading before 1601 produces zero. Neither is reachable from a real
 /// clock; both are reachable from an injected one, and a panic inside an
 /// authentication exchange is not an acceptable answer to a wrong clock.
-///
-/// A negative `t` -- a wall clock set before 1970 -- is meaningful and is
-/// handled: the bias is added first, so any instant from 1601 onwards
-/// converts correctly.
 fn time2filetime(epoch_secs: i64) -> MsFiletime {
     // `t + 11644473600`, in signed arithmetic so that a pre-1970 reading is
     // biased upward rather than wrapping, then clamped at the FILETIME epoch.
@@ -1882,14 +1344,6 @@ fn time2filetime(epoch_secs: i64) -> MsFiletime {
 /// len = HMAC_MD5_LENGTH + NTLMv2_BLOB_LEN;
 /// ```
 ///
-/// `44 - 16 + 4` is 32, so the blob is `32 + target_info_len` bytes and the
-/// response is `48 + target_info_len`. The buffer is `calloc`ed (`:589`), so
-/// every field the code does not write -- the four reserved bytes at blob
-/// offset 4, the four "unknown" bytes at 24, and the four at the end -- is
-/// zero. That is reproduced with a zero-filled [`Vec`], not with explicit
-/// writes, for the same reason C reproduces it with `calloc`: a field written
-/// nowhere cannot be written wrongly.
-///
 /// # The overlapping-buffer trick is the algorithm
 ///
 /// `:604-618` is the part that looks like a bug and is not:
@@ -1903,35 +1357,15 @@ fn time2filetime(epoch_secs: i64) -> MsFiletime {
 /// memcpy(ptr, hmac_output, HMAC_MD5_LENGTH);                 /* (3) */
 /// ```
 ///
-/// Step (1) writes the **server** challenge into bytes 8 through 15, which
-/// are part of the not-yet-written HMAC field. Step (2) then digests
-/// `NTLMv2_BLOB_LEN + 8` bytes starting at offset 8 -- that is, the server
-/// challenge **concatenated with the whole blob**. Step (3) overwrites bytes
-/// 0 through 15 with the digest, erasing the challenge again.
-///
-/// So the HMAC input is `server_challenge || blob`, and the eight bytes at
-/// offset 8 exist only for the duration of the digest. This implementation
-/// assembles the blob once and digests `server_challenge || blob` from an
-/// explicit scratch buffer, which produces byte-identical input and
-/// byte-identical output while making the sequence readable. A test asserts
-/// the final HMAC equals `hmac_md5(v2hash, server_challenge || blob)`
-/// independently of this function.
-///
-/// # The timestamp
-///
-/// From the injected [`Clock`], through [`time2filetime`]. C reads
-/// `time(NULL)` (`:583`) unless `CURL_FORCETIME` is set in a debug build
-/// (`:577-582`), in which case it forces zero; a clock whose `epoch_secs()`
-/// reads zero reproduces the forced path exactly. See the module
-/// documentation.
-///
 /// # Errors
 ///
 /// None: it cannot fail. C returns `CURLE_OUT_OF_MEMORY` for its `calloc`
-/// (`:590-591`) and propagates the HMAC's own code (`:612-615`); neither has
-/// a counterpart here, since [`Vec`] allocation aborts rather than returning
-/// and [`hmac_md5`] is infallible. The type therefore says so, rather than
-/// carrying a result no caller can observe.
+/// (`:590-591`) and propagates the HMAC's own code (`:612-615`). The buffer is
+/// 16 bytes plus the blob the caller already holds -- no amplification, and its
+/// size is bounded by data that is already resident -- so it is not one of the
+/// externally sized allocations `crate::util::fallible` covers, and
+/// [`hmac_md5`] is infallible. The type therefore says so, rather than carrying
+/// a result no caller can observe.
 pub(crate) fn mk_ntlmv2_resp(
     ntlmv2_hash: &[u8; 16],
     challenge_client: &[u8; CHALLENGE_LEN],
@@ -1986,9 +1420,7 @@ pub(crate) fn mk_ntlmv2_resp(
     response
 }
 
-// ---------------------------------------------------------------------------
 // The type-1 message. `lib/vauth/ntlm.c:423-526`.
-// ---------------------------------------------------------------------------
 
 /// Builds a type-1 message: exactly [`TYPE1_SIZE`] bytes, always the same
 /// thirty-two.
@@ -2005,28 +1437,12 @@ pub(crate) fn mk_ntlmv2_resp(
 /// 5. the workstation security buffer, the same five fields;
 /// 6. the domain and host strings themselves.
 ///
-/// Steps 4 through 6 contribute nothing but zeroes, because
-/// `size = 32 + hostlen + domlen` (`:500`) with both lengths zero.
-///
-/// # It takes no arguments beyond the state
-///
-/// The C signature has `userp`, `passwdp`, `service` and `hostname`, and
-/// discards all four: `(void)userp; (void)passwdp; (void)service;
-/// (void)hostname;` at `:456-459`, with `host` and `domain` hard-coded empty
-/// at `:448-449`. A type-1 message carries no identity, so accepting four
-/// parameters here in order to ignore them would advertise an influence that
-/// does not exist, and a caller would eventually pass something and expect it
-/// to matter. [`output_ntlm`] documents the divergence at the one call site.
-///
 /// # It cleans up first
 ///
 /// `Curl_auth_cleanup_ntlm(ntlm)` at `:462`, commented "Clean up any former
 /// leftovers and initialise to defaults". That discards a Target Information
 /// block left by an earlier exchange on the same connection and, deliberately,
 /// leaves the flag word and challenge alone -- see [`NtlmData::cleanup`].
-///
-/// Infallible. C's only failure is the `curl_maprintf` allocation
-/// (`:496-497`).
 pub(crate) fn create_type1_message(ntlm: &mut NtlmData) -> Vec<u8> {
     // `Curl_auth_cleanup_ntlm(ntlm);` -- before anything is composed.
     ntlm.cleanup();
@@ -2066,9 +1482,7 @@ pub(crate) fn create_type1_message(ntlm: &mut NtlmData) -> Vec<u8> {
     message
 }
 
-// ---------------------------------------------------------------------------
 // The type-2 message. `lib/vauth/ntlm.c:256-392`.
-// ---------------------------------------------------------------------------
 
 /// `"NTLM handshake failure (bad type-2 message)"` --
 /// `lib/vauth/ntlm.c:367` and `:377`.
@@ -2090,8 +1504,6 @@ pub(crate) const BAD_TYPE2_TARGET_INFO: &str =
      Target Info Offset Len is set incorrect by the peer";
 
 /// Extracts the Target Information block from a type-2 message.
-///
-/// `ntlm_decode_type2_target` (`lib/vauth/ntlm.c:256-288`).
 ///
 /// # Every bound here is a security bound
 ///
@@ -2196,18 +1608,6 @@ fn decode_type2_target(
 
 /// Decodes a type-2 message into `ntlm`.
 ///
-/// `Curl_auth_decode_ntlm_type2_message` (`lib/vauth/ntlm.c:335-392`). The
-/// layout is in the module documentation.
-///
-/// # The flag word is cleared before validation, not after
-///
-/// `ntlm->flags = 0;` at `:361`, **above** the validation block. That matters
-/// on the failure path: a rejected message leaves the state with no flags
-/// rather than with whatever the previous exchange negotiated, so a caller
-/// that ignores the error and composes a type-3 message anyway produces an
-/// NTLMv1 message rather than one keyed on stale terms. Reproduced in the
-/// same order.
-///
 /// # The three validations
 ///
 /// `:363-369`, one `if` with three disjuncts, any of which rejects the
@@ -2217,17 +1617,6 @@ fn decode_type2_target(
 /// 2. `memcmp(type2, NTLMSSP_SIGNATURE, 8) != 0` -- **eight** bytes,
 ///    including the signature's NUL.
 /// 3. `memcmp(type2 + 8, type2_marker, 4) != 0` -- the message type is 2.
-///
-/// Then the flag word comes from offset 20 and the challenge from offset 24
-/// (`:371-372`), and the Target Information block is extracted only when the
-/// flag word asks for it (`:374-380`).
-///
-/// # The input is entirely attacker-controlled
-///
-/// Everything after the base64 decode is bytes a peer chose. There is no
-/// slicing here that is not preceded by a length check, no indexing that
-/// depends on a peer-supplied offset outside [`decode_type2_target`]'s
-/// validated range, and no path that panics.
 ///
 /// # Errors
 ///
@@ -2270,9 +1659,7 @@ pub(crate) fn decode_type2_message(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // The type-3 message. `lib/vauth/ntlm.c:544-838`.
-// ---------------------------------------------------------------------------
 
 /// `"incoming NTLM message too big"` -- `lib/vauth/ntlm.c:777`.
 ///
@@ -2306,18 +1693,6 @@ pub(crate) const IDENTITY_TOO_BIG: &str =
 /// else
 ///   user = userp;
 /// ```
-///
-/// Backslash **first**, forward slash only if there is no backslash. The
-/// order is observable: in `"a/b\\c"` the separator is the backslash, so the
-/// domain is `"a/b"` and the user is `"c"`, where a slash-first
-/// implementation would say `"a"` and `"b\\c"`.
-///
-/// `strchr` finds the **first** occurrence, so `"a\\b\\c"` splits at the
-/// first backslash: domain `"a"`, user `"b\\c"`. Both are asserted by test.
-///
-/// With no separator the domain is `""` (`:583`), never the user string.
-///
-/// Returns `(domain, user)` in the order the message writes them.
 fn split_user(userp: &[u8]) -> (&[u8], &[u8]) {
     let separator = userp
         .iter()
@@ -2335,27 +1710,6 @@ fn split_user(userp: &[u8]) -> (&[u8], &[u8]) {
 /// Builds a type-3 message answering the type-2 message already decoded into
 /// `ntlm`.
 ///
-/// `Curl_auth_create_ntlm_type3_message` (`lib/vauth/ntlm.c:544-838`). The
-/// layout is in the module documentation.
-///
-/// # Which version is used, and by whose choice
-///
-/// `if(ntlm->flags & NTLMFLAG_NEGOTIATE_NTLM2_KEY)` at `:608`: the **server**
-/// decides, by echoing or clearing bit 19 in its type-2 message. curl's
-/// comment on the version-2 branch (`:613-616`) explains why it is taken
-/// whenever offered: *"Full NTLM version 2. Although this cannot be
-/// negotiated, it is used here if available, as servers featuring extended
-/// security are likely supporting also NTLMv2."*
-///
-/// The version-1 branch **clears the bit from the emitted flag word**
-/// (`:662`), so the type-3 message tells the server which scheme its
-/// responses were computed under. A test asserts the clear.
-///
-/// curl records a *"safer but less compatible alternative"* in a comment at
-/// `:664-666` -- keying the LM slot with the NT hash instead of the LM hash.
-/// It is **not** adopted, because it is deliberately not what curl does and
-/// adopting it would change 24 bytes of every NTLMv1 message.
-///
 /// # Offsets, in the order that makes them right
 ///
 /// `:669-679`. The Unicode doubling happens **first**, and every offset is
@@ -2370,13 +1724,6 @@ fn split_user(userp: &[u8]) -> (&[u8], &[u8]) {
 /// hostoff   = useroff + userlen;
 /// ```
 ///
-/// `lmrespoff` is **always 64** and `ntrespoff` **always 88**, because the LM
-/// slot is always 24 bytes wide -- in the version-2 path too, where it holds
-/// an LMv2 response that also happens to be 24 bytes. The LM security
-/// buffer's two length fields are correspondingly the literal `0x18` in both
-/// paths, written as a literal rather than computed from a variable, exactly
-/// as `:728-730` does.
-///
 /// # The two size guards
 ///
 /// Both compare against [`NTLM_BUFSIZE`] and both fail the transfer with
@@ -2387,13 +1734,6 @@ fn split_user(userp: &[u8]) -> (&[u8], &[u8]) {
 ///   Information block above 888 -- is rejected with [`MESSAGE_TOO_BIG`].
 /// * `if(size + userlen + domlen + hostlen >= NTLM_BUFSIZE)` (`:799-803`),
 ///   rejected with [`IDENTITY_TOO_BIG`]. Note `>=`, not `>`.
-///
-/// # Cleanup runs on both paths
-///
-/// `:832-835` is reached by the `goto error` of both guards **and** by
-/// falling off the success path, and it calls `Curl_auth_cleanup_ntlm(ntlm)`
-/// either way. So a Target Information block is never carried into a second
-/// type-3 message. Reproduced by a single cleanup before every return.
 ///
 /// # Errors
 ///
@@ -2420,12 +1760,6 @@ pub(crate) fn create_type3_message(
 
 /// The body of [`create_type3_message`], so that its cleanup can be
 /// unconditional.
-///
-/// Separated for exactly one reason: the C's `goto error` runs the cleanup on
-/// the failure paths as well as the success path, and the honest Rust
-/// expression of "this runs whatever happens" is a caller that always runs
-/// it. Every citation and every guard is in [`create_type3_message`]'s
-/// documentation; this function is that documentation's code.
 fn build_type3(
     ntlm: &mut NtlmData,
     userp: &[u8],
@@ -2450,13 +1784,6 @@ fn build_type3(
     // `unsigned char lmresp[24]` and `ntresp[24]`, both `memset` to zero at
     // `:591-592`. `ntresplen` starts at 24 (`:574`) and the version-2 branch
     // replaces both the length and the response.
-    //
-    // The C's two `memset`s are defensive and unobservable: both branches
-    // below write all 24 bytes of the LM slot, and the `ntresp` array is not
-    // read at all on the version-2 path, where `ptr_ntresp` is repointed at
-    // the heap response instead. Declaring without an initialiser says the
-    // same thing and lets the compiler prove it, where a zero-fill that is
-    // always overwritten would only look like it mattered.
     let lmresp: [u8; RESPONSE_LEN];
     let ntresp_v1;
     let ntresp_v2;
@@ -2615,9 +1942,6 @@ fn build_type3(
 /// else
 ///   memcpy(&ntlmbuf[size], domain, domlen);
 /// ```
-///
-/// Written once here. See [`unicodecpy`] on why the widening is naive and
-/// must stay that way.
 fn widen_or_copy(src: &[u8], unicode: bool) -> Vec<u8> {
     if unicode {
         unicodecpy(src)
@@ -2626,9 +1950,7 @@ fn widen_or_copy(src: &[u8], unicode: bool) -> Vec<u8> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The HTTP exchange. `lib/http_ntlm.c:51-252`.
-// ---------------------------------------------------------------------------
 
 /// `"NTLM auth restarted"` -- `lib/http_ntlm.c:90`. An `infof()` string, so
 /// frozen `--verbose` output.
@@ -2643,10 +1965,6 @@ pub(crate) const HANDSHAKE_INTERNAL_ERROR: &str =
 
 /// Consumes a `WWW-Authenticate:` or `Proxy-Authenticate:` NTLM challenge.
 ///
-/// `Curl_input_ntlm` (`lib/http_ntlm.c:51-109`). `header` starts at the
-/// scheme token, exactly as C's `header` pointer does, and extends to the end
-/// of the header value.
-///
 /// Two shapes arrive and they mean different things:
 ///
 /// * **`NTLM <base64>`** -- a type-2 message. It is decoded into the
@@ -2657,10 +1975,6 @@ pub(crate) const HANDSHAKE_INTERNAL_ERROR: &str =
 ///   verbatim diagnostic, and then the state becomes [`NtlmState::Type1`]
 ///   (`:104`).
 ///
-/// A header that is not NTLM at all is silently ignored: the C's whole body
-/// is inside `if(checkprefix("NTLM", header))` and it returns `CURLE_OK`
-/// otherwise.
-///
 /// # The three bare-`NTLM` states
 ///
 /// | State | Diagnostic | Effect |
@@ -2668,16 +1982,6 @@ pub(crate) const HANDSHAKE_INTERNAL_ERROR: &str =
 /// | [`NtlmState::Last`] | [`AUTH_RESTARTED`] | data removed, then `Type1` |
 /// | [`NtlmState::Type3`] | [`HANDSHAKE_REJECTED`] | data removed, state `None`, error |
 /// | `>= `[`NtlmState::Type1`] | [`HANDSHAKE_INTERNAL_ERROR`] | error, state left alone |
-///
-/// The third arm is `else if(*state >= NTLMSTATE_TYPE1)`, which after the
-/// first two have been excluded means exactly [`NtlmState::Type1`] and
-/// [`NtlmState::Type2`]: the server sent a bare `NTLM` in the middle of a
-/// handshake. The ordering of the enumeration is what makes the comparison
-/// mean that, which is why [`NtlmState`] derives [`PartialOrd`].
-///
-/// Note that the second arm sets the state to [`NtlmState::None`] before
-/// returning while the third leaves it untouched -- a difference the C is
-/// explicit about and which a shared "reset on error" would lose.
 ///
 /// # Errors
 ///
@@ -2738,22 +2042,12 @@ pub(crate) fn input_ntlm(
 
 /// Produces this request's NTLM authorization header, or none.
 ///
-/// `Curl_output_ntlm` (`lib/http_ntlm.c:114-252`).
-///
 /// # The state advances before the switch, not inside it
-///
-/// `:192-193`, with the C's comment: *"connection is already authenticated,
-/// do not send a header in future requests so go directly to
-/// NTLMSTATE_LAST"*.
 ///
 /// ```c
 /// if(*state == NTLMSTATE_TYPE3)
 ///   *state = NTLMSTATE_LAST;
 /// ```
-///
-/// So there is no `case NTLMSTATE_TYPE3` in the switch -- by the time it runs,
-/// that state has become [`NtlmState::Last`]. Placing the transition inside
-/// the match instead would need a fall-through Rust does not have.
 ///
 /// # The arms
 ///
@@ -2773,17 +2067,6 @@ pub(crate) fn input_ntlm(
 ///   credential string so that no header is produced, and sets `done`. That
 ///   is [`AuthEmission::Nothing`], whose [`AuthEmission::is_done`] is true,
 ///   plus the write to `picked`.
-///
-/// # The identity parameters the C threads through and discards
-///
-/// C reads `service` and `hostname` (`:145-147`, `:158-160`, defaulting the
-/// service to [`DEFAULT_SERVICE`]) and passes both to
-/// `Curl_auth_create_ntlm_type1_message`, which discards them along with the
-/// username and password. [`create_type1_message`] therefore takes none of
-/// the four, and this function does not manufacture them: a parameter that
-/// cannot affect a byte of output is a parameter a caller will eventually
-/// believe in. The divergence is confined to this call site and is recorded
-/// here.
 ///
 /// # The proxy branch of a build without proxy support
 ///
@@ -2888,23 +2171,6 @@ pub(crate) fn output_ntlm(
 /// everything it touches, because every piece belongs to a different lifetime
 /// in C: the state is on the connection, the credentials and `data->info` are
 /// on the easy handle, and the tracer is the handle's diagnostic sink.
-///
-/// # Why the tracer is a field
-///
-/// [`HttpAuthMechanism::input`] and [`HttpAuthMechanism::output`] take no
-/// tracer, and NTLM has five verbatim diagnostics that must reach
-/// `--verbose`. Holding it is what lets the trait be implemented without
-/// losing them. [`input_ntlm`] and [`output_ntlm`] remain callable directly,
-/// with the tracer as an ordinary argument, and are what the tests drive:
-/// the trait adds dispatch, not behaviour.
-///
-/// # It does not implement [`super::ChallengeDecoder`]
-///
-/// That trait is the *whole scan* -- one implementation dispatches all five
-/// schemes from `super::input_auth`, mirroring the `authcmp` chain of
-/// `Curl_http_input_auth` -- so it belongs to the HTTP driver, not to one
-/// mechanism. [`input_ntlm`] is what such an implementation calls for
-/// [`AuthScheme::Ntlm`].
 pub(crate) struct NtlmMechanism<'a, 'sink> {
     /// The connection's two exchange states and two data blocks.
     conn: &'a mut NtlmConnection,
@@ -2986,10 +2252,6 @@ impl HttpAuthMechanism for NtlmMechanism<'_, '_> {
 //     specification. They pin the primitives independently of curl.
 //   * `lib/vauth/ntlm.c`, `lib/curl_ntlm_core.c` and `lib/http_ntlm.c` -- for
 //     structure, ordering and diagnostics.
-//
-// Every expectation that crosses the wire is a literal rather than a value
-// derived from the implementation. Deriving it would make the test agree with
-// whatever the code does, which is the one thing a parity test must not do.
 
 #[cfg(test)]
 mod tests {
@@ -3006,9 +2268,7 @@ mod tests {
         PREFERENCE_ORDER,
     };
 
-    // -----------------------------------------------------------------------
     // Fixtures, decoded from the repository.
-    // -----------------------------------------------------------------------
 
     /// The 32 bytes `tests/data/test1008:108` and `tests/data/test1021:118`
     /// both expect, written exactly as the fixtures spell them.
@@ -3032,19 +2292,6 @@ mod tests {
 
     /// The type-2 message `tests/data/test1008`'s mock proxy sends, decoded
     /// from the `Proxy-Authenticate:` header of its `<connect1001>` reply.
-    ///
-    /// 160 bytes. Its flag word at offset 20 is `86 82 01 00`, that is
-    /// `0x0001_8286` -- bits 1, 2, 7, 9, 15 and 16. So: bit 19 CLEAR, hence
-    /// NTLMv1; bit 0 clear, hence not Unicode; and **bit 23 clear**.
-    ///
-    /// That last one is worth stating, because the message does carry a
-    /// Target Information security buffer at offset 40, declaring 110 bytes at
-    /// offset 50 -- and curl reads NONE of it, because
-    /// `if(ntlm->flags & NTLMFLAG_NEGOTIATE_TARGET_INFO)`
-    /// (`lib/vauth/ntlm.c:374`) gates the whole extraction on a flag the
-    /// server did not set. An implementation that extracted the block anyway
-    /// would still produce the right type-3 message here (NTLMv1 does not use
-    /// the block) but would diverge the moment bit 19 were set as well.
     const FIXTURE_TYPE2_B64: &str = "TlRMTVNTUAACAAAAAgACADAAAACGggEAc51AYVDgy\
         NcAAAAAAAAAAG4AbgAyAAAAQ0MCAAQAQwBDAAEAEgBFAEwASQBTAEEAQgBFAFQASAAEABgA\
         YwBjAC4AaQBjAGUAZABlAHYALgBuAHUAAwAsAGUAbABpAHMAYQBiAGUAdABoAC4AYwBjAC4\
@@ -3076,9 +2323,7 @@ mod tests {
     /// The flag word inside [`FIXTURE_TYPE2_B64`], at offset 20.
     const FIXTURE_TYPE2_FLAGS: u32 = 0x0001_8286;
 
-    // -----------------------------------------------------------------------
     // Harness helpers.
-    // -----------------------------------------------------------------------
 
     /// Runs `body` with a verbose tracer and returns its result together with
     /// everything the sink received, as text.
@@ -3108,12 +2353,6 @@ mod tests {
 
     /// A generator that hands out a fixed byte, so that a client challenge is
     /// reproducible.
-    ///
-    /// `TestRng` reproduces `lib/rand.c`'s `CURL_ENTROPY` seam, which is the
-    /// right tool for asserting curl's own generated values; here the client
-    /// challenge is an opaque input to an HMAC and a constant makes the
-    /// expectation readable. Both are injected, which is the property that
-    /// matters.
     struct FixedRng(u8);
 
     impl Rng for FixedRng {
@@ -3198,9 +2437,7 @@ mod tests {
         message
     }
 
-    // -----------------------------------------------------------------------
     // Constants and the flag table.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_signature_is_eight_bytes_and_ends_in_a_nul() {
@@ -3301,9 +2538,7 @@ mod tests {
         assert_eq!(longquartet(TYPE1_FLAGS), [0x06, 0x82, 0x08, 0x00]);
     }
 
-    // -----------------------------------------------------------------------
     // The little-endian helpers.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn shortpair_and_longquartet_are_little_endian() {
@@ -3361,9 +2596,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // String widening. The naivety is the contract.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn widening_interleaves_zeroes_and_is_not_utf_16() {
@@ -3424,9 +2657,7 @@ mod tests {
         assert_eq!(pass_blanks(b"\rx"), b"\rx");
     }
 
-    // -----------------------------------------------------------------------
     // The primitives, against MS-NLMP section 4.2 and the C's structure.
-    // -----------------------------------------------------------------------
 
     /// The published NTOWFv1 of `"Password"`: MS-NLMP 4.2.2.1.2.
     #[rustfmt::skip]
@@ -3712,10 +2943,6 @@ mod tests {
         // `lib/curl_ntlm_core.c:512-513` returns CURLE_OUT_OF_MEMORY for a
         // length check. The code a caller observes is frozen, so the
         // surprising choice is asserted rather than tidied.
-        //
-        // One buffer serves all three cases -- two rejections and the
-        // acceptance one byte below -- because the C's test is on the length
-        // and a sub-slice has the length it needs.
         let nt_hash = mk_nt_hash(b"Password").expect("a short password");
         let huge = vec![b'x'; CURL_MAX_INPUT_LENGTH + 1];
 
@@ -3781,9 +3008,7 @@ mod tests {
         assert_ne!(response, swapped);
     }
 
-    // -----------------------------------------------------------------------
     // The FILETIME conversion and the NTLMv2 blob.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_filetime_of_the_unix_epoch_is_the_forced_timestamp() {
@@ -3916,9 +3141,7 @@ mod tests {
         assert_ne!(moved, forced);
     }
 
-    // -----------------------------------------------------------------------
     // The type-1 message.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_type1_message_is_the_thirty_two_bytes_the_fixtures_expect() {
@@ -3989,9 +3212,7 @@ mod tests {
         assert_eq!(ntlm.nonce(), &FIXTURE_CHALLENGE, "the challenge survives");
     }
 
-    // -----------------------------------------------------------------------
     // The type-2 message.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_fixture_type2_message_decodes_to_its_flags_and_challenge() {
@@ -4293,9 +3514,7 @@ mod tests {
         assert_eq!(ntlm.target_info(), &[0xEEu8; 12]);
     }
 
-    // -----------------------------------------------------------------------
     // The username and domain split.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_user_splits_on_a_backslash_before_a_slash() {
@@ -4324,10 +3543,8 @@ mod tests {
         assert_eq!(split_user(b"dom\\"), (&b"dom"[..], &b""[..]));
     }
 
-    // -----------------------------------------------------------------------
     // The type-3 message. The fixture comparison is the single most valuable
     // assertion in this file.
-    // -----------------------------------------------------------------------
 
     /// Composes the type-3 message `tests/data/test1008` expects, from that
     /// fixture's own type-2 message and credentials.
@@ -4762,9 +3979,7 @@ mod tests {
         assert_ne!(failing.flags(), NtlmFlags::NONE);
     }
 
-    // -----------------------------------------------------------------------
     // The state machine and the HTTP glue.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_five_states_are_in_the_c_declaration_order() {
@@ -5239,9 +4454,7 @@ mod tests {
         assert_eq!(header_prefix(false), "");
     }
 
-    // -----------------------------------------------------------------------
     // The mechanism adapter.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_mechanism_drives_the_exchange_through_the_trait() {
@@ -5337,20 +4550,12 @@ mod tests {
         assert!(log.contains(HANDSHAKE_REJECTED), "{log}");
     }
 
-    // -----------------------------------------------------------------------
     // Credentials must not reach any output this module controls.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn no_credential_or_hash_appears_in_trace_output() {
         // A full exchange with tracing at its most verbose, then a search of
         // everything the sink received for the password and for both hashes.
-        //
-        // This does NOT assert that curl redacts an `Authorization:` header --
-        // it does not, and 168 fixtures compare that line byte for byte. It
-        // asserts the narrower and binding property: no secret gains a path to
-        // output that curl does not already have, and this module adds no
-        // logging of its own.
         let password: &[u8] = b"correct horse battery staple";
         let type2 = fixture(FIXTURE_TYPE2_B64);
         let encoded = base64::encode(&type2).expect("encodes");
@@ -5502,9 +4707,7 @@ mod tests {
         assert!(rendered.contains("NEGOTIATE_OEM"), "{rendered}");
     }
 
-    // -----------------------------------------------------------------------
     // Cross-module invariants.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn ntlm_is_supported_unconditionally_and_its_state_is_per_connection() {

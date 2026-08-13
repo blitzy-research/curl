@@ -55,11 +55,15 @@ inventory and the status of each gate:
   `curl-rs/src/output/msgs.rs` routes the warning so that no verbosity gate can
   suppress it, and asserts as much across every combination of the silent and
   show-error gates, for `--insecure`, `--proxy-insecure` and `--doh-insecure`
-  alike. What is missing is the parser that would reach it: `curl-rs/src/cli/args.rs`
-  is on disk and supplies the `ParameterError` vocabulary, while the clap-derived
-  parser itself is not built and `main.rs` does not call into it, so every
-  invocation exits reporting that no command-line option can be honoured. The
-  end-to-end behavior therefore remains target state while the emitter is real.
+  alike. The option parser is delivered too: `curl-rs/src/cli/args.rs` carries
+  the frozen inventory, the `clap` 4.x derive built from it, the per-option
+  parsing rules and the `ParameterError` vocabulary. What is missing is the
+  production path between them -- `main.rs` does not call the parser, and the
+  configuration and operation layers that would carry a parsed option into a
+  transfer are not on disk -- so every invocation exits reporting that no
+  command-line option can be honoured. Two implemented pieces with nothing
+  joining them is the accurate reading; the end-to-end behavior remains target
+  state.
 - every fixture eligible under the honestly advertised feature and protocol
   set passes unmodified.
 
@@ -73,14 +77,21 @@ while over-reporting makes it run and fail.
 - 1,476 of them contain a byte-exact `<protocol>` expectation, compared as
   full request strings, so header order matters.
 - Approximately 1,413 fixtures, or 73.8% of the corpus, target the nine
-  implemented schemes, distributed as HTTP 1029, FTP 257, SFTP 40, HTTPS 38,
-  FILE 27, SCP 13 and FTPS 9.
+  schemes the finished engine is specified to serve, distributed as HTTP 1029,
+  FTP 257, SFTP 40, HTTPS 38, FILE 27, SCP 13 and FTPS 9.
 - Approximately 283 fixtures, or 14.8% of the corpus, target protocols
   outside the implementation scope and skip legitimately, because those
   protocols are not advertised: SMTP 91, IMAP 73, POP3 54, MQTT 22, TFTP 18,
   RTSP 10, GOPHER 6, TELNET 4, SMB 2, DICT 2 and LDAP 1.
 - Withholding the `Debug` token makes a further 98 fixtures skip, and
   disables torture mode.
+
+Read that 73.8% as the size of the eventual eligible population and not as a
+present score. Those nine schemes are the specified target; the transfer engines
+behind them are incomplete, the advertised protocol list is empty in
+consequence, and the binary refuses `--version`, which is the one output the
+harness parses to decide eligibility. The eligible set is therefore empty today
+and no fixture has been run.
 
 The criterion, stated exactly: every fixture eligible under the honestly
 advertised feature and protocol set passes unmodified. That result must never
@@ -244,17 +255,30 @@ this section.
   failure. Seven of the 129 do not compile against the committed headers either,
   for reasons belonging to the corpus rather than to this workspace, and the
   differential subtracts them without a hand-maintained skip list.
-  **Red today, for two independent reasons:** none of the 100 symbols is
-  exported yet, and the generated header is missing whole families of type
-  declarations, so it breaks C programs that the committed header builds.
+  **Red today, for two independent reasons:** 59 of the 100 symbols are
+  exported and 41 are not, `curl_easy_perform` among them, so the symmetric
+  comparison fails on the missing side; and header generation is withheld while
+  that surface is short, which leaves the committed headers in place as the ABI
+  contract. `nm -D --defined-only` on the built library is the way to recount
+  rather than trusting this number, and the build script names what is still
+  missing on every build. The 41 are the whole of three unwritten families --
+  `curl_multi_*` (21), `curl_share_*` (3) and `curl_ws_*` (4) -- together with
+  13 `curl_easy_*` names. The six symbols that `global_asm!` defines are no
+  longer among them: they reached the static archive and not the shared library
+  until the build script began promoting their labels into the cdylib's export
+  table, so the two artifacts now agree on ELF.
 - `rust-coverage.yml` (gate 8) runs `cargo llvm-cov` and requires at least 80%
   line coverage on `curl-rs-lib/src/protocols/` and `curl-rs-lib/src/transfer/`.
   That figure is the minimum the gate demands of those two module trees, never a
   result claimed for the code. The per-tree arithmetic is computed explicitly
   rather than delegated to a whole-workspace threshold, because a workspace total
   can sit comfortably above 80% while either mandated tree contributes nothing at
-  all. **Red today:** neither module tree exists yet, and the gate says so rather
-  than scoring an empty set.
+  all. **Red today:** both module trees now exist but neither is complete --
+  `protocols/` carries the scheme registry and the FTP directory-listing parser,
+  and `transfer/` carries the request state, the send and write plumbing, the
+  client writer, progress accounting and rate limiting -- so the gate scores a
+  partial tree rather than an absent one, and the threshold is not the thing to
+  read while modules are still arriving.
 - `rust-audit.yml` (gate 9) scans dependency advisories and requires no critical
   findings, alongside a policy check over dependency licensing and duplicate
   versions. Its accepted-advisory list is symmetric and self-expiring: an

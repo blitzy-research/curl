@@ -24,7 +24,7 @@
 
 // THREE CONVENTIONS OF THIS DIRECTORY, APPLIED HERE, AND ONE DEPARTURE.
 //
-// 1. The 23-line banner above is the one measured at `lib/llist.c:1-23`,
+// 1. The banner above is the one measured at `lib/llist.c:1-23`,
 //    rendered as Rust line comments with the C block-comment decorations
 //    stripped. It is byte-identical to `super`'s and to every other child of
 //    this directory except `inet.rs`, whose C originals carry a different
@@ -32,16 +32,14 @@
 //    the only place in this file where that spelling appears, which is what
 //    `reuse lint` needs.
 //
-// 2. `dead_code` allowances are written at the ITEM, never on the module
-//    declaration and never at a file root. The gate that enforces it lives in
-//    `curl-rs-lib/src/lib.rs` (`mod source_policy`), and the reason is in
-//    `super`: an attribute on a module root would silence the NEXT item
-//    somebody adds. Every item in this file carries its own allowance today
-//    because this module has no consumer yet -- the parsers that sit on top of
-//    it (header, cookie, alt-svc, HSTS, netrc, the URL API, the FTP list
-//    parser, `parsedate`, `range` and `inet`) are later code. Each allowance
-//    is removed when its consumer lands, and until then it reads as an
-//    inventory rather than as a blanket.
+// 2. The gate that enforces it lives in `curl-rs-lib/src/lib.rs` (`mod
+//    source_policy`), and the reason is in `super`: an attribute on a module
+//    root would silence the NEXT item somebody adds. The parsers that sit on
+//    top of this one -- header, cookie, alt-svc, HSTS, netrc, the URL API, the
+//    FTP list parser, `parsedate`, `range` and `inet` -- reach these
+//    primitives at different depths, so an item no caller has reached yet
+//    carries its own allowance and it reads as an inventory rather than as a
+//    blanket.
 //
 // 3. No level for the `unsafe_code` lint is set here, at any level. The crate
 //    root carries `#![deny(unsafe_code)]` and grants exactly one exemption,
@@ -62,9 +60,9 @@
 // no observable behaviour would still make this file the odd one out, and
 // `const fn` already gives call sites everything the hint was meant to buy.
 
-//! The cursor-based bounded parser -- supersedes `lib/curlx/strparse.c`
-//! (304 lines) and `lib/curlx/strparse.h` (113), and additionally owns the
-//! ASCII-only byte classification of `lib/curl_ctype.h` (52).
+//! The cursor-based bounded parser -- supersedes `lib/curlx/strparse.c` and
+//! `lib/curlx/strparse.h`, and additionally owns the ASCII-only byte
+//! classification of `lib/curl_ctype.h`.
 //!
 //! Three C translation units rather than the usual one, and the third is the
 //! reason to read this paragraph. `lib/curl_ctype.h` has no row of its own in
@@ -99,70 +97,6 @@
 //!   algorithms, chosen by `max < base`, and they disagree at the boundaries.
 //!   Both ship.
 //!
-//! # The C surface, function by function
-//!
-//! Every one of the 20 entry points that `lib/curlx/strparse.h` declares is
-//! accounted for. Four are subsumed rather than reproduced, and the reason is
-//! given beside each.
-//!
-//! | C entry point | Measured at | Rust counterpart |
-//! |---|---|---|
-//! | `curlx_str_init` | `strparse.c:26-30` | subsumed: an empty span is `&[]` |
-//! | `curlx_str_assign` | `:32-36` | subsumed: assignment is a binding |
-//! | `curlx_str` | `strparse.h:48` | subsumed: the span itself |
-//! | `curlx_strlen` | `strparse.h:49` | subsumed: `span.len()` |
-//! | `curlx_str_until` | `:40-60` | [`str_until`] |
-//! | `curlx_str_word` | `:64-67` | [`str_word`] |
-//! | `curlx_str_untilnl` | `:71-90` | [`str_untilnl`] |
-//! | `curlx_str_quotedword` | `:94-121` | [`str_quotedword`] |
-//! | `curlx_str_single` | `:125-132` | [`str_single`] |
-//! | `curlx_str_singlespace` | `:136-139` | [`str_singlespace`] |
-//! | `curlx_str_number` | `:195-198` | [`str_number`] |
-//! | `curlx_str_hex` | `:202-205` | [`str_hex`] |
-//! | `curlx_str_octal` | `:209-212` | [`str_octal`] |
-//! | `curlx_str_numblanks` | `:218-222` | [`str_numblanks`] |
-//! | `curlx_str_newline` | `:226-234` | [`str_newline`] |
-//! | `curlx_str_casecompare` | `:239-243` | [`str_casecompare`] |
-//! | `curlx_str_cmp` | `:247-254` | [`str_cmp`] |
-//! | `curlx_str_nudge` | `:258-266` | [`str_nudge`] |
-//! | `curlx_str_cspn` | `:270-286` | [`str_cspn`] |
-//! | `curlx_str_trimblanks` | `:289-297` | [`str_trimblanks`] |
-//! | `curlx_str_passblanks` | `:300-304` | [`str_passblanks`] |
-//! | `curlx_hexasciitable` | `:148-154` | [`HEXASCIITABLE`] |
-//! | `curlx_hexval` | `strparse.h:111` | [`hexval`] |
-//!
-//! # The byte classification, macro by macro
-//!
-//! All 20 macros of `lib/curl_ctype.h:27-50`, so that the correspondence can
-//! be audited without reading the bodies:
-//!
-//! | C macro | Measured at | Rust counterpart |
-//! |---|---|---|
-//! | `ISLOWHEXALHA` | `:27` | [`is_lowhexalpha`] |
-//! | `ISUPHEXALHA` | `:28` | [`is_uphexalpha`] |
-//! | `ISLOWCNTRL` | `:30` | [`is_lowcntrl`] |
-//! | `IS7F` | `:31` | [`is_7f`] |
-//! | `ISLOWPRINT` | `:33` | [`is_lowprint`] |
-//! | `ISPRINT` | `:35` | [`is_print`] |
-//! | `ISGRAPH` | `:36` | [`is_graph`] |
-//! | `ISCNTRL` | `:37` | [`is_cntrl`] |
-//! | `ISALPHA` | `:38` | [`is_alpha`] |
-//! | `ISXDIGIT` | `:39` | [`is_xdigit`] |
-//! | `ISODIGIT` | `:40` | [`is_odigit`] |
-//! | `ISALNUM` | `:41` | [`is_alnum`] |
-//! | `ISUPPER` | `:42` | [`is_upper`] |
-//! | `ISLOWER` | `:43` | [`is_lower`] |
-//! | `ISDIGIT` | `:44` | [`is_digit`] |
-//! | `ISBLANK` | `:45` | [`is_blank`] |
-//! | `ISSPACE` | `:46` | [`is_space`] |
-//! | `ISURLPUNTCS` | `:47-48` | [`is_urlpunct`] |
-//! | `ISUNRESERVED` | `:49` | [`is_unreserved`] |
-//! | `ISNEWLINE` | `:50` | [`is_newline`] |
-//!
-//! The upstream name of the eighteenth is spelled `ISURLPUNTCS`, with the
-//! `C` and the `T` transposed. The Rust name fixes the spelling and this note
-//! records the original so that a reader can still grep the C tree for it.
-//!
 //! # The cursor and the span
 //!
 //! The C API is a pointer-to-pointer cursor plus an out-parameter span:
@@ -183,14 +117,6 @@
 //! let first = str_until(&mut cursor, 32, b',')?;   // b"gzip"
 //! str_single(&mut cursor, b',')?;                  // consume the comma
 //! ```
-//!
-//! Two consequences of that shape are improvements rather than translations,
-//! and both are stated because they are the point of the migration. The C
-//! header says of its span type, "public struct, but all accesses should be
-//! done using the provided functions" -- a convention. A caller here receives
-//! a `&[u8]` and has no invariant to break, so the convention becomes a
-//! property. The second is that the C's `(pointer, length)` pair, which can
-//! disagree, becomes one slice that cannot.
 //!
 //! # Bytes, not text
 //!
@@ -232,77 +158,12 @@
 //! This module names exactly one sibling, [`crate::util::strcase`], and needs
 //! nothing else: `util` is the base of the crate's module graph and depends on
 //! nothing above it.
-//!
-//! # Why every link target below is spelled absolutely
-//!
-//! `util/mod.rs` documents this module with an outer doc comment on its `mod`
-//! declaration, and rustdoc concatenates that with the inner doc comment
-//! above. The measured consequence is that intra-doc links in the merged text
-//! resolve in `util`'s scope rather than this module's, so a target written as
-//! a bare item name is reported unresolved. Each reference definition below
-//! therefore carries a full path, which resolves under either scope and leaves
-//! the tables above at their readable short spellings. The order is the order
-//! of the file: the parser surface, then the error type and the text helper,
-//! then the byte classification.
-//!
-//! One target is deliberately absent. `str_num_base` is private, and a link
-//! from a module's own documentation to a private item does not resolve either,
-//! so the prose above names it in plain code spelling instead.
-//!
-//! [`str_until`]: crate::util::strparse::str_until
-//! [`str_word`]: crate::util::strparse::str_word
-//! [`str_untilnl`]: crate::util::strparse::str_untilnl
-//! [`str_quotedword`]: crate::util::strparse::str_quotedword
-//! [`str_cspn`]: crate::util::strparse::str_cspn
-//! [`str_single`]: crate::util::strparse::str_single
-//! [`str_singlespace`]: crate::util::strparse::str_singlespace
-//! [`str_newline`]: crate::util::strparse::str_newline
-//! [`str_passblanks`]: crate::util::strparse::str_passblanks
-//! [`str_trimblanks`]: crate::util::strparse::str_trimblanks
-//! [`str_nudge`]: crate::util::strparse::str_nudge
-//! [`HEXASCIITABLE`]: crate::util::strparse::HEXASCIITABLE
-//! [`hexval`]: crate::util::strparse::hexval
-//! [`str_number`]: crate::util::strparse::str_number
-//! [`str_hex`]: crate::util::strparse::str_hex
-//! [`str_octal`]: crate::util::strparse::str_octal
-//! [`str_numblanks`]: crate::util::strparse::str_numblanks
-//! [`str_casecompare`]: crate::util::strparse::str_casecompare
-//! [`str_cmp`]: crate::util::strparse::str_cmp
-//! [`StrError`]: crate::util::strparse::StrError
-//! [`as_str`]: crate::util::strparse::as_str
-//! [`is_lowhexalpha`]: crate::util::strparse::is_lowhexalpha
-//! [`is_uphexalpha`]: crate::util::strparse::is_uphexalpha
-//! [`is_lowcntrl`]: crate::util::strparse::is_lowcntrl
-//! [`is_7f`]: crate::util::strparse::is_7f
-//! [`is_lowprint`]: crate::util::strparse::is_lowprint
-//! [`is_print`]: crate::util::strparse::is_print
-//! [`is_graph`]: crate::util::strparse::is_graph
-//! [`is_cntrl`]: crate::util::strparse::is_cntrl
-//! [`is_alpha`]: crate::util::strparse::is_alpha
-//! [`is_xdigit`]: crate::util::strparse::is_xdigit
-//! [`is_odigit`]: crate::util::strparse::is_odigit
-//! [`is_alnum`]: crate::util::strparse::is_alnum
-//! [`is_upper`]: crate::util::strparse::is_upper
-//! [`is_lower`]: crate::util::strparse::is_lower
-//! [`is_digit`]: crate::util::strparse::is_digit
-//! [`is_blank`]: crate::util::strparse::is_blank
-//! [`is_space`]: crate::util::strparse::is_space
-//! [`is_urlpunct`]: crate::util::strparse::is_urlpunct
-//! [`is_unreserved`]: crate::util::strparse::is_unreserved
-//! [`is_newline`]: crate::util::strparse::is_newline
 
 use crate::util::strcase;
 
-// ---------------------------------------------------------------------------
 // The error vocabulary. `lib/curlx/strparse.h:28-36`.
-// ---------------------------------------------------------------------------
 
 /// Why a parse failed.
-///
-/// The eight non-success codes of `lib/curlx/strparse.h:29-36`, one variant
-/// each. `STRE_OK` (`:28`) is deliberately absent: success is `Ok`, and a
-/// success variant inside the error type would let a caller write a match arm
-/// that cannot be reached.
 ///
 /// | C code | Value | Variant |
 /// |---|---|---|
@@ -325,13 +186,6 @@ use crate::util::strcase;
 /// layer, which is also where the mapping belongs -- the same
 /// [`StrError::Overflow`] becomes `CURLE_BAD_FUNCTION_ARGUMENT` from one call
 /// site and a silently-clamped value at another.
-///
-/// [`crate::error::CURLcode`] is the opposite case in every respect: its 103
-/// discriminants are written out explicitly because a C program compiled
-/// against curl 8.19.0-DEV holds their numeric values in its instruction
-/// stream. Merging the two enumerations to save a type would attach that
-/// obligation to codes that do not carry it, and would put a pinned public
-/// enumeration one careless reordering away from breaking every consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StrError {
     /// `STRE_BIG` -- the span reached `max + 1` bytes.
@@ -358,29 +212,9 @@ pub(crate) enum StrError {
     NoNum,
 }
 
-// ---------------------------------------------------------------------------
 // Reading past the end. The one rule the whole file rests on.
-// ---------------------------------------------------------------------------
 
 /// The byte at `index`, or the terminator the C would have read there.
-///
-/// Every loop in `lib/curlx/strparse.c` is written against a terminated
-/// string and reads the terminator itself: `:48` tests `*s` as its loop
-/// condition, `:106` reads `s[1]` one byte ahead of the cursor, and `:169`
-/// dereferences `*p` before any bound is known. A slice has no terminator, so
-/// every such read goes through this helper and index `len()` yields the zero
-/// the C would have found.
-///
-/// That is what makes the zero byte an implicit terminator throughout this
-/// module, and the choice is deliberate rather than incidental: a caller whose
-/// buffer holds an embedded zero must get the same span curl gives it. The
-/// sibling `strcase.rs:207-216` resolves the same problem the same way for the
-/// same reason, and the two helpers are independent because neither module may
-/// widen its surface for the other.
-///
-/// `slice::get` is not a `const fn` under this crate's minimum supported Rust
-/// version, so the bound is tested directly. Both arms are total: the index
-/// is only reached when it is known to be inside the slice.
 #[must_use]
 const fn byte_at(bytes: &[u8], index: usize) -> u8 {
     if index < bytes.len() {
@@ -399,53 +233,17 @@ const fn byte_at(bytes: &[u8], index: usize) -> u8 {
 /// the refusal, instead of the parser imposing a text requirement on every
 /// caller. Returning [`None`] rather than replacing malformed sequences is
 /// what keeps that decision at the call site.
-#[allow(dead_code)] // No consumer yet; trace and message output will call it.
+#[allow(dead_code)] // Callers: trace and message output.
 #[must_use]
 pub(crate) fn as_str(span: &[u8]) -> Option<&str> {
     core::str::from_utf8(span).ok()
 }
 
-// ---------------------------------------------------------------------------
 // The byte classification -- `lib/curl_ctype.h:27-50`, range by range.
-//
-// Every predicate is a `const fn` taking a `u8`, and the shape of each body is
-// the C macro's own: two comparisons joined by `&&`, or a disjunction of
-// predicates already defined. Three notes on that choice, because each rules
-// out an alternative that looks better in isolation.
-//
-// FIRST, why not the standard library. `u8::is_ascii_hexdigit`,
-// `is_ascii_alphanumeric` and their siblings agree with several of these
-// macros and disagree with others, and the disagreements are silent.
-// `u8::is_ascii_whitespace` admits form feed, which `ISBLANK` refuses and
-// `ISSPACE` reaches by a different route; `char::is_alphanumeric` and
-// `char::is_whitespace` are Unicode-aware, so they answer a different question
-// entirely. The classification decides which byte ends a header value, and
-// that decision is visible in the request bytes the fixture corpus compares,
-// so it is transcribed rather than delegated.
-//
-// SECOND, why not `(LO..=HI).contains(&b)`. `RangeInclusive::contains` is not
-// a `const fn`, so it would cost the `const` qualifier that lets these appear
-// in a constant initialiser. The direct comparison is also the literal
-// transcription: `ISDIGIT(x)` is `((x) >= '0') && ((x) <= '9')`, character for
-// character. Measured on the pinned toolchain: `clippy::manual_range_contains`
-// does not fire inside a `const fn`, precisely because the replacement it
-// would suggest is not available there, so the faithful form is also the
-// lint-clean one and no allowance is needed.
-//
-// THIRD, why `u8` is equivalent to the C's `char`. The C macros are handed a
-// plain `char`, which is signed on every platform in the four-target matrix,
-// so a byte of 0x80 or above arrives as a negative value and fails the lower
-// bound of every range. A `u8` of 0x80 passes the lower bound instead and
-// fails the upper one. The answer is the same either way, for all 256 values,
-// because every macro bounds its range on both sides -- and the one macro
-// whose lower bound is open, `ISLOWCNTRL`, casts to `unsigned char` first
-// (`:30`). The equivalence is asserted for all 256 bytes by
-// `tests::the_predicates_agree_with_curl_ctype_h_for_every_byte`.
-// ---------------------------------------------------------------------------
 
 /// `ISLOWHEXALHA` -- `lib/curl_ctype.h:27`. The lower-case hexadecimal
 /// letters, `a` through `f`.
-#[allow(dead_code)] // No consumer yet; `is_xdigit` covers the joint case.
+#[allow(dead_code)] // `is_xdigit` covers the joint case.
 #[must_use]
 pub(crate) const fn is_lowhexalpha(byte: u8) -> bool {
     byte >= b'a' && byte <= b'f'
@@ -453,7 +251,7 @@ pub(crate) const fn is_lowhexalpha(byte: u8) -> bool {
 
 /// `ISUPHEXALHA` -- `lib/curl_ctype.h:28`. The upper-case hexadecimal
 /// letters, `A` through `F`.
-#[allow(dead_code)] // No consumer yet; `is_xdigit` covers the joint case.
+#[allow(dead_code)] // `is_xdigit` covers the joint case.
 #[must_use]
 pub(crate) const fn is_uphexalpha(byte: u8) -> bool {
     byte >= b'A' && byte <= b'F'
@@ -461,19 +259,14 @@ pub(crate) const fn is_uphexalpha(byte: u8) -> bool {
 
 /// `ISLOWCNTRL` -- `lib/curl_ctype.h:30`. Everything up to and including
 /// 0x1f.
-///
-/// The only macro in the header whose C form casts to `unsigned char` before
-/// comparing, which it must: with a signed `char` the test would otherwise
-/// admit every byte from 0x80 upward. Taking a `u8` makes the cast
-/// unnecessary rather than merely correct.
-#[allow(dead_code)] // No consumer yet; `is_cntrl` composes it.
+#[allow(dead_code)] // Composed into `is_cntrl`.
 #[must_use]
 pub(crate) const fn is_lowcntrl(byte: u8) -> bool {
     byte <= 0x1f
 }
 
 /// `IS7F` -- `lib/curl_ctype.h:31`. The delete byte, and nothing else.
-#[allow(dead_code)] // No consumer yet; `is_cntrl` composes it.
+#[allow(dead_code)] // Composed into `is_cntrl`.
 #[must_use]
 pub(crate) const fn is_7f(byte: u8) -> bool {
     byte == 0x7f
@@ -485,7 +278,7 @@ pub(crate) const fn is_7f(byte: u8) -> bool {
 /// Named for the role it plays rather than for what it contains: both
 /// [`is_print`] and [`is_graph`] admit this range, which is why neither of
 /// them is the `isprint(3)` of the C library.
-#[allow(dead_code)] // No consumer yet; `is_print` and `is_graph` compose it.
+#[allow(dead_code)] // Composed into `is_print` and `is_graph`.
 #[must_use]
 pub(crate) const fn is_lowprint(byte: u8) -> bool {
     byte >= 9 && byte <= 0x0d
@@ -496,7 +289,7 @@ pub(crate) const fn is_lowprint(byte: u8) -> bool {
 ///
 /// 0x7e is `~`, the last graphic byte of ASCII; the C spells it in hex and
 /// this follows, so the two read alike.
-#[allow(dead_code)] // No consumer yet; trace formatting will call it.
+#[allow(dead_code)] // Callers: trace formatting.
 #[must_use]
 pub(crate) const fn is_print(byte: u8) -> bool {
     is_lowprint(byte) || (byte >= b' ' && byte <= 0x7e)
@@ -508,7 +301,7 @@ pub(crate) const fn is_print(byte: u8) -> bool {
 /// Differs from [`is_print`] by the space alone. The C bound is strictly
 /// greater than a space, which is transcribed as written rather than turned
 /// into `>= 0x21` so that the two files diff line for line.
-#[allow(dead_code)] // No consumer yet; trace formatting will call it.
+#[allow(dead_code)] // Callers: trace formatting.
 #[must_use]
 pub(crate) const fn is_graph(byte: u8) -> bool {
     is_lowprint(byte) || (byte > b' ' && byte <= 0x7e)
@@ -520,14 +313,14 @@ pub(crate) const fn is_graph(byte: u8) -> bool {
 /// feed and carriage return satisfy both this and [`is_print`]. That is
 /// curl's definition rather than an oversight, and it is why header parsing
 /// cannot use this predicate alone to decide what to reject.
-#[allow(dead_code)] // No consumer yet; header value validation will call it.
+#[allow(dead_code)] // Callers: header value validation.
 #[must_use]
 pub(crate) const fn is_cntrl(byte: u8) -> bool {
     is_lowcntrl(byte) || is_7f(byte)
 }
 
 /// `ISALPHA` -- `lib/curl_ctype.h:38`, defined as `ISLOWER || ISUPPER`.
-#[allow(dead_code)] // No consumer yet; scheme parsing will call it.
+#[allow(dead_code)] // Callers: scheme parsing.
 #[must_use]
 pub(crate) const fn is_alpha(byte: u8) -> bool {
     is_lower(byte) || is_upper(byte)
@@ -535,20 +328,14 @@ pub(crate) const fn is_alpha(byte: u8) -> bool {
 
 /// `ISXDIGIT` -- `lib/curl_ctype.h:39`, defined as
 /// `ISDIGIT || ISLOWHEXALHA || ISUPHEXALHA`.
-///
-/// The validator the C header demands before [`hexval`] may be used, and the
-/// two agree exactly: `hexval` returns a value for precisely the bytes this
-/// admits, which
-/// `tests::hexval_answers_for_exactly_the_bytes_is_xdigit_admits` proves for
-/// all 256 values rather than asserting.
-#[allow(dead_code)] // No consumer yet; `inet` and chunk parsing will call it.
+#[allow(dead_code)] // Callers: `inet` and chunk parsing.
 #[must_use]
 pub(crate) const fn is_xdigit(byte: u8) -> bool {
     is_digit(byte) || is_lowhexalpha(byte) || is_uphexalpha(byte)
 }
 
 /// `ISODIGIT` -- `lib/curl_ctype.h:40`. The octal digits, `0` through `7`.
-#[allow(dead_code)] // No consumer yet; file mode parsing will call it.
+#[allow(dead_code)] // Callers: file mode parsing.
 #[must_use]
 pub(crate) const fn is_odigit(byte: u8) -> bool {
     byte >= b'0' && byte <= b'7'
@@ -560,28 +347,28 @@ pub(crate) const fn is_odigit(byte: u8) -> bool {
 /// Spelled as three predicates rather than as [`is_digit`] with
 /// [`is_alpha`], because that is how the C spells it. The two are the same
 /// set.
-#[allow(dead_code)] // No consumer yet; `is_unreserved` composes it.
+#[allow(dead_code)] // Composed into `is_unreserved`.
 #[must_use]
 pub(crate) const fn is_alnum(byte: u8) -> bool {
     is_digit(byte) || is_lower(byte) || is_upper(byte)
 }
 
 /// `ISUPPER` -- `lib/curl_ctype.h:42`. `A` through `Z`.
-#[allow(dead_code)] // No consumer yet; several composites use it.
+#[allow(dead_code)] // Used by several composites.
 #[must_use]
 pub(crate) const fn is_upper(byte: u8) -> bool {
     byte >= b'A' && byte <= b'Z'
 }
 
 /// `ISLOWER` -- `lib/curl_ctype.h:43`. `a` through `z`.
-#[allow(dead_code)] // No consumer yet; several composites use it.
+#[allow(dead_code)] // Used by several composites.
 #[must_use]
 pub(crate) const fn is_lower(byte: u8) -> bool {
     byte >= b'a' && byte <= b'z'
 }
 
 /// `ISDIGIT` -- `lib/curl_ctype.h:44`. `0` through `9`.
-#[allow(dead_code)] // No consumer yet; date and range parsing will call it.
+#[allow(dead_code)] // Callers: date and range parsing.
 #[must_use]
 pub(crate) const fn is_digit(byte: u8) -> bool {
     byte >= b'0' && byte <= b'9'
@@ -606,7 +393,7 @@ pub(crate) const fn is_blank(byte: u8) -> bool {
 /// return inclusive, so vertical tab (0x0b) and form feed (0x0c) are BOTH
 /// members. Only the space of 0x20 and the tab of 0x09 come from the first
 /// half.
-#[allow(dead_code)] // No consumer yet; header folding will call it.
+#[allow(dead_code)] // Callers: header folding.
 #[must_use]
 pub(crate) const fn is_space(byte: u8) -> bool {
     is_blank(byte) || (byte >= 0x0a && byte <= 0x0d)
@@ -617,7 +404,7 @@ pub(crate) const fn is_space(byte: u8) -> bool {
 /// Supersedes `ISURLPUNTCS` (`lib/curl_ctype.h:47-48`). The upstream name
 /// transposes the `C` and the `T` of "punctuation"; the spelling is corrected
 /// here and the original recorded so the C tree remains greppable.
-#[allow(dead_code)] // No consumer yet; `is_unreserved` composes it.
+#[allow(dead_code)] // Composed into `is_unreserved`.
 #[must_use]
 pub(crate) const fn is_urlpunct(byte: u8) -> bool {
     byte == b'-' || byte == b'.' || byte == b'_' || byte == b'~'
@@ -625,7 +412,7 @@ pub(crate) const fn is_urlpunct(byte: u8) -> bool {
 
 /// `ISUNRESERVED` -- `lib/curl_ctype.h:49`, defined as
 /// `ISALNUM || ISURLPUNTCS`. The bytes a URL may carry unescaped.
-#[allow(dead_code)] // No consumer yet; the URL API will call it.
+#[allow(dead_code)] // Callers: the URL API.
 #[must_use]
 pub(crate) const fn is_unreserved(byte: u8) -> bool {
     is_alnum(byte) || is_urlpunct(byte)
@@ -642,7 +429,6 @@ pub(crate) const fn is_newline(byte: u8) -> bool {
     byte == b'\n' || byte == b'\r'
 }
 
-// ---------------------------------------------------------------------------
 // The span extractors -- `lib/curlx/strparse.c:39-135` and `:268-286`.
 //
 // All five share one contract, stated once here so that each item can record
@@ -661,7 +447,6 @@ pub(crate) const fn is_newline(byte: u8) -> bool {
 //   * A zero byte terminates the span exactly as the delimiter does. See
 //     `byte_at` above for why, and note that this makes the extractors total:
 //     no input can make one of them read out of bounds or fail to terminate.
-// ---------------------------------------------------------------------------
 
 /// Takes the bytes up to the first `delim`, the first zero, or the end.
 ///
@@ -691,15 +476,6 @@ pub(crate) const fn is_newline(byte: u8) -> bool {
 /// to be exactly at the limit, and a truncated header value is a wire
 /// difference rather than a local one.
 ///
-/// # The delimiter is left in place
-///
-/// On success the cursor points AT the delimiter, not past it. That split is
-/// load-bearing rather than incidental: it is what lets a caller distinguish
-/// "the span ended because the delimiter arrived" from "the span ended because
-/// the input did", by asking [`str_single`] for the delimiter and reading its
-/// answer. `curl-rs-lib/src/trace.rs` parses a comma-separated configuration
-/// exactly that way, calling this with a `max` of 32 and a delimiter of `,`.
-///
 /// # Errors
 ///
 /// [`StrError::Big`] when more than `max` bytes precede the delimiter, and
@@ -715,7 +491,7 @@ pub(crate) const fn is_newline(byte: u8) -> bool {
 /// reference cannot be null. Both are caller contract violations rather than
 /// input errors, which is why they are debug assertions here as they are
 /// there, and neither can be reached from untrusted bytes.
-#[allow(dead_code)] // No consumer yet; trace and header parsing will call it.
+#[allow(dead_code)] // Callers: trace and header parsing.
 pub(crate) fn str_until<'a>(
     cursor: &mut &'a [u8],
     max: usize,
@@ -760,14 +536,10 @@ pub(crate) fn str_until<'a>(
 /// delegation rather than a copy, so that the boundary rules of
 /// [`str_until`] cannot drift apart from this one.
 ///
-/// A space and nothing else. A tab does not end a word here, which follows
-/// from the C passing a single character rather than a predicate, and matters
-/// because several header grammars separate on space alone.
-///
 /// # Errors
 ///
 /// As [`str_until`], with a delimiter of `b' '`.
-#[allow(dead_code)] // No consumer yet; netrc and FTP parsing will call it.
+#[allow(dead_code)] // Callers: netrc and FTP parsing.
 pub(crate) fn str_word<'a>(
     cursor: &mut &'a [u8],
     max: usize,
@@ -783,22 +555,12 @@ pub(crate) fn str_word<'a>(
 /// line feed end the span, and the cursor is left on whichever arrived
 /// first.
 ///
-/// The C is a separate function rather than a call into `curlx_str_until`
-/// with a delimiter, because a predicate cannot be passed where a `char` is
-/// expected; the duplication in the C is a consequence of that, not a
-/// behavioural difference. The two bodies are otherwise line for line the
-/// same, including the post-increment bound test.
-///
-/// Note that the C's assertion at `:76` drops the delimiter clause the
-/// `curlx_str_until` assertion carries, exactly because there is no
-/// delimiter to check.
-///
 /// # Errors
 ///
 /// [`StrError::Big`] when more than `max` bytes precede the line ending, and
 /// [`StrError::Short`] when the first byte is already a line ending, a zero,
 /// or absent.
-#[allow(dead_code)] // No consumer yet; netrc and cookie reading will call it.
+#[allow(dead_code)] // Callers: netrc and cookie reading.
 pub(crate) fn str_untilnl<'a>(
     cursor: &mut &'a [u8],
     max: usize,
@@ -855,32 +617,10 @@ pub(crate) fn str_untilnl<'a>(
 ///
 /// # It does NOT unescape, and that is the point
 ///
-/// The returned span is the bytes between the quotes exactly as they appear
-/// in the input, with every backslash still present. `"a\"b"` yields the four
-/// bytes `a\"b`, not the three bytes `a"b`. The C does no unescaping and
-/// neither does this, because unescaping is the caller's decision and
-/// different callers make it differently -- a cookie attribute and an
-/// alt-svc parameter do not agree on what an escape means.
-///
 /// This is the single most likely place in the module to "improve" curl's
 /// behaviour by accident, and the improvement would be a defect: a caller
 /// handed pre-unescaped bytes re-emits different bytes than curl
 /// 8.19.0-DEV, which the fixture corpus compares literally.
-///
-/// # What an escape costs
-///
-/// A backslash followed by any non-terminator byte consumes TWO bytes and
-/// counts TWO toward `max`, so `max` bounds the raw length rather than the
-/// unescaped length. One consequence deserves a test of its own and has one:
-/// a lone backslash immediately before the closing quote swallows that quote
-/// as its escape partner, so `"a\"` is not terminated at all and yields
-/// [`StrError::EndQuote`].
-///
-/// # The cursor lands past the closing quote
-///
-/// The one extractor that consumes its terminator. `*linep = s + 1` steps
-/// over the quote because a quote, unlike a delimiter, cannot begin the next
-/// token and is of no use to the caller.
 ///
 /// # Errors
 ///
@@ -897,7 +637,7 @@ pub(crate) fn str_untilnl<'a>(
 ///
 /// Never. `debug_assert!(max > 0)` reproduces the C's `DEBUGASSERT` at `:99`
 /// and states a caller contract, not an input condition.
-#[allow(dead_code)] // No consumer yet; cookie and alt-svc parsing will call it.
+#[allow(dead_code)] // Callers: cookie and alt-svc parsing.
 pub(crate) fn str_quotedword<'a>(
     cursor: &mut &'a [u8],
     max: usize,
@@ -927,12 +667,6 @@ pub(crate) fn str_quotedword<'a>(
         }
 
         // `if(*s == '\\' && s[1]) { s++; if(++len > max) return STRE_BIG; }`
-        //
-        // The look-ahead is the C's `s[1]`, which reads one byte past the
-        // cursor and relies on the terminator being there. `byte_at` supplies
-        // the same zero at the end of the slice, so a trailing backslash is
-        // not treated as an escape -- and a backslash before the closing
-        // quote IS, because a quote is not a terminator.
         if byte == b'\\' && byte_at(input, index + 1) != 0 {
             index += 1;
             len += 1;
@@ -967,10 +701,6 @@ pub(crate) fn str_quotedword<'a>(
 
 /// Takes the longest prefix containing no byte of `reject`.
 ///
-/// Supersedes `curlx_str_cspn` (`lib/curlx/strparse.c:270-286`), whose body
-/// delegates to `strcspn(s, reject)` and then splits on whether the answer
-/// was zero. The name is the C library function's: "complement span".
-///
 /// Two differences from every other extractor, both the C's:
 ///
 /// * There is no `max`. The span is bounded only by the input, and no bound
@@ -981,15 +711,11 @@ pub(crate) fn str_quotedword<'a>(
 ///   rather than a stale one. Returning `Err` gives the caller nothing to
 ///   read, which is the same guarantee reached more directly.
 ///
-/// `reject` is a byte set rather than a string. A zero inside it can never
-/// match, because a zero in the input stops the scan first -- the same
-/// reason `strcspn` cannot be handed a set containing its own terminator.
-///
 /// # Errors
 ///
 /// [`StrError::Short`] when the first byte is rejected, is zero, or is
 /// absent.
-#[allow(dead_code)] // No consumer yet; URL and cookie parsing will call it.
+#[allow(dead_code)] // Callers: URL and cookie parsing.
 pub(crate) fn str_cspn<'a>(
     cursor: &mut &'a [u8],
     reject: &[u8],
@@ -1015,10 +741,8 @@ pub(crate) fn str_cspn<'a>(
     Ok(span)
 }
 
-// ---------------------------------------------------------------------------
 // Single bytes, blanks, and span adjustment -- `lib/curlx/strparse.c:123-139`,
 // `:224-234` and `:255-304`.
-// ---------------------------------------------------------------------------
 
 /// Consumes exactly `byte`, or fails without moving.
 ///
@@ -1030,18 +754,9 @@ pub(crate) fn str_cspn<'a>(
 /// (*linep)++;                 /* move over it */
 /// ```
 ///
-/// The counterpart to [`str_until`] leaving its delimiter in place: a caller
-/// takes a token, then steps over the separator with this and learns from the
-/// answer whether the separator was really there.
-///
 /// # An empty cursor is a refusal, not a panic
 ///
-/// The C dereferences `**linep` with no bound at all, relying on a terminator
-/// being present, so at the end of a string it compares against zero. Here the
-/// cursor may simply be empty, and the comparison is written as
-/// `first() != Some(&byte)` so that the absent byte matches nothing.
-///
-/// That leaves one input on which this deliberately differs from a literal
+/// There is one input on which this deliberately differs from a literal
 /// reading of the C, and it is recorded rather than glossed: asking for the
 /// zero byte at the end of a C string makes the C advance its pointer PAST the
 /// terminator, after which every later read is out of bounds. No call site in
@@ -1053,7 +768,7 @@ pub(crate) fn str_cspn<'a>(
 ///
 /// [`StrError::Byte`] when the next byte is something else or there is no next
 /// byte. The cursor is untouched in both cases.
-#[allow(dead_code)] // No consumer yet; every list parser will call it.
+#[allow(dead_code)] // Callers: every list parser.
 pub(crate) fn str_single(cursor: &mut &[u8], byte: u8) -> Result<(), StrError> {
     let input = *cursor;
 
@@ -1074,13 +789,10 @@ pub(crate) fn str_single(cursor: &mut &[u8], byte: u8) -> Result<(), StrError> {
 /// body is `return curlx_str_single(linep, ' ')`. A delegation here too, for
 /// the same reason as [`str_word`]: one definition of the behaviour.
 ///
-/// One space, not any run of whitespace and not a tab. [`str_passblanks`] is
-/// the function for a run.
-///
 /// # Errors
 ///
 /// As [`str_single`] with a byte of `b' '`.
-#[allow(dead_code)] // No consumer yet; header and FTP replies will call it.
+#[allow(dead_code)] // Callers: header and FTP replies.
 pub(crate) fn str_singlespace(cursor: &mut &[u8]) -> Result<(), StrError> {
     str_single(cursor, b' ')
 }
@@ -1108,7 +820,7 @@ pub(crate) fn str_singlespace(cursor: &mut &[u8]) -> Result<(), StrError> {
 /// [`StrError::Newline`] when the next byte is neither ending, or when the
 /// cursor is empty. The cursor is untouched in both cases -- an empty cursor
 /// reads as the zero `byte_at` supplies, which [`is_newline`] refuses.
-#[allow(dead_code)] // No consumer yet; netrc and cookie reading will call it.
+#[allow(dead_code)] // Callers: netrc and cookie reading.
 pub(crate) fn str_newline(cursor: &mut &[u8]) -> Result<(), StrError> {
     let input = *cursor;
 
@@ -1124,18 +836,7 @@ pub(crate) fn str_newline(cursor: &mut &[u8]) -> Result<(), StrError> {
 }
 
 /// Advances over every leading blank.
-///
-/// Supersedes `curlx_str_passblanks` (`lib/curlx/strparse.c:300-304`), whose
-/// body is `while(ISBLANK(**linep)) (*linep)++;`.
-///
-/// Blank means space or tab and nothing else ([`is_blank`]), so a line ending
-/// stops the walk. That is what keeps a line-oriented parser inside its own
-/// line, and it is the reason this is not spelled with [`is_space`].
-///
-/// Returns nothing and cannot fail: skipping no blanks at all is a valid
-/// outcome, which is also why the C returns `void`. A zero byte is not blank,
-/// so the walk stops there exactly as the C's does at its terminator.
-#[allow(dead_code)] // No consumer yet; header and cookie parsing will call it.
+#[allow(dead_code)] // Callers: header and cookie parsing.
 pub(crate) fn str_passblanks(cursor: &mut &[u8]) {
     let input = *cursor;
     let mut skip = 0usize;
@@ -1176,7 +877,7 @@ pub(crate) fn str_passblanks(cursor: &mut &[u8]) {
 /// a call site that wants the mutation -- `span = str_trimblanks(span);` --
 /// while also being usable where the input must not change. Offering both
 /// shapes would be surface with no second caller.
-#[allow(dead_code)] // No consumer yet; header value handling will call it.
+#[allow(dead_code)] // Callers: header value handling.
 #[must_use]
 pub(crate) fn str_trimblanks(span: &[u8]) -> &[u8] {
     // `while(out->len && ISBLANK(*out->str)) curlx_str_nudge(out, 1);`
@@ -1211,26 +912,18 @@ pub(crate) fn str_trimblanks(span: &[u8]) -> &[u8] {
 /// return STRE_OVERFLOW;
 /// ```
 ///
-/// `num == span.len()` is legal and yields an empty span; only `num` strictly
-/// greater than the length is an error. `slice::get` over a range expresses
-/// exactly that boundary -- it answers `Some` for `num <= len` and `None`
-/// above it -- so the condition is the standard library's rather than
-/// re-derived here, and there is no arithmetic that could underflow.
-///
 /// # Errors
 ///
 /// [`StrError::Overflow`] when `num` exceeds the length of `span`.
-#[allow(dead_code)] // No consumer yet; alt-svc and HSTS parsing will call it.
+#[allow(dead_code)] // Callers: alt-svc and HSTS parsing.
 pub(crate) fn str_nudge(span: &[u8], num: usize) -> Result<&[u8], StrError> {
     span.get(num..).ok_or(StrError::Overflow)
 }
 
-// ---------------------------------------------------------------------------
 // The hexadecimal table and the number parsers --
 // `lib/curlx/strparse.c:137-222` and `lib/curlx/strparse.h:106-111`. The most
 // detail-sensitive part of the file, and the part where a transcription slip
 // is silent.
-// ---------------------------------------------------------------------------
 
 /// The digit value of every byte from `0` through `f`, indexed by
 /// `byte - b'0'`.
@@ -1242,36 +935,7 @@ pub(crate) fn str_nudge(span: &[u8], num: usize) -> Result<&[u8], StrError> {
 /// asserted by `tests::the_table_holds_exactly_the_fifty_five_c_entries`, so a
 /// dropped or doubled entry fails the test run rather than shifting every
 /// later index by one.
-///
-/// # The first entry is 16, not 0
-///
-/// The one detail that makes this table unlike every other digit lookup, and
-/// the C explains it at `:145-147`: *"We use 16 for the zero index (and the
-/// necessary bitwise AND in the loop) to be able to have a non-zero value
-/// there to make valid_digit() able to use the info."*
-///
-/// The table therefore does double duty. A non-zero entry means "this byte is
-/// a digit", which is how the digit test is written without a second range
-/// check, and the sentinel is masked back down to its real value of zero on
-/// the way out. Transcribing the entry as 0 would compile, pass a casual read,
-/// and make the byte `0` stop being a digit -- so `007` would fail to parse
-/// and `0` would parse as nothing at all.
-///
-/// The mask is applied by [`hexval`] and by nothing else, which is why no
-/// caller ever sees the 16.
-///
-/// # Why the rows are grouped as they are
-///
-/// `#[rustfmt::skip]` is not cosmetic here. This table decides which bytes are
-/// accepted as digits, and that decision reaches the wire, so the
-/// transcription has to stay reviewable against the C side by side. One
-/// presentational change is made and is confined to presentation: the C writes
-/// its twenty-six-entry row on a single line that would exceed this crate's
-/// 80-column limit at Rust indentation, so it appears below as two rows of
-/// thirteen. The values, their order and their count are untouched, and the
-/// test named above rebuilds the whole table from the C's five original rows
-/// to prove the split changed nothing.
-#[allow(dead_code)] // No consumer yet; `inet` will pre-validate against it.
+#[allow(dead_code)] // Used by `inet` as a pre-validation.
 #[rustfmt::skip]
 pub(crate) const HEXASCIITABLE: [u8; 55] = [
     // 0x30 ..= 0x39 -- '0' through '9'. The leading 16 is the sentinel.
@@ -1289,24 +953,6 @@ pub(crate) const HEXASCIITABLE: [u8; 55] = [
 ];
 
 /// The raw table entry for `byte`, or 0 when the byte is outside the table.
-///
-/// The C indexes `curlx_hexasciitable[(x) - '0']` with no bound check of any
-/// kind, which is safe there only because both of its callers -- the digit test
-/// at `:142-143` and `curlx_hexval` at `strparse.h:111` -- are guarded by a
-/// range test the caller is trusted to have made. The header says so in
-/// capitals: *"THIS ONLY WORKS ON VALID HEXADECIMAL LETTER INPUT. Verify
-/// before calling this!"*
-///
-/// This helper makes the guard unnecessary instead of merely documented. A
-/// byte below `0` fails the subtraction and a byte above `f` falls off the end
-/// of the table, and both answer 0 -- which is already the table's own value
-/// for "not a digit", so the total function agrees with the partial one
-/// wherever the partial one was defined.
-///
-/// The widening to an index goes through `usize::from` rather than a cast. The
-/// two cannot differ for a `u8` on any target, but the conversion that cannot
-/// lose information is the one written, because a cast is how the narrowing
-/// defects this migration exists to remove are spelled.
 #[must_use]
 fn hexasciitable_entry(byte: u8) -> u8 {
     byte.checked_sub(b'0')
@@ -1316,32 +962,7 @@ fn hexasciitable_entry(byte: u8) -> u8 {
 }
 
 /// The value of a hexadecimal digit, or [`None`] when `byte` is not one.
-///
-/// Supersedes `curlx_hexval` (`lib/curlx/strparse.h:111`), which is
-/// `(unsigned char)(curlx_hexasciitable[(x) - '0'] & 0x0f)` -- the table
-/// lookup and the mask that removes the sentinel described on
-/// [`HEXASCIITABLE`].
-///
-/// # Fallible where the C is not, deliberately
-///
-/// The C macro is a partial function with its precondition stated in a comment
-/// and enforced nowhere, and its two failure modes are both silent: a byte
-/// below `0` indexes before the table, and a byte above `f` indexes past it.
-/// Returning [`Option`] moves the precondition into the type, so a caller
-/// cannot forget it, and no accessor that panics or answers wrongly is offered
-/// alongside -- an "unchecked" twin would reintroduce exactly the hazard this
-/// removes.
-///
-/// Nothing is lost for callers that do validate. `hexval` answers `Some` for
-/// precisely the bytes [`is_xdigit`] admits, so a caller that pre-validates
-/// the way the C requires can rely on the answer being present, and
-/// [`HEXASCIITABLE`] is reachable for a caller that wants the table itself.
-/// `curl-rs-lib/src/dns` consumes this pair when parsing a literal IPv6
-/// address, which is the shape `lib/curlx/inet_pton.c` uses.
-///
-/// `hexval(b'0')` is `Some(0)`, which is the mask doing its work: the raw
-/// entry there is 16.
-#[allow(dead_code)] // No consumer yet; `inet` and chunk parsing will call it.
+#[allow(dead_code)] // Callers: `inet` and chunk parsing.
 #[must_use]
 pub(crate) fn hexval(byte: u8) -> Option<u8> {
     let entry = hexasciitable_entry(byte);
@@ -1357,27 +978,9 @@ pub(crate) fn hexval(byte: u8) -> Option<u8> {
 
 /// The value of `byte` as a digit in a base whose largest digit is `largest`.
 ///
-/// Fuses the C's two steps into one lookup. `valid_digit(x, m)`
-/// (`lib/curlx/strparse.c:142-143`) is
-///
 /// ```c
 /// (((x) >= '0') && ((x) <= (m)) && curlx_hexasciitable[(x) - '0'])
 /// ```
-///
-/// and every place it succeeds is immediately followed by `curlx_hexval(*p++)`
-/// reading the same table entry again. Asking once returns both answers, and
-/// the fusion is what removes an otherwise-unreachable branch: written as two
-/// calls, the value lookup would need a "cannot happen" arm for the case the
-/// test has already excluded, and a branch no input can reach is a branch no
-/// test can cover.
-///
-/// The three clauses survive intact. The lower bound and the table truth are
-/// both inside [`hexval`], which answers [`None`] for a byte below `0` and for
-/// any in-table byte whose entry is zero; the upper bound is the one
-/// comparison written here. `largest` is `9` for base ten, `f` for base
-/// sixteen and `7` for base eight, which is what makes base eight refuse `8`
-/// and `9`, and what makes bases eight and ten refuse `A` through `F` -- the
-/// letters are above `9` in ASCII, so the bound alone rejects them.
 #[must_use]
 fn digit_value(byte: u8, largest: u8) -> Option<i64> {
     // `((x) <= (m))`
@@ -1390,11 +993,6 @@ fn digit_value(byte: u8, largest: u8) -> Option<i64> {
 }
 
 /// Parses an unsigned number in base 8, 10 or 16, bounded by `max`.
-///
-/// Supersedes `str_num_base` (`lib/curlx/strparse.c:157-191`), which is
-/// `static` in the C and private here for the same reason: the three public
-/// entry points ([`str_number`], [`str_hex`], [`str_octal`]) are the surface,
-/// and the base belongs to them rather than to their callers.
 ///
 /// # What it does not accept
 ///
@@ -1435,14 +1033,6 @@ fn digit_value(byte: u8, largest: u8) -> Option<i64> {
 /// }
 /// ```
 ///
-/// The low-`max` arm multiplies and then tests the product; the general arm
-/// tests before multiplying, because the product it is guarding against is the
-/// one that would not fit. They are not interchangeable at the boundaries --
-/// the pre-test divides by `base`, and with `max` below `base` that division
-/// floors to zero, so the general arm would reject every digit from 1 upward
-/// including ones that fit. Both arms are reproduced, and both are covered by
-/// their own test.
-///
 /// # Neither arm can overflow an `i64`
 ///
 /// Rust arithmetic is checked in debug builds and wraps in release, so "the C
@@ -1457,22 +1047,6 @@ fn digit_value(byte: u8, largest: u8) -> Option<i64> {
 ///   term non-negative, and integer division floors, so `num * base <= max -
 ///   digit` and the sum is at most `max`. `max - digit` cannot underflow
 ///   either, because this arm runs only when `max >= base > digit`.
-///
-/// A negative `max` reaches the low-`max` arm and fails the first digit with
-/// [`StrError::Overflow`], which is what the C does too. The
-/// `debug_assert!(max >= 0)` reproduces the C's assertion at `:166` and its
-/// comment, *"mostly to catch SIZE_MAX, which is too large"*: the value is a
-/// caller mistake rather than bad input, and the release behaviour is a clean
-/// refusal either way.
-///
-/// # On failure the cursor does not move, and no value is produced
-///
-/// The C writes `*nump = 0` before it looks at anything (`:167`) and assigns
-/// `*linep = p` only on the last line, so a failed parse leaves the caller's
-/// cursor untouched and its number at zero. Here the cursor is written once at
-/// the end, giving the same guarantee, and `Result` gives a stronger version of
-/// the second: there is no value to read at all. A caller that wants the C's
-/// zero writes `unwrap_or(0)` and says so.
 ///
 /// # Errors
 ///
@@ -1551,15 +1125,10 @@ fn str_num_base(
 
 /// Parses an unsigned decimal number bounded by `max`.
 ///
-/// Supersedes `curlx_str_number` (`lib/curlx/strparse.c:195-198`), whose body
-/// is `str_num_base(linep, nump, max, 10)`. The C's comment states the
-/// contract: *"Get an unsigned decimal number with no leading space or minus.
-/// Leading zeroes are accepted."*
-///
 /// # Errors
 ///
 /// As [`str_num_base`] in base ten.
-#[allow(dead_code)] // No consumer yet; nearly every later parser will call it.
+#[allow(dead_code)] // Callers: nearly every other parser in this module.
 pub(crate) fn str_number(
     cursor: &mut &[u8],
     max: i64,
@@ -1569,42 +1138,25 @@ pub(crate) fn str_number(
 
 /// Parses an unsigned hexadecimal number bounded by `max`.
 ///
-/// Supersedes `curlx_str_hex` (`lib/curlx/strparse.c:202-205`), whose body is
-/// `str_num_base(linep, nump, max, 16)`. The C's comment is explicit that
-/// there is *"no `0x` support"*, and both letter cases are accepted because
-/// [`HEXASCIITABLE`] carries both.
-///
 /// # Errors
 ///
 /// As [`str_num_base`] in base sixteen.
-#[allow(dead_code)] // No consumer yet; chunked framing will call it.
+#[allow(dead_code)] // Callers: chunked framing.
 pub(crate) fn str_hex(cursor: &mut &[u8], max: i64) -> Result<i64, StrError> {
     str_num_base(cursor, max, 16)
 }
 
 /// Parses an unsigned octal number bounded by `max`.
 ///
-/// Supersedes `curlx_str_octal` (`lib/curlx/strparse.c:209-212`), whose body
-/// is `str_num_base(linep, nump, max, 8)`. No leading `0` is required and none
-/// is consumed as a prefix, and the digits stop at `7`: an `8` or a `9` is not
-/// a digit of this base, so it ends the number, or yields
-/// [`StrError::NoNum`] when it is the first byte.
-///
 /// # Errors
 ///
 /// As [`str_num_base`] in base eight.
-#[allow(dead_code)] // No consumer yet; file mode parsing will call it.
+#[allow(dead_code)] // Callers: file mode parsing.
 pub(crate) fn str_octal(cursor: &mut &[u8], max: i64) -> Result<i64, StrError> {
     str_num_base(cursor, max, 8)
 }
 
 /// Skips leading blanks, then parses an unbounded unsigned decimal number.
-///
-/// Supersedes `curlx_str_numblanks` (`lib/curlx/strparse.c:218-222`), whose
-/// two-line body is `curlx_str_passblanks(str)` followed by
-/// `curlx_str_number(str, num, CURL_OFF_T_MAX)`. The C's comment describes it
-/// as parsing *"a positive number up to 63-bit number written in ASCII. Skip
-/// leading blanks. No support for prefixes."*
 ///
 /// The bound is [`i64::MAX`], which is `CURL_OFF_T_MAX` on every target in the
 /// four-target matrix: `lib/curl_setup.h:599` defines it as
@@ -1612,26 +1164,16 @@ pub(crate) fn str_octal(cursor: &mut &[u8], max: i64) -> Result<i64, StrError> {
 /// asserted rather than assumed, by
 /// `tests::the_unbounded_maximum_is_curl_off_t_max`.
 ///
-/// # The blanks are consumed even when the number fails
-///
-/// Worth stating because it is the one place in this module where a failure
-/// leaves the cursor moved. `str_passblanks` runs first and unconditionally,
-/// so `"   x"` advances past three spaces and then reports
-/// [`StrError::NoNum`] from the `x`. The C behaves identically, for the same
-/// structural reason, and a caller that needs to retry from the original
-/// position keeps its own copy of the cursor.
-///
 /// # Errors
 ///
 /// As [`str_number`]. Overflow is possible despite the bound being the
 /// largest representable value: a long enough run of digits exceeds it.
-#[allow(dead_code)] // No consumer yet; header and reply parsing will call it.
+#[allow(dead_code)] // Callers: header and reply parsing.
 pub(crate) fn str_numblanks(cursor: &mut &[u8]) -> Result<i64, StrError> {
     str_passblanks(cursor);
     str_number(cursor, i64::MAX)
 }
 
-// ---------------------------------------------------------------------------
 // The comparators -- `lib/curlx/strparse.c:236-254`.
 //
 // READ THIS BEFORE DIFFING EITHER FUNCTION AGAINST THE C. These two invert the
@@ -1640,12 +1182,6 @@ pub(crate) fn str_numblanks(cursor: &mut &[u8]) -> Result<i64, StrError> {
 // Their own comments say so -- "Returns non-zero on match" at `:238` and
 // `:246` -- and reading them with the other convention in mind inverts the
 // meaning of every call site.
-//
-// Returning `bool` here removes the ambiguity rather than translating it: there
-// is no "zero" to interpret, and a caller writing `if str_cmp(span, b"gzip")`
-// gets the reading the name suggests. Nothing in this module returns `bool` for
-// a failure, so the two conventions cannot be confused once they are types.
-// ---------------------------------------------------------------------------
 
 /// True when `span` equals `check`, ignoring ASCII letter case.
 ///
@@ -1655,38 +1191,7 @@ pub(crate) fn str_numblanks(cursor: &mut &[u8]) -> Result<i64, StrError> {
 /// size_t clen = check ? strlen(check) : 0;
 /// return ((str->len == clen) && curl_strnequal(str->str, check, clen));
 /// ```
-///
-/// The composition is preserved exactly: a length test, then a folded
-/// comparison of that many bytes. `curl_strnequal` is the exported name of the
-/// comparator in [`crate::util::strcase`], and routing through it is what keeps
-/// ONE definition of curl's folding in the crate. Reaching instead for
-/// `eq_ignore_ascii_case` would be a second definition that happens to agree
-/// today, on a fold that is visible through the exported `curl_strequal` and
-/// `curl_strnequal` and therefore not this module's to choose.
-///
-/// The fold is ASCII-only and locale-independent, which is the whole reason
-/// curl carries its own: only the twenty-six letter pairs fold, so the two
-/// bytes 0xc3 0xa9 do NOT compare equal to 0xc3 0x89 however a locale might
-/// feel about it. That is asserted by test rather than left as a claim.
-///
-/// # The C's conditional compilation has no successor
-///
-/// The C wraps this function in `#ifndef WITHOUT_LIBCURL` (`:236` and `:244`)
-/// because it calls an exported libcurl symbol, and the utility layer is also
-/// built into standalone tools that do not link the library. Here the fold and
-/// the parser are modules of one crate, so there is nothing to exclude and the
-/// function is unconditional. No Cargo feature gates it, and none should be
-/// added: the guard answered a question about linkage, not about capability.
-///
-/// # The C's null comparand
-///
-/// `check` is a `&[u8]` and cannot be null, so the C's `check ? ... : 0` has no
-/// second arm to reproduce. For THIS function the two coincide anyway: a null
-/// comparand gives the C a length of zero and a zero-length comparison, which
-/// succeeds exactly when the span is empty -- and `str_casecompare(span, &[])`
-/// is true exactly when `span` is empty. [`str_cmp`] is where the two paths
-/// genuinely differ, and it says so.
-#[allow(dead_code)] // No consumer yet; header and scheme matching will call it.
+#[allow(dead_code)] // Callers: header and scheme matching.
 #[must_use]
 pub(crate) fn str_casecompare(span: &[u8], check: &[u8]) -> bool {
     // `(str->len == clen) && curl_strnequal(str->str, check, clen)`.
@@ -1704,25 +1209,7 @@ pub(crate) fn str_casecompare(span: &[u8], check: &[u8]) -> bool {
 /// }
 /// return !!(str->len);
 /// ```
-///
-/// Case-sensitive, unlike [`str_casecompare`]. The first arm is a length test
-/// followed by a byte comparison of that length, which is exactly what slice
-/// equality is, so the whole arm is one operator here.
-///
-/// # The null arm, recorded because it does not translate
-///
-/// The second arm is measured, not a typo: with a null comparand the C returns
-/// `!!(str->len)`, so a null "matches" every NON-EMPTY span and fails on an
-/// empty one. Read as a comparison that is backwards; read as a test the
-/// call site can make, it is "did the parse produce anything".
-///
-/// A `&[u8]` cannot be null, so that arm is unreachable here, and passing an
-/// empty slice does NOT reach it -- `str_cmp(span, &[])` is true when `span` is
-/// empty, which is the opposite answer. The observation is recorded rather than
-/// dropped so that a caller porting C code which relied on the null arm writes
-/// `!span.is_empty()` at the call site, where the inverted meaning is local and
-/// visible, instead of expecting it from this function.
-#[allow(dead_code)] // No consumer yet; token and header matching will call it.
+#[allow(dead_code)] // Callers: token and header matching.
 #[must_use]
 pub(crate) fn str_cmp(span: &[u8], check: &[u8]) -> bool {
     // `(str->len == clen) && !strncmp(str->str, check, clen)`.
@@ -1735,33 +1222,15 @@ mod tests {
 
     /// A quote, spelled as a constant so that test inputs can be written as
     /// byte arrays.
-    ///
-    /// The inputs for [`str_quotedword`] are the one place in this module where
-    /// a byte-string literal needs three levels of escaping to say what it
-    /// means, and a reviewer checking the raw span against the C should not
-    /// have to unpick `b"\"a\\\"b\""` first. Arrays of named bytes say the same
-    /// thing and cannot be misread.
     const QUOTE: u8 = b'"';
 
     /// A backslash, for the same reason as [`QUOTE`].
     const BACKSLASH: u8 = b'\\';
 
-    // -----------------------------------------------------------------------
     // The byte classification. `lib/curl_ctype.h:27-50`.
-    // -----------------------------------------------------------------------
 
     /// A second, independent transcription of `lib/curl_ctype.h`, used as the
     /// oracle for the predicates above.
-    ///
-    /// Written with explicit comparisons rather than by delegating to
-    /// `u8::is_ascii_*`, because an oracle that called the standard library
-    /// would be testing whether the standard library agrees with itself. It has
-    /// to be a reading of the header, so it is one, macro by macro and in the
-    /// header's own order.
-    ///
-    /// The single allowance below is what that costs: the comparisons are the
-    /// point, so the lint that would replace them with a range method is
-    /// silenced here and nowhere else.
     #[allow(clippy::manual_range_contains)]
     fn c_macro(name: &str, x: u8) -> bool {
         match name {
@@ -1820,13 +1289,6 @@ mod tests {
     }
 
     /// Every predicate against the oracle, for all 256 byte values.
-    ///
-    /// Exhaustive rather than sampled, which is affordable at this size and is
-    /// the only way to prove the two claims that matter: that the twenty
-    /// predicates are the twenty macros, and that taking a `u8` where the C
-    /// takes a signed `char` changes no answer anywhere -- including across the
-    /// 0x80 boundary, where a sign-extended comparison and an unsigned one
-    /// reach the same verdict by opposite routes.
     #[test]
     fn the_predicates_agree_with_curl_ctype_h_for_every_byte() {
         for value in 0..=u8::MAX {
@@ -1931,12 +1393,6 @@ mod tests {
 
     /// Blank is space and tab, and the four bytes a general-purpose trim would
     /// also take are refused.
-    ///
-    /// Named individually rather than left to the exhaustive test above,
-    /// because these four are the ones a reader is most likely to assume are
-    /// members: line feed, vertical tab, form feed and carriage return. Their
-    /// exclusion is what keeps [`str_passblanks`] and [`str_trimblanks`] inside
-    /// a single line.
     #[test]
     fn blank_is_space_and_tab_and_refuses_the_four_other_whitespace_bytes() {
         assert!(is_blank(b' '));
@@ -1987,21 +1443,9 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // The hexadecimal table. `lib/curlx/strparse.c:148-154`.
-    // -----------------------------------------------------------------------
 
     /// The table, rebuilt from the C's five original rows and compared.
-    ///
-    /// This is the test the two-row split of the twenty-six zeroes exists to be
-    /// checked by. The rows below are the C's, in the C's grouping and with the
-    /// C's counts, concatenated in order; if the table above lost, gained or
-    /// reordered an entry -- or if the split changed anything -- the vectors
-    /// differ here.
-    ///
-    /// Three further properties are asserted because each is a distinct way for
-    /// a transcription to go wrong: the total length is 55, the first entry is
-    /// the sentinel 16 rather than 0, and the last index maps to `f`.
     #[test]
     fn the_table_holds_exactly_the_fifty_five_c_entries() {
         // `lib/curlx/strparse.c:149-153`, row for row.
@@ -2080,12 +1524,6 @@ mod tests {
     }
 
     /// [`hexval`] and [`is_xdigit`] describe the same set of bytes.
-    ///
-    /// The property that lets a caller pre-validate the way the C header
-    /// demands and then rely on the value being present. Proven over all 256
-    /// bytes rather than at the boundaries, because the table's thirty-three
-    /// interior zeroes are exactly where an off-by-one transcription would
-    /// hide.
     #[test]
     fn hexval_answers_for_exactly_the_bytes_is_xdigit_admits() {
         for value in 0..=u8::MAX {
@@ -2098,12 +1536,6 @@ mod tests {
     }
 
     /// The raw entry helper is total, and answers zero outside the table.
-    ///
-    /// Covers the two reads the C makes out of bounds: below the table, where
-    /// the C would index negatively, and above it, where the C would read past
-    /// the end. Both answer zero, which is already the table's own value for
-    /// "not a digit", so the total function agrees with the C wherever the C
-    /// was defined at all.
     #[test]
     fn the_raw_table_lookup_is_total_in_both_directions() {
         // Below `0`: the C computes a negative index here.
@@ -2122,9 +1554,7 @@ mod tests {
         assert_eq!(hexasciitable_entry(b':'), 0);
     }
 
-    // -----------------------------------------------------------------------
     // `str_until`. `lib/curlx/strparse.c:40-60`.
-    // -----------------------------------------------------------------------
 
     /// A span of exactly `max` bytes succeeds and one of `max + 1` does not.
     ///
@@ -2209,9 +1639,7 @@ mod tests {
         assert_eq!(cursor, &input[..]);
     }
 
-    // -----------------------------------------------------------------------
     // `str_word` and `str_untilnl`. `:64-67` and `:71-90`.
-    // -----------------------------------------------------------------------
 
     /// A word ends at a space and NOT at a tab.
     ///
@@ -2259,9 +1687,7 @@ mod tests {
         assert_eq!(cursor, b"\nrest");
     }
 
-    // -----------------------------------------------------------------------
     // `str_quotedword`. `:94-121`.
-    // -----------------------------------------------------------------------
 
     /// A missing opening quote is [`StrError::BegQuote`].
     #[test]
@@ -2367,9 +1793,7 @@ mod tests {
         assert_eq!(cursor, b"!");
     }
 
-    // -----------------------------------------------------------------------
     // `str_cspn`. `:270-286`.
-    // -----------------------------------------------------------------------
 
     /// The cursor lands on the first rejected byte.
     #[test]
@@ -2411,9 +1835,7 @@ mod tests {
         assert_eq!(cursor.first(), Some(&0));
     }
 
-    // -----------------------------------------------------------------------
     // `str_single`, `str_singlespace`, `str_newline`. `:125-139`, `:226-234`.
-    // -----------------------------------------------------------------------
 
     /// A match consumes exactly one byte.
     #[test]
@@ -2499,9 +1921,7 @@ mod tests {
         assert_eq!(str_newline(&mut cursor), Err(StrError::Newline));
     }
 
-    // -----------------------------------------------------------------------
     // `str_passblanks`, `str_trimblanks` and `str_nudge`. `:255-304`.
-    // -----------------------------------------------------------------------
 
     /// Blanks are skipped; a line ending stops the walk.
     #[test]
@@ -2562,9 +1982,7 @@ mod tests {
         assert_eq!(str_nudge(b"", 0), Ok(&[][..]));
     }
 
-    // -----------------------------------------------------------------------
     // The number parsers. `:157-222`.
-    // -----------------------------------------------------------------------
 
     /// Zero, and leading zeroes, parse as the C parses them.
     #[test]
@@ -2780,17 +2198,10 @@ mod tests {
         assert_eq!(cursor, &leading[..]);
     }
 
-    // -----------------------------------------------------------------------
     // The comparators. `:236-254`.
-    // -----------------------------------------------------------------------
 
     /// Case folding applies to the twenty-six ASCII letter pairs and to nothing
     /// else.
-    ///
-    /// The negative half is the point. The two bytes 0xc3 0xa9 and 0xc3 0x89
-    /// are the UTF-8 encodings of a letter in its two cases, and curl's fold
-    /// does NOT relate them -- which is what makes the comparison
-    /// locale-independent and what a Unicode-aware comparison would break.
     #[test]
     fn casecompare_folds_ascii_letters_and_no_other_byte() {
         assert!(str_casecompare(b"chunked", b"CHUNKED"));
@@ -2824,11 +2235,6 @@ mod tests {
 
     /// Both comparators return true for a MATCH, which inverts the C's usual
     /// convention.
-    ///
-    /// Asserted rather than only documented, because the inversion is the one
-    /// thing about these two functions that a reader diffing against
-    /// `lib/curlx/strparse.c` will get backwards: everything else in that file
-    /// returns non-zero for an error.
     #[test]
     fn the_comparators_report_true_on_a_match_not_on_a_failure() {
         assert!(str_cmp(b"same", b"same"), "true means matched");
@@ -2843,12 +2249,6 @@ mod tests {
 
     /// An empty comparand matches an empty span, which is where the C's null
     /// arm and an empty slice part company.
-    ///
-    /// For [`str_casecompare`] the two agree: a null comparand gives the C a
-    /// zero length, and a zero-length comparison succeeds exactly on an empty
-    /// span. For [`str_cmp`] they are opposites -- the C's null arm answers
-    /// `!!len`, so it matches a NON-empty span -- and a caller that needs that
-    /// meaning writes `!span.is_empty()` at the call site.
     #[test]
     fn an_empty_comparand_matches_only_an_empty_span() {
         assert!(str_cmp(b"", b""));
@@ -2862,9 +2262,7 @@ mod tests {
         assert!(!span.is_empty(), "the C's null comparand answers this");
     }
 
-    // -----------------------------------------------------------------------
     // The text helper, and one end-to-end walk.
-    // -----------------------------------------------------------------------
 
     /// Text conversion succeeds for text and refuses everything else.
     #[test]
@@ -2878,13 +2276,6 @@ mod tests {
     }
 
     /// One realistic walk, exercising the pieces together.
-    ///
-    /// A header value of the shape the C parses with these functions:
-    /// `max-age=3600, includeSubDomains`. It alternates extraction, single-byte
-    /// consumption, blank skipping and number parsing, which is the pattern
-    /// every caller of this module follows, and it ends with the cursor
-    /// empty -- the property that proves no step lost or double-counted a
-    /// byte.
     #[test]
     fn the_pieces_compose_into_a_header_value_parse() {
         let mut cursor: &[u8] = b"max-age=3600, includeSubDomains";

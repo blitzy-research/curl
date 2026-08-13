@@ -268,11 +268,15 @@ linker = "aarch64-linux-gnu-gcc"
 # mandates it, not because the variadic entry points are known good on it.
 #
 # WHERE THAT IS ENFORCED, so a reader of this file is not left with a caveat and
-# no consequence: curl-rs-ffi/build.rs REFUSES to build this triple until the
-# decision is recorded in CURL_RS_A4_VARIADIC_DECISION. No workflow in this
-# repository records it, and none may - the choice belongs to whoever set the
-# requirements. So this leg of the four-target gate is red on purpose, carrying
-# the refusal's diagnosis, rather than green with a footnote.
+# no consequence: curl-rs-ffi/build.rs REFUSES to build this triple,
+# unconditionally. It formerly accepted an opt-in through
+# CURL_RS_A4_VARIADIC_DECISION; that bypass has been removed, because it could
+# emit the artifact carrying the fault described above, and setting the variable
+# is now itself refused. The choice belongs to whoever set the requirements, and
+# the two options that remain - raise the MSRV, or drop the triple - are edits
+# to this repository rather than environment settings. So this leg of the
+# four-target gate is red on purpose, carrying the refusal's diagnosis, rather
+# than green with a footnote.
 
 # Cross toolchain for the aarch64 Linux leg
 #
@@ -286,7 +290,45 @@ linker = "aarch64-linux-gnu-gcc"
 # and they are not marked forced: an environment that already defines one - a
 # cross container, or `cross` itself - keeps its own value. All three were
 # verified present in this environment at 15.2.0.
+#
+# CC_aarch64_unknown_linux_gnu is read by one more consumer than cc-rs, and the
+# agreement is enforced rather than hoped for: curl-rs-ffi/build.rs renders
+# `curl-config --cc` and takes this value in preference to its own per-target
+# table, so its check_cross_toolchain_agreement asserts that this value, the
+# linker key above and that table all name the same command. A cross consumer
+# following curl-config must reach the toolchain rustc will actually link with.
 [env]
 CC_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-gcc"
 CXX_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-g++"
 AR_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-ar"
+
+# Future-incompatibility reporting - contained, not silenced
+#
+# Cargo re-prints a future-incompatibility notice for russh 0.54.5 at the end of
+# every build. It is a warning-class diagnostic, and specification 0.8.4's first
+# gate is a ZERO-WARNING build, so the two cannot both stand as they are. The
+# previous arrangement resolved that in the workflow, by enumerating this notice
+# in an allow-list and calling the result a pass. That redefined the gate into a
+# zero-UNAPPROVED-warning gate, and the allow-list matched cargo's generic
+# sentence rather than the crate name, so a future-incompatibility in any OTHER
+# dependency would have been swallowed by it too.
+#
+# The condition itself cannot be resolved at this commit, and that was measured
+# rather than assumed. russh 0.54.6 declares a NON-OPTIONAL dependency on
+# libcrux-ml-kem ^0.0.3; on a 0.0.x version that requirement admits 0.0.3 alone,
+# and 0.0.3 is YANKED on crates.io, so the graph does not resolve - and
+# deny.toml sets yanked = "deny" independently. Moving further forward raises the
+# minimum Rust version above the floor: russh 0.55.0 and the whole 0.62 line
+# declare 1.85. The crate is pinned exactly by specification 0.5.1 and cannot be
+# patched here. It is genuine dependency debt, recorded as such in Cargo.toml.
+#
+# So the notice is contained at its source, which is where cargo provides for it.
+# `frequency = "never"` stops the per-build re-print; it does not discard the
+# report, which stays available in full through
+# `cargo report future-incompatibilities`. The workflow now runs exactly that
+# and asserts the debt is confined to the crate named above, so a
+# future-incompatibility arriving in a different dependency FAILS the leg
+# instead of being absorbed by a pattern match. Containment is verified rather
+# than assumed, and the zero-warning gate is one a normal build can pass.
+[future-incompat-report]
+frequency = "never"

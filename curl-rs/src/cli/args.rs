@@ -8,82 +8,7 @@
 //! rows of the `aliases[]` table (`src/tool_getparam.c:80`), the 282 dispatch
 //! keys of `cmdline_t` (`src/tool_getparam.h:32-314`), the parser that walks a
 //! command line through them, and the outcome vocabulary every parsing step
-//! reports through. AAP section 0.8.1 freezes all of it: "Names, aliases,
-//! argument arity, argument type, and default value are frozen for all 282
-//! alias rows", and so is the text of each diagnostic, because
-//! `tests/data/test*` compares emitted bytes against literal expectations.
-//!
-//! Nothing here may be added to, renamed or re-defaulted. Where `clap` cannot
-//! express a curl behaviour, the behaviour wins and `clap` is driven or
-//! bypassed to match; every such place is marked below and at its call site.
-//!
-//! # `ARG_BOOL` and `ARG_NO` are different things, and the difference is 115
-//! options wide
-//!
-//! The two masks are easy to conflate and the consequence is large:
-//!
-//! * `ARG_BOOL 1` means "accepts a `--no-[name]` prefix"
-//!   (`src/tool_getparam.h:317`). `src/tool_getparam.c:2950` rejects `--no-` on
-//!   anything else with `PARAM_NO_PREFIX`, so **every one of the 115 `ARG_BOOL`
-//!   rows accepts `--no-<name>` and none of the other 167 does**. The long-form
-//!   surface is therefore 282 + 115 = 397 spellings.
-//! * `ARG_NO 0x80` means "the option is documented as `--no-*`"
-//!   (`src/tool_getparam.h:327`) and does something entirely different: at
-//!   `src/tool_getparam.c:2989`, **inside the short-option branch only**,
-//!   `toggle = !(a->desc & ARG_NO)` makes the *short* form of those six rows
-//!   default to off. The six are `alpn`, `buffer`, `clobber`, `keepalive`,
-//!   `progress-meter` and `sessionid`.
-//!
-//! Both sets are derived from [`ALIASES`] at use time rather than restated, and
-//! [`mod tests`](self) asserts the counts so a hand-edited row cannot drift.
-//!
-//! # `--help` is dispatched from inside the parser
-//!
-//! `src/tool_getparam.c:3001-3005` calls `tool_help()` and *then* returns
-//! `PARAM_HELP_REQUESTED`; `src/tool_operate.c:2302-2304` receives that code
-//! and does nothing with it. The output therefore has to be produced here, not
-//! by the caller, and [`ParseHost::help`] is the seam that produces it -- see
-//! GAP #4 on that method for why it is injected rather than called directly.
-//!
-//! # Two C file-scope `static` variables become owned state
-//!
-//! * `static size_t verbose_nopts` (`src/tool_getparam.c:1511`) is reset at
-//!   `:2904`, incremented at `:3042` and read at `:1526`, which is what makes
-//!   `-vvv` accumulate *within* one argv element and reset *between* elements.
-//!   It is a field of [`ParseState`], threaded explicitly. AAP section 0.1.2
-//!   removes the shared-mutable-state design this file's C original leans on,
-//!   so it is neither a `static mut` nor an atomic.
-//! * `findshortopt`'s lazily-built `static const struct LongShort
-//!   *singles[128 - ' ']` with its `static bool singles_done` latch
-//!   (`src/tool_getparam.c:828-845`) becomes a bounds-checked scan of
-//!   [`ALIASES`] in [`findshortopt`]. Performance is a non-goal (AAP section
-//!   0.1.1: "Where a choice exists between a faster design and a more
-//!   behaviourally faithful one, faithfulness wins"), and the scan needs no
-//!   mutable state at all.
-//!
-//! # Where `clap` is bypassed, and why
-//!
-//! [`ClapSurface`] renders the frozen inventory as a `clap` 4.x derive, which
-//! is what AAP section 0.8.3 asks for: "clap 4.x, derived 1:1 from the curl 8.x
-//! long-option inventory". It is the declarative record of the surface and the
-//! source of the completion and usage data. It is **not** the parser, because
-//! `clap` implements none of the following and each one is observable:
-//!
-//! | Behaviour | Anchor |
-//! |---|---|
-//! | the `--expand-<name>` argument-expansion prefix | `:2922-2926`, `:2955-2974` |
-//! | `--no-<name>` over 115 booleans, `PARAM_NO_PREFIX` for the other 167 | `:2916-2921`, `:2950-2954` |
-//! | `-vvv` accumulating as a "super-boolean" within one element | `:1513-1567` |
-//! | `-ofoo`: one option swallowing the rest of a short cluster | `:2997-3000` |
-//! | the `=` split bounded at `MAX_OPTION_LEN`, which suppresses argument consumption | `:2928-2941` |
-//! | the `ARG_TLS` runtime capability gate | `:2991-2994` |
-//! | `ARG_DEPR` warn-and-stop, applying nothing | `:1723-1726`, `:3014-3017` |
-//! | `ARG_CLEAR` argv wiping | `:626-637` |
-//! | `--next` starting a fresh operation | `:1810-1811`, `:3087-3110` |
-//! | a bare argument becoming `--url` with a recursion budget of zero | `:3119` |
-//!
-//! [`getparameter`] and [`parse_args`] therefore reproduce
-//! `src/tool_getparam.c:2888-3149` directly, clause for clause.
+//! reports through.
 //!
 //! # The reported name is `curl`
 //!
@@ -94,17 +19,6 @@
 //! print `curl-rs: ` and the second whatever the invoker chose. Neither
 //! `CARGO_PKG_NAME`, `CARGO_BIN_NAME` nor `argv[0]` is read here; the prefix
 //! comes from [`crate::output::msgs`], which owns those bytes.
-//!
-//! # Arguments are bytes
-//!
-//! [`parse_args`] takes `OsString` values and works on their bytes.
-//! `std::env::args` panics on an argument that is not valid Unicode, and curl
-//! accepts one: `src/tool_getparam.c:3061` passes `argv[i]` through
-//! `convert_tchar_to_UTF8`, a shim that is the identity outside Windows, and
-//! every one of the four targets AAP section 0.1.1 names is Linux or macOS. A
-//! filename, a header value or a POST body may hold arbitrary bytes, so the
-//! parser must not require them to be UTF-8. Option *names* are compared as
-//! bytes too, which is what `strcmp` does.
 //!
 //! # GAPs
 //!
@@ -139,15 +53,6 @@ use crate::output::msgs::{
 };
 
 /// The outcome of parsing or validating one command-line parameter.
-///
-/// Counterpart of `ParameterError` (`src/tool_getparam.h:336-363`). The 26
-/// tokens C declares are reproduced as 25 variants: `PARAM_LAST` is the usual C
-/// sentinel and is deliberately absent, for the same reason `MSTATE_LAST` is
-/// absent from the engine's state machine. It is never returned, never compared
-/// against and never used to size anything -- an exhaustive search of `src/`
-/// finds it only in its own declaration -- so making it constructible would add
-/// an unreachable arm to every `match` and buy nothing. The bound survives as
-/// [`ParameterError::COUNT`] for a caller that wants it.
 ///
 /// # Five variants are not failures
 ///
@@ -320,16 +225,6 @@ impl ParameterError {
 /// `param2text` (`src/tool_helpers.c:35-75`): the phrase C prints for an
 /// outcome.
 ///
-/// # These strings are frozen output
-///
-/// Every one is reproduced byte for byte, because the caller composes them into
-/// a diagnostic that fixtures compare literally. The grammar of the composition
-/// is what explains the wording: `src/tool_getparam.c` prints
-/// `option --<name>: <phrase>`, so each phrase is a verb clause that continues
-/// the sentence rather than a standalone message. That is why
-/// `RequiresParameter` renders as "requires parameter" and not as
-/// "missing parameter".
-///
 /// # Nine variants fall through to C's `default`
 ///
 /// C's `switch` (`:37-74`) lists sixteen cases and a `default` returning
@@ -338,10 +233,9 @@ impl ParameterError {
 /// `src/tool_operate.c` handles them before any text is produced -- plus
 /// `NextOperation` and `Recursion`. Reproducing the fall-through is required:
 /// giving `Recursion` a phrase of its own would change the emitted bytes for a
-/// case a fixture may exercise, which AAP section 0.8.1 forbids. The
-/// exhaustive `match` below makes the set explicit instead of leaving it to a
-/// wildcard, so adding a variant forces a decision rather than silently joining
-/// the default.
+/// case a fixture may exercise. The exhaustive `match` below makes the set
+/// explicit instead of leaving it to a wildcard, so adding a variant forces a
+/// decision rather than silently joining the default.
 #[allow(dead_code)] // Called by `parse_args` at the report step; the attribute
                     // predates that caller and is kept so the item stays
                     // warning-free under any feature combination.
@@ -406,9 +300,7 @@ pub(crate) const fn param2text(error: ParameterError) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The `desc` vocabulary -- `src/tool_getparam.h:316-327`
-// ---------------------------------------------------------------------------
 
 /// `ARG_NONE 0` -- "stand-alone but not a boolean" (`src/tool_getparam.h:316`).
 ///
@@ -474,9 +366,7 @@ pub(crate) const fn argtype(desc: u8) -> u8 {
     desc & ARG_TYPEMASK
 }
 
-// ---------------------------------------------------------------------------
 // Frozen limits
-// ---------------------------------------------------------------------------
 
 /// `MAX_OPTION_LEN 26` -- `src/tool_getparam.c:2886`, "the longest command
 /// line option, excluding the leading --".
@@ -517,9 +407,7 @@ const ALLOW_BLANK: bool = true;
 /// `DENY_BLANK FALSE` -- `src/tool_getparam.c:42`.
 const DENY_BLANK: bool = false;
 
-// ---------------------------------------------------------------------------
 // Public libcurl constants used by the dispatch switches
-// ---------------------------------------------------------------------------
 //
 // Declared here with their header line rather than imported: `curl-rs-ffi`
 // owns the generated ABI and this crate must not depend on it (it links no
@@ -626,38 +514,13 @@ const CURL_PROGRESS_STATS: i32 = 0;
 /// `CURL_PROGRESS_BAR 1` -- `src/tool_cb_prg.h:29`.
 const CURL_PROGRESS_BAR: i32 = 1;
 
-/// `CURL_OFF_T_MAX` -- the largest `curl_off_t`, which is `i64` on every target
-/// AAP section 0.1.1 names. `src/tool_getparam.c:573` and `:618` compare
-/// against it while parsing a size.
+/// `src/tool_getparam.c:573` and `:618` compare against it while parsing a
+/// size.
 const CURL_OFF_T_MAX: i64 = i64::MAX;
 
-// ---------------------------------------------------------------------------
 // `cmdline_t` -- `src/tool_getparam.h:31-314`
-// ---------------------------------------------------------------------------
 
 /// One dispatch key per command-line option: C's `cmdline_t`.
-///
-/// The C comment at `src/tool_getparam.h:28-30` gives the naming rule: "The
-/// name is the verbatim long option name, but in uppercase with periods and
-/// minuses replaced with underscores using a `C_` prefix". The Rust spelling is
-/// the same name in upper camel case, with a trailing digit group joined to the
-/// word before it so that no variant needs an underscore -- `C_HTTP1_0` becomes
-/// `Http10`, `C_TLSV1_2` becomes `Tlsv12`. All 282 spellings stay distinct
-/// under that rule, which [`mod tests`](self) asserts.
-///
-/// # Why the discriminants are written out
-///
-/// C assigns none of them and lets declaration order fix all 282. Nothing in
-/// libcurl's ABI exposes these integers -- `cmdline_t` is internal to the
-/// command-line tool -- but the enumeration is a cross-module contract: the help
-/// table in the target `curl-rs/src/cli/help.rs` keys its scan off the last
-/// entry, and `src/tool_getparam.c` pairs every alias row with exactly one key.
-/// Writing each value keeps a reordering from silently changing which option a
-/// numeric comparison selects, and makes the correspondence with
-/// `src/tool_getparam.h` checkable line by line.
-///
-/// [`CmdKey::c_name`] recovers the `C_*` spelling for a diagnostic or a test
-/// that has to name the token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 #[repr(u16)]
 #[allow(dead_code)] // Every variant is reachable through `ALIASES`; the
@@ -1525,10 +1388,8 @@ impl CmdKey {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `struct LongShort` and `aliases[]` -- `src/tool_getparam.h:329-334`,
 // `src/tool_getparam.c:79-374`
-// ---------------------------------------------------------------------------
 
 /// One row of the option table: C's `struct LongShort`
 /// (`src/tool_getparam.h:329-334`).
@@ -1541,11 +1402,6 @@ impl CmdKey {
 ///   unsigned short cmd;
 /// };
 /// ```
-///
-/// `cmd` is [`CmdKey`] rather than an integer, which is what turns the four
-/// dispatch switches into exhaustive `match`es: C's `switch` on an
-/// `unsigned short` needs a `default:` to be total, and three of the four
-/// deliberately omit one (see [`opt_string`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LongShort {
     /// `lname` -- the long option name, without the leading `--`.
@@ -1553,12 +1409,6 @@ pub(crate) struct LongShort {
     /// `desc` -- the type in the low two bits plus the `ARG_*` flags.
     pub(crate) desc: u8,
     /// `letter` -- the short option, or `' '` when the row has none.
-    ///
-    /// The sentinel is a space rather than `Option<char>` because
-    /// `src/tool_getparam.c:838` tests `aliases[j].letter != ' '` and
-    /// `findshortopt` rejects every byte at or below `' '` anyway
-    /// (`:832`), so a space can never be looked up and needs no separate
-    /// representation.
     pub(crate) letter: char,
     /// `cmd` -- the dispatch key.
     pub(crate) cmd: CmdKey,
@@ -1582,36 +1432,6 @@ const fn row(
 
 /// The option table -- `src/tool_getparam.c:80`, carrying the C comment "this
 /// array MUST be alphasorted based on the 'lname'".
-///
-/// # The sort is an invariant, not a convenience
-///
-/// `findlongopt` (`:1075-1082`) is a `bsearch` with `findarg` (`:821-826`)
-/// comparing `lname` by `strcmp`, so the ordering is byte-wise ascending -- an
-/// `LC_ALL=C` sort, not a locale-aware one. [`findlongopt`] keeps the binary
-/// search, and [`mod tests`](self) asserts the ordering, because a
-/// mis-sorted row would not fail to compile: it would make one option
-/// unreachable and be found by a user rather than by the build.
-///
-/// # Three rows are conditional in C and unconditional here
-///
-/// `ipfs-gateway` sits behind `#ifndef CURL_DISABLE_IPFS`, `test-duphandle` and
-/// `test-event` behind `#ifdef DEBUGBUILD`, and `wdebug` behind
-/// `#ifdef USE_WATT32` (`src/tool_getparam.c:182-184`, `:333-336`, `:369-371`).
-/// The inventory AAP section 0.8.1 freezes is 282 rows, so all 282 are present.
-/// The three whose C `case` is compiled out in this configuration reach
-/// [`opt_bool`]'s `default:` arm and yield
-/// [`ParameterError::OptionUnknown`] -- which is precisely what C answers for
-/// them, because with the guard undefined the row is absent and `findlongopt`
-/// returns `NULL`. `ipfs-gateway` is *enabled* by default in C and is handled
-/// normally.
-///
-/// GAP #6: `--test-duphandle` and `--test-event` set `global->test_duphandle`
-/// and `global->test_event_based` (`src/tool_getparam.c:1981`, `:1984`), and
-/// `--wdebug` calls WATT32's `dbug_init()` (`:1885`). `GlobalConfig`
-/// (`curl-rs/src/config/mod.rs`) declares no such fields and the AAP names no
-/// Cargo feature that would gate them, so the non-`DEBUGBUILD`,
-/// non-`USE_WATT32` arm is the one implemented. Reported rather than worked
-/// around.
 #[allow(dead_code)] // The table is the surface; every consumer is a caller of
                     // `findlongopt` or `findshortopt`.
 pub(crate) static ALIASES: [LongShort; CmdKey::COUNT] = [
@@ -2110,15 +1930,6 @@ pub(crate) static ALIASES: [LongShort; CmdKey::COUNT] = [
 ];
 
 /// The 115 `--no-<name>` spellings, in [`ALIASES`] order.
-///
-/// `clap`'s `Id` and `Str` are built from `&'static str`, so the negations
-/// cannot be assembled with `format!` at call time. They are generated from the
-/// same `ARG_BOOL` rows instead, which keeps the two lists incapable of
-/// disagreeing; [`mod tests`](self) asserts that this array is exactly those
-/// rows' names with `no-` prepended, in order, and that nothing else appears.
-///
-/// The surface they describe is `src/tool_getparam.c:2916-2921` accepting the
-/// prefix and `:2950-2953` rejecting it for every one of the other 167 rows.
 static NEGATIONS: [&str; 115] = [
     "no-alpn",
     "no-append",
@@ -2264,16 +2075,6 @@ pub(crate) fn findlongopt(opt: &[u8]) -> Option<&'static LongShort> {
 }
 
 /// `findshortopt` -- `src/tool_getparam.c:828-845`.
-///
-/// C builds a 95-entry `static` lookup table on first use, latched by a
-/// `static bool singles_done`. Both are gone: this scans [`ALIASES`],
-/// which needs no mutable state and no initialisation order (AAP section 0.1.2;
-/// performance is a non-goal per section 0.1.1).
-///
-/// The bounds are C's, at `:832`: a byte at or below `' '` and a byte at or
-/// above `127` are rejected outright, so the space sentinel in
-/// [`LongShort::letter`] can never be looked up and no control byte or
-/// non-ASCII byte can index the table.
 #[allow(dead_code)] // Called by `getparameter`'s short-cluster loop.
 pub(crate) fn findshortopt(letter: u8) -> Option<&'static LongShort> {
     // `:832-833` -- `if((letter >= 127) || (letter <= ' ')) return NULL;`
@@ -2285,30 +2086,9 @@ pub(crate) fn findshortopt(letter: u8) -> Option<&'static LongShort> {
         .find(|row| row.letter != ' ' && row.letter as u32 == u32::from(letter))
 }
 
-// ---------------------------------------------------------------------------
 // Injected capabilities
-// ---------------------------------------------------------------------------
 
 /// The effects the parser cannot perform itself.
-///
-/// Six of C's operations reach outside the option table: four have no module
-/// among this file's declared dependencies, one needs a concrete sink type this
-/// file never holds, and one is unavailable in safe Rust. They are gathered
-/// here so that the parser stays a pure function of its inputs and can be
-/// exercised without a filesystem, a terminal or a network -- which is what AAP
-/// section 0.3.3's pattern P12 asks for, and what makes the coverage AAP
-/// section 0.8.7 relocates out of `tests/unit` achievable.
-///
-/// # Why a generic bound and never `&mut dyn ParseHost`
-///
-/// [`VarHost`] and [`StdinAccess`] are supertraits so that one object can be
-/// handed to [`setvariable`], [`varexpand`]'s callers and [`formparse`], each of
-/// which wants a different one of the three. Reaching those from a
-/// `&mut dyn ParseHost` would need trait upcasting, which stabilised in Rust
-/// 1.86 -- above the MSRV of 1.75 that AAP section 0.8.3 mandates. Every
-/// function that needs a host is therefore generic over `H: ParseHost`, and
-/// `&mut *host` unsize-coerces to `&mut dyn VarHost` or `&mut dyn StdinAccess`
-/// the ordinary way.
 pub(crate) trait ParseHost: VarHost + StdinAccess {
     /// Whether `path` names something that exists -- C's `curlx_stat` in
     /// `existingfile` (`src/tool_getparam.c:2212`).
@@ -2319,32 +2099,39 @@ pub(crate) trait ParseHost: VarHost + StdinAccess {
 
     /// The modification time of `path`, or `None` when it cannot be read.
     ///
-    /// GAP #1: `getfiletime` (`src/tool_getparam.c:1636`) lives in
+    /// `getfiletime` (`src/tool_getparam.c:1636`) lives in
     /// `curl-rs/src/output/filetime.rs`, which is not among this file's
-    /// declared dependencies, so it cannot be called directly. The warning C
-    /// emits on failure belongs to that module and is left to it; `--time-cond`
-    /// only needs the success or failure, which `:1637-1646` turns into either
-    /// a time or a disabled condition. Reported rather than worked around.
-    fn file_time(&mut self, path: &[u8]) -> Option<i64>;
+    /// declared dependencies, so the host performs the call. `--time-cond`
+    /// itself needs only the success or failure, which `:1637-1646` turns into
+    /// either a time or a disabled condition.
+    ///
+    /// `msgs` is taken because the failure path is not silent: `:78-79` emits
+    /// the frozen `Failed to get filetime: %s` through `warnf`, whose gate at
+    /// `src/tool_msgs.c:95` is `!global->silent`. Passing the verbosity the
+    /// parser has already computed is what lets the host reproduce that gate
+    /// instead of guessing at it.
+    fn file_time(
+        &mut self,
+        path: &[u8],
+        sink: &mut dyn DiagnosticSink,
+        msgs: &MsgConfig,
+    ) -> Option<i64>;
 
     /// `curl_global_trace(config)` -- `src/tool_getparam.c:790`, `:792`,
     /// `:806`. `false` reports the `CURLcode` C treats as out of memory.
-    ///
-    /// GAP #2: the trace configuration is process-global state in C.
-    /// `GlobalConfig` (`curl-rs/src/config/mod.rs`) holds no `TraceConfig`, and
-    /// this crate must not reach into `curl-rs-lib`'s internals, so the owner of
-    /// that state applies the token list. Reported rather than worked around.
     fn set_trace(&mut self, config: &str) -> bool;
 
     /// `tool_set_stderr_file(nextarg)` -- `src/tool_getparam.c:2312`.
     ///
-    /// GAP #3: `crate::output::msgs::set_stderr_file` takes
-    /// `&mut MessageSink`, a concrete type, because it replaces the sink rather
-    /// than writing to it. The parser only ever holds
-    /// `&mut dyn DiagnosticSink` and cannot produce the concrete one, so the
-    /// caller that owns the sink performs the redirection. Reported rather than
-    /// worked around.
-    fn set_stderr_file(&mut self, path: &[u8]);
+    /// `crate::output::msgs::set_stderr_file` takes `&mut MessageSink`, a
+    /// concrete type, because it replaces the sink rather than writing to it.
+    /// The parser only ever holds `&mut dyn DiagnosticSink` and cannot produce
+    /// the concrete one, so the host -- which shares ownership of that sink
+    /// through `crate::output::msgs::SinkHandle` -- performs the redirection.
+    ///
+    /// `msgs` is taken because the failure branch at `src/tool_stderr.c:52-54`
+    /// warns, and that warning is gated on the verbosity.
+    fn set_stderr_file(&mut self, path: &[u8], msgs: &MsgConfig);
 
     /// `tool_help(category)` -- called at `src/tool_getparam.c:3003`, *before*
     /// `PARAM_HELP_REQUESTED` is returned.
@@ -2355,7 +2142,17 @@ pub(crate) trait ParseHost: VarHost + StdinAccess {
     /// signature is the one that module is specified to provide,
     /// `tool_help(category: Option<&str>)`, so wiring it up is a one-line
     /// implementation of this method. Reported rather than worked around.
-    fn help(&mut self, category: Option<&str>);
+    ///
+    /// `msgs` is taken so that the host can say, at the verbosity the parser
+    /// has already computed, that the renderer is absent -- rather than
+    /// returning `PARAM_HELP_REQUESTED` silently and letting the caller report
+    /// success for output nobody produced.
+    fn help(
+        &mut self,
+        category: Option<&str>,
+        sink: &mut dyn DiagnosticSink,
+        msgs: &MsgConfig,
+    );
 
     /// `parseconfig(filename, max_recursive, NULL)` --
     /// `src/tool_getparam.c:2252`.
@@ -2365,10 +2162,15 @@ pub(crate) trait ParseHost: VarHost + StdinAccess {
     /// owner of that module is also the owner of the re-entry; the recursion
     /// budget is passed through already decremented, exactly as `:2246` does.
     /// Reported rather than worked around.
+    ///
+    /// `msgs` is taken because `src/tool_parsecfg.c` reports an unreadable file
+    /// through `errorf`, whose gate is `!(silent && !showerror)`.
     fn parse_config(
         &mut self,
         filename: &[u8],
         max_recursive: i32,
+        sink: &mut dyn DiagnosticSink,
+        msgs: &MsgConfig,
     ) -> ParameterError;
 }
 
@@ -2377,23 +2179,15 @@ pub(crate) trait ParseHost: VarHost + StdinAccess {
 /// GAP #0: under `HAVE_WRITABLE_ARGV` C overwrites the argument in place with
 /// `memset(str, '*', strlen(str))` (`:633`), with the comment "wipe the next
 /// argument out so that the username:password is not displayed in the system
-/// process list". Rust cannot write through `argv` without `unsafe`, and AAP
-/// section 0.8.2 forbids `unsafe` outside the designated FFI modules -- of
-/// which this crate has none. The `!HAVE_WRITABLE_ARGV` arm (`:637`) is
-/// `#define cleanarg(x) tool_nop_stmt`, a supported upstream configuration, so
-/// that arm is the one implemented. Reported rather than worked around: no
+/// process list". The `!HAVE_WRITABLE_ARGV` arm (`:637`) is `#define
+/// cleanarg(x) tool_nop_stmt`, a supported upstream configuration, so that arm
+/// is the one implemented. Reported rather than worked around: no
 /// `/proc/self/cmdline` write, no re-`exec`, no subprocess.
-///
-/// The call site at `:3027-3028` is preserved so that the eleven `ARG_CLEAR`
-/// rows remain identifiable, and so that restoring the behaviour is a change to
-/// this function alone.
 fn cleanarg(_argument: &[u8]) {
     // The `!HAVE_WRITABLE_ARGV` arm, `src/tool_getparam.c:637`.
 }
 
-// ---------------------------------------------------------------------------
 // Parser state and shared accessors
-// ---------------------------------------------------------------------------
 
 /// The state C keeps in file-scope `static` variables.
 ///
@@ -2404,25 +2198,10 @@ fn cleanarg(_argument: &[u8]) {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ParseState {
     /// `static size_t verbose_nopts` -- `src/tool_getparam.c:1511`.
-    ///
-    /// Reset to zero when an argv element begins (`:2904`), incremented once per
-    /// option consumed from that element (`:3042`), and read by [`parse_verbose`]
-    /// at `:1526`. It is what makes `-vvv` climb the verbosity ladder while
-    /// `-v -v` does not: the first `-v` of each element sees it at zero and
-    /// resets to base verbosity.
     verbose_nopts: usize,
 }
 
 /// `MsgConfig` as the diagnostic helpers want it, read from `global`.
-///
-/// C's `warnf` gates on `!global->silent` (`src/tool_msgs.c:95`), `errorf` on
-/// `global->showerror` and `notef` on `global->tracetype`
-/// (`src/tool_msgs.c:83`, `:113`). The snapshot is taken when a handler is
-/// entered rather than threaded from the top of the parse, because `--silent`,
-/// `--show-error` and the trace options change those fields as the command line
-/// is walked and C observes each change from the next diagnostic onwards. No
-/// handler both changes one of them and emits a diagnostic, so a per-handler
-/// snapshot is indistinguishable from C's per-call read.
 fn msg_config(global: &GlobalConfig) -> MsgConfig {
     MsgConfig::new(
         global.silent,
@@ -2435,11 +2214,6 @@ fn msg_config(global: &GlobalConfig) -> MsgConfig {
 /// module: "That mapping, and the two-line
 /// `impl crate::cli::paramhlp::UrlList for OperationConfig` that carries it,
 /// belong to the module that owns that vocabulary rather than to this one".
-///
-/// `push_getout` reserves before it pushes so that a failure leaves the list
-/// untouched, which is what `src/tool_paramhlp.c:39`'s `if(node)` guarantees;
-/// every C call site turns that failure into `PARAM_NO_MEM`
-/// (`src/tool_getparam.c:1110`, `:1352`, `:1395`, `:1499`).
 impl UrlList for OperationConfig {
     fn append(&mut self, node: NewGetOut) -> Result<usize, ParameterError> {
         self.push_getout(node).map_err(|_| ParameterError::NoMem)
@@ -2456,20 +2230,9 @@ impl UrlList for OperationConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // String acceptance -- `src/tool_getparam.c:44-77`
-// ---------------------------------------------------------------------------
 
 /// `getstr` -- `src/tool_getparam.c:44-59`.
-///
-/// C frees the old value, rejects an empty argument unless `allowblank`, and
-/// duplicates. The free and the duplication are what assignment does in Rust;
-/// only the blank check is behaviour, and it is the whole reason `--libcurl ""`
-/// fails in the parser rather than later
-/// (`src/tool_getparam.c:2508`, `DENY_BLANK`).
-///
-/// Returns the accepted bytes so the caller can place them in whichever field
-/// its `case` names.
 fn getstr(value: &[u8], allowblank: bool) -> Result<Vec<u8>, ParameterError> {
     // `:51-52` -- `if(!allowblank && !val[0]) return PARAM_BLANK_STRING;`
     if !allowblank && value.is_empty() {
@@ -2479,15 +2242,6 @@ fn getstr(value: &[u8], allowblank: bool) -> Result<Vec<u8>, ParameterError> {
 }
 
 /// `getstr` for a field typed `Option<String>`.
-///
-/// The 228 fields of `OperationConfig` that hold an option argument are typed
-/// `Option<String>`, `Option<PathBuf>` or `Vec<u8>` according to what the field
-/// holds, so the byte form above is adapted rather than duplicated. A field
-/// typed `String` cannot hold a non-UTF-8 argument; C stores the bytes and
-/// hands them to libcurl, so the lossy conversion here is the one place this
-/// port cannot be byte-exact for such an argument. It is confined to this
-/// function so that widening a field's type is a change in `config/mod.rs`
-/// alone.
 fn getstr_text(
     value: &[u8],
     allowblank: bool,
@@ -2527,9 +2281,7 @@ fn getstrn(
     Ok(String::from_utf8_lossy(taken).into_owned())
 }
 
-// ---------------------------------------------------------------------------
 // `-E` / `--cert` splitting -- `src/tool_getparam.c:376-533`
-// ---------------------------------------------------------------------------
 
 /// The two halves of a `--cert` argument.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2561,10 +2313,9 @@ pub(crate) struct CertParameter {
 ///
 /// `:456-468` accepts `c:\file:password` by treating a colon in the second
 /// column as part of a drive letter, and it is inside `#ifdef _WIN32`. None of
-/// the four targets AAP section 0.1.1 names is Windows, so the branch is absent
-/// exactly as it is absent from a POSIX build; [`mod tests`](self) asserts the
-/// POSIX reading of that input so the difference is recorded rather than
-/// assumed.
+/// the four supported targets is Windows, so the branch is absent exactly as it
+/// is absent from a POSIX build; [`mod tests`](self) asserts the POSIX reading
+/// of that input so the difference is recorded rather than assumed.
 #[allow(dead_code)] // Reached through `get_file_and_password`; also the unit
                     // under test for "Unit test 1394".
 pub(crate) fn parse_cert_parameter(
@@ -2677,12 +2428,6 @@ fn get_file_and_password(
 
 /// `replace_url_encoded_space_by_plus` -- `src/tool_getparam.c:489-515`,
 /// "Replace (in-place) '%20' by '+' according to RFC1866".
-///
-/// C rewrites the buffer and returns the new length. Here the rewrite produces a
-/// new buffer, which is the same transformation without the aliasing: the C
-/// version reads `url[orig_index + 1]` and `[+ 2]` past the end of a trailing
-/// `%`, safe there only because of the NUL terminator. Slicing with `get`
-/// removes that dependence without changing any accepted input.
 fn replace_url_encoded_space_by_plus(url: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(url.len());
     let mut at = 0;
@@ -2700,9 +2445,7 @@ fn replace_url_encoded_space_by_plus(url: &[u8]) -> Vec<u8> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Size parsing -- `src/tool_getparam.c:535-623`
-// ---------------------------------------------------------------------------
 
 /// `struct sizeunit` -- `src/tool_getparam.c:535-539`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2749,25 +2492,12 @@ const SIZE_UNITS: [SizeUnit; 5] = [
 ];
 
 /// `getunit` -- `src/tool_getparam.c:541-556`.
-///
-/// The match is `(unit | 0x20) == list[i].unit` (`:553`), which folds an ASCII
-/// upper-case letter to lower case by setting bit 5. It is deliberately not
-/// `to_lowercase`: that would fold non-ASCII code points and would depend on
-/// Unicode data, and the table holds only ASCII. The `| 0x20` form also folds
-/// bytes that are not letters at all, so `'K' | 0x20 == 'k'` and
-/// `'\x4b' | 0x20` agree with C on every input, letter or not.
 fn getunit(unit: u8) -> Option<&'static SizeUnit> {
     SIZE_UNITS.iter().find(|entry| (unit | 0x20) == entry.unit)
 }
 
 /// `curlx_str_number` for a `curl_off_t` -- the leading-digit scan
 /// `src/tool_getparam.c:573` and `:581` perform.
-///
-/// Returns the value and the number of digits consumed. `Err(true)` is C's
-/// `STRE_OVERFLOW`, which `:574-575` maps to
-/// [`ParameterError::NumberTooLarge`]; `Err(false)` is any other failure,
-/// including "no digits at all", which `:576-577` maps to
-/// [`ParameterError::BadNumeric`].
 fn str_number(text: &[u8], max: i64) -> Result<(i64, usize), bool> {
     let digits = text.iter().take_while(|byte| byte.is_ascii_digit()).count();
     if digits == 0 {
@@ -2800,9 +2530,6 @@ fn str_number(text: &[u8], max: i64) -> Result<(i64, usize), bool> {
 ///   because "cannot handle partial bytes";
 /// * an unrecognised suffix -> `BadUse` (`:595-596`);
 /// * a product that does not fit -> `NumberTooLarge` (`:618-619`).
-///
-/// The fraction arithmetic is reproduced exactly, including the two-way
-/// multiply at `:612-615` that avoids overflowing before dividing.
 #[allow(dead_code)] // Reached from `opt_string`; also the unit under test for
                     // "Unit test 1623".
 pub(crate) fn get_size_parameter(arg: &[u8]) -> Result<i64, ParameterError> {
@@ -2885,9 +2612,7 @@ pub(crate) fn get_size_parameter(arg: &[u8]) -> Result<i64, ParameterError> {
     Ok(value.saturating_mul(mul).saturating_add(add))
 }
 
-// ---------------------------------------------------------------------------
 // `--ip-tos` -- `src/tool_getparam.c:848-892`
-// ---------------------------------------------------------------------------
 
 /// `struct TOSEntry` -- `src/tool_getparam.c:848-851`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2899,14 +2624,6 @@ struct TosEntry {
 }
 
 /// `tos_entries[]` -- `src/tool_getparam.c:853-885`.
-///
-/// Thirty-one keywords, sorted for `bsearch` (`:2470-2472`) with `find_tos`
-/// comparing by `strcmp` (`:887-892`) -- so the lookup is **case-sensitive**,
-/// unlike [`getunit`]. `--ip-tos af11` is therefore not `AF11`; it falls through
-/// to the numeric branch at `:2476` and is rejected as a number. Three values
-/// repeat legitimately: `ECT0`, `LOWCOST` and `MINCOST` are all `0x02`, and
-/// `CE`/`LE`/`RELIABILITY` overlap likewise, because the legacy IP-precedence
-/// names and the DSCP names share a field.
 const TOS_ENTRIES: [TosEntry; 31] = [
     TosEntry {
         name: "AF11",
@@ -3044,9 +2761,7 @@ fn find_tos(name: &[u8]) -> Option<&'static TosEntry> {
     TOS_ENTRIES.get(at)
 }
 
-// ---------------------------------------------------------------------------
 // `--upload-flags` -- `src/tool_getparam.c:1651-1709`
-// ---------------------------------------------------------------------------
 
 /// `struct flagmap` -- `src/tool_getparam.c:1651-1655`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3058,12 +2773,6 @@ struct FlagMap {
 }
 
 /// `flag_table[]` -- `src/tool_getparam.c:1657-1664`.
-///
-/// C terminates with `{ NULL, 0, 0 }` and detects "no match" by reaching it
-/// (`:1697`); the Rust form needs no terminator because the search reports
-/// absence directly. C's `len` column is `strlen(name)` and is compared before
-/// `strncmp` (`:1688`), which makes the match whole-token rather than a prefix
-/// -- reproduced by comparing the token to the whole name.
 const FLAG_TABLE: [FlagMap; 5] = [
     FlagMap {
         name: "answered",
@@ -3154,25 +2863,13 @@ fn togglebit(toggle: bool, modify: &mut u64, bits: u64) {
 /// ```c
 /// return (arg[0] == 0xe2) && (arg[1] == 0x80) && (arg[2] & 0x80);
 /// ```
-///
-/// The three reads are unguarded in C and safe there only because the argument
-/// is NUL-terminated -- a one- or two-byte argument stops the `&&` chain at the
-/// terminator. Slice access reproduces that without the dependence on a
-/// terminator: a short argument simply has no third byte and cannot match, which
-/// [`mod tests`](self) asserts for both the one- and two-byte cases.
-///
-/// The range is the Unicode general-punctuation block that begins at U+2000, so
-/// it catches an en dash or a non-breaking hyphen pasted where an ASCII `-` was
-/// meant.
 fn has_leading_unicode(arg: &[u8]) -> bool {
     arg.first() == Some(&0xe2)
         && arg.get(1) == Some(&0x80)
         && arg.get(2).is_some_and(|byte| byte & 0x80 != 0)
 }
 
-// ---------------------------------------------------------------------------
 // `src/tool_helpers.c` folded in
-// ---------------------------------------------------------------------------
 
 /// `reqname[]` -- `src/tool_helpers.c:80-87`, carrying the C comment "this
 /// mirrors the HttpReq enum in tool_sdecls.h".
@@ -3195,19 +2892,6 @@ const REQ_DEFAULT_METHOD: [&str; 6] =
     ["GET", "GET", "HEAD", "POST", "POST", "PUT"];
 
 /// `SetHTTPrequest` -- `src/tool_helpers.c:77-99`.
-///
-/// Records `req` in `store` and reports whether it conflicted. C returns `int`;
-/// `bool` says the same thing, and every caller tests it as a condition
-/// (`src/tool_getparam.c:2113`, `:2772`).
-///
-/// `true` means "conflict", and the caller turns it into
-/// [`ParameterError::BadUse`]. Setting is accepted when nothing has been chosen
-/// yet **or** when the same shape is chosen again (`:89-93`), which is why
-/// `-I -I` is not an error.
-///
-/// The warning is frozen, and so is its argument order: `reqname[req]` first,
-/// `reqname[*store]` second (`:94-96`) -- the option the user just gave, then the
-/// one already in force.
 #[allow(dead_code)] // Reached from `opt_bool` and `opt_string`.
 pub(crate) fn set_http_request(
     req: HttpReq,
@@ -3234,14 +2918,6 @@ pub(crate) fn set_http_request(
 }
 
 /// `customrequest_helper` -- `src/tool_helpers.c:101-123`.
-///
-/// Comments on a `-X` that was unnecessary or is likely to surprise. Both
-/// comparisons are `curl_strequal`, ASCII case-insensitive, so `-X get` is as
-/// redundant as `-X GET` and `-X HEAD` warns as `-X head` does.
-///
-/// The note is gated on the trace setting and the warning on `--silent`, which
-/// is [`notef`] and [`warnf`] respectively; nothing is written to a stream
-/// directly.
 #[allow(dead_code)] // Called from the operation driver after parsing, per
                     // `src/tool_operate.c`.
 pub(crate) fn customrequest_helper(
@@ -3281,12 +2957,6 @@ pub(crate) fn customrequest_helper(
 
 /// `opt_depr` -- `src/tool_getparam.c:1722-1726`, "the function that handles
 /// ARG_DEPR options".
-///
-/// Warns and returns; the caller then `break`s out of the option loop **without
-/// applying anything** (`:3014-3017`, `:3031-3034`). The nine rows are
-/// `egd-file`, `krb`, `krb4`, `metalink`, `npn`, `ntlm-wb`, `random-file`,
-/// `sslv2` and `sslv3`; the last two carry the short letters `2` and `3`, so
-/// `-2` and `-3` warn too.
 fn opt_depr(
     alias: &LongShort,
     sink: &mut dyn DiagnosticSink,
@@ -3351,9 +3021,7 @@ fn existingfile<H: ParseHost>(
     getstr_path(filename, DENY_BLANK)
 }
 
-// ---------------------------------------------------------------------------
 // Reading files the option arguments name
-// ---------------------------------------------------------------------------
 
 /// Adapts a [`ByteSource`] to [`std::io::Read`].
 ///
@@ -3389,15 +3057,6 @@ fn open_argument<H: ParseHost>(
 }
 
 /// `my_get_line` -- `src/tool_parsecfg.c:325-347`, over the bytes of a source.
-///
-/// GAP #5 (continued): `my_get_line` is declared in
-/// `src/tool_parsecfg.h:31` and
-/// defined in `src/tool_parsecfg.c`, whose port
-/// `curl-rs/src/config/parseconfig.rs` does not exist in this checkout. Two
-/// options here need it -- `--url @file` (`:1145`) and `--header @file`
-/// (`:1298`) -- so the line rule is reproduced locally. It is the same code C
-/// shares; when that module arrives, this function is what it replaces.
-/// Reported rather than worked around.
 ///
 /// The rule, exactly:
 ///
@@ -3437,23 +3096,10 @@ fn read_lines(
     Ok(lines)
 }
 
-// ---------------------------------------------------------------------------
 // `--data-urlencode` and `--url-query` -- `src/tool_getparam.c:643-743`,
 // `:894-928`
-// ---------------------------------------------------------------------------
 
 /// `data_urlencode` -- `src/tool_getparam.c:643-743`.
-///
-/// Accepts the four documented shapes and encodes only the value half:
-/// `name=value`, `name@filename`, `=value` and `@filename`, with `-` standing
-/// for standard input in either `@` form.
-///
-/// The separator search is `strchr(nextarg, '=')` first and `strchr(nextarg,
-/// '@')` only if there is no `=` (`:655-662`), so `a@b=c` splits at the `=` and
-/// is *not* a file reference. With neither separator the whole argument is the
-/// value and no name is prepended (`:667-672`).
-///
-/// `%20` becomes `+` after encoding (`:715`), per RFC 1866.
 fn data_urlencode<H: ParseHost>(
     nextarg: &[u8],
     host: &mut H,
@@ -3493,9 +3139,12 @@ fn data_urlencode<H: ParseHost>(
     }
 
     // `:711-733` -- `curl_easy_escape` then the `%20` fix-up, then the name.
-    let encoded = replace_url_encoded_space_by_plus(
-        &curl_rs_lib::url::escape::escape(&postdata),
-    );
+    // The escape is three times the length of data the user supplied through
+    // `--data-urlencode`, which may be a whole file, so a refusal is reported.
+    // C's own `if(!enc)` arm at `:715-716` answers `PARAM_NO_MEM`.
+    let escaped = curl_rs_lib::url::escape::escape(&postdata)
+        .map_err(|_| ParameterError::NoMem)?;
+    let encoded = replace_url_encoded_space_by_plus(&escaped);
     if nlen == 0 {
         return Ok(encoded);
     }
@@ -3545,9 +3194,7 @@ fn url_query<H: ParseHost>(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // `-d` and friends -- `src/tool_getparam.c:930-1073`
-// ---------------------------------------------------------------------------
 
 /// `set_data` -- `src/tool_getparam.c:930-1008`.
 ///
@@ -3559,11 +3206,6 @@ fn url_query<H: ParseHost>(
 /// * `--data-binary` and `--json` read the file verbatim, everything else reads
 ///   it as text with newlines removed (`:962-970`);
 /// * anything else is the literal argument, blanks allowed (`:985-990`).
-///
-/// Repeated options concatenate with `&` between them, and `--json` is the one
-/// exception: it appends with no separator (`:994-999`). `--json` also sets
-/// `jsoned` (`:991-992`), and every key leaves `postfields` designated
-/// (`:1006`).
 fn set_data<H: ParseHost>(
     cmd: CmdKey,
     nextarg: &[u8],
@@ -3717,13 +3359,6 @@ fn sethttpver(
 /// * `ids` and `time` set only the local mirrors (`:796-801`);
 /// * anything else is forwarded as `+name,-lib-ids` or `-name,-lib-ids`
 ///   (`:802-809`).
-///
-/// The `-lib-ids` suffix is what keeps libcurl from prefixing its own trace
-/// lines with identifiers the tool prints itself. A separator is followed by an
-/// optional single space (`:810-814`), so `--trace-config "ids, time"` parses.
-///
-/// A forwarding failure is C's `CURLcode`, which every caller reports as
-/// [`ParameterError::NoMem`] (`:1522`, `:1549`, `:1555`, `:1560`, `:2588`).
 fn set_trace_config<H: ParseHost>(
     token: &[u8],
     global: &mut GlobalConfig,
@@ -3792,22 +3427,9 @@ fn set_trace_config<H: ParseHost>(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // URL and output nodes -- `src/tool_getparam.c:1084-1509`
-// ---------------------------------------------------------------------------
 
 /// `add_url` -- `src/tool_getparam.c:1084-1125`.
-///
-/// Fills the next URL-less node in the operation's list, creating one when every
-/// existing node already has a URL. `url_get` is the cursor C advances past
-/// filled nodes (`:1091-1099`); a `None` cursor starts at the head.
-///
-/// `remote_noglob` is set only by `--url @file` (`:1147`), which treats every
-/// line as `-O` with globbing off.
-///
-/// The etag check at `:1118-1122` is the frozen error "The etag options only
-/// work on a single URL", and it fires on the *second* URL, because `num_urls`
-/// is incremented first.
 fn add_url(
     config: &mut OperationConfig,
     thisurl: &[u8],
@@ -3870,12 +3492,6 @@ fn add_url(
 }
 
 /// `parse_url` -- `src/tool_getparam.c:1127-1161`.
-///
-/// `--url @file` reads one URL per line and treats them all as `-O`
-/// (`:1131-1158`); anything else is a single URL. A file that cannot be opened,
-/// a line that cannot be read and a URL that [`add_url`] rejects all collapse to
-/// [`ParameterError::ReadError`] (`:1154-1158`) -- which is why an empty line in
-/// such a file is skipped by [`read_lines`] rather than reported.
 fn parse_url<H: ParseHost>(
     config: &mut OperationConfig,
     nextarg: &[u8],
@@ -3904,14 +3520,6 @@ fn parse_url<H: ParseHost>(
 }
 
 /// `parse_localport` -- `src/tool_getparam.c:1163-1197`.
-///
-/// `--local-port <num>[-<num>]`, where the separator may carry one blank on
-/// either side (`:1176-1182`). The range is stored as a base and a count, and
-/// the count is derived by subtracting: `range -= (port - 1)` (`:1192`), so
-/// `8000-8005` becomes base 8000, count 6.
-///
-/// Both bounds are capped at 65535 and a count below one is rejected
-/// (`:1193-1194`).
 fn parse_localport(
     config: &mut OperationConfig,
     nextarg: &[u8],
@@ -4040,18 +3648,6 @@ fn parse_continue_at(
 }
 
 /// `parse_ech` -- `src/tool_getparam.c:1228-1277`.
-///
-/// `--ech` takes a keyword, a `pn:<name>` public name, or an `ecl:` ECHConfigList
-/// that may itself be `ecl:@file` or `ecl:@-`.
-///
-/// The length tests are C's and they are asymmetric: `pn:` needs more than four
-/// bytes and `ecl:` more than five (`:1234`, `:1238`), because each prefix plus
-/// at least one payload byte is the minimum. The capability gate comes first
-/// (`:1232-1233`), so `--ech` without ECH support is
-/// [`ParameterError::LibcurlDoesntSupport`] whatever the argument.
-///
-/// The indirect form stores `ecl:` prepended to the file's contents (`:1266`),
-/// not the filename.
 fn parse_ech<H: ParseHost>(
     config: &mut OperationConfig,
     nextarg: &[u8],
@@ -4117,13 +3713,6 @@ fn parse_ech<H: ParseHost>(
 }
 
 /// `parse_header` -- `src/tool_getparam.c:1279-1324`.
-///
-/// `-H` and `--proxy-header` share this. A leading `@` reads many headers from a
-/// file or standard input (`:1286-1311`); otherwise the argument is one header.
-///
-/// The frozen warning at `:1315-1316` fires when the argument contains neither
-/// `:` nor `;` -- `;` because `-H "Header;"` is how a header is removed -- and its
-/// wording depends on which option was used, "proxy" or "HTTP".
 fn parse_header<H: ParseHost>(
     config: &mut OperationConfig,
     cmd: CmdKey,
@@ -4301,8 +3890,6 @@ fn parse_quote(
 /// * a range containing anything but digits, `-` and `,` warns and is sent as
 ///   given (`:1458-1467`) -- the loop `break`s at the first offending byte, so
 ///   the warning appears once.
-///
-/// The mutual exclusion with `--continue-at` is checked first (`:1436-1439`).
 fn parse_range(
     config: &mut OperationConfig,
     nextarg: &[u8],
@@ -4413,19 +4000,6 @@ fn parse_upload_file(
 /// | 2 | 3 | `tracetype = TRACE_ASCII`, `ssl,read,write` (`:1551-1556`) |
 /// | 3 | 4 | `network` (`:1557-1561`) |
 /// | 4+ | -- | "no effect for now" (`:1562-1564`) |
-///
-/// `--no-verbose` resets to zero, disables every component and clears the trace
-/// type (`:1519-1525`).
-///
-/// # `verbose_nopts` is what separates `-vvv` from `-v -v -v`
-///
-/// `:1526-1531` resets the verbosity to zero when this is the *first* option of
-/// the current argv element, so each new element restarts the ladder at 1 while
-/// letters within one element climb it. The `!global->trace_set` guard on that
-/// reset keeps an explicit `--trace-config` from being undone.
-///
-/// The frozen warning at `:1541-1542` fires only on the 0-to-1 step and only
-/// when a *different* trace type was already chosen.
 fn parse_verbose<H: ParseHost>(
     toggle: bool,
     global: &mut GlobalConfig,
@@ -4536,15 +4110,6 @@ fn parse_writeout<H: ParseHost>(
 }
 
 /// `parse_time_cond` -- `src/tool_getparam.c:1608-1649`.
-///
-/// `-z`. The leading byte selects the condition: `-` is If-Unmodified-Since, `=`
-/// is Last-Modified, and `+` or nothing is If-Modified-Since -- note the
-/// `FALLTHROUGH` at `:1616`, which is what makes `+` and the default share an
-/// arm.
-///
-/// The remainder is a date; if it is not one, it is tried as a filename
-/// (`:1635-1639`), and if that fails too the condition is removed with the
-/// frozen warning at `:1643-1645`.
 fn parse_time_cond<H: ParseHost>(
     config: &mut OperationConfig,
     nextarg: &[u8],
@@ -4576,7 +4141,7 @@ fn parse_time_cond<H: ParseHost>(
         None => {
             // `:1635-1646` -- "now let's see if it is a filename to get the
             // time from instead!"
-            match host.file_time(rest) {
+            match host.file_time(rest, sink, msgs) {
                 Some(when) => config.condtime = when,
                 None => {
                     config.timecond = CURL_TIMECOND_NONE;
@@ -4594,9 +4159,7 @@ fn parse_time_cond<H: ParseHost>(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // The four dispatch switches -- `src/tool_getparam.c:1741-2877`
-// ---------------------------------------------------------------------------
 //
 // C reaches `config` through the parameter of the same name and `global`
 // through a file-static pointer. Here both come from `GlobalConfig`: the
@@ -4605,21 +4168,9 @@ fn parse_time_cond<H: ParseHost>(
 // places. That is why an arm needing a capability flag reads it into a local
 // before taking the configuration -- the two borrows are of different fields but
 // must not be live at the same instant through the same path.
-//
-// `msg_config` is snapshotted once when a switch is entered; see that function
-// for why that is indistinguishable from C's per-call read.
 
 /// `opt_none` -- `src/tool_getparam.c:1741-1818`, "the function that handles
 /// ARG_NONE options".
-///
-/// Twenty rows, of which eighteen have a `case`. `--sslv2` and `--sslv3` do not,
-/// because both are `ARG_DEPR` and [`opt_depr`] has already stopped the loop
-/// before this is reached (`:3031-3034`).
-///
-/// **There is no `default:` arm** (`:1745-1816`). A key with no `case` therefore
-/// leaves `err` at `PARAM_OK` and the option is silently accepted, and the same
-/// is true of [`opt_file`] and [`opt_string`]; only [`opt_bool`] rejects an
-/// unknown key. That asymmetry is preserved.
 fn opt_none(
     alias: &LongShort,
     global: &mut GlobalConfig,
@@ -4724,13 +4275,6 @@ fn opt_none(
 }
 
 /// The operation being configured -- C's `config` parameter.
-///
-/// C reaches it through `global->first` and then `global->last`
-/// (`src/tool_getparam.c:3058`, `:3086`), both of which are non-`NULL` once
-/// `config_alloc()` has succeeded. `ConfigChain` is never empty for the same
-/// reason -- it is constructed around an initial configuration -- so `None` here
-/// stands for the one condition that makes C's pointer `NULL`, an allocation
-/// that did not happen, which `:3104` reports as `PARAM_NO_MEM`.
 fn config_of(
     global: &mut GlobalConfig,
 ) -> Result<&mut OperationConfig, ParameterError> {
@@ -4748,26 +4292,7 @@ fn config_of(
 
 /// `opt_bool` -- `src/tool_getparam.c:1821-2205`, "the function that handles
 /// boolean options".
-///
-/// One hundred and fifteen rows, of which 112 have a `case`; `--metalink`,
-/// `--npn` and `--ntlm-wb` are `ARG_DEPR` and never arrive. Three more --
-/// `--test-duphandle`, `--test-event` and `--wdebug` -- have a `case` only under
-/// `DEBUGBUILD` or `USE_WATT32` and therefore reach the `default:` arm here; see
-/// [`ALIASES`] and GAP #6.
-///
-/// **This is the one switch with a `default:`** (`:2201-2202`), which returns
-/// [`ParameterError::OptionUnknown`].
-///
-/// `toggle` is `false` for `--no-<name>` and, for the six `ARG_NO` rows, for the
-/// short form as well (`:2989`). Six arms therefore read `!toggle`, because the
-/// option's name states the negative: `--alpn` clears `noalpn`, `--buffer`
-/// clears `nobuffer`, `--keepalive` clears `nokeepalive`, `--sessionid` clears
-/// `disable_sessionid`, `--epsv`/`--eprt` clear their `disable_*` twins and
-/// `--progress-meter` clears `noprogress`.
 #[allow(clippy::cognitive_complexity)] // One arm per option, as C has one
-                                       // `case` per option; splitting the table
-                                       // would hide the 1:1 correspondence
-                                       // that AAP section 0.8.1 freezes.
 fn opt_bool<H: ParseHost>(
     alias: &LongShort,
     toggle: bool,
@@ -5113,9 +4638,7 @@ fn opt_bool<H: ParseHost>(
         CmdKey::RemoteHeaderName => {
             config_of(global)?.content_disposition = toggle;
         }
-        // `:2120-2122` -- recorded only. The mandatory warning belongs to
-        // `crate::output::msgs::warn_insecure_flags`, which the transfer path
-        // calls, and the default stays verification-on per AAP section 0.8.1.
+        // `:2120-2122` -- recorded only.
         CmdKey::Insecure => config_of(global)?.insecure_ok = toggle,
         // `:2123-2125`
         CmdKey::DohInsecure => config_of(global)?.doh_insecure_ok = toggle,
@@ -5226,10 +4749,6 @@ fn opt_bool<H: ParseHost>(
 /// `opt_file` -- `src/tool_getparam.c:2221-2339`, "opt_file handles file
 /// options".
 ///
-/// Twenty-five rows, of which 24 have a `case`; `--random-file` is `ARG_DEPR`
-/// and never arrives. Like [`opt_none`] and [`opt_string`] there is **no
-/// `default:`** (`:2231-2337`).
-///
 /// The shared preamble at `:2227-2230` warns when the argument looks like a flag,
 /// which catches `-o -v`; the test is a leading `-` followed by at least one more
 /// byte, so a bare `-` -- standard output -- does not warn.
@@ -5292,7 +4811,7 @@ fn opt_file<H: ParseHost>(
                 );
                 return Err(ParameterError::BadUse);
             }
-            let outcome = host.parse_config(nextarg, remaining);
+            let outcome = host.parse_config(nextarg, remaining, sink, &msgs);
             if outcome != ParameterError::Ok {
                 return Err(outcome);
             }
@@ -5386,7 +4905,7 @@ fn opt_file<H: ParseHost>(
             global.ssl_sessions = Some(getstr_path(nextarg, DENY_BLANK)?);
         }
         // `:2311-2313`
-        CmdKey::Stderr => host.set_stderr_file(nextarg),
+        CmdKey::Stderr => host.set_stderr_file(nextarg, &msgs),
         // `:2314-2321`
         CmdKey::Trace => {
             let path = getstr_path(nextarg, DENY_BLANK)?;
@@ -5447,17 +4966,6 @@ const REDIR_PROTOS: [&str; 4] = ["http", "https", "ftp", "ftps"];
 
 /// `opt_string` -- `src/tool_getparam.c:2342-2877`, "opt_string handles string
 /// options".
-///
-/// One hundred and twenty-two rows, of which 117 have a `case`. The five without
-/// one are `--egd-file`, `--krb` and `--krb4`, which are `ARG_DEPR` and never
-/// arrive; `--help`, which the parser handles itself at `:3001-3005`; and
-/// `--socks5-gssapi-service`, which has no `case` at all and is therefore
-/// **accepted and ignored** -- there is no `default:` here either, so `err` stays
-/// `PARAM_OK`.
-///
-/// `if(!nextarg) nextarg = "";` at `:2356-2357` is why a `--name=` with nothing
-/// after the `=` reaches the handlers as an empty string rather than as an
-/// absent argument, and why `DENY_BLANK` is what rejects it.
 #[allow(clippy::cognitive_complexity)] // One arm per option; see `opt_bool`.
 fn opt_string<H: ParseHost>(
     alias: &LongShort,
@@ -6208,21 +5716,9 @@ fn clamp_u16(value: i64) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
-// ---------------------------------------------------------------------------
 // `getparameter` -- `src/tool_getparam.c:2888-3049`
-// ---------------------------------------------------------------------------
 
 /// One command-line option, applied.
-///
-/// The direct port of `getparameter`, clause for clause. `flag` is either
-/// `--long-name`, a short cluster such as `-abc`, or a bare name with no dashes
-/// -- which is how `parse_args` synthesises `--url` (`:3119`) and how a
-/// configuration file names an option.
-///
-/// `usedarg` reports whether `nextarg` was consumed as a separate argv element,
-/// so the caller knows whether to skip it. It is `false` when the argument came
-/// from a `--name=value` split (`:2938`) or from inside a short cluster
-/// (`:2997-2999`), because in neither case is there a separate element.
 ///
 /// # Order of operations, and why it is not rearranged
 ///
@@ -6239,12 +5735,6 @@ fn clamp_u16(value: i64) -> u16 {
 /// 7. the loop runs once for a long option and once per letter for a cluster,
 ///    with `ARG_TLS` checked first, `--help` special-cased, `ARG_DEPR` stopping
 ///    the loop, and `ARG_CLEAR` wiping afterwards (`:2981-3044`).
-///
-/// The loop condition `!longopt && !singleopt && *++parse && !*usedarg && !err`
-/// is reproduced exactly: a long option runs once; `-ofoo` runs once because the
-/// rest of the cluster became the argument; `-abc` runs three times; and
-/// consuming a separate argument ends the cluster, which is why `-so out` is
-/// `-s -o out` and `-os out` is `-o "s"`.
 #[allow(clippy::too_many_lines)] // The clause order above is the specification;
                                  // splitting it would hide it.
 pub(crate) fn getparameter<H: ParseHost>(
@@ -6381,7 +5871,8 @@ pub(crate) fn getparameter<H: ParseHost>(
                 let category = nextarg
                     .filter(|value| !value.is_empty())
                     .map(|value| String::from_utf8_lossy(value).into_owned());
-                host.help(category.as_deref());
+                let msgs = msg_config(global);
+                host.help(category.as_deref(), sink, &msgs);
                 return Err(ParameterError::HelpRequested);
             } else if nextarg.is_none() {
                 return Err(ParameterError::RequiresParameter);
@@ -6457,18 +5948,9 @@ pub(crate) fn getparameter<H: ParseHost>(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // `parse_args` -- `src/tool_getparam.c:3052-3149`
-// ---------------------------------------------------------------------------
 
 /// The whole command line.
-///
-/// `argv` is the process arguments *including* `argv[0]`, because C's loop starts
-/// at `i = 1` (`:3060`) and this one skips the same element. It is
-/// `[OsString]` rather than `[String]`: `std::env::args` panics on an argument
-/// that is not valid Unicode and curl accepts one -- see the module note on
-/// bytes. `argv[0]` is skipped and never read, so nothing here learns the
-/// program's name from it.
 ///
 /// # The frozen control flow
 ///
@@ -6484,16 +5966,6 @@ pub(crate) fn getparameter<H: ParseHost>(
 ///   [`ParameterError::ContdispResumeFrom`], checked after the walk
 ///   (`:3128-3131`);
 /// * the five `*_REQUESTED` outcomes are exempt from reporting (`:3133-3138`).
-///
-/// # Reporting
-///
-/// [`helpf`] is ungated and always appends the try-line; the prefix is `curl: `.
-/// The composition is `option <opt>: <reason>` unless the failing element was
-/// literally `":"`, the short form of `--next`, in which case only the reason is
-/// printed (`:3141-3144`) -- because "option :: missing URL before --next" would
-/// read as a typo.
-#[allow(dead_code)] // The entry point the operation driver calls; see
-                    // `src/tool_operate.c:2293`.
 pub(crate) fn parse_args<H: ParseHost>(
     argv: &[OsString],
     global: &mut GlobalConfig,
@@ -6615,17 +6087,6 @@ pub(crate) fn parse_args<H: ParseHost>(
 }
 
 /// `PARAM_NEXT_OPERATION` handling -- `src/tool_getparam.c:3088-3110`.
-///
-/// `--next` starts a fresh operation, but only when the current one already has a
-/// URL: the guard is `config->url_list && config->url_list->url`, the *first*
-/// node's URL rather than any node's, so `curl --next` and `curl -o out --next`
-/// both fail with the frozen error.
-///
-/// C allocates the new configuration, links it both ways and moves `global->last`
-/// onto it. `ConfigChain` owns its elements, so appending does all three
-/// (AAP section 0.6.9 replaces the intrusive `next`/`prev` chain with owned
-/// storage), and the failure `:3104` reports as `PARAM_NO_MEM` is the reservation
-/// failing.
 fn start_next_operation(
     global: &mut GlobalConfig,
     sink: &mut dyn DiagnosticSink,
@@ -6652,28 +6113,9 @@ fn start_next_operation(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // The `clap` surface
-// ---------------------------------------------------------------------------
 
 /// The declarative record of the frozen command line, as a `clap` 4.x derive.
-///
-/// AAP section 0.8.3 requires "clap 4.x, derived 1:1 from the curl 8.x
-/// long-option inventory". This is that derive: it carries the program identity,
-/// the usage line and the URL positional, and [`clap_command`] extends it with
-/// every row of [`ALIASES`] so that the inventory is *generated from the table*
-/// rather than restated beside it. A restatement would be 397 hand-written
-/// attributes able to disagree with the table; a generated one cannot, and
-/// [`mod tests`](self) proves the agreement in both directions.
-///
-/// # It is a record, not the parser
-///
-/// [`getparameter`] and [`parse_args`] do the parsing, because `clap` implements
-/// none of the ten behaviours listed in the module documentation. What this
-/// surface is for is everything else that needs to know the inventory: shell
-/// completions (`clap_complete`, replacing `scripts/completion.pl`), the usage
-/// line, and the cross-check that no option has been added, renamed or
-/// re-typed.
 ///
 /// # The identity is `curl`
 ///
@@ -6696,18 +6138,6 @@ fn start_next_operation(
                     // the surface-parity cross-checks.
 pub(crate) struct ClapSurface {
     /// The URLs to transfer.
-    ///
-    /// C has no positional declaration at all: `parse_args` sends any element
-    /// that does not start with `-` to `--url` (`src/tool_getparam.c:3115-3120`).
-    /// The positional records that, and `num_args` is unbounded because
-    /// `--next` and globbing both allow many.
-    ///
-    /// `id` is set explicitly because `clap` derives an identifier from the
-    /// field name, and `url` is already taken: `{"url", ARG_STRG, ' ',
-    /// C_URL}` is a row of the table (`src/tool_getparam.c:361`), so
-    /// [`clap_command`] adds an argument with that identifier. `clap` rejects a
-    /// duplicate identifier outright. The row keeps the name -- it is the
-    /// frozen one -- and the positional, which C does not name at all, yields.
     #[arg(id = "urls", value_name = "url", num_args = 0..)]
     pub(crate) url: Vec<OsString>,
 }
@@ -6724,22 +6154,6 @@ pub(crate) struct ClapSurface {
 ///   is [`ParameterError::NoPrefix`];
 /// * an argument slot for the 147 `ARG_STRG` and `ARG_FILE` rows, and none for
 ///   the other 135.
-///
-/// `disable_help_flag` and `disable_version_flag` on the derive are load-bearing:
-/// `--help`/`-h` and `--version`/`-V` are rows 118 and 275 of the table, and
-/// `clap` would otherwise add its own and refuse to build with a duplicate.
-///
-/// # Two spellings are deliberately absent
-///
-/// `--expand-<name>` (`:2922-2926`) applies to all 147 argument-taking rows and
-/// would add 147 more identifiers whose only difference is that the argument is
-/// expanded before use. It is a prefix of the *parser*, not an option, and
-/// [`getparameter`] strips it before any lookup; adding it here would suggest
-/// there are 544 options rather than 282. `--no-expand-<name>` is not a spelling
-/// at all, because the two prefixes are mutually exclusive.
-///
-/// `allow_hyphen_values` is set on every argument-taking row because `-o -v` is
-/// accepted by C with a warning (`:2227-2230`), not rejected.
 #[allow(dead_code)] // Reached by the completion generator and the cross-checks.
 pub(crate) fn clap_command() -> clap::Command {
     let mut command = <ClapSurface as clap::CommandFactory>::command();
@@ -6793,17 +6207,9 @@ pub(crate) fn clap_command() -> clap::Command {
 
 // Cross-checks
 //
-// AAP section 0.8.7 relocates the coverage of `tests/unit` into the crates,
-// because "A Rust static library does not export `pub(crate)` items and the C
-// unit tests therefore cannot link whatever the quality of the translation".
 // These are that coverage for this module: the frozen inventory, every frozen
 // literal, every acceptance rule and every preserved quirk, asserted against
 // `src/tool_getparam.c` and `src/tool_helpers.c` by line.
-//
-// Nothing here reaches the network, and nothing reaches the filesystem except
-// the two assertions that compare the option surface against
-// `docs/cmdline-opts/`, which is committed reference material that
-// `curl-rs/build.rs` also reads.
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashSet};
@@ -6813,9 +6219,7 @@ mod tests {
     use super::*;
     use crate::cli::paramhlp::SeekSource;
 
-    // -----------------------------------------------------------------------
     // Fixtures
-    // -----------------------------------------------------------------------
 
     /// A [`ParseHost`] with no side effects and a small in-memory filesystem.
     ///
@@ -6845,6 +6249,14 @@ mod tests {
         trace_fails: bool,
         /// The cursor `StdinAccess` reads from.
         stdin_at: usize,
+        /// Every [`MsgConfig`] the parser handed to a host method, in order.
+        ///
+        /// Recorded so that a test can assert the host is told the *current*
+        /// verbosity rather than a default: the four methods that emit a
+        /// diagnostic reproduce gates C reads from `global` at the moment of
+        /// the call (`src/tool_msgs.c:81`, `:95`, `:130`), and a host given a
+        /// stale value would emit under `--silent` where C stays quiet.
+        verbosities: Vec<MsgConfig>,
     }
 
     impl FakeHost {
@@ -6917,7 +6329,13 @@ mod tests {
             self.files.iter().any(|(name, _)| name == path)
         }
 
-        fn file_time(&mut self, path: &[u8]) -> Option<i64> {
+        fn file_time(
+            &mut self,
+            path: &[u8],
+            _sink: &mut dyn DiagnosticSink,
+            msgs: &MsgConfig,
+        ) -> Option<i64> {
+            self.verbosities.push(*msgs);
             self.times
                 .iter()
                 .find(|(name, _)| name == path)
@@ -6929,11 +6347,18 @@ mod tests {
             !self.trace_fails
         }
 
-        fn set_stderr_file(&mut self, path: &[u8]) {
+        fn set_stderr_file(&mut self, path: &[u8], msgs: &MsgConfig) {
+            self.verbosities.push(*msgs);
             self.stderr_files.push(path.to_vec());
         }
 
-        fn help(&mut self, category: Option<&str>) {
+        fn help(
+            &mut self,
+            category: Option<&str>,
+            _sink: &mut dyn DiagnosticSink,
+            msgs: &MsgConfig,
+        ) {
+            self.verbosities.push(*msgs);
             self.helped.push(category.map(str::to_owned));
         }
 
@@ -6941,7 +6366,10 @@ mod tests {
             &mut self,
             filename: &[u8],
             max_recursive: i32,
+            _sink: &mut dyn DiagnosticSink,
+            msgs: &MsgConfig,
         ) -> ParameterError {
+            self.verbosities.push(*msgs);
             self.configs.push((filename.to_vec(), max_recursive));
             self.config_outcome.unwrap_or(ParameterError::Ok)
         }
@@ -6981,6 +6409,29 @@ mod tests {
         run_with(FakeHost::default(), arguments)
     }
 
+    /// What the mandatory warning emits for the configuration a command line
+    /// produced.
+    ///
+    /// The whole chain in one helper: `argv` goes through [`parse_args`], the
+    /// resulting [`OperationConfig`] is handed to
+    /// [`crate::output::msgs::warn_insecure_flags`] as the
+    /// [`crate::output::msgs::InsecureRequest`] it implements, and the bytes
+    /// come back. Nothing here supplies a boolean, which is the point -- the
+    /// only route from a flag to a warning is the one production uses.
+    fn insecure_warning_for(arguments: &[&str]) -> Option<String> {
+        let outcome = run(arguments)?;
+        assert!(
+            outcome.result.is_ok(),
+            "the command line must parse: {:?} gave {:?}",
+            arguments,
+            outcome.result
+        );
+        let config = config(&outcome.global)?;
+        let mut emitted: Vec<u8> = Vec::new();
+        crate::output::msgs::warn_insecure_flags(&mut emitted, config);
+        Some(String::from_utf8_lossy(&emitted).into_owned())
+    }
+
     fn run_with(mut host: FakeHost, arguments: &[&str]) -> Option<Outcome> {
         let (mut global, mut sink) = fixture()?;
         let mut argv: Vec<OsString> = vec![OsString::from("curl")];
@@ -7003,14 +6454,6 @@ mod tests {
     }
 
     /// Reverses the line wrapping `voutf` applies.
-    ///
-    /// `src/tool_msgs.c:45` breaks a diagnostic at the terminal width and
-    /// re-prefixes every continuation, and
-    /// `curl-rs/src/output/msgs.rs` reproduces that -- including reading the
-    /// width from the environment, which makes the raw bytes depend on where the
-    /// test runs. The break keeps the space it broke at, so removing every
-    /// newline-plus-prefix restores the message exactly and lets an assertion be
-    /// about the frozen text rather than about the terminal.
     fn unwrapped(text: &str, prefix: &str) -> String {
         let separator = format!("\n{prefix}");
         let mut out = String::with_capacity(text.len());
@@ -7040,13 +6483,6 @@ mod tests {
     }
 
     /// Whether this build advertises TLS.
-    ///
-    /// `curl-rs-lib/src/version.rs` declares `ENGINE_TLS` absent while
-    /// `curl-rs-lib/src/tls/mod.rs` is unwritten, so the 61 `ARG_TLS` rows are
-    /// refused by the gate at `src/tool_getparam.c:2991` in this checkout. AAP
-    /// section 0.6.5 measures that under-reporting a capability is the safe
-    /// direction, so the tests assert whichever answer the build gives rather
-    /// than assuming one -- and thereby assert the gate itself.
     fn tls_available() -> bool {
         fixture().is_some_and(|(global, _)| global.libinfo.feature_ssl())
     }
@@ -7068,20 +6504,9 @@ mod tests {
             .collect()
     }
 
-    // -----------------------------------------------------------------------
     // 1-7: the frozen inventory
-    // -----------------------------------------------------------------------
 
-    // -----------------------------------------------------------------------
     // `ParameterError` and `param2text`
-    //
-    // These five carry forward verbatim from the earlier state of this file,
-    // where they were written against `src/tool_getparam.h:336-363` and
-    // `src/tool_helpers.c:35-75` and passed. They are restored unchanged in
-    // substance -- only `the_seventeen_named_phrases_are_reproduced_verbatim`
-    // is renamed, because the body always held seventeen assertions and C has
-    // seventeen explicit arms (`:38-71`); the old name said sixteen.
-    // -----------------------------------------------------------------------
 
     /// Every variant, in declaration order, so the discriminant assertions and
     /// the rendering assertions both cover the whole enumeration.
@@ -7263,8 +6688,6 @@ mod tests {
 
     #[test]
     fn the_table_has_exactly_the_282_rows_the_aap_freezes() {
-        // AAP section 0.8.1 and `src/tool_getparam.c:80`. Measured with
-        // `awk 'NR>=80 && /^  \{"/' src/tool_getparam.c | wc -l`.
         assert_eq!(ALIASES.len(), 282);
         assert_eq!(ALIASES.len(), CmdKey::COUNT);
     }
@@ -7516,9 +6939,7 @@ mod tests {
         assert!(findlongopt(&[0xff, 0xfe]).is_none());
     }
 
-    // -----------------------------------------------------------------------
     // 8-13: the clap surface
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_clap_surface_matches_the_table_in_both_directions() {
@@ -7748,9 +7169,7 @@ mod tests {
         assert_eq!(out.result, Err(ParameterError::OptionUnknown));
     }
 
-    // -----------------------------------------------------------------------
     // 14-15: correspondence with `docs/cmdline-opts/`
-    // -----------------------------------------------------------------------
 
     /// The repository root. `CARGO_MANIFEST_DIR` is `<root>/curl-rs`.
     fn repository_root() -> Option<&'static Path> {
@@ -7903,9 +7322,7 @@ mod tests {
         assert_eq!(found, 59);
     }
 
-    // -----------------------------------------------------------------------
     // 16-22: the frozen texts
-    // -----------------------------------------------------------------------
 
     #[test]
     fn set_http_request_reports_a_conflict_with_the_c_argument_order() {
@@ -8141,9 +7558,7 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
     // 23-31: parser-level behaviour
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_parser_fixture_is_available() {
@@ -8154,6 +7569,239 @@ mod tests {
             fixture().is_some(),
             "GlobalConfig::init must succeed for the parser to be testable"
         );
+    }
+
+    /// Every insecure flag, from the command line to the mandatory warning.
+    ///
+    /// The end-to-end assertion AAP section 0.8.4's gate 10 needs, and the one
+    /// this file previously could not make: the three bits were stored here and
+    /// the warning was called elsewhere with literals, so nothing anywhere
+    /// connected `--insecure` on a command line to a line on stderr. The route
+    /// exercised is exactly production's -- `parse_args` writes
+    /// `OperationConfig`, `OperationConfig` implements `InsecureRequest`, and
+    /// `warn_insecure_flags` reads it -- with no boolean supplied by the test.
+    ///
+    /// A URL is included in each command line because these are all boolean
+    /// options and a bare flag is a complete, valid invocation; the URL simply
+    /// makes the lines resemble what a user types.
+    ///
+    /// # `--doh-insecure` is absent here, and that is measured rather than
+    /// overlooked
+    ///
+    /// Its row carries `ARG_TLS` -- `ARG_BOOL|ARG_TLS`, exactly as
+    /// `src/tool_getparam.c:126` writes it, while `insecure` at `:179` and
+    /// `proxy-insecure` at `:256` carry `ARG_BOOL` alone. The gate at `:2991-2994`
+    /// therefore refuses `--doh-insecure` with `PARAM_LIBCURL_DOESNT_SUPPORT`
+    /// unless the library advertises `SSL`, and
+    /// `curl_rs_lib::version::ENGINE_TLS` is deliberately absent because the
+    /// backend cannot complete a handshake yet. A C curl built without TLS
+    /// refuses the flag identically, so this is parity rather than a gap -- and
+    /// a user who cannot request insecure DoH is owed no warning about it.
+    /// [`the_tls_gate_is_what_withholds_doh_insecure`] pins that reason so the
+    /// day `SSL` is advertised, the flag joins the list here.
+    #[test]
+    fn every_insecure_flag_reaches_the_mandatory_warning() {
+        for (flag, expected) in [
+            (
+                "--insecure",
+                "Warning: using --insecure makes the transfer insecure\n",
+            ),
+            (
+                "--proxy-insecure",
+                "Warning: using --proxy-insecure makes the transfer insecure\n",
+            ),
+        ] {
+            let Some(emitted) =
+                insecure_warning_for(&[flag, "https://example.com/"])
+            else {
+                return;
+            };
+            assert_eq!(
+                emitted, expected,
+                "{flag} must reach the mandatory warning"
+            );
+        }
+    }
+
+    /// `--doh-insecure` is refused for the `ARG_TLS` reason, and only that one.
+    ///
+    /// Two assertions, because either alone would be misleading. The row really
+    /// does carry `ARG_TLS` -- so the refusal is the gate at
+    /// `src/tool_getparam.c:2991-2994` and not a parsing accident -- and the
+    /// library really does withhold `SSL`, which is why the gate fires. When the
+    /// TLS engine lands, `feature_ssl()` becomes true, this test's second
+    /// assertion fails, and whoever fixes it is told by the first to move
+    /// `--doh-insecure` into
+    /// [`every_insecure_flag_reaches_the_mandatory_warning`].
+    #[test]
+    fn the_tls_gate_is_what_withholds_doh_insecure() {
+        let row = findlongopt(b"doh-insecure")
+            .expect("the row exists: src/tool_getparam.c:126");
+        assert_ne!(
+            row.desc & ARG_TLS,
+            0,
+            "doh-insecure is ARG_BOOL|ARG_TLS at src/tool_getparam.c:126"
+        );
+        for ungated in ["insecure", "proxy-insecure"] {
+            let other =
+                findlongopt(ungated.as_bytes()).expect("the row exists");
+            assert_eq!(
+                other.desc & ARG_TLS,
+                0,
+                "{ungated} carries ARG_BOOL alone in the C table"
+            );
+        }
+
+        let Some(outcome) = run(&["--doh-insecure", "https://example.com/"])
+        else {
+            return;
+        };
+        if outcome.global.libinfo.feature_ssl() {
+            // TLS has landed. The flag must now be accepted and must reach the
+            // warning; add it back to the list in the test above.
+            assert!(
+                outcome.result.is_ok(),
+                "with SSL advertised, --doh-insecure must parse"
+            );
+            let Some(config) = config(&outcome.global) else {
+                return;
+            };
+            let mut emitted: Vec<u8> = Vec::new();
+            crate::output::msgs::warn_insecure_flags(&mut emitted, config);
+            assert_eq!(
+                String::from_utf8_lossy(&emitted),
+                "Warning: using --doh-insecure makes the transfer insecure\n"
+            );
+        } else {
+            assert_eq!(
+                outcome.result,
+                Err(ParameterError::LibcurlDoesntSupport),
+                "without SSL the ARG_TLS gate refuses it, as the C does"
+            );
+        }
+    }
+
+    /// The negated forms clear the bit, so the warning goes silent again.
+    ///
+    /// Both rows are `ARG_BOOL` in `aliases[]`, so `--no-<flag>` exists and must
+    /// undo the flag rather than being ignored. Asserted because a warning that
+    /// could not be switched off would be as wrong as one that never appeared.
+    ///
+    /// `doh-insecure` is excluded for the `ARG_TLS` reason
+    /// [`the_tls_gate_is_what_withholds_doh_insecure`] records.
+    #[test]
+    fn the_negated_insecure_flags_silence_the_warning_again() {
+        for flag in ["insecure", "proxy-insecure"] {
+            let on = format!("--{flag}");
+            let off = format!("--no-{flag}");
+            let Some(emitted) = insecure_warning_for(&[
+                on.as_str(),
+                off.as_str(),
+                "https://example.com/",
+            ]) else {
+                return;
+            };
+            assert!(
+                emitted.is_empty(),
+                "--no-{flag} must clear the bit, but got {emitted:?}"
+            );
+        }
+    }
+
+    /// A command line asking for nothing insecure emits nothing.
+    ///
+    /// C's three `if` statements are simply not taken when the bits are clear,
+    /// and this is the assertion that the door stays quiet -- a warning on every
+    /// invocation would be as much a parity failure as a missing one, and would
+    /// corrupt the stderr comparison of every fixture.
+    #[test]
+    fn an_ordinary_command_line_emits_no_insecure_warning() {
+        let Some(emitted) = insecure_warning_for(&["https://example.com/"])
+        else {
+            return;
+        };
+        assert!(emitted.is_empty(), "unexpected warning: {emitted:?}");
+    }
+
+    /// Two flags together produce two lines, in `src/config2setopts.c`'s order.
+    ///
+    /// `doh-insecure` precedes `proxy-insecure`, which is neither alphabetical
+    /// nor the order a reader would guess, and the sequence is program output
+    /// that AAP section 0.8.1 freezes. `msgs.rs` asserts the order over its own
+    /// stand-in; this asserts it over a real parsed configuration, so the two
+    /// cannot drift apart.
+    #[test]
+    fn several_insecure_flags_warn_in_the_c_order() {
+        // Given in the reverse of C's order, so a door that emitted them in
+        // argument order would fail.
+        let Some(emitted) = insecure_warning_for(&[
+            "--proxy-insecure",
+            "--insecure",
+            "https://example.com/",
+        ]) else {
+            return;
+        };
+        assert_eq!(
+            emitted,
+            "Warning: using --insecure makes the transfer insecure\n\
+             Warning: using --proxy-insecure makes the transfer insecure\n",
+            "the order is the C's, not the order the flags were given in"
+        );
+
+        // And the middle row's position is pinned over a configuration built
+        // directly, because `--doh-insecure` cannot currently be parsed -- see
+        // `the_tls_gate_is_what_withholds_doh_insecure`. `doh-insecure` between
+        // the other two is the sequence `src/config2setopts.c:379,385,390`
+        // produces, and it is neither alphabetical nor the declaration order a
+        // reader would guess.
+        let all_three = OperationConfig {
+            insecure_ok: true,
+            doh_insecure_ok: true,
+            proxy_insecure_ok: true,
+            ..OperationConfig::default()
+        };
+        let mut full: Vec<u8> = Vec::new();
+        crate::output::msgs::warn_insecure_flags(&mut full, &all_three);
+        assert_eq!(
+            String::from_utf8_lossy(&full),
+            "Warning: using --insecure makes the transfer insecure\n\
+             Warning: using --doh-insecure makes the transfer insecure\n\
+             Warning: using --proxy-insecure makes the transfer insecure\n",
+            "doh-insecure sits between the other two"
+        );
+    }
+
+    /// The trait reports the configuration's own bits, field for field.
+    ///
+    /// The join between the two halves of the fix. `msgs.rs` tests which names
+    /// the door emits; the tests above test that a flag reaches it. This tests
+    /// the step between them -- that `InsecureRequest` is a straight read and
+    /// not a transformation that could disagree with the struct it is reading.
+    /// All eight combinations, because three independent bits have eight states
+    /// and a wrong field pairing would survive any subset of them.
+    #[test]
+    fn the_trait_reports_the_configurations_own_bits() {
+        use crate::output::msgs::InsecureRequest;
+
+        for bits in 0u8..8 {
+            let config = OperationConfig {
+                insecure_ok: bits & 1 != 0,
+                doh_insecure_ok: bits & 2 != 0,
+                proxy_insecure_ok: bits & 4 != 0,
+                ..OperationConfig::default()
+            };
+            assert_eq!(config.insecure(), config.insecure_ok, "bits {bits}");
+            assert_eq!(
+                config.doh_insecure(),
+                config.doh_insecure_ok,
+                "bits {bits}"
+            );
+            assert_eq!(
+                config.proxy_insecure(),
+                config.proxy_insecure_ok,
+                "bits {bits}"
+            );
+        }
     }
 
     #[test]
@@ -8357,10 +8005,7 @@ mod tests {
 
     #[test]
     fn an_arg_tls_row_is_refused_when_tls_is_absent() {
-        // `:2991-2994`. Whether this build reports TLS decides which way the
-        // assertion runs, and both directions are asserted rather than assumed:
-        // over-reporting a capability is what AAP section 0.6.5 calls the unsafe
-        // error.
+        // `:2991-2994`.
         let outcome = fixture();
         assert!(outcome.is_some());
         let Some((global, _)) = outcome else {
@@ -8475,9 +8120,7 @@ mod tests {
             .contains("-v, --verbose overrides an earlier trace option"));
     }
 
-    // -----------------------------------------------------------------------
     // 32-35: the value parsers
-    // -----------------------------------------------------------------------
 
     #[test]
     fn get_size_parameter_accepts_and_rejects_exactly_what_c_does() {
@@ -8653,10 +8296,7 @@ mod tests {
             })
         );
 
-        // The `_WIN32` drive-letter branch (`:456-468`) is not compiled on any
-        // of the four targets AAP section 0.1.1 names, so `c:\file:password`
-        // splits at the first colon here. Asserted so the difference is on the
-        // record rather than assumed.
+        // Asserted so the difference is on the record rather than assumed.
         assert_eq!(
             parse_cert_parameter(b"c:\\file:password"),
             Ok(CertParameter {

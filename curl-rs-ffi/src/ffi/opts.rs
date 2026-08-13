@@ -4,31 +4,7 @@
 
 //! `CURLoption` identity and the `curl_easyoption` metadata authority.
 //!
-//! This module is the SOLE source of truth for option identity. AAP 0.1.2
-//! is explicit about why a second population is not acceptable: "If those
-//! are populated from two places, they will drift, and the drift will be
-//! invisible until a consumer queries an option by name and receives the
-//! wrong identifier." Two independent consumers read this data -- the
-//! generated `include/curl/curl.h`, and the `curl_easy_option_by_name` /
-//! `_by_id` / `_next` introspection API backed by `struct curl_easyoption`
-//! (include/curl/options.h:51) -- so both are served from the tables
-//! below and from nowhere else.
-//!
-//! # Why the integers are written out
-//!
-//! A C program compiled against curl 8.19.0-DEV embeds the NUMERIC value
-//! of every option it names. Reproducing the names without the numbers
-//! yields a library that links and then silently misbehaves. The frozen
-//! header composes each value arithmetically,
-//!
-//! ```c
-//! #define CURLOPT(na, t, nu) na = ((t) + (nu))
-//! ```
-//!
-//! with the type bases pinned at `include/curl/curl.h:1111-1115` and
-//! `:1127-1136`. Every value here is written explicitly rather than
-//! recomputed, because an arithmetic slip in a base would move a whole
-//! class of options at once and nothing would report it.
+//! This module is the SOLE source of truth for option identity.
 //!
 //! # Measured reconciliation
 //!
@@ -40,12 +16,10 @@
 //!                          = 1 sentinel + 15 alias + 308 true options
 //! ```
 //!
-//! The 308 true rows and the 308 enum entries are cross-checked against
-//! each other by test. They come from two INDEPENDENT populations -- the
-//! enum from the frozen header, the table from `lib/optiontable.pl` -- so
-//! the check is a real bridge and not a tautology. `CURLoption` has no
-//! counterpart in `curl-rs-lib`, deliberately: an unused mirror there
-//! would be exactly the drifting second copy AAP 0.1.2 warns about.
+//! The 308 true rows and the 308 enum entries are cross-checked against each
+//! other by test. They come from two INDEPENDENT populations -- the enum from
+//! the frozen header, the table from `lib/optiontable.pl` -- so the check is a
+//! real bridge and not a tautology.
 //!
 //! # What this module does NOT declare
 //!
@@ -56,64 +30,19 @@
 //! duplicate `#define` for each. `struct curl_easyoption` is likewise
 //! verbatim (build.rs:849) because it is layout-visible.
 //!
-//! The 19 `#define CURLOPT_*` backward-compatibility aliases are NOT
-//! emitted from here either, and that needs saying because
-//! build.rs:1111 lists them alongside the enumeration. They cannot be:
-//! the frozen header wraps them in `#ifndef CURL_NO_OLDIES` guards and
-//! puts `#undef CURLOPT_DNS_USE_GLOBAL_CACHE` in the `#else` branch
-//! (include/curl/curl.h:650-736, :2264-2295), and cbindgen emits no
+//! The 19 `#define CURLOPT_*` backward-compatibility aliases are NOT emitted
+//! from here either, and that needs saying because build.rs:1111 lists them
+//! alongside the enumeration. They cannot be: the frozen header wraps them in
+//! `#ifndef CURL_NO_OLDIES` guards and puts `#undef
+//! CURLOPT_DNS_USE_GLOBAL_CACHE` in the `#else` branch
+//! (include/curl/curl.h:650-736,:2264-2295), and cbindgen emits no
 //! preprocessor conditionals at all. Dropping the guards would change
-//! observable behaviour for an application that defines
-//! `CURL_NO_OLDIES`, which AAP 0.8.1 freezes. The guarded blocks are
-//! therefore carried verbatim, and because every one of them expands to
-//! an IDENTIFIER rather than a literal, they resolve THROUGH the
-//! enumeration below and introduce no second population of values. The
+//! observable behaviour for an application that defines `CURL_NO_OLDIES`. The
+//! guarded blocks are therefore carried verbatim, and because every one of
+//! them expands to an IDENTIFIER rather than a literal, they resolve THROUGH
+//! the enumeration below and introduce no second population of values. The
 //! alias -> target mapping is still held here, in [`OPTION_ALIASES`], and
 //! asserted against the enumeration by test.
-//!
-//! # The identifier enumerations this module owns, and the four it does not
-//!
-//! The governing division is arithmetic rather than alphabetical: an
-//! enumeration whose members are COMPOSED -- from the `CURLOPT(na, t, nu)`
-//! macro, or from `CURLINFO_<BASE> + n` -- is option identity and belongs
-//! here. An enumeration whose members are plain declaration ordinals is a
-//! status, code or kind, and belongs to `ffi/codes.rs`. Four of the five
-//! composed enumerations are therefore declared below: [`CURLoption`],
-//! [`CURLINFO`], [`curl_easytype`] and [`CURLformoption`], together with
-//! the [`EASY_OPTIONS`] metadata array, the nine `CURLOPTTYPE_*` bases,
-//! the nine `CURLINFO_*` bases and the two `CURLOPT_WS_OPTIONS` argument
-//! bits.
-//!
-//! Four types that a reader might expect here are deliberately absent, and
-//! the reason is the same rule that put the rest here. `curl_easyoption`
-//! (include/curl/options.h:51) is LAYOUT-visible -- a consumer reads its
-//! fields through a returned pointer -- so it lives with the crate's other
-//! `#[repr(C)]` layout types in `ffi/types.rs`, and `ffi/easy.rs` projects
-//! this module's [`EasyOptionRow`] into it. `CURLMoption` and
-//! `CURLMinfo_offt` are `ffi/types.rs`'s for the same reason they are
-//! declared in `include/curl/multi.h` rather than `curl.h`: they belong to
-//! the multi surface. `CURLSHoption` is `ffi/codes.rs`'s, its members being
-//! bare ordinals.
-//!
-//! That split is not a matter of taste. Declaring `curl_easyoption` here as
-//! well would give the crate two structurally identical but DISTINCT Rust
-//! types for one C struct, and `ffi/easy.rs` would have to pick one -- the
-//! second population this module exists to prevent, arriving by the back
-//! door. It would also close a cycle, since this module would need
-//! `ffi/types.rs` for the struct while `ffi/types.rs` needs this module for
-//! nothing at all. The dependency runs one way, from `types` to `opts`
-//! nowhere and from `easy` to both.
-//!
-//! # The `dead_code` allowances
-//!
-//! Several items below carry `#[allow(dead_code)]`. Every one of them is
-//! exercised by this module's tests, but the plain `lib` target compiles
-//! without `#[cfg(test)]` code, and the exported functions that will read
-//! this data -- `curl_easy_setopt`, `curl_easy_getinfo`, `curl_multi_setopt`
-//! and the `curl_form*` trio -- are not all landed yet. The allowances are
-//! per ITEM rather than a blanket `#![allow(dead_code)]` on the module, so
-//! each one disappears on its own as its consumer arrives and none of them
-//! can mask an unrelated unused item in the meantime.
 
 use core::ffi::{c_int, c_long, c_uint};
 
@@ -123,11 +52,6 @@ use core::ffi::{c_int, c_long, c_uint};
 // a second `#define` for a name the verbatim prologue has already
 // defined, and a duplicate `#define` with an identical body is a warning
 // under `-Wall` in some consumers and an error under others.
-//
-// Four of the nine names are aliases in the frozen header
-// (include/curl/curl.h:1127-1136) and are written here as aliases too,
-// because that is what makes `curl_easytype` impossible to recover from
-// `value / 10000`: three distinct bases share 10000.
 #[allow(dead_code)]
 pub(crate) const CURLOPTTYPE_LONG: i32 = 0;
 #[allow(dead_code)]
@@ -188,13 +112,6 @@ pub enum curl_easytype {
 pub const CURLOT_FLAG_ALIAS: c_uint = 1 << 0;
 
 // The option enumeration, emitted into `include/curl/curl.h`.
-//
-// `cbindgen.toml:898` lists `CURLoption` under `[export] exclude`. AAP
-// 0.1.2 overrides that, and `curl_h_export_exclusions` (build.rs:3101)
-// lifts the one exclusion for the umbrella pass. The lift is recorded in
-// `CURL_H_GENERATED_DESPITE_EXCLUSION` (build.rs:3144) so the divergence
-// from the checked-in cbindgen configuration is deliberate and traceable
-// rather than looking like a configuration bug.
 
 /// Every `CURLOPT_*` identifier, with its integer pinned.
 /// Values are NOT contiguous and are NOT ordered: the enumeration
@@ -890,18 +807,6 @@ pub enum CURLoption {
     /// and shifts nothing else, which is why the mistake survives a
     /// compile: `CURLOPT_LASTENTRY` is a bound, never an option, so only
     /// code that compares against it misbehaves.
-    ///
-    /// curl proves the value itself. `Curl_easyopts_check` at
-    /// `lib/easyoptions.c:388` returns an ERROR when
-    /// `(CURLOPT_LASTENTRY % 10000) != (328 + 1)`, so a correct table
-    /// satisfies the equality `10329 % 10000 == 329`. The `% 10000` is only
-    /// necessary because the value is neither 328 nor 329.
-    ///
-    /// The same trap has a twin in the multi interface:
-    /// `CURLMOPT_LASTENTRY` is 10020, an ordinal follow-on from
-    /// `CURLMOPT_NOTIFYDATA = 10019` (`multi.h:407`), and not 20. That
-    /// enumeration lives in `ffi/types.rs`, which already pins it
-    /// correctly; it is noted here because the two are the same error.
     CURLOPT_LASTENTRY = 10329,
 }
 
@@ -1222,9 +1127,7 @@ impl CURLoption {
         CURLoption::CURLOPT_LASTENTRY,
     ];
 
-    /// Number of real options, excluding `CURLOPT_LASTENTRY`. AAP 0.6.1
-    /// reconciles this as 291 `CURLOPT(...)` plus 17
-    /// `CURLOPTDEPRECATED(...)`.
+    /// Number of real options, excluding `CURLOPT_LASTENTRY`.
     #[allow(dead_code)]
     pub(crate) const REAL_COUNT: usize = 308;
 
@@ -1740,10 +1643,7 @@ impl CURLoption {
 
 // The 19 `#define CURLOPT_*` aliases.
 //
-// Held here so the parity assertion AAP 0.1.2 requires has something to
-// assert against, and NOT exported: the emitted form has to keep its
-// `#ifndef CURL_NO_OLDIES` guards, which cbindgen cannot produce, so the
-// guarded blocks are carried verbatim. See the module documentation.
+// See the module documentation.
 
 /// One `#define CURLOPT_<old> <new>` line from the frozen header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1890,11 +1790,6 @@ pub(crate) const OPTION_ALIASES: &[OptionAlias] = &[
 // populates it rather than a redeclaration of it. Names are stored
 // NUL-terminated so the exported introspection functions can hand out
 // `*const c_char` without allocating or copying.
-//
-// Row order is `lib/optiontable.pl`'s: alphabetical by the STRIPPED
-// name, with the sentinel last. `curl_easy_option_next` walks this array
-// in order and a consumer may rely on that order, so it is preserved
-// exactly rather than re-sorted.
 
 /// One row of the option metadata table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3892,22 +3787,6 @@ pub(crate) const EASY_OPTIONS: &[EasyOptionRow] = &[
 
 // The four row counts, DERIVED from [`EASY_OPTIONS`] rather than
 // transcribed beside it.
-//
-// Every one of these was previously a hand-written literal, which made the
-// table and its own description two independent populations: a row added or
-// removed without a matching edit here produced a silently wrong count, and
-// only `metadata_table_shape_matches_optiontable_pl` below would have caught
-// it, and only when tests ran. `curl-rs-ffi/src/ffi/easy.rs` uses
-// `EASY_OPTION_ROWS` as an array length, so a stale literal there was a
-// wrong-sized array rather than a wrong number in a comment.
-//
-// Computing them makes that class of drift unrepresentable instead of
-// detectable. The `const` assertions immediately below then pin the DATA to
-// the C oracle -- `perl lib/optiontable.pl < include/curl/curl.h` -- so the
-// derivation cannot quietly agree with itself while both halves drift away
-// from curl 8.19.0-DEV. Derivation and pinning answer different questions
-// and both are needed: derivation keeps the numbers honest about the table,
-// pinning keeps the table honest about curl.
 
 /// Rows flagged `CURLOT_FLAG_ALIAS`, counted over the table.
 ///
@@ -3967,11 +3846,6 @@ pub(crate) const EASY_OPTION_TRUE_ROWS: usize =
 // with brace-balanced scanning: 324 rows, of which 1 is the terminating
 // `{ NULL, CURLOPT_LASTENTRY, CURLOT_LONG, 0 }` and 15 carry
 // `CURLOT_FLAG_ALIAS`, leaving 308 preferred options.
-//
-// A `const` assertion rather than a test, because a test reports drift and
-// this refuses to build with it. `curl-rs-ffi/build.rs` re-derives the same
-// four counts by reading THIS FILE as text, so the numbers are checked from
-// both inside and outside the crate.
 const _: () = assert!(
     EASY_OPTION_ROWS == 324,
     "lib/optiontable.pl emits 324 rows including the sentinel"
@@ -3990,9 +3864,7 @@ const _: () = assert!(
      CURLOPTDEPRECATED)"
 );
 
-// ---------------------------------------------------------------------------
 // CURLINFO: the second composed identifier space.
-// ---------------------------------------------------------------------------
 
 // Information type bases (include/curl/curl.h:2890-2898).
 //
@@ -4000,23 +3872,6 @@ const _: () = assert!(
 // `CURLOPTTYPE_*` bases above: `curl-rs-ffi/build.rs:2095-2103` carries
 // these nine `#define` lines verbatim, and cbindgen would render a `pub`
 // constant as a SECOND `#define` of the same name.
-//
-// The type is `c_int` rather than `i32` because every one of these is used
-// as the right operand of a mask against a value that arrived from C as an
-// `int` -- `lib/getinfo.c:636` is `type = CURLINFO_TYPEMASK & (int)info;`.
-// `c_int` is `i32` on all four targets AAP 0.8.3 mandates, so nothing about
-// the arithmetic changes; only the declared intent does.
-//
-// CORRECTION 2 -- `curl_easytype` is not recoverable from `id / 10000` --
-// HAS AN EXACT TWIN HERE, and it is why [`InfoBase`] exists below instead
-// of a bare integer. `CURLINFO_PTR` and `CURLINFO_SLIST` are DELIBERATELY
-// the same value, and the frozen header says so in the comment `/* same as
-// SLIST */`. Five members are affected: three are spelled `CURLINFO_PTR`
-// (`CERTINFO`, `TLS_SESSION`, `TLS_SSL_PTR`) and two `CURLINFO_SLIST`
-// (`SSL_ENGINES`, `COOKIELIST`). A renderer that recovered the spelling
-// from the integer would emit the wrong one for all five, and the emitted
-// header would still compile -- which is precisely the silent failure mode
-// this module exists to make impossible.
 pub(crate) const CURLINFO_STRING: c_int = 0x100000;
 pub(crate) const CURLINFO_LONG: c_int = 0x200000;
 pub(crate) const CURLINFO_DOUBLE: c_int = 0x300000;
@@ -4143,17 +3998,6 @@ impl InfoBase {
 }
 
 /// The six arms of `curl_easy_getinfo`'s type switch.
-///
-/// Six, not seven, and the missing one is not an omission: `lib/getinfo.c`
-/// masks with `CURLINFO_TYPEMASK` and then switches on the result
-/// (`:636-671`), so `CURLINFO_PTR` and `CURLINFO_SLIST` reach the same arm
-/// and a `Ptr` arm would be unreachable. Rust would reject a duplicate
-/// pattern outright, which is a better outcome than C's silent acceptance.
-///
-/// Each variant names the pointer type the caller must have passed, and
-/// that is the whole reason the classification has to be right: reading the
-/// wrong pointer type out of the variadic argument list is undefined
-/// behaviour, not a wrong answer.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) enum InfoValueKind {
@@ -4207,32 +4051,12 @@ pub(crate) const fn info_value_kind(info: c_int) -> Option<InfoValueKind> {
 // block is carried verbatim (build.rs:2106-2996) and this declaration is
 // the RUST-side authority that the verbatim text is asserted against --
 // not a second population, because the assertion is what makes them one.
-//
-// Why the integers are written out rather than composed. A Rust
-// `#[repr(C)]` enum discriminant is an `isize` expression, so it cannot
-// name the `c_int` bases above without a cast that would obscure the value.
-// Writing `0x100001` and asserting `== CURLINFO_STRING + 1` from
-// [`INFO_COMPOSITION`] keeps both halves visible and pins the integer, which
-// is what AAP 0.6.1 requires. The doc comment on each member carries the
-// header's own `CURLINFO_<BASE> + n` spelling so a reader never has to do
-// the hexadecimal in their head.
 
 /// Every `CURLINFO_*` identifier, with its integer pinned.
-///
-/// 79 members. Two are not composed from a base -- `CURLINFO_NONE` is the
-/// ordinal 0 and `CURLINFO_LASTONE` is a bare 70 -- and the remaining 77
-/// are `CURLINFO_<BASE> + n`. The values are neither contiguous nor
-/// ordered, so the contiguity assertion `ffi/codes.rs` uses would be wrong
-/// here; what is asserted instead is that every value equals its base plus
-/// its ordinal, that no two members share a value, and that no two share a
-/// `(base, ordinal)` pair.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
-// Frozen C ABI name: `include/curl/curl.h:2996` spells it this way and AAP
-// 0.8.1 forbids changing a public typedef, so the style lints yield to the
-// contract.
 #[allow(clippy::upper_case_acronyms)]
 #[allow(clippy::enum_variant_names)]
 pub enum CURLINFO {
@@ -4257,32 +4081,28 @@ pub enum CURLINFO {
     /// `CURLINFO_DOUBLE + 7`. Number of bytes uploaded.
     ///
     /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_SIZE_UPLOAD_T")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLINFO_SIZE_UPLOAD = 0x300007,
     /// `CURLINFO_OFF_T + 7`. Number of bytes uploaded.
     CURLINFO_SIZE_UPLOAD_T = 0x600007,
     /// `CURLINFO_DOUBLE + 8`. Number of bytes downloaded.
     ///
     /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_SIZE_DOWNLOAD_T")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLINFO_SIZE_DOWNLOAD = 0x300008,
     /// `CURLINFO_OFF_T + 8`. Number of bytes downloaded.
     CURLINFO_SIZE_DOWNLOAD_T = 0x600008,
     /// `CURLINFO_DOUBLE + 9`. Average download speed.
     ///
-    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_SPEED_DOWNLOAD_T")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_SPEED_DOWNLOAD_T")` in the
+    /// frozen header.
     CURLINFO_SPEED_DOWNLOAD = 0x300009,
     /// `CURLINFO_OFF_T + 9`. Average download speed.
     CURLINFO_SPEED_DOWNLOAD_T = 0x600009,
     /// `CURLINFO_DOUBLE + 10`. Average upload speed.
     ///
     /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_SPEED_UPLOAD_T")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLINFO_SPEED_UPLOAD = 0x30000a,
     /// `CURLINFO_OFF_T + 10`. Average upload speed in number of bytes per
     /// second.
@@ -4300,16 +4120,14 @@ pub enum CURLINFO {
     /// `CURLINFO_DOUBLE + 15`. Content length from the Content-Length header.
     ///
     /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_CONTENT_LENGTH_DOWNLOAD_T")` in
-    /// the frozen header. Kept, because AAP 0.8.2 forbids removing a deprecated
-    /// public name.
+    /// the frozen header.
     CURLINFO_CONTENT_LENGTH_DOWNLOAD = 0x30000f,
     /// `CURLINFO_OFF_T + 15`. Content length from the Content-Length header.
     CURLINFO_CONTENT_LENGTH_DOWNLOAD_T = 0x60000f,
     /// `CURLINFO_DOUBLE + 16`. Upload size.
     ///
-    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_CONTENT_LENGTH_UPLOAD_T")` in the
-    /// frozen header. Kept, because AAP 0.8.2 forbids removing a deprecated
-    /// public name.
+    /// `CURL_DEPRECATED(7.55.0, "Use CURLINFO_CONTENT_LENGTH_UPLOAD_T")` in
+    /// the frozen header.
     CURLINFO_CONTENT_LENGTH_UPLOAD = 0x300010,
     /// `CURLINFO_OFF_T + 16`. Upload size.
     CURLINFO_CONTENT_LENGTH_UPLOAD_T = 0x600010,
@@ -4344,8 +4162,7 @@ pub enum CURLINFO {
     /// `CURLINFO_LONG + 29`. Last socket used.
     ///
     /// `CURL_DEPRECATED(7.45.0, "Use CURLINFO_ACTIVESOCKET")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLINFO_LASTSOCKET = 0x20001d,
     /// `CURLINFO_STRING + 30`. The entry path after logging in to an FTP
     /// server.
@@ -4382,8 +4199,7 @@ pub enum CURLINFO {
     /// processing.
     ///
     /// `CURL_DEPRECATED(7.48.0, "Use CURLINFO_TLS_SSL_PTR")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLINFO_TLS_SESSION = 0x40002b,
     /// `CURLINFO_SOCKET + 44`. The session's active socket.
     CURLINFO_ACTIVESOCKET = 0x50002c,
@@ -4397,7 +4213,6 @@ pub enum CURLINFO {
     /// `CURLINFO_LONG + 48`. The protocol used for the connection.
     ///
     /// `CURL_DEPRECATED(7.85.0, "Use CURLINFO_SCHEME")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLINFO_PROTOCOL = 0x200030,
     /// `CURLINFO_STRING + 49`. The scheme used for the connection.
     CURLINFO_SCHEME = 0x100031,
@@ -4550,11 +4365,8 @@ impl CURLINFO {
 
     /// The number of tokens the frozen enumeration declares.
     ///
-    /// Seventy-nine, and NOT seventy: AAP 0.4.1's phrase "70 CURLINFO
-    /// accessors" describes how many the getinfo implementation answers
-    /// for, which is the value of `CURLINFO_LASTONE`, not the size of the
-    /// enumeration. The two numbers are asserted separately below so that
-    /// neither can be mistaken for the other.
+    /// The two numbers are asserted separately below so that neither can be
+    /// mistaken for the other.
     #[allow(dead_code)]
     pub(crate) const TOKEN_COUNT: usize = 79;
 
@@ -4729,15 +4541,6 @@ impl CURLINFO {
 }
 
 /// The `(member, base spelling, ordinal)` triple for each composed member.
-///
-/// 77 rows -- every member except `CURLINFO_NONE` and `CURLINFO_LASTONE`.
-/// The base and the ordinal are INDEPENDENT axes, and they have to be: the
-/// ordinal is reused across bases (`n = 7` is both
-/// `CURLINFO_SIZE_UPLOAD` on `CURLINFO_DOUBLE` and
-/// `CURLINFO_SIZE_UPLOAD_T` on `CURLINFO_OFF_T`), so `(base, ordinal)` is
-/// the unique key and the ordinal alone never is. This is the data
-/// `build.rs` renders back into the header's `= CURLINFO_<BASE> + n` form;
-/// a table holding only the composed integer could not produce it.
 #[allow(dead_code)]
 pub(crate) const INFO_COMPOSITION: &[(CURLINFO, InfoBase, c_int)] = &[
     (CURLINFO::CURLINFO_EFFECTIVE_URL, InfoBase::String, 1),
@@ -4840,12 +4643,6 @@ pub(crate) const INFO_COMPOSITION: &[(CURLINFO, InfoBase, c_int)] = &[
 ];
 
 /// One `CURL_DEPRECATED(version, message)` attribute from the frozen header.
-///
-/// Held in Rust because cbindgen cannot express the attribute in any of the
-/// four positions the headers use it in, so the affected declarations are
-/// carried verbatim; this table is what lets a test assert that the
-/// verbatim text still covers exactly the members it covered in curl
-/// 8.19.0-DEV. Deprecated is not removed: AAP 0.8.2 keeps every one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct Deprecation<T> {
@@ -4911,19 +4708,11 @@ pub(crate) const INFO_DEPRECATIONS: &[Deprecation<CURLINFO>] = &[
 ];
 
 /// `#define CURLINFO_HTTP_CODE CURLINFO_RESPONSE_CODE` (curl.h:3000).
-///
-/// The one preprocessor alias in the information space, and the only reason
-/// it is a `pub(crate) const` of enum type rather than an integer is that
-/// the alias expands to an IDENTIFIER in the frozen header: it resolves
-/// THROUGH the enumeration, so it cannot drift from it. `build.rs` carries
-/// the `#define` verbatim, which is why this is not `pub`.
 #[allow(dead_code)]
 pub(crate) const CURLINFO_HTTP_CODE: CURLINFO =
     CURLINFO::CURLINFO_RESPONSE_CODE;
 
-// ---------------------------------------------------------------------------
 // CURLformoption: the legacy form-post option space.
-// ---------------------------------------------------------------------------
 
 // Unlike the two spaces above, these members are plain declaration
 // ordinals: `include/curl/curl.h:2555-2584` composes nothing. They live
@@ -4933,16 +4722,6 @@ pub(crate) const CURLINFO_HTTP_CODE: CURLINFO =
 // identity for the easy API. `CURLFORMcode`, which is a RESULT and not an
 // argument, is `ffi/codes.rs`'s; note also the spelling difference, a
 // lowercase `f` here against `CURLFORMcode`'s uppercase.
-//
-// CORRECTION 12. Exactly EIGHTEEN of the 22 members carry
-// `CURL_DEPRECATED(7.56.0, ...)`, not 21. The four without it are
-// `CURLFORM_OBSOLETE` (:2566), `CURLFORM_END` (:2576),
-// `CURLFORM_OBSOLETE2` (:2577) and `CURLFORM_LASTENTRY` (:2583); the first,
-// third and fourth are retired or sentinel slots with nothing to advise,
-// and `CURLFORM_END` cannot be deprecated because a caller has no way to
-// stop passing it. Measured by brace-and-paren-balanced scanning of the
-// enumeration body; a per-line regex under-counts, which is how the 21
-// figure arises.
 //
 // CORRECTION 20. `CURLFORM_CONTENTLEN` puts the attribute in a FOURTH
 // position -- the member name and its trailing comment on :2580, the
@@ -4957,104 +4736,77 @@ pub(crate) const CURLINFO_HTTP_CODE: CURLINFO =
 /// Every `CURLFORM_*` identifier, with its ordinal pinned.
 ///
 /// 22 members, values 0 through 21, none written explicitly in the frozen
-/// header. They are written explicitly here so that inserting a member in
-/// the middle cannot silently renumber its successors -- the same discipline
-/// AAP 0.6.1 requires of `CURLcode`, and for the same reason: a caller
-/// compiled against curl 8.19.0-DEV holds the number, not the name.
+/// header.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
-// Frozen C ABI name: `include/curl/curl.h:2584` spells it with a lowercase
-// `f`, and AAP 0.8.1 forbids changing a public typedef.
 #[allow(clippy::enum_variant_names)]
 pub enum CURLformoption {
     /// The first one is unused.
-    ///
-    /// `CURL_DEPRECATED(7.56.0, "")` in the frozen header. Kept, because AAP
-    /// 0.8.2 forbids removing a deprecated public name.
     CURLFORM_NOTHING = 0,
     /// Name of the part, copied.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_name()")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLFORM_COPYNAME = 1,
     /// Name of the part, by pointer.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_name()")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLFORM_PTRNAME = 2,
     /// Length of a name that is not NUL terminated.
-    ///
-    /// `CURL_DEPRECATED(7.56.0, "")` in the frozen header. Kept, because AAP
-    /// 0.8.2 forbids removing a deprecated public name.
     CURLFORM_NAMELENGTH = 3,
     /// Contents of the part, copied.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLFORM_COPYCONTENTS = 4,
     /// Contents of the part, by pointer.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLFORM_PTRCONTENTS = 5,
     /// Length of the contents, as a long.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLFORM_CONTENTSLENGTH = 6,
     /// Read the contents from a named file.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data_cb()")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLFORM_FILECONTENT = 7,
     /// Continue reading options from a `curl_forms` array.
-    ///
-    /// `CURL_DEPRECATED(7.56.0, "")` in the frozen header. Kept, because AAP
-    /// 0.8.2 forbids removing a deprecated public name.
     CURLFORM_ARRAY = 8,
     /// Retired slot, held so the successors keep their ordinals.
     CURLFORM_OBSOLETE = 9,
     /// Upload the named file as this part.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_filedata()")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLFORM_FILE = 10,
     /// Set the remote file name for a buffer upload.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_filename()")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLFORM_BUFFER = 11,
     /// Contents of a buffer upload.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLFORM_BUFFERPTR = 12,
     /// Length of a buffer upload.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLFORM_BUFFERLENGTH = 13,
     /// Content-Type of the part.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_type()")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLFORM_CONTENTTYPE = 14,
     /// Extra headers for the part.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_headers()")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLFORM_CONTENTHEADER = 15,
     /// Remote file name of the part.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_filename()")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLFORM_FILENAME = 16,
     /// Terminates the option list. Never deprecated: a caller cannot stop
     /// passing it.
@@ -5064,13 +4816,11 @@ pub enum CURLformoption {
     /// Read the contents through the read callback.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data_cb()")` in the frozen
-    /// header. Kept, because AAP 0.8.2 forbids removing a deprecated public
-    /// name.
+    /// header.
     CURLFORM_STREAM = 19,
     /// Length of the contents, as a `curl_off_t`. Added in 7.46.0.
     ///
     /// `CURL_DEPRECATED(7.56.0, "Use curl_mime_data()")` in the frozen header.
-    /// Kept, because AAP 0.8.2 forbids removing a deprecated public name.
     CURLFORM_CONTENTLEN = 20,
     /// The last unused.
     CURLFORM_LASTENTRY = 21,
@@ -5253,9 +5003,7 @@ pub(crate) const FORM_DEPRECATIONS: &[Deprecation<CURLformoption>] = &[
     },
 ];
 
-// ---------------------------------------------------------------------------
 // CURLOPT_WS_OPTIONS argument bits.
-// ---------------------------------------------------------------------------
 
 // These two are `setopt` ARGUMENT VALUES, which is why they are here and
 // not with the websocket frame flags: a caller passes them to
@@ -5272,9 +5020,6 @@ pub(crate) const FORM_DEPRECATIONS: &[Deprecation<CURLformoption>] = &[
 // `int` argument on LP64 would leave the upper half of the slot
 // unspecified. The frame flags are passed as a declared `unsigned int`
 // parameter instead, so they need no suffix.
-//
-// `pub(crate)` because `build.rs:1231` carries both `#define` lines
-// verbatim.
 
 /// `CURLWS_RAW_MODE`, bit 0 of `CURLOPT_WS_OPTIONS`.
 #[allow(dead_code)]
@@ -5284,9 +5029,7 @@ pub(crate) const CURLWS_RAW_MODE: c_long = 1 << 0;
 #[allow(dead_code)]
 pub(crate) const CURLWS_NOAUTOPONG: c_long = 1 << 1;
 
-// ---------------------------------------------------------------------------
 // The introspection contract this table has to satisfy.
-// ---------------------------------------------------------------------------
 
 // `curl_easy_option_by_name`, `_by_id` and `_next` are exported from
 // `ffi/easy.rs`, and they read [`EASY_OPTIONS`] directly rather than a
@@ -5320,15 +5063,6 @@ pub(crate) const CURLWS_NOAUTOPONG: c_long = 1 << 1;
 //     by_name("ENCODING")         -> the CURLOPT_ACCEPT_ENCODING alias row
 //     by_name("encoding")         -> the same row, case-insensitively
 //     by_name("CURLOPT_ENCODING") -> NULL
-//
-// A validation item of the form `by_name("CURLOPT_X")->id == CURLOPT_X` is
-// therefore wrong, and both the positive and the negative case are asserted
-// below so the wrong reading cannot be reintroduced.
-//
-// `lib/easygetopt.c` wraps the whole API in `#ifndef
-// CURL_DISABLE_GETOPTIONS` and returns NULL from every entry point when it
-// is defined. That symbol is not among the capabilities this workspace
-// makes configurable, so the enabled behaviour is the only behaviour.
 
 #[cfg(test)]
 mod tests {
@@ -5573,8 +5307,7 @@ mod tests {
         }
     }
 
-    /// AAP 0.6.1 requires the aliases to "resolve to identical
-    /// integers". This is that assertion.
+    /// This is that assertion.
     #[test]
     fn aliases_resolve_to_identical_integers() {
         assert_eq!(OPTION_ALIASES.len(), 19);
@@ -5815,9 +5548,8 @@ mod tests {
     fn info_token_count_is_seventy_nine_and_lastone_is_seventy() {
         assert_eq!(CURLINFO::ABI_VARIANTS.len(), CURLINFO::TOKEN_COUNT);
         assert_eq!(CURLINFO::TOKEN_COUNT, 79);
-        // The two numbers AAP 0.4.1's prose conflates. `CURLINFO_LASTONE`
-        // is the highest ordinal in use, written as a bare 70 at
-        // curl.h:2995; 79 is how many tokens the enumeration declares.
+        // `CURLINFO_LASTONE` is the highest ordinal in use, written as a bare
+        // 70 at curl.h:2995; 79 is how many tokens the enumeration declares.
         assert_eq!(CURLINFO::CURLINFO_LASTONE.as_c_int(), 70);
         assert_eq!(CURLINFO::CURLINFO_NONE.as_c_int(), 0);
         assert_ne!(CURLINFO::CURLINFO_LASTONE.as_c_int(), 79);
@@ -6053,7 +5785,7 @@ mod tests {
             .collect();
         assert_eq!(seen, expected);
         for entry in INFO_DEPRECATIONS {
-            // Deprecated is not removed. AAP 0.8.2.
+            // Deprecated is not removed.
             assert!(CURLINFO::ABI_VARIANTS.contains(&entry.member));
             assert!(!entry.since.is_empty());
             assert!(
@@ -6466,11 +6198,6 @@ mod tests {
         // `prev++`. The layout is therefore directly observable, and it is
         // asserted here -- at the authority for the data -- rather than
         // only where the type happens to be declared.
-        //
-        // The numbers are LP64. All four targets AAP 0.8.3 mandates are
-        // 64-bit, and AAP 0.6.2 records that 32-bit is deliberately
-        // forfeited, so a target where these fail is a target this
-        // workspace does not claim.
         use crate::ffi::types::curl_easyoption;
         use core::{mem, ptr};
 

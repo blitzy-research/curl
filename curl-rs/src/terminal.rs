@@ -4,8 +4,8 @@
 
 //! Terminal detection and password prompting for the `curl` command-line tool.
 //!
-//! This module supersedes two C translation units, `src/terminal.c`
-//! (87 lines) and `src/tool_getpass.c` (197 lines), and it
+//! This module supersedes two C translation units, `src/terminal.c` and
+//! `src/tool_getpass.c`, and it
 //! provides exactly the two capabilities they provided -- report the terminal
 //! width, and read a password from the controlling terminal:
 //!
@@ -16,7 +16,7 @@
 //!   operation!". The POSIX implementation never returns `NULL`, so the abort
 //!   outcome is made unrepresentable here rather than merely unused.
 //!
-//! Only ~70 of `src/tool_getpass.c`'s 197 lines are in scope. The `__VMS` arm
+//! Only part of `src/tool_getpass.c` is in scope. The `__VMS` arm
 //! (`:54-86`), the `_WIN32` `_getch` arm with its backspace handling
 //! (`:88-114`), the `__AMIGA__` adjustment (`:26-28`) and the legacy System-V
 //! `HAVE_TERMIO_H` `ioctl(TCGETA/TCSETA)` arm all fall outside the

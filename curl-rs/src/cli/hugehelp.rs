@@ -86,28 +86,51 @@ include!(concat!(env!("OUT_DIR"), "/hugehelp.rs"));
 ///
 /// # Errors
 ///
-/// Returns the first write error. C discards `puts`'s return value, so an error
-/// is invisible there; it is surfaced here because the caller is `--manual`
-/// handling, which can report it, and because silently truncating the manual
-/// halfway is worse than saying so. A caller that wants C's exact
-/// indifference can discard the result.
+/// Returns the first write error, and **keeps going after it**, which is the
+/// combination C's `puts` loop produces.
 ///
-/// `#[allow(dead_code)]` for the same reason `cli::args` and `cli::libinfo` carry
-/// it: the `--manual` arm that calls this lives in `cli::help`, which
-/// `cli/mod.rs` records as specified-but-not-yet-declared. The attribute is on the
-/// function rather than the module so that it lapses the moment a caller appears.
-#[allow(dead_code)]
+/// The earlier revision of this function used `?` and stopped at the first
+/// failure. That is a behaviour change of exactly the kind AAP section 0.8.2
+/// forbids: `src/mkhelp.pl:231-236` is `while(curlman[i]) puts(curlman[i++]);`,
+/// and `puts` reports failure through its return value, which the loop never
+/// reads. C therefore attempts **every** line whatever happens, and a transient
+/// failure -- an interrupted write, a full pipe buffer that later drains --
+/// costs C one line and cost this function the entire remainder of the manual.
+///
+/// So the loop is unconditional and the *first* error is remembered and returned
+/// at the end. That gives a caller strictly more than C has, without changing
+/// what reaches the stream: `crate::outcome_for` discards the result, exactly as
+/// C's `--manual` arm at `src/tool_operate.c:2309` does, and a caller that wants
+/// to know can look.
 pub(crate) fn hugehelp<W: Write>(sink: &mut W) -> io::Result<()> {
+    let mut first_failure: Option<io::Error> = None;
+
     for line in MANUAL {
         // One `write_all` per element plus one for the newline would double the
         // syscall count on an unbuffered sink, so the newline goes out with the
         // line. `writeln!` is not used because it would format, and these bytes
         // are already final.
-        sink.write_all(line.as_bytes())?;
-        sink.write_all(b"\n")?;
+        //
+        // `write_all` is used rather than `write` because a short write is not a
+        // failure and C's `puts` writes the whole string; the two calls are
+        // sequenced so a failure on the line does not suppress the newline, which
+        // is what `puts` -- one call per element -- would also do.
+        let line_result = sink.write_all(line.as_bytes());
+        let newline_result = sink.write_all(b"\n");
+
+        for outcome in [line_result, newline_result] {
+            if let Err(error) = outcome {
+                if first_failure.is_none() {
+                    first_failure = Some(error);
+                }
+            }
+        }
     }
 
-    Ok(())
+    match first_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// How many lines the built-in manual has.
@@ -291,6 +314,58 @@ mod tests {
         assert!(
             hugehelp(&mut Closed).is_err(),
             "the manual must not truncate silently"
+        );
+    }
+
+    #[test]
+    fn a_transient_failure_does_not_abandon_the_remainder() {
+        // THE PARITY PROPERTY. `src/mkhelp.pl:231-236` never reads `puts`'s
+        // return value, so a failure costs C one line and nothing more. This
+        // sink fails once and then works, and every element after the failure
+        // must still arrive -- which the earlier `?`-based loop did not deliver.
+        struct FailsOnce {
+            failed: bool,
+            written: Vec<u8>,
+        }
+
+        impl Write for FailsOnce {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if !self.failed {
+                    self.failed = true;
+                    return Err(io::Error::other("transient"));
+                }
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut sink = FailsOnce {
+            failed: false,
+            written: Vec::new(),
+        };
+        let outcome = hugehelp(&mut sink);
+
+        // The failure is still reported, because a caller that wants to know can.
+        assert!(outcome.is_err(), "the first failure must be remembered");
+
+        // And the manual is all there except the one element that failed.
+        let mut whole: Vec<u8> = Vec::new();
+        hugehelp(&mut whole).expect("a Vec sink cannot fail");
+        let first = MANUAL.first().expect("the manual must not be empty");
+        let lost = first.len();
+        assert_eq!(
+            sink.written.len(),
+            whole.len() - lost,
+            "exactly the failed element must be missing, and nothing else"
+        );
+        assert!(
+            sink.written.starts_with(b"\n"),
+            "the newline that followed the failed element must still be written, \
+             as a second `puts` call would write it"
         );
     }
 }

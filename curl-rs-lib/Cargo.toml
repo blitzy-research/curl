@@ -390,8 +390,10 @@ socket2 = { workspace = true, features = ["all"] }
 # clears the workspace MSRV requires a hickory-proto carrying
 # RUSTSEC-2026-0119, and every release that carries the fix declares
 # rust-version 1.88. The two sets are disjoint. The root manifest records
-# the full option space and the measurement; the feature below turns
-# enabling it into a build failure rather than a silent no-op.
+# the full option space and the measurement; the feature below is therefore
+# declared, default-off, buildable and backed by no dependency, and it
+# advertises nothing because the resolver engine row is absent. See its own
+# comment beside [features] for why a build failure was rejected.
 #
 # --- URL and encoding -----------------------------------------------------
 #
@@ -632,6 +634,73 @@ memchr = { workspace = true }
 # is therefore safe at the declared MSRV, and it suppresses the implicit feature
 # that an optional dependency would otherwise create - which is what allows
 # `brotli` and `zstd` to name features identical to their crate names.
+#
+# ---------------------------------------------------------------------------
+# CLOSURE STATE OF THE FIFTEEN FEATURES, measured at this checkpoint
+# ---------------------------------------------------------------------------
+#
+# WHY THIS TABLE EXISTS. Enabling a feature in Cargo selects code; it does not
+# make a capability work. Twelve of these fifteen are ON BY DEFAULT because a
+# drop-in replacement for curl 8.x must offer what curl 8.x offers out of the
+# box, and reading that default list as a delivery claim would be wrong for
+# fourteen of the fifteen rows. Each entry's own comment below says what it
+# gates; this table says, in one place, HOW FAR each one closes today. Three
+# columns, because there are three independent things a feature needs and they
+# fail independently:
+#
+#   DEP    - the crates the feature switches on are pinned and resolve.
+#   MODULE - every module AAP 0.4.1 assigns the capability is on disk.
+#   E2E    - a real invocation can exercise it end to end.
+#
+#   feature       default  DEP  MODULE  E2E   what is missing
+#   ------------  -------  ---  ------  ----  --------------------------------
+#   http2         on       yes  NO      no    protocols/http2.rs
+#   http3         on       yes  NO      no    protocols/http3.rs
+#   ftp           on       n/a  NO      no    protocols/ftp/pingpong.rs
+#   ssh           on       yes  NO      no    protocols/{sftp,scp}.rs
+#   websockets    on       n/a  NO      no    protocols/ws.rs, 4 curl_ws_*
+#   brotli        on       yes  NO      no    transfer/content_encoding.rs
+#   zstd          on       yes  NO      no    transfer/content_encoding.rs
+#   gzip          on       yes  NO      no    transfer/content_encoding.rs
+#   cookies       on       yes  yes     no    no traffic to fill the jar
+#   hsts          on       n/a  yes     no    no response to record from
+#   altsvc        on       n/a  yes     no    no response to record from
+#   doh           on       n/a  yes     no    no dns::DohTransport implementor
+#   negotiate     OFF      n/a  NO      no    proxy/socks_gss.rs; no exchange
+#   hickory-dns   OFF      NO   yes     no    no backing crate (advisory gate)
+#   memdebug      OFF      n/a  yes     YES   nothing - this row is closed
+#
+# So exactly ONE feature is closed end to end, and it is the one whose work is
+# self-contained: `memdebug` installs a counting `GlobalAlloc` and writes the
+# `lib/memdebug.c` record format, which needs no transfer to be true.
+#
+# The eight `MODULE = NO` rows fail for a missing FILE; the five
+# `MODULE = yes, E2E = no` rows fail for missing WIRING - their code is written
+# and tested against the C oracle, and what they lack is a transfer to be
+# called from. `hickory-dns` fails for neither reason: it is a reserved name
+# with no dependency behind it, for the advisory reasons set out at its own
+# entry. That three-way split is the same distinction `src/version.rs` records
+# per capability as `Engine::working` / `inert` / `unwritten`, and it is worth
+# keeping straight here because the two failures have opposite remedies.
+#
+# WHAT THIS MEANS FOR THE ARTIFACT, stated plainly rather than left to be
+# inferred: the workspace is NOT shippable at this checkpoint, and the root
+# manifest's `publish = false` is not the whole of that. `cargo build` produces
+# a `curl` that parses its command line and then returns
+# `CURLE_NOT_BUILT_IN` for every operation, and a `libcurl.so.4` exporting 59
+# of the 100 symbols `lib/libcurl.def` requires. Neither is a drop-in
+# replacement for anything. The gates of AAP 0.8.4 are what will say otherwise
+# when it becomes true.
+#
+# WHAT KEEPS THIS FROM BECOMING A LIE AT RUNTIME. Nothing in this table is read
+# by code, so it cannot itself misreport. What a caller observes comes from
+# `src/version.rs`, where every capability claim is
+# `configured && engine.is_present()` - so a feature being ON here can never on
+# its own put a token into `curl --version`. That is the under-reporting AAP
+# 0.6.5 measures as the only safe error: withholding a capability the binary has
+# makes its fixtures SKIP, advertising one it lacks makes them RUN AND FAIL.
+# Measured over this checkout, the default build advertises no protocol and no
+# capability that depends on an absent engine, which is the truthful report.
 
 [features]
 
@@ -655,19 +724,25 @@ default = [
 # HTTP/2 -- src/protocols/http2.rs, superseding lib/http2.c and its nghttp2
 # dependency. Gates this crate's direct use of h2's raw SETTINGS and
 # flow-control surface; see the h2 entry above for the honest caveat about hyper
-# keeping h2 in the graph regardless.
+# keeping h2 in the graph regardless. The module named is the AAP 0.4.1
+# assignment and is NOT on disk (closure table above): the dependency is here,
+# the implementation is not.
 http2 = ["dep:h2"]
 
-# HTTP/3 over QUIC -- src/protocols/http3.rs, superseding lib/vquic/*.
+# HTTP/3 over QUIC -- src/protocols/http3.rs, superseding lib/vquic/*. As with
+# http2, the three crates are pinned and the module is not on disk.
 http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
 
 # FTP and FTPS -- src/protocols/ftp/{mod,pingpong,listparser}.rs, superseding
 # lib/ftp.c, lib/pingpong.c, lib/ftplistparser.c and lib/fileinfo.c. No
 # exclusive external dependency: the command sequencing is ours and must stay
-# byte-exact, and FTPS reuses the unconditional TLS stack.
+# byte-exact, and FTPS reuses the unconditional TLS stack. Of the three modules,
+# `listparser` and `mod` exist and `pingpong` does not, so no command sequence
+# can be driven.
 ftp = []
 
-# SFTP and SCP -- src/protocols/{sftp,scp}.rs.
+# SFTP and SCP -- src/protocols/{sftp,scp}.rs. russh is pinned; neither module is
+# on disk.
 ssh = ["dep:russh"]
 
 # The WebSocket surface -- src/protocols/ws.rs, superseding lib/ws.c and
@@ -683,10 +758,12 @@ websockets = []
 # the public-suffix domain-matching rules.
 cookies = ["dep:publicsuffix"]
 
-# HSTS cache and its on-disk format -- src/cookies/hsts.rs.
+# HSTS cache and its on-disk format -- src/cookies/hsts.rs. Written and matched
+# against the lib/hsts.c oracle; no response yet arrives for it to record.
 hsts = []
 
-# Alt-Svc cache and its on-disk format -- src/cookies/altsvc.rs.
+# Alt-Svc cache and its on-disk format -- src/cookies/altsvc.rs. Written and
+# matched against the lib/altsvc.c oracle; nothing yet populates it.
 altsvc = []
 
 # DNS-over-HTTPS -- src/dns/doh.rs. No external dependency: DoH is specified to
@@ -748,7 +825,8 @@ negotiate = []
 #
 # What is implemented now is the rule this workspace already applies to every
 # other capability - `compiled_in = configured && engine.is_present()`. The
-# feature compiles; `ENGINE_DNS` in src/version.rs is absent, so
+# feature compiles; `ENGINE_DNS` in src/version.rs is `Engine::inert` -- the
+# resolver modules are on disk and nothing calls them -- so
 # `resolver_token_is_earned()` is false at every feature setting and the token is
 # withheld. That is under-reporting, which AAP 0.6.5 calls safe.
 #
@@ -803,14 +881,34 @@ negotiate = []
 # what keeps it from being mistaken for the second, without making a declared
 # feature unbuildable to say so.
 #
+# THIS IS A BLOCKED GATE, AND IT IS NOW DECLARED AS ONE RATHER THAN ONLY
+# EXPLAINED HERE. The reasoning above is complete but it is prose, and prose in a
+# manifest reads as an explanation of a choice; AAP 0.5.2 asks for a working
+# optional backend and this workspace does not have one, which is a gate that is
+# BLOCKED. It is recorded as such under
+# [workspace.metadata.curl-rs.blocked-aap-gates.hickory-dns] in the root
+# manifest, in machine-readable form, alongside the three other rows the frozen
+# inventory cannot have as written. `hickory-dns = []` below is what the blocked
+# state looks like in code: a declared, buildable feature name with nothing
+# behind it, which is the shape that keeps `--all-features` compiling while
+# refusing to advertise a resolver this binary does not contain.
+#
 # Recorded precisely because the honest state is easy to overstate in either
 # direction: AAP 0.8.3 requires the "System resolver by default", which
 # src/dns/resolver.rs is the designated home for, "with hickory-dns as an
-# optional feature that is disabled by default" - and disabled it is. This
-# checkpoint carries no src/dns/ module at all, so even with the dependency
-# wired there would be no consumer of it here, and the crate would sit in the
-# lockfile unreferenced by any line of Rust while its advisories were scanned
-# on every build. Nothing in this file claims otherwise.
+# optional feature that is disabled by default" - and disabled it is.
+#
+# One statement that stood here has been REMOVED because it went stale, and the
+# removal is recorded so nobody restores it from memory of the old text: "This
+# checkpoint carries no src/dns/ module at all, so even with the dependency wired
+# there would be no consumer of it here." That was true when written and is not
+# true now - src/dns/ carries mod.rs, resolver.rs, doh.rs, httpsrr.rs and
+# if2ip.rs. It does not change the conclusion, and that is exactly why it was
+# worth removing: a stale supporting fact makes a sound argument look like one
+# nobody has re-read. The argument that stands is the advisory conflict above,
+# which the absent module never had any part in. What resolver.rs does carry is
+# `alternative_resolver_available()`, the predicate that reports false at every
+# feature setting, and it names this gate rather than restating it.
 hickory-dns = []
 
 # A counting `GlobalAlloc` reproducing the allocation log of lib/memdebug.c

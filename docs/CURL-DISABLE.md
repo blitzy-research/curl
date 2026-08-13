@@ -65,39 +65,57 @@ for a reason worth stating:
 - `negotiate` needs an operating system GSS-API library for Negotiate, SPNEGO
   and Kerberos authentication. Leaving the feature off keeps the default build
   free of any C security library.
-- `hickory-dns` is a **reserved name with no implementation**, and enabling it
-  is a deliberate build failure rather than a silent no-op. It was intended to
-  select an in-process resolver as an alternative to the system resolver, which
-  is what resolves names by default. No version of `hickory-resolver` can
-  currently back it: every release that satisfies the workspace minimum Rust
-  version (0.24.0 through 0.25.2) requires a `hickory-proto` affected by
-  RUSTSEC-2026-0119, and every release carrying that fix (0.26.0, 0.26.1)
-  declares `rust-version 1.88` and breaks the minimum. The two sets are
-  disjoint. Declaring the crate as an optional dependency would not have
-  confined the advisory either, because `cargo deny` and `cargo audit` read
+- `hickory-dns` is a **reserved name with no dependency behind it**. It is
+  declared, it is default-off, it **builds**, and it advertises nothing. It was
+  intended to select an in-process resolver as an alternative to the system
+  resolver, which is what resolves names by default. No version of
+  `hickory-resolver` can currently back it: every release that satisfies the
+  workspace minimum Rust version (0.24.0 through 0.25.2) requires a
+  `hickory-proto` affected by RUSTSEC-2026-0119, and every release carrying that
+  fix (0.26.0, 0.26.1) declares `rust-version 1.88` and breaks the minimum. The
+  two sets are disjoint. Declaring the crate as an optional dependency would not
+  have confined the advisory either, because `cargo deny` and `cargo audit` read
   `Cargo.lock` rather than the active feature set, so it would be reported for
-  every build including default ones. The name is kept because three
-  self-description surfaces are written against the fifteen feature names --
-  the `Features:` line of `curl --version`, the capability table the FFI build
-  script emits, and `curlinfo`'s table -- and the root `Cargo.toml` records the
-  full measurement. Because Cargo has no "all features except one" selector,
-  feature-matrix builds enumerate the fourteen implementable features rather
-  than passing `--all-features`.
+  every build including default ones -- that was measured, not predicted. The
+  name is kept because three self-description surfaces are written against the
+  fifteen feature names -- the `Features:` line of `curl --version`, the
+  capability table the FFI build script emits, and `curlinfo`'s table -- and the
+  root `Cargo.toml` records the full measurement.
+
+  What enabling it must not do is make `curl --version` name a resolver that is
+  not in the build, since over-reporting a capability is the one failure mode
+  the truthfulness rule forbids. Two ways of preventing that were rejected and
+  one adopted. A bare `cfg` switch the banner still keys off would advertise
+  `hickory-resolver` with nothing behind it, which is exactly the over-report.
+  A `compile_error!` on the feature -- which this page previously described --
+  turns a declared feature into an unbuildable one, makes `--all-features`
+  impossible for a workspace whose own `deny.toml` sets `all-features = true`,
+  and forces every feature-matrix job to enumerate fourteen names in lockstep.
+  Neither is in force. The rule actually applied is the one every other
+  capability already uses: advertise only when configured **and** the engine
+  behind it is present. The resolver engine row is absent, so the token is
+  withheld however the feature is set, the feature compiles to nothing
+  observable, and continuous integration passes `--all-features` normally.
 - `memdebug` selects allocation tracking, and it carries a cost that the
   section below states in full.
 
 Which of the fifteen pull in a dependency is a separate question from which are
 declared, and the answer divides them cleanly. Seven gate an optional
 dependency today: `http2`, `http3`, `ssh`, `cookies`, `brotli`, `zstd` and
-`gzip`. The other eight are declared with an empty definition, because the
-modules they are specified to gate are not yet on disk: `ftp`, `websockets`,
-`hsts`, `altsvc`, `doh`, `negotiate`, `hickory-dns` and `memdebug`. An empty
-definition is not an inert name, and reading it that way would be the second
-obvious-but-wrong reading on this page: every one of the fifteen is consulted by
-`cfg` in the sources today. `negotiate` gates the build half of the `GSS-API`,
-`Kerberos` and `SPNEGO` rows of the version banner, and `hickory-dns` gates the
-`compile_error!` described above. What an empty definition does mean is that
-enabling one adds no crate to the dependency graph.
+`gzip`. The other eight are declared with an empty definition -- `ftp`,
+`websockets`, `hsts`, `altsvc`, `doh`, `negotiate`, `hickory-dns` and
+`memdebug` -- and the reason is that none of them gates an external crate, not
+that the code behind them is missing. `ftp` is the clearest case: the command
+sequencing is this project's own and has to stay byte-exact, and FTPS reuses the
+unconditional TLS stack, so there is no crate for the feature to switch on.
+
+An empty definition is not an inert name, and reading it that way would be the
+second obvious-but-wrong reading on this page: every one of the fifteen is
+consulted by `cfg` in the sources today, several of them in dozens of places.
+`negotiate` gates the build half of the `GSS-API`, `Kerberos` and `SPNEGO` rows
+of the version banner, and `hickory-dns` gates the withheld resolver token
+described above. What an empty definition does mean is that enabling one adds no
+crate to the dependency graph.
 
 ## The mapping is not one to one
 
@@ -129,14 +147,26 @@ implemented. Those schemes stay part of the public ABI. Their `CURLPROTO_*`
 constants remain in `include/curl/curl.h`, which is retained here at
 8.19.0-DEV and is unmodified. Beyond the constants, the paragraph splits into a
 part that is specified and a part that is delivered, and the two are worth
-keeping apart. A URL naming one of these schemes is specified to still parse,
-and a transfer request for one to fail with `CURLE_UNSUPPORTED_PROTOCOL` from
-the stub registration; both await `curl-rs-lib/src/protocols/`, which is not
-yet on disk, so neither is observable today. The `Protocols:` line is the part
-that is delivered: `curl-rs-lib/src/version.rs` names only the nine schemes
-that do perform transfers, and asserts by test that the other 24 are withheld
-from the banner, which is what lets the test suite skip the cases needing them
-rather than fail them.
+keeping apart.
+
+Specified: a URL naming one of these schemes still parses, and a transfer
+request for one fails with `CURLE_UNSUPPORTED_PROTOCOL` from the stub
+registration. Delivered so far: `curl-rs-lib/src/protocols/mod.rs` is on disk
+and carries the 33-row scheme registry, which is what records these 24 as
+registered-but-unimplemented in the first place. What is not on disk is the stub
+table that would return the error code, or any transfer engine for the other
+nine, so neither half of the specified behavior is observable yet -- and the
+executable honours no command-line option, so no URL of any scheme reaches the
+registry.
+
+The `Protocols:` line follows the same rule and currently withholds everything.
+`curl-rs-lib/src/version.rs` conditions each of the nine transferable schemes on
+the protocol engine being present, and that engine row is absent while
+`protocols/` is incomplete, so the advertised list is empty rather than nine
+names long. The 24 are withheld too, permanently and by a separate decision, and
+tests assert that they never appear. Under-reporting is the safe direction: an
+empty list makes fixtures skip, whereas naming a scheme this build cannot serve
+would make them run and fail.
 
 **Its subject is unconditional, so no switch exists.** `CURL_DISABLE_AWS`,
 `CURL_DISABLE_BASIC_AUTH`, `CURL_DISABLE_BEARER_AUTH`,
@@ -147,13 +177,31 @@ rather than fail them.
 `CURL_DISABLE_NTLM`, `CURL_DISABLE_PARSEDATE`,
 `CURL_DISABLE_PROGRESS_METER`, `CURL_DISABLE_PROXY`,
 `CURL_DISABLE_SHA512_256`, `CURL_DISABLE_SHUFFLE_DNS`,
-`CURL_DISABLE_SOCKETPAIR` and `CURL_DISABLE_VERBOSE_STRINGS` each describe a
-capability that the default build provides at all times.
+`CURL_DISABLE_SOCKETPAIR` and `CURL_DISABLE_VERBOSE_STRINGS` each name a
+capability that no build configuration may switch off.
 `CURL_DISABLE_PARSEDATE` is the clearest of them: `curl_getdate` is one of the
 100 symbols `lib/libcurl.def` exports, so date parsing has to work in every
 configuration, and a switch that removed it would break the exported surface.
 No feature name covers any capability in this group, and inventing one would
 advertise a choice that the build does not offer.
+
+That is a statement about the feature vocabulary, and it must not be read as a
+statement that the capabilities are present. "No switch removes it" and "the
+build has it" are different claims, and for most of this group only the first
+one holds today. Authentication (basic, bearer, digest, Negotiate, AWS SigV4 and
+the HTTP-auth dispatch), the MIME and form APIs, the header API, `.netrc`,
+proxying, cookies, DoH, `--libcurl` emission, TLS session import and export, the
+certificate-status request and `bindlocal` are all still waiting on the engine
+modules behind them, and each is withheld from the advertised feature set until
+its module lands. Only a handful of the group is genuinely delivered: date
+parsing, verbose diagnostic strings, extended attributes and the large-file and
+large-time types.
+
+Do not maintain that split by hand from this page. `curlinfo` prints one row per
+capability with `ON` or `OFF` computed from the same engine table the banner
+reads, so running it answers the question for the build in front of you:
+
+    curlinfo
 
 **It has no counterpart at all.** `CURL_DISABLE_CA_SEARCH` turns off an unsafe
 CA bundle search along `PATH` on Windows, and Windows sits outside the four

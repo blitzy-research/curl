@@ -23,11 +23,6 @@
 //**************************************************************************/
 //! Per-request state: supersedes `lib/request.c` and `lib/request.h`.
 //!
-//! One [`SingleRequest`] covers exactly ONE request attempt. The C comment at
-//! `lib/request.h:49-55` states the scope, and it is the scope reproduced
-//! here: *"This struct only keeps stuff that is interesting for \*this\*
-//! request, as it will be cleared between multiple ones"*.
-//!
 //! Two deliberate exceptions to that, and both matter:
 //!
 //! 1. **A redirect or a retry keeps the overall timing.** The follow path
@@ -53,15 +48,6 @@
 //! cycle Rust does permit and this module refuses, because the engine is
 //! assembled LAST and everything it assembles must be nameable without it.
 //!
-//! Everything the C reaches for therefore arrives through [`RequestIo`], a
-//! typed seam the engine implements: the transport send path, the pending and
-//! flush queries, the send close and send shutdown, the send-pause query, the
-//! client reader, the client writer lifecycle, the DoH request teardown, the
-//! progress accounting and the four diagnostics emitters. Nothing else. There
-//! is no raw socket, no TLS provider, no resolver global and no untyped
-//! context in [`SingleRequest`], and a unit test drives the whole state
-//! machine over an in-memory implementation of that one trait.
-//!
 //! The two client-chain pointers of `struct SingleRequest` --
 //! `writer_stack` (`lib/request.h:86`) and `reader_stack` (`:89`) -- are that
 //! seam's [`RequestIo::client_start`], [`RequestIo::client_reset`],
@@ -79,16 +65,6 @@
 //! caller cannot read the flag without having handled the error and cannot
 //! forget to initialise it. Written bytes are likewise a RETURN value rather
 //! than the C's `size_t *pnwritten`.
-//!
-//! # The clock
-//!
-//! Every instant this module uses arrives through
-//! [`RequestIo::pgrs_now`] -- `Curl_pgrs_now` (`lib/progress.c:171-177`) --
-//! or through [`RequestIo::pgrs_time`]. Neither `Instant::now` nor
-//! `SystemTime::now` is called here, directly or indirectly, which is what
-//! lets `crate::util::timeval::TestClock` pin the request start time and the
-//! `TIMER_POSTRANSFER` record in the test module and what puts the line
-//! coverage AAP 0.8.4 demands over `src/transfer/` within reach.
 
 use core::fmt;
 
@@ -96,19 +72,13 @@ use crate::error::{CURLcode, CodeResult};
 use crate::transfer::progress::{Progress, TimerId};
 use crate::transfer::sendf::{ReadOutcome, TraceDataKind};
 use crate::util::bufq::{BufQ, BufqOpts};
+use crate::util::redact::RedactedOpt;
 use crate::util::timeval::CurlTime;
 
-// =========================================================================
 // The request-control vocabulary
-// =========================================================================
 
 /// Which halves of a transfer are still live -- supersedes the `KEEP_*` bits
 /// of `data->req.keepon` (`lib/urldata.h:413-414`).
-///
-/// A newtype over the C's `int` rather than two booleans, because the C
-/// clears both at once (`keepon &= ~(KEEP_RECV | KEEP_SEND)` at
-/// `lib/request.c:487`) and because the field is read as a mask by the
-/// transfer loop. The two values are the C's, unchanged.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct KeepFlags(i32);
 
@@ -176,19 +146,6 @@ impl core::ops::BitOrAssign for KeepFlags {
 
 /// The `Expect: 100-continue` handshake state -- supersedes
 /// `enum expect100` (`lib/request.h:34-40`).
-///
-/// Declared here because it is declared in `request.h`. The FIELD that holds
-/// it is not part of `struct SingleRequest` in curl 8.19.0-DEV either: it
-/// lives in `struct cr_exp100_ctx` (`lib/http.c:1445-1450`), the context of
-/// the `cr-exp100` client reader stage, so the HTTP protocol module owns the
-/// value and this module owns the vocabulary. Splitting them the way the C
-/// splits them keeps the enumeration reachable from both without either
-/// naming the other.
-///
-/// The discriminants are the C's declaration order, written out explicitly:
-/// the state is compared for equality by code in two different translation
-/// units, so the order is observable and inference would let a reordering
-/// pass unnoticed.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) enum Expect100 {
     /// `EXP100_SEND_DATA`: *"enough waiting, just send the body now"*.
@@ -264,11 +221,6 @@ impl Upgrade101 {
 
 /// How far a send-direction shutdown got -- the typed successor of
 /// `Curl_xfer_send_shutdown`'s `bool *done` (`lib/transfer.h:159`).
-///
-/// The C initialises the flag inside the callee and the caller reads it only
-/// after checking the return code; getting that order wrong reads an
-/// uninitialised `bool`. Returning the progress instead makes the mistake
-/// unrepresentable, and the error case carries no progress at all.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum SendShutdown {
@@ -288,9 +240,7 @@ impl SendShutdown {
     }
 }
 
-// =========================================================================
 // The settings this module reads, and the debug-build environment seam
-// =========================================================================
 
 /// `data->set.upload_buffer_size`'s default -- `UPLOADBUFFER_DEFAULT`
 /// (`lib/urldata.h:209`), assigned at `lib/url.c:438`.
@@ -338,20 +288,6 @@ impl Default for RequestConfig {
 }
 
 /// The one environment variable `lib/request.c` reads, behind a seam.
-///
-/// `xfer_send` consults `CURL_SMALLREQSEND` (`lib/request.c:189`) to force
-/// short initial sends, under `#ifdef DEBUGBUILD`. Reading the process
-/// environment from inside the send path would make the send path untestable
-/// -- an environment variable is global mutable state shared with every other
-/// test in the binary -- so the read is a seam the engine implements and a
-/// test supplies directly.
-///
-/// A production build returns `None` from [`RequestIo::debug_env`], which is
-/// exactly what the C's `#ifdef DEBUGBUILD` leaves behind: the override is
-/// then inert, and the clamp below it can never fire. Compiling the branch
-/// unconditionally rather than behind `cfg(debug_assertions)` is deliberate;
-/// a state-machine branch that only exists in one profile is a branch the
-/// coverage gate cannot see and a release build has never executed.
 pub(crate) trait DebugEnv: fmt::Debug {
     /// `getenv("CURL_SMALLREQSEND")`, verbatim and unparsed.
     ///
@@ -362,25 +298,11 @@ pub(crate) trait DebugEnv: fmt::Debug {
     fn small_req_send(&self) -> Option<&str>;
 }
 
-// =========================================================================
 // `RequestIo` -- everything `lib/request.c` reaches through `data` for
-// =========================================================================
 
 /// The typed seam between the request state machine and the transfer engine.
 ///
-/// Every operation `lib/request.c` performs on something outside
-/// `struct SingleRequest`, and nothing more. The C reaches all of it through
-/// one `struct Curl_easy *data`; here each reach is a method a reader can
-/// enumerate, and the engine -- `transfer/mod.rs` -- is the only production
-/// implementation.
-///
 /// # `CodeResult`, and where `CURLE_AGAIN` survives
-///
-/// Every fallible method returns `CodeResult<_>`, which is
-/// `Result<_, CURLcode>`: the C returns a bare `CURLcode` from all of these,
-/// and the specific diagnostic reaches `CURLOPT_ERRORBUFFER` through
-/// [`Self::failf`] rather than being attached to the code, exactly as
-/// `failf()` does in the C.
 ///
 /// [`CURLcode::Again`] is a READINESS condition and is preserved precisely
 /// where the C preserves it, which is not everywhere:
@@ -417,15 +339,6 @@ pub(crate) trait RequestIo: fmt::Debug {
     /// `Curl_xfer_send(data, buf, blen, eos, pnwritten)`
     /// (`lib/transfer.c:829-850`): offer bytes to the connection.
     ///
-    /// Returns how many bytes the transport ACCEPTED, which may be fewer than
-    /// offered and may be zero. Zero is backpressure, not an error: the C
-    /// folds the transport's `CURLE_AGAIN` into this case, and so must an
-    /// implementation.
-    ///
-    /// `eos` tells the transport that these are the last request bytes. It is
-    /// passed through untouched, and a zero-length call with `eos` set is a
-    /// meaningful event -- see [`SingleRequest::flush`].
-    ///
     /// # Errors
     ///
     /// Any transport failure, unchanged. Never [`CURLcode::Again`].
@@ -455,8 +368,6 @@ pub(crate) trait RequestIo: fmt::Debug {
 
     /// `Curl_xfer_send_shutdown(data, &done)` (`lib/transfer.c:160-165`):
     /// begin or advance a graceful shutdown of the send direction.
-    ///
-    /// Call it again while it answers [`SendShutdown::Pending`].
     ///
     /// # Errors
     ///
@@ -495,12 +406,6 @@ pub(crate) trait RequestIo: fmt::Debug {
 
     /// `Curl_creader_total_length(data)` (`lib/sendf.c:1408-1412`): how many
     /// bytes the reader chain will produce in total.
-    ///
-    /// -1 when the chain does not exist or the length is unknown, which is
-    /// TRUTHY in the C's `if` and is therefore not the same as 0. Both call
-    /// sites depend on the distinction: `Curl_req_send` direct-sends only
-    /// when this is exactly 0, and `req_set_upload_done` chooses between two
-    /// different informational lines on it.
     fn creader_total_length(&self) -> i64;
 
     /// `Curl_client_start(data)` (`lib/sendf.c:95-115`): a new request
@@ -524,13 +429,6 @@ pub(crate) trait RequestIo: fmt::Debug {
 
     /// `Curl_doh_close(data)`: release any DNS-over-HTTPS request state this
     /// attempt started.
-    ///
-    /// Called by `Curl_req_done` (`lib/request.c:106`) and
-    /// `Curl_req_hard_reset` (`:121`), both under `#ifndef CURL_DISABLE_DOH`.
-    /// There is no `cfg` here: a build without the `doh` feature implements
-    /// this as a no-op, which is what the C's disabled branch is, and a
-    /// conditional method would make the seam's shape depend on the feature
-    /// set.
     fn doh_close(&mut self);
 
     // ---- progress accounting --------------------------------------------
@@ -557,11 +455,6 @@ pub(crate) trait RequestIo: fmt::Debug {
 
     /// `Curl_debug(data, kind, buf, len)`: hand a raw payload to the
     /// application's debug callback.
-    ///
-    /// This module emits exactly two kinds, and the split between them is a
-    /// frozen contract rather than a convenience:
-    /// [`TraceDataKind::HeaderOut`] for the header prefix of an accepted
-    /// send and [`TraceDataKind::DataOut`] for the body bytes after it.
     fn debug(&mut self, kind: TraceDataKind, bytes: &[u8]);
 
     /// `infof(data, ...)`: a verbose-mode informational line, not an error.
@@ -586,9 +479,7 @@ pub(crate) trait RequestIo: fmt::Debug {
     }
 }
 
-// =========================================================================
 // `SingleRequest` -- the state of one request attempt
-// =========================================================================
 
 /// The state of one request attempt -- supersedes `struct SingleRequest`
 /// (`lib/request.h:56-131`).
@@ -602,15 +493,6 @@ pub(crate) trait RequestIo: fmt::Debug {
 /// | `struct bufq sendbuf` plus `BIT(sendbuf_init)` | `Option<BufQ>` | the flag IS whether the queue exists; two encodings of one fact can disagree |
 /// | `char *location`, `char *newurl` | `Option<String>` | owned, freed by drop |
 /// | `struct Curl_cwriter *writer_stack`, `struct Curl_creader *reader_stack` | [`RequestIo`] | see the module documentation |
-///
-/// The fields are `pub(crate)` because the C's are read and written directly
-/// by the protocol modules, the transfer loop and the multi handle -- 30-odd
-/// translation units touch `data->req` -- and an accessor pair per field would
-/// be 40 pairs of noise that changed nothing. [`Self::keepon`] is the one
-/// exception: it is private with a small vocabulary of methods over it,
-/// because every mutation in the C tree is one of exactly three shapes and
-/// naming them stops a fourth appearing.
-#[derive(Debug)]
 pub(crate) struct SingleRequest {
     /// `req.size`: the expected response body length, or -1 when it is not
     /// known at this point (`lib/request.h:57`).
@@ -648,10 +530,6 @@ pub(crate) struct SingleRequest {
     /// `req.deductheadercount`: bytes that do not count when deciding whether
     /// anything was transferred at the end of a connection
     /// (`lib/request.h:67-72`).
-    ///
-    /// The C's comment explains the whole purpose: it is what makes a lone
-    /// `100` reply, with no second response code after it, produce
-    /// `CURLE_GOT_NOTHING`.
     pub(crate) deductheadercount: u32,
 
     /// `req.headerline`: counts header lines so the first can be recognised
@@ -690,13 +568,6 @@ pub(crate) struct SingleRequest {
     /// `req.sendbuf` together with `BIT(sendbuf_init)`
     /// (`lib/request.h:90` and `:127`): the bytes waiting to go to the
     /// server.
-    ///
-    /// `None` is the C's `sendbuf_init == FALSE`. One chunk of
-    /// [`RequestConfig::upload_buffer_size`] bytes under
-    /// [`BufqOpts::SOFT_LIMIT`], so a write is never refused for want of room
-    /// while [`BufQ::is_full`] still reports the pressure -- which is what
-    /// makes `req_send_buffer_add`'s "the queue took all of it" invariant hold
-    /// (`lib/request.c:361-362`).
     sendbuf: Option<BufQ>,
 
     /// `req.sendbuf_hds_len`: how many of the queued bytes are HEADER bytes
@@ -792,12 +663,6 @@ pub(crate) struct SingleRequest {
 
     /// `BIT(resp_trailer)`: the response carried a `Trailer:` header field
     /// (`lib/request.h:118`).
-    ///
-    /// The one boolean neither reset touches, because it is established from
-    /// the response headers of the attempt that is being torn down and the
-    /// chunked decoder reads it while that teardown runs. The C leaves it
-    /// alone in both `Curl_req_soft_reset` and `Curl_req_hard_reset`, and so
-    /// does this.
     #[allow(dead_code)]
     pub(crate) resp_trailer: bool,
 
@@ -837,14 +702,72 @@ pub(crate) struct SingleRequest {
     pub(crate) shutdown_err_ignore: bool,
 
     /// `BIT(reader_started)`: client reads have begun (`lib/request.h:130`).
-    ///
-    /// The guard that starts the upload rate limiter exactly once per reader
-    /// chain (`lib/sendf.c:1197-1200`). The reader chain lives behind
-    /// [`RequestIo`], which owns the guard's read and write; the field is
-    /// carried here because it is a member of the C struct and the engine
-    /// projects it.
     #[allow(dead_code)]
     pub(crate) reader_started: bool,
+}
+
+/// Metadata only: the two URLs are redacted and the byte counts are not.
+///
+/// # Why this is not `#[derive(Debug)]`
+///
+/// Two fields carry a URL that the peer chose: [`Self::location`], the
+/// `Location:` header verbatim, and [`Self::newurl`], the redirect or retry
+/// target. A URL routinely carries a credential -- userinfo in the authority,
+/// a signed query parameter, a one-time token in a path -- and
+/// `crate::url::Url`'s own formatter redacts userinfo for exactly that reason,
+/// so rendering these two as plain strings here would have reinstated by the
+/// back door what that formatter closed. They render as byte counts.
+///
+/// # Why the rest is a chosen subset rather than all forty-odd fields
+///
+/// This struct mirrors `struct SingleRequest` (`lib/request.h:52-140`) field
+/// for field, and most of those fields are counters and single-bit flags whose
+/// individual values are meaningless without the transfer that set them. A
+/// forty-row dump is not a diagnostic; it is noise that hides the four numbers
+/// a reader of a transfer-level message wants. So this renders the size and
+/// progress accounting, the phase flags that decide what happens next, and the
+/// presence of the queued send buffer -- whose contents `crate::util::bufq`
+/// already declines to render.
+///
+/// Nothing about the stored values changes: [`Self::location`] and
+/// [`Self::newurl`] are ordinary `pub(crate)` fields and every consumer reads
+/// them verbatim, so redirect handling and `CURLINFO_REDIRECT_URL` are
+/// unaffected.
+impl fmt::Debug for SingleRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SingleRequest")
+            // Size and progress accounting.
+            .field("size", &self.size)
+            .field("maxdownload", &self.maxdownload)
+            .field("bytecount", &self.bytecount)
+            .field("writebytecount", &self.writebytecount)
+            .field("headerbytecount", &self.headerbytecount)
+            .field("offset", &self.offset)
+            .field("httpcode", &self.httpcode)
+            .field("keepon", &self.keepon())
+            // The redirect targets, redacted.
+            .field(
+                "location",
+                &RedactedOpt(self.location.as_deref().map(str::as_bytes)),
+            )
+            .field(
+                "newurl",
+                &RedactedOpt(self.newurl.as_deref().map(str::as_bytes)),
+            )
+            // The phase flags that decide what happens next.
+            .field("header", &self.header)
+            .field("done", &self.done)
+            .field("upload_done", &self.upload_done)
+            .field("ignorebody", &self.ignorebody)
+            .field("chunk", &self.chunk)
+            .field("eos_read", &self.eos_read)
+            .field("eos_sent", &self.eos_sent)
+            // The queued send buffer reports presence and length only; its
+            // bytes are the request body.
+            .field("has_sendbuf", &self.sendbuf.is_some())
+            .field("sendbuf_hds_len", &self.sendbuf_hds_len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for SingleRequest {
@@ -907,9 +830,7 @@ impl Default for SingleRequest {
     }
 }
 
-// -------------------------------------------------------------------------
 // The keep-flag vocabulary
-// -------------------------------------------------------------------------
 
 impl SingleRequest {
     /// Which halves of the transfer are still live -- reads `req.keepon`.
@@ -979,9 +900,7 @@ impl SingleRequest {
     }
 }
 
-// -------------------------------------------------------------------------
 // Initialisation, reset, start, done, cleanup
-// -------------------------------------------------------------------------
 
 impl SingleRequest {
     /// `Curl_req_init(req)` (`lib/request.c:38-41`): the state of the request
@@ -997,16 +916,6 @@ impl SingleRequest {
 
     /// `Curl_req_soft_reset(req, data)` (`lib/request.c:43-87`): the request
     /// may continue with a follow-up.
-    ///
-    /// Resets the members of ONE attempt and keeps [`Self::start`], so the
-    /// overall duration of an operation that redirects still measures the
-    /// operation. The field list below is the C's, in the C's order, and it is
-    /// deliberately narrower than [`Self::hard_reset`]'s -- a soft reset does
-    /// not touch `size`, `maxdownload`, `offset`, `httpcode`, `keepon`,
-    /// `upgr101`, `timeofdoc`, `location`, `newurl`, `content_range`,
-    /// `rewind_read`, `http_bodyless`, `chunk`, `ignore_cl`, `upload_chunky`,
-    /// `no_body` or `authneg`, because a follow-up is being SET UP from those
-    /// while this runs.
     ///
     /// # The send queue
     ///
@@ -1077,12 +986,6 @@ impl SingleRequest {
     /// `Curl_req_start(req, data)` (`lib/request.c:89-94`): the request is
     /// about to start.
     ///
-    /// Records the start instant from [`RequestIo::pgrs_now`] and then does a
-    /// soft reset. The order is the C's and it matters: a soft reset that ran
-    /// first would still leave the same fields set, but the instant would then
-    /// be sampled after the client chain had been rewound, and the rewind can
-    /// call into an application callback of unbounded duration.
-    ///
     /// # Errors
     ///
     /// [`Self::soft_reset`]'s error, unchanged. The start instant is recorded
@@ -1095,17 +998,6 @@ impl SingleRequest {
 
     /// `Curl_req_done(req, data, aborted)` (`lib/request.c:98-109`): the
     /// request is over.
-    ///
-    /// When the request was NOT aborted, one last flush is attempted and its
-    /// result is DISCARDED. That is the C's `(void)req_flush(data)` at `:103`
-    /// and it is not an oversight: the request is already finished, so a
-    /// blocked or failed flush cannot change its outcome, and propagating the
-    /// code would turn a successful transfer whose final bytes could not be
-    /// pushed into a failure. An aborted request skips the flush entirely --
-    /// there is nothing worth pushing and the connection may be unusable.
-    ///
-    /// Then the client writer state is reset and any DoH request is closed,
-    /// in that order.
     ///
     /// # Errors
     ///
@@ -1134,24 +1026,6 @@ impl SingleRequest {
 
     /// `Curl_req_hard_reset(req, data)` (`lib/request.c:111-164`): restore the
     /// virgin state without discarding the reusable allocations.
-    ///
-    /// The C's own comment at `:123` is the specification: *"Can no longer
-    /// memset() this struct as we need to keep some state"*. What survives is
-    /// the send queue's allocation -- emptied, not freed -- and the three
-    /// fields that describe how the transfer was set up rather than what the
-    /// attempt did: [`Self::resp_trailer`], [`Self::shutdown_err_ignore`] and
-    /// [`Self::reader_started`].
-    ///
-    /// Everything else returns to the state [`Default::default`] produces,
-    /// with one exception the C makes explicitly: [`Self::no_body`] is
-    /// restored from [`RequestConfig::opt_no_body`] and not to false, because
-    /// a `HEAD` request must still be a `HEAD` request afterwards.
-    ///
-    /// Both rate limiters are unblocked with the ZERO timestamp, which is the
-    /// C's `struct curltime t0 = { 0, 0 }` at `:113` reaching `:162-163`.
-    /// Unblocking restarts a limiter with an unknown total, so the zero
-    /// instant becomes its new reference and no tokens accrue for the time it
-    /// spent blocked -- see `RateLimit::block`.
     #[allow(dead_code)]
     pub(crate) fn hard_reset(&mut self, io: &mut dyn RequestIo) {
         // `:113`.
@@ -1217,16 +1091,6 @@ impl SingleRequest {
 
     /// `Curl_req_free(req, data)` (`lib/request.c:166-172`): release the
     /// request's state, which is not usable afterwards.
-    ///
-    /// The C frees `newurl`, frees the send queue if it was initialised and
-    /// tears both client chains down. Here the owned strings go by ordinary
-    /// drop -- clearing them is what makes "not usable afterwards" observable
-    /// rather than merely documented -- while the queue and the chains go
-    /// through their own teardown, because both hold resources the engine
-    /// pooled and a drop alone would not return them.
-    ///
-    /// Calling this twice is harmless: the second call finds no queue and
-    /// nothing to clear.
     #[allow(dead_code)]
     pub(crate) fn free(&mut self, io: &mut dyn RequestIo) {
         // `:168`.
@@ -1259,21 +1123,6 @@ fn new_sendbuf(chunk_size: usize) -> BufQ {
 /// An unsigned decimal number with no sign, no prefix and no leading blanks,
 /// rejected when it exceeds `max` -- `curlx_str_number(&p, &num, max)`
 /// through `str_num_base` (`lib/curlx/strparse.c:157-191`).
-///
-/// Transcribed rather than delegated to `str::parse`, because the two differ
-/// in three ways that matter for the one caller: this accepts trailing
-/// non-digit characters and stops at them, it rejects a value above the
-/// ceiling instead of only a value above the type's range, and it rejects a
-/// leading sign. `Some` is the C's `STRE_OK`; `None` covers both `STRE_NO_NUM`
-/// and `STRE_OVERFLOW`, which the caller treats identically -- the C tests
-/// `if(!curlx_str_number(...))` and ignores the distinction.
-///
-/// The C splits the overflow test in two, on whether `max` is below the base.
-/// One test covers both here and is equivalent: `max < digit` can only be
-/// reached by a value already above the ceiling, and
-/// `value > (max - digit) / base` holds exactly when
-/// `value * base + digit > max`. Neither multiplication can overflow, because
-/// the test runs before it.
 fn parse_capped_number(text: &str, max: u64) -> Option<u64> {
     const BASE: u64 = 10;
 
@@ -1299,34 +1148,12 @@ fn parse_capped_number(text: &str, max: u64) -> Option<u64> {
     }
 }
 
-// -------------------------------------------------------------------------
 // The low-level send
-// -------------------------------------------------------------------------
 
 impl SingleRequest {
     /// `xfer_send(data, buf, blen, hds_len, pnwritten)`
     /// (`lib/request.c:174-229`): offer `bytes` to the transport, of which the
     /// first `hds_len` are request HEADER bytes.
-    ///
-    /// Returns how many bytes the transport accepted, which may be fewer than
-    /// offered and may be zero. A partial write is preserved exactly: nothing
-    /// is retried here and nothing is buffered here.
-    ///
-    /// # The header prefix is not merely a label
-    ///
-    /// Four behaviours turn on it, and all four are frozen by AAP 0.8.1:
-    ///
-    /// 1. `CURL_SMALLREQSEND` may shorten the BODY portion and never the
-    ///    header prefix.
-    /// 2. `CURLOPT_MAX_SEND_SPEED_LARGE` clamps the BODY portion and never
-    ///    the header prefix. The C's own comment at `:198-199` states it:
-    ///    *"The headers do not count to the max speed."*
-    /// 3. Accepted header bytes are reported as `CURLINFO_HEADER_OUT` and
-    ///    accepted body bytes as `CURLINFO_DATA_OUT`, so `--trace` renders
-    ///    them under the right heading.
-    /// 4. Only body bytes reach [`Self::writebytecount`] and the upload
-    ///    progress counter, so `%{size_upload}` counts the payload and not
-    ///    the request line.
     ///
     /// # Errors
     ///
@@ -1393,13 +1220,6 @@ impl SingleRequest {
         }
 
         // `:198-204`. The send-rate clamp, body bytes only.
-        //
-        // The C tests `if(data->set.max_send_speed)` and then casts the
-        // setting to `size_t`. A negative setting would therefore make the
-        // comparison true and the cast enormous; `> 0` is used here instead
-        // because `CURLOPT_MAX_SEND_SPEED_LARGE` cannot be negative -- so no
-        // reachable behaviour moves -- and because an unreachable path with a
-        // defined outcome is worth more than an unreachable path without one.
         let max_send_speed = io.config().max_send_speed;
         if max_send_speed > 0 {
             let body_bytes = blen - hds_len;
@@ -1458,19 +1278,12 @@ impl SingleRequest {
     }
 }
 
-// -------------------------------------------------------------------------
 // The upload queue, the flush, end-of-stream and shutdown
-// -------------------------------------------------------------------------
 
 impl SingleRequest {
     /// `req_send_buffer_add(data, buf, blen, hds_len)`
     /// (`lib/request.c:352-365`): queue `bytes`, of which the first `hds_len`
     /// are request HEADER bytes.
-    ///
-    /// The queue carries [`BufqOpts::SOFT_LIMIT`], so it accepts the whole
-    /// input however full it already is -- which is the invariant the C
-    /// asserts at `:361-362` and the reason only `hds_len` needs adding to the
-    /// header count rather than "as much of `hds_len` as fitted".
     ///
     /// # Errors
     ///
@@ -1509,23 +1322,6 @@ impl SingleRequest {
 
     /// `req_send_buffer_flush(data)` (`lib/request.c:231-253`): hand the
     /// queued bytes to the transport, oldest first.
-    ///
-    /// Each turn peeks one contiguous run, works out how much of it is still
-    /// header (`min(sendbuf_hds_len, run length)`, the C's `CURLMIN` at
-    /// `:238`), sends it, skips exactly what was accepted and reduces the
-    /// header count by exactly the header bytes that went out. A short write
-    /// ends the loop WITHOUT an error -- the network is blocking or a rate
-    /// limit is pacing us, and neither is a failure. An error ends the loop
-    /// too, and the bytes of that turn are not skipped, so the retry offers
-    /// the same bytes again.
-    ///
-    /// # Why the queue is moved out and back
-    ///
-    /// `BufQ::peek` borrows the queue for as long as the run it returns is
-    /// alive, and the send needs `&mut self` at the same time. Taking the
-    /// queue into a local for the duration makes the two borrows disjoint
-    /// without copying a single byte, which a scratch buffer would not. The
-    /// queue is restored on every path out, including the error path.
     ///
     /// # Errors
     ///
@@ -1589,10 +1385,6 @@ impl SingleRequest {
     /// `req_set_upload_done(data)` (`lib/request.c:255-283`): all request data
     /// has been sent, or the send has been abandoned.
     ///
-    /// The transition is one-way and happens exactly once per attempt, which
-    /// is why `TIMER_POSTRANSFER` can be recorded here: it marks
-    /// `upload_done` going false to true and nothing else does.
-    ///
     /// Four informational lines are possible and the choice between them is
     /// frozen, because the fixture corpus compares recorded stderr:
     ///
@@ -1603,10 +1395,6 @@ impl SingleRequest {
     /// | not aborted, bytes sent | `upload completely sent off: N bytes` |
     /// | no bytes, download not done, reader length not 0 | `We are completely uploaded and fine` |
     /// | no bytes, download not done, reader length 0 | `Request completely sent off` |
-    ///
-    /// Note the last two: [`RequestIo::creader_total_length`] answers -1 for
-    /// an unknown length, which is TRUTHY in the C's ternary at `:277-279`, so
-    /// only an exact zero selects the shorter line.
     ///
     /// # Errors
     ///
@@ -1777,41 +1565,11 @@ impl SingleRequest {
     }
 }
 
-// -------------------------------------------------------------------------
 // Sending the request headers, and continuing the upload
-// -------------------------------------------------------------------------
 
 impl SingleRequest {
     /// `Curl_req_send(data, req, httpversion)` (`lib/request.c:367-412`): send
     /// the request headers, buffering whatever does not go out.
-    ///
-    /// `header_bytes` is the COMPLETE header block and no body, already
-    /// serialised by the protocol module. It is passed through byte for byte:
-    /// nothing here parses it, reorders it, re-cases it, appends to it or
-    /// normalises it in any way. AAP 0.6.7 is why -- 1,476 of the 1,914
-    /// fixtures compare the emitted request against a literal expectation as
-    /// ONE string, so header order, header casing and the exact set of default
-    /// headers are all part of the contract, and the only correct thing this
-    /// layer can do with them is hand them over unchanged.
-    ///
-    /// `httpversion` is the encoded version actually used -- 09, 10, 11, 20,
-    /// 30 -- and is recorded in [`Self::httpversion_sent`]. It is a parameter
-    /// rather than something derived from the bytes for the same reason.
-    ///
-    /// # The direct-send optimisation, and its precondition
-    ///
-    /// All three conditions must hold (`:385-387`): the queue is empty, the
-    /// reader chain's total length is exactly zero, and the whole header block
-    /// fits ONE queue chunk. The third is not about efficiency. The C's
-    /// comment at `:382-384` gives the reason: a blocked send is retried later
-    /// from the queue, and a block larger than one chunk would then be retried
-    /// with a shortened length -- so the request bytes would change between
-    /// attempts. An oversized block is therefore queued instead, never
-    /// direct-sent.
-    ///
-    /// End-of-stream is marked as READ before the direct send, because a
-    /// request with no body has nothing further to come from the client and
-    /// the send must be able to carry the end-of-stream flag.
     ///
     /// # Errors
     ///
@@ -1869,17 +1627,6 @@ impl SingleRequest {
     /// `Curl_req_send_more(data)` (`lib/request.c:445-466`): read more from
     /// the client and flush everything that is buffered.
     ///
-    /// The fill is attempted only when all four of the C's conditions hold
-    /// (`:450-453`): the upload was not aborted, the client has not already
-    /// reported end-of-stream, the transport send is not paused, and the queue
-    /// is not full. Any one of them false skips straight to the flush, which
-    /// is what lets a paused or saturated transfer still push what it already
-    /// has.
-    ///
-    /// A [`CURLcode::Again`] from the client read is non-fatal FOR THIS
-    /// ITERATION -- the application simply has nothing ready -- and any other
-    /// error propagates.
-    ///
     /// # Errors
     ///
     /// Any error from the client read except [`CURLcode::Again`], and any
@@ -1921,15 +1668,6 @@ impl SingleRequest {
     /// (`lib/request.c:455-456`) together with `add_from_client`
     /// (`:338-350`).
     ///
-    /// One read of the client, into whatever room the queue's tail has. A zero
-    /// maximum means "as much as fits", which is what the C's `0` argument
-    /// asks for.
-    ///
-    /// End-of-stream is recorded only on a SUCCESSFUL read, which is the C's
-    /// `if(!result && eos)` at `:347`. The flag is applied after the queue has
-    /// been put back so that the queue is restored on every path, error paths
-    /// included.
-    ///
     /// # Errors
     ///
     /// Whatever the client read returns, [`CURLcode::Again`] included, and
@@ -1962,9 +1700,7 @@ impl SingleRequest {
     }
 }
 
-// -------------------------------------------------------------------------
 // Want-send, want-receive, abort and stop
-// -------------------------------------------------------------------------
 
 impl SingleRequest {
     /// `Curl_req_sendbuf_empty(data)` (`lib/request.c:414-417`): true when
@@ -1995,16 +1731,6 @@ impl SingleRequest {
 
     /// `Curl_req_want_send(data)` (`lib/request.c:419-430`): the request has
     /// something to send and is not blocked.
-    ///
-    /// Three conditions, and the third is a disjunction of three (`:421-424`):
-    /// the request is not done, the UPLOAD limiter is not blocked, and at
-    /// least one of `KEEP_SEND`, queued bytes, or output the connection is
-    /// still holding.
-    ///
-    /// The limiter is consulted rather than a separate pause flag because
-    /// `Curl_xfer_pause_send` blocks that limiter -- pausing and rate-limiting
-    /// are one mechanism in curl 8.19.0-DEV, and the two directions block
-    /// independently.
     #[allow(dead_code)]
     pub(crate) fn want_send(&self, io: &dyn RequestIo) -> bool {
         !self.done
@@ -2028,11 +1754,6 @@ impl SingleRequest {
 
     /// `Curl_req_done_sending(data)` (`lib/request.c:440-443`): the request has
     /// sent all its headers and data.
-    ///
-    /// Both halves are needed. [`Self::upload_done`] alone would answer true
-    /// while the connection still held unflushed output, and
-    /// `!want_send` alone would answer true for a request that is merely
-    /// blocked.
     #[allow(dead_code)]
     pub(crate) fn done_sending(&self, io: &dyn RequestIo) -> bool {
         self.upload_done && !self.want_send(io)
@@ -2040,11 +1761,6 @@ impl SingleRequest {
 
     /// `Curl_req_abort_sending(data)` (`lib/request.c:468-477`): stop sending
     /// request data.
-    ///
-    /// Idempotent: an upload that is already done is left alone and `Ok(())`
-    /// is returned, which is what makes [`Self::stop_send_recv`] safe to call
-    /// repeatedly and what lets an error path call it without knowing whether
-    /// the send already finished.
     ///
     /// # Errors
     ///
@@ -2069,14 +1785,6 @@ impl SingleRequest {
     /// `Curl_req_stop_send_recv(data)` (`lib/request.c:479-489`): stop sending
     /// AND receiving.
     ///
-    /// The C's comment at `:481-483` is the specification, and the second half
-    /// of it is easy to lose: *"stop receiving and ALL sending as well,
-    /// including PAUSE and HOLD. We might still be paused on receive client
-    /// writes though, so keep those bits around."* Only the two keep bits are
-    /// cleared here. A client-output pause lives in the writer chain and in
-    /// the download limiter, neither of which this touches, so a transfer
-    /// paused by `curl_easy_pause` stays paused and can still be resumed.
-    ///
     /// # Errors
     ///
     /// [`Self::abort_sending`]'s error, unchanged -- and the keep bits are
@@ -2098,9 +1806,7 @@ impl SingleRequest {
     }
 }
 
-// =========================================================================
 // Redirect and retry bookkeeping
-// =========================================================================
 
 /// Why a new request is being issued -- supersedes `followtype`
 /// (`lib/http.h:40-48`).
@@ -2226,12 +1932,6 @@ pub(crate) const MAXREDIRS_MAX: i64 = 0x7fff;
 /// `curl_easy_setopt(CURLOPT_MAXREDIRS, value)`'s validation
 /// (`lib/setopt.c:1078-1082` through `value_range` at `:832-841`).
 ///
-/// The asymmetry is the C's and is easy to get wrong in both directions:
-/// below -1 is an ERROR, while above `0x7fff` is CLAMPED and succeeds. That
-/// falls straight out of `value_range(&arg, -1, -1, 0x7fff)`, whose
-/// `below_error` and `min` are both -1, so the "raise to min" branch is
-/// unreachable and only the "lower to max" branch can fire.
-///
 /// # Errors
 ///
 /// [`CURLcode::BadFunctionArgument`] for a value below
@@ -2277,10 +1977,6 @@ pub(crate) const CURL_REDIR_POST_303: i64 = 4;
 impl PostRedir {
     /// `curl_easy_setopt(CURLOPT_POSTREDIR, value)`'s validation
     /// (`lib/setopt.c:1083-1090`).
-    ///
-    /// Unknown bits above the three defined ones are IGNORED rather than
-    /// rejected, which is the C's behaviour: it masks each bit out
-    /// individually and never checks for leftovers.
     ///
     /// # Errors
     ///
@@ -2355,9 +2051,6 @@ impl HttpRequestKind {
     /// *"is this a POST"* -- `HTTPREQ_POST`, `HTTPREQ_POST_FORM` and
     /// `HTTPREQ_POST_MIME` (`lib/http.c:1324-1326`, `:1348-1350`,
     /// `:1366-1368`).
-    ///
-    /// A predicate rather than three comparisons repeated at three sites,
-    /// which is what let the C's three sites drift apart in the first place.
     #[allow(dead_code)]
     pub(crate) const fn is_post_like(self) -> bool {
         matches!(self, Self::Post | Self::PostForm | Self::PostMime)
@@ -2441,13 +2134,6 @@ pub(crate) struct FollowState {
     pub(crate) requests: i32,
 
     /// `data->info.httpcode`: the status `CURLINFO_RESPONSE_CODE` reports.
-    ///
-    /// Distinct from [`SingleRequest::httpcode`] on purpose, because the C
-    /// reads the two at DIFFERENT points of the same function: `req.httpcode`
-    /// decides whether an inherited explicit port survives (`lib/http.c:1174`)
-    /// and `info.httpcode` decides the method switch (`:1293`). They normally
-    /// agree -- `lib/http.c:3741` copies one into the other -- and a proxy
-    /// CONNECT exchange is where they do not (`lib/cf-h1-proxy.c:170`).
     pub(crate) httpcode: i32,
 
     /// `data->info.wouldredirect` (`lib/urldata.h:762`): *"URL this would have
@@ -2526,11 +2212,6 @@ pub(crate) enum ResolvedTarget {
     /// protocol performs it and this module consumes the result. `reason` is
     /// `curl_url_strerror(uc)`, which appears verbatim in the C's failure
     /// line.
-    ///
-    /// A [`FollowType::Fake`] follow SURVIVES this, unless the code is
-    /// [`CURLcode::OutOfMemory`]: the C duplicates the raw target instead
-    /// (`lib/http.c:1195-1197`), so `CURLINFO_REDIRECT_URL` still answers with
-    /// whatever the server actually sent.
     Unparsable {
         /// The curl code the failure maps to.
         code: CURLcode,
@@ -2540,18 +2221,6 @@ pub(crate) enum ResolvedTarget {
 }
 
 /// The protocol-specific half of following a redirect.
-///
-/// Everything in `Curl_http_follow` (`lib/http.c:1115-1396`) that needs to
-/// know about URLs, schemes, ports or request methods, and nothing else. The
-/// counting, the ceiling, the fake-follow storage, the soft reset, the log
-/// lines and the method-switch DECISIONS all stay in this module, which is why
-/// `transfer/request.rs` names no protocol module and `protocols/http1.rs`
-/// does not reimplement the bookkeeping.
-///
-/// `lib/multi.c:1870-1878` is the reason this is an `Option` at the call site
-/// rather than a required argument: a scheme whose handler has no `follow`
-/// operation answers `CURLE_TOO_MANY_REDIRECTS`, which
-/// [`SingleRequest::follow`] reproduces.
 pub(crate) trait ProtocolFollow: fmt::Debug {
     /// `Curl_is_absolute_url(newurl, NULL, 0, FALSE)`, as called at
     /// `lib/http.c:1176`.
@@ -2559,11 +2228,6 @@ pub(crate) trait ProtocolFollow: fmt::Debug {
 
     /// `curl_url_set(data->state.uh, CURLUPART_URL, newurl, flags)` and the
     /// `curl_url_get` that follows it (`lib/http.c:1181-1204`).
-    ///
-    /// The flags the C computes from `follow_type` are the protocol's
-    /// business: `CURLU_NON_SUPPORT_SCHEME` for a fake follow,
-    /// `CURLU_URLENCODE` for a real redirect, `CURLU_ALLOW_SPACE` always, and
-    /// `CURLU_PATH_AS_IS` when `CURLOPT_PATH_AS_IS` is set.
     fn resolve_target(
         &mut self,
         target: &str,
@@ -2572,9 +2236,6 @@ pub(crate) trait ProtocolFollow: fmt::Debug {
 
     /// Replace `data->state.referer` with the current URL stripped of its
     /// fragment, its user and its password (`lib/http.c:1142-1168`).
-    ///
-    /// Called only for a real redirect, and only when
-    /// [`FollowSettings::auto_referer`] is set.
     ///
     /// # Errors
     ///
@@ -2585,16 +2246,6 @@ pub(crate) trait ProtocolFollow: fmt::Debug {
 
     /// Drop the credentials when the resolved URL moved to another port or
     /// another scheme (`lib/http.c:1207-1250`).
-    ///
-    /// `allow_port` is [`FollowState::allow_port`], which the C reads together
-    /// with `data->set.use_port` at `:1213` to decide whether the comparison
-    /// uses the user's explicit port or the URL's.
-    ///
-    /// Called only when [`FollowSettings::allow_auth_to_other_hosts`] is false
-    /// and the follow is not fake. The two informational lines it emits --
-    /// `Clear auth, redirects to port from %u to %u` and `Clear auth,
-    /// redirects scheme from %s to %s` -- name values only the protocol
-    /// holds, so they are emitted there.
     ///
     /// # Errors
     ///
@@ -2626,10 +2277,6 @@ impl SingleRequest {
     /// about to go back to `CONNECT` with a URL nothing can act on, so
     /// answering "no more redirects" is what stops it. Silently ignoring the
     /// follow would leave the transfer looping.
-    ///
-    /// This function DOES NOT take ownership of `target`, exactly as the C's
-    /// comment at `:1868` promises: *"This function DOES NOT FREE the given
-    /// url."*
     ///
     /// # Errors
     ///
@@ -2689,16 +2336,6 @@ impl SingleRequest {
     /// 9. A failed rewind is fatal unless the method became GET, and then the
     ///    redirect timer is recorded and the transfer sizes are forgotten
     ///    (`:1387-1393`).
-    ///
-    /// # Why the rewind failure is deferred
-    ///
-    /// Step 7's soft reset rewinds the client reader, and that can fail -- an
-    /// upload from a non-seekable source cannot be replayed. The C does not
-    /// return there. It carries the code to `:1387-1389` and returns it only
-    /// if the method did NOT become GET, because a redirect that turns a POST
-    /// into a GET has no body to replay and the failure is therefore moot.
-    /// Returning early would break every 301-to-GET redirect of a piped
-    /// upload.
     ///
     /// # Errors
     ///
@@ -2802,13 +2439,7 @@ impl SingleRequest {
             state.allow_port = false;
         }
         // The C hands the allocation to the bufref and then reads the same
-        // pointer for the line below. A clone is the safe equivalent, and one
-        // copy of a URL per redirect is invisible next to the request it is
-        // about to issue -- performance is an explicit non-goal under
-        // AAP 0.1.1, and the ORDER of the three side effects here is not: the
-        // commit, then the reset, then the line, because the reset can itself
-        // emit trace output and the recorded stderr of curl 8.19.0-DEV has it
-        // in that sequence.
+        // pointer for the line below.
         protocol.commit_url(follow_url.clone());
         let rewind_result = self.soft_reset(io);
         io.infof(format_args!(
@@ -2845,9 +2476,6 @@ impl SingleRequest {
     /// (`lib/http.c:1293-1385`), and `http_switch_to_get`
     /// (`:1098-1112`) with it.
     ///
-    /// Returns whether the method became GET, which step 9 of
-    /// [`Self::follow_location`] needs.
-    ///
     /// Three codes act; every other code, including 304, 305, 307 and 308,
     /// leaves the method alone:
     ///
@@ -2870,12 +2498,6 @@ impl SingleRequest {
     /// * [`FollowMode::FirstOnly`] keeps it silently, because it has already
     ///   logged `Drop custom request method for next request` at step 7 and
     ///   saying both would contradict itself.
-    ///
-    /// The pending rewind is cancelled either way -- `Curl_creader_set_rewind(
-    /// data, FALSE)` at `:1111`, which writes [`Self::rewind_read`]. A GET has
-    /// no body, so there is nothing left to rewind, and leaving the request
-    /// pending would make the next [`Self::soft_reset`] rewind a reader chain
-    /// that is about to be replaced.
     fn redirect_method_switch(
         &mut self,
         io: &mut dyn RequestIo,
@@ -2928,17 +2550,8 @@ impl SingleRequest {
     }
 }
 
-// =========================================================================
 // Tests
-// =========================================================================
 
-// Not one test below sleeps, reads the host clock, opens a socket, resolves a
-// name or performs a TLS handshake. Every instant is a [`CurlTime`] a
-// [`TestClock`] was placed at, and every byte crosses an in-memory
-// [`TestIo`] -- which is what makes the request state machine assertable at
-// all, and what puts the line coverage AAP 0.8.4 demands over `src/transfer/`
-// within reach.
-//
 // `cargo test` builds with `debug_assertions` on, so the contract assertions
 // this module transcribes from the C's `DEBUGASSERT`s do fire during a test
 // run. No test drives a path into one deliberately: an assertion that fires
@@ -6045,12 +5658,6 @@ mod tests {
     /// The seam with ONLY its required methods implemented -- which is what a
     /// production engine looks like, because the three defaulted methods are
     /// defaulted precisely so that no engine has to write them.
-    ///
-    /// [`TestIo`] overrides two of the three so that a test can observe the
-    /// debug-build environment and the debug-build trace lines. This type
-    /// exists to exercise what happens when nobody overrides them, which is
-    /// the SHIPPED behaviour: no environment is consulted and every trace line
-    /// is discarded.
     #[derive(Debug)]
     struct PlainIo(TestIo);
 
@@ -6275,5 +5882,36 @@ mod tests {
                 index + 1
             );
         }
+    }
+
+    /// A redirect target cannot appear in a formatted request.
+    ///
+    /// `Location:` and the derived redirect URL both arrive from the peer and
+    /// both can carry a credential, which is why `crate::url::Url` redacts
+    /// userinfo; this asserts the same for the two places a transfer keeps one.
+    #[test]
+    fn a_redirect_url_cannot_reach_a_formatted_request() {
+        const LOCATION: &str = "https://alice:hunter2@example.com/next?tok=s3";
+
+        let mut req = SingleRequest::new();
+        req.location = Some(String::from(LOCATION));
+        req.newurl = Some(String::from(LOCATION));
+
+        let text = format!("{req:?}");
+        assert!(!text.contains("hunter2"), "the password leaked: {text}");
+        assert!(!text.contains("alice"), "the username leaked: {text}");
+        assert!(!text.contains("example.com"), "the target leaked: {text}");
+        assert!(
+            text.contains(&format!("<redacted, {} bytes>", LOCATION.len())),
+            "{text}"
+        );
+
+        // The accounting a reader of a transfer message wants still renders,
+        // and the dump says it is a summary rather than the whole struct.
+        assert!(text.contains("bytecount"), "{text}");
+        assert!(text.contains(".."), "{text}");
+
+        // The stored values are unchanged, so redirect handling is unaffected.
+        assert_eq!(req.newurl.as_deref(), Some(LOCATION));
     }
 }

@@ -93,7 +93,47 @@
 //! `src/tool_main.c:148`, *before* anything that can fail, so that the first
 //! diagnostic the tool can emit -- `out of file descriptors` at
 //! `src/tool_main.c:170` -- already has a channel to emit on. [`main`] builds
-//! [`output::msgs::MessageSink`] first for exactly that reason.
+//! [`output::msgs::SinkHandle`] over that sink first for exactly that reason.
+//!
+//! # What an invocation reaches, and what it does not
+//!
+//! [`operate`] drives the whole of `src/tool_operate.c:2260-2330`: the
+//! no-arguments path, the 282-row option parser through
+//! [`cli::args::parse_args`], the mandatory `--insecure` warning, and the
+//! outcome dispatch in [`outcome_for`]. Of C's five "requested" outcomes,
+//! `--manual` and `--dump-ca-embed` are served in full because their renderers
+//! are part of this checkout; `--help`, `--version` and `--engine list` render
+//! through `src/tool_help.c`, whose counterpart `curl-rs/src/cli/help.rs` is
+//! not, and each reports that rather than returning a successful exit for
+//! output nobody produced.
+//!
+//! What no invocation reaches is a transfer. A command line that parses cleanly
+//! ends with a diagnostic naming the driver and `CURLE_NOT_BUILT_IN`, which is
+//! documented as "a requested feature, protocol or option was not found built-in
+//! in this libcurl due to a build-time decision".
+//!
+//! Sixteen of the files AAP section 0.3.1 assigns to this crate have no
+//! implementation at this commit, enumerated here rather than gestured at
+//! because every one of them is a separate planned unit of work and a reader
+//! needs to know which:
+//!
+//! * the three-module operation driver, `operate/{mod,single,parallel}.rs`
+//! * the option-to-`setopt` mapping, `config/to_setopts.rs`
+//! * the two remaining configuration stages, `config/parseconfig.rs` (whose
+//!   readable half is absent; the unreadable half is reproduced by
+//!   [`OsParseHost`]) and `config/ssls.rs`
+//! * the seven transfer callbacks under [`callbacks`] --
+//!   `{write,read,header,debug,seek,progress,socket}.rs`. That module is
+//!   declared and declares none of them, which is why a parsed command line has
+//!   nothing to hand a transfer.
+//! * the two CLI renderers `cli/help.rs` and `cli/ipfs.rs`
+//! * the `--libcurl` emitter, `libcurl_src.rs`
+//!
+//! That list is CHECKED, not merely written: `absent_target_gate` in
+//! `src/bin/curlinfo.rs` holds the same sixteen paths together with the
+//! eighteen `curl-rs-lib` and three `curl-rs-ffi` targets, and fails naming any
+//! that has since landed. When it fails, this paragraph is what needs
+//! updating.
 //!
 //! # The runtime shape is prescribed
 //!
@@ -142,12 +182,20 @@ mod terminal;
 mod urlglob;
 mod util;
 
-use std::io::Write;
+use std::ffi::{OsStr, OsString};
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::process::ExitCode;
 
-use curl_rs_lib::CURLcode;
+use curl_rs_lib::{CURLcode, TraceConfig};
 
-use crate::output::msgs::{self, DiagnosticSink, MessageSink, MsgConfig};
+use crate::cli::args::{ParameterError, ParseHost};
+use crate::cli::paramhlp::ByteSource;
+use crate::cli::vars::{OsVarHost, VarHost};
+use crate::config::{GlobalConfig, TraceType};
+use crate::output::formparse::{ProcessStdin, StdinAccess};
+use crate::output::msgs::{self, DiagnosticSink, MsgConfig, SinkHandle};
 
 /// Entry point: the Rust counterpart of `main()` at `src/tool_main.c:143-205`.
 ///
@@ -178,12 +226,20 @@ use crate::output::msgs::{self, DiagnosticSink, MessageSink, MsgConfig};
 ///   VMS-only.
 ///
 /// What remains is the order that matters: the diagnostic channel first, then
-/// the runtime, then the invocation, then the exit status.
+/// the allocation accounting, then the configuration, then the runtime, then
+/// the invocation, then the exit status.
 fn main() -> ExitCode {
     // `src/tool_main.c:148` -- `tool_init_stderr()`, before anything that can
-    // fail. Held by value here so that `--stderr <file>` can redirect it later
-    // without any global state.
-    let mut sink = MessageSink::init();
+    // fail.
+    //
+    // A [`SinkHandle`] rather than a bare `MessageSink` because `--stderr
+    // <file>` is honoured from *inside* the option parser
+    // (`src/tool_getparam.c:2312`), which needs the concrete sink at a moment
+    // when the parser already holds it for emitting. C solves that with the
+    // file-scope `FILE *tool_stderr` of `src/tool_stderr.c:29`; the handle is
+    // the narrowest replacement for that global -- shared ownership of one
+    // value, reachable from the two places that need it and from nowhere else.
+    let mut sink = SinkHandle::init();
 
     // `src/tool_main.c:182` -- `memory_tracking_init()`, which C places after
     // `tool_init_stderr()` at `:148` and `main_checkfds()` at `:169` and before
@@ -205,22 +261,68 @@ fn main() -> ExitCode {
     #[cfg(feature = "memdebug")]
     curl_rs_lib::memdebug_init_from_env();
 
-    let result = match runtime() {
-        Ok(runtime) => runtime.block_on(operate(&mut sink)),
-        Err(error) => {
-            // No `curl` counterpart, because C has no runtime to build. The
-            // shape follows `src/tool_main.c:166` -- the one place C reports a
-            // failed platform initialization -- which uses `errorf` and returns
-            // the code rather than panicking. A panic here would produce a
-            // Rust backtrace on standard error and an exit status of 101,
-            // neither of which any fixture expects.
-            msgs::errorf(
-                &mut sink,
-                &MsgConfig::new(false, false, false),
-                format_args!("failed to start the async runtime: {error}"),
-            );
-            CURLcode::FailedInit
-        }
+    // The verbosity nothing has yet been able to change: C's `global` is
+    // zero-initialised until the option parser runs, so warnings and errors are
+    // emitted and notes are not (`src/tool_msgs.c:81`, `:95`, `:130`).
+    let boot = MsgConfig::new(false, false, false);
+
+    // `src/tool_main.c:186` -- `result = globalconf_init();`, and `:187`'s
+    // `if(!result)` guard on everything that follows. C returns the code
+    // without calling `operate()` when it fails, and `globalconf_free()` at
+    // `:192` runs only on the success path; here the value's own `Drop`
+    // (`curl-rs/src/config/mod.rs:1993`) is that call, so the coupling C spells
+    // out with an `if` is expressed by ownership and cannot be forgotten.
+    let result = match GlobalConfig::init(&mut sink, &boot) {
+        Err(code) => code,
+        Ok(mut global) => match runtime() {
+            Ok(runtime) => {
+                // The production [`ParseHost`]: the six effects the parser
+                // cannot perform itself (`curl-rs/src/cli/args.rs`'s
+                // "Injected capabilities"). It shares the diagnostic channel
+                // with `sink` above rather than owning a second one.
+                let mut host = OsParseHost::new(sink.handle());
+
+                // C's `main` receives `argv` and hands it to `operate(argc,
+                // argv)` at `:189`; the command line is collected here for the
+                // same reason -- `operate` is then a function of its arguments
+                // and can be driven with any command line, which is what makes
+                // the outcome mapping below testable without a subprocess.
+                //
+                // `args_os` rather than `args`: an argument is arbitrary bytes on
+                // the four mandated targets and `std::env::args` panics on one
+                // that is not valid Unicode, which curl accepts.
+                let args: Vec<OsString> = std::env::args_os().collect();
+
+                // C's `puts` and `curl_mprintf` write to the `stdout` global.
+                // It is passed in rather than reached for so that `--manual` and
+                // `--dump-ca-embed` can be exercised against a buffer, which is
+                // the only way to assert their bytes without a subprocess
+                // (AAP section 0.3.3's pattern P12).
+                let mut out = io::stdout();
+
+                runtime.block_on(operate(
+                    &args,
+                    &mut out,
+                    &mut sink,
+                    &mut host,
+                    &mut global,
+                ))
+            }
+            Err(error) => {
+                // No `curl` counterpart, because C has no runtime to build. The
+                // shape follows `src/tool_main.c:166` -- the one place C reports
+                // a failed platform initialization -- which uses `errorf` and
+                // returns the code rather than panicking. A panic here would
+                // produce a Rust backtrace on standard error and an exit status
+                // of 101, neither of which any fixture expects.
+                msgs::errorf(
+                    &mut sink,
+                    &boot,
+                    format_args!("failed to start the async runtime: {error}"),
+                );
+                CURLcode::FailedInit
+            }
+        },
     };
 
     // `src/tool_main.c:204` -- `return (int)result;`. The stream is flushed
@@ -252,6 +354,279 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
+/// The production [`ParseHost`]: the real filesystem, the real environment, the
+/// real standard input and the real diagnostic channel.
+///
+/// `curl-rs/src/cli/args.rs` keeps the 282-row option parser a pure function of
+/// its inputs by injecting the effects it cannot perform itself (AAP section
+/// 0.3.3's pattern P12). Until this type existed the only implementation was the
+/// `FakeHost` of that module's own tests, which is why no option could be
+/// honoured: `parse_args` had nothing to run against outside a test binary.
+///
+/// # What each capability resolves to, and the two that cannot yet
+///
+/// | [`ParseHost`] method | C original | Resolved by |
+/// |---|---|---|
+/// | `exists` | `curlx_stat` in `existingfile`, `src/tool_getparam.c:2212` | [`std::fs::metadata`] |
+/// | `file_time` | `getfiletime`, `:1636` | [`crate::output::filetime::getfiletime`] |
+/// | `set_trace` | `curl_global_trace(config)`, `:790` | [`TraceConfig::apply_code`] |
+/// | `set_stderr_file` | `tool_set_stderr_file`, `:2312` | [`SinkHandle::redirect`] |
+/// | `help` | `tool_help(category)`, `:3003` | **absent** -- see below |
+/// | `parse_config` | `parseconfig(...)`, `:2252` | **partly absent** -- see below |
+///
+/// GAP #4 and GAP #5 stand, and both are recorded on the trait rather than
+/// worked around here. `curl-rs/src/cli/help.rs` and
+/// `curl-rs/src/config/parseconfig.rs` are specified by AAP section 0.3.1 and
+/// are not part of this checkout, and neither capability can be reproduced
+/// without them:
+///
+/// * `tool_help` renders a 273-row table, 25 categories and a per-option scan of
+///   the built-in manual (`src/tool_help.c:222-296`). Emitting an
+///   approximation of it here would put a second printer in the tree, and the
+///   two would then be free to disagree about bytes AAP section 0.8.1 freezes.
+/// * `parseconfig` re-enters the parser for every line of the file
+///   (`src/tool_parsecfg.c`), so it belongs with the module that owns that
+///   re-entry. The half that *is* reproducible is reproduced: an unreadable
+///   file yields exactly C's `cannot read config from '%s'` and
+///   `PARAM_READ_ERROR` (`:267-270`).
+///
+/// Both therefore report their own absence through the diagnostic channel
+/// rather than returning quietly, so that no caller can mistake "nothing was
+/// printed" for "the request was served".
+struct OsParseHost {
+    /// The shared diagnostic channel, so that `--stderr` redirects the same
+    /// sink the parser is emitting through.
+    sink: SinkHandle,
+
+    /// The live process environment and the real filesystem, for
+    /// `--variable`'s `%name` and `@path` forms (`src/var.c:408`, `:446`).
+    vars: OsVarHost,
+
+    /// The process's standard input, for `-F name=@-` and `--variable name@-`
+    /// (`src/tool_formparse.c:121-244`, `src/var.c:444`).
+    stdin: ProcessStdin,
+
+    /// `curl_global_trace`'s process-global token state
+    /// (`lib/curl_trc.c:600-636`), held as a value.
+    ///
+    /// GAP #2 narrows rather than closes. Applying the tokens is what validates
+    /// them, and that is what `set_trace`'s boolean reports, so `--trace-config`
+    /// now behaves exactly as C's `curl_global_trace` does at the option
+    /// boundary. What no consumer reads yet is the resulting configuration: the
+    /// trace emitters live in `curl-rs-lib`, whose `trace` module is
+    /// `pub(crate)` by design -- only [`TraceConfig`] itself crosses the crate
+    /// boundary (`curl-rs-lib/src/lib.rs:1303`) -- so the value is owned here
+    /// and handed on when the engine grows the sink that consumes it.
+    trace: TraceConfig,
+}
+
+impl OsParseHost {
+    /// Binds the real operating system to a shared diagnostic channel.
+    fn new(sink: SinkHandle) -> Self {
+        Self {
+            sink,
+            vars: OsVarHost,
+            stdin: ProcessStdin::new(),
+            trace: TraceConfig::new(),
+        }
+    }
+}
+
+/// Forwarded to [`OsVarHost`], which is `src/var.c`'s three reaches for the
+/// operating system.
+impl VarHost for OsParseHost {
+    fn getenv(&self, name: &[u8]) -> Option<Vec<u8>> {
+        self.vars.getenv(name)
+    }
+
+    fn open(&mut self, path: &[u8]) -> io::Result<Box<dyn ByteSource>> {
+        self.vars.open(path)
+    }
+
+    fn stdin(&mut self) -> Box<dyn ByteSource> {
+        self.vars.stdin()
+    }
+}
+
+/// Forwarded to [`ProcessStdin`], which is what `src/tool_formparse.c` does
+/// with the `stdin` global.
+impl StdinAccess for OsParseHost {
+    fn regular_extent(&mut self) -> Option<(i64, i64)> {
+        self.stdin.regular_extent()
+    }
+
+    fn read_all(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
+        self.stdin.read_all(out)
+    }
+
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stdin.read_chunk(buffer)
+    }
+
+    fn seek_to(&mut self, offset: i64) -> io::Result<()> {
+        self.stdin.seek_to(offset)
+    }
+}
+
+impl ParseHost for OsParseHost {
+    /// `existingfile(filename)` -- `src/tool_getparam.c:2206-2216`.
+    ///
+    /// C inspects only whether `curlx_stat` succeeded, and `curlx_stat` is
+    /// `stat()` rather than `lstat()` on the four mandated targets, so
+    /// [`std::fs::metadata`] -- which follows symbolic links -- is the same
+    /// question. A dangling link reports `false` in both.
+    fn exists(&mut self, path: &[u8]) -> bool {
+        std::fs::metadata(Path::new(OsStr::from_bytes(path))).is_ok()
+    }
+
+    /// `getfiletime(nextarg, &value)` -- `src/tool_getparam.c:1636`.
+    ///
+    /// The whole of the behaviour, including the frozen
+    /// `Failed to get filetime: %s` warning of `src/tool_filetime.c:78-79`,
+    /// belongs to [`crate::output::filetime::getfiletime`]; this only supplies
+    /// it the channel and the verbosity, and turns its two-valued return into
+    /// the [`Option`] the parser wants. `stamp` is read only on success, as
+    /// `:1637`'s `if(!rc)` requires.
+    fn file_time(
+        &mut self,
+        path: &[u8],
+        sink: &mut dyn DiagnosticSink,
+        msgs: &MsgConfig,
+    ) -> Option<i64> {
+        let mut stamp = 0_i64;
+        let outcome = crate::output::filetime::getfiletime(
+            sink,
+            msgs,
+            Path::new(OsStr::from_bytes(path)),
+            &mut stamp,
+        );
+
+        if outcome == crate::output::filetime::FILETIME_SUCCESS {
+            Some(stamp)
+        } else {
+            None
+        }
+    }
+
+    /// `curl_global_trace(config)` -- `src/tool_getparam.c:790`, `:792`, `:806`.
+    ///
+    /// C tests the returned `CURLcode` for truth and turns a non-`CURLE_OK`
+    /// answer into `PARAM_NO_MEM`, which is what the boolean here reports. The
+    /// token grammar -- the `+`/`-` prefixes, the four keywords, the `doh`
+    /// alias, the 32-byte token cap and the empty-token stop -- is
+    /// [`TraceConfig::apply`]'s, so nothing about `--trace-config`'s acceptance
+    /// is decided in this crate.
+    ///
+    /// The bytes are handed through undecoded, because `curl_global_trace` takes
+    /// a `const char *` and `trc_opt()` never decodes it.
+    fn set_trace(&mut self, config: &str) -> bool {
+        self.trace.apply_code(Some(config.as_bytes())) == CURLcode::Ok
+    }
+
+    /// `tool_set_stderr_file(nextarg)` -- `src/tool_getparam.c:2312`.
+    ///
+    /// The redirection lands on the sink the parser is emitting through, so the
+    /// very next diagnostic goes to the new destination -- which is what C's
+    /// file-scope `tool_stderr` achieves and what the shared handle is for.
+    fn set_stderr_file(&mut self, path: &[u8], msgs: &MsgConfig) {
+        self.sink.redirect(msgs, Some(OsStr::from_bytes(path)));
+    }
+
+    /// `tool_help(category)` -- `src/tool_getparam.c:3003`.
+    ///
+    /// GAP #4: the renderer is `curl-rs/src/cli/help.rs`, which is not part of
+    /// this checkout. Reporting that is the whole of this body, and it is
+    /// reported rather than passed over in silence because the caller turns
+    /// `PARAM_HELP_REQUESTED` into a *successful* exit in C
+    /// (`src/tool_operate.c:2303-2305`): a silent return would claim that help
+    /// had been printed.
+    fn help(
+        &mut self,
+        category: Option<&str>,
+        sink: &mut dyn DiagnosticSink,
+        msgs: &MsgConfig,
+    ) {
+        match category {
+            Some(category) => msgs::errorf(
+                sink,
+                msgs,
+                format_args!(
+                    "--help {category} is not built in: the help text is \
+                     rendered by tool_help (src/tool_help.c:222), which this \
+                     build does not carry"
+                ),
+            ),
+            None => msgs::errorf(
+                sink,
+                msgs,
+                format_args!(
+                    "--help is not built in: the help text is rendered by \
+                     tool_help (src/tool_help.c:222), which this build does \
+                     not carry"
+                ),
+            ),
+        }
+    }
+
+    /// `parseconfig(filename, max_recursive, NULL)` --
+    /// `src/tool_getparam.c:2252`.
+    ///
+    /// The unreadable-file half is C's, byte for byte: `src/tool_parsecfg.c:267`
+    /// sets `PARAM_READ_ERROR` when the file cannot be opened and `:269-270`
+    /// then emits `cannot read config from '%s'` through `errorf`. Measured
+    /// against the oracle binary: `curl -K /nonexistent/config/file` prints that
+    /// line, then `option -K: error encountered when reading a file`, then the
+    /// try-line, and exits **26** -- `CURLE_READ_ERROR`.
+    ///
+    /// GAP #5 covers the other half. A file that *can* be read has to be parsed
+    /// line by line back through [`crate::cli::args`]'s `getparameter`, and
+    /// that re-entry belongs to `curl-rs/src/config/parseconfig.rs`, which is
+    /// not part of this checkout. `PARAM_LIBCURL_DOESNT_SUPPORT` is the closest
+    /// truthful answer in C's frozen vocabulary -- "the installed libcurl
+    /// version does not support this", and `src/tool_operate.c:2329` maps it to
+    /// `CURLE_FAILED_INIT` -- and the diagnostic above it names exactly what is
+    /// owed, so the outcome cannot be mistaken for a file that parsed to
+    /// nothing.
+    fn parse_config(
+        &mut self,
+        filename: &[u8],
+        max_recursive: i32,
+        sink: &mut dyn DiagnosticSink,
+        msgs: &MsgConfig,
+    ) -> ParameterError {
+        // The budget is C's and is already decremented by the caller
+        // (`src/tool_getparam.c:2246`). Nothing here can recurse, so nothing
+        // here can spend it; it is named rather than dropped so that the
+        // signature stays the one `parseconfig` needs when it lands.
+        let _ = max_recursive;
+        let path = Path::new(OsStr::from_bytes(filename));
+        let shown = path.display();
+
+        // `src/tool_parsecfg.c:265-270` -- "could not open the file", then the
+        // frozen message. `File::open` answers the same question
+        // `fopen(filename, FOPEN_READTEXT)` answers at `:114`.
+        if std::fs::File::open(path).is_err() {
+            msgs::errorf(
+                sink,
+                msgs,
+                format_args!("cannot read config from '{shown}'"),
+            );
+            return ParameterError::ReadError;
+        }
+
+        msgs::errorf(
+            sink,
+            msgs,
+            format_args!(
+                "cannot read config from '{shown}': configuration files are \
+                 parsed by curl-rs/src/config/parseconfig.rs \
+                 (src/tool_parsecfg.c), which this build does not carry"
+            ),
+        );
+        ParameterError::LibcurlDoesntSupport
+    }
+}
+
 /// The Rust counterpart of `operate()` (`src/tool_operate.c:2260-2340`), driven
 /// inside the current-thread runtime.
 ///
@@ -270,34 +645,56 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
 /// `curl-rs/src/config/parseconfig.rs` in the target design
 /// (`src/tool_parsecfg.c`). Until a configuration file can contribute a URL,
 /// `argc == 1` is unconditionally the no-URL case, which is the same answer C
-/// gives for an absent or URL-free `.curlrc`.
+/// gives for an absent or URL-free `.curlrc` -- and the answer the oracle binary
+/// gives under `env -i`, measured: exit 2 and the try-line alone.
 ///
-/// # Any other invocation
+/// The same absence removes C's implicit `.curlrc` read for *every* other
+/// invocation (`:2280`, taken unless the first argument begins `-q` or is
+/// `--disable`), and removes the `Read config file from '%s'` note at `:2296`
+/// with it. Both arrive with that module; nothing here approximates them,
+/// because a partial configuration reader would apply some of a user's defaults
+/// and silently drop the rest.
 ///
-/// Every other invocation requires the option surface -- `parse_args()` at
-/// `src/tool_operate.c:2293`, which this workspace places in
-/// `curl-rs/src/cli/args.rs`. That module is not part of this crate, so no
-/// option can be honoured, and the code returned says exactly that:
-/// `CURLE_NOT_BUILT_IN` is documented as "a requested feature, protocol or
-/// option was not found built-in in this libcurl due to a build-time
-/// decision", which is a truthful description of this configuration.
+/// # Any other invocation goes through the option parser
 ///
-/// Reporting it is deliberately *not* silent, and deliberately not a panic.
-/// The diagnostic goes through [`output::msgs::errorf`] with the same
-/// `curl: ` prefix and wrapping every other error uses, followed by the
-/// try-line, so a caller sees the standard shape rather than a Rust backtrace.
+/// `parse_args()` (`src/tool_operate.c:2293`) is
+/// [`crate::cli::args::parse_args`], and it is called here with the production
+/// [`OsParseHost`]. Its outcome is dispatched by [`outcome_for`], which
+/// reproduces `src/tool_operate.c:2297-2330` arm for arm.
+///
+/// Two of C's five "requested" outcomes are served in full, because their
+/// renderers are part of this checkout: `--manual` writes the built-in manual
+/// through [`crate::cli::hugehelp::hugehelp`], and `--dump-ca-embed` writes
+/// [`crate::ca_embed::bundle`] -- or nothing at all, and still succeeds, when no
+/// bundle was embedded, exactly as C's `#ifdef CURL_CA_EMBED` does. Every parse
+/// *failure* is served in full too: the code, the `option <opt>: <reason>`
+/// composition and the try-line are all C's.
+///
+/// What is not served is named where it is missing rather than blanketed over
+/// the whole command line, which is the substantive change from the previous
+/// revision of this function: it returned `CURLE_NOT_BUILT_IN` for *every*
+/// non-empty invocation, so `curl --bogus` could not report an unknown option
+/// and `curl --manual` could not print the manual.
 ///
 /// # The mandatory insecure warning is reached here
 ///
-/// [`output::msgs::warn_insecure_flags`] is called on the pre-transfer path,
-/// which is where `src/config2setopts.c:378-393` switches verification off. It
-/// is placed in the driver rather than left to the option layer so that the
-/// door is *executed* on every invocation: AAP section 0.8.4's gate 10 asks for
-/// a warning that cannot fail to appear, and a call site that only exists in a
-/// module nothing reaches would not deliver that. With no option parser every
-/// flag is clear and it emits nothing, exactly as C does with all three bits
-/// clear.
-async fn operate(sink: &mut dyn DiagnosticSink) -> CURLcode {
+/// [`crate::output::msgs::warn_insecure_flags`] is called on the pre-transfer
+/// path, which is where `src/config2setopts.c:378-393` switches verification
+/// off. It is placed in the driver rather than left to the option layer so that
+/// the door is *executed* on every invocation: AAP section 0.8.4's gate 10 asks
+/// for a warning that cannot fail to appear, and a call site that only exists in
+/// a module nothing reaches would not deliver that.
+///
+/// The three flags now come from the parsed configuration chain, through
+/// [`insecure_flags`], rather than from three literals. See that function for
+/// why the chain is reduced to one call rather than warning per operation.
+async fn operate<H: ParseHost>(
+    args: &[OsString],
+    out: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
+    host: &mut H,
+    global: &mut GlobalConfig,
+) -> CURLcode {
     // `src/tool_operate.c:2270-2272` -- the `#ifdef HAVE_SETLOCALE` pair
     // `setlocale(LC_ALL, ""); setlocale(LC_NUMERIC, "C");`, commented there
     // "Override locale for number parsing (only)". C makes it the first
@@ -324,22 +721,34 @@ async fn operate(sink: &mut dyn DiagnosticSink) -> CURLcode {
     // set leaves the `C` default, which is the one every fixture expects.
     let _ = curl_rs_lib::set_locale_from_environment();
 
-    // C reads `argc`; the Rust equivalent counts the arguments *after* the
-    // program name, so `argc == 1` is `args.is_empty()`.
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-
-    if args.is_empty() {
+    // `src/tool_operate.c:2283` -- `argc == 1`. `args` holds the whole command
+    // line, `argv[0]` included, because `crate::cli::args::parse_args` starts its
+    // walk at index 1 exactly as `src/tool_getparam.c:3060` does, so `argc == 1`
+    // is `args.len() < 2`.
+    if args.len() < 2 {
         // `src/tool_operate.c:2284` -- `helpf(NULL)`, the try-line alone.
         msgs::helpf(sink, None);
         // `src/tool_operate.c:2285`.
         return CURLcode::FailedInit;
     }
 
-    // The gates below are the ones C would have derived from the parsed
-    // options. With no parser, none of `--silent`, `--show-error` or a trace
-    // mode can have been requested, so the honest configuration is the default
-    // one -- and it is the configuration under which an error IS reported.
-    let config = MsgConfig::new(false, false, false);
+    // `src/tool_operate.c:2293` -- `ParameterError err = parse_args(argc,
+    // argv);`. The 282-row inventory, the `--` terminator, the bare-URL form,
+    // `--next`, the `option <opt>: <reason>` reporting and the try-line are all
+    // this call's; nothing about the surface is decided here.
+    let parsed = cli::args::parse_args(args, global, host, sink);
+
+    // The gates C reads from `global` once the parser has filled it in
+    // (`src/tool_msgs.c:81`, `:95`, `:130`). C computes them at each emission
+    // site; this is the same three predicates, taken after the parse so that
+    // `--silent`, `--show-error` and `--verbose` are in force for everything
+    // below -- which is exactly what `src/tool_operate.c:2295-2297`'s comment
+    // "After parse_args so notef knows the verbosity" is about.
+    let config = MsgConfig::new(
+        global.silent,
+        global.showerror,
+        global.tracetype != TraceType::None,
+    );
 
     // `src/config2setopts.c:378-393` is the point at which certificate
     // verification is switched off, and therefore -- per AAP section 0.1.1
@@ -348,34 +757,305 @@ async fn operate(sink: &mut dyn DiagnosticSink) -> CURLcode {
     // the pre-transfer path, so that the door is reached on every invocation
     // rather than depending on a future caller remembering it.
     //
-    // The three booleans come from exactly where `config` above comes from:
-    // no option can be honoured by this build, so no `--insecure`,
-    // `--doh-insecure` or `--proxy-insecure` can have been accepted, and all
-    // three bits of `src/tool_cfgable.h:258-261` are clear. C emits nothing
-    // when they are clear -- its three `if` statements are simply not taken --
-    // and neither does this, so the emitted bytes are unchanged. The moment
-    // the option table can set a bit, the warning appears with no further
-    // wiring, because `warn_insecure_flags` is the only place the three flag
-    // names exist.
-    msgs::warn_insecure_flags(sink, false, false, false);
+    // The three bits are the PARSED ones, reduced over the whole `--next` chain
+    // by `insecure_flags`, and they reach the warning through the typed
+    // `InsecureRequest` seam rather than as three positional literals. Both
+    // halves matter. The call used to read `warn_insecure_flags(sink, false,
+    // false, false)`, and the literals were the defect: they would have gone on
+    // reporting "nothing insecure was requested" after the option parser
+    // landed, after `--insecure` began to be honoured and after certificate
+    // verification began to be switched off, and they would have kept compiling
+    // the whole way. `crate::config::OperationConfig` implements the same trait
+    // by reading the three bits of `src/tool_cfgable.h:258-261`, so there is no
+    // longer a spelling of this call that passes an anonymous boolean.
+    //
+    // The bits are read even when the parse FAILED, deliberately: `curl -k
+    // --bogus` accepted `-k` before it rejected `--bogus`, so verification was
+    // asked to be switched off and saying so is the point of the requirement.
+    let (insecure, doh_insecure, proxy_insecure) = insecure_flags(global);
+    let requested = msgs::RequestedInsecurely {
+        insecure,
+        doh_insecure,
+        proxy_insecure,
+    };
 
-    msgs::errorf(
-        sink,
-        &config,
-        format_args!(
-            "option parsing is not built in; no command-line option can be \
-             honoured by this build"
-        ),
-    );
-    msgs::helpf(sink, None);
+    msgs::warn_insecure_flags(sink, &requested);
 
-    CURLcode::NotBuiltIn
+    match parsed {
+        // `src/tool_operate.c:2333-2340` and beyond -- `easysrc_init()` when
+        // `--libcurl` was given, then `run_all_transfers`. Neither is part of
+        // this checkout: the emitter is `curl-rs/src/libcurl_src.rs` and the
+        // driver is `curl-rs/src/operate/`, both specified by AAP section 0.3.1.
+        //
+        // Every option on the command line has been parsed, validated and
+        // recorded in `global` by this point, so what is missing is the transfer
+        // itself and the code says exactly that. `CURLE_NOT_BUILT_IN` is
+        // documented as "a requested feature, protocol or option was not found
+        // built-in in this libcurl due to a build-time decision", which is a
+        // truthful description of this configuration -- and it is now reached
+        // only here, rather than for every invocation.
+        Ok(()) => {
+            msgs::errorf(
+                sink,
+                &config,
+                format_args!(
+                    "no transfer was performed: the operation driver \
+                     (curl-rs/src/operate/, src/tool_operate.c) is not part of \
+                     this build"
+                ),
+            );
+            CURLcode::NotBuiltIn
+        }
+        Err(error) => outcome_for(error, out, sink, &config),
+    }
+}
+
+/// The three verification-off flags, reduced over the whole `--next` chain.
+///
+/// # Why a reduction rather than one warning per operation
+///
+/// C's three `if` statements live in `config2setopts` (`:379`, `:385`, `:390`),
+/// which runs once per operation, so a chain of two `--insecure` transfers would
+/// reach them twice. That says nothing about how many *warnings* to emit,
+/// because -- measured against the oracle binary --
+/// `curl --insecure http://127.0.0.1:1/a --next --insecure http://127.0.0.1:1/b`
+/// emits **no warning at all**: `src/config2setopts.c:379-393` contains three
+/// bare `my_setopt_long` blocks and no `warnf`. The warning is an AAP
+/// requirement (section 0.1.1 goal G4, section 0.8.4 gate 10) with no C
+/// behaviour to imitate, which `crate::output::msgs::warn_insecure` documents at
+/// length.
+///
+/// So the requirement is read as it is written -- a warning must be emitted
+/// before proceeding, per flag that was asked for -- and one reduction over the
+/// chain delivers that with the single unconditional call site that gate 10 is
+/// about. Warning once per operation would repeat an identical line for a
+/// repeated flag while adding nothing a reader could act on.
+///
+/// The chain is walked by index rather than by iterator because
+/// `crate::config::ConfigChain` deliberately exposes no iterator: it owns its
+/// elements to replace C's intrusive `next`/`prev` pointers, and `get` plus
+/// `len` is the accessor pair it offers.
+fn insecure_flags(global: &GlobalConfig) -> (bool, bool, bool) {
+    let mut origin = false;
+    let mut doh = false;
+    let mut proxy = false;
+
+    for at in 0..global.chain.len() {
+        if let Some(config) = global.chain.get(at) {
+            // `src/tool_cfgable.h:258-261` -- the three bits, in declaration
+            // order, which is also the order `warn_insecure_flags` emits in.
+            origin |= config.insecure_ok;
+            doh |= config.doh_insecure_ok;
+            proxy |= config.proxy_insecure_ok;
+        }
+    }
+
+    (origin, doh, proxy)
+}
+
+/// `src/tool_operate.c:2297-2330`: what a non-`PARAM_OK` parse outcome means.
+///
+/// C sets `result = CURLE_OK` first (`:2298`) and then either produces output or
+/// overrides the code, so five of the outcomes are *requests* rather than
+/// failures. The arms below are C's, in C's order, with two of the five served in
+/// full and three reporting an absent renderer.
+///
+/// # The three that cannot be served, and why they do not return `CURLE_OK`
+///
+/// `tool_help`, `tool_version_info` and `tool_list_engines` are all defined in
+/// `src/tool_help.c` (`:222`, `:311`, `:389`), whose Rust counterpart
+/// `curl-rs/src/cli/help.rs` is specified by AAP section 0.3.1 and is not part of
+/// this checkout. C's own precedent for an output capability that was configured
+/// out is `--manual` without `USE_MANUAL` at `:2308-2311`: warn, and keep
+/// `CURLE_OK`. That precedent is deliberately *not* followed, for one reason --
+/// it describes a supported build configuration, whereas this describes work that
+/// has not landed. Returning zero would report success for output nobody
+/// produced, which is precisely the inert-entry-point defect this workspace is
+/// under review for. Each of the three therefore emits a diagnostic naming the
+/// missing renderer and yields `CURLE_NOT_BUILT_IN`, and when
+/// `curl-rs/src/cli/help.rs` lands these three arms become C's exactly by
+/// calling it.
+fn outcome_for(
+    error: ParameterError,
+    mut out: &mut dyn Write,
+    sink: &mut dyn DiagnosticSink,
+    config: &MsgConfig,
+) -> CURLcode {
+    match error {
+        // `:2303-2305` -- "already done": `getparameter` calls `tool_help`
+        // before returning this. `OsParseHost::help` is what ran, and it has
+        // already reported that the renderer is absent, so nothing is said twice
+        // here.
+        ParameterError::HelpRequested => CURLcode::NotBuiltIn,
+
+        // `:2307-2312` -- `hugehelp()`, served in full.
+        //
+        // The manual goes to standard output, because C emits it with `puts`
+        // (`src/mkhelp.pl:231-236`). The write result is discarded for the same
+        // reason C discards `puts`'s: see
+        // `crate::cli::hugehelp::hugehelp`.
+        ParameterError::ManualRequested => {
+            // `&mut out` rather than `out`: `hugehelp` is generic over a `Sized`
+            // writer, and `&mut &mut dyn Write` satisfies that through
+            // `impl<W: Write + ?Sized> Write for &mut W`. Reborrowing here keeps
+            // that generic bound as narrow as the module wrote it.
+            let _ = cli::hugehelp::hugehelp(&mut out);
+            let _ = out.flush();
+            CURLcode::Ok
+        }
+
+        // `:2314-2315` -- `tool_version_info()`.
+        ParameterError::VersionInfoRequested => {
+            msgs::errorf(
+                sink,
+                config,
+                format_args!(
+                    "--version is not built in: the banner is rendered by \
+                     tool_version_info (src/tool_help.c:311), which this build \
+                     does not carry"
+                ),
+            );
+            CURLcode::NotBuiltIn
+        }
+
+        // `:2317-2318` -- `tool_list_engines()`.
+        ParameterError::EnginesRequested => {
+            msgs::errorf(
+                sink,
+                config,
+                format_args!(
+                    "--engine list is not built in: the list is rendered by \
+                     tool_list_engines (src/tool_help.c:389), which this build \
+                     does not carry"
+                ),
+            );
+            CURLcode::NotBuiltIn
+        }
+
+        // `:2320-2324` -- `curl_mprintf("%s", curl_ca_embed)` inside
+        // `#ifdef CURL_CA_EMBED`, served in full.
+        //
+        // Standard output, no trailing newline, and *nothing at all* when no
+        // bundle was embedded -- which still succeeds, because C's `#ifdef`
+        // simply compiles the statement away. Measured against the oracle
+        // binary: `curl --dump-ca-embed` on a build without one prints nothing
+        // and exits 0.
+        ParameterError::CaEmbedRequested => {
+            if let Some(bundle) = ca_embed::bundle() {
+                let _ = out.write_all(bundle);
+                let _ = out.flush();
+            }
+            CURLcode::Ok
+        }
+
+        // `:2325-2326`
+        ParameterError::LibcurlUnsupportedProtocol => {
+            CURLcode::UnsupportedProtocol
+        }
+
+        // `:2327-2328`
+        ParameterError::ReadError => CURLcode::ReadError,
+
+        // `:2329-2330` -- C's `else`. Every remaining outcome, listed rather
+        // than wildcarded so that a new variant cannot join this arm without
+        // someone choosing to put it here. `Ok` and `NextOperation` cannot
+        // arrive: the first is not an error and the second never escapes
+        // `parse_args` (`src/tool_getparam.c:3087-3110`).
+        ParameterError::Ok
+        | ParameterError::OptionUnknown
+        | ParameterError::ConfigOptionUnknown
+        | ParameterError::RequiresParameter
+        | ParameterError::BadUse
+        | ParameterError::GotExtraParameter
+        | ParameterError::BadNumeric
+        | ParameterError::NegativeNumeric
+        | ParameterError::LibcurlDoesntSupport
+        | ParameterError::NoMem
+        | ParameterError::NextOperation
+        | ParameterError::NoPrefix
+        | ParameterError::NumberTooLarge
+        | ParameterError::ContdispResumeFrom
+        | ParameterError::ExpandError
+        | ParameterError::BlankString
+        | ParameterError::VarSyntax
+        | ParameterError::Recursion => CURLcode::FailedInit,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{operate, runtime};
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io::{self, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+
     use curl_rs_lib::CURLcode;
+
+    use super::{insecure_flags, operate, outcome_for, runtime, OsParseHost};
+    use crate::cli::args::{ParameterError, ParseHost};
+    use crate::cli::paramhlp::{ByteSource, SeekSource};
+    use crate::cli::vars::VarHost;
+    use crate::config::{GlobalConfig, OperationConfig};
+    use crate::output::formparse::StdinAccess;
+    use crate::output::msgs::{self, DiagnosticSink, MsgConfig, SinkHandle};
+
+    /// The try-line of `src/tool_msgs.c:118-122`, with the `curl: ` prefix of
+    /// `:113`. Measured byte for byte against the oracle binary `/usr/bin/curl`.
+    const TRY_LINE: &str =
+        "curl: try 'curl --help' or 'curl --manual' for more information\n";
+
+    /// The default verbosity: C's zero-initialised `global`.
+    fn boot() -> MsgConfig {
+        MsgConfig::new(false, false, false)
+    }
+
+    /// Everything one `operate` call produced.
+    struct Run {
+        /// The `CURLcode` `main` would turn into the process exit status.
+        code: CURLcode,
+        /// Everything written to the diagnostic channel, as text.
+        diagnostics: String,
+        /// Everything written to standard output.
+        stdout: Vec<u8>,
+        /// Every `--help` category the parser forwarded to the host.
+        helped: Vec<Option<String>>,
+    }
+
+    /// Drives one whole invocation over a synthetic command line.
+    ///
+    /// `operate` takes its arguments and both output streams rather than reading
+    /// the process's, exactly as C's `operate(argc, argv)` takes its own, so an
+    /// invocation is driven here with no subprocess, no terminal and no
+    /// filesystem writes. `argv[0]` is supplied because the parser skips index
+    /// 0, as `src/tool_getparam.c:3060` does.
+    fn run(arguments: &[&str]) -> Run {
+        let mut argv: Vec<OsString> = vec![OsString::from("curl")];
+        argv.extend(arguments.iter().map(OsString::from));
+
+        let runtime = runtime().expect("the current-thread runtime must build");
+        let mut sink: Vec<u8> = Vec::new();
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut global = GlobalConfig::init(&mut sink, &boot())
+            .expect("globalconf_init must succeed on this platform");
+        let mut host = TestHost::default();
+
+        let code = runtime.block_on(operate(
+            &argv,
+            &mut stdout,
+            &mut sink,
+            &mut host,
+            &mut global,
+        ));
+
+        Run {
+            code,
+            diagnostics: String::from_utf8(sink)
+                .expect("diagnostics are UTF-8 here"),
+            stdout,
+            helped: host.helped,
+        }
+    }
 
     #[test]
     fn the_current_thread_runtime_builds_with_both_drivers() {
@@ -393,36 +1073,724 @@ mod tests {
         assert_eq!(runtime.metrics().num_workers(), 1);
     }
 
+    // -- the invocation paths, against the oracle binary's measured answers --
+
     #[test]
-    fn every_invocation_emits_the_try_line_and_a_specific_code() {
-        // `operate` reads the real process arguments, which a test cannot set,
-        // so both of its branches are admissible here: `cargo test` may pass
-        // arguments to the test binary or none at all. Both return a specific
-        // non-zero `CURLcode` and both emit the try-line, and that pair is what
-        // is asserted -- so the test is meaningful whichever way it runs, and
-        // it exercises the production body rather than a copy of it.
+    fn no_arguments_emits_the_try_line_alone_and_fails_init() {
+        // `src/tool_operate.c:2283-2287`, and the oracle: bare `curl` writes the
+        // try-line and nothing else, and exits 2.
+        let run = run(&[]);
+
+        assert_eq!(run.code, CURLcode::FailedInit);
+        assert_eq!(run.code.as_i32(), 2);
+        assert_eq!(run.diagnostics, TRY_LINE);
+        assert!(run.stdout.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_option_is_reported_by_the_parser_and_fails_init() {
+        // THE ASSERTION THIS PHASE EXISTS FOR. Before `parse_args` was wired in,
+        // this invocation returned `CURLE_NOT_BUILT_IN` with a message about
+        // option parsing being absent -- for every option, valid or not. The
+        // oracle's answer is exit 2, `curl: option --bogus: is unknown`, then the
+        // try-line, and that is now what comes out.
+        let run = run(&["--bogus"]);
+
+        assert_eq!(run.code, CURLcode::FailedInit);
+        assert_eq!(
+            run.diagnostics,
+            format!("curl: option --bogus: is unknown\n{TRY_LINE}")
+        );
+    }
+
+    #[test]
+    fn a_missing_argument_is_reported_by_the_parser() {
+        // The oracle: `curl --stderr` prints
+        // `curl: option --stderr: requires parameter` and exits 2.
+        let run = run(&["--stderr"]);
+
+        assert_eq!(run.code, CURLcode::FailedInit);
+        assert_eq!(
+            run.diagnostics,
+            format!("curl: option --stderr: requires parameter\n{TRY_LINE}")
+        );
+    }
+
+    #[test]
+    fn next_without_a_url_reports_both_frozen_lines() {
+        // Measured against the oracle: `curl --next` emits
+        // `curl: missing URL before --next` (`src/tool_getparam.c:3106-3109`),
+        // then `curl: option --next: is badly used here` (`:3141-3144`), then the
+        // try-line, and exits 2. All three come from the parser; this asserts
+        // that the wiring neither swallows nor reorders them.
+        let run = run(&["--next"]);
+
+        assert_eq!(run.code, CURLcode::FailedInit);
+        assert_eq!(
+            run.diagnostics,
+            format!(
+                "curl: missing URL before --next\ncurl: option --next: is \
+                 badly used here\n{TRY_LINE}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_url_parses_and_then_reports_the_absent_transfer_driver() {
+        // A well-formed command line now reaches the end of the parse, so the
+        // only thing left to report is the missing driver. That distinction is
+        // the point: the code names what is actually absent instead of refusing
+        // every option.
+        let run = run(&["http://example.invalid/"]);
+
+        assert_eq!(run.code, CURLcode::NotBuiltIn);
+        assert_eq!(run.code.as_i32(), 4);
+        assert!(
+            run.diagnostics.contains("no transfer was performed"),
+            "expected the driver report, got {:?}",
+            run.diagnostics
+        );
+        // The parse succeeded, so no try-line: `helpf` is reached only from a
+        // failing outcome (`src/tool_getparam.c:3133-3145`).
+        assert!(
+            !run.diagnostics.contains("try 'curl --help'"),
+            "a successful parse must not emit the try-line, got {:?}",
+            run.diagnostics
+        );
+    }
+
+    // -- F7-05: the three flags come from the parsed chain --------------------
+
+    #[test]
+    fn insecure_is_taken_from_the_parsed_chain_and_warns_per_flag() {
+        // The three arguments used to be literal `false`s, so no invocation
+        // could ever warn. Each flag now produces its own warning, in
+        // `src/config2setopts.c`'s order: origin (`:379`), DoH (`:385`), proxy
+        // (`:390`).
+        let one = run(&["--insecure", "http://example.invalid/"]);
+        assert!(
+            one.diagnostics
+                .contains("using --insecure makes the transfer insecure"),
+            "expected the mandatory warning, got {:?}",
+            one.diagnostics
+        );
+
+        // `--insecure` and `--proxy-insecure` are plain `ARG_BOOL` rows
+        // (`src/tool_getparam.c:179`, `:256`), so both are reachable from the
+        // command line today. `--doh-insecure` is not, and that is asserted in
+        // its own test below rather than glossed over here.
+        let pair =
+            run(&["--insecure", "--proxy-insecure", "http://example.invalid/"]);
+        let origin = pair
+            .diagnostics
+            .find("--insecure makes")
+            .expect("the origin warning must be emitted");
+        let proxy = pair
+            .diagnostics
+            .find("--proxy-insecure makes")
+            .expect("the proxy warning must be emitted");
+        assert!(
+            origin < proxy,
+            "the warnings must follow src/config2setopts.c's order, got {:?}",
+            pair.diagnostics
+        );
+    }
+
+    #[test]
+    fn doh_insecure_is_refused_while_tls_is_not_advertised() {
+        // MEASURED, and the reason the test above uses `--proxy-insecure`
+        // instead: `src/tool_getparam.c:126` marks `--doh-insecure`
+        // `ARG_BOOL|ARG_TLS`, and the gate at `:2991-2994` turns every `ARG_TLS`
+        // row into `PARAM_LIBCURL_DOESNT_SUPPORT` when `feature_ssl` is false.
+        // `curl-rs-lib/src/version.rs` derives that feature from
+        // `ENGINE_TLS.is_present()`, which is currently false, so the option is
+        // refused -- exactly as it is by a C curl built without TLS. Truthful
+        // advertisement is what produces this, and AAP section 0.6.5 requires
+        // it, so the refusal is correct rather than a defect to route around.
+        let run = run(&["--doh-insecure", "http://example.invalid/"]);
+
+        assert_eq!(run.code, CURLcode::FailedInit);
+        assert_eq!(
+            run.diagnostics,
+            format!(
+                "curl: option --doh-insecure: the installed libcurl version \
+                 does not support this\n{TRY_LINE}"
+            )
+        );
+    }
+
+    #[test]
+    fn the_reduction_covers_all_three_bits_and_the_whole_chain() {
+        // `insecure_flags` reduces the three bits over every operation, and the
+        // DoH bit is exercised here because the command line cannot reach it
+        // while TLS is unadvertised. Setting the fields directly is what makes
+        // the reduction itself testable rather than the parser.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut global = GlobalConfig::init(&mut sink, &boot())
+            .expect("globalconf_init must succeed on this platform");
+
+        assert_eq!(insecure_flags(&global), (false, false, false));
+
+        // The first operation carries the origin bit.
+        global
+            .chain
+            .first_mut()
+            .expect("globalconf_init allocates one operation")
+            .insecure_ok = true;
+        assert_eq!(insecure_flags(&global), (true, false, false));
+
+        // A second and a third operation carry one bit each, so a reduction
+        // that only read `current()` or `first()` would miss them.
+        let at = global
+            .chain
+            .append(OperationConfig::new())
+            .expect("appending an operation must succeed");
+        global
+            .chain
+            .get_mut(at)
+            .expect("the operation just appended must be there")
+            .doh_insecure_ok = true;
+
+        let at = global
+            .chain
+            .append(OperationConfig::new())
+            .expect("appending an operation must succeed");
+        global
+            .chain
+            .get_mut(at)
+            .expect("the operation just appended must be there")
+            .proxy_insecure_ok = true;
+
+        assert_eq!(global.chain.len(), 3);
+        assert_eq!(insecure_flags(&global), (true, true, true));
+    }
+
+    #[test]
+    fn nothing_is_warned_when_no_flag_was_given() {
+        // C's behaviour with all three bits clear: its three `if` statements are
+        // simply not taken. The requirement is a warning when verification is
+        // switched off, not a warning on every run.
+        let run = run(&["http://example.invalid/"]);
+
+        assert!(
+            !run.diagnostics.contains("makes the transfer insecure"),
+            "no flag was given, so nothing may be warned: {:?}",
+            run.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_flag_on_a_later_operation_still_warns() {
+        // `insecure_flags` reduces over the whole `--next` chain, so a flag that
+        // only the second operation carries is still reported. Reading only
+        // `chain.current()` would miss it.
+        let run = run(&[
+            "http://example.invalid/a",
+            "--next",
+            "--insecure",
+            "http://example.invalid/b",
+        ]);
+
+        assert!(
+            run.diagnostics
+                .contains("using --insecure makes the transfer insecure"),
+            "expected the warning for the second operation, got {:?}",
+            run.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_flag_accepted_before_a_parse_failure_still_warns() {
+        // `curl -k --bogus` accepted `-k` before it rejected `--bogus`, so
+        // verification WAS asked to be switched off. The warning is emitted from
+        // `operate`'s own statement level, ahead of the outcome dispatch, so it
+        // does not depend on the parse having succeeded.
+        let run = run(&["-k", "--bogus"]);
+
+        assert_eq!(run.code, CURLcode::FailedInit);
+        assert!(
+            run.diagnostics
+                .contains("using --insecure makes the transfer insecure"),
+            "expected the warning before the failure report, got {:?}",
+            run.diagnostics
+        );
+        assert!(
+            run.diagnostics.contains("option --bogus: is unknown"),
+            "the failure must still be reported, got {:?}",
+            run.diagnostics
+        );
+    }
+
+    // -- the five "requested" outcomes ---------------------------------------
+
+    #[test]
+    fn the_manual_is_served_in_full_and_succeeds() {
+        // `src/tool_operate.c:2307-2311` -- `hugehelp()`, which C emits with
+        // `puts` (`src/mkhelp.pl:231-236`): every element followed by exactly
+        // one line feed, to standard output, with nothing on the diagnostic
+        // channel.
+        let mut out: Vec<u8> = Vec::new();
+        let mut sink: Vec<u8> = Vec::new();
+        let code = outcome_for(
+            ParameterError::ManualRequested,
+            &mut out,
+            &mut sink,
+            &boot(),
+        );
+
+        assert_eq!(code, CURLcode::Ok);
+        assert!(sink.is_empty(), "the manual is not a diagnostic");
+
+        // Byte-identical to what the module itself writes, rather than a
+        // restatement of its line arithmetic: `crate::cli::hugehelp` already owns
+        // and tests the folded-blank rendering, and a second copy of that
+        // reasoning here would be free to disagree with it.
+        let mut expected: Vec<u8> = Vec::new();
+        let _ = crate::cli::hugehelp::hugehelp(&mut expected);
+        assert_eq!(out, expected);
+
+        // And it is a real manual rather than an empty artifact. The first
+        // element is the first line of the five-line ASCII logo
+        // `src/mkhelp.pl:20-27` prepends, which carries that script's leading
+        // tab -- so this also pins the START of what was written, which is the
+        // part a truncating write would corrupt first.
+        assert!(crate::cli::hugehelp::manual_lines() > 1000);
+        assert!(out.starts_with(b"\t"));
+    }
+
+    #[test]
+    fn dump_ca_embed_writes_exactly_the_bundle_and_succeeds() {
+        // `src/tool_operate.c:2320-2324`: the statement sits inside
+        // `#ifdef CURL_CA_EMBED`, so an unconfigured build prints nothing and
+        // still exits 0 -- measured against the oracle binary, which has no
+        // embedded bundle. A configured build writes the payload with no
+        // trailing newline, because C uses `curl_mprintf("%s", ...)`.
+        let mut out: Vec<u8> = Vec::new();
+        let mut sink: Vec<u8> = Vec::new();
+        let code = outcome_for(
+            ParameterError::CaEmbedRequested,
+            &mut out,
+            &mut sink,
+            &boot(),
+        );
+
+        assert_eq!(code, CURLcode::Ok);
+        assert!(sink.is_empty());
+        match crate::ca_embed::bundle() {
+            Some(bundle) => assert_eq!(out, bundle),
+            None => assert!(out.is_empty()),
+        }
+    }
+
+    #[test]
+    fn the_three_absent_renderers_report_themselves_and_do_not_claim_success() {
+        // `tool_help`, `tool_version_info` and `tool_list_engines` are all in
+        // `src/tool_help.c`, whose counterpart `curl-rs/src/cli/help.rs` is not
+        // part of this checkout. None of them may return `CURLE_OK`: that would
+        // report success for output nobody produced.
+        for error in [
+            ParameterError::HelpRequested,
+            ParameterError::VersionInfoRequested,
+            ParameterError::EnginesRequested,
+        ] {
+            let mut out: Vec<u8> = Vec::new();
+            let mut sink: Vec<u8> = Vec::new();
+            let code = outcome_for(error, &mut out, &mut sink, &boot());
+
+            assert_eq!(code, CURLcode::NotBuiltIn, "{error:?} claimed success");
+            assert!(out.is_empty(), "{error:?} produced output it cannot");
+        }
+
+        // `--version` and `--engine list` name their renderer on the diagnostic
+        // channel; `--help` is reported by the host, before the outcome is
+        // returned, which the parser-level test below covers.
+        let version = run(&["--version"]);
+        assert_eq!(version.code, CURLcode::NotBuiltIn);
+        assert!(version.diagnostics.contains("tool_version_info"));
+
+        // `--engine` is an `ARG_TLS` row (`src/tool_getparam.c:132`), so the
+        // command line cannot reach `PARAM_ENGINES_REQUESTED` while TLS is
+        // unadvertised -- see `doh_insecure_is_refused_while_tls_is_not_advertised`
+        // for the gate. The mapping is asserted above, on the outcome itself.
+        let engines = run(&["--engine", "list"]);
+        assert_eq!(engines.code, CURLcode::FailedInit);
+        assert_eq!(
+            engines.diagnostics,
+            format!(
+                "curl: option --engine: the installed libcurl version does \
+                 not support this\n{TRY_LINE}"
+            )
+        );
+    }
+
+    #[test]
+    fn help_reaches_the_host_before_the_outcome_is_returned() {
+        // `src/tool_getparam.c:3001-3005` -- "--help is special": the output is
+        // produced inside `getparameter`, before `PARAM_HELP_REQUESTED` is
+        // returned. This asserts the category reached the host, which is the
+        // only observable that the call happened at all.
+        assert_eq!(run(&["--help"]).helped, vec![None]);
+        assert_eq!(
+            run(&["--help", "http"]).helped,
+            vec![Some("http".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_outcome_map_agrees_with_tool_operate_arm_for_arm() {
+        // `src/tool_operate.c:2297-2330`. `outcome_for` matches exhaustively
+        // with no wildcard, so the compiler already enforces coverage; this
+        // checks the codes.
+        let mut out: Vec<u8> = Vec::new();
+        let mut sink: Vec<u8> = Vec::new();
+
+        for (error, expected) in [
+            (ParameterError::HelpRequested, CURLcode::NotBuiltIn),
+            (ParameterError::ManualRequested, CURLcode::Ok),
+            (ParameterError::VersionInfoRequested, CURLcode::NotBuiltIn),
+            (ParameterError::EnginesRequested, CURLcode::NotBuiltIn),
+            (ParameterError::CaEmbedRequested, CURLcode::Ok),
+            (
+                ParameterError::LibcurlUnsupportedProtocol,
+                CURLcode::UnsupportedProtocol,
+            ),
+            (ParameterError::ReadError, CURLcode::ReadError),
+            (ParameterError::Ok, CURLcode::FailedInit),
+            (ParameterError::OptionUnknown, CURLcode::FailedInit),
+            (ParameterError::ConfigOptionUnknown, CURLcode::FailedInit),
+            (ParameterError::RequiresParameter, CURLcode::FailedInit),
+            (ParameterError::BadUse, CURLcode::FailedInit),
+            (ParameterError::GotExtraParameter, CURLcode::FailedInit),
+            (ParameterError::BadNumeric, CURLcode::FailedInit),
+            (ParameterError::NegativeNumeric, CURLcode::FailedInit),
+            (ParameterError::LibcurlDoesntSupport, CURLcode::FailedInit),
+            (ParameterError::NoMem, CURLcode::FailedInit),
+            (ParameterError::NextOperation, CURLcode::FailedInit),
+            (ParameterError::NoPrefix, CURLcode::FailedInit),
+            (ParameterError::NumberTooLarge, CURLcode::FailedInit),
+            (ParameterError::ContdispResumeFrom, CURLcode::FailedInit),
+            (ParameterError::ExpandError, CURLcode::FailedInit),
+            (ParameterError::BlankString, CURLcode::FailedInit),
+            (ParameterError::VarSyntax, CURLcode::FailedInit),
+            (ParameterError::Recursion, CURLcode::FailedInit),
+        ] {
+            assert_eq!(
+                outcome_for(error, &mut out, &mut sink, &boot()),
+                expected,
+                "{error:?} maps to the wrong CURLcode"
+            );
+        }
+
+        // Every variant was listed, so the table is a complete function of the
+        // enumeration rather than a sample of it.
+        assert_eq!(ParameterError::COUNT, 25);
+
+        // The two codes C singles out are observable as exit statuses.
+        assert_eq!(CURLcode::UnsupportedProtocol.as_i32(), 1);
+        assert_eq!(CURLcode::ReadError.as_i32(), 26);
+        assert_eq!(CURLcode::NotBuiltIn.as_i32(), 4);
+    }
+
+    // -- the production host -------------------------------------------------
+
+    /// This crate's own manifest: a path that certainly exists.
+    fn manifest() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
+    }
+
+    /// A path that certainly does not.
+    const ABSENT: &str = "/nonexistent/blitzy/curl-rs/probe";
+
+    fn production_host() -> OsParseHost {
+        OsParseHost::new(SinkHandle::init())
+    }
+
+    #[test]
+    fn the_production_host_answers_existence_from_the_real_filesystem() {
+        // `existingfile` -- `src/tool_getparam.c:2206-2216`, whose `curlx_stat`
+        // is `stat()` and therefore follows symbolic links.
+        let mut host = production_host();
+        let path = manifest();
+
+        assert!(host.exists(path.as_os_str().as_bytes()));
+        assert!(!host.exists(ABSENT.as_bytes()));
+    }
+
+    #[test]
+    fn the_production_host_reads_a_real_modification_time() {
+        // `getfiletime(nextarg, &value)` -- `src/tool_getparam.c:1636`. Success
+        // yields a stamp; failure yields `None` *and* the frozen
+        // `Failed to get filetime: %s` warning of `src/tool_filetime.c:78-79`,
+        // which is the half that used to be missing entirely.
+        let mut host = production_host();
+        let mut sink: Vec<u8> = Vec::new();
+        let path = manifest();
+
+        assert!(host
+            .file_time(path.as_os_str().as_bytes(), &mut sink, &boot())
+            .is_some());
+        assert!(sink.is_empty(), "success is silent");
+
+        assert!(host
+            .file_time(ABSENT.as_bytes(), &mut sink, &boot())
+            .is_none());
+        let text = String::from_utf8(sink).expect("UTF-8 here");
+        assert!(
+            text.contains("Failed to get filetime:"),
+            "the frozen warning must be emitted, got {text:?}"
+        );
+        // The message carries no filename -- the asymmetry with `setfiletime` is
+        // C's and is preserved (`src/tool_filetime.c:78`).
+        assert!(!text.contains(ABSENT));
+    }
+
+    #[test]
+    fn the_production_host_silences_the_filetime_warning_under_silent() {
+        // The reason `file_time` is handed the verbosity rather than assuming
+        // one: `warnf`'s gate is `!global->silent` (`src/tool_msgs.c:95`).
+        let mut host = production_host();
+        let mut sink: Vec<u8> = Vec::new();
+
+        assert!(host
+            .file_time(
+                ABSENT.as_bytes(),
+                &mut sink,
+                &MsgConfig::new(true, false, false)
+            )
+            .is_none());
+        assert!(sink.is_empty(), "--silent must suppress the warning");
+    }
+
+    #[test]
+    fn the_production_host_applies_a_trace_configuration() {
+        // `curl_global_trace(config)` -- `src/tool_getparam.c:790`. C turns a
+        // non-`CURLE_OK` answer into `PARAM_NO_MEM`; `TraceConfig::apply` can
+        // only produce `CURLE_OK`, exactly as `Curl_trc_opt()` can, so every
+        // token list -- including a malformed one, which C also accepts -- is
+        // reported as applied.
+        let mut host = production_host();
+
+        assert!(host.set_trace("all"));
+        assert!(host.set_trace("multi,-dns"));
+        assert!(host.set_trace(",dns"));
+        assert!(host.set_trace(""));
+    }
+
+    #[test]
+    fn the_production_host_redirects_the_shared_diagnostic_channel() {
+        // THE PROPERTY THE SHARED HANDLE EXISTS FOR. `--stderr <file>` is
+        // honoured from inside the parser (`src/tool_getparam.c:2312`), so a
+        // diagnostic written *after* it must land in the file. The two owners --
+        // the host and the emitting sink -- are separate values over one
+        // `MessageSink`, which is what C's file-scope `tool_stderr` achieves.
+        let target = Path::new(env!("OUT_DIR")).join("blitzy_stderr_probe");
+        let _ = fs::remove_file(&target);
+
+        let shared = SinkHandle::init();
+        let mut emitter = shared.handle();
+        let mut host = OsParseHost::new(shared.handle());
+
+        host.set_stderr_file(target.as_os_str().as_bytes(), &boot());
+        msgs::errorf(&mut emitter, &boot(), format_args!("after the redirect"));
+        let _ = emitter.flush();
+
+        let written = fs::read_to_string(&target).expect("the file must exist");
+        assert_eq!(written, "curl: after the redirect\n");
+        let _ = fs::remove_file(&target);
+    }
+
+    #[test]
+    fn an_unopenable_stderr_target_warns_and_leaves_the_channel_alone() {
+        // `src/tool_stderr.c:49-56`, including the doubled prefix `:53` produces
+        // because the literal already carries one. Measured against the oracle:
+        // `curl --stderr /nonexistent/dir/x --bogus` writes
+        // `Warning: Warning: Failed to open /nonexistent/dir/x` and then still
+        // reports the unknown option on the ORIGINAL channel.
+        //
+        // The first redirect is what makes this observable: it points the shared
+        // sink at a file, so the second -- which must fail -- writes its warning
+        // where the test can read it, and the fact that it lands there at all is
+        // the proof that the channel was left unchanged.
+        let target = Path::new(env!("OUT_DIR")).join("blitzy_stderr_keep");
+        let _ = fs::remove_file(&target);
+
+        let shared = SinkHandle::init();
+        let mut emitter = shared.handle();
+        let mut host = OsParseHost::new(shared.handle());
+
+        host.set_stderr_file(target.as_os_str().as_bytes(), &boot());
+        host.set_stderr_file(b"/nonexistent/blitzy/dir/x", &boot());
+        msgs::errorf(&mut emitter, &boot(), format_args!("still here"));
+        let _ = emitter.flush();
+
+        let written = fs::read_to_string(&target).expect("the file must exist");
+        assert_eq!(
+            written,
+            "Warning: Warning: Failed to open /nonexistent/blitzy/dir/x\n\
+             curl: still here\n"
+        );
+        let _ = fs::remove_file(&target);
+    }
+
+    #[test]
+    fn the_production_host_reproduces_the_unreadable_config_message() {
+        // `src/tool_parsecfg.c:267-270`, and the oracle: `curl -K <absent>`
+        // prints `curl: cannot read config from '<f>'` and ultimately exits 26.
+        let mut host = production_host();
+        let mut sink: Vec<u8> = Vec::new();
+
+        let outcome =
+            host.parse_config(ABSENT.as_bytes(), 4, &mut sink, &boot());
+
+        assert_eq!(outcome, ParameterError::ReadError);
+        assert_eq!(
+            String::from_utf8(sink).expect("UTF-8 here"),
+            format!("curl: cannot read config from '{ABSENT}'\n")
+        );
+    }
+
+    #[test]
+    fn the_production_host_names_the_absent_config_reader() {
+        // GAP #5. A file that CAN be read has to be parsed back through
+        // `getparameter`, and that re-entry belongs to
+        // `curl-rs/src/config/parseconfig.rs`. The answer must not be silence
+        // and must not be success.
+        let mut host = production_host();
+        let mut sink: Vec<u8> = Vec::new();
+        let path = manifest();
+
+        let outcome = host.parse_config(
+            path.as_os_str().as_bytes(),
+            4,
+            &mut sink,
+            &boot(),
+        );
+
+        assert_eq!(outcome, ParameterError::LibcurlDoesntSupport);
+        let text = String::from_utf8(sink).expect("UTF-8 here");
+        assert!(
+            text.contains("parseconfig.rs"),
+            "the absent module must be named, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_unreadable_config_path_is_reached_through_a_whole_invocation() {
+        // The end-to-end form of the two tests above, with the production host,
+        // so the mapping `PARAM_READ_ERROR -> CURLE_READ_ERROR`
+        // (`src/tool_operate.c:2327`) is exercised rather than asserted.
         let runtime = runtime().expect("the current-thread runtime must build");
         let mut sink: Vec<u8> = Vec::new();
-        let code = runtime.block_on(operate(&mut sink));
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut global = GlobalConfig::init(&mut sink, &boot())
+            .expect("globalconf_init must succeed on this platform");
+        let mut host = production_host();
+        let argv: Vec<OsString> = ["curl", "-K", ABSENT, "http://a.invalid/"]
+            .iter()
+            .map(OsString::from)
+            .collect();
 
-        assert!(
-            code == CURLcode::FailedInit || code == CURLcode::NotBuiltIn,
-            "expected CURLE_FAILED_INIT or CURLE_NOT_BUILT_IN, got {code:?}"
+        let code = runtime.block_on(operate(
+            &argv,
+            &mut stdout,
+            &mut sink,
+            &mut host,
+            &mut global,
+        ));
+
+        assert_eq!(code, CURLcode::ReadError);
+        assert_eq!(code.as_i32(), 26);
+        assert_eq!(
+            String::from_utf8(sink).expect("UTF-8 here"),
+            format!(
+                "curl: cannot read config from '{ABSENT}'\ncurl: option -K: \
+                 error encountered when reading a file\n{TRY_LINE}"
+            )
         );
+    }
 
-        // Neither code may be zero: a tool that honoured nothing must not
-        // report success. This is the property the process exit status carries.
-        assert!(!code.is_ok());
+    /// A [`ParseHost`] that touches nothing outside itself.
+    ///
+    /// [`OsParseHost`] is the production one and reaches the real filesystem,
+    /// the real environment and the real standard input; the invocation-level
+    /// tests above must not. Every member answers the "nothing is there" case,
+    /// which is what makes those tests independent of the machine they run on.
+    #[derive(Debug, Default)]
+    struct TestHost {
+        /// Every `--help` category the parser forwarded.
+        helped: Vec<Option<String>>,
+    }
 
-        // The try-line of `src/tool_msgs.c:118-122` is emitted from `helpf` on
-        // both paths, with the `curl: ` prefix of `:113`.
-        let text = String::from_utf8(sink).expect("diagnostics are UTF-8 here");
-        let expected =
-            "curl: try 'curl --help' or 'curl --manual' for more information\n";
-        assert!(
-            text.ends_with(expected),
-            "the try-line must be emitted verbatim, got {text:?}"
-        );
+    impl VarHost for TestHost {
+        fn getenv(&self, _name: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn open(&mut self, _path: &[u8]) -> io::Result<Box<dyn ByteSource>> {
+            Err(io::Error::other("no filesystem in this test"))
+        }
+
+        fn stdin(&mut self) -> Box<dyn ByteSource> {
+            Box::new(SeekSource::new(io::Cursor::new(Vec::new())))
+        }
+    }
+
+    impl StdinAccess for TestHost {
+        fn regular_extent(&mut self) -> Option<(i64, i64)> {
+            None
+        }
+
+        fn read_all(&mut self, _out: &mut Vec<u8>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn read_chunk(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn seek_to(&mut self, _offset: i64) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ParseHost for TestHost {
+        fn exists(&mut self, _path: &[u8]) -> bool {
+            false
+        }
+
+        fn file_time(
+            &mut self,
+            _path: &[u8],
+            _sink: &mut dyn DiagnosticSink,
+            _msgs: &MsgConfig,
+        ) -> Option<i64> {
+            None
+        }
+
+        fn set_trace(&mut self, _config: &str) -> bool {
+            true
+        }
+
+        fn set_stderr_file(&mut self, _path: &[u8], _msgs: &MsgConfig) {}
+
+        fn help(
+            &mut self,
+            category: Option<&str>,
+            _sink: &mut dyn DiagnosticSink,
+            _msgs: &MsgConfig,
+        ) {
+            self.helped.push(category.map(str::to_owned));
+        }
+
+        fn parse_config(
+            &mut self,
+            _filename: &[u8],
+            _max_recursive: i32,
+            _sink: &mut dyn DiagnosticSink,
+            _msgs: &MsgConfig,
+        ) -> ParameterError {
+            ParameterError::ReadError
+        }
     }
 }
 
@@ -435,16 +1803,18 @@ mod tests {
 /// guarantee is worthless if nothing calls it: an unreachable warning is
 /// indistinguishable from an absent one.
 ///
-/// A behavioural test cannot establish the call site. With no option parser all
-/// three flags are clear, C emits nothing in that state, and section 0.8.1
-/// freezes that -- so the correct behaviour today is silence, and silence is
-/// exactly what deleting the call would also produce. The property therefore has
-/// to be asserted structurally, and this module does it the way the workspace
-/// already does elsewhere (`curl-rs-ffi/src/lib.rs`'s unsafe-boundary gate and
-/// `curl-rs-lib/src/lib.rs`'s source policy): by reading its own source through
-/// [`include_str!`] and asserting on the code, with comments and string literals
-/// stripped so that the prose above -- which names the function twice -- cannot
-/// satisfy the gate on its own.
+/// The behavioural tests in [`mod tests`](self) now cover the emission itself --
+/// `--insecure` and `--proxy-insecure` each produce their warning, and an
+/// invocation with neither produces none. What they cannot cover is the *shape*
+/// of the call site, and the shape is what gate 10 is about: a warning moved
+/// inside an `if`, or moved after the point at which the path proceeds, would
+/// still pass every one of those tests on the inputs they use while leaving some
+/// other input silent. So the shape is asserted structurally here, the way the
+/// workspace already does elsewhere (`curl-rs-ffi/src/lib.rs`'s unsafe-boundary
+/// gate and `curl-rs-lib/src/lib.rs`'s source policy): by reading its own source
+/// through [`include_str!`] and asserting on the code, with comments and string
+/// literals stripped so that the prose above -- which names the function twice --
+/// cannot satisfy the gate on its own.
 #[cfg(test)]
 mod mandatory_warning_gate {
     /// This file's own text. `include_str!` resolves relative to this file, so
@@ -531,8 +1901,13 @@ mod mandatory_warning_gate {
 
     /// The line range of `operate`'s body: its signature, and the module that
     /// follows it.
+    ///
+    /// The needle omits the opening parenthesis on purpose: `operate` is generic
+    /// over its [`crate::cli::args::ParseHost`], so the declaration reads
+    /// `async fn operate<H: ParseHost>(` and a needle ending in `(` would find
+    /// nothing and make every assertion below vacuous.
     fn operate_bounds() -> (usize, usize) {
-        let operate = first_code_line("async fn operate(")
+        let operate = first_code_line("async fn operate")
             .expect("`operate` must be declared");
         let tests = first_code_line("mod tests")
             .expect("the test module must follow `operate`");
@@ -704,20 +2079,27 @@ mod mandatory_warning_gate {
         // placed after the first parse would leave the earliest-parsed numbers
         // reading a decimal comma in a locale like `de_DE`.
         //
-        // `args_os` is the first thing on this path that a configuration could
-        // come from, so it stands in for `parseconfig` until the parser exists,
-        // and the assertion stays correct when the parser arrives because a
-        // parser can only appear after the arguments are collected.
+        // The option parser is the first thing on this path that parses a
+        // number, so it is what the locale has to precede. It stands in for
+        // `parseconfig` too, which re-enters it for every line of a
+        // configuration file.
+        //
+        // The needle used to be `args_os(`, which moved to `main` when `operate`
+        // became a function of its arguments -- as C's `operate(argc, argv)` is.
+        // Merely collecting `argv` parses nothing, and C reads `argv[1]` at
+        // `:2267` before it calls `setlocale` at `:2271`, so the ordering C
+        // actually guarantees is the one asserted here.
         let door = first_code_line(LOCALE_DOOR)
             .expect("`operate` must call the engine's locale facade");
         let (operate, tests) = operate_bounds();
-        let first_input = first_code_line_within("args_os(", operate, tests)
-            .expect("`operate` must read its arguments");
+        let first_input =
+            first_code_line_within("cli::args::parse_args(", operate, tests)
+                .expect("`operate` must call the option parser");
 
         assert!(
             door < first_input,
             "the locale must be set before the first configuration input, but \
-             the call is on line {door} and `args_os` on line {first_input}"
+             the call is on line {door} and `parse_args` on line {first_input}"
         );
     }
 
@@ -733,10 +2115,15 @@ mod mandatory_warning_gate {
         let door = first_code_line(MEMDEBUG_DOOR)
             .expect("`main` must call the engine's allocation-cap facade");
 
+        // `"fn operate"` and not `"fn operate("`: the declaration is generic, so
+        // a needle ending in `(` would match nothing and `unwrap_or(usize::MAX)`
+        // would make the assertion pass vacuously.
+        let operate =
+            first_code_line("fn operate").expect("`operate` must be declared");
         assert!(
-            door < first_code_line("fn operate(").unwrap_or(usize::MAX),
+            door < operate,
             "the call must be in `main`, ahead of `operate`, but it is on \
-             line {door}"
+             line {door} and `operate` is declared on line {operate}"
         );
     }
 

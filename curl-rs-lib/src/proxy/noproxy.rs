@@ -22,8 +22,8 @@
 //
 //***************************************************************************
 
-//! `NO_PROXY` and `--noproxy` host matching -- supersedes `lib/noproxy.c`
-//! (259 lines) and `lib/noproxy.h` (43).
+//! `NO_PROXY` and `--noproxy` host matching -- supersedes `lib/noproxy.c` and
+//! `lib/noproxy.h`.
 //!
 //! # What this module is
 //!
@@ -42,16 +42,6 @@
 //! block that expects an ordinary direct `GET`. The SOCKS proxy named on the
 //! command line is deliberately unresolvable, so the fixture passes only if
 //! this predicate suppressed it.
-//!
-//! # The polarity, which is easy to invert
-//!
-//! [`check_noproxy`] returns **`true` when the name MATCHED the list**, and
-//! the C says so in as many words at `lib/noproxy.c:178-181`: *"Checks if the
-//! host is in the noproxy list. returns TRUE if it matches and therefore the
-//! proxy should NOT be used."* So `true` means "bypass the proxy", not "use
-//! it". A caller that reads the sense backwards routes exactly the traffic
-//! the user excluded through the proxy it was excluded from, and nothing
-//! about that failure is loud.
 //!
 //! # Why the matching rules are transcribed rather than reimplemented
 //!
@@ -83,14 +73,6 @@
 //! * Blanks are space and tab only -- a newline is not a blank
 //!   (`lib/curl_ctype.h:45`).
 //!
-//! Two things the C does NOT do, recorded because a reimplementation is
-//! tempted to add both. It does not understand a port suffix: the
-//! documentation's claim that `local.com` matches `local.com:80`
-//! (`docs/cmdline-opts/noproxy.md`) is true because the CALLER passes a host
-//! name with the port already removed, not because anything here parses a
-//! colon. And it does not cache: the value is re-tokenized on every call, so
-//! a `NO_PROXY` re-read between two transfers takes effect immediately.
-//!
 //! # Bytes, not `str`
 //!
 //! Both arguments are `&[u8]`. `NO_PROXY` arrives from the environment and
@@ -101,19 +83,6 @@
 //! ASCII letter pairs, so [`crate::util::strcase::ncasecompare`] is used
 //! rather than [`str::to_lowercase`] -- which allocates and applies Unicode
 //! folding that curl does not do.
-//!
-//! # Relocated coverage
-//!
-//! `lib/noproxy.h:30-38` declares `Curl_cidr4_match` and `Curl_cidr6_match`
-//! under `#ifdef UNITTESTS`, purely so that `tests/unit/unit1614.c` can link
-//! against them; they are not part of any public or internal contract. That C
-//! program cannot link against a Rust static library, because [`cidr4_match`]
-//! and [`cidr6_match`] are private items and a private item is genuinely
-//! absent from the symbol table rather than merely hidden. Its coverage
-//! therefore moves INTO this file: the three tables of `unit1614.c` are
-//! transcribed row for row in the test module below, and the two functions
-//! stay private. Re-exporting them to make the C link would defeat the
-//! encapsulation the crate's safety guarantee rests on.
 
 use crate::util::inet;
 use crate::util::strcase;
@@ -121,11 +90,6 @@ use crate::util::strparse;
 
 /// How the name under test was classified -- `enum nametype`,
 /// `lib/noproxy.c:112-116`.
-///
-/// The classification decides which matcher a token is handed to, and it is
-/// made ONCE per call, before any token is examined. It also decides whether
-/// a trailing dot is stripped from the name, which is the asymmetry
-/// [`check_noproxy`] documents at the site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NameType {
     /// Not parseable as an address, so treated as a host name. `TYPE_HOST`.
@@ -137,22 +101,6 @@ enum NameType {
 }
 
 /// The prefix of `bytes` up to its first zero, or all of it when it has none.
-///
-/// The C reads both of its arguments as `const char *`, so every length it
-/// works with comes from a terminator: `name[0] == '\0'` at
-/// `lib/noproxy.c:188`, `strlen(name)` at `:207`, `no_proxy[0]` at `:196`,
-/// `strcmp("*", no_proxy)` at `:201` and `while(*p)` at `:220` all stop
-/// there. A Rust slice carries its length instead, so a caller CAN hand this
-/// module bytes that the C could never have seen -- a slice with a zero in
-/// the middle of it.
-///
-/// Truncating here is what keeps the two implementations answering the same
-/// question for every possible input rather than only for the inputs a real
-/// caller produces. It is not a defensive guess: it is the C's own rule,
-/// applied once at the entry point instead of implicitly at eleven sites.
-/// Without it a zero would be an ordinary byte -- rejected by
-/// [`inet::pton4`] as an invalid character, and compared as data by
-/// [`match_host`] -- and the divergence would be silent.
 fn cstr(bytes: &[u8]) -> &[u8] {
     match bytes.iter().position(|&byte| byte == 0) {
         Some(end) => &bytes[..end],
@@ -161,57 +109,6 @@ fn cstr(bytes: &[u8]) -> &[u8] {
 }
 
 /// True when `ipv4` lies inside the CIDR range `network`/`bits`.
-///
-/// Supersedes `Curl_cidr4_match` (`lib/noproxy.c:44-75`), whose own comment
-/// reads *"returns TRUE if the given IPv4 address is within the specified
-/// CIDR address range"*. Both arguments are address TEXT, not bytes: the C
-/// hands each to `curlx_inet_pton` and answers `FALSE` if either fails to
-/// parse, so a token that is not a dotted quad is a non-match rather than an
-/// error.
-///
-/// # `bits == 0` and `bits == 32` both mean exact equality
-///
-/// This is the single most surprising line in the module, and it is
-/// deliberate. The C's guard is `if(bits && (bits != 32))`, so a zero prefix
-/// length falls through to `return address == check` at `:74` -- the same
-/// place `/32` lands. A `/0` prefix conventionally matches every address in
-/// the space; here it matches only the one address written beside it.
-///
-/// It is not an accident of the arithmetic either. `bits == 0` also arrives
-/// through the ordinary path, because [`match_ip`] leaves `bits` at zero when
-/// a token carries no slash at all -- and `192.168.0.0` with no slash must
-/// mean that one address. Giving `/0` its conventional meaning would make
-/// `10.0.0.0/0` in a `NO_PROXY` value disable the proxy for the entire
-/// internet, which is a behaviour change and therefore out of bounds.
-/// `tests/unit/unit1614.c` pins both readings: `192.160.0.1` in
-/// `192.160.0.1/0` is a match, and `192.160.0.1` in `10.0.0.1/0` is not.
-///
-/// # Why the shift cannot overflow
-///
-/// `32 - bits` is evaluated only inside the `bits != 0 && bits != 32` arm,
-/// and `bits > 32` has already returned. So `bits` is in `1..=31` there and
-/// the shift distance is in `1..=31`, always strictly less than the width of
-/// the type. That guard is load-bearing rather than incidental: `1u32 << 32`
-/// panics in a debug build and is undefined in the C, so an implementation
-/// that "simplified" the guard away would fail in exactly the configuration
-/// the test suite runs in.
-///
-/// # The `htonl` pair, and why it disappears
-///
-/// The C holds each parsed address in an `unsigned int` containing
-/// NETWORK-order bytes, then applies `htonl` to both before masking. On a
-/// little-endian host that byte-swaps into host order; on a big-endian host
-/// it is the identity and the value was already in host order. Either way the
-/// two operands reach the mask as host-order numbers, most significant octet
-/// first, which is what makes a left shift produce a network prefix mask.
-/// [`u32::from_be_bytes`] states that same conversion directly, and it does
-/// so identically on every target rather than depending on the host's
-/// endianness cancelling out.
-///
-/// The exact-equality arm compares the same two host-order numbers, which is
-/// the C's `address == check` byte-pattern comparison expressed on the values
-/// instead of on the storage. Both spellings are the same predicate, because
-/// [`u32::from_be_bytes`] is injective.
 #[must_use]
 fn cidr4_match(ipv4: &[u8], network: &[u8], bits: u32) -> bool {
     // `if(bits > 32) return FALSE;` with the C's comment: "strange input".
@@ -253,45 +150,6 @@ fn cidr4_match(ipv4: &[u8], network: &[u8], bits: u32) -> bool {
 }
 
 /// True when `ipv6` lies inside the CIDR range `network`/`bits`.
-///
-/// Supersedes `Curl_cidr6_match` (`lib/noproxy.c:77-110`). As with
-/// [`cidr4_match`], both arguments are address text and an unparseable one is
-/// a non-match.
-///
-/// # Implemented unconditionally, unlike the C
-///
-/// The C body sits inside `#ifdef USE_IPV6`, with an `#else` arm at
-/// `:104-108` that voids its three arguments and returns `FALSE` -- so a
-/// build without IPv6 answers "no match" for every IPv6 token, whatever it
-/// says. There is no such build here. IPv6 support is not a Cargo feature of
-/// this workspace, [`std::net::Ipv6Addr`] and [`inet::pton6`] are always
-/// available, and the fifteen declared features contain no name that could
-/// switch it off. The `#else` arm is therefore unreachable rather than
-/// omitted, and this function has no `#[cfg]` on it at all.
-///
-/// # The asymmetry with [`cidr4_match`], preserved as written
-///
-/// `if(!bits) bits = 128;` at `:87-88` promotes a zero prefix length to a
-/// full-width one. The IPv4 matcher does not do this; it reaches the same
-/// OUTCOME -- exact equality -- by falling through its mask guard instead.
-/// Two different mechanisms for one behaviour, and both are kept, because
-/// unifying them would mean choosing which one to rewrite and neither is more
-/// correct than the other.
-///
-/// # The `bytes == 16 && rest` case, which cannot arise from a valid prefix
-///
-/// `if((bytes > 16) || ((bytes == 16) && rest)) return FALSE;` refuses two
-/// things at once. `bytes > 16` refuses a prefix of 136 or more. The second
-/// clause refuses a prefix whose byte count is exactly 16 AND which has
-/// leftover bits -- arithmetically impossible for `bits <= 128`, since
-/// `bits / 8 == 16` implies `bits >= 128` and `bits & 7 != 0` implies
-/// `bits != 128`, so it can only be reached from 129 through 135. Those
-/// seven values are what the clause exists for, and `tests/unit/unit1614.c`
-/// pins `::1` in `0:0::1/129` as a non-match.
-///
-/// That refusal is also what makes the indexing below sound: whenever `rest`
-/// is non-zero, `bytes` is at most 15, so `address[bytes]` is in bounds. The
-/// [`debug_assert!`] records the argument rather than trusting it.
 #[must_use]
 fn cidr6_match(ipv6: &[u8], network: &[u8], bits: u32) -> bool {
     // `if(!bits) bits = 128;`
@@ -340,9 +198,6 @@ fn cidr6_match(ipv6: &[u8], network: &[u8], bits: u32) -> bool {
         // a value that came from an `unsigned char` XOR, so only the low
         // eight ever contribute. A `u8` shift drops them instead of carrying
         // them, which is the same mask with the dead high bits removed.
-        //
-        // `rest` is in 1..=7 here, so the distance is in 1..=7 and stays
-        // inside the width of a `u8`.
         let mask: u8 = 0xff << (8 - rest);
         if (address[bytes] ^ check[bytes]) & mask != 0 {
             return false;
@@ -355,23 +210,7 @@ fn cidr6_match(ipv6: &[u8], network: &[u8], bits: u32) -> bool {
 
 /// True when the host name `name` matches the no-proxy token `token`.
 ///
-/// Supersedes `match_host` (`lib/noproxy.c:118-146`). Both arguments carry
-/// their own length, which is what the C's two `size_t` parameters are for:
-/// neither slice is terminated, because `token` points into the middle of the
-/// `NO_PROXY` value and `name` may have had a trailing dot trimmed off by the
-/// caller.
-///
 /// # Token normalisation, in the C's order
-///
-/// One trailing dot is dropped, and THEN one leading dot. The order is
-/// observable on the token `.example.com.`, which becomes `example.com` --
-/// reversing it would leave the trailing dot in place, because the leading-dot
-/// test would have consumed the only edit. `tests/unit/unit1614.c` pins that
-/// exact token as matching `www.example.com`.
-///
-/// Only ONE dot is removed at each end. `..example.com` keeps a leading dot
-/// and matches nothing, which is a consequence of the C using `if` rather
-/// than `while` and is preserved as written.
 ///
 /// A note for anyone diffing this against the original: the C's trailing-dot
 /// test at `:124` is `if(token[tokenlen - 1] == '.')` with NO guard on
@@ -391,14 +230,6 @@ fn cidr6_match(ipv6: &[u8], network: &[u8], bits: u32) -> bool {
 /// B: www.example.com matches 'example.com'
 /// C: nonexample.com DOES NOT match 'example.com'
 /// ```
-///
-/// Case C is the reason case B tests a byte the token never covers. A plain
-/// suffix comparison would accept `nonexample.com` for the token
-/// `example.com`, since the token IS a suffix of it. The extra requirement is
-/// that the byte immediately before the matched tail be a label separator,
-/// and in `nonexample.com` that byte is `n`. Dropping the test would silently
-/// widen every entry in every user's `NO_PROXY` value to cover host names
-/// they never listed.
 #[must_use]
 fn match_host(token: &[u8], name: &[u8]) -> bool {
     debug_assert!(
@@ -423,23 +254,9 @@ fn match_host(token: &[u8], name: &[u8]) -> bool {
 
     if token.len() == name.len() {
         // Case A, exact match. `curl_strnequal(token, name, namelen)`.
-        //
-        // The two lengths are equal here, so the C's byte budget covers both
-        // strings completely and the call is whole-string case-insensitive
-        // equality. It also covers the degenerate pair: a name of `.` trims
-        // to nothing and a token of `.` normalises to nothing, and
-        // `ncasecompare` with a budget of zero answers true -- "they are
-        // equal this far" -- exactly as the C's does.
         strcase::ncasecompare(token, name, name.len())
     } else if token.len() < name.len() {
         // Case B, tail match against a domain.
-        //
-        // `(name[namelen - tokenlen - 1] == '.') &&
-        //  curl_strnequal(token, name + (namelen - tokenlen), tokenlen)`
-        //
-        // `offset` is at least 1 because this arm runs only when the token is
-        // strictly shorter, so `offset - 1` cannot wrap and both indexes are
-        // in bounds.
         let offset = name.len() - token.len();
         name[offset - 1] == b'.'
             && strcase::ncasecompare(token, &name[offset..], token.len())
@@ -452,48 +269,14 @@ fn match_host(token: &[u8], name: &[u8]) -> bool {
 
 /// The size of the C's fixed `checkip` buffer -- `char checkip[128]`,
 /// `lib/noproxy.c:153`.
-///
-/// A token of this length or more is refused outright at `:154-156`, with the
-/// C's comment "this cannot match", because it would not fit the buffer
-/// together with its terminator. The bound is therefore OBSERVABLE and is
-/// reproduced literally even though a Rust slice needs no copy and no
-/// terminator: `tests/unit/unit1614.c` carries a 128-byte token and asserts
-/// it does not match, alongside a 127-byte one that fits the buffer and fails
-/// for the ordinary reason that it is not an address.
 const CHECKIP_LEN: usize = 128;
 
 /// The largest prefix length the `/bits` parser will accept --
 /// `curlx_str_number(&p, &value, 128)`, `lib/noproxy.c:166`.
-///
-/// This is the parser's ceiling, not the matchers'. A value of 129 or above
-/// is refused HERE, before either matcher sees it; a value of 33 through 128
-/// parses cleanly and is then refused by [`cidr4_match`] when the name is a
-/// dotted quad. The C's comment at `:168` says so: *"a too large value is
-/// rejected in the cidr function below"*.
 const MAX_PREFIX: i64 = 128;
 
 /// True when the address `name` matches the no-proxy token `token`, which may
 /// carry a `/bits` CIDR suffix.
-///
-/// Supersedes `match_ip` (`lib/noproxy.c:148-176`). `kind` is the
-/// classification of `name`, made once by [`check_noproxy`]; it selects the
-/// matcher, and the C passes it as a plain `int`.
-///
-/// # No copy, and why that is still the C's behaviour
-///
-/// The C copies the token into `checkip[128]`, terminates it, finds the slash
-/// with `strchr`, and overwrites that slash with a zero so that the buffer
-/// holds just the network part. Every one of those steps exists to give a
-/// pointer into the middle of a longer string a length of its own. A slice
-/// already has one, so the copy, the terminator and the destructive
-/// truncation all become subslicing -- and the length bound that made the
-/// copy safe is kept anyway, because it changes the answer.
-///
-/// The search range is identical: `strchr` scans the terminated copy, which
-/// holds exactly the token's bytes, so it finds the FIRST slash within the
-/// token and never past it. A token with two slashes, `10.0.0.0/8/9`, is
-/// refused -- the parse stops at the second slash and the leftover-byte test
-/// rejects what remains.
 ///
 /// # The `/bits` parse is strict at both ends
 ///
@@ -506,20 +289,6 @@ const MAX_PREFIX: i64 = 128;
 ///   `curlx_str_number` accepts them -- `/008` is `/8`.
 /// * Nothing may follow the digits. `*p` is the C's terminator test, so
 ///   `192.168.0.0/16a` fails.
-///
-/// A trailing BLANK, however, is not trailing garbage. `192.168.0.0/16 ` in a
-/// `NO_PROXY` value matches, because the tokenizer ends the token at the
-/// blank and the blank is never part of what this function sees.
-/// `192.168.0.0/ 16` does NOT match, for the same reason read the other way:
-/// the token is `192.168.0.0/` and no digit follows the slash.
-/// `tests/unit/unit1614.c` pins all four of these.
-///
-/// # `bits` stays zero when there is no slash
-///
-/// Which routes both matchers to their exact-equality behaviour, documented
-/// at [`cidr4_match`] and [`cidr6_match`]. It is the reason a bare
-/// `192.168.0.0` in a `NO_PROXY` value means that one address rather than a
-/// network.
 #[must_use]
 fn match_ip(kind: NameType, token: &[u8], name: &[u8]) -> bool {
     // `if(tokenlen >= sizeof(checkip)) return FALSE;` -- "this cannot match".
@@ -576,69 +345,7 @@ fn match_ip(kind: NameType, token: &[u8], name: &[u8]) -> bool {
 
 /// True when `name` appears in the no-proxy list `no_proxy`, and therefore
 /// **the proxy must NOT be used** for it.
-///
-/// Supersedes `Curl_check_noproxy` (`lib/noproxy.c:182-257`), the only
-/// function `lib/noproxy.h` declares outside its unit-test guard.
-///
-/// `name` is a host name or an address literal with no port and no scheme --
-/// the caller has already reduced the URL to its host component, which is why
-/// nothing here parses a colon. `no_proxy` is the raw value of `--noproxy`,
-/// or of the `no_proxy` or `NO_PROXY` environment variable, exactly as it was
-/// given.
-///
-/// # Empty means "no opinion", for both arguments
-///
-/// The C's first test is `if(!name || name[0] == '\0') return FALSE;`, whose
-/// comment explains the case it exists for: *"If we do not have a hostname at
-/// all, like for example with a FILE transfer, we have nothing to interrogate
-/// the noproxy list with."* Its second is `if(no_proxy && no_proxy[0])`,
-/// which wraps the whole body -- so a NULL or empty list matches nothing.
-/// An empty slice models both the NULL pointer and the empty string, because
-/// the C treats them identically at both sites.
-///
-/// # The asterisk overrides only as the ENTIRE value
-///
-/// `if(!strcmp("*", no_proxy)) return TRUE;` is a whole-string comparison
-/// made BEFORE the name is classified and before any token is cut, so it can
-/// only ever fire for a value that is exactly one asterisk. A `*` appearing
-/// as one token among several -- `foo,*` -- does not reach it, and the
-/// tokenizer then hands that asterisk to [`match_host`] as an ordinary
-/// one-byte name, which matches nothing whose last label is not literally
-/// `*`. `docs/cmdline-opts/noproxy.md` describes the behaviour in the same
-/// terms: *"The only wildcard is a single `*` character"*.
-///
-/// This is a common divergence in reimplementations, which tend to treat `*`
-/// as a per-token wildcard, and it is the reason a token of `*.example.com`
-/// matches nothing at all here. The leading-dot handling in [`match_host`] is
-/// the whole of curl's subdomain support; there is no glob anywhere in the
-/// module.
-///
-/// # Classification happens first, and only a host name loses a trailing dot
-///
-/// The order at `:206-218` is load-bearing. The name is offered to the IPv4
-/// parser, then to the IPv6 parser, and a trailing dot is trimmed only in the
-/// `else` -- so an address literal keeps every byte it arrived with, and only
-/// a host name is trimmed. Trimming first would be observable in both
-/// directions: `10.0.0.1.` would parse as nothing either way, but the trailing
-/// dot would then be gone from the string handed to [`match_ip`].
-///
-/// Nor is an IPv6 literal case-folded anywhere, and it needs no folding: the
-/// address parser normalises hexadecimal itself, so `::AB` and `::ab` become
-/// the same sixteen bytes before any comparison happens. Only [`match_host`]
-/// folds case.
-///
-/// # The tokenizer, and its two exits
-///
-/// A token runs from the first non-blank byte to the next blank, comma or end
-/// of value. Between tokens the scan skips blanks, and then makes the single
-/// most surprising decision in the function: `if(*p != ',') break;`. Anything
-/// that is not a comma ends the ENTIRE scan, not just the current token. A
-/// blank-separated list is therefore not a list at all --
-/// `localhost .example.com` tests `localhost` and stops, which
-/// `tests/unit/unit1614.c` pins as a non-match for `www.example.com`. Runs of
-/// commas, on the other hand, are skipped wholesale, so `foo,,,,,bar` is two
-/// tokens and a trailing or leading comma is harmless.
-#[allow(dead_code)] // No consumer yet; proxy selection will call it.
+#[allow(dead_code)] // proxy selection calls it.
 #[must_use]
 pub(crate) fn check_noproxy(name: &[u8], no_proxy: &[u8]) -> bool {
     // C string semantics, applied once. See `cstr` for why.
@@ -662,12 +369,6 @@ pub(crate) fn check_noproxy(name: &[u8], no_proxy: &[u8]) -> bool {
     }
 
     // "NO_PROXY was specified and it was not just an asterisk"
-    //
-    // `namelen = strlen(name);` then the three-way classification. The
-    // subject is the slice each matcher compares against: the whole name for
-    // an address, and the name minus at most one trailing dot for a host.
-    // Pairing the two in one expression is what makes it structurally
-    // impossible to trim an address literal.
     let (kind, subject) = if inet::pton4(name).is_some() {
         // `if(curlx_inet_pton(AF_INET, name, &address) == 1) type = TYPE_IPV4;`
         (NameType::Ipv4, name)
@@ -697,14 +398,6 @@ pub(crate) fn check_noproxy(name: &[u8], no_proxy: &[u8]) -> bool {
 
         // `token = p; while(*p && !ISBLANK(*p) && (*p != ',')) { p++;
         //  tokenlen++; }` -- pass over the pattern.
-        //
-        // The C's three stopping conditions are the end of the value, a blank
-        // and a comma; the first is the slice running out, and `is_blank` is
-        // the crate's transcription of curl's own ISBLANK, which admits space
-        // and tab and nothing else. Neither `char::is_whitespace` nor
-        // `u8::is_ascii_whitespace` would do: both admit a line feed, and a
-        // `NO_PROXY` value carrying one would then be split where curl keeps
-        // it whole.
         let end = cursor
             .iter()
             .position(|&byte| strparse::is_blank(byte) || byte == b',')
@@ -747,9 +440,6 @@ pub(crate) fn check_noproxy(name: &[u8], no_proxy: &[u8]) -> bool {
     false
 }
 
-// The relocated coverage of `tests/unit/unit1614.c`, plus the cases that
-// program does not reach.
-//
 // The C unit test builds three tables and walks them, counting mismatches.
 // Its rows are transcribed here row for row, in the C's own order, so that a
 // row added upstream can be added here by reading a diff. The C guards its
@@ -757,12 +447,6 @@ pub(crate) fn check_noproxy(name: &[u8], no_proxy: &[u8]) -> bool {
 // `#if defined(DEBUGBUILD) && !defined(CURL_DISABLE_PROXY)`; none of those
 // three conditions has an analogue in this crate, so every row runs
 // unconditionally.
-//
-// Everything beyond the transcription is here because the C program cannot
-// express it: `Curl_check_noproxy` takes `const char *`, so no C row can
-// carry an interior zero or a byte sequence that is not valid UTF-8, and no C
-// row can compare the byte-and-remainder arithmetic of the two matchers
-// against an independent bit-at-a-time reference.
 #[cfg(test)]
 mod tests {
     use super::{
@@ -844,14 +528,6 @@ mod tests {
 
     /// The six `no_proxy` values the C's table repeats, named so that every
     /// row below fits one line.
-    ///
-    /// The strings are the C's, byte for byte; only the repetition is
-    /// factored out, and the C reuses four of these across several rows
-    /// anyway. Naming them also puts each one's distinguishing feature in a
-    /// place where it can be described.
-    ///
-    /// `:73`: blank-separated rather than comma-separated, so the scan
-    /// stops after `localhost` and never sees the two domains.
     const BLANK_SEPARATED: &str = "localhost .example.com .example.de";
     /// `:74`: both domain tokens carry a leading dot.
     const LEADING_DOTS: &str = "localhost,.example.com,.example.de";
@@ -1002,9 +678,7 @@ mod tests {
         assert_eq!(TOKEN_127.len() - boundary, 127);
     }
 
-    // -----------------------------------------------------------------------
     // The entry point's two refusals and the asterisk.
-    // -----------------------------------------------------------------------
 
     /// `if(!name || name[0] == '\0') return FALSE;` -- and it is tested
     /// against `*`, because the emptiness test comes FIRST. A FILE transfer
@@ -1031,13 +705,6 @@ mod tests {
     }
 
     /// `if(!strcmp("*", no_proxy)) return TRUE;` -- a whole-value test.
-    ///
-    /// The second half is the divergence this module exists to avoid: as one
-    /// token among several the asterisk is an ordinary name, so it matches
-    /// only something whose relevant label is literally `*`, and it does NOT
-    /// act as a wildcard. The last two assertions show that curl's subdomain
-    /// support is the leading dot and nothing else -- `*.example.com` matches
-    /// no host at all.
     #[test]
     fn a_lone_asterisk_overrides_only_as_the_entire_value() {
         assert!(check("example.com", "*"));
@@ -1053,9 +720,7 @@ mod tests {
         assert!(!check("example.com", "*.example.com"));
     }
 
-    // -----------------------------------------------------------------------
     // Host matching: cases A, B and C.
-    // -----------------------------------------------------------------------
 
     /// Case A, and the fold is ASCII-only and case-insensitive in both
     /// directions.
@@ -1132,13 +797,6 @@ mod tests {
     }
 
     /// A token, and a name, that normalise to nothing at all.
-    ///
-    /// Reached through [`match_host`] directly because the tokenizer refuses
-    /// to dispatch an empty token, so the only route to a zero-length token
-    /// is a token of exactly `.`, and the only route to a zero-length name is
-    /// a name of exactly `.`. The C's case A then calls `curl_strnequal` with
-    /// a budget of zero, which answers "equal this far" -- so the pair
-    /// matches, and a `.` against any real name does not.
     #[test]
     fn a_token_of_one_dot_normalises_to_nothing() {
         assert!(match_host(b".", b""));
@@ -1149,9 +807,7 @@ mod tests {
         assert!(!check("example.com", "."));
     }
 
-    // -----------------------------------------------------------------------
     // Address matching.
-    // -----------------------------------------------------------------------
 
     /// An address with no prefix at all means that one address.
     #[test]
@@ -1222,11 +878,6 @@ mod tests {
     /// A prefix that is not a whole number of bytes exercises the remainder
     /// mask, which is the one piece of arithmetic in [`cidr6_match`] that the
     /// byte comparison cannot reach.
-    ///
-    /// `/60` leaves the low four bits of the fourth group free, so
-    /// `2001:db8:0:f::1` is inside `2001:db8::/60`; `/61` leaves only three,
-    /// so the same address is outside it. The pair differs by one bit of
-    /// prefix and flips the answer.
     #[test]
     fn an_ipv6_prefix_that_is_not_byte_aligned_uses_the_remainder_mask() {
         assert!(check("2001:db8:0:f::1", "2001:db8::/60"));
@@ -1295,13 +946,6 @@ mod tests {
 
     /// `if(tokenlen >= sizeof(checkip)) return FALSE;` -- the bound is 128
     /// bytes, and 127 is admitted.
-    ///
-    /// The 127-byte case is built so that it WOULD match if it were examined:
-    /// a valid address followed by enough padding to reach the length. At 127
-    /// bytes the padding makes it unparseable and it fails on that; at 128 it
-    /// is refused before anything looks at it. The test that the bound is
-    /// exactly 128 is therefore the pair of counted tokens above, which come
-    /// from the C's own table.
     #[test]
     fn a_token_of_128_bytes_or_more_cannot_match_an_address() {
         let mut token = String::from("10.1.2.3/8");
@@ -1360,18 +1004,10 @@ mod tests {
         assert!(!cidr6("fe80::1%eth0", "fe80::", 16));
     }
 
-    // -----------------------------------------------------------------------
     // Classification, and the trailing-dot asymmetry it creates.
-    // -----------------------------------------------------------------------
 
     /// Classification happens BEFORE any trailing dot is stripped, so a name
     /// with a trailing dot is never an address literal.
-    ///
-    /// The consequence is visible: `127.0.0.1` matches the network
-    /// `127.0.0.0/8`, and `127.0.0.1.` does not -- because the second one is
-    /// a host name, and a host name is compared against the token as text,
-    /// where `127.0.0.0/8` is simply a different string. It still matches a
-    /// token spelling the same host name, through the host path.
     #[test]
     fn an_address_literal_never_loses_a_trailing_dot() {
         assert!(check("127.0.0.1", "127.0.0.0/8"));
@@ -1382,9 +1018,7 @@ mod tests {
         assert!(!check("::1.", "::0/64"));
     }
 
-    // -----------------------------------------------------------------------
     // The tokenizer.
-    // -----------------------------------------------------------------------
 
     /// Blanks around tokens, tabs as separators, runs of commas, and a comma
     /// at either end. Blank means space and tab only.
@@ -1408,11 +1042,6 @@ mod tests {
 
     /// `if(*p != ',') break;` -- anything else ends the whole scan, so a
     /// blank-separated list is not a list.
-    ///
-    /// A newline is not a blank in curl, so it is neither a separator nor
-    /// something the scan steps over: it becomes part of a token, and the
-    /// token then matches nothing. That is what distinguishes curl's
-    /// `ISBLANK` from [`u8::is_ascii_whitespace`], which would admit it.
     #[test]
     fn anything_other_than_a_comma_between_tokens_ends_the_scan() {
         assert!(check("localhost", "localhost .example.com"));
@@ -1449,9 +1078,7 @@ mod tests {
         assert!(!check("127.0.0.2", "127.0.0.1"));
     }
 
-    // -----------------------------------------------------------------------
     // Byte-string behaviour the C's `const char *` cannot express.
-    // -----------------------------------------------------------------------
 
     /// Both arguments are bytes, so a value that is not valid UTF-8 is
     /// matched rather than rejected, and nothing panics on the way.
@@ -1470,13 +1097,6 @@ mod tests {
 
         // A whole sweep of single-byte names against themselves, which
         // reaches every value including the ones no `&str` could carry.
-        //
-        // Four bytes are excluded and each for a reason that is the C's
-        // behaviour rather than an inconvenience: zero terminates the string,
-        // space and tab are blanks so a list holding one yields no token at
-        // all, and a lone comma yields no token either. They are asserted
-        // separately below so that the exclusions are tested rather than
-        // merely skipped.
         const NOT_A_TOKEN: [u8; 4] = [0x00, b'\t', b' ', b','];
         let mut matched = 0_usize;
         for byte in 1..=u8::MAX {
@@ -1511,17 +1131,9 @@ mod tests {
         assert!(check_noproxy(b"nomatch", b"nomatch\0,example.com"));
     }
 
-    // -----------------------------------------------------------------------
     // Differential sweeps against an independent prefix comparison.
-    // -----------------------------------------------------------------------
 
     /// Do the first `bits` bits of two addresses agree?
-    ///
-    /// One bit at a time, most significant first, with no byte count and no
-    /// remainder anywhere in it. That is the point: the implementations under
-    /// test split a prefix into whole bytes plus leftover bits, and this
-    /// reference does not, so an error in either split shows up as a
-    /// disagreement rather than being reproduced.
     fn prefix_bits_agree(left: &[u8], right: &[u8], bits: u32) -> bool {
         (0..bits as usize).all(|bit| {
             let byte = bit / 8;
@@ -1532,12 +1144,6 @@ mod tests {
 
     /// Every prefix from 1 to 32 over six address pairs, against
     /// [`prefix_bits_agree`].
-    ///
-    /// `bits == 0` is deliberately outside the sweep: the reference would
-    /// answer "no bits disagree, so they match", and curl answers exact
-    /// equality instead. That divergence is curl's documented behaviour and
-    /// is asserted on its own above rather than smuggled into a reference
-    /// that would then have to encode it.
     #[test]
     fn the_ipv4_mask_agrees_with_a_bitwise_reference() {
         const PAIRS: [(&str, &str); 6] = [

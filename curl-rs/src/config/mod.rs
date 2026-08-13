@@ -5,86 +5,29 @@
 //! The command-line tool's configuration model -- `src/tool_cfgable.c` and
 //! `src/tool_cfgable.h`, with the ordered string list of `src/slist_wc.c`.
 //!
-//! AAP section 0.4.1 places `GlobalConfig`, `OperationConfig` and the string
-//! list here, and section 0.3.1 puts this file at the root of the
-//! `curl-rs/src/config` subtree. Everything in this module is `pub(crate)`:
-//! this crate exports no C ABI and must not be reachable from one, so the
-//! 100-symbol export set that `nm` grades cannot be perturbed from here.
-//!
-//! # There is no global configuration handle, by construction
-//!
-//! The C tree keeps the whole tool's configuration in a file-scope pair at
-//! `src/tool_cfgable.c:33-34`:
-//!
-//! ```c
-//! static struct GlobalConfig globalconf;
-//! struct GlobalConfig *global;
-//! ```
-//!
-//! declared for every translation unit at `src/tool_cfgable.h:42` as
-//! `extern struct GlobalConfig *global;` and reached from dozens of sites --
-//! `src/tool_easysrc.c:174` and `src/tool_setopt.c:245`, `:283`, `:333`,
-//! `:561`, `:581`, `:611`, `:627`, `:654` and `:684` among them.
-//!
-//! AAP section 0.1.2 replaces that shared mutable state with "per-module
-//! structs with explicit ownership", and this file has no counterpart for
-//! either line. There is no `static mut` -- `#![forbid(unsafe_code)]` on
-//! `curl-rs/src/main.rs` makes one a compile error rather than a review
-//! finding -- and no substitute for it either: no `thread_local!`, no
-//! `OnceLock` holding a lock, no ambient accessor that reaches configuration
-//! without being handed it. [`GlobalConfig`] is constructed by the entry point
-//! and threaded down the call chain by reference, so a function that has not
-//! been given the configuration cannot reach it, and the borrow checker rather
-//! than a convention is what enforces that.
-//!
-//! # The two linked lists become owned storage
-//!
-//! `struct OperationConfig` carries `prev` and `next` pointers
-//! (`src/tool_cfgable.h:171-172`, whose comment reads "Always last in the
-//! struct") that `config_free` walks backwards (`src/tool_cfgable.c:193-206`)
-//! and that `--next` grows. `struct getout` carries its own `next`
-//! (`src/tool_sdecls.h:86`). Neither pointer survives: AAP section 0.6.9
-//! replaces the intrusive chains with owned collections and retained pointers
-//! with keys, "so a stale handle is detectably stale rather than a dangling
-//! pointer". [`ConfigChain`] and [`OperationConfig::url_list`] are those
-//! collections, and every cursor C kept as a pointer is an index here.
+//! Everything in this module is `pub(crate)`: this crate exports no C ABI and
+//! must not be reachable from one, so the 100-symbol export set that `nm`
+//! grades cannot be perturbed from here.
 //!
 //! # Measured composition, so nothing is invented and nothing is dropped
 //!
 //! `struct OperationConfig` spans `src/tool_cfgable.h:60-322` and holds, by
-//! count taken from the header rather than estimated: one `struct dynbuf`,
-//! 83 `char *`, 11 `struct curl_slist *`, five `struct getout *` cursors with
-//! a `size_t num_urls`, two `struct tool_mime *` with one `curl_mime *`,
-//! 10 `curl_off_t`, 27 `long`, four `unsigned long`, one `HttpReq`, one
-//! anonymous clobber enum, three `unsigned char`, one `unsigned short`, the
-//! `prev`/`next` pair and **84** `BIT(...)` one-bit bitfields.
-//! `struct GlobalConfig` spans `:331-367` and holds 14 bitfields, of which the
-//! two under `#ifdef DEBUGBUILD` (`:351-354`) are omitted here because
+//! count taken from the header rather than estimated: one `struct dynbuf`, 83
+//! `char *`, 11 `struct curl_slist *`, five `struct getout *` cursors with a
+//! `size_t num_urls`, two `struct tool_mime *` with one `curl_mime *`, 10
+//! `curl_off_t`, 27 `long`, four `unsigned long`, one `HttpReq`, one anonymous
+//! clobber enum, three `unsigned char`, one `unsigned short`, the
+//! `prev`/`next` pair and **84** `BIT(...)` one-bit bitfields. `struct
+//! GlobalConfig` spans `:331-367` and holds 14 bitfields, of which the two
+//! under `#ifdef DEBUGBUILD` (`:351-354`) are omitted here because
 //! `DEBUGBUILD` is not a Cargo feature. The `#ifdef _WIN32` members `:324-329`
 //! and `:341-343` are omitted too: the four mandated targets are `x86_64` and
-//! `aarch64` on Linux and macOS (AAP section 0.2.2).
+//! `aarch64` on Linux and macOS.
 //!
 //! `ipfs_gateway` (`:108-110`) is *not* conditional here even though C guards
 //! it with `#ifndef CURL_DISABLE_IPFS`, because `CURL_DISABLE_IPFS` is not a
 //! Cargo feature either and the module that consumes it exists
 //! unconditionally.
-//!
-//! # The struct is flat, deliberately
-//!
-//! A model with 84 booleans invites a grouping into sub-structs, and this file
-//! does not perform one. `clippy::struct_excessive_bools` is the lint that
-//! would ask for it and it is *pedantic*, enabled nowhere in this workspace --
-//! not in `clippy.toml`, not in a crate attribute, and not in a `[lints]`
-//! table, and `.github/workflows/rust-clippy.yml` runs plain
-//! `cargo clippy --locked --workspace [--all-targets] [--all-features] --
-//! -D warnings` with the default groups only. With no lint asking, AAP section
-//! 0.8.2 decides: "a refactor that produces different-but-arguably-better
-//! output has failed". A flat struct in the header's own field order is
-//! auditable against `src/tool_cfgable.h:60-322` line by line, and a taxonomy
-//! this file invented would not be. Should the workspace ever enable
-//! `pedantic`, the seams to use are the C's own blank-line groups at `:288`,
-//! `:295` and `:303`, which is a change to make deliberately rather than to
-//! anticipate.
 //!
 //! # Gaps reported rather than worked around
 //!
@@ -93,58 +36,21 @@
 //! silently dropped:
 //!
 //! * `CURL_HET_DEFAULT` (`include/curl/curl.h:967`, `200L`) and
-//!   `CURLULFLAG_SEEN` (`:1042`, `1L << 4`) are public libcurl constants.
-//!   `curl-rs-lib` re-exports neither; they exist only as `pub(crate)` items in
-//!   `curl-rs-ffi/src/ffi/codes.rs:3164-3168`, and AAP section 0.4.2 fixes the
-//!   dependency direction as `curl-rs-ffi -> curl-rs-lib <- curl-rs`, so this
-//!   crate cannot reach them. The two frozen defaults are therefore written as
-//!   the header's own values at the single site that needs them, with the
-//!   header line cited, and no competing named constant is declared. When
-//!   `curl-rs-lib` re-exports them, that site adopts the names.
-//! * `PARALLEL_DEFAULT` (`src/tool_main.h:34`, `50`) belongs to `operate/`,
-//!   which does not exist yet. Same treatment, same single site.
+//!   `CURLULFLAG_SEEN` (`:1042`, `1L << 4`) are public libcurl constants. The
+//!   two frozen defaults are therefore written as the header's own values at
+//!   the single site that needs them, with the header line cited, and no
+//!   competing named constant is declared. When `curl-rs-lib` re-exports them,
+//!   that site adopts the names.
+//! * Same treatment, same single site.
 //! * `MAX_FILE2MEMORY` (`src/tool_paramhlp.h:33`) is private to
 //!   `crate::cli::paramhlp`. Nothing is needed from it here:
 //!   [`OperationConfig::postdata`] starts empty, and the cap belongs to the
 //!   append site that already enforces it.
-//!
-//! # `slist_wc` is a cache, not a wildcard matcher
-//!
-//! AAP section 0.4.1 labels `src/slist_wc.c` "wildcard string lists". The
-//! measured semantics are different, and following the label would be a
-//! defect. `src/slist_wc.h:30` reads "linked-list structure with last node
-//! cache for easysrc" and the struct is a `first`/`last` pair, so "wc" is
-//! *with cache*: a cached tail giving an append that does not walk the chain.
-//! The whole API is two functions, `slist_wc_append` at `src/slist_wc.c:34-57`
-//! and `slist_wc_free_all` at `:60-67`, and neither examines a byte of the
-//! data it stores. [`SlistWc`] is that type, and it interprets no `*` and no
-//! `?`. Inventing matching semantics the C never had is exactly the behaviour
-//! change AAP section 0.8.2 forbids.
-//!
-//! # The four sibling modules -- declared as each one arrives
-//!
-//! AAP section 0.3.1 caps this folder at five files. A `mod` line without its
-//! file is `E0583`, a hard error that no `#[allow]` can reach because module
-//! resolution never gets far enough to produce a lint, so declaring a module
-//! ahead of its file would stop the crate compiling rather than merely assert
-//! something unverified. Each declaration therefore arrives with its file, and
-//! every one is `pub(crate)` -- that visibility is part of the specification,
-//! and the alphabetical order is what `rustfmt.toml`'s `reorder_modules`
-//! produces:
-//!
-//! ```text
-//! pub(crate) mod findfile;     // src/tool_findfile.c   -- declared below
-//! pub(crate) mod parseconfig;  // src/tool_parsecfg.c
-//! pub(crate) mod ssls;         // src/tool_ssls.c
-//! pub(crate) mod to_setopts;   // src/config2setopts.c, src/tool_setopt.c
-//! ```
-//!
-//! `findfile` has landed and is declared; the remaining three are still absent
-//! from this checkout and stay undeclared until they are not.
 
 pub(crate) mod findfile;
 
 use std::collections::TryReserveError;
+use std::fmt;
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -154,49 +60,72 @@ use crate::cli::libinfo::LibInfo;
 use crate::cli::paramhlp::{GetOutSeq, NewGetOut};
 use crate::cli::vars::Variables;
 use crate::output::formparse::MimeTree;
-use crate::output::msgs::{errorf, DiagnosticSink, MsgConfig};
+use crate::output::msgs::{errorf, DiagnosticSink, InsecureRequest, MsgConfig};
 use crate::urlglob::UrlGlob;
 
+/// What a redacting formatter prints in place of a value.
+///
+/// One spelling, so a test can assert both its presence and the absence of the
+/// value it replaced. It matches `curl-rs-lib`'s marker deliberately: the two
+/// crates' diagnostics are read together, and two spellings of "we did not
+/// print this" would read as two different things.
+#[allow(dead_code)] // Reached only from the redacting
+                    // formatters below, which are themselves dead until the option parser is
+                    // wired; see the module's other dead-code allowances.
+const REDACTED: &str = "<redacted>";
+
+/// A [`fmt::Debug`] adaptor rendering a byte length in place of the bytes.
+///
+/// Used by the formatters below for every caller-supplied value. A length
+/// rather than a fixed mask, because whether a password is set, and whether it
+/// is plausibly the one the user meant, is the question a reader of a
+/// configuration dump actually has -- and a length answers it while disclosing
+/// nothing an attacker holding the ciphertext does not already have.
+#[allow(dead_code)] // Reached only from the redacting
+                    // formatters below, which are themselves dead until the option parser is
+                    // wired; see the module's other dead-code allowances.
+struct Hidden(usize);
+
+impl fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{REDACTED}, {} bytes>", self.0)
+    }
+}
+
+/// `Some(<redacted, N bytes>)` or `None`, keeping unset distinct from empty.
+#[allow(dead_code)] // Reached only from the redacting
+                    // formatters below, which are themselves dead until the option parser is
+                    // wired; see the module's other dead-code allowances.
+fn hidden_str(value: Option<&String>) -> Option<Hidden> {
+    value.map(|text| Hidden(text.len()))
+}
+
+/// The same for a byte string.
+#[allow(dead_code)] // Reached only from the redacting
+                    // formatters below, which are themselves dead until the option parser is
+                    // wired; see the module's other dead-code allowances.
+fn hidden_bytes(value: Option<&Vec<u8>>) -> Option<Hidden> {
+    value.map(|bytes| Hidden(bytes.len()))
+}
+
+/// The same for a path, whose text can disclose a filesystem layout or a
+/// tenant identity.
+#[allow(dead_code)] // Reached only from the redacting
+                    // formatters below, which are themselves dead until the option parser is
+                    // wired; see the module's other dead-code allowances.
+fn hidden_path(value: Option<&PathBuf>) -> Option<Hidden> {
+    value.map(|path| Hidden(path.as_os_str().len()))
+}
+
 /// `MAX_CONFIG_LINE_LENGTH` -- `src/tool_cfgable.h:32`.
-///
-/// 10 MiB, and it is defined in the header rather than in
-/// `src/tool_parsecfg.c`, which is why it is owned here rather than by the
-/// module that consumes it: `src/tool_parsecfg.c` caps both of its line
-/// buffers with it.
-///
-/// `crate::urlglob` holds a module-private constant of the same name and the
-/// same value at `curl-rs/src/urlglob.rs:230`, reached for the scratch buffer
-/// of `glob_url` (`src/tool_urlglob.c:502`). The values agree, so this is a
-/// duplicated declaration and not a divergence; that copy is private and
-/// cannot be imported, and it adopts this one when that file is next touched.
 #[allow(dead_code)]
 pub(crate) const MAX_CONFIG_LINE_LENGTH: usize = 10 * 1024 * 1024;
 
 /// `DEFAULT_MAXREDIRS` -- `src/tool_main.h:28`, `50L`.
-///
-/// The only one of the seven constants at `src/tool_main.h:28-37` that belongs
-/// here. `RETRY_SLEEP_DEFAULT`, `RETRY_SLEEP_MAX`, `MAX_PARALLEL`,
-/// `PARALLEL_DEFAULT`, `MAX_PARALLEL_HOST` and `PARALLEL_HOST_DEFAULT` are
-/// `operate/`'s, and none of them is declared in this file.
-///
-/// `long` in C, so `i64` here: it reaches `CURLOPT_MAXREDIRS`, a long option,
-/// and a narrower type would clamp a value the option accepts.
-///
-/// The allowance is per item, never on a module or a crate root, and it is
-/// needed even though [`OperationConfig::default`] reads this: nothing outside
-/// this module reaches that constructor yet, so dead-code analysis prunes the
-/// whole subtree and this constant with it. It goes when the option parser
-/// arrives.
 #[allow(dead_code)]
 pub(crate) const DEFAULT_MAXREDIRS: i64 = 50;
 
 /// The `fail` tri-state -- `src/tool_cfgable.h:56-58`.
-///
-/// C spells it as three `#define`s stored in an `unsigned char`
-/// (`src/tool_cfgable.h:225`, commented "NONE, with body, without body"). The
-/// discriminants are pinned to the C values because `--fail` and
-/// `--fail-with-body` select between them and the transfer path compares
-/// against all three.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[repr(u8)]
 #[allow(dead_code)]
@@ -234,12 +163,6 @@ pub(crate) enum ClobberMode {
 
 /// `trace` -- `src/tool_sdecls.h:104-109`, the type of
 /// [`GlobalConfig::tracetype`].
-///
-/// Declaration order is preserved and the discriminants are written out,
-/// because `TRACE_NONE` is the zero value that C's `calloc` leaves behind and
-/// consumers compare against it to decide whether tracing is on at all --
-/// `src/tool_cb_dbg.c:190` and `src/tool_msgs.c` by way of
-/// [`MsgConfig::trace_enabled`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[repr(u8)]
 #[allow(dead_code)]
@@ -257,12 +180,6 @@ pub(crate) enum TraceType {
 
 /// `HttpReq` -- `src/tool_sdecls.h:114-121`, the type of
 /// [`OperationConfig::httpreq`].
-///
-/// Declaration order is preserved. The C comment on the first variant reads
-/// "first in list", and it is load-bearing: `SetHTTPrequest`
-/// (`src/tool_helpers.c`) treats the zero value as "no request method has been
-/// chosen yet" and refuses a second explicit choice, so a reordering would
-/// change which command lines are accepted.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[repr(u8)]
 #[allow(dead_code)]
@@ -296,7 +213,7 @@ pub(crate) enum HttpReq {
 /// and back would be two lossy conversions where C performs none, and the
 /// conversion that does happen -- to an `OsStr` at the point a file is
 /// opened -- is exact on every mandated target.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct GetOut {
     /// `char *url` -- the URL this node deals with (`:87`).
@@ -328,33 +245,40 @@ pub(crate) struct GetOut {
     pub(crate) out_null: bool,
 }
 
+/// Lengths in place of the URL and the two filenames; every flag in full.
+///
+/// # Why this is not `#[derive(Debug)]`
+///
+/// [`Self::url`] is a command-line URL, and a URL carries credentials: userinfo
+/// in the authority, a signed query parameter, a one-time token in a path.
+/// `curl_rs_lib`'s own `Url` formatter redacts userinfo for that reason, so
+/// rendering the raw bytes here would have reinstated the disclosure one layer
+/// up. [`Self::outfile`] and [`Self::infile`] are local paths, which disclose a
+/// filesystem layout and often a user name.
+///
+/// Every flag and the sequence number render in full: they are what a reader
+/// debugging `-o`/`-O`/`-T` interaction needs, and none is a secret.
+impl fmt::Debug for GetOut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GetOut")
+            .field("url", &hidden_bytes(self.url.as_ref()))
+            .field("outfile", &hidden_bytes(self.outfile.as_ref()))
+            .field("infile", &hidden_bytes(self.infile.as_ref()))
+            .field("num", &self.num)
+            .field("outset", &self.outset)
+            .field("urlset", &self.urlset)
+            .field("uploadset", &self.uploadset)
+            .field("useremote", &self.useremote)
+            .field("noupload", &self.noupload)
+            .field("noglob", &self.noglob)
+            .field("out_null", &self.out_null)
+            .finish()
+    }
+}
+
 /// The ordered string list that replaces `src/slist_wc.c`.
 ///
-/// C's `struct slist_wc` (`src/slist_wc.h:31-34`) is a `curl_slist` chain plus
-/// a cached tail, and the cache is its whole reason for existing: it makes
-/// `slist_wc_append` (`src/slist_wc.c:34-57`) an append that does not walk the
-/// chain. `Vec<String>` supplies that intrinsically -- `push` is amortized
-/// constant time and the tail is wherever the last element is -- so the cached
-/// pointer disappears rather than being reproduced, and with it the class of
-/// defect where `first` and `last` disagree.
-///
-/// `slist_wc_free_all` (`:60-67`) has no counterpart: dropping this value drops
-/// the `Vec`, which drops each `String`.
-///
-/// # This performs no matching of any kind
-///
-/// See the module documentation: "wc" is *with cache*, not *wildcard*. Neither
-/// C function examines the data it stores, and neither does this. A value
-/// holding `*` or `?` round-trips byte for byte.
-///
 /// # Deliberately not shared with the `--libcurl` emitter
-///
-/// The C file sits entirely inside `#ifndef CURL_DISABLE_LIBCURL_OPTION`
-/// (`src/slist_wc.c:26` and `:69`), so it exists solely to serve `--libcurl`
-/// and easysrc. That preprocessor guard has no Cargo feature -- the fifteen
-/// features are fixed and `CURL_DISABLE_LIBCURL_OPTION` is not among them --
-/// so nothing here is `#[cfg]`-gated, and whether the emitter runs at all is a
-/// runtime question about the option.
 ///
 /// `curl-rs/src/libcurl_src.rs` keeps its own accumulators in the target
 /// design and states that it must not use this type. The divergence is
@@ -378,10 +302,6 @@ impl SlistWc {
     }
 
     /// `slist_wc_append` -- `src/slist_wc.c:34-57`.
-    ///
-    /// Doubles as initializer and appender exactly as the C does, because an
-    /// empty list is a valid receiver. Duplicates and empty strings are kept:
-    /// C stores whatever `curl_slist_append` was handed.
     ///
     /// # Errors
     ///
@@ -448,20 +368,10 @@ impl SlistWc {
 /// ordinary exclusive borrow; nothing is wrapped in a cell, because a plain
 /// `&mut` suffices and interior mutability would hide the aliasing rule that
 /// makes the borrow safe.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct OperationConfig {
     /// `struct dynbuf postdata` -- `:61`, the `--data` accumulator.
-    ///
-    /// `Vec<u8>` rather than `String`: `--data` and `--data-binary` can carry
-    /// NUL bytes and arbitrary binary content, and the request body is compared
-    /// byte for byte by the fixture corpus.
-    ///
-    /// C initializes it with a ceiling of `MAX_FILE2MEMORY`
-    /// (`src/tool_cfgable.c:55`, `src/tool_paramhlp.h:33`). That constant is
-    /// private to `crate::cli::paramhlp`, and nothing is needed from it here:
-    /// this starts empty, and the ceiling is enforced where bytes are appended,
-    /// which is the one place that can enforce it.
     pub(crate) postdata: Vec<u8>,
     /// `char *useragent` -- `:62`.
     pub(crate) useragent: Option<String>,
@@ -498,12 +408,6 @@ pub(crate) struct OperationConfig {
     /// `state->httpgetfields`. Those are its only two assignments in the whole
     /// tree, and it is absent from `free_config_fields` precisely because
     /// `postdata` owns the storage.
-    ///
-    /// What the pointer therefore carries is one bit of information --
-    /// whether the collected [`OperationConfig::postdata`] is designated as the
-    /// request body -- and `src/tool_operate.c:1413` reads exactly that bit as
-    /// `if(config->postfields)`. The alias half is a borrow of `postdata`,
-    /// which needs no field.
     pub(crate) postfields: bool,
     /// `char *referer` -- `:73`.
     pub(crate) referer: Option<String>,
@@ -565,12 +469,6 @@ pub(crate) struct OperationConfig {
     /// `char *netrc_file` -- `:101`.
     pub(crate) netrc_file: Option<PathBuf>,
     /// `struct getout *url_list` -- `:102`, C's "point to the first node".
-    ///
-    /// The whole chain, owned. C's `url_last` (`:103`, "point to the
-    /// last/current node") is not a field here because the tail of a `Vec` is
-    /// wherever the last element is; [`OperationConfig::url_last`] reports it.
-    /// `free_config_fields` walks and frees this chain node by node at
-    /// `src/tool_cfgable.c:107-115`, which dropping the vector does.
     pub(crate) url_list: Vec<GetOut>,
     /// `struct getout *url_get` -- `:104`, the node to fill in the URL.
     pub(crate) url_get: Option<usize>,
@@ -586,12 +484,6 @@ pub(crate) struct OperationConfig {
     /// a URL, so the two are not the same number.
     pub(crate) num_urls: usize,
     /// The `static int outnum` of `src/tool_paramhlp.c:40`, as a field.
-    ///
-    /// `crate::cli::paramhlp` documents the relocation and names this file as
-    /// the owner: a mutable `static` is forbidden outright here, and a
-    /// `static AtomicU32` would preserve the C shape while reintroducing a
-    /// global and destroying test isolation. It is reached through
-    /// [`OperationConfig::getout_sequence_mut`].
     pub(crate) getout_seq: GetOutSeq,
     /// `char *ipfs_gateway` -- `:109`.
     ///
@@ -684,15 +576,6 @@ pub(crate) struct OperationConfig {
     /// `struct curl_slist *proxyheaders` -- `:150`.
     pub(crate) proxyheaders: Vec<String>,
     /// `struct tool_mime *mimeroot` and `*mimecurrent` -- `:151-152`.
-    ///
-    /// One value for the pair, because `crate::output::formparse` already
-    /// defines it and its documentation names these two header lines as what it
-    /// stands for: the root is the outermost multipart and the cursor is the
-    /// group the next field joins. That module is imported rather than
-    /// duplicated -- a second definition of the same concept is what this
-    /// avoids -- and the direction of the dependency is the C's own:
-    /// `src/tool_cfgable.c:27` includes `tool_formparse.h` so that
-    /// `free_config_fields` can call `tool_mime_free` at `:173`.
     ///
     /// `curl_mime *mimepost` (`:153`) has no field here. Its only purpose in C
     /// is the deferred `curl_mime_free` at `src/tool_cfgable.c:171-172`, and
@@ -1007,37 +890,126 @@ pub(crate) struct OperationConfig {
     pub(crate) skip_existing: bool,
 }
 
+/// Shape, policy and counts -- never a credential, a body, a header or a URL.
+///
+/// # Why this is not `#[derive(Debug)]`
+///
+/// `struct OperationConfig` is `src/tool_cfgable.h:56-322` field for field, and
+/// among its 228 fields are every credential a curl command line can carry:
+/// `userpwd`, `proxyuserpwd`, `tls_password`, `proxy_tls_password`,
+/// `key_passwd`, `proxy_key_passwd`, `oauth_bearer`, `aws_sigv4`; the request
+/// body in `postdata`; every application header in `headers` and
+/// `proxyheaders`; every URL in `url_list`; and the FTP command lists, which
+/// carry a `USER`/`PASS` pair whenever `--ftp-alternative-to-user` is in play.
+/// A derived formatter renders all of it, and this type is the argument every
+/// option handler takes, so a single `{:?}` in any diagnostic -- present or
+/// future -- would have written a password to a log.
+///
+/// # Why a chosen summary rather than 228 redacted fields
+///
+/// Two reasons, and the second is the load-bearing one:
+///
+/// 1. A 228-row dump is not a diagnostic. The fields a reader of a
+///    configuration message wants are which request kind was selected, which
+///    authentication was requested, whether verification was switched off, and
+///    how many URLs, headers and cookies are in play.
+/// 2. **A field-by-field redacted formatter would be safe only for as long as
+///    everybody remembers to redact.** The 229th field, added later by somebody
+///    who does not read this comment, would arrive unredacted. This formatter
+///    names the fields it prints, so a new field is invisible to it by default
+///    and the failure mode of forgetting is a missing line rather than a leaked
+///    secret. `finish_non_exhaustive` says so in the output.
+///
+/// # What the credential fields report
+///
+/// Presence and length, through [`Hidden`]. That is enough to tell an unset
+/// password from an empty one -- a distinction `crate::cli::args` acts on -- and
+/// discloses nothing further. The three insecure flags render in full and
+/// deliberately: `crate::output::msgs::warn_insecure_flags` is the mandated
+/// warning path and this is the state it reports, so hiding it here would work
+/// against the very thing AAP section 0.8.1 requires be visible.
+impl fmt::Debug for OperationConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OperationConfig")
+            // What the request is.
+            .field("httpreq", &self.httpreq)
+            .field("customrequest", &hidden_str(self.customrequest.as_ref()))
+            .field("num_urls", &self.num_urls)
+            .field("url_list", &self.url_list.len())
+            .field("postdata", &Hidden(self.postdata.len()))
+            .field("postfields", &self.postfields)
+            .field("headers", &self.headers.len())
+            .field("proxyheaders", &self.proxyheaders.len())
+            .field("has_mime", &self.mime.is_some())
+            // Who it authenticates as. Presence only.
+            .field("authtype", &self.authtype)
+            .field("has_userpwd", &self.userpwd.is_some())
+            .field("has_proxyuserpwd", &self.proxyuserpwd.is_some())
+            .field("has_tls_password", &self.tls_password.is_some())
+            .field("has_proxy_tls_password", &self.proxy_tls_password.is_some())
+            .field("has_key_passwd", &self.key_passwd.is_some())
+            .field("has_proxy_key_passwd", &self.proxy_key_passwd.is_some())
+            .field("has_oauth_bearer", &self.oauth_bearer.is_some())
+            .field("has_aws_sigv4", &self.aws_sigv4.is_some())
+            .field("netrc", &self.netrc)
+            .field("netrc_opt", &self.netrc_opt)
+            // The transport-security policy. Rendered in full on purpose.
+            .field("insecure_ok", &self.insecure_ok)
+            .field("doh_insecure_ok", &self.doh_insecure_ok)
+            .field("proxy_insecure_ok", &self.proxy_insecure_ok)
+            .field("verifystatus", &self.verifystatus)
+            .field("doh_verifystatus", &self.doh_verifystatus)
+            .field("ssl_version", &self.ssl_version)
+            .field("ssl_version_max", &self.ssl_version_max)
+            .field("has_cacert", &self.cacert.is_some())
+            .field("has_capath", &self.capath.is_some())
+            .field("has_cert", &self.cert.is_some())
+            .field("has_key", &self.key.is_some())
+            .field("has_pinnedpubkey", &self.pinnedpubkey.is_some())
+            // State stores, by presence rather than by path.
+            .field("cookies", &self.cookies.len())
+            .field("cookiefiles", &self.cookiefiles.len())
+            .field("cookiejar", &hidden_path(self.cookiejar.as_ref()))
+            .field("has_altsvc", &self.altsvc.is_some())
+            .field("has_hsts", &self.hsts.is_some())
+            .field("has_netrc_file", &self.netrc_file.is_some())
+            // Where it connects, without disclosing where.
+            .field("has_proxy", &self.proxy.is_some())
+            .field("has_preproxy", &self.preproxy.is_some())
+            .field("has_doh_url", &self.doh_url.is_some())
+            .field("has_unix_socket", &self.unix_socket_path.is_some())
+            .field("resolve", &self.resolve.len())
+            .field("connect_to", &self.connect_to.len())
+            .field("ip_version", &self.ip_version)
+            .field("httpversion", &self.httpversion)
+            // FTP command lists carry credentials; count them only.
+            .field("quote", &self.quote.len())
+            .field("postquote", &self.postquote.len())
+            .field("prequote", &self.prequote.len())
+            // Timing and limits, which hold nothing sensitive.
+            .field("timeout_ms", &self.timeout_ms)
+            .field("connecttimeout_ms", &self.connecttimeout_ms)
+            .field("maxredirs", &self.maxredirs)
+            .field("followlocation", &self.followlocation)
+            .field("max_filesize", &self.max_filesize)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for OperationConfig {
     /// `config_alloc` -- `src/tool_cfgable.c:36-57`.
-    ///
-    /// C allocates with `curlx_calloc` (`:38-39`), which leaves every field
-    /// zero, `NULL` or `FALSE`, and then assigns twelve of them explicitly at
-    /// `:43-54` before initializing `postdata` at `:55`. Both halves are here:
-    /// the zeroed half is written out field by field, because Rust has no
-    /// `calloc` to inherit it from and a construction that spelled only the
-    /// twelve would not compile, and each of the twelve carries the C line it
-    /// comes from.
-    ///
-    /// # These defaults are frozen
-    ///
-    /// AAP section 0.8.1 freezes "default option values, including the
-    /// default-on state of certificate verification", and these are exactly
-    /// such values. Turning `tcp_nodelay` or `ftp_skip_ip` off, or moving
-    /// `maxredirs`, is a change to what the tool does on a command line that
-    /// mentions none of them, which section 0.8.2 does not permit.
     ///
     /// # The three insecure flags are false, and that is a guarantee
     ///
     /// `insecure_ok`, `doh_insecure_ok` and `proxy_insecure_ok` are false here
     /// because the C `calloc` zeroes them, and that is the tool-side half of
-    /// the default-on verification guarantee of AAP section 0.1.1 goal G4. The
-    /// library side lives in `curl-rs-lib`; what this side has to get right is
-    /// that nothing turns verification on, because it was never off. The option
-    /// applier only ever turns it **off**, and only when one of these three
-    /// bits is set -- `src/config2setopts.c:378-381` -- so inverting the
-    /// polarity of any of the three would silently disable verification for
-    /// every invocation. That is why they are asserted by a test rather than
-    /// left to inspection.
+    /// the default-on verification guarantee. The library side lives in
+    /// `curl-rs-lib`; what this side has to get right is that nothing turns
+    /// verification on, because it was never off. The option applier only ever
+    /// turns it **off**, and only when one of these three bits is set --
+    /// `src/config2setopts.c:378-381` -- so inverting the polarity of any of
+    /// the three would silently disable verification for every invocation.
+    /// That is why they are asserted by a test rather than left to inspection.
     fn default() -> Self {
         Self {
             // `curlx_dyn_init(&config->postdata, MAX_FILE2MEMORY)` -- `:55`.
@@ -1176,14 +1148,6 @@ impl Default for OperationConfig {
             gssapi_delegation: 0,
             expect100timeout_ms: 0,
             // `config->happy_eyeballs_timeout_ms = CURL_HET_DEFAULT` -- `:50`.
-            //
-            // `CURL_HET_DEFAULT` is `200L` at `include/curl/curl.h:967`. The
-            // value is written rather than the name because the name is a
-            // public libcurl constant that `curl-rs-lib` does not re-export and
-            // that this crate is not permitted to declare; see the module
-            // documentation's reported gap. Nothing else here depends on the
-            // number, so there is exactly one site to update when the name
-            // becomes reachable.
             happy_eyeballs_timeout_ms: 200,
             timecond: 0,
             followlocation: 0,
@@ -1194,12 +1158,6 @@ impl Default for OperationConfig {
             // `config->file_clobber_mode = CLOBBER_DEFAULT` -- `:53`.
             file_clobber_mode: ClobberMode::Default,
             // `config->upload_flags = CURLULFLAG_SEEN` -- `:54`.
-            //
-            // `CURLULFLAG_SEEN` is `1L << 4` at `include/curl/curl.h:1042`,
-            // the fifth of the five `CURLOPT_UPLOAD_FLAGS` bits. Written as the
-            // shift rather than as 16 so that it reads as the bit the header
-            // defines, and written as a value rather than as the name for the
-            // reason recorded above.
             upload_flags: 1 << 4,
             porttouse: 0,
             ssl_version: 0,
@@ -1300,6 +1258,39 @@ impl Default for OperationConfig {
     }
 }
 
+/// The three verification bits, read straight off the configuration that holds
+/// them.
+///
+/// This is the whole point of [`InsecureRequest`] being a trait: the warning can
+/// only be told what was requested by something that knows, and the thing that
+/// knows is this struct -- `src/tool_cfgable.h:258-261` is where C keeps the
+/// same three bits, and `src/config2setopts.c:378-393` is where it reads them.
+///
+/// No transformation, no defaulting and no interpretation. Each method returns
+/// the field the option parser set at `crate::cli::args`
+/// (`CmdKey::Insecure`, `CmdKey::DohInsecure` and `CmdKey::ProxyInsecure`), so
+/// there is no step between "the user asked" and "the warning was emitted" that
+/// could quietly disagree.
+impl InsecureRequest for OperationConfig {
+    fn insecure(&self) -> bool {
+        self.insecure_ok
+    }
+
+    fn doh_insecure(&self) -> bool {
+        self.doh_insecure_ok
+    }
+
+    fn proxy_insecure(&self) -> bool {
+        self.proxy_insecure_ok
+    }
+}
+
+// The inventory allowance this block has always carried: several accessors here
+// stand in for `struct OperationConfig` members whose production consumers --
+// `crate::config::to_setopts` chiefly -- have not landed, so today only tests
+// call them. It sits on the inherent block and NOT on the trait implementation
+// above, which needs no allowance: `InsecureRequest` is called from
+// `crate::main` through `warn_insecure_flags`.
 #[allow(dead_code)]
 impl OperationConfig {
     /// `config_alloc` -- `src/tool_cfgable.c:36-57`.
@@ -1313,29 +1304,11 @@ impl OperationConfig {
 
     /// `config->url_last` -- `src/tool_cfgable.h:103`, "point to the
     /// last/current node".
-    ///
-    /// Derived rather than stored: the tail of an owned vector is wherever the
-    /// last element is, so the two writes C performs at
-    /// `src/tool_paramhlp.c:43-49` -- append, then move the tail -- cannot
-    /// disagree here, because there is only one of them.
     pub(crate) fn url_last(&self) -> Option<usize> {
         self.url_list.len().checked_sub(1)
     }
 
     /// Appends one node and reports the index it took.
-    ///
-    /// This is `src/tool_paramhlp.c:42-49` in one operation:
-    /// `if(last) last->next = node; else config->url_list = node;` followed by
-    /// `config->url_last = node;`. The returned index stands in for the
-    /// `struct getout *` the four callers keep in
-    /// [`OperationConfig::url_get`], [`OperationConfig::url_out`] or
-    /// [`OperationConfig::url_ul`] before filling the node in
-    /// (`src/tool_getparam.c:1102-1112`, `:1344-1353`, `:1388-1396`,
-    /// `:1490-1500`).
-    ///
-    /// Only the two fields `new_getout` sets are taken, because that is all it
-    /// sets: `node->num` at `:52` and `node->useremote` at `:51`. Everything
-    /// else stays at its default, exactly as `:47`'s `calloc` leaves it.
     ///
     /// # Errors
     ///
@@ -1395,14 +1368,6 @@ impl OperationConfig {
 /// `trace_fopened && trace_stream` (`src/tool_cfgable.c:259-260`) and then
 /// clears the pointer unconditionally (`:261`). Closing a borrowed standard
 /// stream instead would take the tool's own diagnostics down with it.
-///
-/// One enum expresses both fields, so the invariant is not something the code
-/// has to remember: only [`TraceStream::File`] owns a handle, so only it can be
-/// closed, and `trace_fopened` becomes a question the type answers rather than
-/// a flag that can disagree with the pointer.
-///
-/// The three destinations are exactly the three `src/tool_cb_dbg.c:169-179`
-/// can reach, chosen from the trace destination name on first use.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub(crate) enum TraceStream {
@@ -1445,10 +1410,6 @@ impl TraceStream {
 /// The per-invocation cursor set -- `struct State`
 /// (`src/tool_cfgable.h:44-54`), whose C comment reads "for
 /// create_transfer()".
-///
-/// A field of [`GlobalConfig`], so it is modelled here. No `create_transfer`
-/// logic is: that belongs to the module that drives operations, and this type
-/// carries only the state it walks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct State {
@@ -1456,12 +1417,6 @@ pub(crate) struct State {
     /// [`OperationConfig::url_list`] rather than a pointer into the chain.
     pub(crate) urlnode: Option<usize>,
     /// `struct URLGlob inglob` -- `:46`, the upload-name glob.
-    ///
-    /// [`Option`] because `crate::urlglob`'s type is only constructible by
-    /// parsing a pattern, which is the honest expression of C's embedded-but-
-    /// zeroed struct: a `URLGlob` with no patterns is "no glob in progress",
-    /// and that is what [`None`] means. The type itself is imported rather than
-    /// redefined.
     pub(crate) inglob: Option<UrlGlob>,
     /// `struct URLGlob urlglob` -- `:47`, the URL glob, on the same terms.
     pub(crate) urlglob: Option<UrlGlob>,
@@ -1506,7 +1461,7 @@ pub(crate) struct State {
 /// first. Reproducing the C order therefore takes an explicit
 /// [`Drop`] that pops, which is what [`ConfigChain::release`] does, rather than
 /// letting the vector drop itself.
-#[derive(Debug, Default)]
+#[derive(Default)]
 #[allow(dead_code)]
 pub(crate) struct ConfigChain {
     /// The operations in command-line order. Index 0 is C's `first`, and the
@@ -1518,6 +1473,22 @@ pub(crate) struct ConfigChain {
     /// `calloc` leaves it `NULL` and the option parser is what points it
     /// somewhere.
     current: Option<usize>,
+}
+
+/// The chain's shape, with each operation redacted by its own formatter.
+///
+/// Hand-written only because the derive was removed from [`OperationConfig`].
+/// Rendering the operations rather than only their count is safe -- each one
+/// redacts itself -- and it is what makes the chain's structure debuggable,
+/// which matters because `--next` builds a chain whose length is the thing
+/// usually in question. `current` is an index and holds nothing sensitive.
+impl fmt::Debug for ConfigChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigChain")
+            .field("configs", &self.configs)
+            .field("current", &self.current)
+            .finish()
+    }
 }
 
 #[allow(dead_code)]
@@ -1591,10 +1562,6 @@ impl ConfigChain {
     }
 
     /// Points `global->current` at `at`, or clears it with [`None`].
-    ///
-    /// An out-of-range index is refused rather than stored, so that
-    /// [`ConfigChain::current`] can never observe a stale cursor -- the
-    /// detectably-stale handle of AAP section 0.6.9.
     pub(crate) fn set_current(&mut self, at: Option<usize>) -> bool {
         match at {
             Some(index) if index >= self.configs.len() => false,
@@ -1620,11 +1587,6 @@ impl ConfigChain {
 
     /// Appends one operation and reports the index it took, which becomes the
     /// new `global->last`.
-    ///
-    /// This is what `--next` grows: `PARAM_NEXT_OPERATION` allocates a
-    /// configuration, links it after the current tail and moves `last` to it.
-    /// Here the tail moves because the element is last, so the two writes
-    /// cannot disagree.
     ///
     /// # Errors
     ///
@@ -1669,13 +1631,6 @@ impl ConfigChain {
 impl Drop for ConfigChain {
     /// Releases the chain in `config_free`'s order even when this value is
     /// dropped on its own rather than through [`GlobalConfig`].
-    ///
-    /// Without this the vector's own drop glue would release element 0 first,
-    /// which is the opposite of `src/tool_cfgable.c:197`'s "Free each of the
-    /// structures in reverse order". The order is not observable through a
-    /// side effect today, and it is reproduced regardless: it is part of the
-    /// behaviour being preserved, and a later field that does observe its own
-    /// drop would otherwise change meaning silently.
     fn drop(&mut self) {
         self.release();
     }
@@ -1683,27 +1638,6 @@ impl Drop for ConfigChain {
 
 /// The whole tool's configuration -- `struct GlobalConfig`
 /// (`src/tool_cfgable.h:331-367`).
-///
-/// One owned value, constructed by the entry point and threaded down by
-/// reference. There is no ambient way to reach it; see the module
-/// documentation for why that is the single most important property of this
-/// file.
-///
-/// # What is not here
-///
-/// * `BIT(test_duphandle)` and `BIT(test_event_based)` (`:351-354`) sit under
-///   `#ifdef DEBUGBUILD`, which is not a Cargo feature. Omitted.
-/// * `struct termout term` (`:341-343`, with the type at `:324-329`) sits under
-///   `#ifdef _WIN32`. Windows is outside the four mandated targets
-///   (AAP section 0.2.2). Omitted.
-/// * `BIT(trace_fopened)` (`:359`) is folded into [`TraceStream`], where it
-///   cannot disagree with the handle it describes.
-///
-/// # No [`Debug`], deliberately
-///
-/// [`LibInfo`] derives none, and widening a sibling's derives from here would
-/// be a change to that module rather than to this one. Every other type in this
-/// file does derive it, so the parts that can be inspected are.
 #[allow(dead_code)]
 pub(crate) struct GlobalConfig {
     /// `struct State state` -- `:332`, "for create_transfer()".
@@ -1717,15 +1651,6 @@ pub(crate) struct GlobalConfig {
     /// `FILE *trace_stream` -- `:334`, with `trace_fopened` folded in.
     pub(crate) trace_stream: TraceStream,
     /// `char *libcurl` -- `:335`, "Output libcurl code to this filename".
-    ///
-    /// The `--libcurl` destination, and only the destination. The emitter's own
-    /// state -- the five accumulated sections and the two counters of
-    /// `src/tool_easysrc.c` -- is owned by `curl-rs/src/libcurl_src.rs` in the
-    /// target design, and that file does not exist in this checkout, so the
-    /// field that holds it cannot be typed yet. It attaches here, beside this
-    /// one, as a sibling field typed by that module and arriving with it. No
-    /// second emitter-state type is declared here, which is what keeps the two
-    /// from drifting.
     pub(crate) libcurl: Option<PathBuf>,
     /// `char *ssl_sessions` -- `:336`, the file to load and save TLS session
     /// tickets from, which `--ssl-sessions` names.
@@ -1745,13 +1670,6 @@ pub(crate) struct GlobalConfig {
     pub(crate) tracetype: TraceType,
     /// `int progressmode` -- `:347`, `CURL_PROGRESS_BAR` or
     /// `CURL_PROGRESS_STATS`.
-    ///
-    /// Kept as the C's `int`. The two values are `CURL_PROGRESS_STATS 0` and
-    /// `CURL_PROGRESS_BAR 1` at `src/tool_cb_prg.h:28-29`, which makes them the
-    /// progress callback's constants rather than this file's; they are cited
-    /// here and declared where they belong. Zero is the default, which is the
-    /// value C's `calloc` leaves and which its own comment calls the "default
-    /// progress display".
     pub(crate) progressmode: i32,
     /// `unsigned short parallel_host` -- `:348`; `MAX_PARALLEL_HOST` is the
     /// maximum, and both bounds are `operate/`'s constants.
@@ -1761,15 +1679,6 @@ pub(crate) struct GlobalConfig {
     /// `unsigned char verbosity` -- `:350`, how verbose to be.
     pub(crate) verbosity: u8,
     /// What `get_libcurl_info()` returned at `src/tool_cfgable.c:235`.
-    ///
-    /// C assigns to the file-scope globals declared `extern` at
-    /// `src/tool_libinfo.h:30-65` and keeps no handle. Those globals have no
-    /// counterpart here, so the value has to be owned by something, and
-    /// `crate::cli::libinfo` names the owner in its own documentation: "the C
-    /// call site is `src/tool_cfgable.c:235`, so the tool's configuration layer
-    /// is the owner". This is that field. Constructing it is part of
-    /// [`GlobalConfig::init`], so the banner the test harness parses and the
-    /// library it describes can never disagree.
     pub(crate) libinfo: LibInfo,
     /// `BIT(parallel)` -- `:355`.
     pub(crate) parallel: bool,
@@ -1803,28 +1712,11 @@ pub(crate) struct GlobalConfig {
 
 /// `curl_global_init(CURL_GLOBAL_DEFAULT)` -- `src/tool_cfgable.c:232`.
 ///
-/// This is the step, at the point in the sequence C makes it, and it reports
-/// success because there is nothing for it to arm.
-///
 /// The reason is structural rather than an omission. `curl_global_init` exists
 /// to initialize process-global state -- C's `global_init`
 /// (`lib/easy.c:124-192`) performs eight subsystem initializations behind a
 /// reference count -- and in this workspace that reference count and those
-/// subsystems belong to `curl-rs-ffi`, the crate that owns the C ABI. This
-/// crate links the engine directly instead of going through that ABI, and AAP
-/// section 0.4.2 fixes the direction as `curl-rs-ffi -> curl-rs-lib <-
-/// curl-rs`, so there is no reference count on this path to increment and
-/// nothing that a second caller could observe. What the engine does need is
-/// arranged elsewhere and explicitly: the cryptographic provider is pinned in
-/// the manifests rather than selected at run time (AAP section 0.5.1), the
-/// resolver and the clock are injected rather than reached for globally
-/// (section 0.3.3 pattern P12), and the locale and the counting allocator are
-/// the entry point's calls.
-///
-/// The step is kept rather than deleted for two reasons. It holds the position
-/// in the sequence, so the two calls that follow it stay in the C's order; and
-/// it is the seam that a future engine-side global initialization returns
-/// through, with the branch that reports it already written and already tested.
+/// subsystems belong to `curl-rs-ffi`, the crate that owns the C ABI.
 fn library_init() -> CURLcode {
     CURLcode::Ok
 }
@@ -1832,10 +1724,6 @@ fn library_init() -> CURLcode {
 #[allow(dead_code)]
 impl GlobalConfig {
     /// `globalconf_init` -- `src/tool_cfgable.c:213-253`.
-    ///
-    /// The C comment at `:208-211` reads: "This is the main global constructor
-    /// for the app. Call this before _any_ libcurl usage. If this fails, *NO*
-    /// libcurl functions may be used, or havoc may be the result."
     ///
     /// # The value exists only on success, which is the whole point
     ///
@@ -1849,18 +1737,6 @@ impl GlobalConfig {
     ///   globalconf_free();
     /// }
     /// ```
-    ///
-    /// C has to arrange that by hand, because its configuration is a
-    /// file-scope object that exists whether initialization worked or not.
-    /// Returning the value instead makes the pairing automatic: on the error
-    /// path nothing is bound, so nothing is dropped and [`Drop`] cannot run
-    /// against a half-built configuration. A caller writes
-    /// `let global = GlobalConfig::init(sink, msgs)?;` and gets the C's
-    /// discipline from the language.
-    ///
-    /// `sink` and `msgs` are taken because two of the three failure paths emit
-    /// a diagnostic before returning, and this crate has no ambient error
-    /// stream any more than it has an ambient configuration.
     ///
     /// # Errors
     ///
@@ -1885,18 +1761,13 @@ impl GlobalConfig {
     ///
     /// [`GlobalConfig::init`] is this function with the real ones. The split
     /// exists because C's three failure branches are reachable and this
-    /// design's are not reachable through the production arguments: Rust
-    /// aborts on an allocation failure rather than reporting one, and the two
+    /// design's are not reachable through the production arguments: the
+    /// allocation the first branch guards is fixed-size, with no stable
+    /// fallible spelling at the declared minimum Rust version, and the two
     /// calls that follow cannot fail on this path. The branches are
     /// nonetheless part of the frozen behaviour -- three messages, three
     /// codes, one ordering -- so they are written once, here, where a caller
     /// can drive each of them and assert the bytes and the code.
-    ///
-    /// The outcomes are functions rather than values so that the C's laziness
-    /// survives: `:230`'s `if(global->first)` guards the library
-    /// initialization, which guards `get_libcurl_info()`. Passing results
-    /// instead would compute all three up front and initialize the library
-    /// even when the allocation that precedes it failed.
     fn init_with<L, I>(
         initial: Option<OperationConfig>,
         library: L,
@@ -1964,10 +1835,8 @@ impl GlobalConfig {
             parallel_host: 0,
             // `:226` -- `global->parallel_max = PARALLEL_DEFAULT;`.
             //
-            // `PARALLEL_DEFAULT` is `50` at `src/tool_main.h:34` and belongs to
-            // `operate/`, which does not exist in this checkout; see the module
-            // documentation's reported gap. One site, so one line to change
-            // when the name becomes importable.
+            // One site, so one line to change when the name becomes
+            // importable.
             parallel_max: 50,
             verbosity: 0,
             libinfo,
@@ -2011,10 +1880,6 @@ impl Drop for GlobalConfig {
     /// 3. `config_free(global->last)` (`:282`) and the two `NULL` assignments
     ///    at `:283-284`, which [`ConfigChain::release`] performs in the reverse
     ///    order `:197` requires.
-    ///
-    /// `variables` is not released here, and neither does C release it here:
-    /// `varcleanup()` is called from `src/tool_operate.c:2396`, before this
-    /// runs. Dropping this value drops it, which is that call.
     fn drop(&mut self) {
         // Step 2 -- `free_globalconfig`.
         drop(self.trace_dump.take());
@@ -2029,17 +1894,9 @@ impl Drop for GlobalConfig {
 
 // Cross-checks
 //
-// AAP section 0.8.7 relocates the coverage of `tests/unit` into the crates,
-// because a Rust static library does not export `pub(crate)` items and the C
-// unit tests therefore cannot link whatever the quality of the translation.
 // These are that coverage for this module: every frozen default, every pinned
 // discriminant, and every preserved ordering, asserted against the C original
 // by line.
-//
-// Nothing here reaches the network, the environment or the clock, and nothing
-// uses a panicking result accessor: a fallible value is matched or asserted on
-// with `is_ok`/`is_err` before it is used, which keeps the assertions free of
-// the constructs the production code is not permitted either.
 
 #[cfg(test)]
 mod tests {
@@ -2101,11 +1958,10 @@ mod tests {
 
     #[test]
     fn the_three_insecure_flags_start_false() {
-        // The tool-side half of AAP section 0.1.1 goal G4. C gets this from
-        // `calloc`; a Rust `Default` has to state it, and inverting any one of
-        // the three would disable certificate verification for every
-        // invocation while still compiling and still passing every other test
-        // in this file.
+        // C gets this from `calloc`; a Rust `Default` has to state it, and
+        // inverting any one of the three would disable certificate
+        // verification for every invocation while still compiling and still
+        // passing every other test in this file.
         let config = OperationConfig::default();
         assert!(!config.insecure_ok, "src/tool_cfgable.h:258");
         assert!(!config.doh_insecure_ok, "src/tool_cfgable.h:259-260");
@@ -2615,5 +2471,79 @@ mod tests {
             assert!(global.libcurl.is_none(), ":264");
             assert!(global.chain.is_empty(), ":282-284");
         }
+    }
+
+    /// No credential, body, header or URL can reach a formatted configuration.
+    ///
+    /// The single assertion that matters for `OperationConfig`: every secret a
+    /// command line can carry is set to a distinctive value, and none of them
+    /// appears. The list is deliberately the review's own -- credentials,
+    /// request bodies, custom headers and URLs -- so a regression in any one
+    /// of the four families fails here.
+    #[test]
+    fn no_secret_can_reach_a_formatted_operation_config() {
+        // Built in one initializer rather than by reassignment: with 228
+        // fields the struct-update form is the only spelling that does not
+        // trip `clippy::field_reassign_with_default`, and it also states
+        // plainly that every field not named here is its default.
+        let config = OperationConfig {
+            userpwd: Some(String::from("alice:hunter2")),
+            proxyuserpwd: Some(String::from("proxyuser:proxypass")),
+            tls_password: Some(String::from("tlssecret")),
+            proxy_tls_password: Some(String::from("proxytlssecret")),
+            key_passwd: Some(String::from("keysecret")),
+            proxy_key_passwd: Some(String::from("proxykeysecret")),
+            oauth_bearer: Some(String::from("bearer-token-value")),
+            aws_sigv4: Some(String::from("aws:amz:us-east-1:s3")),
+            postdata: b"password=hunter2&card=4111111111111111".to_vec(),
+            headers: vec![String::from("Authorization: Basic c2VjcmV0")],
+            proxyheaders: vec![String::from(
+                "Proxy-Authorization: Bearer ptok",
+            )],
+            quote: vec![String::from("USER alice")],
+            cookies: vec![String::from("session=cafebabe")],
+            cookiejar: Some(PathBuf::from("/home/alice/.cookies")),
+            doh_url: Some(String::from("https://tok@doh.example/q")),
+            proxy: Some(String::from("http://proxyuser:pw@proxy.example")),
+            customrequest: Some(String::from("PROPFIND")),
+            ..Default::default()
+        };
+
+        let text = format!("{config:?}");
+        for secret in [
+            "hunter2",
+            "proxypass",
+            "tlssecret",
+            "proxytlssecret",
+            "keysecret",
+            "proxykeysecret",
+            "bearer-token-value",
+            "4111111111111111",
+            "c2VjcmV0",
+            "ptok",
+            "USER alice",
+            "cafebabe",
+            "/home/alice/.cookies",
+            "doh.example",
+            "proxy.example",
+            "PROPFIND",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+
+        // What a reader needs still renders: presence, counts and the
+        // transport-security policy the mandated warning reports.
+        assert!(text.contains("has_userpwd: true"), "{text}");
+        assert!(text.contains("has_oauth_bearer: true"), "{text}");
+        assert!(text.contains("headers: 1"), "{text}");
+        assert!(text.contains("insecure_ok: false"), "{text}");
+        // And the dump says it is a summary rather than the whole struct, so a
+        // reader does not mistake an omission for an unset field.
+        assert!(text.contains(".."), "{text}");
+
+        // A chain renders its operations through the same formatter.
+        let mut chain = ConfigChain::new(config.clone());
+        assert!(chain.append(config).is_ok());
+        assert!(!format!("{chain:?}").contains("hunter2"));
     }
 }

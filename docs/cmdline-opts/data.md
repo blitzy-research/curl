@@ -48,8 +48,15 @@ The data for this option is passed on to the server exactly as provided on the
 command line. curl does not convert, change or improve it. It is up to the
 user to provide the data in the correct form.
 
-Transfers for `MQTT` and `MQTTS` are not implemented in this build, so neither
-scheme appears in the `Protocols:` line of the --version output; this option,
-its data argument and any @ file it names are still parsed and read, and it is
-the `MQTT` transfer that then fails with `CURLE_UNSUPPORTED_PROTOCOL`. POST
-over HTTP and HTTPS remains fully supported, exactly as described above.
+Transfers for `MQTT` and `MQTTS` are outside the specified scope of this
+rewrite, so the `Protocols:` line of the --version output withholds both
+schemes; accepting this option, its data argument and any @ file it names is
+still specified, with the `MQTT` transfer then failing with
+`CURLE_UNSUPPORTED_PROTOCOL`. POST over `HTTP` and `HTTPS` is specified to work
+exactly as described above.
+
+That last sentence states specified behavior rather than what this build does.
+Nothing routes this option into a transfer yet: the executable honours no
+command-line option, and no HTTP request engine exists to carry a body. The
+rules for the argument, the @ form included, live in the option module and are
+tested there, but no command line reaches them.

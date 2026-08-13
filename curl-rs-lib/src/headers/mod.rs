@@ -36,40 +36,12 @@
 //! | `include/curl/header.h:47-56`| --    | `CURLHcode`, owned by `error` |
 //! | `lib/http2.c:657-702`        | --    | [`PushHeaders`]               |
 //!
-//! Four of the 100 symbols `lib/libcurl.def` exports are projections of what
-//! is below. The `#[no_mangle]` shims themselves live in
-//! `curl-rs-ffi/src/ffi/misc.rs`; this module is the safe engine they call.
-//!
 //! | def line | symbol                   | backed by                     |
 //! |----------|--------------------------|-------------------------------|
 //! | 6        | `curl_easy_header`       | [`HeaderStore::header`]       |
 //! | 8        | `curl_easy_nextheader`   | [`HeaderStore::next_header`]  |
 //! | 79       | `curl_pushheader_byname` | [`PushHeaders::by_name`]      |
 //! | 80       | `curl_pushheader_bynum`  | [`PushHeaders::by_num`]       |
-//!
-//! # Order, casing and spacing ARE the specification
-//!
-//! This is the constraint that decides the storage type, so it comes first.
-//! 1,476 of the 1,914 fixtures under `tests/data/` carry a `<protocol>`
-//! block naming the exact bytes the client must send, and `compareparts`
-//! (`tests/getpart.pm:351`) joins BOTH sides into a single string and
-//! compares them as one string. There is no per-line matching, no
-//! normalisation and no reordering.
-//!
-//! Three consequences, each of which rules out the obvious implementation:
-//!
-//! * Storage is an **ordered sequence**, never a map. A hash or sorted
-//!   container would destroy arrival order, and arrival order is compared.
-//! * Storage is **case-preserving**. The ABI documents this about itself at
-//!   `include/curl/header.h:32` -- `char *name; /* this might not use the
-//!   same case */`. Lookup folds ASCII case; storage never does.
-//! * Storage is **byte-transparent**: [`Vec<u8>`], not [`String`]. Header
-//!   names and values are arbitrary byte sequences with no UTF-8 guarantee,
-//!   and a lossy conversion would be a behaviour change.
-//!
-//! The HTTP/1 emission form is exactly `name`, `": "`, `value`, `"\r\n"` --
-//! one space after the colon and no final blank line. See
-//! [`HeaderSet::h1_dprint`].
 //!
 //! # Two stores, two lookup rules -- do not unify them
 //!
@@ -112,13 +84,22 @@
 //!   forwarded downstream. That plumbing belongs to `transfer/writeout.rs`;
 //!   this module supplies [`classify_origin`] so the precedence cannot be
 //!   got wrong there.
-//! * **`CURLHE_NOT_BUILT_IN` is never returned from here.** The C guards
-//!   this file with `CURL_DISABLE_HEADERS_API` (`lib/headers.c:31`) and its
-//!   disabled branch returns that code (`lib/headers.c:365-381`). No Cargo
-//!   feature in this workspace's fifteen-feature vocabulary corresponds, so
-//!   the header API is compiled in unconditionally. The variant stays
-//!   defined in [`crate::error`] and reachable for the shim; nothing below
-//!   produces it, and that is deliberate rather than an omission.
+//! * **`CURLHE_NOT_BUILT_IN` is never returned from here, and IS returned by
+//!   the shim.** The C guards this file with `!CURL_DISABLE_HTTP &&
+//!   !CURL_DISABLE_HEADERS_API` (`lib/headers.c:31`) and supplies a second,
+//!   complete definition of both entry points under the `#else`
+//!   (`lib/headers.c:365-394`): `CURLHE_NOT_BUILT_IN` unconditionally, and
+//!   NULL. Which of the two definitions a build uses is a question about the
+//!   build, not about this module -- this module is the built-in branch's
+//!   store and lookup, and it answers `CURLHE_NOHEADERS` for an empty store
+//!   because that is what the built-in branch answers. `curl-rs-ffi`'s
+//!   `ffi/misc.rs` selects the branch, from
+//!   [`crate::version::ENGINE_HEADERS`], and today selects the `#else`: no
+//!   HTTP protocol is implemented, so the collecting client writer described
+//!   below has no module to live in and no store in this build has ever held
+//!   a header. The variant stays defined in [`crate::error`] for that
+//!   selection to use; nothing below produces it, and that is deliberate
+//!   rather than an omission.
 //!
 //! # Safety and layering
 //!
@@ -133,29 +114,21 @@
 //! Imports reach only [`crate::error`] and [`crate::util`]. The protocol,
 //! transfer, connection, TLS, easy and multi layers all depend on this
 //! module, so an import of any of them would close a cycle.
-//!
-//! # Performance is a non-goal
-//!
-//! Every lookup below is a linear scan of an ordered [`Vec`], which is what
-//! the C does. No hash index, side map or sorted structure is added: each
-//! one would put the ordering guarantee above at risk, and specification
-//! 0.1.1 is explicit that where a faster design and a more behaviourally
-//! faithful one conflict, faithfulness wins.
 
-// Items whose only consumers are modules that have not landed yet carry
-// `#[allow(dead_code)]` individually, the convention the rest of this crate
-// follows. The allowance is never set on this module's root, because that
-// would also hide the next unreferenced item somebody adds -- the crate's own
-// policy test in `lib.rs` enforces the distinction.
+// The allowance is never set on this module's root, because that would also
+// hide the next unreferenced item somebody adds -- the crate's own policy test
+// in `lib.rs` enforces the distinction.
+
+use core::fmt;
 
 use memchr::memchr;
 
 use crate::error::{CURLHcode, CURLcode, CodeResult, HeaderResult};
 use crate::util::dynbuf::{DynBuf, DYN_HTTP_REQUEST};
+use crate::util::redact::{HeaderValue, Lossy};
 use crate::util::strcase::{casecompare, ncasecompare, raw_tolower};
 use crate::util::strparse::is_blank;
 
-// ---------------------------------------------------------------------------
 // The `origin` bit set -- `include/curl/header.h:41-45`.
 //
 // Plain `u32` constants keeping their C spellings, for two reasons. The
@@ -164,7 +137,6 @@ use crate::util::strparse::is_blank;
 // newtype would only add a conversion at the boundary that owns none of the
 // meaning. The `bitflags` crate is deliberately not used -- it is not in the
 // workspace dependency set, and five constants do not need it.
-// ---------------------------------------------------------------------------
 
 /// A plain server response header -- `CURLH_HEADER`.
 ///
@@ -201,32 +173,9 @@ pub const CURLH_ORIGIN_MASK: u32 =
     CURLH_HEADER | CURLH_TRAILER | CURLH_CONNECT | CURLH_1XX | CURLH_PSEUDO;
 
 /// The reserved bit every projected origin carries -- `lib/headers.c:50`.
-///
-/// The C comment at `lib/headers.c:46-49` explains the intent: *"this will
-/// randomly OR a reserved bit for the sole purpose of making it impossible
-/// for applications to do `==` comparisons, as that would otherwise be
-/// tempting and then lead to the reserved bits not being reserved
-/// anymore."*
-///
-/// Despite the word "randomly", the bit is FIXED at `1 << 27` and must be
-/// reproduced exactly: it is part of an integer applications can observe. A
-/// consumer testing `origin & CURLH_HEADER` still succeeds; a consumer
-/// testing `origin == CURLH_HEADER` still fails, precisely as against curl
-/// 8.19.0-DEV.
-///
-/// Private, because `include/curl/header.h` does not name it either -- it is
-/// an artefact of `copy_header_external`, applied on the way out by
-/// [`HeaderStore::project`] and never stored.
 const CURLH_RESERVED_BIT: u32 = 1 << 27;
 
-// ---------------------------------------------------------------------------
 // The five pseudo-header names -- `lib/http.h:237-241`.
-//
-// Header identity is this module's subject, so the canonical spellings live
-// here rather than being respelled by `protocols/http2.rs`,
-// `protocols/http3.rs` and `proxy/http_connect.rs` independently. They are
-// wire bytes: never reformat them, and never let a lint rewrite them.
-// ---------------------------------------------------------------------------
 
 /// `HTTP_PSEUDO_METHOD` -- `lib/http.h:237`.
 pub const HTTP_PSEUDO_METHOD: &[u8] = b":method";
@@ -258,40 +207,15 @@ pub const HTTP_PSEUDO_NAMES: [&[u8]; 5] = [
     HTTP_PSEUDO_STATUS,
 ];
 
-// ---------------------------------------------------------------------------
 // Limits.
-// ---------------------------------------------------------------------------
 
 /// The most response headers one HTTP response may contribute to a store.
-///
-/// `MAX_HTTP_RESP_HEADER_COUNT`, `lib/http.h:170`, whose comment reads
-/// *"the maximum number of response headers that libcurl allows for a
-/// single HTTP response, including CONNECT and redirects."*
-///
-/// It lives here rather than with the rest of `lib/http.h` because
-/// `lib/headers.c:253` is its only consumer in the whole C tree, which a
-/// grep over `lib/` and `src/` confirms.
 pub(crate) const MAX_HTTP_RESP_HEADER_COUNT: usize = 5000;
 
 /// The most `PUSH_PROMISE` fields [`PushHeaders`] will accept.
-///
-/// Derived, not declared. `lib/http2.c:1452-1476` allocates 10 entries and
-/// then doubles on exhaustion, bailing out when the allocation would grow
-/// past 1000: 10, 20, 40, 80, 160, 320, 640, 1280, and at 1280 the
-/// `alloc > 1000` test finally holds. So 1280 fields are accepted and the
-/// 1281st fails.
 pub(crate) const MAX_PUSH_PROMISE_HEADERS: usize = 1280;
 
-// ---------------------------------------------------------------------------
 // Origin classification -- `lib/headers.c:296-313`.
-//
-// The five client-write flags below are mirrored from `lib/sendf.h:42-50`.
-// Their authoritative home is `transfer/writeout.rs`, which supersedes the
-// writer chain itself; they appear here because `classify_origin` has to read
-// them and because one definition shared across the crate cannot drift the
-// way two would. The remaining four flags -- BODY, INFO, EOS and 0LEN -- are
-// not read by this module and are therefore not restated.
-// ---------------------------------------------------------------------------
 
 /// `CLIENTWRITE_HEADER` -- meta information, a header. `lib/sendf.h:44`.
 pub(crate) const CLIENTWRITE_HEADER: u32 = 1 << 2;
@@ -324,11 +248,6 @@ pub(crate) const CLIENTWRITE_TRAILER: u32 = 1 << 6;
 ///   Exactly one bit comes back. A write flagged both `CONNECT` and `1XX`
 ///   classifies as [`CURLH_CONNECT`], which a bitwise OR would get wrong.
 ///
-/// [`CURLH_PSEUDO`] is never produced here. Pseudo-headers do not arrive
-/// through the writer chain at all; the HTTP/2 and HTTP/3 layers hand them
-/// to [`HeaderStore::push`] with that origin themselves, which is why the
-/// origin is a parameter there rather than being inferred.
-///
 /// The whole mapping, which the tests at the foot of this file assert:
 ///
 /// ```text
@@ -339,7 +258,7 @@ pub(crate) const CLIENTWRITE_TRAILER: u32 = 1 << 6;
 /// HEADER | STATUS            -> None
 /// BODY                       -> None
 /// ```
-#[allow(dead_code)] // consumer module not landed: transfer/writeout.rs
+#[allow(dead_code)] // consumer: transfer/writeout.rs
 #[must_use]
 pub(crate) fn classify_origin(write_flags: u32) -> Option<u32> {
     // `lib/headers.c:300` -- a header write, and not a status line.
@@ -361,16 +280,12 @@ pub(crate) fn classify_origin(write_flags: u32) -> Option<u32> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The iteration cursor -- the `anchor` field of `struct curl_header`.
-// ---------------------------------------------------------------------------
 
 // `HeaderCursor` packs its two 32-bit fields into one `usize` so that the ABI
-// can carry it through `void *anchor`. All four targets specification 0.8.3
-// mandates are 64-bit -- x86_64 and aarch64, Linux and Darwin -- and 32-bit
-// support is a deliberate forfeit rather than an oversight. Asserting it here
-// turns that forfeit into a compile error on a 32-bit target, where the shift
-// below would otherwise overflow silently in a release build.
+// can carry it through `void *anchor`. Asserting it here turns that forfeit
+// into a compile error on a 32-bit target, where the shift below would
+// otherwise overflow silently in a release build.
 const _: () = assert!(
     core::mem::size_of::<usize>() >= 8,
     "HeaderCursor packs a 32-bit index and a 32-bit generation into one \
@@ -379,27 +294,6 @@ const _: () = assert!(
 
 /// A resumable position in a [`HeaderStore`], and the value behind the
 /// `anchor` field of `struct curl_header`.
-///
-/// In C, `anchor` is the linked-list node pointer of the header just returned
-/// (`lib/headers.c:51`): a position to resume from, not a handle to the entry.
-/// The store here is a [`Vec`], so the position is an index -- and an index
-/// alone would be a stale-reference bug waiting to happen, because a store
-/// that has been pushed to, reset or cleaned up since would answer with a
-/// different header.
-///
-/// The generation counter closes that. [`HeaderStore`] bumps it on every
-/// mutation, so a cursor minted before the change no longer matches and
-/// [`HeaderStore::next_header`] reports the end of iteration instead of a
-/// shifted element. This is the same technique specification 0.6.9
-/// prescribes for the multi handle's easy-handle collection.
-///
-/// # A null `anchor` is stale by construction
-///
-/// A store's generation starts at 1 and never becomes 0, so
-/// [`HeaderCursor::from_raw`] applied to a null `anchor` yields generation 0,
-/// which cannot match any store. The C's *"something is wrong"* branch for a
-/// null anchor (`lib/headers.c:140-142`) therefore needs no separate test
-/// here: the same [`None`] falls out of the staleness check.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct HeaderCursor {
     /// Index of the header this cursor points at.
@@ -417,12 +311,6 @@ impl HeaderCursor {
     const INDEX_MASK: usize = 0xffff_ffff;
 
     /// The opaque form the ABI stores in `void *anchor`.
-    ///
-    /// Lossless and infallible in both directions: both halves are exactly
-    /// 32 bits wide, so [`HeaderCursor::from_raw`] recovers what went in.
-    /// The result is never 0 for a cursor a store issued, because such a
-    /// cursor's generation is at least 1 and the generation occupies the
-    /// high half.
     #[must_use]
     pub fn to_raw(self) -> usize {
         ((self.generation as usize) << Self::GENERATION_SHIFT)
@@ -456,9 +344,7 @@ impl HeaderCursor {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The outward projection -- `include/curl/header.h:31-38`.
-// ---------------------------------------------------------------------------
 
 /// One header as the public API presents it: the safe form of
 /// `struct curl_header`.
@@ -492,7 +378,7 @@ impl HeaderCursor {
 /// as a comment -- *"This function MUST assign all struct fields in the
 /// output struct"* -- and constructing a whole [`HeaderView`] at once is how
 /// this file keeps it, since a struct literal cannot leave one stale.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct HeaderView<'a> {
     /// The header name, in the case it arrived in.
     pub name: &'a [u8],
@@ -512,9 +398,40 @@ pub struct HeaderView<'a> {
     pub anchor: HeaderCursor,
 }
 
+/// Name-aware redaction, matching [`StoredHeader`]'s.
+///
+/// This is the borrowed view of a [`StoredHeader`] and is what
+/// `curl_easy_header` hands out (`lib/headers.c:33-34`), so it must not
+/// disclose what the stored form does not. The value renders through
+/// `crate::util::redact::HeaderValue` and everything else in full.
+///
+/// That path is written as plain code rather than as an intra-doc link on
+/// purpose: `crate::util::redact` is `pub(crate)`, and a link from the
+/// documentation of a public item to a private one is an error under
+/// `RUSTDOCFLAGS=-D warnings`. The same paths ARE linked elsewhere in this
+/// crate, which is correct there because those items are themselves private,
+/// so rustdoc resolves the link without complaint.
+impl fmt::Debug for HeaderView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeaderView")
+            .field("name", &Lossy(self.name))
+            .field(
+                "value",
+                &HeaderValue {
+                    name: self.name,
+                    value: self.value,
+                },
+            )
+            .field("amount", &self.amount)
+            .field("index", &self.index)
+            .field("origin", &self.origin)
+            .field("anchor", &self.anchor)
+            .finish()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The ordered header set -- `lib/dynhds.c`, `lib/dynhds.h`.
-// ---------------------------------------------------------------------------
 
 /// One name/value pair in a [`HeaderSet`] -- `struct dynhds_entry`,
 /// `lib/dynhds.h:36-41`.
@@ -528,10 +445,31 @@ pub struct HeaderView<'a> {
 /// Both members are arbitrary bytes. Neither is folded on the way in unless
 /// [`HeaderSet::set_opts`] asked for it, and the value is never folded at
 /// all.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HeaderEntry {
     name: Vec<u8>,
     value: Vec<u8>,
+}
+
+/// Name-aware, so `Authorization` and `Cookie` never reach a log.
+///
+/// Hand-written rather than derived for the reason [`StoredHeader`]'s own
+/// formatter records at length: this type is a leaf, so a redaction here is one
+/// a parent formatter cannot undo, and the parent formatters are the ones that
+/// get attached without anybody thinking about the values underneath.
+impl fmt::Debug for HeaderEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeaderEntry")
+            .field("name", &Lossy(&self.name))
+            .field(
+                "value",
+                &HeaderValue {
+                    name: &self.name,
+                    value: &self.value,
+                },
+            )
+            .finish()
+    }
 }
 
 impl HeaderEntry {
@@ -550,20 +488,6 @@ impl HeaderEntry {
 
 /// A bounded, ordered, duplicate-permitting set of header fields.
 ///
-/// Supersedes `struct dynhds` (`lib/dynhds.h:43-51`) and all of
-/// `lib/dynhds.c`. This is the set the HTTP/1, HTTP/2, HTTP/3 and
-/// CONNECT-proxy layers compose a request in, and the one HTTP/2 collects
-/// response trailers into (`stream->resp_trailers`, `lib/http2.c:280`).
-///
-/// # It is a sequence, and duplicates are the point
-///
-/// [`HeaderSet::add`] appends in arrival order and does not look for an
-/// existing entry of the same name. `lib/dynhds.h:142-143` says so:
-/// *"Add a header, name + value, to `dynhds` at the end. Does *not* check
-/// for duplicate names."* There is no deduplication, no coalescing of
-/// repeated names into one comma-joined value, no sorting and no trimming.
-/// `Set-Cookie` depends on all of that.
-///
 /// # Limits
 ///
 /// Two, both from `lib/dynhds.c:139-142`, and both reported as
@@ -576,10 +500,6 @@ impl HeaderEntry {
 /// * `max_strs_size`, the running total of all name and value lengths. The
 ///   test is strictly greater, so a total landing exactly on the limit is
 ///   accepted. All eight call sites pass `DYN_HTTP_REQUEST`, 1 MiB.
-///
-/// [`HeaderSet::new`] is therefore those measured defaults, and
-/// [`HeaderSet::with_limits`] is `Curl_dynhds_init` for the rare caller that
-/// wants others.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HeaderSet {
     /// The entries, in arrival order. Never reordered.
@@ -602,12 +522,6 @@ impl Default for HeaderSet {
 
 impl HeaderSet {
     /// An empty set with the limits every call site in the C tree uses.
-    ///
-    /// Unlimited entries and 1 MiB of strings -- `DYN_HTTP_REQUEST`. Measured
-    /// rather than chosen: all eight `Curl_dynhds_init` calls pass exactly
-    /// this pair, at `lib/http.c:4673`, `:4674`, `:4794`, `:4795`, `:4960`
-    /// and `:4961`, `lib/http2.c:280` and `:2077`, `lib/cf-h2-proxy.c:705`
-    /// and `lib/vquic/curl_ngtcp2.c:1588`.
     #[must_use]
     pub fn new() -> Self {
         Self::with_limits(0, DYN_HTTP_REQUEST)
@@ -615,15 +529,6 @@ impl HeaderSet {
 
     /// An empty set with explicit limits -- `Curl_dynhds_init`,
     /// `lib/dynhds.c:57-67`.
-    ///
-    /// `max_entries` of 0 means unlimited. Options start cleared, matching
-    /// the C's `dynhds->opts = 0`.
-    ///
-    /// A `max_strs_size` of 0 is accepted here where the C carries a
-    /// `DEBUGASSERT` against it (`lib/dynhds.c:61`). That assertion is a
-    /// debug-build guard rather than behaviour, and the arithmetic it guards
-    /// is well defined: with a zero ceiling every pair whose name and value
-    /// are not both empty is rejected.
     #[must_use]
     pub fn with_limits(max_entries: usize, max_strs_size: usize) -> Self {
         Self {
@@ -662,12 +567,6 @@ impl HeaderSet {
     }
 
     /// The FIRST entry with this name, or [`None`].
-    ///
-    /// `Curl_dynhds_get`, `lib/dynhds.c:113-124`. Lengths are compared first
-    /// and only then the bytes, ASCII-case-insensitively, which is exactly
-    /// the C's `namelen == namelen && curl_strnequal(...)`. First match wins:
-    /// with duplicates present the later ones are reachable only through
-    /// [`HeaderSet::getn`] or [`HeaderSet::iter`].
     #[must_use]
     pub fn get(&self, name: &[u8]) -> Option<&HeaderEntry> {
         self.entries.iter().find(|entry| {
@@ -690,24 +589,14 @@ impl HeaderSet {
     }
 
     /// Whether names are ASCII-folded on insertion.
-    #[allow(dead_code)] // consumer module not landed: protocols/http2.rs
+    #[allow(dead_code)] // consumer: protocols/http2.rs
     #[must_use]
     pub(crate) fn lowercase(&self) -> bool {
         self.lowercase
     }
 
     /// Replace the options -- `Curl_dynhds_set_opts`, `lib/dynhds.c:102-105`.
-    ///
-    /// The C takes an `int` bitmask with exactly one bit defined,
-    /// `DYNHDS_OPT_LOWERCASE` (`lib/dynhds.h:54`); a [`bool`] is that
-    /// bitmask's entire information content, so it is the parameter here.
-    ///
-    /// Per `lib/dynhds.h:80-81` this *"will not have an effect on already
-    /// existing headers"* -- only insertions after the call are folded.
-    /// HTTP/2 and HTTP/3 set it because their field names must be lowercase
-    /// on the wire; HTTP/1 leaves it clear because the case a header arrived
-    /// in is part of what the fixtures compare.
-    #[allow(dead_code)] // consumer module not landed: protocols/http2.rs
+    #[allow(dead_code)] // consumer: protocols/http2.rs
     pub(crate) fn set_opts(&mut self, lowercase: bool) {
         self.lowercase = lowercase;
     }
@@ -718,7 +607,7 @@ impl HeaderSet {
     /// keeps the pointer array; [`Vec::clear`] keeps capacity, which is the
     /// same bargain. `strs_len` returns to 0; the limits and the options
     /// survive.
-    #[allow(dead_code)] // consumer module not landed: protocols/http1.rs
+    #[allow(dead_code)] // consumer: protocols/http1.rs
     pub(crate) fn reset(&mut self) {
         self.entries.clear();
         self.strs_len = 0;
@@ -730,7 +619,7 @@ impl HeaderSet {
     /// [`HeaderSet::reset`] is only the allocation: the C's `Curl_safefree`
     /// on `hds` zeroes `hds_allc` too. The limits and the options survive
     /// here as they do there.
-    #[allow(dead_code)] // consumer module not landed: protocols/http1.rs
+    #[allow(dead_code)] // consumer: protocols/http1.rs
     pub(crate) fn free(&mut self) {
         self.entries = Vec::new();
         self.strs_len = 0;
@@ -745,7 +634,7 @@ impl HeaderSet {
     /// growing strictly past `max_strs_size`. Both C returns are
     /// `CURLE_OUT_OF_MEMORY` and neither is changed here, however much
     /// `CURLE_TOO_LARGE` would suit the second.
-    #[allow(dead_code)] // consumer module not landed: protocols/http1.rs
+    #[allow(dead_code)] // consumer: protocols/http1.rs
     pub(crate) fn add(&mut self, name: &[u8], value: &[u8]) -> CodeResult<()> {
         // `lib/dynhds.c:139-140`. The `max_entries &&` short-circuit is why
         // 0 means unlimited.
@@ -814,7 +703,7 @@ impl HeaderSet {
     ///
     /// [`CURLcode::BadFunctionArgument`] when the line holds no colon, or
     /// whatever [`HeaderSet::add`] reports for the resulting pair.
-    #[allow(dead_code)] // consumer module not landed: protocols/http1.rs
+    #[allow(dead_code)] // consumer: protocols/http1.rs
     pub(crate) fn h1_add_line(&mut self, line: &[u8]) -> CodeResult<()> {
         // `lib/dynhds.c:192-193`.
         if line.is_empty() {
@@ -851,30 +740,13 @@ impl HeaderSet {
 
     /// Write every header into `dbuf` in HTTP/1 form.
     ///
-    /// `Curl_dynhds_h1_dprint`, `lib/dynhds.c:297-315`. Each entry becomes
-    /// `name`, `": "`, `value`, `"\r\n"` -- the C's
-    /// `"%.*s: %.*s\r\n"` -- in arrival order.
-    ///
-    /// **No final blank line is emitted.** `lib/dynhds.h:170-173` is
-    /// explicit: *"Will NOT output a last empty line."* The caller appends
-    /// the terminating CRLF that ends the header block. Getting this wrong
-    /// breaks every HTTP/1 fixture, in both directions.
-    ///
-    /// An empty set writes nothing and succeeds (`lib/dynhds.c:302-303`).
-    ///
-    /// The bytes go in through [`DynBuf::addn`] rather than a format string,
-    /// because a name or value is arbitrary bytes and need not be UTF-8. Each
-    /// line is assembled whole and added in one call, so the emission unit
-    /// matches the C's single `curlx_dyn_addf` per entry: a line either lands
-    /// entirely or not at all.
-    ///
     /// # Errors
     ///
     /// Whatever [`DynBuf::addn`] reports -- [`CURLcode::TooLarge`] when the
     /// buffer's ceiling is reached. Emission stops at the first failure, as
     /// the C's `if(result) break;` does, and the entries after it are not
     /// written.
-    #[allow(dead_code)] // consumer module not landed: protocols/http1.rs
+    #[allow(dead_code)] // consumer: protocols/http1.rs
     pub(crate) fn h1_dprint(&self, dbuf: &mut DynBuf) -> CodeResult<()> {
         if self.entries.is_empty() {
             return Ok(());
@@ -893,9 +765,7 @@ impl HeaderSet {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The received-header store -- `lib/headers.c`, `lib/headers.h`.
-// ---------------------------------------------------------------------------
 
 /// One received header, as [`HeaderStore`] keeps it.
 ///
@@ -922,12 +792,60 @@ impl HeaderSet {
 /// * `origin` widens to [`u32`] from the C's `unsigned char`. Only the low
 ///   five bits are ever set, the C widens it again on output, and carrying
 ///   one width throughout removes a narrowing that meant nothing.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredHeader {
     name: Vec<u8>,
     value: Vec<u8>,
     request: i32,
     origin: u32,
+}
+
+/// Name-aware redaction, applied at the leaf so a parent cannot undo it.
+///
+/// # Why this is not `#[derive(Debug)]`
+///
+/// A header store holds whatever the peer and the application put in it, which
+/// includes `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie`.
+/// A derived formatter would render every one of those verbatim, and this type
+/// is reachable from `CURLINFO`-bearing state, from redirect handling and from
+/// `crate::transfer`, so any `{:?}` on a parent -- including one written years
+/// from now by somebody who never reads this file -- would have written a
+/// session cookie into a log.
+///
+/// Redacting at the LEAF rather than at each parent is the whole design. A
+/// parent may derive `Debug` freely and still cannot disclose a credential,
+/// because the only formatter that can see these bytes is this one. The
+/// alternative -- auditing every parent -- fails the first time somebody adds
+/// a parent.
+///
+/// # What is redacted, and what deliberately is not
+///
+/// Only the VALUE, and only when `crate::util::redact::is_sensitive_header`
+/// classifies the name. The name itself always renders, because knowing that
+/// an `Authorization` header is present is exactly what a reader needs and
+/// discloses nothing. `request` and `origin` are integers with no secret in
+/// them. Ordinary values -- `Content-Type`, `Location` -- render in full,
+/// because they are already visible in `--trace` output and redacting them
+/// would cost a debugging capability for no confidentiality gain.
+///
+/// Nothing about the STORED bytes changes: [`Self::value`] still returns them
+/// verbatim, which is what `curl_easy_header` hands to a caller
+/// (`lib/headers.c:33-34`).
+impl fmt::Debug for StoredHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredHeader")
+            .field("name", &Lossy(&self.name))
+            .field(
+                "value",
+                &HeaderValue {
+                    name: &self.name,
+                    value: &self.value,
+                },
+            )
+            .field("request", &self.request)
+            .field("origin", &self.origin)
+            .finish()
+    }
 }
 
 impl StoredHeader {
@@ -976,27 +894,6 @@ impl StoredHeader {
 }
 
 /// Every response header received on a transfer, in arrival order.
-///
-/// Supersedes `data->state.httphdrs` (`lib/urldata.h:1031`) and the whole of
-/// the enabled half of `lib/headers.c`. Backs the exported
-/// `curl_easy_header` and `curl_easy_nextheader`.
-///
-/// # An ordered `Vec`, not a list and not a map
-///
-/// The C threads an intrusive `Curl_llist` through the entries. Specification
-/// 0.6.9 replaces intrusive lists with owned collections, and the ordering
-/// requirement in this module's own documentation rules out anything that
-/// could reorder. Lookup is a linear scan, which is what the C does too.
-///
-/// # The generation counter
-///
-/// Every mutation -- [`HeaderStore::push`], [`HeaderStore::reset`],
-/// [`HeaderStore::cleanup`] -- advances a counter that [`HeaderCursor`]
-/// records. That is what turns the C's dangling-node hazard into a detectable
-/// condition: a cursor minted before the change no longer matches, and
-/// [`HeaderStore::next_header`] answers [`None`] instead of a shifted
-/// element. The counter starts at 1 and never becomes 0, so a null
-/// `void *anchor` decodes to a cursor that is stale by construction.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HeaderStore {
     /// Received headers, in arrival order.
@@ -1054,19 +951,13 @@ impl HeaderStore {
     /// The C keeps the pointer so that `lib/http.c` can reach the header a
     /// continuation line folds onto. [`Vec::last`] is the same fact without
     /// the second copy of it that could fall out of step.
-    #[allow(dead_code)] // consumer module not landed: protocols/http1.rs
+    #[allow(dead_code)] // consumer: protocols/http1.rs
     #[must_use]
     pub(crate) fn prevhead(&self) -> Option<&StoredHeader> {
         self.headers.last()
     }
 
     /// Advance the generation, invalidating every outstanding cursor.
-    ///
-    /// Wrapping, and skipping 0 on the wrap so that the invariant behind
-    /// [`HeaderStore::FIRST_GENERATION`] holds for the life of the store. A
-    /// wrap needs 2^32 mutations of one store; if it happens the counter
-    /// stays a valid discriminator, it merely stops distinguishing that one
-    /// far-apart pair of generations.
     fn bump_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
@@ -1087,14 +978,6 @@ impl HeaderStore {
     }
 
     /// Build the outward view of the header at `at`.
-    ///
-    /// Supersedes `copy_header_external` (`lib/headers.c:35-52`), whose
-    /// comment requires that *"This function MUST assign all struct fields in
-    /// the output struct"*. A struct literal cannot leave one behind, so the
-    /// requirement is met by construction rather than by review.
-    ///
-    /// The reserved bit is applied HERE and nowhere else: it is never part of
-    /// what a store holds.
     fn project(
         &self,
         at: usize,
@@ -1117,22 +1000,14 @@ impl HeaderStore {
     /// `headers_reset`, `lib/headers.c:286-290`. The C re-initialises the
     /// list and clears `prevhead`; clearing the [`Vec`] does both, since
     /// `prevhead` is [`Vec::last`] here. Outstanding cursors are invalidated.
-    #[allow(dead_code)] // consumer module not landed: transfer/writeout.rs
+    #[allow(dead_code)] // consumer: transfer/writeout.rs
     pub(crate) fn reset(&mut self) {
         self.headers.clear();
         self.bump_generation();
     }
 
     /// Free every stored header and return to the initial state.
-    ///
-    /// `Curl_headers_cleanup`, `lib/headers.c:351-363`. The C walks the list
-    /// saving each `next` before freeing, then resets; dropping the [`Vec`]'s
-    /// contents is that walk. Outstanding cursors are invalidated.
-    ///
-    /// This returns nothing where the C returns `CURLcode`: the C's return is
-    /// unconditionally `CURLE_OK` (`lib/headers.c:362`), so a [`Result`] here
-    /// would be one no caller could act on.
-    #[allow(dead_code)] // consumer module not landed: the easy-handle lifecycle
+    #[allow(dead_code)] // consumer: the easy-handle lifecycle
     pub(crate) fn cleanup(&mut self) {
         self.headers = Vec::new();
         self.bump_generation();
@@ -1196,7 +1071,7 @@ impl HeaderStore {
     /// `failf(data, "Invalid response header")` alongside the last of these
     /// and returns the same code; diagnostics are outside the observable
     /// contract here and never change a return value.
-    #[allow(dead_code)] // consumer module not landed: transfer/writeout.rs
+    #[allow(dead_code)] // consumer: transfer/writeout.rs
     pub(crate) fn push(
         &mut self,
         header: &[u8],
@@ -1258,18 +1133,6 @@ impl HeaderStore {
 
     /// Look one header up by name, origin mask, request and index.
     ///
-    /// Supersedes `curl_easy_header` (`lib/headers.c:55-118`). `cur_request`
-    /// is `data->state.requests`, the number of the request in progress.
-    ///
-    /// Matching is `curl_strequal` on the name -- ASCII case-insensitive,
-    /// case-preserving storage notwithstanding -- a bitwise AND against
-    /// `origin`, so any shared bit counts, and exact equality on the request
-    /// number.
-    ///
-    /// `index` selects among headers that repeat the same name, counting from
-    /// 0 in arrival order. `amount` on the returned view is how many there
-    /// are in total.
-    ///
     /// # Errors
     ///
     /// In the C's order, which is the order they are tested here:
@@ -1325,14 +1188,6 @@ impl HeaderStore {
             return Err(CURLHcode::Badindex);
         }
 
-        // `lib/headers.c:96-112`. The C special-cases the last occurrence,
-        // reusing the entry its counting pass already found, and walks the
-        // list again otherwise. Both arms select the same element -- the
-        // shortcut fires exactly when `index` is the last match -- so the
-        // walk stands for both. Performance is a non-goal (specification
-        // 0.1.1), and with one arm the C's defensive `if(!e)` branch
-        // ("this should not happen") cannot arise: `index < amount` is
-        // already established, so the search below always finds its match.
         let at = self
             .headers
             .iter()
@@ -1351,10 +1206,6 @@ impl HeaderStore {
 
     /// Step to the next header matching an origin mask and request.
     ///
-    /// Supersedes `curl_easy_nextheader` (`lib/headers.c:121-179`). `prev` is
-    /// the [`HeaderView::anchor`] of the previous result, or [`None`] to
-    /// start. `cur_request` is `data->state.requests`.
-    ///
     /// # This function validates nothing
     ///
     /// Deliberately, because the C does not. There is no origin-mask check
@@ -1366,20 +1217,6 @@ impl HeaderStore {
     /// them. Adding a validation path here would be a behaviour change; the
     /// only guard the ABI shim adds is a null handle, which it answers with
     /// `NULL`.
-    ///
-    /// A `prev` from a store that has changed since -- pushed to, reset or
-    /// cleaned up -- ends iteration rather than reading a shifted element.
-    /// The same answer covers the C's *"something is wrong"* branch for a
-    /// null anchor (`lib/headers.c:140-142`).
-    ///
-    /// # `amount` and `index`
-    ///
-    /// Both are computed with a full pass over the whole store
-    /// (`lib/headers.c:164-174`), counting every header sharing the selected
-    /// one's name under the same mask and request -- those BEFORE the
-    /// selected entry as well as those after. So `index` is the selected
-    /// header's zero-based ordinal among its namesakes in arrival order, and
-    /// `amount` is how many namesakes there are altogether.
     pub fn next_header(
         &self,
         origin: u32,
@@ -1443,18 +1280,6 @@ impl HeaderStore {
 }
 
 /// Split a stored header line into its name and value.
-///
-/// Supersedes `namevalue` (`lib/headers.c:181-214`). The C rewrites its input
-/// in place, writing NUL over the separating colon and over each trailing
-/// blank; there is no Rust counterpart to that, so this returns owned copies
-/// instead. The BYTES are identical either way, which is what the fixtures
-/// compare.
-///
-/// The three rules that are easy to get wrong are documented on
-/// [`HeaderStore::push`], which is this function's only caller. In short:
-/// a pseudo-header keeps its leading colon, the separator search stops at an
-/// embedded NUL, and the trailing-blank trim never consumes the value's last
-/// byte.
 ///
 /// # Errors
 ///
@@ -1528,29 +1353,10 @@ fn namevalue(header: &[u8], origin: u32) -> CodeResult<(Vec<u8>, Vec<u8>)> {
     Ok((header[..separator].to_vec(), header[start..end].to_vec()))
 }
 
-// ---------------------------------------------------------------------------
 // The HTTP/2 PUSH_PROMISE field set -- `lib/http2.c`.
-// ---------------------------------------------------------------------------
 
 /// The header fields of an HTTP/2 `PUSH_PROMISE`, as the push callback sees
 /// them.
-///
-/// Supersedes the `push_headers` trio of `struct h2_stream_ctx`
-/// (`lib/http2.c:132-134`) and backs the exported `curl_pushheader_bynum` and
-/// `curl_pushheader_byname`. `struct curl_pushheaders` is a forward
-/// declaration only (`include/curl/multi.h:500`), so it is genuinely opaque
-/// and this type owes it no layout. The `CURL_PUSH_OK` family
-/// (`include/curl/multi.h:496-498`) belongs to the multi and FFI layers, not
-/// here.
-///
-/// # Lookup here is CASE-SENSITIVE
-///
-/// Stated loudly because it is the opposite of the other store in this
-/// module. [`PushHeaders::by_name`] compares bytes exactly, because
-/// `lib/http2.c:694` uses `strncmp`. [`HeaderStore::header`] folds ASCII
-/// case, because `lib/headers.c:83` uses `curl_strequal`. Two stores, two
-/// rules, both shipped: unifying them would silently change which fields a
-/// push callback can find.
 ///
 /// # The stored form is `name:value`, with no space
 ///
@@ -1561,10 +1367,63 @@ fn namevalue(header: &[u8], origin: u32) -> CodeResult<(Vec<u8>, Vec<u8>)> {
 /// [`PushHeaders::by_num`] hands back the WHOLE `name:value` string, not the
 /// value. Tidying that into a value-only accessor would break every existing
 /// push callback.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct PushHeaders {
     /// One `name:value` string per promised field, in arrival order.
     entries: Vec<Vec<u8>>,
+}
+
+/// Name-aware redaction over the combined `name:value` entries.
+///
+/// The stored form is one string per field with the name and the value joined
+/// by a colon (`lib/http2.c:1478`), so classifying an entry means splitting it
+/// at the first colon -- which is what the C's own consumers do. An entry with
+/// no colon cannot be classified and is redacted whole, which is the safe
+/// direction: a malformed promise is exactly the case where guessing wrong
+/// would be worst.
+///
+/// A server-push promise carries the request headers the server intends to
+/// answer, so `Authorization` and `Cookie` appear here for the same reason
+/// they appear in [`StoredHeader`].
+impl fmt::Debug for PushHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        /// One entry, rendered as the C stores it but with a credential value
+        /// replaced by its length.
+        struct Entry<'a>(&'a [u8]);
+
+        impl fmt::Debug for Entry<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match memchr(b':', self.0) {
+                    Some(at) => {
+                        let (name, rest) = self.0.split_at(at);
+                        // `rest` still carries the colon; skip exactly it.
+                        let value = rest.get(1..).unwrap_or_default();
+                        write!(
+                            f,
+                            "{:?}:{:?}",
+                            Lossy(name),
+                            HeaderValue { name, value }
+                        )
+                    }
+                    // No colon: unclassifiable, so redact the whole entry.
+                    None => fmt::Debug::fmt(
+                        &HeaderValue {
+                            name: b"authorization",
+                            value: self.0,
+                        },
+                        f,
+                    ),
+                }
+            }
+        }
+
+        f.debug_struct("PushHeaders")
+            .field(
+                "entries",
+                &self.entries.iter().map(|e| Entry(e)).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl PushHeaders {
@@ -1589,15 +1448,12 @@ impl PushHeaders {
     }
 
     /// Drop every field -- `free_push_headers`, `lib/http2.c`.
-    #[allow(dead_code)] // consumer module not landed: protocols/http2.rs
+    #[allow(dead_code)] // consumer: protocols/http2.rs
     pub(crate) fn free(&mut self) {
         self.entries = Vec::new();
     }
 
     /// Record one promised field.
-    ///
-    /// The `name` and `value` are joined into the single `name:value` string
-    /// the ABI hands back, exactly as `lib/http2.c:1478` does.
     ///
     /// # Errors
     ///
@@ -1613,7 +1469,7 @@ impl PushHeaders {
     /// exists to copy. [`CURLcode::TooLarge`] is the closest honest reading --
     /// a count limit was exceeded, the same currency
     /// `MAX_HTTP_RESP_HEADER_COUNT` uses at `lib/headers.c:256`.
-    #[allow(dead_code)] // consumer module not landed: protocols/http2.rs
+    #[allow(dead_code)] // consumer: protocols/http2.rs
     pub(crate) fn push(&mut self, name: &[u8], value: &[u8]) -> CodeResult<()> {
         // `lib/http2.c:1452-1467`. The C allocates 10 slots and doubles on
         // exhaustion, refusing to grow past 1000 allocated -- which lands on
@@ -1633,22 +1489,12 @@ impl PushHeaders {
     }
 
     /// The `num`-th promised field as the whole `name:value` string.
-    ///
-    /// Supersedes `curl_pushheader_bynum` (`lib/http2.c:657-668`). Returns
-    /// [`None`] past the end, which is the C's `NULL`.
-    ///
-    /// It really is the whole string, colon and value included -- see this
-    /// type's documentation. The C's handle validation
-    /// (`!h || !GOOD_EASY_HANDLE(h->data)`) is the ABI shim's, since neither
-    /// condition is representable here.
     #[must_use]
     pub fn by_num(&self, num: usize) -> Option<&[u8]> {
         self.entries.get(num).map(Vec::as_slice)
     }
 
     /// The value of the first field with this name, or [`None`].
-    ///
-    /// Supersedes `curl_pushheader_byname` (`lib/http2.c:673-702`).
     ///
     /// # Rejected queries
     ///
@@ -1659,13 +1505,6 @@ impl PushHeaders {
     ///    !strcmp(name, ":") || strchr(name + 1, ':'))
     ///   return NULL;
     /// ```
-    ///
-    /// So an empty name is rejected, a name that is exactly `":"` is
-    /// rejected, and a name with a colon anywhere past position 0 is
-    /// rejected. A LEADING colon is accepted, because pseudo-fields need it.
-    /// The C explains the middle-colon rule: *"If we have ':' in the middle
-    /// of header, it could be matched in middle of the value, this is because
-    /// we do prefix match."*
     ///
     /// # Matching
     ///
@@ -1720,19 +1559,7 @@ impl PushHeaders {
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
     // Coverage relocated from the C's `UNITTESTS` block.
-    //
-    // `lib/dynhds.h:97-136` and `lib/dynhds.c:222-295` expose `contains`,
-    // `count_name`, `remove` and `set` behind `#ifdef UNITTESTS`, commented
-    // there "used by unit2602.c". Specification 0.8.7 records why that C
-    // program cannot link a Rust static library -- `pub(crate)` items are
-    // genuinely absent from the symbol table, not merely hidden -- and
-    // requires the coverage to move here instead. These four are therefore
-    // test-local: NOT `pub`, and deliberately not re-exported, because
-    // widening them to satisfy a C linker would defeat the encapsulation the
-    // crate's safety guarantee rests on.
-    // -----------------------------------------------------------------------
 
     /// `Curl_dynhds_contains`, `lib/dynhds.c:225-229`.
     fn contains(set: &HeaderSet, name: &[u8]) -> bool {
@@ -1751,12 +1578,6 @@ mod tests {
     }
 
     /// `Curl_dynhds_remove`, `lib/dynhds.c:264-288`.
-    ///
-    /// The C decrements the length, subtracts the entry's two lengths from
-    /// `strs_len`, frees, shifts the remainder down and then re-examines the
-    /// same index because an entry moved into it. [`Vec::retain`] with a
-    /// side-effecting closure is that whole dance, and it cannot skip a
-    /// shifted element by construction.
     fn remove(set: &mut HeaderSet, name: &[u8]) -> usize {
         let mut removed = 0usize;
         let mut freed = 0usize;
@@ -1804,9 +1625,7 @@ mod tests {
         store
     }
 
-    // -----------------------------------------------------------------------
     // The ABI integers.
-    // -----------------------------------------------------------------------
 
     /// `include/curl/header.h:41-45`, and the mask `lib/headers.c:70-71`
     /// builds from them.
@@ -1862,9 +1681,7 @@ mod tests {
         assert_eq!(CLIENTWRITE_TRAILER, 1 << 6);
     }
 
-    // -----------------------------------------------------------------------
     // `classify_origin` -- `lib/headers.c:296-313`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_status_line_is_never_stored() {
@@ -1930,9 +1747,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // `HeaderSet` -- ordering, casing and byte transparency.
-    // -----------------------------------------------------------------------
 
     /// The property the whole module is shaped around. Forty-eight entries
     /// crosses the C's grow-by-16 boundary three times
@@ -2112,9 +1927,7 @@ mod tests {
         assert_eq!(count_name(&set, b"set-cookie"), 3);
     }
 
-    // -----------------------------------------------------------------------
     // `HeaderSet` -- limits, `lib/dynhds.c:139-142`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_entry_ceiling_reports_out_of_memory_and_zero_means_unlimited() {
@@ -2197,9 +2010,7 @@ mod tests {
         assert!(set.is_empty());
     }
 
-    // -----------------------------------------------------------------------
     // `HeaderSet::h1_add_line` -- `lib/dynhds.c:183-215`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn an_empty_h1_line_is_a_silent_success() {
@@ -2290,9 +2101,7 @@ mod tests {
         assert_eq!(set.getn(0).unwrap().value(), b"v");
     }
 
-    // -----------------------------------------------------------------------
     // `HeaderSet::h1_dprint` -- `lib/dynhds.c:297-315`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn printing_an_empty_set_writes_nothing_and_succeeds() {
@@ -2352,9 +2161,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The relocated `UNITTESTS` helpers.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn contains_and_count_name_fold_case() {
@@ -2408,9 +2215,7 @@ mod tests {
         assert_eq!(set.getn(1).unwrap().value(), b"final");
     }
 
-    // -----------------------------------------------------------------------
     // `HeaderStore::push` -- `lib/headers.c:221-281`.
-    // -----------------------------------------------------------------------
 
     /// `lib/headers.c:231-233`: a silent success, and checked before any
     /// trimming.
@@ -2615,9 +2420,7 @@ mod tests {
         assert_eq!(store.as_slice()[0].value(), b"10:30:00");
     }
 
-    // -----------------------------------------------------------------------
     // `HeaderStore::header` -- `lib/headers.c:55-118`.
-    // -----------------------------------------------------------------------
 
     /// `lib/headers.c:69-72`, and the order matters: validation precedes the
     /// empty-store test, so a bad argument beats `CURLHE_NOHEADERS`.
@@ -2842,9 +2645,7 @@ mod tests {
         assert_eq!(view.origin, CURLH_HEADER | CURLH_RESERVED_BIT);
     }
 
-    // -----------------------------------------------------------------------
     // `HeaderStore::next_header` and the cursor -- `lib/headers.c:121-179`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn iteration_visits_every_match_exactly_once_in_order() {
@@ -3085,9 +2886,7 @@ mod tests {
         assert_eq!(store.generation, HeaderStore::FIRST_GENERATION);
     }
 
-    // -----------------------------------------------------------------------
     // `PushHeaders` -- `lib/http2.c:657-702`.
-    // -----------------------------------------------------------------------
 
     /// `lib/http2.c:1478` builds `"%s:%s"`, and `bynum` hands back the whole
     /// string rather than the value.
@@ -3204,5 +3003,67 @@ mod tests {
         push.free();
         assert!(push.is_empty());
         assert_eq!(push.by_name(b"a"), None);
+    }
+
+    /// A credential header's value cannot appear in a formatted store.
+    ///
+    /// Negative assertions, naming each secret, so a formatter change that
+    /// reinstates one fails here. Every parent formatter is covered by this
+    /// single test, because the redaction is at the leaf: nothing above
+    /// [`StoredHeader`] can see the bytes.
+    #[test]
+    fn a_credential_header_value_cannot_reach_a_formatted_store() {
+        let mut store = HeaderStore::new();
+        for line in [
+            "Authorization: Basic YWxpY2U6aHVudGVyMg==\r\n",
+            "Cookie: session=abc123deadbeef\r\n",
+            "Set-Cookie: sid=cafebabe; Path=/\r\n",
+            "Proxy-Authorization: Bearer proxy-token-xyz\r\n",
+            "WWW-Authenticate: Digest nonce=deadbeefcafe\r\n",
+            "Content-Type: text/plain\r\n",
+        ] {
+            store
+                .push(line.as_bytes(), 1 << 0, 0)
+                .expect("these headers store");
+        }
+
+        let text = format!("{store:?}");
+        for secret in [
+            "YWxpY2U6aHVudGVyMg==",
+            "abc123deadbeef",
+            "cafebabe",
+            "proxy-token-xyz",
+            "deadbeefcafe",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+
+        // The names survive, so a reader can still see what arrived.
+        for name in ["Authorization", "Cookie", "Set-Cookie"] {
+            assert!(text.contains(name), "{name} is missing: {text}");
+        }
+        // And an ordinary value renders in full.
+        assert!(text.contains("text/plain"), "{text}");
+
+        // The stored bytes are unchanged: this is a formatting change only.
+        let view = store
+            .header(b"authorization", 0, 1 << 0, 0, 0)
+            .expect("the header is stored");
+        assert_eq!(view.value, b"Basic YWxpY2U6aHVudGVyMg==");
+    }
+
+    /// The same for a promised-push field set, whose entries are combined.
+    #[test]
+    fn a_credential_push_header_cannot_reach_a_formatted_set() {
+        let mut push = PushHeaders::new();
+        push.push(b"cookie", b"session=abc123deadbeef")
+            .expect("the entry is added");
+        push.push(b"content-type", b"text/plain")
+            .expect("the entry is added");
+
+        let text = format!("{push:?}");
+        assert!(!text.contains("abc123deadbeef"), "{text}");
+        assert!(text.contains("cookie"), "{text}");
+        assert!(text.contains("text/plain"), "{text}");
     }
 }

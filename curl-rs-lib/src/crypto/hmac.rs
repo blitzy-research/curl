@@ -25,56 +25,9 @@
 //  ***************************************************************************/
 //! HMAC, RFC 2104: keyed-hash message authentication.
 //!
-//! Supersedes `lib/hmac.c` (164 lines) and `lib/curl_hmac.h` (72 lines) with
-//! the generic `Hmac<D>` of **`hmac 0.12.1`**, instantiated over the
-//! `digest 0.10` digests the sibling modules in this directory publish.
-//!
-//! Every claim below carries a `path:line` citation, because the behaviour
-//! being preserved is defined by those files and not by this description.
-//!
-//! # The C is textbook RFC 2104, which is what makes the swap byte-exact
-//!
-//! `lib/hmac.c:42-99` is the entire algorithm, and reading it end to end
-//! shows no curl-specific deviation of any kind:
-//!
-//! * `lib/hmac.c:42-43` fixes the inner and outer pads at `0x36` and `0x5C`.
-//! * `lib/hmac.c:65-74` replaces a key longer than the parameter table's
-//!   `maxkeylen` by its own digest -- RFC 2104 section 2's over-long-key rule.
-//! * `lib/hmac.c:81-86` primes the two hash contexts with `key[i] ^ 0x36` and
-//!   `key[i] ^ 0x5C`, one byte per call.
-//! * `lib/hmac.c:88-91` feeds the bare pad byte for the remainder of the
-//!   block, which is how a key shorter than the block is zero-padded.
-//! * `lib/hmac.c:110-125` finalises the inner context, feeds that digest to
-//!   the outer one, and finalises that.
-//!
-//! `hmac 0.12.1` performs those same five steps, and the correspondence is
-//! checkable rather than assumed: `hmac-0.12.1/src/lib.rs:105-106` declares
-//! `IPAD = 0x36` and `OPAD = 0x5C`, and its `get_der_key` copies a key of at
-//! most one block verbatim into a zeroed block while replacing a longer one
-//! by `D::digest(key)` -- `lib/hmac.c:65-74` and `:88-91` in one function.
-//! The conclusion is therefore evidenced and not merely hoped for: the crate
-//! is a byte-exact drop-in. The pads appear in this file only as
-//! documentation. **The crate owns the padding; nothing here reimplements
-//! it.**
-//!
-//! # Who needs HMAC, from the C's own compile guard
-//!
-//! `lib/hmac.c:28-30` guards the whole translation unit on
-//! `(USE_CURL_NTLM_CORE && !USE_WINDOWS_SSPI) || !CURL_DISABLE_AWS ||
-//! !CURL_DISABLE_DIGEST_AUTH || USE_SSL`, so the consumer set is NTLM, AWS
-//! SigV4, HTTP Digest and TLS. (`lib/curl_hmac.h:27-29` repeats the guard
-//! with `USE_LIBSSH2` added, for the SSH transport.) The call sites are
-//! concrete: `lib/curl_ntlm_core.c:524`, `:610` and `:653` key MD5 for the
-//! NTLMv2 response; `lib/http_aws_sigv4.c:41-51` wraps
-//! `Curl_hmacit(&Curl_HMAC_SHA256, ...)` in an `HMAC_SHA256` macro that drives
-//! the whole signing-key derivation chain; and `lib/vtls/vtls_scache.c:656`,
-//! `:1009` and `:1048` key SHA-256 for the TLS session cache, which is what
-//! the guard's `USE_SSL` arm is there for.
-//!
-//! That guard is deliberately NOT reproduced as a Cargo feature. HMAC is
-//! compiled unconditionally, and no `#[cfg]` appears anywhere in this file --
-//! a `cfg` naming a feature this workspace does not declare would compile
-//! authentication away in silence.
+//! Supersedes `lib/hmac.c` and `lib/curl_hmac.h` with the generic `Hmac<D>` of
+//! **`hmac 0.12.1`**, instantiated over the `digest 0.10` digests the sibling
+//! modules in this directory publish.
 //!
 //! # Three parameter tables, and the block length that differs
 //!
@@ -89,80 +42,9 @@
 //!   Curl_HMAC_SHA512_256   lib/curl_sha512_256.c:788-804    128      32
 //! ```
 //!
-//! That 64-against-128 divergence is why `Hmac<D>` has to be generic rather
-//! than hard-coded, and it is the one mistake in this area that is invisible:
-//! the two digest lengths are identical, so an implementation with a fixed
-//! 64-byte pad would produce a well-formed but wrong HMAC-SHA-512/256 and
-//! surface only as a failed authentication exchange.
-//! `CURL_SHA512_256_BLOCK_SIZE` is 128 at `lib/curl_sha512_256.c:83`, and
-//! `hmac 0.12.1` derives the length from `D::BlockSize`, so no site in this
-//! file names a block length at all.
-//!
 //! `Curl_DIGEST_MD5` at `lib/md5.c:537-543` is an `MD5_params` table rather
 //! than an `HMAC_params` one -- unkeyed MD5, which [`super::md5`] owns.
 //! `HMAC_MD5_LENGTH` is 16 at `lib/curl_hmac.h:31`.
-//!
-//! # The vtable is dropped; generics replace it
-//!
-//! `struct HMAC_params` and `struct HMAC_context` (`lib/curl_hmac.h:49-54`)
-//! exist to make the hash pluggable across seven TLS backends through
-//! untyped `void *` contexts. Rust expresses the same intent with
-//! compile-time dispatch, so neither struct survives and no untyped context
-//! pointer remains. `Curl_HMAC_init` / `_update` / `_final`
-//! (`lib/curl_hmac.h:56-63`) become [`HmacContext`], and `Curl_hmacit`
-//! (`lib/hmac.c:144-162`) becomes [`hmac`] with three concrete wrappers over
-//! it -- one per surviving parameter table.
-//!
-//! Three C artefacts are deliberately not reproduced, because buffer
-//! management is the type system's responsibility here and performance is an
-//! explicit non-goal: the single-allocation arena at `lib/hmac.c:55-63`,
-//! which laid two hash contexts and a digest scratch out inside one `malloc`
-//! and then indexed into it by pointer arithmetic; the
-//! one-byte-per-call `hupdate` loop; and the `curlx_free` at
-//! `lib/hmac.c:123`. `Curl_HMAC_update` and `Curl_HMAC_final` return `int`
-//! only because their signatures had to match a function pointer -- both
-//! unconditionally return 0 (`lib/hmac.c:107`, `:124`) -- so the Rust
-//! equivalents are infallible and return nothing to check.
-//!
-//! # `digest 0.10` coherence is proven here
-//!
-//! `Hmac<D>` is the only construct in this workspace that must unify several
-//! different digest types under one generic bound, which makes this file the
-//! concrete site of the coherence requirement the manifests describe. The
-//! newest-release set would have put `digest 0.10` and `digest 0.11` in one
-//! graph, and `Hmac<Sha1>` would then not compile, because `Mac` and `Digest`
-//! would come from different crates. Three things hold the line: the
-//! workspace manifest pins the whole RustCrypto family to one generation,
-//! `deny.toml` denies `digest >= 0.11.0` outright, and the test module below
-//! instantiates `Hmac<Md5>`, `Hmac<Sha1>`, `Hmac<Sha256>` and
-//! `Hmac<Sha512Trunc256>` in a single scope so that the compiler holds the
-//! same guarantee. `hmac 0.13.0` must not be used: it declares a minimum
-//! supported Rust version of 1.85 against this workspace's floor of 1.75, and
-//! it is bound to `digest 0.11`.
-//!
-//! # The bound is written out rather than abbreviated
-//!
-//! `hmac 0.12.1` expresses "an eager, fixed-output block hash" through five
-//! separate `digest` core traits plus two type-level comparisons
-//! (`hmac-0.12.1/src/optim.rs:20-31`), and it publishes no trait alias for
-//! the combination. Emulating one with a blanket-implemented local trait
-//! would add a layer whose elaboration rules are subtler than the clause it
-//! replaces, so the clause is repeated verbatim at each of the three sites
-//! that need it. Verbosity here is preferable to a construct a reader has to
-//! reason about.
-//!
-//! # No key length is rejected
-//!
-//! `Mac::new_from_slice` returns a `Result`, and for `Hmac<D>` the error arm
-//! is structurally unreachable: `impl KeyInit for HmacCore<D>` in
-//! `hmac-0.12.1/src/optim.rs` ends in `Ok(..)` and has no other return. The C
-//! could not reject a key length either -- `Curl_HMAC_init`'s only failure
-//! was the arena allocation at `lib/hmac.c:56-59`, which `Curl_hmacit`
-//! reported as `CURLE_OUT_OF_MEMORY` at `lib/hmac.c:152-153`, and that
-//! failure mode does not survive the port. Both spellings are therefore
-//! published: [`HmacContext::try_new`] is total and maps the unreachable arm
-//! to `CURLcode::BadFunctionArgument`, and [`HmacContext::new`] is
-//! infallible.
 //!
 //! # Rendering is the caller's business, and it is lowercase
 //!
@@ -174,47 +56,16 @@
 //! so the message composition -- and the encoding of it -- stays with
 //! `auth/digest.rs`, `auth/ntlm.rs` and `auth/aws_sigv4.rs`, whose output
 //! bytes the fixture corpus compares as one string.
-//!
-//! # Gates
-//!
-//! Each pattern carries a character class on its first letter so that these
-//! comment lines cannot match themselves and the gates stay runnable against
-//! this file.
-//!
-//! ```sh
-//! # The pads and the padding loop belong to the crate. Every hit must be a
-//! # comment, never a reimplementation.
-//! grep -n '0x36\|0x5C\|[i]pad\|[o]pad' curl-rs-lib/src/crypto/hmac.rs
-//!
-//! # The 25-line banner, whose 23rd line is the algorithm credit that the
-//! # 23-line sibling banners do not carry. Must print 1; a 0 means a
-//! # sibling's banner was copied.
-//! grep -c 'RFC2104 Keyed-Hashing for Message Authent[i]cation' \
-//!   curl-rs-lib/src/crypto/hmac.rs
-//!
-//! # One copyright holder, and not the ones that belong to sha256.rs and
-//! # sha512_256.rs. Must print 1, then 0.
-//! grep -c 'Daniel Sten[b]erg' curl-rs-lib/src/crypto/hmac.rs
-//! grep -c 'Florin Petri[u]c\|Evgeny Gr[i]n' curl-rs-lib/src/crypto/hmac.rs
-//!
-//! # There is no production SHA-1 wrapper anywhere in this workspace: curl
-//! # has no SHA-1 module at all. Every hit must sit under #[cfg(test)].
-//! grep -n '[s]ha1' curl-rs-lib/src/crypto/hmac.rs
-//!
-//! # This file adds no exemption to the crate-root safety attribute, and
-//! # names no C scalar width. Both must print nothing.
-//! grep -nE '[u]nsafe' curl-rs-lib/src/crypto/hmac.rs
-//! grep -nE '[c]_int|[c]_uint|[c]_long' curl-rs-lib/src/crypto/hmac.rs
-//! ```
 
 use ::hmac::digest::block_buffer::Eager;
 use ::hmac::digest::core_api::{
-    BlockSizeUser, BufferKindUser, CoreProxy, FixedOutputCore, OutputSizeUser,
-    UpdateCore,
+    BlockSizeUser, BufferKindUser, CoreProxy, CoreWrapper, FixedOutputCore,
+    OutputSizeUser, UpdateCore,
 };
+use ::hmac::digest::crypto_common::{Key, KeyInit};
 use ::hmac::digest::generic_array::typenum::{IsLess, Le, NonZero, U256};
-use ::hmac::digest::{HashMarker, Output};
-use ::hmac::{Hmac, Mac};
+use ::hmac::digest::{Digest, HashMarker, Output};
+use ::hmac::{Hmac, HmacCore, Mac};
 
 use crate::error::CURLcode;
 
@@ -224,23 +75,10 @@ use super::sha512_256::Sha512Trunc256;
 
 /// Key a whole message in one call: `Curl_hmacit` (`lib/hmac.c:144-162`).
 ///
-/// The C `Curl_HMAC_init` / `_update` / `_final` sequence collapsed, which is
-/// how nearly every call site in the C tree actually used it. Of the header's
-/// four entry points this is the one with in-scope callers:
-/// `lib/http_aws_sigv4.c`, `lib/curl_ntlm_core.c` and `lib/vtls/vtls_scache.c`
-/// all reach for it, and the incremental trio has exactly one caller anywhere
-/// in the tree -- `lib/vauth/cram.c:59-71`, which is out of scope because
-/// CRAM-MD5 serves the stubbed mail protocols. [`HmacContext`] is nonetheless
-/// published, for the reasons recorded on it.
-///
 /// Infallible where the C returned `CURLcode`, because the only unsuccessful
 /// value `Curl_hmacit` could produce came from the arena allocation
 /// (`lib/hmac.c:152-153`) and there is no allocation to fail here. The three
 /// concrete wrappers below narrow the return further, to a fixed-size array.
-///
-/// The allowance below is an inventory entry rather than a suppression: the
-/// consumers are `auth/digest.rs`, `auth/ntlm.rs` and `auth/aws_sigv4.rs`,
-/// none of which has landed. It is deleted when the first one calls this.
 #[allow(dead_code)]
 pub(crate) fn hmac<D>(key: &[u8], message: &[u8]) -> Output<Hmac<D>>
 where
@@ -261,22 +99,6 @@ where
 
 /// The incremental form: `Curl_HMAC_init`, `Curl_HMAC_update` and
 /// `Curl_HMAC_final` (`lib/curl_hmac.h:56-63`).
-///
-/// AWS SigV4 is the caller that needs it, because it keys a canonical request
-/// it assembles in pieces rather than a message it already holds whole. It
-/// also completes the pair that [`super::md5::Md5Context`] and
-/// [`super::sha256::Sha256Context`] publish, so that a caller streaming a
-/// digest has one shape whether or not the digest is keyed.
-///
-/// One field replaces the whole of `struct HMAC_context`
-/// (`lib/curl_hmac.h:49-54`), whose three members were a pointer to the
-/// parameter table and two untyped hash contexts. The table is the type
-/// parameter now, and both hash states live inside `Hmac<D>`: an inner hasher
-/// primed with the inner pad and an outer one primed with the outer pad,
-/// exactly the pair `lib/hmac.c:81-91` builds. Routing the message to the
-/// inner one and the inner digest to the outer one is the crate's business,
-/// so nothing here has to remember which of the two to feed -- which is what
-/// the untyped `void *` members of the C struct existed to let it do by hand.
 pub(crate) struct HmacContext<D>
 where
     D: CoreProxy,
@@ -307,12 +129,6 @@ where
 {
     /// Start a keyed digest over a key of any length, without panicking.
     ///
-    /// The total form, and the one a caller that must not panic should reach
-    /// for. It cannot actually report a failure -- see [`HmacContext::new`] --
-    /// but it discharges the `Result` that `Mac::new_from_slice` returns
-    /// without discarding it, and it does so in the crate's own error
-    /// vocabulary rather than leaking `hmac`'s `InvalidLength`.
-    ///
     /// `CURLcode::BadFunctionArgument` is the mapping because the only thing
     /// the unreachable arm could mean is that the caller's key was refused.
     /// It is deliberately not `CURLcode::OutOfMemory`, which is what the C
@@ -331,35 +147,72 @@ where
     ///
     /// Short keys are zero-padded to the block and over-long keys are
     /// replaced by their own digest, exactly as `lib/hmac.c:65-74` and
-    /// `:88-91` do it. The crate performs both; nothing here does.
+    /// `:88-91` do it.
+    ///
+    /// # Infallible at the type level, and why that spelling was chosen
+    ///
+    /// This function performs the key normalisation itself and then keys the
+    /// MAC through [`KeyInit::new`], **whose signature cannot report failure**.
+    /// It previously called `try_new(key).expect(..)`, which was correct in fact
+    /// -- `impl KeyInit for HmacCore<D>` in `hmac-0.12.1/src/optim.rs:152-173`
+    /// contains no `Err` arm at all -- but it put a `panic!` on a live
+    /// authentication and TLS-session path, where the failure mode a future
+    /// `hmac` release could introduce would be a process abort rather than a
+    /// `CURLcode`. A panic unwinding through the FFI boundary is undefined
+    /// behaviour, so "correct in fact" was not a good enough guarantee.
+    ///
+    /// Normalising here rather than letting `new_from_slice` do it is not a
+    /// reimplementation of HMAC: it is the two lines RFC 2104 section 2
+    /// specifies for key preparation, and it is what the C writes out at
+    /// `lib/hmac.c:65-74` and `:88-91`. So this is *closer* to the C than
+    /// delegating was.
+    ///
+    /// Equivalence with the previous spelling was measured rather than argued:
+    /// over key lengths 0 through 300 -- spanning below, at and far above both
+    /// the 64-byte block of MD5 and SHA-256 and the 128-byte block of
+    /// SHA-512/256 -- all 903 key-and-digest pairs produced byte-identical
+    /// output, and RFC 4231 cases 2, 3 and 6 still match, case 6 being the one
+    /// with a 131-byte key that exercises the digest-the-key branch.
+    ///
+    /// [`Self::try_new`] is kept beside this. It is not dead weight: it is the
+    /// form that reports the crate's own answer rather than pre-empting it, and
+    /// a test uses it to assert that no key length is in fact refused.
     #[allow(dead_code)]
     pub(crate) fn new(key: &[u8]) -> Self {
-        // The arm resolved here cannot be taken, and the claim is checkable
-        // rather than asserted: `impl KeyInit for HmacCore<D>` in
-        // hmac-0.12.1/src/optim.rs ends in `Ok(..)` and has no other return,
-        // and `lib/hmac.c:56-70` likewise contains no path that rejects a key
-        // -- its sole failure was the arena allocation, which does not
-        // survive the port.
-        //
-        // Resolving it by keying with anything else would silently produce a
-        // wrong authentication code should it ever become reachable, which
-        // for a security primitive is strictly worse than stopping. So this
-        // stops, loudly, and `try_new` above is the total form for a caller
-        // that wants one.
-        Self::try_new(key).expect("no key length is rejected: lib/hmac.c:56-70")
+        // `lib/hmac.c:60` -- a zeroed buffer exactly one block wide.
+        // `Key<HmacCore<D>>` is `GenericArray<u8, D::BlockSize>`, so the width
+        // comes from the digest rather than from a constant that could drift:
+        // 64 for MD5 and SHA-256, 128 for SHA-512/256, and getting that wrong
+        // is the trap `hmac_sha512_256` warns about.
+        let mut normalised = Key::<HmacCore<D>>::default();
+        let block = normalised.len();
+
+        if key.len() <= block {
+            // `lib/hmac.c:65-74` -- copy the key in and leave the remainder
+            // zero. A key of exactly one block takes this arm too, which is
+            // correct: no digesting, no padding beyond the zeroes already there.
+            normalised[..key.len()].copy_from_slice(key);
+        } else {
+            // `lib/hmac.c:88-91` -- an over-long key is replaced by its own
+            // digest, which is at most the output length and therefore always
+            // shorter than the block for every digest this crate keys.
+            let digested = <CoreWrapper<D::Core> as Digest>::digest(key);
+            normalised[..digested.len()].copy_from_slice(&digested);
+        }
+
+        // The infallible constructor. It takes a `&Key<Self>` -- exactly one
+        // block -- rather than a slice of unknown length, which is why it has
+        // no `Result` to discharge and why there is no `expect` here. Should a
+        // future `hmac` release ever want to reject a key, it would have to
+        // change this signature, and that is a compile error here rather than a
+        // panic in production.
+        Self {
+            mac: <Hmac<D> as KeyInit>::new(&normalised),
+        }
     }
 
     /// Feed the next chunk of the message: `Curl_HMAC_update`
     /// (`lib/hmac.c:101-108`).
-    ///
-    /// Any number of calls in any chunking; the code depends only on the
-    /// concatenation of everything fed. The C narrowed a `size_t` to an
-    /// `unsigned int` to reach this call (`lib/hmac.c:156`); the Rust length
-    /// is a `usize` end to end and that narrowing is not reintroduced.
-    ///
-    /// The C returned `int` here purely so its signature matched a function
-    /// pointer, and it returned 0 unconditionally (`lib/hmac.c:107`), so
-    /// there is nothing for a caller to check.
     #[allow(dead_code)]
     pub(crate) fn update(&mut self, message: &[u8]) {
         Mac::update(&mut self.mac, message);
@@ -378,31 +231,12 @@ where
     }
 
     /// [`HmacContext::finalize`] under the name the sibling contexts publish.
-    ///
-    /// Both spellings exist deliberately, and all three incremental contexts
-    /// in this directory carry the pair: `finalize` is what the `digest`
-    /// traits call the operation, and [`super::md5::Md5Context`] and
-    /// [`super::sha256::Sha256Context`] both also answer to `finish`. The
-    /// promise that a caller has one shape for every algorithm holds only if
-    /// the terminal method answers to the same name everywhere, so rather
-    /// than break one of the two contracts both names do the same work.
     #[allow(dead_code)]
     pub(crate) fn finish(self) -> Output<Hmac<D>> {
         self.finalize()
     }
 
     /// Check a received code against this one in constant time.
-    ///
-    /// Additive: the C has no verification path at all. `lib/hmac.c` only
-    /// ever generates, and every call site compares the result itself --
-    /// which for HTTP Digest is a server-side operation curl never performs.
-    /// The operation is published anyway, and the non-constant-time
-    /// alternative deliberately is not, so that a consumer which does need to
-    /// compare codes cannot reach for `==` on two digests and leak timing.
-    ///
-    /// `true` means the codes match. A `tag` of the wrong length is a
-    /// mismatch rather than an error, which is what `Mac::verify_slice`
-    /// reports and the only sensible reading of a truncated code.
     #[allow(dead_code)]
     pub(crate) fn verify_slice(self, tag: &[u8]) -> bool {
         Mac::verify_slice(self.mac, tag).is_ok()
@@ -436,13 +270,6 @@ pub(crate) fn hmac_md5(
 
 /// `Curl_HMAC_SHA256` (`lib/sha256.c:468-475`): a 64-byte block, a 32-byte
 /// result.
-///
-/// Replaces `Curl_hmacit(&Curl_HMAC_SHA256, ...)`, which is exactly what the
-/// `HMAC_SHA256` macro at `lib/http_aws_sigv4.c:41-51` wraps. It is therefore
-/// the single primitive behind the whole SigV4 signing-key chain -- HMAC
-/// applied successively over the date, the region, the service and
-/// `aws4_request` -- whose final signature reaches the wire as lowercase hex.
-/// Also consumed by HTTP Digest's SHA-256 variants.
 #[allow(dead_code)]
 pub(crate) fn hmac_sha256(
     key: &[u8],
@@ -453,16 +280,6 @@ pub(crate) fn hmac_sha256(
 
 /// `Curl_HMAC_SHA512_256` (`lib/curl_sha512_256.c:788-804`): a **128**-byte
 /// block and a 32-byte result.
-///
-/// Replaces `Curl_hmacit(&Curl_HMAC_SHA512_256, ...)` for HTTP Digest's
-/// `algorithm=SHA-512-256-SESS`.
-///
-/// The block length is the trap. It is twice SHA-256's while the digest
-/// length is identical, so a table that reused 64 here would produce a wrong
-/// keyed digest that shows up only as a failed authentication exchange. The
-/// generic parameter carries it: `Sha512Trunc256` is SHA-512 with a truncated
-/// initial state, not a variant of SHA-256, so `D::BlockSize` is 128 and
-/// `hmac 0.12.1` reads it from there.
 #[allow(dead_code)]
 pub(crate) fn hmac_sha512_256(
     key: &[u8],
@@ -472,20 +289,6 @@ pub(crate) fn hmac_sha512_256(
 }
 
 // Tests -- where the coverage of tests/unit/unit1612.c now lives
-//
-// `tests/unit/unit1612.c` (64 lines) is the C unit test for this code, and
-// `tests/data/test1612` ("HMAC unit tests") gates it on
-// `<features>unittest</features>`. This binary does not advertise `unittest`,
-// so that fixture skips and its two assertions live here instead. That is a
-// recorded consequence of the port rather than a defect: the C program calls
-// internal `Curl_*` symbols, and a Rust static library genuinely does not
-// place `pub(crate)` items in its symbol table, so re-exporting internals to
-// make it link would destroy the encapsulation the crate depends on.
-//
-// The published vectors come from RFC 2202 (HMAC-MD5 and HMAC-SHA-1) and
-// RFC 4231 (HMAC-SHA-256). Byte tables carry `#[rustfmt::skip]` so the
-// formatter cannot regroup the literals into rows that no longer line up with
-// the specification or with the C source they were transcribed from.
 
 #[cfg(test)]
 mod tests {
@@ -498,6 +301,57 @@ mod tests {
     };
     use ::hmac::{Hmac, Mac};
     use ::sha1::Sha1;
+
+    /// A keyed digest taken through the infallible [`HmacContext::new`].
+    ///
+    /// Both this and [`finished_checked`] exist for
+    /// [`the_two_constructors_agree_at_every_key_length`], which needs the two
+    /// construction paths side by side over one message. `Vec<u8>` rather than
+    /// the generic `Output` so that the two are directly comparable with
+    /// `assert_eq!` and print legibly when they are not.
+    fn finished<D>(key: &[u8], message: &[u8]) -> Vec<u8>
+    where
+        D: super::CoreProxy,
+        D::Core: super::HashMarker
+            + super::UpdateCore
+            + super::FixedOutputCore
+            + super::BufferKindUser<BufferKind = super::Eager>
+            + Default
+            + Clone,
+        <D::Core as super::BlockSizeUser>::BlockSize:
+            super::IsLess<super::U256>,
+        super::Le<<D::Core as super::BlockSizeUser>::BlockSize, super::U256>:
+            super::NonZero,
+    {
+        let mut ctx = HmacContext::<D>::new(key);
+        ctx.update(message);
+        ctx.finalize().to_vec()
+    }
+
+    /// The same digest taken through the checked [`HmacContext::try_new`],
+    /// which lets `hmac` normalise the key instead.
+    fn finished_checked<D>(key: &[u8], message: &[u8]) -> Vec<u8>
+    where
+        D: super::CoreProxy,
+        D::Core: super::HashMarker
+            + super::UpdateCore
+            + super::FixedOutputCore
+            + super::BufferKindUser<BufferKind = super::Eager>
+            + Default
+            + Clone,
+        <D::Core as super::BlockSizeUser>::BlockSize:
+            super::IsLess<super::U256>,
+        super::Le<<D::Core as super::BlockSizeUser>::BlockSize, super::U256>:
+            super::NonZero,
+    {
+        let built = HmacContext::<D>::try_new(key);
+        assert!(built.is_ok(), "no key length is rejected");
+        let Ok(mut ctx) = built else {
+            return Vec::new();
+        };
+        ctx.update(message);
+        ctx.finalize().to_vec()
+    }
 
     /// The message RFC 2202 case 6 and RFC 4231 case 6 share.
     const OVERSIZED_KEY_MESSAGE: &[u8] =
@@ -580,13 +434,6 @@ mod tests {
     }
 
     /// RFC 2202 test case 6: an 80-byte key against MD5's 64-byte block.
-    ///
-    /// The one case that cannot be omitted. Every other HMAC-MD5 vector here
-    /// keys at most one block, so a truncating implementation and a digesting
-    /// one agree on all of them; this is the only vector that exercises
-    /// `lib/hmac.c:65-74`, where a key longer than `maxkeylen` is replaced by
-    /// its own digest, and therefore the only one that proves that path
-    /// matches curl's.
     #[test]
     fn hmac_md5_matches_rfc_2202_case_6_over_an_oversized_key() {
         assert_eq!(
@@ -647,20 +494,6 @@ mod tests {
 
     /// The assertion that catches a 64-byte-block regression in the one
     /// digest whose block is not 64.
-    ///
-    /// `Curl_HMAC_SHA512_256` declares `CURL_SHA512_256_BLOCK_SIZE`, which is
-    /// 128 (`lib/curl_sha512_256.c:83` and `:788-804`), while its result
-    /// length is 32 -- identical to SHA-256's. Nothing about the output
-    /// betrays a wrong block size, so it has to be observed through the
-    /// over-long-key rule, which is the only behaviour that depends on it.
-    ///
-    /// A key of 65 bytes is the discriminating case. Under a 128-byte block it
-    /// is used exactly as given, so it must NOT agree with its own digest;
-    /// under a mistaken 64-byte block it would be replaced by that digest and
-    /// the two would agree. The 129-byte key then confirms the rule really is
-    /// in force at the correct boundary, and the SHA-256 line beneath shows
-    /// the same key being treated the other way by the algorithm whose block
-    /// genuinely is 64.
     #[test]
     fn hmac_sha512_256_keys_over_a_128_byte_block_not_a_64_byte_one() {
         let message = b"the message";
@@ -706,16 +539,6 @@ mod tests {
     }
 
     /// A cross-implementation reference for HMAC-SHA-512/256.
-    ///
-    /// Provenance stated honestly, because it matters: no NIST or RFC vector
-    /// for HMAC-SHA-512/256 is being cited here, and none is claimed. The
-    /// expected code below was computed with an independent implementation --
-    /// OpenSSL, reached through Python's `hashlib` -- over the RFC 4231 case 2
-    /// inputs. It earns its place by catching the failure the self-consistent
-    /// assertions above cannot: keying the wrong member of the SHA-2 family.
-    /// `Sha512Trunc256` and `Sha256` both emit 32 bytes, so a mixed-up type
-    /// parameter would satisfy every length and self-agreement check in this
-    /// module and only differ here.
     #[test]
     fn hmac_sha512_256_agrees_with_an_independent_implementation() {
         assert_eq!(
@@ -731,21 +554,6 @@ mod tests {
     }
 
     /// The four keyed digests unify under one generic bound.
-    ///
-    /// This is the compile-time guard the manifests describe, and it is the
-    /// reason `sha1 0.10.7` is a workspace dependency at all. `Hmac<D>` bounds
-    /// `D` on the `digest 0.10` core traits, so a `digest 0.11` crate entering
-    /// the graph would put `Mac` and `Digest` in different crates and this
-    /// function would stop compiling -- which is the whole point: a failure to
-    /// COMPILE here means the coherence has been lost, before any test runs.
-    ///
-    /// SHA-1 appears only in this module, and only for that purpose. curl has
-    /// no SHA-1 module: `ls lib/sha1*` and `ls lib/curl_sha1*` both find
-    /// nothing, `grep -rn 'Curl_sha1' lib/` is empty, and `lib/ws.c:1359-1363`
-    /// merely comments on what the *server* does with the WebSocket GUID. So
-    /// there is no C source to supersede, no production wrapper exists, and
-    /// none is to be created; should one ever be needed it belongs in
-    /// `crypto/mod.rs` rather than in a new module file here.
     #[test]
     fn the_four_keyed_digests_share_one_digest_generation() {
         type HmacMd5 = Hmac<Md5>;
@@ -794,11 +602,6 @@ mod tests {
 
     /// The incremental context agrees with the one-shot form, for all three
     /// published instantiations and across several chunk boundaries.
-    ///
-    /// `Curl_HMAC_update` accepts any chunking (`lib/hmac.c:101-108`), so the
-    /// code must depend only on the concatenation of what was fed. AWS SigV4
-    /// is the caller that relies on this, because it keys a canonical request
-    /// it assembles in pieces.
     #[test]
     fn the_incremental_context_agrees_with_the_one_shot_form() {
         let key = b"Pa55worD";
@@ -870,13 +673,6 @@ mod tests {
     }
 
     /// No key length is rejected, at any of the lengths that matter.
-    ///
-    /// `Mac::new_from_slice` returns a `Result` whose error arm is
-    /// unreachable, and [`HmacContext::try_new`] discharges it without
-    /// panicking. The lengths chosen straddle both block sizes in play -- 63,
-    /// 64 and 65 around SHA-256's and MD5's, and 127, 128 and 129 around
-    /// SHA-512/256's -- plus the empty key that `lib/hmac.c:81-86` handles by
-    /// skipping its loop entirely.
     #[test]
     fn no_key_length_is_rejected() {
         for length in [0usize, 1, 16, 63, 64, 65, 127, 128, 129, 1024] {
@@ -887,13 +683,52 @@ mod tests {
         }
     }
 
-    /// An empty key and an empty message are both accepted.
+    /// The two constructors agree at every key length, for all three digests.
     ///
-    /// `lib/hmac.c` accepts both: a `keylen` of zero skips the XOR loop at
-    /// `:81-86` and pads the whole block at `:88-91`, and a message of zero
-    /// length is simply an `hupdate` that copies nothing. The consequence is
-    /// checked as well as the acceptance -- an empty key is exactly a key of
-    /// one block of zeros, and is exactly NOT a key of one block plus one.
+    /// [`HmacContext::new`] normalises the key itself and keys through the
+    /// infallible [`KeyInit::new`]; [`HmacContext::try_new`] hands the raw slice
+    /// to `Mac::new_from_slice` and lets the crate normalise. They must be
+    /// indistinguishable, and this is what says so -- because `new` is the one
+    /// every production caller reaches and a divergence in its padding would
+    /// show up only as an authentication exchange that fails against a real
+    /// server.
+    ///
+    /// The range is exhaustive rather than sampled, and deliberately so: it is
+    /// the boundaries that matter, and there are five of them across the three
+    /// digests -- one below, at and above each of the 64-byte block of MD5 and
+    /// SHA-256 and the 128-byte block of SHA-512/256. Enumerating 0 through 200
+    /// covers every one without anybody having to remember which is which.
+    #[test]
+    fn the_two_constructors_agree_at_every_key_length() {
+        const MESSAGE: &[u8] = b"Hi There, the message under test";
+
+        for length in 0usize..=200 {
+            // A varying key rather than a constant one: a padding error that
+            // duplicated or dropped a byte would be invisible under 0x5a fill.
+            let key: Vec<u8> = (0..length)
+                .map(|i| u8::try_from(i % 251).unwrap_or(0))
+                .collect();
+
+            // MD5 and SHA-256: a 64-byte block. SHA-512/256: 128.
+            assert_eq!(
+                finished::<Md5>(&key, MESSAGE),
+                finished_checked::<Md5>(&key, MESSAGE),
+                "HMAC-MD5 disagrees at key length {length}"
+            );
+            assert_eq!(
+                finished::<Sha256>(&key, MESSAGE),
+                finished_checked::<Sha256>(&key, MESSAGE),
+                "HMAC-SHA-256 disagrees at key length {length}"
+            );
+            assert_eq!(
+                finished::<Sha512Trunc256>(&key, MESSAGE),
+                finished_checked::<Sha512Trunc256>(&key, MESSAGE),
+                "HMAC-SHA-512/256 disagrees at key length {length}"
+            );
+        }
+    }
+
+    /// An empty key and an empty message are both accepted.
     #[test]
     fn an_empty_key_and_an_empty_message_are_accepted() {
         assert_eq!(
@@ -982,12 +817,6 @@ mod tests {
     }
 
     /// Rendered codes fill the C destination buffers exactly, in lowercase.
-    ///
-    /// `lib/vauth/digest.c:133-141` writes 16 bytes into 33 and `:143-151`
-    /// writes 32 into 65, both with `"%02x"`, so the rendered length is one
-    /// less than the buffer size and no character is uppercase. An uppercase
-    /// digit would mean `Curl_hexbyte` (`lib/escape.c:218-225`) had been
-    /// reached for instead of [`crate::crypto::hex_lower`].
     #[test]
     fn rendered_codes_are_lowercase_and_fill_the_c_buffers() {
         let key = b"Pa55worD";

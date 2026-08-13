@@ -81,33 +81,43 @@ detail, and any replacement has to keep all four:
   invocation. That is a hazard of the C interface, and it is the kind of
   hazard the specified migration removes.
 
-## Specified `Rust` Successors
+## The `Rust` Successors
 
-Every path in this section names **specified target state**. The tree does
-already contain `Rust` source, in all three `crates`, but neither of the two
-files named below is among the delivered ones, and nothing below describes code
-that has been written. The mapping is recorded so that the contract above
-survives the migration intact.
+Both successors are **delivered**. The paths below name code that exists and is
+tested, and the C files remain the reference oracle. The mapping is recorded so
+that the contract above is checkable against the implementation rather than
+merely intended.
 
-* `curl-rs-lib/src/util/timeval.rs` is the specified successor to
-  `lib/curlx/timeval.c` and covers the clock reading.
-* `curl-rs-lib/src/util/timediff.rs` is the specified successor to
-  `lib/curlx/timediff.c` and covers the difference and conversion arithmetic,
-  including the difference helpers the C tree keeps beside the clock reading.
+* `curl-rs-lib/src/util/timeval.rs` succeeds `lib/curlx/timeval.c`. It covers
+  the clock reading and, following the C, the difference helpers that
+  `timeval.c` keeps beside it: the millisecond and microsecond differences and
+  the ceiling variant.
+* `curl-rs-lib/src/util/timediff.rs` succeeds `lib/curlx/timediff.c`. It covers
+  the difference type itself, its bounds and the two conversions between
+  milliseconds and a duration -- the mapping that tells a reactor whether to
+  block indefinitely, poll without blocking or wait a bounded time.
 
 Both are among the six `lib/curlx/` sources specified to receive a dedicated
 module rather than being absorbed into a shared utility module; see
 [`curlx`](CURLX.md).
 
-### Two clocks, two types
+### Two clocks, one reading type
 
-The monotonic instant and the wall-clock time are specified as distinct
-types. A monotonic instant cannot be formatted as a date, and a wall-clock
-time cannot be subtracted to yield a timeout budget, because neither type
-offers the operation. The C design keeps both in comparable structures and
-leans on discipline to tell them apart; the specified design makes that
-confusion fail to compile. That is the safety gain: the first property above
-stops being a rule to remember and becomes a property of the types.
+The two clocks are distinct and injected, but the reading they hand back is one
+type, and this is where the delivered code differs from a design that separated
+them. A monotonic reading and a wall-clock reading are both a pair of seconds
+and microseconds, and which of the two a value holds depends on the clock that
+produced it rather than on its type, exactly as in the C. Mixing them is
+therefore still a rule to observe rather than something the compiler refuses.
+
+The reason is the coverage requirement rather than preference. The standard
+library's opaque instant cannot be constructed at a chosen value, so a test
+could not place a transfer at a known point in time, and the line-coverage gate
+over the time-driven modules would be out of reach. A constructible reading type
+is what makes a controllable clock possible; that clock is what makes the gate
+reachable. The safety the migration does gain here is narrower and real: reading
+a clock happens in exactly one module, so nothing else in the engine can consult
+the wall clock by accident.
 
 ### One "now" per iteration, owned rather than pointed to
 

@@ -24,13 +24,13 @@
 //! `SSLKEYLOGFILE` support: the NSS key log that lets Wireshark decrypt a
 //! capture.
 //!
-//! Rust counterpart of `lib/vtls/keylog.c` (148 lines) and
-//! `lib/vtls/keylog.h` (69 lines). When the `SSLKEYLOGFILE` environment
-//! variable names a writable path, every TLS secret the handshake derives is
-//! appended to that file in the NSS key log format. A packet capture plus
-//! that file is enough to decrypt the session offline, which is why this is
-//! the single most security-sensitive file in the TLS module and why nothing
-//! here is best-effort in the sense of "approximately right".
+//! Rust counterpart of `lib/vtls/keylog.c` and `lib/vtls/keylog.h`. When the
+//! `SSLKEYLOGFILE` environment variable names a writable path, every TLS
+//! secret the handshake derives is appended to that file in the NSS key log
+//! format. A packet capture plus that file is enough to decrypt the session
+//! offline, which is why this is the single most security-sensitive file in
+//! the TLS module and why nothing here is best-effort in the sense of
+//! "approximately right".
 //!
 //! # Every byte is the contract
 //!
@@ -47,58 +47,6 @@
 //!       |            `- exactly 64 UPPERCASE hex digits (32 bytes)
 //!       `- at most 31 bytes, written verbatim
 //! ```
-//!
-//! Two properties of that line are easy to get wrong and are therefore
-//! stated explicitly.
-//!
-//! **The hex digits are UPPERCASE.** `lib/vtls/keylog.c:128` and `:135` call
-//! `Curl_hexbyte`, documented at `lib/escape.c:218-226` as "Output a single
-//! unsigned char as a two-digit UPPERCASE hex number" and implemented by
-//! indexing `Curl_udigits[] = "0123456789ABCDEF"` (`lib/mprintf.c:39`). The
-//! lowercase twin `Curl_ldigits` (`lib/mprintf.c:36`) belongs to
-//! `Curl_hexencode` and is *not* on this path. rustls ships its own
-//! [`rustls::KeyLogFile`], and it formats with `{b:02x}` -- lowercase -- so
-//! it cannot stand in for this module without changing curl's output.
-//!
-//! **The maximum generated line is 194 bytes.** `lib/vtls/keylog.c:110-111`
-//! sizes its buffer `KEYLOG_LABEL_MAXLEN + 1 + 2 * CLIENT_RANDOM_SIZE + 1 +
-//! 2 * SECRET_MAXLEN + 1 + 1`, that is 31 + 1 + 64 + 1 + 96 + 1 + 1 = 195,
-//! and the comment at `:79` records the same number: "The current maximum
-//! valid keylog line length LF and NUL is 195." The final `1` is the C string
-//! terminator, which Rust neither needs nor writes, so the same line is 194
-//! bytes here. See [`MAX_GENERATED_LINE`].
-//!
-//! # What the C tree does, and where
-//!
-//! | C origin | Behaviour reproduced here |
-//! |----------|---------------------------|
-//! | `lib/vtls/keylog.c:37-145` | the lifecycle, both writers, the rejections |
-//! | `lib/vtls/keylog.h:28-37` | the three size constants |
-//! | `lib/escape.c:218-226` | uppercase hex, two digits, no separator |
-//! | `lib/vtls/rustls.c:504-515` | the callback shape and its argument sizes |
-//! | `lib/vtls/rustls.c:809-829` | register only when enabled; close on failure |
-//! | `lib/vtls/rustls.c:1392-1395` | cleanup closes, possibly a second time |
-//!
-//! The three size constants are [`KEYLOG_LABEL_MAXLEN`],
-//! [`CLIENT_RANDOM_SIZE`] and [`SECRET_MAXLEN`]; each carries the reasoning
-//! from `keylog.h` at its definition.
-//!
-//! # The one construct deliberately not reproduced
-//!
-//! `lib/vtls/keylog.c:38` is `static FILE *keylog_file_fp;` -- a mutable
-//! process-global file pointer, opened by one backend and closed by another,
-//! with no ownership and no synchronization beyond whatever the C library's
-//! `stdio` happens to provide. This is exactly the class of construct the
-//! rewrite replaces: state becomes owned, and access an explicit borrow.
-//!
-//! [`KeyLogFile`] is therefore an ordinary object. It is created by the TLS
-//! factory, shared with rustls through an [`Arc`], and dropped when the last
-//! holder goes away. There is no `static`, no lazily initialised singleton
-//! and no hidden reader of the environment: `SSLKEYLOGFILE` is consulted only
-//! by [`KeyLogFile::open_from_env`] and [`KeyLogFile::open`], never on a
-//! write path. Two independent [`KeyLogFile`] values can coexist -- which is
-//! what makes this module testable without touching the process environment
-//! at all.
 //!
 //! # Buffering, and why a whole line is one critical section
 //!
@@ -118,56 +66,6 @@
 //! inside [`KeyLogFile`], held across the whole record -- format, buffer and
 //! drain -- rather than across each fragment.
 //!
-//! # Failure is silent, by design
-//!
-//! An absent variable, an empty variable, an unopenable path and a failing
-//! write all leave the transfer running. `lib/vtls/rustls.c:815-818` shows
-//! why: the backend calls `Curl_tls_keylog_open()`, asks
-//! `Curl_tls_keylog_enabled()`, and returns `CURLE_OK` when the answer is no.
-//! A missing key log is a diagnostic that was not requested, never a TLS
-//! error. The one case that *does* fail the handshake is a registration
-//! failure inside the backend (`rustls.c:820-827`), and the backend's
-//! response there is to call [`KeyLogFile::close`] -- which is why close is
-//! idempotent and safe to call again from `cr_cleanup`
-//! (`rustls.c:1392-1395`).
-//!
-//! No diagnostic in this module ever carries key material. Nothing is logged
-//! on a write failure, and the [`fmt::Debug`] implementation prints one
-//! boolean.
-//! That is stricter than rustls, which logs a warning naming the path, and
-//! stricter than a `#[derive(Debug)]` would be, which would print the
-//! buffered bytes.
-//!
-//! # Deliberate, documented differences from the C implementation
-//!
-//! 1. **A 31-byte label is not truncated.** `lib/vtls/rustls.c:509` declares
-//!    `char clabel[KEYLOG_LABEL_MAXLEN]` -- 31 bytes including room for the
-//!    terminator -- and fills it with `curl_msnprintf(..., "%.*s", ...)`, so
-//!    a label of exactly `KEYLOG_LABEL_MAXLEN` bytes loses its last
-//!    character before `Curl_tls_keylog_write` ever sees it, even though that
-//!    function accepts 31. Rust strings carry their length, so the label
-//!    arrives intact; this module accepts up to and including 31 bytes and
-//!    rejects 32. Nothing rustls emits is that long -- the longest label in
-//!    the NSS vocabulary is `CLIENT_HANDSHAKE_TRAFFIC_SECRET`, whose 31 bytes
-//!    are what defines the limit (`lib/vtls/keylog.h:28`) -- so the effect is
-//!    to remove a latent defect rather than to change any observable output.
-//! 2. **No NUL byte is written.** C terminates its scratch buffer at
-//!    `keylog.c:97` and `:139` because it hands the buffer to `fputs`. The
-//!    terminator is never part of the file's contents in either
-//!    implementation.
-//! 3. **A write failure is reported.** C calls `fputs` and returns `TRUE`
-//!    without inspecting the result (`keylog.c:101-102`, `:143-144`). Here a
-//!    failed write returns `false`. The log stays open, because a transient
-//!    failure must not silently disable the rest of the session, and no
-//!    caller changes its behaviour on the strength of the return value.
-//! 4. **LF is written verbatim on every target.** C opens with
-//!    `FOPEN_APPENDTEXT`, which is `"at"` on `_WIN32` and MSDOS
-//!    (`lib/curl_setup.h:1243-1246`) and therefore translates LF to CRLF
-//!    there. On all four mandated targets it is `"a"`
-//!    (`lib/curl_setup.h:1257-1260`), so plain append is the faithful
-//!    behaviour; Rust's [`std::fs::File`] is byte-oriented and never
-//!    translates.
-//!
 //! # Wiring it into the rustls backend
 //!
 //! [`KeyLogFile`] implements [`rustls::KeyLog`], so the backend needs no
@@ -180,23 +78,7 @@
 //!     config.key_log = keylog.into_key_log(); // set_key_log()
 //! }
 //! ```
-//!
-//! This module selects no cryptographic provider and names none. Provider
-//! choice belongs to the manifests, which pin `ring` with
-//! `default-features = false`; a key log has no opinion about who computed the
-//! secret it is recording.
 
-// `dead_code` is NOT allowed for this module as a whole. Every item below that
-// has no consumer yet carries its own `#[allow(dead_code)]`, written at the
-// item, so the suppression reads as an inventory rather than a blanket: each
-// one is load-bearing, deleting any one of them restores a warning, and an
-// item added later with no consumer is still reported. Each is removed when
-// its consumer lands. A module- or crate-scoped `#![allow(dead_code)]` would
-// instead silence the NEXT item somebody adds, which hides incomplete
-// scaffolding rather than recording it; the rule and the executable gate that
-// enforces it across the workspace live in `curl-rs-lib/src/lib.rs`
-// (`mod source_policy`).
-//
 // Every production consumer of this file lives in a sibling module.
 // `tls/rustls_backend.rs` is the only caller -- it opens the log and
 // registers the callback where C calls `Curl_tls_keylog_open`
@@ -210,16 +92,6 @@
 // themselves not yet reachable. Compiling this same file as a test target,
 // where the module's own tests supply the missing consumer, reports nothing at
 // all.
-//
-// Each allowance is written on the item it excuses, and there is no
-// `#![allow(dead_code)]` on this module root. A `dead_code` level on a crate
-// or module root would silence the next unreferenced item somebody adds, which
-// is why `mod source_policy` in `curl-rs-lib/src/lib.rs` fails the build when
-// it finds one.
-//
-// No level for the `unsafe_code` lint is set here, at any level, by design:
-// the crate root denies it and this module contains no `unsafe`, so the
-// crate-wide guarantee must stay in force.
 
 use std::env::var_os;
 use std::ffi::{OsStr, OsString};
@@ -227,10 +99,10 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 // `MetadataExt` supplies `uid()` and `mode()`, `OpenOptionsExt` supplies
-// `mode()` and `custom_flags()`. Both are `#[cfg(unix)]`, and all four mandated
-// targets are Unix (AAP section 0.1.1 goal G8), so no configuration guard is
-// needed here -- consistent with `src/ffi/sys.rs`, which likewise compiles only
-// for those four and names the omission rather than hiding it.
+// `mode()` and `custom_flags()`. Both are `#[cfg(unix)]`, and all four
+// mandated targets are Unix, so no configuration guard is needed here --
+// consistent with `src/ffi/sys.rs`, which likewise compiles only for those
+// four and names the omission rather than hiding it.
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
@@ -251,24 +123,10 @@ use crate::ffi::{effective_uid, O_CLOEXEC, O_NOFOLLOW};
 ///     CLIENT_HANDSHAKE_TRAFFIC_SECRET
 ///     |<---------- 31 bytes -------->|
 /// ```
-///
-/// Every other label in the vocabulary documented on
-/// [`rustls::KeyLog::log`] is shorter: `CLIENT_RANDOM` (13),
-/// `EXPORTER_SECRET` (15), `CLIENT_TRAFFIC_SECRET_0` (23),
-/// `SERVER_HANDSHAKE_TRAFFIC_SECRET` (31), `CLIENT_EARLY_TRAFFIC_SECRET`
-/// (27). A longer label is rejected rather than truncated.
 #[allow(dead_code)]
 pub(crate) const KEYLOG_LABEL_MAXLEN: usize = 31;
 
 /// The size of a TLS client random, in bytes (`lib/vtls/keylog.h:30`).
-///
-/// Fixed by the protocol: `ClientHello.random` is 32 bytes in every TLS
-/// version curl speaks, which is why the C prototype at
-/// `lib/vtls/keylog.h:60` declares the parameter as
-/// `const unsigned char client_random[32]` and why `lib/vtls/rustls.c:511`
-/// asserts `client_random_len == CLIENT_RANDOM_SIZE`. That assertion is a
-/// `DEBUGASSERT`, so a release build of the C tree would format whatever it
-/// was handed; here a client random of any other length is rejected.
 #[allow(dead_code)]
 pub(crate) const CLIENT_RANDOM_SIZE: usize = 32;
 
@@ -295,15 +153,10 @@ pub(crate) const SECRET_MAXLEN: usize = 48;
 ///    + 1  separating space
 ///   + 96  secret, two hex digits per byte
 ///    + 1  LF
-///   ----
 ///    194  bytes written by this module
 ///    + 1  C string terminator, which Rust does not write
-///   ----
 ///    195  the figure quoted by keylog.c:79
 /// ```
-///
-/// This is the capacity the formatting buffer reserves, so no key log record
-/// ever reallocates while it holds key material.
 #[allow(dead_code)]
 const MAX_GENERATED_LINE: usize = KEYLOG_LABEL_MAXLEN
     + 1
@@ -313,13 +166,6 @@ const MAX_GENERATED_LINE: usize = KEYLOG_LABEL_MAXLEN
     + 1;
 
 /// The longest input [`KeyLogFile::write_line`] accepts, in bytes.
-///
-/// `lib/vtls/keylog.c:81` declares `char buf[256]` and `:88` rejects a line
-/// whose length exceeds `sizeof(buf) - 2`, reserving one byte for an LF that
-/// may have to be appended and one for the terminator. 256 - 2 = 254, so 254
-/// bytes are accepted and 255 are not. The reserved terminator has no
-/// counterpart here, but the limit is part of the accepted-input contract and
-/// is therefore preserved exactly rather than widened.
 #[allow(dead_code)]
 const LINE_MAXLEN: usize = 254;
 
@@ -337,23 +183,13 @@ const KEYLOG_BUFSIZ: usize = 4096;
 const SSLKEYLOGFILE: &str = "SSLKEYLOGFILE";
 
 /// The mode a key log this process creates is created with.
-///
-/// `0600`: read and write for the owner, nothing for anyone else. This replaces
-/// the `0666` that `fopen(name, "a")` requests (`lib/vtls/keylog.c:47`), which
-/// the umask then narrows to whatever the user happens to have configured --
-/// `0644` under the usual `022`, and `0666` under a umask of `0`.
-///
-/// A umask can only clear bits, never set them, so this value is a ceiling that
-/// the kernel may lower and nothing can raise. The execute bit is absent
-/// because a key log is data.
 const SECRET_FILE_MODE: u32 = 0o600;
 
 /// The permission bits a key log may not have: any granted to group or other.
 ///
-/// `0o077` and not `0o177` or `0o777`: the owner triad is deliberately excluded,
-/// because this process *is* the owner by the time the mask is applied and its
-/// own access is the point. Only the two triads that let somebody else read the
-/// secrets are rejected.
+/// `0o077` and not `0o177` or `0o777`: the owner triad is deliberately
+/// excluded, because this process *is* the owner by the time the mask is
+/// applied and its own access is the point.
 const FOREIGN_PERMISSION_BITS: u32 = 0o077;
 
 /// The uppercase hex alphabet, `Curl_udigits` (`lib/mprintf.c:39`).
@@ -396,13 +232,6 @@ fn hexbyte(value: u8) -> [u8; 2] {
 }
 
 /// Why a path was refused as a key log destination.
-///
-/// Three variants rather than one boolean, because each one is a different
-/// mistake with a different remedy, and because a test that only knew "refused"
-/// could not tell a correct refusal from a coincidental one. The reason never
-/// reaches the user: this module fails silently by design (see the module
-/// documentation), and [`KeyLogFile::open_env_file`] discards it. It exists so
-/// that [`secret_file_verdict`] is checkable in isolation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SecretFileRejection {
     /// Not a regular file -- a FIFO, socket, device or directory.
@@ -429,34 +258,12 @@ impl SecretFileRejection {
     }
 
     /// Converts a refusal into the [`io::Error`] the open path returns.
-    ///
-    /// [`io::ErrorKind::PermissionDenied`] for all three, because that is what
-    /// the condition is from the caller's point of view and because the kernel
-    /// uses the same kind for the checks it performs itself -- the refusal is
-    /// indistinguishable, to a caller, from the `EACCES` it would have got had
-    /// the directory not been writable.
     fn into_io_error(self) -> io::Error {
         io::Error::new(io::ErrorKind::PermissionDenied, self.reason())
     }
 }
 
 /// Decides whether a file this process has just opened may receive secrets.
-///
-/// Split out of [`KeyLogFile::open_private_append`] as a pure function over the
-/// four facts that decide the question, for the same reason
-/// [`KeyLogFile::env_path`] is split out of the environment read: the rule then
-/// has a test that does not need a filesystem, a particular user id or root
-/// privileges. Every combination of the four inputs is reachable from a test,
-/// including the combinations a single host cannot be made to produce.
-///
-/// `mode` is the raw `st_mode` from `fstat`, file-type bits and all. Only the
-/// permission bits are examined -- [`FOREIGN_PERMISSION_BITS`] -- because the
-/// file type arrives separately as `is_regular_file`, already decoded by
-/// [`std::fs::FileType`].
-///
-/// The order of the checks is the order of severity, so that a file which fails
-/// more than one test reports the most fundamental failure. It has no effect on
-/// whether the file is accepted.
 ///
 /// # Errors
 ///
@@ -511,20 +318,9 @@ fn secret_file_verdict(
 ///   effect is one `write` per key log line -- which is the property that
 ///   keeps concurrent handshakes from splicing their secrets together.
 /// * **`_IONBF`** (Windows). Each record goes straight to the file.
-///
-/// The buffer is overwritten with zeroes as soon as it has been handed to the
-/// writer, including on the failure path. It is a scratch area holding key
-/// material, and leaving that material in a live allocation for the lifetime
-/// of the process would be gratuitous.
 #[allow(dead_code)]
 struct LineBufferedSink {
     /// The file, or any other writer an owner chose to inject.
-    ///
-    /// `Box<dyn Write + Send>` rather than [`std::fs::File`] for one reason
-    /// that matters in production and one that matters in test: a caller may
-    /// legitimately want the records elsewhere, and every behaviour in this
-    /// module can be verified against an in-memory writer without creating a
-    /// file or reading the process environment.
     inner: Box<dyn Write + Send>,
 
     /// Staged bytes, never more than [`KEYLOG_BUFSIZ`] of them.
@@ -625,9 +421,6 @@ impl LineBufferedSink {
 
 impl Drop for LineBufferedSink {
     fn drop(&mut self) {
-        // A sink dropped without [`Self::finish`] -- through an unwind, or
-        // because its owner was dropped -- must still not leave a record in
-        // memory or a line unwritten.
         self.finish();
     }
 }
@@ -646,29 +439,9 @@ impl Drop for LineBufferedSink {
 /// | `Curl_tls_keylog_write` | [`Self::write_secret`] |
 /// | `Curl_tls_keylog_write_line` | [`Self::write_line`] |
 /// | `static FILE *keylog_file_fp` | the owned [`Mutex`] below |
-///
-/// # Thread safety
-///
-/// rustls calls [`rustls::KeyLog::log`] from whichever task drives the
-/// handshake, and a multi handle can drive many at once, so this type is
-/// [`Send`] and [`Sync`] and every write takes the sink's lock for the
-/// duration of a whole record. The lock is never held across a call into
-/// rustls, so no lock ordering exists to get wrong.
-///
-/// A panic elsewhere while the lock was held poisons it. Every access here
-/// recovers with [`PoisonError::into_inner`], the pattern this crate already
-/// uses for diagnostic sinks: a key log that stops working because an
-/// unrelated task panicked would be a worse outcome than one that keeps
-/// appending.
 #[allow(dead_code)]
 pub(crate) struct KeyLogFile {
     /// The destination, or [`None`] when the log is disabled or closed.
-    ///
-    /// One [`Option`] carries both states because C carries both in one
-    /// pointer: `keylog_file_fp` is `NULL` when the variable was unset, when
-    /// the file could not be opened, when `setvbuf` failed, and after
-    /// `Curl_tls_keylog_close`. Nothing distinguishes them, and nothing needs
-    /// to.
     sink: Mutex<Option<LineBufferedSink>>,
 }
 
@@ -686,13 +459,6 @@ impl KeyLogFile {
     }
 
     /// Reads `SSLKEYLOGFILE` and opens the log if it names a usable path.
-    ///
-    /// The direct counterpart of `Curl_tls_keylog_open`
-    /// (`lib/vtls/keylog.c:40-62`) as the rustls backend calls it at
-    /// `lib/vtls/rustls.c:815`. An absent variable, an empty variable and an
-    /// unopenable path all yield a disabled log rather than an error, exactly
-    /// as they do in C, because `rustls.c:816-818` returns `CURLE_OK` when the
-    /// log did not open.
     #[allow(dead_code)]
     pub(crate) fn open_from_env() -> Arc<Self> {
         let keylog = Self::disabled();
@@ -703,12 +469,6 @@ impl KeyLogFile {
     }
 
     /// A key log that writes to an injected writer instead of a file.
-    ///
-    /// The seam that keeps this module testable without a file or an
-    /// environment variable, and that lets an owner send records somewhere
-    /// other than the filesystem. Buffering follows the same rule as a
-    /// file-backed log, so an injected writer observes exactly the write
-    /// pattern a file would.
     #[allow(dead_code)]
     pub(crate) fn with_writer(writer: Box<dyn Write + Send>) -> Arc<Self> {
         Arc::new(Self {
@@ -718,12 +478,6 @@ impl KeyLogFile {
 
     /// Opens the log from the environment if it is not already open, and
     /// reports whether it is open afterwards.
-    ///
-    /// Idempotent, because `Curl_tls_keylog_open` is: `lib/vtls/keylog.c:44`
-    /// guards the whole body with `if(!keylog_file_fp)`, so a second call on
-    /// an open log neither re-reads the environment nor reopens the file. The
-    /// rustls backend relies on that -- `rustls.c:815` calls it on every
-    /// configuration build, once per easy handle.
     #[allow(dead_code)]
     pub(crate) fn open(&self) -> bool {
         let mut sink = self.locked();
@@ -747,17 +501,9 @@ impl KeyLogFile {
 
     /// Appends one NSS key log record, returning whether it was written.
     ///
-    /// `Curl_tls_keylog_write` (`lib/vtls/keylog.c:105-145`), reached from
-    /// `cr_keylog_log_cb` (`lib/vtls/rustls.c:504-515`). The record is
-    ///
     /// ```text
     ///     <label> <64 hex digits> <2 * secret.len() hex digits><LF>
     /// ```
-    ///
-    /// with uppercase hex, exactly one space between fields, no CR, and no
-    /// trailing byte after the LF.
-    ///
-    /// Returns `false`, writing nothing, when
     ///
     /// * the log is disabled or has been closed (`keylog.c:113-115`),
     /// * `label` is longer than [`KEYLOG_LABEL_MAXLEN`] bytes
@@ -768,10 +514,6 @@ impl KeyLogFile {
     ///   (`keylog.c:118`), or
     /// * the write itself fails, which C does not report at all
     ///   (`keylog.c:143-144`).
-    ///
-    /// Nothing is logged or reported about a rejection beyond that `false`.
-    /// The arguments are key material, and a diagnostic that named them would
-    /// defeat the point of the file's permissions.
     #[allow(dead_code)]
     pub(crate) fn write_secret(
         &self,
@@ -794,24 +536,11 @@ impl KeyLogFile {
     /// Appends an arbitrary line, terminating it with an LF if it is not
     /// terminated already.
     ///
-    /// `Curl_tls_keylog_write_line` (`lib/vtls/keylog.c:77-103`). Takes bytes
-    /// rather than a string because the C signature takes `const char *` and
-    /// because a key log line is a byte sequence: no encoding conversion, no
-    /// escape processing and no newline normalization may happen on the way
-    /// through.
-    ///
-    /// Returns `false`, writing nothing, when
-    ///
     /// * the log is disabled or has been closed (`keylog.c:83`),
     /// * `line` is empty (`keylog.c:88`),
     /// * `line` is longer than [`LINE_MAXLEN`] bytes (`keylog.c:88`, which
     ///   rejects `linelen > sizeof(buf) - 2` for a 256-byte buffer), or
     /// * the write fails.
-    ///
-    /// A line that already ends in an LF is written unchanged -- C compares
-    /// `line[linelen - 1] != '\n'` before appending (`keylog.c:94-96`) -- so
-    /// a caller can hand over a record it composed itself and get exactly
-    /// those bytes.
     #[allow(dead_code)]
     pub(crate) fn write_line(&self, line: &[u8]) -> bool {
         if line.is_empty() || line.len() > LINE_MAXLEN {
@@ -831,16 +560,6 @@ impl KeyLogFile {
     }
 
     /// Closes the log. Safe to call any number of times.
-    ///
-    /// `Curl_tls_keylog_close` (`lib/vtls/keylog.c:64-70`), which is guarded
-    /// by `if(keylog_file_fp)` and therefore already idempotent. Two callers
-    /// in the rustls backend depend on that: `init_config_builder_keylog`
-    /// calls it when `rustls_client_config_builder_set_key_log` fails
-    /// (`lib/vtls/rustls.c:823-826`), and `cr_cleanup` calls it
-    /// unconditionally afterwards (`rustls.c:1392-1395`).
-    ///
-    /// Buffered bytes are flushed while the lock is still held, so a
-    /// concurrent [`Self::open`] cannot interleave with the flush.
     #[allow(dead_code)]
     pub(crate) fn close(&self) {
         let mut sink = self.locked();
@@ -850,13 +569,6 @@ impl KeyLogFile {
     }
 
     /// Hands this log to rustls as its [`rustls::KeyLog`].
-    ///
-    /// `ClientConfig::key_log` is an `Arc<dyn KeyLog>`
-    /// (`rustls-0.23.42/src/client/client_conn.rs:217`), and this is the
-    /// upcast that fills it -- the safe counterpart of
-    /// `rustls_client_config_builder_set_key_log(builder, cr_keylog_log_cb,
-    /// NULL)` at `lib/vtls/rustls.c:820-822`, with the object itself standing
-    /// in for the `NULL` user-data pointer that C had to pass.
     #[allow(dead_code)]
     pub(crate) fn into_key_log(self: Arc<Self>) -> Arc<dyn RustlsKeyLog> {
         self
@@ -871,11 +583,6 @@ impl KeyLogFile {
     /// * `append(true)` -- an existing key log is added to, never truncated.
     ///   A capture taken an hour ago must still be decryptable.
     /// * `create(true)` -- a first run creates the file.
-    ///
-    /// Any failure yields [`None`], which leaves the log disabled. That
-    /// covers a missing directory, a permission denial, a path that names a
-    /// directory, a path this process must not write secrets into (see
-    /// [`Self::open_private_append`]), and every other reason `open` can fail.
     fn open_env_file() -> Option<Box<dyn Write + Send>> {
         let path = Self::env_path(var_os(SSLKEYLOGFILE))?;
         let file = Self::open_private_append(path.as_ref()).ok()?;
@@ -898,9 +605,9 @@ impl KeyLogFile {
     /// it does not own by an attacker who wins the race to create the path
     /// first. Both are properties of the C code, not of its translation.
     ///
-    /// This is therefore not a parity repair; it is a deliberate hardening, and
-    /// the deliberation is recorded here rather than left to be inferred. Three
-    /// things justify diverging from a frozen behaviour (AAP section 0.8.1):
+    /// This is therefore not a parity repair; it is a deliberate hardening,
+    /// and the deliberation is recorded here rather than left to be inferred.
+    /// Three things justify diverging from a frozen behaviour:
     ///
     /// 1. The bytes are unchanged. Nothing about the file's *contents*, its
     ///    append semantics or its buffering differs; only which files this
@@ -936,20 +643,6 @@ impl KeyLogFile {
     ///   already had -- [`OpenOptionsExt::mode`] applies only on creation -- so
     ///   a key log left behind at `0644` by a C curl, or by a redirect, is
     ///   refused rather than appended to.
-    ///
-    /// # Why the checks read the descriptor and not the path
-    ///
-    /// [`std::fs::File::metadata`] is `fstat` on the descriptor that was just
-    /// opened, so the file examined is exactly the file that will be written.
-    /// Checking the *path* with [`std::fs::metadata`] would be a
-    /// time-of-check/time-of-use race: the path could be replaced between the
-    /// check and the open. There is no such window here, and the mode the file
-    /// is created with closes the remaining one -- a file created `0600` cannot
-    /// be read by anyone else even for the instant before the check runs.
-    ///
-    /// Nothing is tightened in place. A `chmod` on a file the user owns would
-    /// change observable filesystem state, which this module has no mandate to
-    /// do; refusing changes nothing outside the process.
     fn open_private_append(path: &OsStr) -> io::Result<File> {
         let file = OpenOptions::new()
             .append(true)
@@ -973,18 +666,6 @@ impl KeyLogFile {
     }
 
     /// Applies curl's rule for an empty environment value.
-    ///
-    /// [`var_os`] rather than `var` so that a path which is not valid UTF-8
-    /// still works: `curl_getenv` hands `fopen` the raw bytes
-    /// (`lib/getenv.c:78-79`), and a Unix path is a byte string. Rejecting
-    /// such a path would be a regression that no test of a UTF-8 path could
-    /// detect.
-    ///
-    /// An empty value counts as absent, because `curl_getenv` returns `NULL`
-    /// unless `env && env[0]` (`lib/getenv.c:79`).
-    ///
-    /// Split out from [`Self::open_env_file`] so the rule is testable without
-    /// mutating the process environment.
     #[allow(dead_code)]
     fn env_path(value: Option<OsString>) -> Option<OsString> {
         match value {
@@ -994,12 +675,6 @@ impl KeyLogFile {
     }
 
     /// Formats one NSS key log record, or rejects the arguments.
-    ///
-    /// The body of `Curl_tls_keylog_write` (`lib/vtls/keylog.c:117-139`)
-    /// without its file handling, so that the format can be verified byte for
-    /// byte on its own. The buffer is created at [`MAX_GENERATED_LINE`]
-    /// capacity and never grows, so no key material is copied into a second
-    /// allocation on the way out.
     #[allow(dead_code)]
     fn secret_record(
         label: &str,
@@ -1063,10 +738,6 @@ impl fmt::Debug for KeyLogFile {
     /// rustls avoids the same trap by hand (`key_log_file.rs`: "we omit
     /// self.buf deliberately as it may contain key data") and additionally
     /// prints the file handle, which names the path. This prints neither.
-    ///
-    /// [`Mutex::try_lock`] rather than [`Mutex::lock`]: formatting must not
-    /// block, and must not deadlock if a future caller ever formats this
-    /// value while a write is in flight.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = f.debug_struct("KeyLogFile");
         match self.sink.try_lock() {
@@ -1082,12 +753,6 @@ impl fmt::Debug for KeyLogFile {
 
 impl Drop for KeyLogFile {
     /// Flushes and releases the file.
-    ///
-    /// `cr_cleanup` (`lib/vtls/rustls.c:1392-1395`) closes the C log
-    /// explicitly, and the rustls backend is the only thing that ever did;
-    /// anything else that had opened it leaked the handle for the life of the
-    /// process. An owned object closes itself, so the explicit call becomes an
-    /// optimization rather than an obligation.
     fn drop(&mut self) {
         // `get_mut` rather than `lock`: `&mut self` proves that no other
         // holder exists, so there is nothing to contend with.
@@ -1115,25 +780,11 @@ impl RustlsKeyLog for KeyLogFile {
     ///   (`rustls.c:510`) and no `DEBUGASSERT` that vanishes in a release
     ///   build (`:511`): a client random of the wrong length is rejected in
     ///   every build.
-    ///
-    /// The return value of [`KeyLogFile::write_secret`] is deliberately
-    /// dropped. rustls has no way to report a key log failure and no
-    /// behaviour that should change because of one -- `cr_keylog_log_cb`
-    /// discards the same answer.
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
         let _recorded = self.write_secret(label, client_random, secret);
     }
 
     /// Whether [`Self::log`] would write this label's secret.
-    ///
-    /// rustls documents this as a performance optimization and skips the
-    /// derivation of the logged secret when it answers `false`, so answering
-    /// accurately keeps key material out of memory that would never be
-    /// written. Both conditions that would make [`KeyLogFile::write_secret`]
-    /// reject on the label's account are checked: the log must be open, and
-    /// the label must fit [`KEYLOG_LABEL_MAXLEN`].
-    ///
-    /// The length test comes first because it needs no lock.
     fn will_log(&self, label: &str) -> bool {
         label.len() <= KEYLOG_LABEL_MAXLEN && self.enabled()
     }
@@ -1323,12 +974,6 @@ mod tests {
 
     /// Binds a scratch directory, failing the test loudly if the environment
     /// cannot provide one.
-    ///
-    /// A macro rather than a function because the failure arm has to leave the
-    /// *test*. `unwrap`, `expect` and `panic!` are avoided throughout this
-    /// file, in tests as well as in the code they exercise; the `let ... else`
-    /// arm is unreachable because the assertion above it has already failed
-    /// the test.
     macro_rules! scratch {
         ($name:ident) => {
             let $name = tempfile::tempdir();
@@ -1368,14 +1013,6 @@ mod tests {
     }
 
     /// Writes `bytes` to `path` at exactly `mode`, reporting success.
-    ///
-    /// [`fs::write`] cannot be used where the mode matters: it creates with
-    /// `0666` narrowed by the process umask, so the resulting mode is a property
-    /// of the environment the test runs in rather than of the test. The mode is
-    /// requested at creation *and* set again afterwards, because a umask can
-    /// only clear bits -- requesting `0600` under a umask of `0077` would leave
-    /// `0600`, but requesting `0644` under the same umask would leave `0600` and
-    /// silently defeat a test that meant to produce a group-readable file.
     fn seed_at_mode(path: &Path, bytes: &[u8], mode: u32) -> bool {
         let file = OpenOptions::new()
             .write(true)
@@ -1398,15 +1035,6 @@ mod tests {
 
     // -- why some tests below are `#[cfg_attr(miri, ignore)]` ----------------
     //
-    // Miri's two relevant shims contradict each other, which was measured
-    // rather than assumed: `geteuid()` returns a hard-coded `1000`, while every
-    // file its filesystem shim reports is owned by uid `0`. So under Miri the
-    // ownership comparison in `secret_file_verdict` can never hold, whatever the
-    // code does -- a test that expects an open to succeed necessarily fails, and
-    // a test that expects a refusal necessarily passes for the wrong reason.
-    // Both are worthless there, so both are ignored, and the reason string on
-    // each one names the shim rather than the symptom.
-    //
     // Nothing of Miri's actual purpose is lost. This module contains no
     // `unsafe`, the only foreign call the hardened open reaches is `geteuid`
     // (which `ffi/sys.rs` covers under Miri in its own right), and the refusal
@@ -1414,19 +1042,8 @@ mod tests {
     // `secret_file_verdict` tests, which take the ownership and mode as
     // arguments and touch no filesystem at all.
     //
-    // The reason string used throughout is deliberately identical, so that the
-    // concession is countable. The audit pattern is ANCHORED at the start of
-    // the line, and that is not decoration: these paragraphs quote the reason
-    // text as well, so an unanchored grep would count its own documentation and
-    // over-report. A comment line begins with `    // ` and an attribute line
-    // with `    #[`, so anchoring separates them exactly.
-    //
-    //   grep -cE '^    #\[cfg_attr\(miri, ignore = "Miri.s uid shims'  -> 12
-    //
     // A SECOND, DISTINCT REASON EXISTS, and it is spelled differently on
     // purpose so that each concession stays separately auditable:
-    //
-    //   grep -cE '^    #\[cfg_attr\(miri, ignore = "Miri.s isolation'  -> 4
     //
     // Miri runs with filesystem isolation enabled, and this gate deliberately
     // passes no `-Zmiri-disable-isolation` -- `.github/workflows/rust-miri.yml`
@@ -1442,17 +1059,6 @@ mod tests {
     //   opening_an_open_log_does_not_reopen_it       mkdir  aborts
     //   a_dangling_symlink_creates_nothing           mkdir  aborts
     //   a_directory_is_refused_by_the_open           mkdir  aborts
-    //
-    // and, for contrast, the two neighbouring cases that take no scratch
-    // directory -- `an_absent_variable_leaves_the_log_disabled` and
-    // `an_empty_variable_leaves_the_log_disabled` -- both PASS under Miri and
-    // are therefore NOT ignored. The rule is exactly "ignore what needs a
-    // scratch directory", not "ignore this area of the file".
-    //
-    // Nothing of Miri's purpose is lost here either. What these four assert is
-    // the behaviour of a real `openat` against a real directory entry, which is
-    // a kernel property rather than a language-level one; Miri has no more to
-    // say about it than the native test run already does.
 
     // -- the constants ------------------------------------------------------
 
@@ -2161,14 +1767,6 @@ mod tests {
     /// An existing key log is appended to, never truncated: `"a"` mode
     /// (`keylog.c:47`, `lib/curl_setup.h:1257-1260`). A capture taken before
     /// this run must stay decryptable.
-    ///
-    /// The seed is written at [`SECRET_FILE_MODE`] rather than with a plain
-    /// `fs::write`, which would take its mode from the process umask -- `0644`
-    /// under the usual `0022` -- and be refused by
-    /// [`KeyLogFile::open_private_append`]. That refusal is correct and is
-    /// asserted by [`a_world_readable_key_log_is_refused`]; what this test is
-    /// about is the append, so its fixture models a key log this implementation
-    /// would itself have left behind.
     #[test]
     #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
     fn an_existing_key_log_is_appended_not_truncated() {
@@ -2288,20 +1886,6 @@ mod tests {
     }
 
     // -- secret-file safety (F21) ------------------------------------------
-    //
-    // Two layers, tested separately on purpose.
-    //
-    // `secret_file_verdict` is the rule, and it is a pure function of four
-    // facts, so every combination -- including the ones a single host cannot be
-    // made to produce, such as a file owned by a user this process is not --
-    // is reachable without root, without a particular filesystem and without a
-    // `chown`.
-    //
-    // `open_private_append` is the wiring, and it is tested against real files
-    // in a real directory, because the properties that matter there are
-    // properties of the kernel: whether `O_NOFOLLOW` really refuses a symlink,
-    // whether the mode a file is created with really is `0600` after the umask
-    // has had its say, and whether the descriptor really carries `O_CLOEXEC`.
 
     /// A private, self-owned regular file is the one accepted combination.
     #[test]
@@ -2407,11 +1991,6 @@ mod tests {
 
     /// A key log this implementation creates is private before any umask is
     /// consulted.
-    ///
-    /// The umask in force is deliberately widened to `0` for the duration, which
-    /// is the configuration under which C's `fopen(name, "a")` leaves a `0666`
-    /// file. If the mode came from the umask rather than from
-    /// [`SECRET_FILE_MODE`], this is the test that says so.
     #[test]
     #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
     fn a_created_key_log_is_private() {
@@ -2445,12 +2024,6 @@ mod tests {
     }
 
     /// A key log left behind world-readable is refused, and left untouched.
-    ///
-    /// This is the case a C curl produces under the usual umask, so the refusal
-    /// is the deliberate divergence documented on
-    /// [`KeyLogFile::open_private_append`] -- not an accident. The file's
-    /// contents are checked afterwards because a refusal that had already
-    /// appended would be worthless.
     #[test]
     #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
     fn a_world_readable_key_log_is_refused() {
@@ -2583,15 +2156,6 @@ mod tests {
     }
 
     /// A character device is refused: the regular-file check.
-    ///
-    /// `/dev/null` is the one non-regular file that can be opened for writing
-    /// on any of the mandated targets without blocking and without privileges.
-    /// A FIFO is deliberately *not* used: opening one for writing with no reader
-    /// blocks inside `open`, before any check of ours can run, so a test built
-    /// on one would hang rather than fail. That limit is real and is recorded
-    /// here rather than papered over -- the regular-file test stops a device or
-    /// a socket from receiving secrets, and a FIFO blocks exactly as C's
-    /// `fopen` would.
     #[test]
     #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
     fn a_character_device_is_refused() {
@@ -2609,14 +2173,6 @@ mod tests {
     }
 
     /// The descriptor is close-on-exec, so a child process cannot read it.
-    ///
-    /// Read back from `/proc/self/fdinfo`, which reports the descriptor's flags
-    /// in octal, rather than trusted from the flag having been passed: Rust's
-    /// [`File`] sets `O_CLOEXEC` itself, so passing it proves nothing on its
-    /// own and this is the assertion that the property actually holds.
-    ///
-    /// Linux only, because `/proc` is where the answer is legible without a
-    /// `fcntl` call, which this module may not make.
     #[test]
     #[cfg_attr(miri, ignore = "Miri's uid shims disagree")]
     #[cfg(target_os = "linux")]

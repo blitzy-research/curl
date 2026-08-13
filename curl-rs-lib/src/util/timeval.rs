@@ -26,26 +26,10 @@
 // read a clock. Nothing else in the crate may call a monotonic or a
 // wall-clock primitive: every consumer receives a [`Clock`] and asks it.
 //
-// That is AAP 0.3.3's P12 (dependency injection) applied to time, and it is
-// an architectural requirement rather than a preference. AAP 0.8.4 sets a
-// line-coverage gate of at least 80 percent over `src/protocols/` and
-// `src/transfer/`, and almost everything in those directories is
-// time-driven: connect and transfer timeouts, retry backoff, keep-alive
-// expiry, rate limiting and the multi handle's timer tree. A test cannot
-// reach those paths deterministically unless it can move time itself, so a
-// clock that cannot be controlled makes the gate unreachable. Hence
-// [`TestClock`], which is `pub(crate)` and NOT `#[cfg(test)]`, so that any
-// module's tests can inject it.
-//
 // HOW TO CHECK THE CLAIM, because it is the kind of invariant that decays
-// silently:
-//
-//   grep -rn 'Instant::now\|SystemTime::now' curl-rs-lib/src \
-//     --include='*.rs'
-//
-// Every match must be either inside this file or inside a comment. Measured:
-// the only calls are in this file, and the two other matches -- in
-// `src/lib.rs` and `src/trace.rs` -- are prose stating this same rule.
+// silently: every match for a clock constructor must be either inside this
+// file or inside a comment. Real clock reads are confined here; matches
+// elsewhere in the crate are prose stating this same rule.
 //
 // NO GLOBAL CLOCK, at any level. No `static mut`, no clock in a
 // `thread_local!`, and no `OnceLock<Box<dyn Clock>>` singleton that a test
@@ -55,22 +39,12 @@
 // immutable-once-written `OnceLock<Instant>` and is documented at its
 // definition.
 //
-// `dead_code` is allowed per ITEM, never for the file. Nothing outside this
-// file consumes the clock yet -- `conn/`, `transfer/`, `multi/` and
-// `cookies/` are the consumers, and they land after it -- so each item that
-// has no caller today carries its own `#[allow(dead_code)]`, to be removed
-// when its consumer arrives. A file- or module-scoped allowance would
-// instead silence the NEXT unreferenced item somebody adds; the rule and the
-// executable gate that enforces it across the workspace live in
-// `curl-rs-lib/src/lib.rs` (`mod source_policy`).
-//
 // FOUR THINGS THIS FILE MUST NOT NAME, each for its own reason:
 //
 //   * `unsafe` -- `src/lib.rs` carries `#![deny(unsafe_code)]` and grants
 //     exactly one exemption, on `mod ffi`, which is not here. The C's four
 //     preprocessor clock paths and its `gmtime_r` call are precisely the
-//     platform reaching that AAP 0.6.9 replaces with safe standard-library
-//     calls.
+//     platform reaching that safe standard-library calls replace.
 //   * `libc` -- the crate does declare it, and it is reserved for
 //     `src/ffi/`. A C scalar width or a C-shaped time structure appearing
 //     here would make a platform assumption part of the engine's own API.
@@ -82,8 +56,8 @@
 //     that `as` performs quietly.
 
 //! The monotonic clock, the instant type, the time differences and the UTC
-//! calendar conversion -- supersedes `lib/curlx/timeval.c` (272 lines) and
-//! `lib/curlx/timeval.h` (74).
+//! calendar conversion -- supersedes `lib/curlx/timeval.c` and
+//! `lib/curlx/timeval.h`.
 //!
 //! # The whole C surface, item by item
 //!
@@ -119,55 +93,7 @@
 //! * There is NO `curlx_ptimediff_ceil_ms` in the C -- only the value-taking
 //!   form -- and none is invented here.
 //! * `curlx_now_init` is inside `#ifdef _WIN32` and exists solely to fill in
-//!   `QueryPerformanceFrequency` before the first reading. All four mandated
-//!   targets (AAP 0.8.3) are Linux and macOS, so it is excluded by the
-//!   platform boundary of AAP 0.2.2 along with the rest of the Windows tree.
-//!
-//! # Four monotonic sources collapse into one
-//!
-//! `lib/curlx/timeval.c` selects a clock with the preprocessor and has four
-//! implementations of the same function. All four collapse into
-//! [`std::time::Instant`], which already performs that selection per
-//! platform and guarantees monotonicity. This is a substantive
-//! simplification, so it is recorded here rather than left for a reader to
-//! notice:
-//!
-//! 1. **`clock_gettime`** (`timeval.c:53-116`), preferring
-//!    `CLOCK_MONOTONIC_RAW` where the build detected it, falling back to
-//!    `CLOCK_MONOTONIC`, then to `gettimeofday`, then to `time(NULL)` with a
-//!    zero microsecond field. The C states the contract it relies on at
-//!    `:55-61`: the clock increases monotonically, and although its starting
-//!    point is unspecified -- system start-up, the epoch, or something else
-//!    -- that starting point does not change once the system is up.
-//! 2. **`mach_absolute_time`** (`timeval.c:122-143`), the older macOS path,
-//!    which scales Mach absolute time units by the ratio from
-//!    `mach_timebase_info` and then splits the result into seconds and
-//!    microseconds.
-//! 3. **`gettimeofday`** (`timeval.c:147-158`), carrying the C's own warning
-//!    at `:150-153` that it is NOT granted to increase monotonically,
-//!    because clock drift and external time sync move it in either
-//!    direction.
-//! 4. **`time(NULL)`** (`timeval.c:162-169`), the last resort, with
-//!    one-second granularity.
-//!
-//! Plus a fifth thing that disappears: the Apple weak-symbol guard at
-//! `timeval.c:66-73`. `clock_gettime` may be declared by Apple's SDK as a
-//! weak symbol, so the C compiles against it and then fails at run time on
-//! an OS version that lacks it, and the C therefore tests
-//! `__builtin_available(macOS 10.12, iOS 10, tvOS 10, watchOS 3, *)` before
-//! every call. The standard library resolves that question when it is built
-//! for the target, which is exactly the substitution AAP 0.4.2 prescribes:
-//! a `curl_setup.h`-style platform probe becomes the standard library's
-//! responsibility or a crate's, not this code's.
-//!
-//! **One honest deviation.** `CLOCK_MONOTONIC_RAW` is not reachable through
-//! [`Instant`], and it is not reproduced. Reaching it would mean naming
-//! `libc` in `util`, which is reserved for the FFI island. The difference is
-//! not observable behaviour: both clocks are monotonic, and RAW differs only
-//! in skipping the adjustments an external time sync makes, which affects the
-//! RATE at which an elapsed measurement accrues by parts per million and
-//! never its sign or its ordering. No test in `tests/data` can distinguish
-//! them, because no fixture asserts an elapsed duration to that precision.
+//!   `QueryPerformanceFrequency` before the first reading.
 //!
 //! # The monotonic reading and the wall reading are different clocks
 //!
@@ -183,33 +109,6 @@
 //! never expires or expires immediately, and nothing in the type system
 //! stops that, which is why it is stated here.
 //!
-//! [`Clock::epoch_secs`] is WALL time: seconds since the Unix epoch, the
-//! successor of the bare `time(NULL)` that the C calls at each site that
-//! needs a calendar instant -- `lib/http_aws_sigv4.c:955`, cookie expiry,
-//! and the HSTS and Alt-Svc caches. It may jump in either direction, so it
-//! must never be used to measure how long something took.
-//!
-//! The C keeps the same separation, in the same file: `curlx_now` is the
-//! monotonic reading, while `curlx_gmtime` takes a `time_t` from its caller
-//! and reads no clock at all.
-//!
-//! # The millisecond difference is not `Duration::as_millis`
-//!
-//! `curlx_ptimediff_ms` computes `secs_delta * 1000 + usec_delta / 1000`,
-//! and both the C and Rust truncate integer division TOWARD ZERO. A
-//! microsecond delta of -500 therefore contributes 0, not -1, so the result
-//! is not the same number that subtracting two instants and asking for whole
-//! milliseconds would give. The formula is transcribed literally in
-//! [`timediff_ms`] for that reason, and the four vectors of
-//! `tests/unit/unit1323.c` pin it.
-//!
-//! A negative result is LEGAL and is returned unchanged. The C says so three
-//! times, once above each declaration (`timeval.h:43-48`, `:53-58`,
-//! `:62-67`): make sure the first argument is the more recent time, "as
-//! otherwise you get a weird negative time-diff back". Callers detect a
-//! swapped pair of arguments by seeing that negative value, so clamping it
-//! to zero here would hide their bug and change behaviour.
-//!
 //! # The calendar conversion is pure Rust
 //!
 //! [`gmtime`] supersedes `curlx_gmtime`, whose own comment (`:247-249`)
@@ -217,14 +116,6 @@
 //! use the gmtime_s(), gmtime_r() or gmtime() functions anywhere else but
 //! here." Restated for this crate: **this is the only calendar conversion in
 //! `curl-rs-lib`, and every other module calls it.**
-//!
-//! It is implemented rather than delegated because there is nothing to
-//! delegate to. `libc` is reserved for the FFI island, and the pinned
-//! dependency set of AAP 0.5.1 contains no calendar crate -- `httpdate`
-//! formats and parses the three HTTP date forms and exposes no broken-down
-//! time. The days-from-civil algorithm is about twenty lines, is exact over
-//! the whole proleptic Gregorian calendar, and is far easier to test than to
-//! argue about.
 //!
 //! Two neighbours own the two adjacent jobs, and neither is duplicated here:
 //!
@@ -243,24 +134,6 @@
 //!   formats that the C builds field by field with `curl_msnprintf`, at
 //!   `lib/http.c:1904-1910`, `lib/file.c:454-460`, `lib/ftp.c:2461-2467`,
 //!   `lib/hsts.c:293-294` and `lib/altsvc.c:270-271`.
-//!
-//! # What is deliberately absent
-//!
-//! * **No free `now(clock: &dyn Clock)` function.** It would add a name
-//!   without adding meaning: `clock.now()` already reads as the C does.
-//! * **No default [`Clock`] implementation and no `Default` for the trait
-//!   object.** A consumer that forgot to inject a clock must fail to
-//!   compile, not silently fall back to the system clock.
-//! * **No `From<Duration> for CurlTime`.** A [`Duration`] is a span and a
-//!   [`CurlTime`] is an instant; converting between them without naming a
-//!   zero point is the confusion the section above warns about.
-//!   [`CurlTime::add`] takes a span and returns an instant, which is the only
-//!   direction that has a meaning.
-//! * **No leap-second handling.** Unix time has no leap seconds and neither
-//!   `gmtime_r` nor this successor invents any.
-//! * **No time-zone support.** The C's only conversion is to UTC. Local time
-//!   is `crate::ffi::sys`'s business, because it requires the platform's
-//!   zone database.
 
 use std::fmt;
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -280,10 +153,6 @@ const MS_PER_SEC: TimeDiff = 1_000;
 /// ```text
 /// diff * 1000 + (newer->tv_usec - older->tv_usec) / 1000
 /// ```
-///
-/// The left one scales seconds into milliseconds and the right one reduces
-/// microseconds to milliseconds. Two names keep the two roles legible; a test
-/// asserts they agree numerically.
 const MICROS_PER_MS: TimeDiff = 1_000;
 
 /// Microseconds in a second: the `1000000` of `timeval.c:230`.
@@ -310,17 +179,6 @@ const DAYS_PER_WEEK: i64 = 7;
 /// };
 /// ```
 ///
-/// # The two field widths, and why they differ
-///
-/// `time_t` is a signed 64-bit integer on all four mandated targets
-/// (AAP 0.8.3), so [`i64`] is not an assumption but the width the C tree
-/// compiles to; AAP 0.2.2 forfeits 32-bit targets deliberately, and this is
-/// one of the places that decision shows. `tv_usec` is a plain C `int`, which
-/// is 32-bit on every one of those targets, so it is [`i32`] rather than an
-/// unsigned type -- the C's own arithmetic subtracts one microsecond field
-/// from another and relies on the difference being signed
-/// (`timeval.c:194`).
-///
 /// # The invariant
 ///
 /// **`0 <= usec < 1_000_000`.** Every constructor and every arithmetic method
@@ -328,34 +186,6 @@ const DAYS_PER_WEEK: i64 = 7;
 /// rather than leaving it out of range. [`CurlTime::new`] additionally
 /// asserts it in a debug build, so a caller passing 1_500_000 microseconds
 /// learns of the mistake instead of receiving a silently corrected value.
-///
-/// The fields are `pub(crate)` because the C's are public and every C call
-/// site reads them directly. A struct literal therefore bypasses [`new`] and
-/// its assertion, exactly as C does; the invariant is then the writer's
-/// contract. The comparison and difference functions below stay well defined
-/// either way -- they never index or allocate on the strength of `usec` --
-/// so a violated invariant produces a wrong number rather than a panic or
-/// worse, which is also what C does.
-///
-/// # Ordering
-///
-/// [`Ord`] is DERIVED, and the field declaration order is what makes it
-/// correct: `secs` is compared first and `usec` only breaks a tie. That is
-/// load-bearing rather than incidental, because the expiry timer tree that
-/// supersedes `lib/splay.c` keys on a reading, and the order in which timers
-/// fire is observable in `--trace` output. Deriving is preferred to
-/// hand-writing precisely so that adding a field cannot silently change the
-/// comparison; a test asserts the property rather than trusting the derive.
-///
-/// # Not [`Instant`]
-///
-/// [`Instant`] is deliberately NOT the type that crosses module boundaries.
-/// It is opaque and cannot be constructed at a chosen value, so a test could
-/// not place a transfer at a known instant, and the coverage gate of
-/// AAP 0.8.4 over the time-driven modules would be out of reach. [`Instant`]
-/// backs [`SystemClock`] internally and stops there.
-///
-/// [`new`]: CurlTime::new
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) struct CurlTime {
@@ -368,12 +198,6 @@ pub(crate) struct CurlTime {
 
 impl CurlTime {
     /// The zero reading, `{ tv_sec = 0, tv_usec = 0 }`.
-    ///
-    /// The C uses an all-zero `struct curltime` as "not set" and tests for it
-    /// field by field -- `if(!bs->started.tv_sec && !bs->started.tv_usec)` at
-    /// `lib/cf-ip-happy.c:396`, and `if(!conn->shutdown.start[i].tv_sec)` at
-    /// `lib/connect.c:185`. [`Self::is_zero`] is that test, and this is the
-    /// value it recognises. It equals [`Default::default`].
     #[allow(dead_code)]
     pub(crate) const ZERO: Self = Self { secs: 0, usec: 0 };
 
@@ -403,16 +227,6 @@ impl CurlTime {
     }
 
     /// This reading advanced by `span`.
-    ///
-    /// The successor of the C's open-coded `now.tv_sec + seconds` additions
-    /// at every expiry site. Saturating rather than wrapping: an expiry
-    /// placed [`i64::MAX`] seconds away is one that never arrives, which is
-    /// the intended reading of "as far in the future as this type can say",
-    /// whereas wrapping would place it in the distant past and fire it
-    /// immediately.
-    ///
-    /// The microsecond field is carried, so the result satisfies the
-    /// invariant even when the two microsecond parts sum past a second.
     #[allow(dead_code)]
     pub(crate) fn add(self, span: Duration) -> Self {
         let (secs, usec) = split(span);
@@ -429,10 +243,6 @@ impl CurlTime {
     /// clamped span. Callers that need the signed answer use
     /// [`timediff_ms`] or [`timediff_us`], which return it exactly as the C
     /// does -- see the module's note on negative differences.
-    ///
-    /// [`None`] is also returned when the difference in microseconds
-    /// overflows [`i64`], which needs the two readings to be about 292,000
-    /// years apart.
     #[allow(dead_code)]
     pub(crate) fn checked_sub(self, older: Self) -> Option<Duration> {
         let secs = self.secs.checked_sub(older.secs)?;
@@ -445,12 +255,6 @@ impl CurlTime {
 
     /// Builds a reading from a seconds field and an UNCHECKED microsecond
     /// field, carrying whole seconds out of the latter.
-    ///
-    /// The one place the invariant is established. [`i64::div_euclid`] and
-    /// [`i64::rem_euclid`] are floor division and a NON-NEGATIVE remainder,
-    /// which is what makes this correct for a negative microsecond field as
-    /// well: -1 microsecond becomes `secs - 1` plus 999,999 microseconds
-    /// rather than a negative field that would then compare wrongly.
     fn carry(secs: i64, usec: i32) -> Self {
         let total = i64::from(usec);
         Self {
@@ -465,13 +269,6 @@ impl CurlTime {
 }
 
 /// Splits a span into whole seconds and a microsecond remainder.
-///
-/// Shared by [`CurlTime::add`] and [`SystemClock`], which both need a
-/// [`Duration`] in the C's two fields. The seconds conversion saturates
-/// because [`Duration`] counts seconds in a [`u64`] and this type counts them
-/// in an [`i64`]: [`Duration::MAX`] is about 5.8e11 years, which no clock
-/// reading can represent, and saturating there yields "further away than this
-/// type can say" rather than a wrapped value in the past.
 fn split(span: Duration) -> (i64, i32) {
     let secs = i64::try_from(span.as_secs()).unwrap_or(i64::MAX);
     // `subsec_micros` returns `0..1_000_000` by construction, so this
@@ -482,32 +279,6 @@ fn split(span: Duration) -> (i64, i32) {
 }
 
 /// The crate's source of time, injected rather than reached for.
-///
-/// Supersedes `curlx_now` (`lib/curlx/timeval.c:173-178`) and the bare
-/// `time(NULL)` calls scattered through the C, and it is the seam that
-/// AAP 0.3.3's P12 requires. Every consumer takes a clock -- by reference,
-/// by trait object or as a generic parameter -- and no consumer reads the
-/// host clock itself. The module preamble records the grep that checks it.
-///
-/// # Two readings, never interchangeable
-///
-/// [`Self::now`] is monotonic and [`Self::epoch_secs`] is wall time. The
-/// module documentation states the prohibition in full; the short form is
-/// that elapsed time comes only from the first and calendar time only from
-/// the second.
-///
-/// # Why [`fmt::Debug`] is a supertrait
-///
-/// So that a structure holding a clock can itself derive [`Debug`], which is
-/// what lets a failing test print the state that produced the failure. Both
-/// implementations here satisfy it cheaply.
-///
-/// # Object safety
-///
-/// Both methods take `&self` and neither is generic, so `&dyn Clock` and
-/// `Box<dyn Clock>` both work. That is deliberate: a connection filter chain
-/// holds heterogeneous state and needs the trait-object form, while a unit
-/// test is happier with a concrete [`TestClock`].
 #[allow(dead_code)]
 pub(crate) trait Clock: fmt::Debug {
     /// A monotonic reading -- the successor of `curlx_now()`.
@@ -519,54 +290,16 @@ pub(crate) trait Clock: fmt::Debug {
 
     /// Wall-clock seconds since the Unix epoch -- the successor of
     /// `time(NULL)`.
-    ///
-    /// Negative before 1970, exactly as `time_t` is. Whole seconds only,
-    /// because that is all `time(NULL)` reports and all its consumers here
-    /// need: HTTP date headers, cookie expiry, the HSTS and Alt-Svc caches,
-    /// and comparisons against the instants [`crate::util::parsedate`]
-    /// returns.
-    ///
-    /// This reading may jump backwards. Do not measure elapsed time with it.
     fn epoch_secs(&self) -> i64;
 }
 
 /// The production [`Clock`]: the host's own clocks.
-///
-/// Zero-sized, so injecting it costs nothing and a structure holding one
-/// stays exactly as large as it was.
-///
-/// # What happened to the four C implementations
-///
-/// They collapsed into two standard-library calls, and the module
-/// documentation names each of the four and the Apple weak-symbol guard that
-/// went with them. In short: [`Instant`] is the monotonic clock, and
-/// [`SystemTime`] is the wall clock.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct SystemClock;
 
 impl Clock for SystemClock {
     /// Elapsed time since the first reading taken in this process.
-    ///
-    /// # The one `static` in this file
-    ///
-    /// [`Instant`] cannot be converted into a number, so a monotonic reading
-    /// has to be expressed as a difference from a fixed baseline. The
-    /// baseline is captured once per process in an [`OnceLock`] and is never
-    /// written again, which makes it immutable shared state rather than
-    /// mutable global state -- the distinction the module preamble draws.
-    /// Two [`SystemClock`] values in the same process therefore agree with
-    /// each other, which is what "monotonic" has to mean for readings taken
-    /// by different parts of one transfer.
-    ///
-    /// This is NOT a global clock and cannot be used as one: it holds an
-    /// [`Instant`], not a [`Clock`], so no test can install a different
-    /// clock through it and no code can obtain the time without being handed
-    /// a [`Clock`] first.
-    ///
-    /// The zero point is thus the first reading rather than system start-up.
-    /// The C's zero point is equally unspecified (`timeval.c:55-61`), so
-    /// nothing observable depends on the difference.
     fn now(&self) -> CurlTime {
         /// The process-start baseline. See this method's documentation.
         static BASELINE: OnceLock<Instant> = OnceLock::new();
@@ -581,18 +314,6 @@ impl Clock for SystemClock {
     }
 
     /// The successor of `time(NULL)`.
-    ///
-    /// # Before 1970
-    ///
-    /// [`SystemTime::duration_since`] fails rather than returning a negative
-    /// span when the host clock is set before the epoch, and failing is not
-    /// an option here because `time(NULL)` simply returns a negative
-    /// `time_t`. The error arm reconstructs that: the span is negated, and a
-    /// sub-second remainder borrows a whole second so that the result is the
-    /// FLOOR of the true value. That matches `time_t`, whose value counts
-    /// whole seconds and where 1969-12-31T23:59:59.5Z is -1 rather than 0,
-    /// and it keeps this reading consistent with [`gmtime`], which also
-    /// floors.
     fn epoch_secs(&self) -> i64 {
         match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(since) => i64::try_from(since.as_secs()).unwrap_or(i64::MAX),
@@ -614,24 +335,17 @@ impl Clock for SystemClock {
 /// # Why this is not `#[cfg(test)]`
 ///
 /// Because the tests that need it are not in this file. The coverage gate of
-/// AAP 0.8.4 falls on `src/protocols/` and `src/transfer/`, whose retries,
+/// The coverage gate falls on `src/protocols/` and `src/transfer/`, whose
+/// retries,
 /// timeouts, keep-alive expiry and rate limiting are all driven by a clock,
 /// and a `#[cfg(test)]` item in `util` is invisible to those modules' own
 /// test builds. It is `pub(crate)` so that every module's tests can inject
 /// it, and it is compiled into the library for the same reason. Nothing
-/// outside the crate can see it: AAP 0.4.2 keeps the surface `pub(crate)`,
-/// and AAP 0.8.7 forbids widening internals to make the C test programs
+/// outside the crate can see it: the surface stays `pub(crate)`,
+/// and internals are not widened to make the C test programs
 /// link.
 ///
 /// # Interior mutability, and why a [`Mutex`]
-///
-/// [`Clock::now`] takes `&self`, so moving the clock has to work through a
-/// shared reference. A [`Mutex`] is used rather than a [`Cell`] because a
-/// clock is injected into asynchronous code that may be polled from more
-/// than one thread, and a [`Cell`] is not [`Sync`]: with one, this type
-/// could not be shared across tasks at all. Both readings live behind the
-/// same lock, so a reader can never observe the monotonic reading from
-/// before an `advance` together with the wall reading from after it.
 ///
 /// A poisoned lock is recovered from rather than propagated. The state is two
 /// plain integers with no invariant spanning them, so a panic elsewhere
@@ -686,12 +400,6 @@ impl TestClock {
     }
 
     /// Places the monotonic reading at `at`, forwards or backwards.
-    ///
-    /// Moving it backwards is permitted here even though a real monotonic
-    /// clock never does, because a test may need to construct exactly that
-    /// pathology and check that a consumer survives it -- the C's own
-    /// fallback paths (`timeval.c:147-158`) can produce it on a host where
-    /// the monotonic clock turned out to be unavailable at run time.
     #[allow(dead_code)]
     pub(crate) fn set(&self, at: CurlTime) {
         self.mutate(|reading| reading.monotonic = at);
@@ -704,12 +412,6 @@ impl TestClock {
     }
 
     /// Moves time forward by `span`.
-    ///
-    /// BOTH readings move, by the same span. A test that waits an hour
-    /// expects the hour to have passed on both clocks, and modelling a host
-    /// whose wall clock is being dragged in a different direction from its
-    /// monotonic clock is what [`Self::set`] and [`Self::set_epoch_secs`]
-    /// are for.
     #[allow(dead_code)]
     pub(crate) fn advance(&self, span: Duration) {
         self.mutate(|reading| {
@@ -754,11 +456,6 @@ impl Clock for TestClock {
 /// return diff * 1000 + (newer->tv_usec - older->tv_usec) / 1000;
 /// ```
 ///
-/// Pass the MORE RECENT reading first. The C repeats the warning above each
-/// declaration (`timeval.h:43-48`): otherwise "you get a weird negative
-/// time-diff back". That negative value is returned unchanged rather than
-/// clamped, because it is how a caller detects the swap.
-///
 /// # Four details that are easy to get wrong, and are pinned by tests
 ///
 /// 1. **The division truncates toward ZERO, including for a negative
@@ -780,21 +477,11 @@ impl Clock for TestClock {
 ///    literal reading of the requirement suggests, without introducing an
 ///    arm that no input can reach and no test can cover.
 ///
-/// # Where the C would have undefined behaviour
-///
-/// `(timediff_t)newer->tv_sec - older->tv_sec` overflows signed arithmetic
-/// when the two seconds fields sit at opposite ends of [`i64`], which is
-/// undefined behaviour in C and a panic in a debug Rust build.
-/// [`i64::saturating_sub`] is used instead, and it lands on the same answer:
-/// a saturated difference is at least `TIMEDIFF_T_MAX / 1000` or at most
-/// `TIMEDIFF_T_MIN / 1000`, so the guard immediately below returns the bound
-/// that the true difference also implies.
-///
 /// # `@unittest: 1323`
 ///
 /// The C annotates this function with that reference (`timeval.c:184`).
 /// `tests/unit/unit1323.c` cannot link against a Rust static library
-/// (AAP 0.8.7), so its four vectors are ported into this file's test module
+///, so its four vectors are ported into this file's test module
 /// verbatim.
 #[allow(dead_code)]
 pub(crate) fn timediff_ms(newer: CurlTime, older: CurlTime) -> TimeDiff {
@@ -817,26 +504,6 @@ pub(crate) fn timediff_ms(newer: CurlTime, older: CurlTime) -> TimeDiff {
 /// ```text
 /// return diff * 1000 + (newer.tv_usec - older.tv_usec + 999) / 1000;
 /// ```
-///
-/// The C has only this value-taking form -- there is no
-/// `curlx_ptimediff_ceil_ms` -- and none is added here.
-///
-/// # "Rounded up" holds only for a non-negative numerator
-///
-/// Adding 999 and then truncating toward zero is the ceiling of a
-/// non-negative quotient, so 1 microsecond becomes 1 millisecond and 1001
-/// becomes 2. For a NEGATIVE microsecond difference the same expression is
-/// not a ceiling in any direction one would name: -500 microseconds becomes
-/// `(-500 + 999) / 1000`, which is 0, while -1500 becomes `(-1500 + 999) /
-/// 1000`, which is 0 as well because truncation toward zero discards the
-/// -0.501 remainder. The C's formula is what it is, and faithfulness wins
-/// over an idealised ceiling (AAP 0.1.1): a caller of this function is
-/// arming a timer, and a timer that fires a millisecond earlier or later than
-/// C's would change observable retry timing. The cases are enumerated in the
-/// tests rather than described in prose alone.
-///
-/// The guards, their operators and their divisor are [`timediff_ms`]'s and
-/// carry the same reasoning.
 #[allow(dead_code)]
 pub(crate) fn timediff_ceil_ms(newer: CurlTime, older: CurlTime) -> TimeDiff {
     let diff = newer.secs.saturating_sub(older.secs);
@@ -863,25 +530,6 @@ pub(crate) fn timediff_ceil_ms(newer: CurlTime, older: CurlTime) -> TimeDiff {
 /// else if(diff <= (TIMEDIFF_T_MIN / 1000000))  return TIMEDIFF_T_MIN;
 /// return diff * 1000000 + newer->tv_usec - older->tv_usec;
 /// ```
-///
-/// # The divisor is the difference
-///
-/// `TIMEDIFF_T_MAX / 1000000`, not `/ 1000`. This function therefore
-/// saturates a thousand times sooner than [`timediff_ms`] does: a difference
-/// of 1e13 seconds is exact in milliseconds and saturated in microseconds.
-/// A test finds a value in that gap and asserts both answers, so a
-/// copy-and-paste slip between the two functions fails rather than shipping.
-///
-/// # No microsecond division at all
-///
-/// The result is in the unit the fields are already in, so the two
-/// microsecond fields enter the sum directly. The C's left-to-right order,
-/// `diff * 1000000 + newer->tv_usec - older->tv_usec`, is preserved by the
-/// chained operators, which matters only at the extremes where the order of
-/// two saturating operations can differ.
-///
-/// `--trace` prints this function's result for pending expiry timers, so its
-/// value reaches the output that AAP 0.8.1 freezes.
 #[allow(dead_code)]
 pub(crate) fn timediff_us(newer: CurlTime, older: CurlTime) -> TimeDiff {
     let diff = newer.secs.saturating_sub(older.secs);
@@ -923,26 +571,10 @@ const TM_YEAR_BASE: i32 = 1900;
 
 /// A calendar instant in UTC: the fields of `struct tm` that curl reads.
 ///
-/// The successor of the `struct tm` that `curlx_gmtime`
-/// (`lib/curlx/timeval.c:251-272`) fills in. Eight fields rather than the
-/// C structure's eleven, and the field set was chosen by reading the call
-/// sites rather than by copying the declaration: `grep -rn 'curlx_gmtime'
-/// lib/ src/` finds nine of them, and between them they read `tm_wday`,
-/// `tm_mday`, `tm_mon`, `tm_year`, `tm_hour`, `tm_min` and `tm_sec`. Neither
-/// `tm_yday` nor `tm_isdst` is read anywhere in `lib/` or `src/`; `tm_yday`
-/// is carried anyway because it is free to compute here and a date formatter
-/// that wants a day-of-year should not have to reconstruct it, while
-/// `tm_isdst` is not, because UTC has no daylight saving and `gmtime_r`
-/// writes zero into it.
-///
 /// # The field conventions are the C's, with ONE deliberate change
 ///
-/// These values reach the wire and reach files whose formats AAP 0.8.1
-/// freezes -- an `If-Modified-Since` header, a Netscape cookie jar, and the
-/// HSTS and Alt-Svc caches -- so a convention that differs silently from the
-/// C's would corrupt output that has to stay byte-identical. Each field
-/// therefore documents its own convention, and the one departure is spelled
-/// out here rather than left to be discovered:
+/// Each field therefore documents its own convention, and the one departure is
+/// spelled out here rather than left to be discovered:
 ///
 /// **`year` is the ABSOLUTE year, not C's years-since-1900.** `gmtime(0)`
 /// gives `year == 1970`, where the C gives `tm_year == 70`. The reason is
@@ -954,10 +586,6 @@ const TM_YEAR_BASE: i32 = 1900;
 /// an obvious failure. [`Self::tm_year`] returns the C's value for anyone who
 /// needs the raw field, and a test asserts both spellings of the same instant
 /// so the choice cannot drift.
-///
-/// Every OTHER convention is preserved exactly: see `mon`, `wday` and `yday`
-/// below, each of which is a 0-based index that a C caller uses to subscript
-/// a table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct BrokenTime {
@@ -991,13 +619,6 @@ pub(crate) struct BrokenTime {
 
 impl BrokenTime {
     /// The C's `tm_year`: the year less 1900.
-    ///
-    /// The bridge for code transcribing this into a C `struct tm`, and the
-    /// second spelling that lets a test assert the year convention from both
-    /// sides. Saturating rather than wrapping, which cannot be observed
-    /// through a value [`gmtime`] produced -- it rejects any instant whose
-    /// year would not survive the subtraction -- but keeps the accessor total
-    /// for a hand-built [`BrokenTime`].
     #[allow(dead_code)]
     pub(crate) const fn tm_year(self) -> i32 {
         self.year.saturating_sub(TM_YEAR_BASE)
@@ -1021,22 +642,6 @@ impl BrokenTime {
 /// implemented it is also thread-safe by construction -- it holds no state
 /// and returns its result by value, so the C's third path, whose whole defect
 /// is a shared static buffer, has no successor to worry about.
-///
-/// # The algorithm
-///
-/// Howard Hinnant's `civil_from_days`, which is exact over the whole
-/// proleptic Gregorian calendar and is the standard formulation of this
-/// conversion. It works by shifting the epoch onto a calendar whose year
-/// begins on 1 March, so that the leap day lands at the end of a year and
-/// every month before it has a fixed length; the 400-year era then divides
-/// evenly at 146,097 days, and the month and day fall out of two integer
-/// divisions with no table of month lengths at all.
-///
-/// The three constants inside the year-of-era expression are Hinnant's and
-/// are stated here so they are not mistaken for arbitrary: 1,460 is a
-/// four-year cycle of days without its leap day, 36,524 is a century, and
-/// 146,096 is one day short of the era, which is what makes the final
-/// division land on the last day of an era rather than past it.
 ///
 /// # Floor division everywhere, which is what makes negative instants work
 ///
@@ -1134,26 +739,11 @@ pub(crate) fn gmtime(intime: i64) -> Result<BrokenTime, CURLcode> {
 }
 
 /// The proleptic Gregorian leap-year rule.
-///
-/// Divisible by 4, except centuries, except every fourth century. Rust's `%`
-/// truncates toward zero, so a negative year answers correctly without a
-/// special case: -400 is divisible by 400 in exactly the same way 400 is.
-///
-/// `lib/parsedate.c:274-289` encodes the same rule as a running count of leap
-/// days rather than a predicate, because it is converting in the other
-/// direction; the two are consistent and a test checks the boundary years
-/// that distinguish the rule from a naive one.
 fn is_leap_year(year: i32) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 /// Narrows a calendar field the algorithm has already bounded.
-///
-/// Every caller passes a value inside `0..=365` -- a month index, a day, an
-/// hour, a minute, a second, a weekday or a day-of-year -- so the fallback
-/// cannot be reached. It exists because this crate admits no narrowing `as`
-/// cast, and the assertion is there so that a future change which breaks the
-/// bound fails loudly in a test build instead of quietly returning zero.
 fn narrow(value: i64) -> i32 {
     debug_assert!(
         (0..=365).contains(&value),
@@ -1164,48 +754,26 @@ fn narrow(value: i64) -> i32 {
 
 // TESTS
 //
-// `tests/unit/*.c` (59 files) and `tests/libtest/*.c` (235) link a debug
-// static build of the C library and call internal `Curl_*` and `curlx_*`
-// symbols, which a Rust static library does not export. Their coverage
-// therefore relocates into `#[cfg(test)]` modules inside the files under test
-// (AAP 0.8.7), and this is this file's share of that relocation --
-// specifically `tests/unit/unit1323.c`, which the C names in a `@unittest`
-// annotation above `curlx_ptimediff_ms` (`lib/curlx/timeval.c:184`). Its four
-// vectors appear below unchanged.
-//
-// Nothing here needs a network or a fixture, and only two tests read the host
-// clock at all -- the two that exist to check that reading it works. Every
-// other assertion is a hand-computed value taken from the C or from the
-// calendar, so the whole module is valid under Miri and under
-// `cargo test --release`.
+// `tests/unit/*.c` (59 files) and `tests/libtest/*.c` link a debug static
+// build of the C library and call internal `Curl_*` and `curlx_*` symbols,
+// which a Rust static library does not export. Their coverage therefore
+// relocates into `#[cfg(test)]` modules inside the files under test (AAP
+// 0.8.7), and this is this file's share of that relocation -- specifically
+// `tests/unit/unit1323.c`, which the C names in a `@unittest` annotation above
+// `curlx_ptimediff_ms` (`lib/curlx/timeval.c:184`). Its four vectors appear
+// below unchanged.
 //
 // TWO BUILDS ARE NEEDED to cover this file completely, because
 // `CurlTime::new` behaves differently under `debug_assertions`:
 //
 //     cargo test -p curl-rs-lib
 //     cargo test -p curl-rs-lib --release
-//
-// The pair of tests around that split is marked with the matching `cfg`, so
-// each build runs the half that applies to it.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The inverse of [`gmtime`], as a test oracle only.
-    ///
-    /// Howard Hinnant's `days_from_civil`, the counterpart of the
-    /// `civil_from_days` under test. It is here rather than in the module
-    /// because the production inverse belongs to
-    /// [`crate::util::parsedate`](super::super::parsedate), which carries the
-    /// C's own arithmetic from `lib/parsedate.c:274-289`; this is an
-    /// INDEPENDENT formulation, which is exactly what makes it useful as an
-    /// oracle. Two implementations of the same conversion, written from
-    /// opposite directions, agreeing on tens of thousands of dates is a
-    /// stronger statement than any list of hand-checked instants.
-    ///
-    /// `month` is 1-based here, unlike [`BrokenTime::mon`], so that a caller
-    /// writing a date reads it the way it is spoken.
     fn epoch_of(year: i64, month: i64, day: i64) -> i64 {
         let shifted_year = year - i64::from(month <= 2);
         let era = shifted_year.div_euclid(400);
@@ -1762,13 +1330,6 @@ mod tests {
 
     /// Both implementations are usable through the trait object, which is the
     /// form a filter chain or a transfer holds.
-    ///
-    /// [`Clock::epoch_secs`] is dispatched through `&dyn Clock` here as well,
-    /// but only on a [`TestClock`]: reaching the HOST wall clock is the one
-    /// thing an interpreter refuses, and
-    /// `the_system_clock_reads_the_host_wall_clock` is the single test that
-    /// does it. Keeping that call out of this one is what lets object safety
-    /// stay covered under interpretation.
     #[test]
     fn a_clock_is_usable_as_a_trait_object() {
         fn elapsed_ms(clock: &dyn Clock, since: CurlTime) -> TimeDiff {
@@ -1923,9 +1484,6 @@ mod tests {
         assert_eq!((stamp.hour, stamp.min, stamp.sec), (3, 14, 8));
     }
 
-    /// The field conventions, asserted as conventions rather than as
-    /// incidental values, because output that AAP 0.8.1 freezes depends on
-    /// them.
     #[test]
     fn the_field_conventions_are_the_c_s() {
         // `mon` is 0-based, so it subscripts a January-first table directly.

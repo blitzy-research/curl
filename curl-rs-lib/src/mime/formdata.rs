@@ -21,8 +21,8 @@
 //  * SPDX-License-Identifier: curl
 //  *
 //  ***************************************************************************/
-//! The legacy HTTP form-post API: `lib/formdata.c` (867 lines) and
-//! `lib/formdata.h` (55 lines), superseded here in full.
+//! The legacy HTTP form-post API: `lib/formdata.c` and `lib/formdata.h`,
+//! superseded here in full.
 //!
 //! Three of the hundred symbols `lib/libcurl.def` exports live in this file
 //! -- `curl_formadd`, `curl_formfree` and `curl_formget`, listed together at
@@ -35,99 +35,28 @@
 //!
 //! Every `CURLformoption` token except `CURLFORM_NOTHING`,
 //! `CURLFORM_OBSOLETE`, `CURLFORM_OBSOLETE2`, `CURLFORM_END` and
-//! `CURLFORM_LASTENTRY` carries `CURL_DEPRECATED(7.56.0, ...)` in
+//! `CURLFORM_LASTENTRY` carries `CURL_DEPRECATED(7.56.0,...)` in
 //! `include/curl/curl.h:2555-2584`, pointing callers at the `curl_mime_*`
-//! family instead. That is advice to callers, not licence to drop the
-//! implementation: AAP 0.8.2 prohibits "removal of deprecated exported
-//! symbols", and all three names remain in the hundred-symbol parity set
-//! measured from `lib/libcurl.def`. A program compiled against curl 8.x
-//! that calls `curl_formadd` must therefore keep working, so this module is
-//! fully functional rather than a compatibility shim that fails. There is
-//! no `todo!`, no `unimplemented!` and no entry point that returns an error
-//! unconditionally; a stub here would be equivalent to the removal the AAP
-//! forbids.
-//!
-//! # The variadic problem, and where it is solved
-//!
-//! `curl_formadd`'s C prototype is variadic: a `CURLformoption`-tagged
-//! argument list terminated by `CURLFORM_END`, optionally routed through a
-//! `struct curl_forms` array by `CURLFORM_ARRAY`. A true C-variadic
-//! `extern "C"` function is **unstable** on the MSRV this workspace pins
-//! (`error[E0658]: C-variadic functions are unstable`, tracking issue
-//! 44930), which AAP 0.6.2 records as measured rather than assumed.
-//!
-//! Decoding a `va_list` is therefore `curl-rs-ffi`'s problem, and this
-//! module's contribution is the other half of that split: a **non-variadic
-//! builder** driven by an already-decoded, ordered list of options. See
-//! [`FormOption`] for the vocabulary and [`form_add`] for the entry point.
-//! Nothing here is variadic and nothing here parses C arguments.
+//! family instead. A program compiled against curl 8.x that calls
+//! `curl_formadd` must therefore keep working, so this module is fully
+//! functional rather than a compatibility shim that fails.
 //!
 //! # What this module does not own
-//!
-//! **No public integer is declared here.** `CURLformoption`
-//! (`include/curl/curl.h:2555-2584`, 22 tokens), `struct curl_forms`
-//! (`:2586-2590`), `CURLFORMcode` (`:2607-2621`, 9 tokens) and the eight
-//! `CURL_HTTPPOST_*` flags (`:205-220`) are public ABI whose numeric values
-//! belong to `curl-rs-ffi/src/ffi/opts.rs`, the sole source of truth per AAP
-//! 0.1.2. Everything below names those tokens and cites the header; nothing
-//! below assigns them a value. [`FormCode`] and [`FormFlags`] are the
-//! engine-side spellings, deliberately without `#[repr]` and without
-//! discriminants, so that a change of numbering in the ABI crate cannot
-//! silently disagree with a second table kept here.
 //!
 //! **No serializer.** `lib/formdata.c` has none either: `Curl_getformdata`
 //! translates the legacy model into `curl_mime_*` builder calls and lets
 //! `lib/mime.c` emit the bytes. The same division holds here, which is why
 //! every function below is expressed in terms of [`crate::mime`]'s
 //! [`Mime`], [`MimePart`] and [`PartReader`].
-//!
-//! **No `#[cfg(feature = ...)]`.** `lib/formdata.c:30` guards the whole file
-//! with `#if !defined(CURL_DISABLE_HTTP) && !defined(CURL_DISABLE_FORM_API)`
-//! and supplies fallbacks at `:843-866` that return `CURL_FORMADD_DISABLED`.
-//! That is a C build-configuration artifact with no Cargo counterpart: the
-//! fifteen features AAP 0.5.2 declares include no `form` and no `mime`, and a
-//! gate on a name that does not exist would delete this module silently
-//! rather than fail. The guard and the disabled fallbacks are therefore not
-//! reproduced. [`FormCode::Disabled`] exists so that the ABI crate can still
-//! spell `CURL_FORMADD_DISABLED`, but no code path here returns it.
-//!
-//! # Provenance of the constraints named in this file
-//!
-//! `review_rules` reports that **no user-specified rules were provided** for
-//! this project, so nothing here comes from that channel and no file entered
-//! scope by rule. Every constraint cited as binding comes from the Agent
-//! Action Plan's record of the user's request -- the preservation mandate of
-//! AAP 0.8.1, the prohibitions of AAP 0.8.2, the byte-exact fixture
-//! comparison of AAP 0.6.7, the dependency injection of AAP 0.3.3 pattern
-//! P12 and the coverage relocation of AAP 0.8.7 -- and is attributed to the
-//! AAP throughout rather than to rules that do not exist. Their absence is
-//! not a lower bar: enterprise-standard practice governs, expressed here as
-//! compiler- and test-enforced invariants rather than as prose.
-//!
-//! # Two oracles this file is measured against
-//!
-//! `tests/libtest/lib1308.c` is where the `@unittest: 1308` annotations at
-//! `lib/formdata.c:606` and `:625` point, and it asserts two byte counts
-//! from `curl_formget`: 518 for a three-field form and a further 381 for a
-//! single file field. Both reconcile exactly against this implementation --
-//! see the tests at the end of this file -- and they are the reason the top
-//! part of a `curl_formget` serialization is known to carry its own
-//! `Content-Type` header and no `Content-Disposition`.
-//!
-//! `tests/data/test1133` is the second oracle: `Content-Length: 1324` over a
-//! nested `multipart/mixed` produced by `-F 'name=@a;type=m/f,@b'`. It pins
-//! the shape this module's `more` chain must build, including that the inner
-//! children carry `Content-Disposition: attachment` rather than `form-data`.
-//! Both are read-only reference material. AAP 0.8.1 is explicit that
-//! "editing a fixture to make it pass is prohibited": a mismatch is a defect
-//! here.
 
+use core::fmt;
 use std::borrow::Cow;
 use std::io::Read;
 use std::path::Path;
 
 use crate::crypto::rand::{Rng, SystemRng};
 use crate::error::{CURLcode, CodeResult};
+use crate::util::redact::Redacted;
 use crate::util::slist::SList;
 use crate::util::CurlOffT;
 
@@ -147,34 +76,14 @@ use super::{
 // case-insensitive, lives in the parent module's `contenttype` table and is
 // reached through it rather than reimplemented here.
 
-// ---------------------------------------------------------------------------
 // Constants transcribed from lib/formdata.c
-// ---------------------------------------------------------------------------
 
 /// The buffer `curl_formget` reads through: `char buffer[8192]`
 /// (`lib/formdata.c:644`).
-///
-/// The chunk boundaries this produces are **not** part of the contract --
-/// `curl_formget` may hand the body to its callback in any number of pieces
-/// -- but the concatenation is, byte for byte. The size is nonetheless
-/// reproduced rather than chosen, because it is the one number a caller
-/// could observe through the callback's `len` argument, and because a
-/// `quoted-printable` or `base64` encoder needs room to make progress: the
-/// parent module documents a floor below which an encoded part cannot be
-/// drained.
 const FORMGET_BUFFER_SIZE: usize = 8192;
 
 /// The content type `curl_formget` prepares the top part with
 /// (`lib/formdata.c:640`).
-///
-/// Passed as a literal, exactly as the C passes it, and not derived from the
-/// parent module's `MULTIPART_CONTENTTYPE_DEFAULT` -- that constant is
-/// `multipart/mixed`, which is what an unlabelled nested multipart gets. The
-/// distinction is observable: `Curl_mime_prepare_headers` gives a child
-/// `Content-Disposition: form-data` only when its parent's type matches
-/// `multipart/form-data` (`lib/mime.c:1798-1801`), and `multipart/mixed`
-/// leaves the child to fall back to `attachment`. `tests/data/test1133`
-/// shows both in one body.
 #[rustfmt::skip]
 const FORMGET_CONTENT_TYPE: &str = "multipart/form-data";
 
@@ -202,17 +111,10 @@ const STREAM_VALUE_PLACEHOLDER: &[u8] = b"";
 
 /// The invariant every helper below relies on: the accumulator is never
 /// empty.
-///
-/// `FormAdd` allocates the first `FormInfo` before it reads any option
-/// (`lib/formdata.c:322-326`) and only ever appends, so `curr` is always the
-/// tail of a chain with at least one node. Spelled once so that the several
-/// `expect` calls that depend on it all say the same thing.
 const CHAIN_NEVER_EMPTY: &str =
     "FormAdd seeds the chain with one node before reading any option";
 
-// ---------------------------------------------------------------------------
 // The outcome of a builder call: CURLFORMcode, by name
-// ---------------------------------------------------------------------------
 
 /// The outcome `curl_formadd` reports: `CURLFORMcode`
 /// (`include/curl/curl.h:2607-2621`).
@@ -236,37 +138,17 @@ const CHAIN_NEVER_EMPTY: &str =
 /// can be constructed and matched but never means anything, which is exactly
 /// the failure mode a Rust enum exists to prevent. It is dropped, and the
 /// ABI crate reproduces the integer without needing a variant to hold it.
-///
-/// # Why this carries no discriminants
-///
-/// `CURLFORMcode` is a **separate** enumeration from `CURLcode`, with its own
-/// numbering starting at `CURL_FORMADD_OK`. Those integers are public ABI and
-/// belong to `curl-rs-ffi/src/ffi/opts.rs`, the sole source of truth per AAP
-/// 0.1.2. Declaring them here as well would create two tables that must
-/// agree, and a disagreement between them would be invisible: a caller would
-/// receive a plausible-looking code that means something else. So this enum
-/// has no `#[repr]` and no discriminant, and the ABI crate maps the variants
-/// onto integers in the one place that owns them.
-///
-/// # Errors this enum does not report
-///
-/// [`Self::Disabled`] is never returned by this implementation -- see the
-/// module documentation for why the C's `CURL_DISABLE_FORM_API` guard has no
-/// Cargo counterpart. It is present so that the ABI crate has a variant to
-/// map, and so that a reader comparing this list against
-/// `include/curl/curl.h:2607-2621` finds every token accounted for.
-///
-/// [`Self::IllegalArray`] is likewise never returned from [`form_add`], but
-/// for a different reason: it is raised during **decoding**, not building.
-/// See [`FormOption`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FormCode {
     /// `CURL_FORMADD_OK`: the part was added.
     Ok,
     /// `CURL_FORMADD_MEMORY`: an allocation or a length conversion failed.
     ///
-    /// Rust's allocator aborts rather than returning on failure, so the
-    /// classic "malloc returned NULL" route to this code does not exist here.
+    /// The C's `malloc` sites here are fixed-size `struct curl_httppost` and
+    /// `struct FormInfo` nodes, whose sizes this module chooses; a fixed-size
+    /// allocation has no stable fallible spelling at the declared minimum Rust
+    /// version, so the classic "malloc returned NULL" route to this code does
+    /// not exist here.
     /// The variant is nonetheless live and reachable, for two reasons that
     /// AAP 0.8.2 makes it wrong to drop. First, `AddHttpPost`
     /// (`lib/formdata.c:66-68`) returns `NULL` -- and therefore this code --
@@ -302,31 +184,15 @@ pub enum FormCode {
 
 impl FormCode {
     /// Whether this is `CURL_FORMADD_OK`.
-    ///
-    /// The C tests the code with `if(!retval)` and `while(retval ==
-    /// CURL_FORMADD_OK)`, which works because `CURL_FORMADD_OK` is zero.
-    /// That arithmetic is not available to an enum without discriminants, so
-    /// the predicate is named instead -- and naming it is what keeps the
-    /// numbering out of this file.
     #[must_use]
     pub fn is_ok(self) -> bool {
         matches!(self, Self::Ok)
     }
 }
 
-// ---------------------------------------------------------------------------
 // Ownership: what curl_formfree may release, and what it must not
-// ---------------------------------------------------------------------------
 
 /// Who owns a byte range that a form entry points at.
-///
-/// This is the information the `CURL_HTTPPOST_PTR*` flags exist to carry.
-/// `curl_formfree` (`lib/formdata.c:679-683`) frees a name only when
-/// `CURL_HTTPPOST_PTRNAME` is clear and contents only when none of
-/// `CURL_HTTPPOST_PTRCONTENTS`, `CURL_HTTPPOST_BUFFER` or
-/// `CURL_HTTPPOST_CALLBACK` is set, because in the other cases the memory is
-/// the caller's and the caller may reuse or free it after `curl_formfree`
-/// returns.
 ///
 /// In Rust that decision is the compiler's -- an owned `Vec<u8>` is dropped
 /// and a borrowed slice is not -- but the ABI crate still has to make it,
@@ -351,12 +217,6 @@ pub enum Ownership {
 
 /// What `curl_formfree` would release for one entry, and what it must leave
 /// alone.
-///
-/// A transcription of `lib/formdata.c:679-686`, field by field, so that the
-/// ABI crate can walk a chain and free exactly what the C would have freed.
-/// The two unconditional cases are recorded as well as the two conditional
-/// ones: leaving them implicit would mean the ABI crate had to re-derive
-/// them from the same header, which is how the two copies drift apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FreePlan {
     /// `if(!(form->flags & HTTPPOST_PTRNAME)) free(form->name);` (`:679`).
@@ -372,26 +232,9 @@ pub struct FreePlan {
     pub showfilename: Ownership,
 }
 
-// ---------------------------------------------------------------------------
 // The read-function argument, made explicit
-// ---------------------------------------------------------------------------
 
 /// Whether the caller of the bridge supplied a read function.
-///
-/// `Curl_getformdata`'s fourth parameter is a `curl_read_callback`
-/// (`lib/formdata.h:52`), and it is the read half of a `CURLFORM_STREAM`
-/// part: the C keeps the function in the easy handle and the context pointer
-/// in `post->userp`, then pairs them at bridge time. Here the pair arrives
-/// already assembled as a [`PartReader`], because that is the only shape in
-/// which a reader and its state can be held safely, so what is left of the
-/// C's parameter is the question of whether a read function exists at all.
-///
-/// It is not a hypothetical question. `curl_formget` passes `NULL`
-/// (`lib/formdata.c:638`), and `curl_mime_data_cb` with a null `readfunc`
-/// clears the content and installs nothing (`lib/mime.c:1425-1434`), so a
-/// form serialized by `curl_formget` renders a `CURLFORM_STREAM` part as
-/// headers with an empty body. That is curl 8.x's behaviour and AAP 0.8.1
-/// freezes it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamPolicy {
     /// A read function was supplied: a callback part reaches the mime tree
@@ -402,9 +245,7 @@ pub enum StreamPolicy {
     Unavailable,
 }
 
-// ---------------------------------------------------------------------------
 // The decoded option vocabulary: the contract curl-rs-ffi drives
-// ---------------------------------------------------------------------------
 
 /// One decoded `CURLFORM_*` option.
 ///
@@ -419,52 +260,6 @@ pub enum StreamPolicy {
 /// * **[`form_add`]** consumes that `Vec` and applies the semantics of
 ///   `FormAdd` (`lib/formdata.c:301-601`) to it.
 ///
-/// The order of the `Vec` is significant and must be the caller's: every
-/// "given twice" outcome, every `Null`, and the `more`-chain spawning that
-/// turns `-F 'name=@a,@b'` into a nested multipart all depend on which
-/// option arrived first.
-///
-/// # `CURLFORM_ARRAY` never appears here
-///
-/// The C flattens an array inline (`lib/formdata.c:334-345`, `:356-365`) and
-/// permits **exactly one level**: `CURLFORM_ARRAY` inside a
-/// `CURLFORM_ARRAY` is `CURL_FORMADD_ILLEGAL_ARRAY` ("we do not support an
-/// array from within an array", `:357-359`) and a null array pointer is
-/// `CURL_FORMADD_NULL` (`:362-363`). Because the ABI crate flattens before
-/// calling, this vocabulary has no `Array` variant and [`form_add`] never
-/// sees one -- but both outcomes are still spelled in [`FormCode`], as
-/// [`FormCode::IllegalArray`] and [`FormCode::Null`], so that the ABI crate
-/// has something to return when it hits them during decoding.
-///
-/// # Null pointers are modelled, not filtered
-///
-/// Most variants below carry an `Option`, and `None` is the C's null
-/// pointer. The ABI crate must pass the `None` through rather than
-/// short-circuiting on it, because the C checks in a specific order and the
-/// order is observable. `CURLFORM_FILENAME` is the clearest case: `:557-560`
-/// tests "already set" **before** it touches the argument, so
-/// `CURLFORM_FILENAME, "a", CURLFORM_FILENAME, NULL` is
-/// `CURL_FORMADD_OPTION_TWICE` and not `CURL_FORMADD_NULL`. A decoder that
-/// rejected the null first would return the wrong code.
-///
-/// # Lengths must be resolved before the slice is built
-///
-/// Three options carry a length that the C applies to a pointer it was given
-/// separately: [`Self::NameLength`], [`Self::BufferLength`] and
-/// [`Self::ContentsLength`]. In C the pointer and the length are independent,
-/// and the length may arrive **after** the pointer. A Rust slice carries its
-/// own length, so the ABI crate has to decide how long each slice is when it
-/// builds it, which means a **two-pass decode**: scan the argument list for
-/// the length options first, then construct
-/// [`Self::CopyName`]/[`Self::PtrName`] and [`Self::BufferPtr`] with the full
-/// extent they will need.
-///
-/// [`form_add`] then treats the length option as selecting a **prefix** of
-/// the slice, clamped to the slice's own length. Clamping is not a licence to
-/// pass a short slice: it is the defined answer to a length that exceeds the
-/// buffer, which in C is an out-of-bounds read and therefore has no behaviour
-/// to preserve.
-///
 /// # A negative length is a real code, not a clamp
 ///
 /// [`Self::NameLength`] and [`Self::BufferLength`] are `usize` here because
@@ -476,19 +271,8 @@ pub enum StreamPolicy {
 /// clamping to zero or rejecting early, because [`form_add`] reproduces the
 /// guard and will return [`FormCode::Memory`] for exactly the inputs the C
 /// does.
-#[derive(Debug)]
 pub enum FormOption<'a> {
     /// `CURLFORM_COPYNAME`: the field name, copied.
-    ///
-    /// `lib/formdata.c:373-383`. The C stores the pointer without copying at
-    /// this stage -- `Curl_bufref_set(&curr->name, avalue, 0, NULL); /* No
-    /// copy yet. */` -- and copies it in `FormAddCheck` (`:267`). The
-    /// deferral is reproduced with a [`Cow`], so a caller of [`form_add`] may
-    /// pass a short-lived slice for this variant and the entry will own its
-    /// own copy afterwards.
-    ///
-    /// Already set is [`FormCode::OptionTwice`]; `None` is
-    /// [`FormCode::Null`].
     CopyName(Option<&'a [u8]>),
     /// `CURLFORM_PTRNAME`: the field name, borrowed.
     ///
@@ -520,11 +304,6 @@ pub enum FormOption<'a> {
     PtrContents(Option<&'a [u8]>),
     /// `CURLFORM_CONTENTSLENGTH`: the value's length, as a `long`.
     ///
-    /// `:408-410`. **There is deliberately no "given twice" check here**,
-    /// unlike almost every other option: the C allows it to be set
-    /// repeatedly and the last value wins. That asymmetry is transcribed, not
-    /// corrected.
-    ///
     /// The C's expression is `(curl_off_t)(size_t)form_int_arg(long)`, a
     /// round trip through `size_t` that is the identity on the four 64-bit
     /// targets, so the value is stored as it arrives.
@@ -537,16 +316,6 @@ pub enum FormOption<'a> {
     ContentLen(CurlOffT),
     /// `CURLFORM_FILECONTENT`: send the named file's **contents** as an
     /// ordinary value.
-    ///
-    /// `:418-432`. Copies the filename immediately and sets
-    /// `CURL_HTTPPOST_READFILE`. Already `CURL_HTTPPOST_PTRCONTENTS` or
-    /// `CURL_HTTPPOST_READFILE` is [`FormCode::OptionTwice`]; `None` is
-    /// [`FormCode::Null`].
-    ///
-    /// The distinction from [`Self::File`] is entirely in what reaches the
-    /// wire: this option sends the bytes without a `filename=` parameter,
-    /// because the bridge clears the remote filename afterwards
-    /// (`:804-805`).
     FileContent(Option<&'a str>),
     /// `CURLFORM_FILE`: upload the named file.
     ///
@@ -559,17 +328,8 @@ pub enum FormOption<'a> {
     /// * a value already present **with** that flag -- spawn a new node on
     ///   the `more` chain and make it current, which is what turns
     ///   `-F 'name=@a.txt,@b.txt'` into a nested `multipart/mixed`.
-    ///
-    /// `None` is [`FormCode::Null`] in either of the last two cases.
     File(Option<&'a str>),
     /// `CURLFORM_BUFFERPTR`: upload from a caller-owned buffer.
-    ///
-    /// `:470-484`. Sets **both** `CURL_HTTPPOST_PTRBUFFER` and
-    /// `CURL_HTTPPOST_BUFFER` before the twice check, and also writes the
-    /// value slot -- "Make value non-NULL to be accepted as fine" -- with no
-    /// twice check of its own, so a `CURLFORM_BUFFERPTR` after a
-    /// `CURLFORM_COPYCONTENTS` replaces the value. A buffer already recorded
-    /// is [`FormCode::OptionTwice`]; `None` is [`FormCode::Null`].
     BufferPtr(Option<&'a [u8]>),
     /// `CURLFORM_BUFFERLENGTH`: the buffer's length.
     ///
@@ -578,11 +338,6 @@ pub enum FormOption<'a> {
     /// spells as `CURL_ZERO_TERMINATED` (`:807-810`).
     BufferLength(usize),
     /// `CURLFORM_BUFFER`: the filename to show for a buffer upload.
-    ///
-    /// `:554-561`. **This writes the same field as [`Self::FileName`]** --
-    /// `showfilename` -- because the C shares one arm between the two
-    /// options. It does **not** set `CURL_HTTPPOST_BUFFER`, despite the
-    /// name; only [`Self::BufferPtr`] does that.
     ///
     /// # `None` here is undefined behaviour in the C
     ///
@@ -594,26 +349,8 @@ pub enum FormOption<'a> {
     /// the C does define is unchanged.
     Buffer(Option<&'a str>),
     /// `CURLFORM_CONTENTTYPE`: the part's `Content-Type`.
-    ///
-    /// `:511-540`. Copied immediately. Like [`Self::File`] it spawns a
-    /// `more` node when a content type is already set **and**
-    /// `CURL_HTTPPOST_FILENAME` is set, which is how each file of a
-    /// multi-file part gets its own type -- `tests/data/test1133` exercises
-    /// exactly that with `-F 'file3=@a;type=m/f,@b'`. Set without that flag
-    /// is [`FormCode::OptionTwice`]; `None` is [`FormCode::Null`].
     ContentType(Option<&'a str>),
     /// `CURLFORM_CONTENTHEADER`: extra headers for this part.
-    ///
-    /// `:542-553`. Already set is [`FormCode::OptionTwice`]. A `None` list is
-    /// stored as "not set" and is **not** an error, exactly as the C stores a
-    /// null `struct curl_slist *` without complaint -- which also means a
-    /// later `CURLFORM_CONTENTHEADER` with a real list still succeeds.
-    ///
-    /// The list arrives by value, as a copy of the caller's. That is what
-    /// makes the bridge's `curl_mime_headers(part, file->contentheader, 0)`
-    /// (`:767`) faithful without aliasing: `take_ownership` is zero there, so
-    /// the caller keeps its own `curl_slist` and `curl_formfree` never frees
-    /// it.
     ContentHeader(Option<SList>),
     /// `CURLFORM_FILENAME`: the filename to show for a file upload.
     ///
@@ -621,17 +358,6 @@ pub enum FormOption<'a> {
     /// [`Self::Buffer`]; see that variant for the `None` case.
     FileName(Option<&'a str>),
     /// `CURLFORM_STREAM`: read the part's content through a callback.
-    ///
-    /// `:493-509`. Sets `CURL_HTTPPOST_CALLBACK` before the twice check. In
-    /// C the option carries only a `void *` context and the read function
-    /// comes from the easy handle; here the pair arrives already assembled,
-    /// because a function pointer and an untyped context cannot be held
-    /// safely apart. A reader already recorded is [`FormCode::OptionTwice`];
-    /// `None` is [`FormCode::Null`].
-    ///
-    /// Whether the reader is actually installed on the mime part depends on
-    /// [`StreamPolicy`], which is the surviving half of the C's `fread_func`
-    /// argument.
     Stream(Option<Box<dyn PartReader>>),
     /// Any option outside the vocabulary: `CURL_FORMADD_UNKNOWN_OPTION`.
     ///
@@ -644,9 +370,91 @@ pub enum FormOption<'a> {
     Unknown,
 }
 
+/// The option's identity, never its payload.
+///
+/// # Why this is not `#[derive(Debug)]`
+///
+/// Nine of these seventeen variants carry caller-supplied bytes: a field name,
+/// a field value, a buffer, a filename, a content type, a header list. A
+/// multipart form is how a browser and `curl -F` upload credentials and
+/// private files -- `docs/cmdline-opts/form.md`'s own examples post a password
+/// field -- so a derived formatter would render exactly the bytes a user
+/// least expects in a log, and this type is an *argument* to
+/// [`form_add`], so it appears in every diagnostic that reports a bad option.
+///
+/// What renders is the variant name plus, where there is one, a byte count.
+/// That is what a caller debugging `CURL_FORMADD_OPTION_TWICE` or
+/// `CURL_FORMADD_NULL` needs: which option was given and whether it was empty.
+/// The numeric variants render their number, because a length or a
+/// `contentslength` is not a secret and is precisely what the twice-and-null
+/// checks turn on.
+impl fmt::Debug for FormOption<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        /// `Some(n bytes)` or `None`, so an absent option stays distinct from
+        /// an empty one -- the distinction the C's `NULL` checks turn on
+        /// (`lib/formdata.c:260-263`).
+        fn bytes(
+            f: &mut fmt::Formatter<'_>,
+            name: &str,
+            v: Option<&[u8]>,
+        ) -> fmt::Result {
+            match v {
+                Some(bytes) => write!(f, "{name}({:?})", Redacted(bytes)),
+                None => write!(f, "{name}(None)"),
+            }
+        }
+
+        /// A path or a content type: a length, for the same reason. A filename
+        /// discloses a private path and a content type can carry a boundary.
+        fn text(
+            f: &mut fmt::Formatter<'_>,
+            name: &str,
+            v: Option<&str>,
+        ) -> fmt::Result {
+            match v {
+                Some(text) => {
+                    write!(f, "{name}({:?})", Redacted(text.as_bytes()))
+                }
+                None => write!(f, "{name}(None)"),
+            }
+        }
+
+        match self {
+            Self::CopyName(v) => bytes(f, "CopyName", *v),
+            Self::PtrName(v) => bytes(f, "PtrName", *v),
+            Self::NameLength(n) => write!(f, "NameLength({n})"),
+            Self::CopyContents(v) => bytes(f, "CopyContents", *v),
+            Self::PtrContents(v) => bytes(f, "PtrContents", *v),
+            Self::ContentsLength(n) => write!(f, "ContentsLength({n})"),
+            Self::ContentLen(n) => write!(f, "ContentLen({n})"),
+            Self::FileContent(v) => text(f, "FileContent", *v),
+            Self::File(v) => text(f, "File", *v),
+            Self::BufferPtr(v) => bytes(f, "BufferPtr", *v),
+            Self::BufferLength(n) => write!(f, "BufferLength({n})"),
+            Self::Buffer(v) => text(f, "Buffer", *v),
+            Self::ContentType(v) => text(f, "ContentType", *v),
+            Self::ContentHeader(v) => {
+                write!(
+                    f,
+                    "ContentHeader({} headers)",
+                    v.as_ref().map_or(0, SList::len)
+                )
+            }
+            Self::FileName(v) => text(f, "FileName", *v),
+            Self::Stream(v) => {
+                write!(
+                    f,
+                    "Stream({})",
+                    if v.is_some() { "set" } else { "None" }
+                )
+            }
+            Self::Unknown => f.write_str("Unknown"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The flag word, as named booleans
-// ---------------------------------------------------------------------------
 
 /// The eight `CURL_HTTPPOST_*` flags (`include/curl/curl.h:205-220`), which
 /// `lib/formdata.c:39-45` aliases to shorter local names.
@@ -668,15 +476,12 @@ pub enum FormOption<'a> {
 ///   content-type probe from the value to the shown filename (`:248-249`);
 /// * `callback` selects the reader branch (`:811`).
 ///
-/// Keeping all eight also keeps `post->flags` reproducible for the ABI crate,
-/// which must present a `long` a C caller can read.
-///
 /// # The bit positions are not here
 ///
 /// `include/curl/curl.h:205-220` assigns them and
-/// `curl-rs-ffi/src/ffi/opts.rs` owns them, per AAP 0.1.2. Each field below
-/// names its C token so the correspondence is unambiguous without restating a
-/// value that would then have to be kept in step.
+/// `curl-rs-ffi/src/ffi/opts.rs` owns them. Each field below names its C token
+/// so the correspondence is unambiguous without restating a value that would
+/// then have to be kept in step.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FormFlags {
     /// `CURL_HTTPPOST_FILENAME`: the content names a file to upload.
@@ -696,33 +501,15 @@ pub struct FormFlags {
     pub callback: bool,
     /// `CURL_HTTPPOST_LARGE`: the length lives in `contentlen` rather than
     /// `contentslength`.
-    ///
-    /// `AddHttpPost` sets this on **every** node it creates --
-    /// `post->flags = src->flags | CURL_HTTPPOST_LARGE` at
-    /// `lib/formdata.c:78` -- regardless of whether the caller used
-    /// `CURLFORM_CONTENTLEN`. See [`FormEntry::content_length`] for what that
-    /// means in practice.
     pub large: bool,
 }
 
-// ---------------------------------------------------------------------------
 // FormInfo: the accumulator FormAdd fills while it reads options
-// ---------------------------------------------------------------------------
 
 /// `struct FormInfo` (`lib/formdata.h:33-47`): the temporary accumulator
 /// `FormAdd` fills before validation turns it into entries.
 ///
 /// # Two C constructs that do not survive
-///
-/// **The `more` pointer.** `lib/formdata.h:41` chains these intrusively, and
-/// `AddFormInfo` (`:142-153`) splices a new node in after the current one.
-/// The crate-wide decision recorded in `crate::util::llist` is that the
-/// intrusive pattern does not survive, so the chain is a `Vec` in
-/// [`form_add`] and this struct has no link field. The splice is a push,
-/// which is exact rather than merely equivalent: `curr` in the C is always
-/// the tail, because `AddFormInfo` immediately makes the new node current and
-/// nothing ever moves it back, so `parent->more` is always `NULL` at the
-/// moment of the splice.
 ///
 /// **The four `struct bufref` fields.** `lib/formdata.h:34-37` uses a
 /// `bufref` precisely so that a name or value can be stored borrowed now and
@@ -735,7 +522,7 @@ pub struct FormFlags {
 /// `contenttype` and `showfilename` are `String` rather than `Cow` because
 /// the C copies both eagerly (`:535`, `:559`), so no deferral exists to
 /// model, and `curl_formfree` frees both unconditionally (`:684-685`).
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct FormInfo<'a> {
     /// `struct bufref name`.
     name: Option<Cow<'a, [u8]>>,
@@ -763,15 +550,37 @@ struct FormInfo<'a> {
     flags: FormFlags,
 }
 
+/// Shape and presence, never the accumulated bytes.
+///
+/// The accumulator holds the same caller-supplied name, value, buffer,
+/// filename and content type that [`FormOption`] delivers, so it discloses the
+/// same secrets and is redacted the same way. It is `struct`-private and
+/// short-lived, but it appears in `{:?}` the moment anybody debugging
+/// `FormAddCheck` reaches for one, which is exactly when a form body is in it.
+impl fmt::Debug for FormInfo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FormInfo")
+            .field("name", &self.name.as_deref().map(Redacted))
+            .field("value", &self.value.as_deref().map(Redacted))
+            .field("contenttype", &self.contenttype.as_deref().map(str::len))
+            .field("showfilename", &self.showfilename.as_deref().map(str::len))
+            .field("buffer", &self.buffer.map(Redacted))
+            .field("has_reader", &self.reader.is_some())
+            .field(
+                "contentheader",
+                &self.contentheader.as_ref().map(SList::len),
+            )
+            .field("contentslength", &self.contentslength)
+            .field("namelength", &self.namelength)
+            .field("bufferlength", &self.bufferlength)
+            .field("flags", &self.flags)
+            .finish()
+    }
+}
+
 impl<'a> FormInfo<'a> {
     /// A node chained onto an existing one: `NewFormInfo` (`:106-118`)
     /// followed by `AddFormInfo` (`:142-153`).
-    ///
-    /// The only thing `AddFormInfo` does besides splicing is
-    /// `form_info->flags |= HTTPPOST_FILENAME` at `:144`, and that assignment
-    /// is load-bearing: it is why every node of a multi-file chain reports
-    /// itself as a file even when the option that spawned it was
-    /// `CURLFORM_CONTENTTYPE`.
     fn spawned() -> Self {
         Self {
             flags: FormFlags {
@@ -783,9 +592,7 @@ impl<'a> FormInfo<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // FormEntry and FormList: the validated form, owned as a tree
-// ---------------------------------------------------------------------------
 
 /// One validated form part: `struct curl_httppost`
 /// (`include/curl/curl.h:188-230`), as an owned Rust value.
@@ -812,25 +619,6 @@ impl<'a> FormInfo<'a> {
 /// | `showfilename` | `char *` | [`Self::showfilename`] |
 /// | `userp` | `void *` | [`Self::reader`] |
 /// | `contentlen` | `curl_off_t` | [`Self::contentlen`] |
-///
-/// **The `#[repr(C)]` mirror belongs in `curl-rs-ffi`, not here.** This type
-/// is an owned tree -- a `Vec` of sub-entries where the C has a `more`
-/// pointer, and no `next` field at all because [`FormList`] holds the
-/// sequence -- so it deliberately does not match the C layout. AAP 0.1.2
-/// puts the layout-bearing declaration in the crate that owns the ABI.
-///
-/// # `contentslength` is vestigial, and that is observable
-///
-/// `AddHttpPost` (`lib/formdata.c:69-82`) never writes `post->contentslength`
-/// -- the struct arrives zeroed from `calloc` and the accumulator's length
-/// goes into `post->contentlen` instead -- **and** it sets
-/// `CURL_HTTPPOST_LARGE` unconditionally. The bridge's selection at `:779-782`
-/// therefore always picks `contentlen`. Both fields are modelled anyway,
-/// because both are public and a C caller can read them, and the selection is
-/// written out in [`Self::content_length`] rather than folded away, so that a
-/// reader comparing this against the header finds the same two members and
-/// the same rule.
-#[derive(Debug)]
 pub struct FormEntry<'a> {
     /// `char *name` -- "pointer to allocated name".
     name: Option<Cow<'a, [u8]>>,
@@ -870,6 +658,52 @@ pub struct FormEntry<'a> {
     contentlen: CurlOffT,
 }
 
+/// Shape and presence, never a name, a value, a buffer or a filename.
+///
+/// # Why this is not `#[derive(Debug)]`
+///
+/// This is the assembled multipart form: the field names, the field values,
+/// the upload buffers and the filenames a caller handed to `curl_formadd`, plus
+/// the `more` chain of every additional file under one field name. A multipart
+/// body is how credentials and private files are uploaded -- and unlike a
+/// header, there is no name to classify against, because a form field called
+/// `password` and one called `comment` are indistinguishable to this type. So
+/// every caller-supplied byte is redacted, unconditionally.
+///
+/// What renders is enough to debug the assembly: which fields are present, how
+/// long each is, how many extra headers a part carries, the flags, and the
+/// `more` chain's length. Those are what [`Self::content_length`]'s selection
+/// and the `CURL_HTTPPOST_*` flag interactions turn on.
+///
+/// The `more` chain is rendered recursively, so a nested part is redacted by
+/// this same formatter rather than by a parent that might not be.
+///
+/// Nothing about the stored bytes changes: [`Self::name`], [`Self::contents`]
+/// and [`Self::buffer`] still return them verbatim, which is what the
+/// `#[repr(C)]` bridge in `curl-rs-ffi` hands to a C caller.
+impl fmt::Debug for FormEntry<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FormEntry")
+            .field("name", &self.name.as_deref().map(Redacted))
+            .field("namelength", &self.namelength)
+            .field("contents", &self.contents.as_deref().map(Redacted))
+            .field("contentslength", &self.contentslength)
+            .field("buffer", &self.buffer.map(Redacted))
+            .field("bufferlength", &self.bufferlength)
+            .field("contenttype", &self.contenttype.as_deref().map(str::len))
+            .field(
+                "contentheader",
+                &self.contentheader.as_ref().map(SList::len),
+            )
+            .field("more", &self.more)
+            .field("flags", &self.flags)
+            .field("showfilename", &self.showfilename.as_deref().map(str::len))
+            .field("has_reader", &self.reader.is_some())
+            .field("contentlen", &self.contentlen)
+            .finish()
+    }
+}
+
 impl<'a> FormEntry<'a> {
     /// The field name, as the bytes the caller supplied.
     ///
@@ -883,11 +717,6 @@ impl<'a> FormEntry<'a> {
 
     /// The field name narrowed to [`Self::namelength`]: what `setname`
     /// (`lib/formdata.c:692-705`) copies.
-    ///
-    /// The C's helper copies `len` bytes and NUL-terminates them, so this is
-    /// the exact byte range that becomes the `name=` parameter of the part's
-    /// `Content-Disposition`. A length beyond the slice is clamped; in C that
-    /// is an out-of-bounds read.
     #[must_use]
     pub fn name_bytes(&self) -> Option<&[u8]> {
         let name = self.name.as_deref()?;
@@ -933,10 +762,6 @@ impl<'a> FormEntry<'a> {
     /// if(post->flags & CURL_HTTPPOST_LARGE)
     ///   clen = post->contentlen;
     /// ```
-    ///
-    /// Zero means "measure the value", which the bridge spells as
-    /// `CURL_ZERO_TERMINATED` (`include/curl/curl.h:2420`) for an in-memory
-    /// part and as `-1` for a callback part.
     #[must_use]
     pub fn content_length(&self) -> CurlOffT {
         if self.flags.large {
@@ -1064,11 +889,26 @@ impl<'a> FormEntry<'a> {
 /// into `parent->more` (`:86-92`), so a chain of N accumulators becomes one
 /// top-level node with N-1 entries on its `more` chain. That is what makes
 /// `-F 'name=@a.txt,@b.txt'` one form field rather than two.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct FormList<'a> {
     /// The `next` chain, in order. Each element carries its own `more`
     /// chain.
     entries: Vec<FormEntry<'a>>,
+}
+
+/// The entries, each redacted by [`FormEntry`]'s own formatter.
+///
+/// Hand-written only because the derive was removed from [`FormEntry`]; the
+/// list itself holds nothing secret beyond what its elements hold, and each
+/// element redacts itself. Rendering the elements rather than only their count
+/// is therefore safe, and it is what makes a form's *structure* -- which the
+/// one-call-one-entry rule above makes non-obvious -- debuggable.
+impl fmt::Debug for FormList<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FormList")
+            .field("entries", &self.entries)
+            .finish()
+    }
 }
 
 impl<'a> FormList<'a> {
@@ -1114,17 +954,10 @@ impl<'a> FormList<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // form_add: curl_formadd, without the varargs
-// ---------------------------------------------------------------------------
 
 /// `curl_formadd` (`lib/formdata.c:609-618`) and the `FormAdd` it wraps
 /// (`:301-601`): adds one part to a form.
-///
-/// The C entry point is three lines of `va_start`/`FormAdd`/`va_end`; this is
-/// the `FormAdd` half, driven by an ordered list of already-decoded options
-/// instead of a `va_list`. See [`FormOption`] for the vocabulary and the
-/// module documentation for why the split falls here.
 ///
 /// # All or nothing
 ///
@@ -1136,13 +969,6 @@ impl<'a> FormList<'a> {
 /// so an early return discards them and only a successful build pushes. The
 /// behaviour is observable: a caller that gets a non-`Ok` code can retry, and
 /// must not find a half-built part in its form.
-///
-/// # Why `options` is taken by value
-///
-/// [`FormOption::Stream`] carries a `Box<dyn PartReader>`, which cannot be
-/// moved out of a shared slice. Consuming the `Vec` also mirrors the C, whose
-/// `va_list` is likewise consumed, and it means the ABI crate hands over the
-/// readers it built rather than being asked to keep them alive alongside.
 ///
 /// # Returns
 ///
@@ -1184,10 +1010,10 @@ pub fn form_add<'a>(
 
 /// One iteration of `FormAdd`'s option switch (`lib/formdata.c:355-566`).
 ///
-/// Split out from [`form_add`] so that each arm sits beside its locator and
-/// so that the loop above stays readable; the C's `switch` is one 210-line
-/// statement. `chain`'s last element is the C's `curr`, and the two arms that
-/// push are the two that call `AddFormInfo`.
+/// Split out from [`form_add`] so that each arm sits beside its locator and so
+/// that the loop above stays readable; the C's `switch` is one statement.
+/// `chain`'s last element is the C's `curr`, and the two arms that push are
+/// the two that call `AddFormInfo`.
 fn apply_option<'a>(
     chain: &mut Vec<FormInfo<'a>>,
     option: FormOption<'a>,
@@ -1233,8 +1059,7 @@ fn apply_option<'a>(
 
         // `case CURLFORM_CONTENTSLENGTH:` (`:408-410`). NO "given twice"
         // check, deliberately: the C allows repetition and the last value
-        // wins. Adding one here would reject argument lists that curl 8.x
-        // accepts, which AAP 0.8.1 forbids.
+        // wins.
         FormOption::ContentsLength(length) => {
             chain.last_mut().expect(CHAIN_NEVER_EMPTY).contentslength = length;
             FormCode::Ok
@@ -1422,11 +1247,6 @@ fn apply_option<'a>(
 
 /// The shared body of `CURLFORM_PTRNAME` and `CURLFORM_COPYNAME`
 /// (`lib/formdata.c:373-383`).
-///
-/// The value is stored **without** copying -- the C's comment is literally
-/// "No copy yet" -- because whether a copy happens at all depends on the
-/// `CURL_HTTPPOST_PTRNAME` flag, which a later option cannot set but an
-/// earlier one can. `FormAddCheck` makes that decision (`:264-269`).
 fn store_name<'a>(
     curr: &mut FormInfo<'a>,
     value: Option<&'a [u8]>,
@@ -1462,33 +1282,10 @@ fn store_value<'a>(
     }
 }
 
-// ---------------------------------------------------------------------------
 // form_add_check: validation, content-type inference, and the prevtype carry
-// ---------------------------------------------------------------------------
 
 /// `FormAddCheck` (`lib/formdata.c:216-286`): validates the accumulator chain
 /// and turns it into one entry.
-///
-/// The C walks the chain "check for completeness and if everything is alright
-/// add the HttpPost item", returning at the **first** failure. Order matters:
-/// each part is checked, then given a content type, then checked for an
-/// embedded NUL, then copied, then converted -- and the first check that fails
-/// wins. Every step below carries its locator so the order can be verified
-/// against the C rather than trusted.
-///
-/// # The one non-obvious rule
-///
-/// `prevtype` (`:220`, `:245-259`, `:281-282`) carries the previous part's
-/// resolved content type forward. A file or buffer part with no explicit type
-/// gets, in order: whatever curl's own suffix table recognises; failing that,
-/// the **previous part's** type; failing that,
-/// `application/octet-stream`. The middle step is easy to miss and it is
-/// directly observable in the `Content-Type` header of the second and later
-/// files of a multi-file field.
-///
-/// `prevtype` is a local, so it resets on every [`form_add`] call. Two
-/// separate calls never influence each other's inference, however adjacent
-/// their parts end up in the form.
 fn form_add_check<'a>(
     chain: Vec<FormInfo<'a>>,
 ) -> Result<FormEntry<'a>, FormCode> {
@@ -1548,12 +1345,6 @@ fn form_add_check<'a>(
 
         // `if(name && form->namelength) { if(memchr(name, 0,
         // form->namelength)) return CURL_FORMADD_NULL; }` (`:260-263`).
-        //
-        // An explicitly sized name may not contain a NUL, because `setname`
-        // (`:692-705`) NUL-terminates its copy and the wire form would be
-        // silently truncated at the embedded byte. Only the first
-        // `namelength` bytes are examined, exactly as `memchr`'s third
-        // argument says; a NUL beyond that length is outside the name.
         if let Some(name) = form.name.as_deref() {
             if form.namelength != 0 {
                 let extent = form.namelength.min(name.len());
@@ -1565,12 +1356,6 @@ fn form_add_check<'a>(
 
         // `if(!(form->flags & HTTPPOST_PTRNAME)) FormInfoCopyField(
         //     &form->name, form->namelength);` (`:264-269`).
-        //
-        // This is where a `Cow::Borrowed` becomes a `Cow::Owned`. The C's
-        // comment at `:265-266` notes the name may legitimately be NULL here
-        // "if the app passed in a bad combo", and `FormInfoCopyField`
-        // (`:121-133`) does nothing at all in that case -- no copy and no
-        // error -- which `Option::take` reproduces exactly.
         if !form.flags.ptrname {
             if let Some(name) = form.name.take() {
                 let extent = effective_usize_len(form.namelength, name.len());
@@ -1593,9 +1378,11 @@ fn form_add_check<'a>(
                     // The C's `(size_t)` cast turns a negative length into a
                     // value near `SIZE_MAX`, `Curl_bufref_memdup0` cannot
                     // allocate it, and `FormAddCheck` reports
-                    // `CURL_FORMADD_MEMORY` (`:273-274`). Reproduced as the
-                    // code rather than as an allocation attempt, because
-                    // Rust's allocator aborts instead of returning.
+                    // `CURL_FORMADD_MEMORY` (`:273-274`). Reproduced as the code
+                    // rather than as an allocation attempt: refusing a length
+                    // this absurd before asking the allocator is what
+                    // `crate::util::fallible` would achieve here, one step
+                    // earlier and with the C's own code.
                     return Err(FormCode::Memory);
                 }
                 let requested =
@@ -1633,25 +1420,15 @@ fn form_add_check<'a>(
 /// `AddHttpPost` (`lib/formdata.c:57-103`): converts one validated
 /// accumulator into one entry.
 ///
-/// The C also performs the list surgery -- splicing into `parent->more` or
-/// onto `*last_post` -- which [`form_add_check`] does structurally instead by
-/// collecting into a `Vec`. What is left here is the field transfer and the
-/// one guard.
-///
 /// # The `LONG_MAX` guard, and why it is kept
 ///
 /// `if((src->bufferlength > LONG_MAX) || (namelength > LONG_MAX)) return
 /// NULL;` at `:66-68`, with the C's own comment "avoid overflow in typecasts
-/// below": both fields are `size_t` in the accumulator and `long` in
-/// `struct curl_httppost`, so a value above `LONG_MAX` would become negative.
-/// On the four 64-bit targets AAP 0.8.3 mandates, `long`, `curl_off_t` and
-/// `size_t` are all 64 bits wide, so no ordinary length can trip it -- but a
-/// caller that passes a negative `long` to `CURLFORM_NAMELENGTH` or
-/// `CURLFORM_BUFFERLENGTH` reaches the accumulator's `size_t` through a cast
-/// (`:388`, `:490`) and lands above `LONG_MAX` exactly. The guard is
-/// therefore reachable and is reproduced rather than dismissed as a 32-bit
-/// concern. It is written with `try_from` instead of a comparison against a
-/// cast bound so that no cast appears at all.
+/// below": both fields are `size_t` in the accumulator and `long` in `struct
+/// curl_httppost`, so a value above `LONG_MAX` would become negative. The
+/// guard is therefore reachable and is reproduced rather than dismissed as a
+/// 32-bit concern. It is written with `try_from` instead of a comparison
+/// against a cast bound so that no cast appears at all.
 ///
 /// # Errors
 ///
@@ -1660,14 +1437,6 @@ fn form_add_check<'a>(
 fn add_http_post<'a>(form: FormInfo<'a>) -> Result<FormEntry<'a>, FormCode> {
     // `size_t namelength = src->namelength; if(!namelength &&
     // Curl_bufref_ptr(&src->name)) namelength = strlen(...);` (`:63-65`).
-    //
-    // NOT routed through `effective_usize_len`, deliberately. The substitution
-    // is one-directional -- a measured length replaces a zero one and never
-    // the other way round -- because the guard immediately below tests the
-    // caller's value, and clamping first would defeat it: `usize::MAX` reduced
-    // to the name's real length would sail past a check that exists precisely
-    // to reject it. The clamp belongs at the point of USE instead, which is
-    // `FormEntry::name_bytes` and the copy in `form_add_check`.
     let namelength = if form.namelength == 0 {
         form.name.as_deref().map_or(0, <[u8]>::len)
     } else {
@@ -1716,17 +1485,6 @@ fn add_http_post<'a>(form: FormInfo<'a>) -> Result<FormEntry<'a>, FormCode> {
 
 /// Resolves a length that may mean "measure it" against a slice that already
 /// knows how long it is.
-///
-/// Two C idioms collapse into this one helper, and both spell "zero means
-/// measure": `FormInfoCopyField`'s `if(!len) len = strlen(value);`
-/// (`lib/formdata.c:127-128`) and `AddHttpPost`'s `if(!namelength && ...)
-/// namelength = strlen(...);` (`:64-65`).
-///
-/// A length **beyond** the slice is clamped. In C the pointer and the length
-/// are independent and an overlong length is an out-of-bounds read, which has
-/// no behaviour to preserve; clamping gives it a defined answer. See
-/// [`FormOption`] for the decoding rule that keeps the clamp from ever being
-/// needed in practice.
 fn effective_usize_len(requested: usize, available: usize) -> usize {
     if requested == 0 {
         available
@@ -1735,17 +1493,10 @@ fn effective_usize_len(requested: usize, available: usize) -> usize {
     }
 }
 
-// ---------------------------------------------------------------------------
 // get_form_data: the httppost -> mimepart bridge
-// ---------------------------------------------------------------------------
 
 /// `Curl_getformdata` (`lib/formdata.c:717-841`): converts a form into a mime
 /// tree.
-///
-/// This is the function that makes the legacy API a thin layer over the modern
-/// one. It builds nothing itself -- every byte is produced later by
-/// [`crate::mime`] -- and its whole job is to translate one model into the
-/// other, in an order that is observable in the emitted headers.
 ///
 /// # Shape
 ///
@@ -1758,26 +1509,7 @@ fn effective_usize_len(requested: usize, available: usize) -> usize {
 /// `Content-Disposition: attachment; filename="..."` -- `form-data` only
 /// propagates under a `multipart/form-data` parent (`lib/mime.c:1798-1801`).
 ///
-/// # The field asymmetry, which is easy to get wrong
-///
-/// The inner loop reads **three** fields from the per-file entry --
-/// `contentheader`, `contenttype` and `contents` (`:767`, `:770`, `:785`) --
-/// and everything else from the **top** entry: the flags, the name and its
-/// length, both lengths, the buffer, the reader, the shown filename and the
-/// presence of the chain itself. Reading a flag from the wrong entry would
-/// change which content branch runs.
-///
 /// # Randomness is injected, never reached for
-///
-/// Each multipart needs a boundary, and a boundary needs a generator. The C
-/// receives one through its `CURL *data` first argument; here it arrives as
-/// `rng`, per AAP 0.3.3's pattern P12. There is no `static`, no
-/// `thread_local!`, no lazily initialised singleton and no direct reach for an
-/// operating-system source anywhere in this module. The **order** of
-/// generator use is also reproduced -- the outer multipart first, then one per
-/// field with a `more` chain, in field order -- because with a deterministic
-/// generator that order fixes which boundary each multipart gets, and the
-/// boundaries are wire bytes.
 ///
 /// # Errors
 ///
@@ -1889,9 +1621,6 @@ fn build_form_tree(
 /// `name=` parameter inside a `multipart/mixed` that curl 8.x does not emit --
 /// visible in `tests/data/test1133`, whose inner children carry only
 /// `Content-Disposition: attachment; filename="..."`.
-///
-/// Expressed as a named two-state value rather than a `bool` so that the call
-/// sites read as the condition they encode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NameSite {
     /// No `more` chain: the name belongs on this part.
@@ -1913,16 +1642,6 @@ const NESTED_MULTIPART_ATTACHED: &str =
     "the nested multipart was attached to the intermediate part above";
 
 /// One iteration of the bridge's inner loop (`lib/formdata.c:759-834`).
-///
-/// `post` is the top entry of the field and `file` is the entry whose contents
-/// this part carries; for a single-file field they are the same entry. See
-/// [`get_form_data`] for why the distinction matters.
-///
-/// The five steps are in the C's order, and the order is observable: headers
-/// before the content type means a caller's `Content-Type` header is already
-/// in place when `prepare_headers` looks for one (`lib/mime.c:1694-1696`), and
-/// the fake filename last means it overrides the base name `set_file`
-/// derived as a side effect.
 ///
 /// # Errors
 ///
@@ -2041,12 +1760,6 @@ fn fill_part(
 /// curlx_free(zname);
 /// ```
 ///
-/// The C's early return covers both a null name and a zero length; the second
-/// is unreachable through `AddHttpPost`, which substitutes `strlen` for a zero
-/// length whenever a name exists (`:63-65`), so a zero length here means the
-/// name is genuinely the empty string. Either way the result is the same:
-/// [`FormEntry::name_bytes`] yields the exact range the C would have copied.
-///
 /// # Errors
 ///
 /// [`CURLcode::BadFunctionArgument`] for a name that is not valid UTF-8. The
@@ -2091,11 +1804,6 @@ fn set_file_content(
         // guaranteed to result as expected. This feature has been kept for
         // backward compatibility: use of "-" pseudo filename should be
         // avoided."
-        //
-        // The length is unknown, as the C's `-1` says, so the enclosing
-        // multipart's size becomes unknown too and the transfer layer chooses
-        // chunked framing over a `Content-Length`. That propagation is the
-        // observable consequence and it is preserved.
         part.set_reader(None, Some(Box::new(StdinReader)));
         return Ok(());
     }
@@ -2120,34 +1828,11 @@ fn set_file_content(
 }
 
 /// The reader the `"-"` pseudo-filename installs: bare `fread` on `stdin`.
-///
-/// `lib/formdata.c:794-797` passes the C library's `fread` and `curlx_fseek`
-/// straight through as the part's callbacks, with `stdin` as the context.
-/// There is no wrapper and no error handling around them, and the three
-/// consequences below are transcribed rather than improved -- AAP 0.8.2 is
-/// explicit that "a refactor that produces different-but-arguably-better
-/// output has failed".
 #[derive(Debug)]
 struct StdinReader;
 
 impl PartReader for StdinReader {
     /// `fread(buffer, 1, nitems, stdin)`.
-    ///
-    /// # Why a read error ends the part instead of failing the transfer
-    ///
-    /// `fread` reports a short count on error, and a short count of zero is
-    /// indistinguishable from end of file: `mime_read`'s `case 0:`
-    /// (`lib/mime.c:738`) ends the part either way. So curl 8.x truncates the
-    /// upload silently when standard input fails, and this reproduces that
-    /// rather than substituting [`ReadStatus::ReadError`], which would abort
-    /// a transfer curl 8.x completes. `EINTR` is retried, which is what a
-    /// libc `fread` does internally and which cannot change the bytes
-    /// produced.
-    ///
-    /// An empty buffer is [`ReadStatus::Eof`] rather than
-    /// [`ReadStatus::StopFilling`], matching `fread(buf, 1, 0, stdin)`
-    /// returning zero. `StopFilling` would be wrong in a way that does not
-    /// merely differ: `MimePart::read` retries it indefinitely.
     fn read(&mut self, buf: &mut [u8]) -> ReadStatus {
         if buf.is_empty() {
             return ReadStatus::Eof;
@@ -2168,14 +1853,6 @@ impl PartReader for StdinReader {
     }
 
     /// `curlx_fseek(stdin, offset, whence)`.
-    ///
-    /// The C installs a real seek function, which succeeds when standard input
-    /// happens to be a redirected regular file and fails when it is a pipe.
-    /// `std::io::Stdin` does not implement `Seek` at all, so there is no
-    /// position to restore and the honest answer is
-    /// [`SeekResult::CantSeek`] -- which is also the value
-    /// `mime_part_rewind` derives from a failed `fseek` (`lib/mime.c:983-985`),
-    /// so it is the outcome the pipe case already produced.
     fn seek(&mut self, _offset: CurlOffT, _whence: SeekWhence) -> SeekResult {
         SeekResult::CantSeek
     }
@@ -2191,9 +1868,7 @@ impl PartReader for StdinReader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // form_get: curl_formget, the serializer
-// ---------------------------------------------------------------------------
 
 /// `curl_formget` (`lib/formdata.c:627-659`): serializes a form and hands the
 /// bytes to a callback.
@@ -2216,34 +1891,6 @@ impl PartReader for StdinReader {
 /// }
 /// Curl_mime_cleanpart(&toppart);
 /// ```
-///
-/// # The top part carries headers, and that is measurable
-///
-/// `Curl_mime_initpart` does **not** set `MIME_BODY_ONLY`, so the top part
-/// emits its own `Content-Type: multipart/form-data; boundary=...` followed by
-/// the blank line before the first delimiter. It gets no
-/// `Content-Disposition`, because `Curl_mime_prepare_headers` withholds one
-/// when the type begins `multipart/` (`lib/mime.c:1731-1733`). Those two facts
-/// account for exactly 94 of the 518 bytes `tests/libtest/lib1308.c:74`
-/// asserts, and the test at the end of this file reproduces the whole figure.
-///
-/// # The form escape table is the only one reachable here
-///
-/// The C passes `NULL` as the easy handle, both to the bridge (`:638`) and to
-/// `Curl_mime_prepare_headers` (`:640`), so `escape_string`'s
-/// `data && data->set.mime_formescape` test (`lib/mime.c:222`) is false and
-/// the **form** table always applies: `"` becomes `%22`, CR becomes `%0D`, LF
-/// becomes `%0A`, and a backslash is passed through literally. That state is
-/// `MimeOptions::default()`, which is what this function passes -- so
-/// `CURLMIMEOPT_FORMESCAPE` is unreachable from `curl_formget` here for the
-/// same reason it is unreachable there.
-///
-/// # Chunk boundaries are not the contract
-///
-/// The callback may be invoked any number of times with any split; only the
-/// concatenation is fixed, byte for byte. It must return the length it was
-/// given, exactly as the C's `curl_formget_callback` must: a short count is
-/// [`CURLcode::ReadError`].
 ///
 /// # Errors
 ///
@@ -2324,21 +1971,6 @@ pub(crate) fn form_get(
 /// if(nread == CURL_READFUNC_ABORT)
 ///   result = CURLE_ABORTED_BY_CALLBACK;
 /// ```
-///
-/// Only the abort is distinguished. Everything else collapses to
-/// [`CURLcode::ReadError`]: the failing source, the pause -- which
-/// `curl_formget` has no transfer to pause and therefore cannot honour -- and
-/// a real byte count that the callback consumed only part of.
-///
-/// [`ReadStatus::Eof`] appears in the second arm for exhaustiveness rather
-/// than because it is an error. The caller tests for it first, which is the
-/// same precedence the C's `if(!nread) break;` has over the classification
-/// below it.
-///
-/// [`ReadStatus::StopFilling`] cannot arrive from `MimePart::read`, which
-/// loops on it instead of returning it, as `lib/mime.c:1506-1515` does. It is
-/// named anyway so that adding a status to the enum is a compile error here
-/// rather than a value silently swept into a catch-all.
 fn formget_failure(status: ReadStatus) -> CURLcode {
     match status {
         ReadStatus::Abort => CURLcode::AbortedByCallback,
@@ -2353,19 +1985,6 @@ fn formget_failure(status: ReadStatus) -> CURLcode {
 /// `curl_formget` with a system-seeded generator: the ABI's entry point.
 ///
 /// # Why this exists alongside `form_get`
-///
-/// `curl_formget`'s C signature has nowhere to put a generator -- it takes a
-/// form, a context and a callback -- yet the boundaries it emits need one.
-/// The C reaches its fallback randomness path because it passes a null easy
-/// handle; here the generator is a parameter, per AAP 0.3.3's pattern P12, and
-/// `crate::crypto::rand::Rng` is crate-private, so a `pub` function cannot
-/// name it. This constructor asks `crate::crypto::rand` for a fresh
-/// system-seeded generator and delegates, which is the same split
-/// `Mime::new` and `Mime::with_system_rng` already use in the parent module.
-///
-/// A new generator is constructed per call, on the stack, through the crate's
-/// single sanctioned constructor. There is no `static`, no `thread_local!` and
-/// no lazily initialised singleton.
 ///
 /// # Errors
 ///
@@ -2386,9 +2005,7 @@ pub fn form_get_with_system_rng(
     form_get(form, &mut rng, append)
 }
 
-// ---------------------------------------------------------------------------
 // form_free: curl_formfree, which Drop already performs
-// ---------------------------------------------------------------------------
 
 /// `curl_formfree` (`lib/formdata.c:665-689`): releases a whole form.
 ///
@@ -2407,13 +2024,6 @@ pub fn form_get_with_system_rng(
 /// } while(form);
 /// ```
 ///
-/// Taking the form by value is the whole implementation: it is dropped when
-/// this function returns, and dropping it releases the `Vec` of entries, each
-/// entry's `Vec` of children, every `String`, every owned name and value, every
-/// `SList` and every boxed reader -- the C's iteration over `next`, its
-/// recursion into `more`, and its six `free` calls, all at once and in a form
-/// no leak and no double free can be written into.
-///
 /// # What does NOT fall out of `Drop`, and where it went
 ///
 /// The C's frees are **conditional**, and the condition is observable rather
@@ -2424,48 +2034,11 @@ pub fn form_get_with_system_rng(
 /// that, because on its side the borrowed case is a raw C pointer that must
 /// not be freed. [`FormEntry::free_plan`] carries the decision across, and it
 /// is a transcription of `:679-683` rather than a re-derivation.
-///
-/// # Two C helpers with no counterpart
-///
-/// `free_formlist` (`:155-163`) releases the accumulator chain's four
-/// `bufref` fields without releasing the nodes, and `free_chain` (`:290-299`)
-/// -- the C calls it a "Shallow cleanup" and its comment says "Remove the
-/// newly created chain, the structs only and not the content they point to" --
-/// releases the nodes without releasing their contents. Both exist because
-/// `FormAdd`'s error path has to unwind a half-built structure whose fields
-/// have been handed from one owner to another, and it must free each field
-/// exactly once across the two. Neither has anything to do here: the
-/// accumulator and the new entry are locals in [`form_add`], so an early
-/// return drops precisely what was built and nothing else, which is the
-/// all-or-nothing contract that those two helpers exist to hand-implement.
 pub fn form_free(form: FormList<'_>) {
     drop(form);
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
-//
-// COVERAGE RELOCATED HERE, per AAP 0.8.7.
-//
-// `curl_formadd` and `curl_formget` are both annotated `@unittest: 1308`
-// (`lib/formdata.c:606`, `:625`). That annotation points at
-// `tests/libtest/lib1308.c`, a C program that links a debug static libcurl.
-// The C tests cannot link against a Rust static library at all -- `pub(crate)`
-// items are genuinely absent from its symbol table rather than merely hidden
-// -- so AAP 0.8.7 records the deviation and requires their assertions to move
-// into the crate that owns the code. They are reproduced below, including both
-// of `lib1308.c`'s byte-count assertions, which are the strongest available
-// cross-check against curl 8.x's actual output.
-//
-// Re-exporting internals to make the C program link is explicitly rejected by
-// AAP 0.8.7: it "would defeat the encapsulation that makes the zero-`unsafe`
-// guarantee possible".
-//
-// Every boundary below is deterministic, because `crate::crypto::rand::TestRng`
-// is injected. That is what makes byte-exact assertions possible at all, and
-// it is the reason AAP 0.3.3's pattern P12 forbids reaching for a generator
-// rather than receiving one.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2564,13 +2137,6 @@ mod tests {
     }
 
     /// A path in the system temporary directory, unique to this process.
-    ///
-    /// The tests that reach a real file are `#[cfg_attr(miri, ignore)]`,
-    /// because `MimePart::set_file` stats the path and Miri's isolation
-    /// refuses `statx(2)`. That is the remedy the parent module already
-    /// applies for the same reason, and it is deliberately not answered with
-    /// `-Zmiri-disable-isolation`, which would relax the aliasing model of the
-    /// whole run to accommodate a handful of tests.
     fn scratch_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "blitzy_adhoc_test_formdata_{}_{name}",
@@ -3033,8 +2599,7 @@ mod tests {
     #[test]
     fn contents_length_may_be_given_twice_and_the_last_wins() {
         // `:408-410` has NO "given twice" check, unlike almost every other
-        // option. Adding one would reject argument lists curl 8.x accepts,
-        // which AAP 0.8.1 forbids.
+        // option.
         let mut form = FormList::new();
         assert_eq!(
             form_add(
@@ -3261,12 +2826,6 @@ mod tests {
         // `CURL_FORMADD_ILLEGAL_ARRAY` -- the C's comment at `:357-359` is "we
         // do not support an array from within an array" -- and a null array is
         // `CURL_FORMADD_NULL` (`:362-363`).
-        //
-        // Both are raised while DECODING, in `curl-rs-ffi/src/ffi/form.rs`,
-        // because the ABI crate flattens the array before calling and this
-        // vocabulary therefore has no `Array` variant. The builder cannot
-        // produce the code, and the contract is that it does not have to: the
-        // variant exists here so that the decoder has something to return.
         assert_ne!(FormCode::IllegalArray, FormCode::Ok);
         assert_ne!(FormCode::IllegalArray, FormCode::Null);
         assert!(!FormCode::IllegalArray.is_ok());
@@ -3288,10 +2847,7 @@ mod tests {
     #[test]
     fn disabled_is_never_returned() {
         // `lib/formdata.c:843-866` returns `CURL_FORMADD_DISABLED` from three
-        // stub entry points when the form API is compiled out. That is a C
-        // build-configuration artifact with no Cargo counterpart -- there is
-        // no `form` feature among the fifteen AAP 0.5.2 declares -- so the
-        // guard is not reproduced and this code is unreachable. The variant
+        // stub entry points when the form API is compiled out. The variant
         // exists only so the ABI crate can spell the token.
         assert!(!FormCode::Disabled.is_ok());
         let mut form = FormList::new();
@@ -3473,9 +3029,6 @@ mod tests {
         // carries the filename flag (`AddFormInfo`, `:144`) and no value, so a
         // following `CURLFORM_PTRCONTENTS` succeeds at option time and the
         // combination is caught at check time.
-        //
-        // This is also the clearest demonstration that `FormAddCheck` runs
-        // after the whole list rather than during it.
         let mut form = FormList::new();
         assert_eq!(
             form_add(
@@ -4107,11 +3660,6 @@ mod tests {
     fn filecontent_clears_the_remote_filename() {
         // `if(!result && (post->flags & HTTPPOST_READFILE)) result =
         // curl_mime_filename(part, NULL);` (`:804-805`).
-        //
-        // `CURLFORM_FILECONTENT` sends the file's CONTENTS as an ordinary
-        // value, so the base name that `curl_mime_filedata` sets as a side
-        // effect (`lib/mime.c:1337`) has to be removed again -- otherwise the
-        // part would advertise a `filename=` curl 8.x does not send.
         let path = scratch_file("filecontent", b"body bytes\n");
         let path_text = path.to_str().expect("a UTF-8 temporary path");
 
@@ -4346,11 +3894,6 @@ mod tests {
 
     #[test]
     fn a_stream_part_is_bodiless_when_no_read_function_was_supplied() {
-        // `curl_formget` passes `NULL` as `fread_func` (`:638`), and
-        // `curl_mime_data_cb` with a null `readfunc` clears the content and
-        // installs nothing (`lib/mime.c:1425-1434`). So the part renders as
-        // headers with an empty body -- curl 8.x's behaviour, frozen by AAP
-        // 0.8.1.
         let mut form = FormList::new();
         assert_eq!(
             form_add(
@@ -4516,12 +4059,6 @@ mod tests {
         // `CURL_READFUNC_ABORT` propagates out of `MimePart::read` as
         // `ReadStatus::Abort`, which `formget_failure` then maps to
         // `CURLE_ABORTED_BY_CALLBACK`.
-        //
-        // It is not reachable through `form_get` itself, and that is curl 8.x's
-        // behaviour rather than a gap here: `curl_formget` passes a null
-        // `fread_func` (`:638`), so the only source that could abort is never
-        // installed. The two halves are therefore asserted separately, which
-        // is the honest way to cover a path the C also cannot reach.
         let mut form = FormList::new();
         assert_eq!(
             form_add(
@@ -4595,10 +4132,6 @@ mod tests {
         // `%0D`, LF becomes `%0A`, and a backslash is passed through
         // literally. That state is `MimeOptions::default()`, which is what
         // `form_get` passes.
-        //
-        // The WHATWG rule the C quotes at `:200-206` is explicit that the user
-        // agent "must not perform any other escapes", which is why the
-        // backslash survives.
         //
         // Written with escapes rather than as raw strings, because
         // `source_policy::no_raw_string_literal_defeats_the_stripper` in
@@ -4796,9 +4329,6 @@ mod tests {
         // writes the value at `:504`. So a `CURLFORM_STREAM` lands cleanly on a
         // node that already has a value from `CURLFORM_FILE`, replacing it, and
         // the resulting part reports BOTH flags.
-        //
-        // Transcribed rather than tidied: testing the value instead would
-        // reject an argument list curl 8.x accepts.
         let mut form = FormList::new();
         assert_eq!(
             form_add(
@@ -5022,5 +4552,70 @@ mod tests {
         let without =
             build(&form, 0, StreamPolicy::Unavailable).expect("builds");
         assert_eq!(with.content_size(), without.content_size());
+    }
+
+    /// A form field's value, buffer and filename cannot reach a formatted form.
+    ///
+    /// A multipart body has no header name to classify against, so every
+    /// caller-supplied byte is redacted unconditionally and this asserts that
+    /// for each of the three routes a value can arrive by.
+    #[test]
+    fn form_contents_cannot_reach_any_formatted_representation() {
+        const PASSWORD: &str = "hunter2-not-in-a-log";
+        const BUFFER: &str = "private-file-bytes";
+        const FILENAME: &str = "/home/alice/secrets.txt";
+
+        let mut form = FormList::new();
+        assert_eq!(
+            form_add(
+                &mut form,
+                vec![
+                    FormOption::CopyName(Some(b"password")),
+                    FormOption::CopyContents(Some(PASSWORD.as_bytes())),
+                ]
+            ),
+            FormCode::Ok
+        );
+        assert_eq!(
+            form_add(
+                &mut form,
+                vec![
+                    FormOption::CopyName(Some(b"upload")),
+                    FormOption::BufferPtr(Some(BUFFER.as_bytes())),
+                    FormOption::BufferLength(BUFFER.len()),
+                    FormOption::Buffer(Some(FILENAME)),
+                ]
+            ),
+            FormCode::Ok
+        );
+
+        let text = format!("{form:?}");
+        for secret in [PASSWORD, BUFFER, FILENAME] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        // Lengths survive, so the assembly is still debuggable.
+        assert!(
+            text.contains(&format!("<redacted, {} bytes>", PASSWORD.len())),
+            "{text}"
+        );
+
+        // The option enum, which is the argument every diagnostic reports.
+        let option = FormOption::CopyContents(Some(PASSWORD.as_bytes()));
+        let rendered = format!("{option:?}");
+        assert!(!rendered.contains(PASSWORD), "{rendered}");
+        assert!(
+            rendered.starts_with("CopyContents(<redacted,"),
+            "{rendered}"
+        );
+
+        // An absent option stays distinct from an empty one.
+        assert_eq!(
+            format!("{:?}", FormOption::CopyContents(None)),
+            "CopyContents(None)"
+        );
+        assert_eq!(
+            format!("{:?}", FormOption::CopyContents(Some(b""))),
+            "CopyContents(<redacted, 0 bytes>)"
+        );
     }
 }

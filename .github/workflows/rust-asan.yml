@@ -3,91 +3,49 @@
 # SPDX-License-Identifier: curl
 
 # Validation gate 6 of the ten that guard the Rust workspace: ADDRESS
-# SANITIZER.
+# SANITIZER, with zero errors across the FFI surface.
 #
-# The gate, verbatim: AddressSanitizer with zero errors across the FFI surface.
 # This file installs a pinned nightly, rebuilds the standard library under
 # instrumentation, exercises the FFI surface from Rust AND from a real C
 # consumer, and asserts that the instrumentation was genuine, that the run was
-# not vacuous, and that the detectors are still able to fire. Nothing else.
+# not vacuous, and that the detectors are still able to fire. Nothing else: one
+# workflow per validation gate, so that a failure names its own cause.
 #
-# It does nothing further. The build lives in rust-build.yml, lint in
-# rust-clippy.yml, the tests in rust-test.yml, undefined behaviour in
-# rust-miri.yml, coverage in rust-coverage.yml, symbol and header parity in
-# rust-abi.yml, supply chain in rust-audit.yml, and the curl fixture corpus in
-# curl-testsuite.yml. One workflow per validation gate, so that a failure names
-# its own cause.
+# WHY THIS IS NOT rust-miri.yml, since both install a nightly and both look for
+# memory errors. Miri INTERPRETS, so it sees violations of the language's rules
+# even on paths a concrete execution would optimise away - but it cannot
+# execute a FOREIGN FUNCTION and cannot run against a real allocator. ASan
+# EXECUTES, so it sees what actually happens at a C boundary: an out-of-bounds
+# access through a caller's raw pointer, a use-after-free of a
+# `Box::into_raw`'d handle, a leak of an allocation the C side never freed.
+# Those are the failure modes of an FFI shim, and they are the ones Miri is
+# worst placed to find. The consequence worth stating plainly is that
+# `curl-rs-ffi`'s C boundary IS AUDITED HERE AND NOT BY MIRI.
 #
-# WHY THIS IS SEPARATE FROM rust-miri.yml, since both install a nightly and
-# both look for memory errors. They disagree about what they can see, and the
-# disagreement is the reason both exist:
+# `curl-rs` is not a subject: it carries `#![forbid(unsafe_code)]` with no
+# exemption and declares no `mod ffi`, so it contains no `unsafe` block for ASan
+# to find anything in. Instrumentation is not narrowed to the named packages
+# anyway - RUSTFLAGS plus a standard-library rebuild instruments the ENTIRE
+# dependency graph including `core`, `alloc` and `std`, so an error inside
+# rustls, quinn or `core` reached from the FFI surface is still caught here.
 #
-#   Miri INTERPRETS. It models the abstract machine, so it sees violations of
-#   the language's rules - an invalidated pointer, a data race in its model, an
-#   aliasing rule broken - including in code paths that a concrete execution
-#   would optimise away. What it cannot do is execute FOREIGN FUNCTIONS: it has
-#   no shim for a call that arrives from C, and it cannot run against a real
-#   allocator.
+# TWO CONSTRAINTS THIS FILE MAY NOT BREAK:
 #
-#   ASan EXECUTES. It instruments real machine code and real allocations, so it
-#   sees what actually happens at the boundary this workspace exists to
-#   provide: an out-of-bounds access through a raw pointer handed in by a C
-#   caller, a use-after-free of a `Box::into_raw`'d handle, a leak of an
-#   allocation the C side never freed. Those are exactly the failure modes of an
-#   FFI shim, and they are the ones Miri is worst placed to find.
-#
-# So the two gates have different subjects, and the split is not a division of
-# convenience. Miri's subject is `curl-rs-lib`, the safe engine.
-# THIS one's subject is the FFI surface, and the consequence worth stating
-# plainly is that `curl-rs-ffi`'s C boundary IS AUDITED HERE AND NOT BY MIRI.
-# Neither crate is unaudited; they are audited by the gate that can see them.
-#
-# LINEAGE. This file succeeds the sanitizer legs of
-# .github/workflows/linux.yml, which built the C tree under
-# `-fsanitize=address` among others. The inheritance is partial by necessity:
-# those legs also ran MemorySanitizer, ThreadSanitizer and UndefinedBehaviour
-# sanitizer over C code, and the ten-gate framework this file belongs to names
-# only AddressSanitizer. Adding the other three here would be scope this file
-# does not have; Miri covers a large part of what UBSan covered, and safe Rust
-# plus a single-threaded engine covers most of what TSan did. linux.yml itself
-# is untouched - it is a source for this file, not a target.
-#
-# WHY curl-rs IS NOT A SUBJECT. The command-line crate carries
-# `#![forbid(unsafe_code)]` at its root with no exemption and declares no
-# `mod ffi`, so it contains no `unsafe` block for ASan to find anything in - a
-# claim the compiler enforces rather than one this comment asserts. It is also
-# not part of "the FFI surface", which is what gate 6 names. Note that
-# instrumentation is not narrowed to the named packages anyway: RUSTFLAGS plus
-# a standard-library rebuild instruments the ENTIRE dependency graph including
-# `core`, `alloc` and `std`, so an error inside rustls, quinn or `core` reached
-# from the FFI surface is still caught here.
-#
-# TWO PROFILE FACTS FROM THE ROOT Cargo.toml THAT THIS GATE DEPENDS ON.
-#
-#   1. `[profile.release] debug = 1` exists partly FOR THIS GATE. Debug
-#      information is what lets the sanitizer runtime turn a report into a
-#      function-and-line list instead of a column of raw addresses, and a
-#      report nobody can read is barely a report. The steps below build with
-#      the DEV profile rather than release, because dev carries fuller debug
-#      information again (`debug = 2` by default) and this gate has no interest
-#      in optimised code - it has an interest in legible reports. The release
-#      setting still matters, because the C-consumer leg links the same
-#      artifacts a downstream consumer would and because rust-build.yml's
-#      release output must stay symbolisable. Measured here: symbolisation only
+#   1. The steps below build with the DEV profile, not release, because dev
+#      carries fuller debug information and this gate has an interest in
+#      legible reports rather than optimised code. Symbolisation only
 #      materialises when an `llvm-symbolizer` binary is reachable, which is why
 #      one is installed and pointed at explicitly below.
 #
-#   2. `panic = "abort"` is PROHIBITED workspace-wide, and the reason is
-#      architectural rather than stylistic: unwinding must never cross the C
-#      ABI, so `curl-rs-ffi` CONTAINS a panic at the boundary
+#   2. `panic = "abort"` is PROHIBITED here and workspace-wide. Unwinding must
+#      never cross the C ABI, so `curl-rs-ffi` CONTAINS a panic at the boundary
 #      (`src/ffi/panic_boundary.rs`, whose `guard`, `guard_ptr` and `guard_void`
 #      wrap every exported function) instead of letting it abort the host
-#      process. Nothing in this file may add `panic = "abort"` or a codegen flag
-#      equivalent to it, however much simpler that would make a sanitizer
-#      configuration, because it would delete the very boundary semantics this
-#      gate exists to validate. The standard-library rebuild is consequently
-#      spelled with the UNWINDING panic runtime - `panic_unwind`, never
-#      `panic_abort`.
+#      process. Adding `panic = "abort"` or a codegen flag equivalent to it
+#      would delete the boundary semantics this gate exists to validate, however
+#      much simpler it would make a sanitizer configuration. The
+#      standard-library rebuild is consequently spelled with the UNWINDING panic
+#      runtime - `panic_unwind`, never `panic_abort`.
 
 name: 'Rust sanitizer'
 
@@ -110,11 +68,9 @@ name: 'Rust sanitizer'
       - 'Dockerfile'
       - 'projects/**'
 
-# A deny-list, deliberately, and never an allow-list. An allow-list would have
-# to enumerate every path that can affect memory safety, and the day it missed
-# `curl-rs-ffi/src/**` this gate would stay silent on exactly the change it
-# exists to judge. The four entries below are the ones linux.yml ignores and
-# cannot influence a Rust build.
+# A deny-list, deliberately. An allow-list would have to enumerate every path
+# that can affect memory safety, and the day it missed `curl-rs-ffi/src/**`
+# this gate would stay silent on exactly the change it exists to judge.
 
 concurrency:
   group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}'
@@ -123,48 +79,34 @@ concurrency:
 permissions: {}
 
 env:
-  # Colour off. Several steps below parse tool output with `grep`, `sed` and
-  # `awk` to decide a verdict, and an ANSI escape sequence embedded in a
-  # diagnostic would make an anchored pattern silently stop matching. An
-  # assertion that silently stops matching is worse than no assertion.
+  # Colour off: several steps below decide a verdict by matching tool output,
+  # and an embedded ANSI escape would make an anchored pattern silently stop
+  # matching.
   CARGO_TERM_COLOR: never
 
-  # A nightly toolchain and the locked dependency graph are both downloaded
-  # here. A transient registry or CDN hiccup should retry rather than fail this
-  # gate and send somebody hunting for a memory error that is not there.
+  # A transient registry hiccup should retry rather than fail this gate and send
+  # somebody hunting for a memory error that is not there.
   CARGO_NET_RETRY: '3'
 
-  # No cache is restored in this job - see the cache decision recorded on the
-  # job's timeout below - so incremental state is output that nothing ever
-  # reads. Not a speed tuning: performance is an explicit non-goal of this work
-  # and no step below is ordered or configured for it.
+  # No cache is restored in this job, so incremental state is output that
+  # nothing ever reads.
   CARGO_INCREMENTAL: '0'
 
-  # THE NIGHTLY PIN. A DATED channel, never the moving `nightly` alias, for the
-  # same reason rust-miri.yml pins its own: with a moving channel an unchanged
-  # commit gains or loses findings over time, in both directions, and neither
-  # direction is detectable after the fact because the log of the earlier run
-  # names a nightly that no longer resolves to the same compiler. The sanitizer
-  # flag and the standard-library rebuild are both unstable, so their behaviour
-  # is explicitly allowed to change between nightlies.
+  # THE NIGHTLY PIN. A DATED channel, never the moving `nightly` alias: the
+  # sanitizer flag and the standard-library rebuild are both unstable, so with a
+  # moving channel an unchanged commit gains or loses findings over time and
+  # neither direction is detectable afterwards, because the earlier log names a
+  # nightly that no longer resolves to the same compiler.
   #
-  # This is a SEPARATE copy of the pin from the one in rust-miri.yml, and the
-  # duplication is deliberate: the two gates are independent, and being able to
-  # advance one nightly without disturbing the other is worth more than sharing
-  # a single value. Neither belongs in rust-toolchain.toml, which pins the
-  # stable channel every other leg builds on and records that the nightly
-  # belongs to "the Miri and AddressSanitizer gates" which "name it explicitly
-  # per invocation" - and which says of this file that it "installs its own
-  # dated nightly with rust-src". This env var is that dated nightly. It is
-  # also, deliberately, not a renovate-managed pin: rust-toolchain.toml owns the
-  # toolchain policy for the workspace, and neither renovate.json nor
-  # .github/dependabot.yml is touched by this file.
+  # This is deliberately a SEPARATE copy of the pin from rust-miri.yml's, so
+  # that one nightly can be advanced without disturbing the other. Neither
+  # belongs in rust-toolchain.toml, which pins the stable channel every other
+  # leg builds on.
   #
-  # MEASURED, because the naming is counter-intuitive: a dated nightly channel
-  # is the channel PUBLISHED on that date and carries a compiler BUILT THE
-  # PREVIOUS DAY. nightly-2026-07-31 resolves to
-  # `rustc 1.99.0-nightly (8ab9fdff5 2026-07-30)`, and it ships `rust-src`,
-  # which the standard-library rebuild requires.
+  # Counter-intuitive and therefore worth recording: a dated nightly channel is
+  # the channel PUBLISHED on that date and carries a compiler BUILT THE PREVIOUS
+  # DAY. It must ship `rust-src`, which the standard-library rebuild
+  # requires.
   NIGHTLY_TOOLCHAIN: 'nightly-2026-07-31'
 
   # An explicit target triple is MANDATORY for a standard-library rebuild:
@@ -173,34 +115,28 @@ env:
   # run. Naming the triple splits host artifacts from target artifacts and is
   # what makes the instrumented build work at all.
   #
-  # x86_64-unknown-linux-gnu is one of the four mandated targets and the one an
-  # Ubuntu runner executes natively. ASan requires RUNNING the instrumented
-  # code, so the other three - aarch64-unknown-linux-gnu, x86_64-apple-darwin
-  # and aarch64-apple-darwin - would need an emulator or a foreign runner.
-  # Compilation for all four is gate 1 and is asserted in rust-build.yml; this
-  # gate deliberately does not duplicate it.
+  # This is the one mandated target an Ubuntu runner executes natively. ASan
+  # requires RUNNING the instrumented code, so the other three would need an
+  # emulator or a foreign runner; compilation for all four is gate 1, asserted
+  # in rust-build.yml.
   ASAN_TARGET: 'x86_64-unknown-linux-gnu'
 
   # THE SANITIZER FLAG, held here as the single source of truth and mapped onto
   # the real RUSTFLAGS variable by a STEP-SCOPED `env:` on each instrumented
-  # step - never at workflow scope, and never at repository scope.
-  #
-  # Why the scoping is load-bearing rather than tidy. `.cargo/config.toml`
-  # deliberately sets NO rustflags for any target, and records why: an unstable
-  # compiler flag placed there "would be rejected by the pinned toolchain and
-  # would break EVERY build, not just those two legs". The same file refuses a
-  # deny-warnings flag on a second ground that applies here too - rustflags
-  # participate in Cargo's fingerprint, so a flag visible to more steps than
-  # need it forces rebuilds and destroys per-gate attribution. Keeping the flag
-  # on the steps that sanitize means the toolchain install, the version probes,
-  # the dependency fetch and the working-tree check all run un-instrumented,
-  # and a failure in any of them is unambiguously theirs.
+  # step - never at workflow scope, and never in `.cargo/config.toml`, which
+  # deliberately sets no rustflags for any target because an unstable flag there
+  # would break every build rather than these legs. Rustflags also participate
+  # in Cargo's fingerprint, so a flag visible to more steps than need it forces
+  # rebuilds and destroys per-gate attribution: with the flag scoped to the
+  # instrumented steps, the toolchain install, the version probes, the
+  # dependency fetch and the working-tree check all run un-instrumented, and a
+  # failure in any of them is unambiguously theirs.
   #
   # It is set through RUSTFLAGS rather than passed after `--` so that it reaches
   # every crate in the graph rather than only the top-level one. An
   # uninstrumented dependency is a blind spot, and the interesting allocations
-  # in this workspace - rustls buffers, quinn packet buffers, the `Box`ed
-  # handles the C ABI hands out - live in dependencies.
+  # here - rustls buffers, quinn packet buffers, the `Box`ed handles the C ABI
+  # hands out - live in dependencies.
   ASAN_RUSTFLAGS: '-Zsanitizer=address'
 
   # The standard-library rebuild, as a cargo flag rather than a rustc one. This
@@ -231,23 +167,15 @@ env:
   #                                   and for a non-zero status, never for 1.
   #   allocator_may_return_null=1     restores malloc's contract - a request the
   #                                   allocator cannot serve returns NULL. ASan
-  #                                   otherwise treats an over-large request as
-  #                                   a fatal `allocation-size-too-big` error,
-  #                                   which is not a memory-safety finding but
-  #                                   an emulation gap: it makes an
-  #                                   out-of-memory branch unreachable and so
-  #                                   UNTESTABLE. curl-rs-lib/src/ffi/gss.rs
-  #                                   contains exactly such a test - it hands a
-  #                                   security-context buffer an impossible
-  #                                   length to prove the fallible reservation
-  #                                   REPORTS CURLE_OUT_OF_MEMORY rather than
-  #                                   aborting the host process - and it already
-  #                                   carries a `cfg_attr(miri, ignore)` for the
-  #                                   same emulation gap in the interpreter.
-  #                                   This option narrows nothing that this gate
-  #                                   is for: measured here, the leak and
-  #                                   use-after-free controls below both still
-  #                                   fire with it enabled.
+  #                                   otherwise makes an over-large request a
+  #                                   fatal `allocation-size-too-big` error,
+  #                                   which is an emulation gap rather than a
+  #                                   finding: it makes an out-of-memory branch
+  #                                   unreachable and so UNTESTABLE, and this
+  #                                   workspace tests exactly such a branch.
+  #                                   Measured: the leak and use-after-free
+  #                                   controls below both still fire with it
+  #                                   enabled.
   #   strict_string_checks=1          C string functions are checked for reading
   #                                   past a terminator, which is precisely what
   #                                   an incorrectly sized CStr conversion does.
@@ -324,23 +252,15 @@ jobs:
     # installs system packages and needs a full apt environment.
     runs-on: ubuntu-latest
 
-    # A standard-library rebuild recompiles core, alloc and std from source
-    # under instrumentation, and it does so more than once here because the two
-    # ASan subjects are configured with different feature sets and the
-    # C-consumer leg links a third artifact. The budget is generous for that
-    # reason; the tree's usual 10 or 15 minutes would expire mid-build, and a
-    # gate that times out reports a timeout, which teaches a reader nothing
-    # about memory safety.
+    # The budget is generous because a standard-library rebuild happens more
+    # than once here - the two ASan subjects use different feature sets and the
+    # C-consumer leg links a third artifact - and a gate that times out reports
+    # a timeout, which teaches a reader nothing about memory safety.
     #
-    # THE CACHE DECISION, recorded rather than left implicit: nothing is cached.
-    # A cache keyed on the nightly pin would shorten the rebuild, but an
-    # instrumented standard library is exactly the artifact whose staleness
-    # would be invisible - a restored `std` compiled by a different nightly, or
-    # compiled before the sanitizer flag was added, produces a green run with a
-    # blind spot rather than an error. Rebuilding every time costs minutes and
-    # buys certainty, and this gate is not on the critical path of a merge.
-    # Performance is an explicit non-goal of this work, so the trade is not
-    # close.
+    # NOTHING IS CACHED, deliberately. An instrumented standard library is
+    # exactly the artifact whose staleness would be invisible: a restored `std`
+    # compiled by a different nightly, or compiled before the sanitizer flag was
+    # added, produces a green run with a blind spot rather than an error.
     timeout-minutes: 60
 
     steps:
@@ -355,26 +275,17 @@ jobs:
         timeout-minutes: 10
         run: |
           # rust-toolchain.toml pins a STABLE channel and deliberately does not
-          # pin a nightly, naming this file and rust-miri.yml as the two gates
-          # that install one for themselves. So installing the nightly is this
-          # workflow's job, and rust-toolchain.toml is not modified - it is owned
-          # elsewhere and correct as it stands.
+          # pin a nightly, so installing one is this workflow's job.
           #
-          # rust-src is the component the standard-library rebuild needs: it is
-          # the standard library's SOURCE, and without it there is nothing to
-          # rebuild under instrumentation. miri is deliberately NOT requested -
-          # that component belongs to rust-miri.yml and downloading it here
-          # would be dead weight.
+          # rust-src is the standard library's SOURCE, without which there is
+          # nothing to rebuild under instrumentation. miri is deliberately NOT
+          # requested: that component belongs to rust-miri.yml.
           #
-          # --profile minimal because nothing in this job needs rustfmt, clippy
-          # or rust-docs. --no-self-update keeps rustup itself fixed. --override
-          # is deliberately NOT passed: it would write a directory override and
+          # --profile minimal because nothing here needs rustfmt, clippy or
+          # rust-docs. --no-self-update keeps rustup itself fixed. --override is
+          # deliberately NOT passed: it would write a directory override and
           # mutate the state of the checkout, and every invocation below names
           # the toolchain explicitly instead.
-          #
-          # There is no Rust-toolchain action anywhere in this repository, so
-          # rustup is driven directly. The only two actions this tree pins are
-          # checkout and cache, and only checkout is used here.
           command -v rustup
           rustup --version
 
@@ -425,10 +336,15 @@ jobs:
           # system package and not as a memory-safety verdict. See this file's
           # env block for why each package is required.
           #
-          # The house apt pattern, taken verbatim from rust-build.yml.
+          # The house apt pattern, taken verbatim from rust-build.yml -
+          # including the explicit non-interactive spelling on both verbs, which
+          # that file documents: -y answers apt's confirmation and
+          # DEBIAN_FRONTEND=noninteractive stops a postinst dialogue. Neither is
+          # implied by Dpkg::Use-Pty=0, and a prompt here would hang the leg
+          # until the job timed out rather than fail with a diagnosis.
           sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
-          sudo apt-get -o Dpkg::Use-Pty=0 update
-          sudo apt-get -o Dpkg::Use-Pty=0 install \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Use-Pty=0 update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Use-Pty=0 install -y \
             ${NATIVE_LINK_PACKAGES} \
             ${SYMBOLIZER_PACKAGES}
 
@@ -499,8 +415,8 @@ jobs:
       - name: 'assert: the pinned nightly is the active one, and rust-src is present'
         run: |
           # A directory-scoped rust-toolchain.toml with an explicit `channel` is
-          # authoritative for a bare `cargo`, so in this checkout `rustc
-          # --version` reports the pinned stable release. An explicit
+          # authoritative for a bare `cargo`, so a bare `rustc --version` here
+          # reports the pinned STABLE release, not this gate's nightly. An explicit
           # `+toolchain` argument outranks that file, which is why every
           # invocation in this job carries one. A gate that merely ASSUMED the
           # override wins would be a gate that silently ran on stable - where
@@ -675,29 +591,22 @@ jobs:
           #         curl-rs-ffi/src/ffi/misc.rs:694
           #
           # WHY IT IS A FALSE POSITIVE - a sanitizer artefact of Rust `static`
-          # storage, not a defect. The allocation is made by `immortal_c_string`
-          # (curl-rs-ffi/src/ffi/misc.rs), whose whole contract is to LEAK: it
-          # backs curl_version and curl_version_info, whose C signatures hand out
-          # a `const char *` that must stay valid for the life of the process,
-          # and the C it supersedes used `static` buffers for exactly these
-          # strings. In production the pointer stays reachable from a static, so
-          # LeakSanitizer finds a root and reports nothing. The report above comes
-          # from a #[cfg(test)] function that calls the helper DIRECTLY to assert
-          # its documented truncation behaviour and then discards the pointer,
-          # which makes an intentionally immortal allocation unreachable at exit.
+          # storage, not a defect. `immortal_c_string` exists to LEAK: it backs
+          # curl_version and curl_version_info, whose C signatures hand out a
+          # `const char *` that must stay valid for the life of the process. In
+          # production the pointer stays reachable from a static, so
+          # LeakSanitizer finds a root and reports nothing; the report above
+          # comes from a #[cfg(test)] function that calls the helper DIRECTLY and
+          # then discards the pointer.
           #
           # WHY THE RULE NAMES A TEST AND NOT THE HELPER: measured here, a rule
           # naming `immortal_c_string` does not match, because the helper is
-          # inlined into its caller and never appears as its own frame. A rule
-          # naming the file or the module DOES match but would silence the whole
-          # of misc.rs, including the exported functions. The test function's own
-          # name is the narrowest pattern that matches - and no exported ABI
-          # symbol is or could be called that, so this rule cannot mask a real
-          # finding in the C boundary.
-          #
-          # WHY NOT FIX IT INSTEAD: curl-rs-ffi/src/** is owned by another crate
-          # and is not this workflow's to edit. The finding is REPORTED loudly
-          # below so it reaches its owner.
+          # inlined and never appears as its own frame. A rule naming the file or
+          # the module DOES match but would silence the whole of misc.rs,
+          # including the exported functions. The test function's own name is the
+          # narrowest pattern that matches, and no exported ABI symbol is or
+          # could be called that, so this rule cannot mask a real finding in the
+          # C boundary.
           #
           # detect_leaks stays 1. This is one named rule, not a blanket
           # suppression, and the step after the subjects asserts its exact hit
@@ -759,6 +668,16 @@ jobs:
           # The dev profile, not release: this gate wants the fullest debug
           # information it can get, because that is what turns a report into a
           # frame list. See the prologue on the root Cargo.toml's debug setting.
+          #
+          # STREAMED THROUGH tee AND THE STATUS RECOVERED FROM PIPESTATUS. The
+          # log is kept because the assertions further down read it - the
+          # vacuity checks, the report scan and the suppression account all
+          # parse it - and a plain redirect would leave a timed-out or aborted
+          # run with nothing printed. `tee` is then the last command of the
+          # pipeline, and the shell GitHub uses for a `run:` body is `bash -e`
+          # WITHOUT `pipefail`, so the pipeline's status is `tee`'s and cargo's
+          # own would be lost. `PIPESTATUS[0]` is cargo's, read on the very next
+          # line before any other command can overwrite the array.
           log="${RUNNER_TEMP}/asan-ffi.log"
           status=0
           cargo "+${NIGHTLY_TOOLCHAIN}" test \
@@ -766,7 +685,8 @@ jobs:
             "${ASAN_BUILD_STD}" \
             --target "${ASAN_TARGET}" \
             -p curl-rs-ffi \
-            --all-targets 2>&1 | tee "${log}" || status=$?
+            --all-targets 2>&1 | tee "${log}"
+          status="${PIPESTATUS[0]}"
 
           if [ "${status}" -ne 0 ]; then
             echo "FAIL: AddressSanitizer run over curl-rs-ffi exited ${status}."
@@ -796,6 +716,11 @@ jobs:
           # sake: mod gss sits behind the default-off negotiate feature, and the
           # step that declared the surface said so explicitly. --all-targets for
           # the same measured reason as the step above.
+          #
+          # tee plus PIPESTATUS for the same reason as the step above: the log is
+          # read by the assertions further down, and `tee` being last in the
+          # pipeline would otherwise hand this check `tee`'s status instead of
+          # cargo's under `bash -e` without `pipefail`.
           log="${RUNNER_TEMP}/asan-lib.log"
           status=0
           cargo "+${NIGHTLY_TOOLCHAIN}" test \
@@ -804,7 +729,8 @@ jobs:
             --target "${ASAN_TARGET}" \
             -p curl-rs-lib \
             --all-features \
-            --all-targets 2>&1 | tee "${log}" || status=$?
+            --all-targets 2>&1 | tee "${log}"
+          status="${PIPESTATUS[0]}"
 
           if [ "${status}" -ne 0 ]; then
             echo "FAIL: AddressSanitizer run over curl-rs-lib --all-features exited ${status}."
@@ -829,8 +755,31 @@ jobs:
           # called from C, and a Rust test calling curl_easy_escape is not a C
           # program linking against libcurl.a. The next two steps close that gap
           # by building the real static library under instrumentation and linking
-          # a real C consumer against it, so Box::into_raw and Box::from_raw are
-          # crossed the way a downstream consumer crosses them.
+          # a real C consumer against it.
+          #
+          # WHAT THE C CONSUMER CROSSES, STATED PRECISELY. Two ownership shapes,
+          # not one, because they fail differently:
+          #
+          #   * a BUFFER the ABI allocated and C releases through curl_free -
+          #     curl_easy_escape, curl_easy_unescape, curl_getenv, and the
+          #     curl_slist chain.
+          #   * a HANDLE - curl_url() performing Box::into_raw and handing C the
+          #     only reference, curl_url_cleanup() performing Box::from_raw and
+          #     destroying it, with curl_url_set, curl_url_get and curl_url_dup
+          #     in between. Box::from_raw reconstructs a typed value and runs its
+          #     destructor, so a stale or repeated handle pointer corrupts more
+          #     than a byte range, and a buffer round trip cannot stand in for it.
+          #
+          # CURLU is used for the handle because it is a genuine opaque struct in
+          # the public headers (include/curl/urlapi.h:107), unlike CURL, CURLM and
+          # CURLSH which are `void`; the C side can therefore only hold it as a
+          # pointer, which is the shape the audit needs. curl_easy_init and
+          # curl_easy_cleanup belong here too and will be added when they are
+          # exported - until then this file must not pretend they are.
+          #
+          # The step after next commits FIVE deliberate errors across both shapes
+          # and requires every one to be reported, so a detector that has quietly
+          # stopped working cannot leave this leg green.
           status=0
           cargo "+${NIGHTLY_TOOLCHAIN}" build \
             --locked \
@@ -889,9 +838,12 @@ jobs:
           /* A C consumer of the instrumented libcurl.a, used only by
              .github/workflows/rust-asan.yml. Declares exactly the entry points it calls.
 
-             Three modes. "clean" must be silent; "leak" and "uaf" are POSITIVE CONTROLS
-             that must produce a report, and they are what proves this gate can still
-             fail. */
+             Six modes. "clean" must be silent and exercises BOTH ownership shapes -
+             buffers the ABI allocated, and an opaque CURLU handle constructed, mutated,
+             read, duplicated and released. The other five are POSITIVE CONTROLS that
+             must each produce a report, and they are what proves this gate can still
+             fail: "leak" and "uaf" on a buffer, "handle-stale",
+             "handle-double-free" and "handle-leak" on a handle. */
           #include <stdio.h>
           #include <string.h>
 
@@ -909,9 +861,35 @@ jobs:
           extern void  curl_slist_free_all(struct curl_slist *list);
           extern int   curl_strequal(const char *s1, const char *s2);
 
+          /* THE OPAQUE-HANDLE FAMILY. These are the reason this driver exists.
+             Everything above returns a buffer; these construct, mutate, duplicate and
+             destroy a HANDLE, which is what Box::into_raw and Box::from_raw actually
+             transfer. CURLU is a genuine opaque struct in the public headers
+             (include/curl/urlapi.h:107, `typedef struct Curl_URL CURLU`), unlike CURL,
+             CURLM and CURLSH which are `void`, so the C side can only hold it as a
+             pointer - exactly the shape the ownership audit needs. */
+          typedef struct Curl_URL CURLU;
+          extern CURLU *curl_url(void);
+          extern void   curl_url_cleanup(CURLU *handle);
+          extern CURLU *curl_url_dup(const CURLU *in);
+          extern int    curl_url_set(CURLU *handle, int part, const char *content, unsigned int flags);
+          extern int    curl_url_get(const CURLU *handle, int part, char **part_out, unsigned int flags);
+          extern const char *curl_url_strerror(int code);
+
+          /* CURLUPart, from include/curl/urlapi.h:74-83. Only the two this driver uses
+             are named, by their declaration ordinals: the enum runs URL, SCHEME, USER,
+             PASSWORD, OPTIONS, HOST, so CURLUPART_URL is 0 and CURLUPART_HOST is 5.
+             Spelled as constants rather than included so the driver needs no header on
+             the include path - the same reason curl_slist is declared above rather
+             than pulled in. */
+          #define CURLUPART_URL  0
+          #define CURLUPART_HOST 5
+
           /* Provided by the sanitizer runtime. Declared rather than included so the
              driver needs no sanitizer headers on the include path. */
           extern int __lsan_do_recoverable_leak_check(void);
+
+          static int handle_roundtrip(void);
 
           /* Rust allocates, C reads, C releases through the ABI's own deallocator. This
              is the ownership transfer the gate exists to audit, crossed for real. */
@@ -980,7 +958,86 @@ jobs:
               return 1;
             }
 
+            if (handle_roundtrip() != 0) {
+              return 1;
+            }
+
             curl_global_cleanup();
+            return 0;
+          }
+
+          /* THE OWNERSHIP TRANSFER THIS GATE EXISTS FOR, crossed for real.
+             Everything in clean_roundtrip above allocates a BUFFER; this constructs a
+             HANDLE. curl_url() performs Box::into_raw and hands C the only reference;
+             curl_url_cleanup() performs Box::from_raw and destroys it. In between, the
+             handle is mutated, read (which allocates a buffer C must release with
+             curl_free, a second and differently-shaped transfer) and duplicated - so a
+             second independent handle is created and destroyed, which is what catches a
+             duplicate that shares an allocation with its original.
+
+             Every ordering here is deliberate: the dup is released BEFORE the original
+             so that a use-after-free in the dup's own teardown cannot be masked by the
+             original still being alive, and the retrieved string is released before its
+             handle so that a handle destructor freeing strings it did not own would be
+             reported as a double free rather than pass unnoticed. */
+          static int handle_roundtrip(void)
+          {
+            CURLU *url;
+            CURLU *copy;
+            char *host = NULL;
+            char *rebuilt = NULL;
+            int rc;
+
+            url = curl_url();
+            if (url == NULL) {
+              fprintf(stderr, "curl_url returned NULL\n");
+              return 1;
+            }
+
+            rc = curl_url_set(url, CURLUPART_URL, "https://example.com/a/b?c=d", 0);
+            if (rc != 0) {
+              fprintf(stderr, "curl_url_set(URL) refused: %s\n", curl_url_strerror(rc));
+              curl_url_cleanup(url);
+              return 1;
+            }
+
+            rc = curl_url_get(url, CURLUPART_HOST, &host, 0);
+            if (rc != 0 || host == NULL) {
+              fprintf(stderr, "curl_url_get(HOST) refused: %s\n", curl_url_strerror(rc));
+              curl_url_cleanup(url);
+              return 1;
+            }
+            printf("host      = %s\n", host);
+            curl_free(host);
+
+            /* A second handle from the first. Released before the original, so that a
+               shared allocation shows up as a double free on the ORIGINAL's teardown
+               rather than being reported against whichever happened to go last. */
+            copy = curl_url_dup(url);
+            if (copy == NULL) {
+              fprintf(stderr, "curl_url_dup returned NULL\n");
+              curl_url_cleanup(url);
+              return 1;
+            }
+            rc = curl_url_get(copy, CURLUPART_URL, &rebuilt, 0);
+            if (rc != 0 || rebuilt == NULL) {
+              fprintf(stderr, "curl_url_get(URL) on the dup refused: %s\n",
+                      curl_url_strerror(rc));
+              curl_url_cleanup(copy);
+              curl_url_cleanup(url);
+              return 1;
+            }
+            printf("rebuilt   = %s\n", rebuilt);
+            curl_free(rebuilt);
+            curl_url_cleanup(copy);
+
+            /* A null handle must be a silent no-op, exactly as the C's `if(u)` guard
+               makes it. Exercised because it is the one input a caller is most likely
+               to pass and the one a Box::from_raw would fault on. */
+            curl_url_cleanup(NULL);
+
+            curl_url_cleanup(url);
+            printf("handles   = constructed, mutated, read, duplicated, released\n");
             return 0;
           }
 
@@ -1027,6 +1084,66 @@ jobs:
               return 1;
             }
 
+            /* HANDLE-SPECIFIC CONTROLS. The two above prove the detectors work on a
+               BUFFER the ABI handed out. These prove they work on a HANDLE, which is a
+               different allocation shape: Box::from_raw reconstructs a typed value and
+               runs its destructor, so a stale or repeated handle pointer corrupts more
+               than a byte range. Kept as separate modes rather than folded into the
+               buffer controls because a gate that cannot distinguish them cannot report
+               which boundary regressed. */
+            if (strcmp(mode, "handle-stale") == 0) {
+              CURLU *url = curl_url();
+              char *part = NULL;
+              if (url == NULL) {
+                fprintf(stderr, "curl_url returned NULL\n");
+                return 1;
+              }
+              if (curl_url_set(url, CURLUPART_URL, "https://example.com/", 0) != 0) {
+                fprintf(stderr, "curl_url_set refused\n");
+                curl_url_cleanup(url);
+                return 1;
+              }
+              curl_url_cleanup(url);
+              /* Deliberate use of a handle whose ownership has been given back. */
+              (void)curl_url_get(url, CURLUPART_HOST, &part, 0);
+              if (part != NULL) {
+                curl_free(part);
+              }
+              fprintf(stderr, "CONTROL FAILED: the use of a released handle was not reported\n");
+              return 1;
+            }
+
+            if (strcmp(mode, "handle-double-free") == 0) {
+              CURLU *url = curl_url();
+              if (url == NULL) {
+                fprintf(stderr, "curl_url returned NULL\n");
+                return 1;
+              }
+              curl_url_cleanup(url);
+              /* Deliberate second release of the same handle. This is the mistake a real
+                 consumer makes most often, and the one an ABI that took ownership twice
+                 would turn into heap corruption. */
+              curl_url_cleanup(url);
+              fprintf(stderr, "CONTROL FAILED: the second release of one handle was not reported\n");
+              return 1;
+            }
+
+            if (strcmp(mode, "handle-leak") == 0) {
+              /* A handle constructed and abandoned. Volatile and cleared inside the
+                 frame for the same reason drop_one_allocation does it: LeakSanitizer
+                 scans the live stack for roots. */
+              CURLU *volatile url = curl_url();
+              if (url != NULL) {
+                printf("handle    = %p\n", (void *)url);
+              }
+              url = NULL;
+              if (__lsan_do_recoverable_leak_check() == 0) {
+                fprintf(stderr, "CONTROL FAILED: an abandoned handle was not reported\n");
+                return 1;
+              }
+              return 0;
+            }
+
             fprintf(stderr, "unknown mode '%s'\n", mode);
             return 2;
           }
@@ -1048,9 +1165,27 @@ jobs:
           #    step's env - because the only justified suppression names a Rust
           #    #[cfg(test)] function that this binary cannot reach. So the C
           #    boundary is audited here with leak detection entirely unnarrowed.
+          #
+          #    THE STATUS COMES FROM PIPESTATUS, AND THAT IS THE WHOLE POINT OF
+          #    THIS LEG. `tee` is the last command of the pipeline, the shell
+          #    GitHub uses for a `run:` body without a `shell:` key is `bash -e`
+          #    WITHOUT `pipefail`, and so the pipeline's own status is `tee`'s -
+          #    which is 0 essentially always. Capturing it with `|| status=$?`
+          #    therefore records `tee` and never the C program, and `-e` does not
+          #    fire either, so a failing consumer would sail through: the driver
+          #    prints all three required marker lines before it can return 1 on
+          #    a null `curl_easy_strerror(0)` or a disagreeing `curl_strequal`,
+          #    and neither of those emits a sanitizer report, so every later
+          #    check in this step would pass and this gate would report a clean
+          #    ownership-boundary run that never happened. A security control
+          #    that cannot fail is worse than no control, because it looks like
+          #    evidence. `PIPESTATUS[0]` is the producer's own status and is read
+          #    on the very next line, before any other command can overwrite the
+          #    array. Same spelling as rust-build.yml and rust-miri.yml.
           clean_log="${RUNNER_TEMP}/asan-c-clean.log"
           status=0
-          "${binary}" clean 2>&1 | tee "${clean_log}" || status=$?
+          "${binary}" clean 2>&1 | tee "${clean_log}"
+          status="${PIPESTATUS[0]}"
 
           if [ "${status}" -ne 0 ]; then
             echo "FAIL: the C consumer exited ${status} on the clean round trip."
@@ -1068,7 +1203,16 @@ jobs:
 
           # The clean run must actually have done something. A driver that
           # printed nothing proves nothing.
-          for expected in 'escaped   =' 'unescaped =' 'banner    ='; do
+          #
+          # `host      =`, `rebuilt   =` and `handles   =` are the handle half and
+          # are checked for the same reason the buffer lines are: the ownership
+          # transfer this gate is named for is Box::into_raw / Box::from_raw, and
+          # without these three the clean run's silence would only be evidence
+          # about buffers. `handles   =` is emitted last in handle_roundtrip, after
+          # every release, so its presence means the whole sequence completed
+          # rather than merely started.
+          for expected in 'escaped   =' 'unescaped =' 'banner    =' \
+                          'host      =' 'rebuilt   =' 'handles   ='; do
             if ! grep -q -F "${expected}" "${clean_log}"; then
               echo "FAIL: the clean round trip never printed '${expected}'."
               echo 'The C consumer did not reach the calls it exists to make, so its silence is'
@@ -1077,9 +1221,10 @@ jobs:
             fi
           done
 
-          echo 'the C consumer crossed the ownership boundary cleanly, with no report'
+          echo 'the C consumer crossed both ownership boundaries cleanly - buffers AND an'
+          echo 'opaque handle constructed, mutated, read, duplicated and released - with no report'
 
-      - name: 'assert: the detectors can still fail - two positive controls'
+      - name: 'assert: the detectors can still fail - five positive controls'
         env:
           ASAN_OPTIONS: '${{ env.ASAN_RUNTIME_OPTIONS }}'
           ASAN_SYMBOLIZER_PATH: '/usr/bin/llvm-symbolizer'
@@ -1092,11 +1237,20 @@ jobs:
           # for the runtime's presence in the binary catches the first case and is
           # done in the next step. Only executing a defect catches the second.
           #
-          # So the C consumer is asked to commit two real errors at the FFI
-          # boundary - an allocation from curl_easy_escape that is never released,
-          # and a read of memory curl_free has already released - and BOTH must be
-          # reported. If either is not, this gate has stopped being able to fail
+          # So the C consumer is asked to commit FIVE real errors at the FFI
+          # boundary, and every one must be reported. Two are on a buffer - an
+          # allocation from curl_easy_escape that is never released, and a read of
+          # memory curl_free has already released. Three are on an opaque handle -
+          # a read through a handle curl_url_cleanup has destroyed, a second
+          # release of one handle, and a handle constructed and abandoned. If any
+          # of the five is not reported, this gate has stopped being able to fail
           # and it says so instead of passing.
+          #
+          # The buffer and handle sets are BOTH required because they fail
+          # differently: a buffer is a byte range, whereas Box::from_raw
+          # reconstructs a typed value and runs its destructor. A gate that only
+          # ever mishandled buffers would keep passing while handle ownership
+          # regressed.
           #
           # Note on exit status: abort_on_error=1 makes a reporting process abort,
           # so the status is 134 rather than 1. These checks therefore require a
@@ -1154,7 +1308,75 @@ jobs:
             exit 1
           fi
 
-          echo 'both detectors fired on demand: this gate is able to fail, so its green runs count'
+          # CONTROLS 3 TO 5 - THE SAME THREE FAILURES, ON A HANDLE.
+          #
+          # The two above prove the detectors see a mishandled BUFFER. A handle is
+          # a different allocation shape: Box::from_raw reconstructs a typed value
+          # and runs its destructor, so these three exercise the boundary the two
+          # above cannot reach. Each is its own mode so that a failure names the
+          # boundary that regressed rather than "the C consumer".
+          #
+          # The expected report is asserted PER MODE rather than "any report",
+          # because accepting any would let one detector stand in for another and
+          # hide which had stopped working.
+          #
+          # handle-double-free expects heap-use-after-free, NOT "attempting
+          # double-free", and that is measured rather than assumed. A C double
+          # free reaches the allocator twice and the allocator complains; a
+          # repeated curl_url_cleanup reaches Box::from_raw twice, and the second
+          # reconstruction READS the struct to run its fields' destructors before
+          # anything is handed back to the allocator. So the stale read is
+          # reported first. The observed frame list is
+          #   drop_glue::<Option<Vec<u8>>> -> drop_glue::<url::Url>
+          #     -> drop_glue::<ffi::url::UrlHandle> -> handle::drop_raw
+          #     -> ffi::url::curl_url_cleanup
+          # which is precisely the ownership path this gate exists to audit.
+          # Asserting the allocator's wording instead would have failed the leg
+          # for the wrong reason - and did, before this was run.
+          for control in 'handle-stale:heap-use-after-free' \
+                         'handle-double-free:heap-use-after-free' \
+                         'handle-leak:ERROR: LeakSanitizer'; do
+            mode="${control%%:*}"
+            expect="${control#*:}"
+
+            echo "::group::positive control - ${mode}"
+            log="${RUNNER_TEMP}/asan-c-${mode}.log"
+            status=0
+            "${binary}" "${mode}" > "${log}" 2>&1 || status=$?
+            sed -n '1,30p' "${log}"
+            echo '::endgroup::'
+
+            # ALL THREE must exit non-zero, handle-leak included, and the reason is
+            # worth recording because the driver's source suggests otherwise:
+            # handle-leak calls __lsan_do_recoverable_leak_check and `return 0`,
+            # yet abort_on_error=1 turns even a RECOVERABLE leak report into an
+            # abort, so the process never reaches that return. Measured: 134, the
+            # same status the buffer `leak` mode above produces from identical
+            # code. Requiring 0 here would have failed the leg on a control that
+            # was working perfectly - which is what the first draft of this loop
+            # did, until it was run.
+            #
+            # So the expectation is a NON-ZERO status plus the per-mode report
+            # text, never a particular number, exactly as the two controls above.
+            if [ "${status}" -eq 0 ]; then
+              echo "FAIL: the ${mode} control exited 0, so the defect it commits at the"
+              echo 'opaque-handle boundary was NOT reported. Box::from_raw ownership is not'
+              echo 'being audited, and no green result from this gate means anything until it is.'
+              exit 1
+            fi
+
+            if ! grep -q -E "${expect}" "${log}"; then
+              echo "FAIL: the ${mode} control did not produce a report matching '${expect}'."
+              echo 'It behaved unexpectedly rather than proving what it exists to prove; a report'
+              echo 'of a DIFFERENT kind would mean a different detector fired and this one did not.'
+              exit 1
+            fi
+
+            echo "${mode}: reported as required"
+          done
+
+          echo 'all five detectors fired on demand - two on a buffer, three on an opaque handle:'
+          echo 'this gate is able to fail on both ownership shapes, so its green runs count'
 
       - name: 'assert: the instrumentation was real'
         env:

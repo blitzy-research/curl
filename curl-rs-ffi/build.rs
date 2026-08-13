@@ -17,32 +17,6 @@
 //!    is gone. Third-party build systems query both, so they have to keep
 //!    reporting the correct version, feature set and link line.
 //!
-//! # Three traps, each proven by running code rather than by reading
-//!
-//! ## Trap 1: emit single-colon `cargo:` directives, never `cargo::`
-//!
-//! The `cargo::key=value` spelling was stabilised in Cargo 1.77. This
-//! workspace declares `rust-version = "1.75"`. Measured on this machine
-//! with a throwaway cdylib crate:
-//!
-//! ```text
-//! cargo +1.75.0, "cargo::rustc-link-arg-cdylib=..."
-//!   -> build fails; readelf -d shows NO SONAME. Cargo 1.75 prints
-//!      "Either change the directive to `cargo:key=value` syntax (note
-//!      the single `:`) or upgrade your version of Rust."
-//! cargo +1.75.0, "cargo:rustc-link-arg-cdylib=..."
-//!   -> Library soname: [libcurl.so.4]
-//! cargo 1.97.1,  "cargo:rustc-link-arg-cdylib=..."
-//!   -> Library soname: [libcurl.so.4]
-//! ```
-//!
-//! So every directive below uses one colon. A future contributor
-//! "modernising" the syntax would silently produce a `libcurl.so` with no
-//! `DT_SONAME`, which fails the symbol-parity gate with no diagnostic that
-//! points anywhere near the cause. Do not do it. Note the distinction: the
-//! *instruction* `rustc-link-arg-cdylib` has been stable since Rust 1.50;
-//! only the `cargo::` *prefix syntax* is version-sensitive.
-//!
 //! ## Trap 2: the soname belongs here, not in `.cargo/config.toml`
 //!
 //! `[target.<triple>] rustflags` are not artifact-scoped. Measured with a
@@ -64,17 +38,28 @@
 //!
 //! # What is deliberately absent
 //!
-//! * No linker version script, and no export-hiding script. Both were
-//!   measured to be pointless: a user-supplied `--version-script` handed
-//!   through `-C link-arg` does not control Rust exports, because rustc's
-//!   internal export list takes precedence, so symbol names of the form
-//!   `name@@CURL_OPENSSL_4` are unreachable that way. That is a documented
-//!   deviation, exactly equivalent to curl's own supported
-//!   `--disable-versioned-symbols` build mode. Hiding is
-//!   unnecessary besides: a cdylib exporting only its
-//!   `#[no_mangle] pub extern "C"` items measured total=2, curl_*=2,
-//!   leaked=0. Export parity comes from declaration discipline, not from
-//!   link-time filtering.
+//! * No export-HIDING script, and no versioned symbol names. Both were
+//!   measured to be unreachable this way: a user-supplied `--version-script`
+//!   handed through `-C link-arg` cannot *remove* a Rust export, because
+//!   rustc's own script already lists it in `global:` and a symbol listed
+//!   global in any script stays global -- so names of the form
+//!   `name@@CURL_OPENSSL_4` are unreachable through a link argument. That is a
+//!   documented deviation, exactly equivalent to curl's own supported
+//!   `--disable-versioned-symbols` build mode. Hiding is unnecessary besides:
+//!   a cdylib exporting only its `#[no_mangle] pub extern "C"` items measured
+//!   total=2, curl_*=2, leaked=0.
+//!
+//!   **ADDING an export through a second version script is a different
+//!   question, and the answer is different.** It works, it is measured on both
+//!   Linux targets and at the MSRV floor, and `promote_assembled_exports`
+//!   below does exactly that for the six symbols `global_asm!` defines --
+//!   which rustc cannot see and therefore localises. The one thing that route
+//!   needs is that the linker be LLD, selected explicitly from the invoking
+//!   toolchain's own sysroot rather than left to whatever `cc` defaults to;
+//!   GNU ld refuses a second anonymous version tag outright. So export parity
+//!   comes from declaration discipline for the fifty-three Rust items, and
+//!   from one measured, ELF-only link argument for the six that cannot be
+//!   Rust items at this MSRV.
 //! * No claim of 32-bit support, anywhere. The four supported targets are
 //!   all 64-bit, and the C ABI shim's single-trailing-pointer setters hold
 //!   an `off_t` in one register-width slot only where `off_t` fits a
@@ -109,22 +94,13 @@
 //! * No `unsafe`. A build script is an ordinary host-side program, so
 //!   `#![forbid(unsafe_code)]` would be clutter, but the file contains no
 //!   `unsafe` block either.
-//!
-//! # Text hygiene
-//!
-//! `scripts/spacecheck.pl` walks `git ls-files` and rejects, for any path
-//! not in one of its allow-lists, a tab, a non-LF line ending, trailing
-//! whitespace, a missing or duplicated newline at EOF, two consecutive
-//! blank lines and any byte in 0x80-0xff. This path matches none of those
-//! allow-lists, so all of it applies, and that is why nothing below uses a
-//! typographic dash, arrow or section sign. It runs in CI at
-//! `.github/workflows/hygiene.yml:164-165` and from `Makefile.am:175`.
 
 use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, Once};
 
@@ -144,9 +120,6 @@ use std::sync::{Mutex, Once};
 /// * `lib/CMakeLists.txt:285` computes
 ///   `math(EXPR _cmakesoname "${VERSIONCHANGE} - ${VERSIONDEL}")` and
 ///   `:286` derives `VERSION 4.8.0` from it, applied at `:291`.
-///
-/// The literal 4 appears once, here, so the two names below cannot drift
-/// apart from each other or from the C build.
 const SONAME_MAJOR: u32 = 12 - 8;
 
 /// Basename of the ELF shared object. `lib/Makefile.am:35` declares
@@ -192,22 +165,21 @@ const DEFAULT_PREFIX: &str = "/usr/local";
 /// `A4_DECISION_ENV` is here because the refusal in [`check_variadic_abi`]
 /// reads it: a cargo that had not been told this build depends on it would
 /// not re-evaluate the refusal on the day the decision is recorded.
-const TRACKED_ENV: [&str; 6] = [
+/// `STRICT_ABI_ENV` is here for the same reason and the mirror image of it --
+/// setting it must turn the incomplete-export warning into a failure on the
+/// NEXT build rather than whenever something else happens to dirty this script.
+const TRACKED_ENV: [&str; 7] = [
     "CURL_RS_PREFIX",
     "CC",
     "TARGET_CC",
     "CURL_CA_BUNDLE",
     "CURL_RS_STAGING_DIR",
     A4_DECISION_ENV,
+    STRICT_ABI_ENV,
 ];
 
 /// Every environment variable this script reads, including the two whose
 /// names are derived from `TARGET`.
-///
-/// [`compiler`] resolves `CC_<target>` and `CC_<target_with_underscores>`
-/// ahead of `TARGET_CC` and `CC`, so a change to either must re-render the
-/// consumer metadata. Cargo cannot be told about a variable whose name is not
-/// a literal, which is why the list is assembled rather than declared.
 fn tracked_env_keys() -> Vec<String> {
     let mut keys: Vec<String> =
         TRACKED_ENV.iter().map(|k| (*k).to_string()).collect();
@@ -229,11 +201,6 @@ fn tracked_env_keys() -> Vec<String> {
 
 // Section 1b: the variadic ABI gate (open ambiguity A4)
 //
-// Two of this project's own requirements contradict each other, and this is
-// the only place that can see the contradiction at build time. Specification
-// 0.8.6 records the ambiguity as A4 and calls silent acceptance "the worst
-// option"; what follows is the mechanism that makes it impossible.
-//
 // The four option-identifier functions -- curl_easy_setopt, curl_easy_getinfo,
 // curl_multi_setopt and curl_share_setopt -- are reached by a NON-variadic Rust
 // callee taking one trailing pointer, which is sound because the option value
@@ -244,48 +211,6 @@ fn tracked_env_keys() -> Vec<String> {
 // register x2, which the caller never populated. Reading an uninitialised
 // register as a user-supplied option value is memory-unsafe, not merely wrong,
 // and the failure is silent: nothing in a Linux test run can surface it.
-//
-// A further eleven of the 100 exports have no ABI-correct expression on ANY of
-// the four targets at the declared minimum Rust version -- five plain printf
-// variadics, five `va_list` forms and curl_formadd -- because `va_start` and
-// `VaList::next_arg` are unavailable there.
-//
-// So the build REFUSES, in `check_variadic_abi`, which `main` calls where an
-// `Err` can stop it. A `cargo:warning` -- which is what used to be here -- was
-// the wrong instrument twice over: it is not a refusal, so an unsound artifact
-// still shipped; and specification 0.8.4's validation gate 1 requires a
-// warning-free build, so a permanent warning is a gate that is either
-// suppressed or scrolled past.
-//
-// The refusal is released only by a recorded decision, never by a default, and
-// the single warning that acceptance produces fires only where that acceptance
-// actually suppressed a refusal. Both of those are policy rather than
-// convenience, and both are argued in full on `variadic_abi_verdict`.
-//
-// A MEASURED REMEDY EXISTS FOR THE FOUR, AND IT DOES NOT CLOSE A4. A
-// `global_asm!` trampoline that reloads the third argument from the stack
-// (`ldr x2, [sp]`) before branching to the implementation was built on
-// stable 1.97.1 AND on 1.75.0 with no C compiler, and llvm-nm shows the
-// trampoline exported as a global `T` with the implementation left as a
-// local `t`. `check_variadic_strategy` REQUIRES that trampoline, on every
-// target, of any plain non-variadic definition of the four -- so the hazard
-// cannot be introduced unnoticed from a Linux workstation, which is where it
-// would otherwise be introduced. One thing that trampoline does not do, and
-// it is why this section stays: it is exercised by nothing today, because none
-// of the four has a Rust body -- all four are carried into the generated
-// headers as verbatim prototypes.
-//
-// AND A LARGER REMEDY HAS SINCE BEEN MEASURED, WHICH NARROWS THE OPEN ITEM
-// WITHOUT CLOSING IT. This section used to claim that a trampoline "cannot
-// make the eleven above implementable at the declared minimum". That claim was
-// wrong, and it was wrong in the direction that matters -- it argued for
-// leaving something unbuilt. A four-instruction thunk cannot reach a
-// format-driven function, but the whole of `va_start` can be written out: spill
-// the general-purpose and floating-point argument registers into the record the
-// target's own ABI defines, synthesise the `va_list` that indexes it, and call
-// the `va_list` sibling. That was built for all four required targets, and the
-// assembled prologue was disassembled and compared field by field against the
-// one the target's own C compiler emits.
 //
 // `src/ffi/printf.rs` now does exactly that for ten of the eleven, and
 // `src/ffi/form.rs` for the eleventh, so all eleven are implemented and
@@ -313,21 +238,36 @@ fn tracked_env_keys() -> Vec<String> {
 // of at most eight bytes on all four required targets and none is a
 // floating-point type, so one cursor over the general-purpose slots decodes the
 // whole list, and `va_start` is precisely what was missing.
-//
-// The four option-identifier functions ARE still untouched, so
-// `check_variadic_abi` remains the instrument that says A4 is open out loud, and
-// `check_printf_trampolines` and `check_formadd_trampoline` are what keep the
-// eleven from regressing.
+
+/// Turns the incomplete-export diagnostic from a warning into a build failure.
+///
+/// # Why a gate rather than a change of default
+///
+/// The export surface is incomplete while the migration is in progress, and the
+/// guard that reports it is a `cargo:warning` so that the workspace stays
+/// buildable -- the reasoning is set out in full where the guard fires. That is
+/// the right default for a developer and the WRONG one for a release gate,
+/// because `-D warnings` reaches rustc and clippy diagnostics and does not reach
+/// a build script's, so AAP section 0.8.4's zero-warning build gate would sign
+/// off a known ABI failure. That is exactly the hole this variable closes.
+///
+/// Setting it to anything non-empty makes an incomplete export surface a hard
+/// error. `.github/workflows/rust-abi.yml` and `rust-build.yml` set it, so the
+/// two legs whose job is to certify the artifact cannot pass while symbols are
+/// missing, while an ordinary `cargo build` still works.
+///
+/// Named alongside [`A4_DECISION_ENV`] and read the same way, so a reader who
+/// has met one has met both.
+const STRICT_ABI_ENV: &str = "CURL_RS_REQUIRE_COMPLETE_EXPORTS";
 
 /// Records the A4 decision, which is a user's to make and not this file's.
 const A4_DECISION_ENV: &str = "CURL_RS_A4_VARIADIC_DECISION";
 
 /// The only accepted value, spelled so it cannot be set by accident.
 ///
-/// It names the decision it records -- specification 0.8.6's third option,
-/// "accept that one target's varargs entry points are unsupported" -- rather
-/// than reading like a switch that silences a nuisance. Setting it is an
-/// assertion that the consequence below is understood and accepted:
+/// It names the decision it records rather than reading like a switch that
+/// silences a nuisance. Setting it is an assertion that the consequence below
+/// is understood and accepted:
 ///
 /// * `curl_easy_setopt`, `curl_easy_getinfo`, `curl_multi_setopt` and
 ///   `curl_share_setopt` are NOT ABI-correct on aarch64-apple-darwin. A C
@@ -390,12 +330,6 @@ const VARIADIC_UNIMPLEMENTABLE: [&str; 11] = [
 
 /// The four that the trailing-pointer design does solve, on three of the four
 /// targets.
-///
-/// Kept beside the eleven and asserted disjoint from them, because conflating
-/// the two sets is the mistake that would make either gate look satisfied when
-/// it is not. `include/curl/curl.h:3328-3341` corroborates the split from the
-/// header's own side: it defines three-argument enforcement macros for exactly
-/// these four and for none of the rest.
 const VARIADIC_TRAILING_POINTER: [&str; 4] = [
     "curl_easy_setopt",
     "curl_easy_getinfo",
@@ -406,70 +340,19 @@ const VARIADIC_TRAILING_POINTER: [&str; 4] = [
 /// The modules that would ship an argument-passing shape nobody has verified,
 /// relative to the manifest.
 ///
-/// Their absence is what keeps the second half of the gate inert: there is
-/// nothing to ship, so nothing can ship wrongly. The moment one appears, the
-/// gate applies -- which is the point at which the decision genuinely has to
-/// have been made.
-///
-/// # Why `src/ffi/printf.rs` is no longer listed
-///
-/// It was, and its removal is a narrowing of the gate rather than a weakening
-/// of it, because a stricter check replaced it.
-///
-/// This list answers one question: "is a variadic entry point about to be
-/// shipped with its argument passing merely *assumed*?" For the ten
-/// `curl_m*printf` forms that question now has a mechanical answer, so the
-/// blanket refusal is the wrong instrument. The five plain-variadic forms are
-/// not Rust functions at all: each is an assembly trampoline that performs the
-/// target's own `va_start` and then calls its `va_list` sibling, with a
-/// separate prologue for x86-64 System V, AAPCS64, Apple x86-64 and Apple
-/// arm64. Apple arm64 -- the target A4 is about -- is the simplest of the four,
-/// because its `va_list` *is* the entry stack pointer, so the trampoline is
-/// `mov x<n>, sp` followed by a tail call and there is no register for a callee
-/// to read by mistake.
-///
-/// [`check_printf_trampolines`] enforces that arrangement per name: it refuses
-/// a plain Rust `extern "C" fn` definition of any of the five, and it requires
-/// a `global_asm!` trampoline naming that export and its `va_list` sibling.
-/// That is a per-symbol obligation where this list is a per-file veto, and it
-/// cannot be satisfied by recording a decision in an environment variable.
-///
-/// # Why `src/ffi/form.rs` is no longer listed either, and why the list is now
-/// empty
-///
-/// The same narrowing, for the same reason, applied to the eleventh symbol.
-/// `src/ffi/form.rs` was listed while nothing had been built for `curl_formadd`.
-/// It has been built now, by the same route: an assembled `va_start` prologue
-/// per ABI, plus the per-target cursor `src/ffi/printf.rs` already owned. So the
-/// per-file veto is again the wrong instrument -- it cannot tell a correct
-/// implementation from an incorrect one -- and [`check_formadd_trampoline`]
-/// replaces it with a per-symbol obligation that no environment variable
-/// silences.
-///
-/// An empty list keeps the mechanism rather than deleting it. A future module
-/// claiming one of the eleven with nothing to show for it goes back in here, and
-/// the refusal below still says exactly what has to be decided.
+/// Empty, because a per-file veto cannot tell a correct variadic
+/// implementation from an incorrect one -- it only counts files, and an
+/// environment variable silences it. Every variadic export is instead held to
+/// a per-symbol obligation that nothing can silence:
+/// [`check_printf_trampolines`] for the five plain-variadic printf forms and
+/// [`check_formadd_trampoline`] for `curl_formadd`, each requiring an
+/// assembled `va_start` prologue per ABI rather than a plain Rust
+/// `extern "C" fn` reached through a variadic prototype.
 const VARIADIC_IMPLEMENTATION_FILES: [&str; 0] = [];
 
 // The four headers that must never be written
 
 /// Public headers cbindgen cannot express, carried verbatim in the tree.
-///
-/// Line counts measured in this checkout:
-///
-/// * `system.h` (399) is pure platform detection. It produces `curl_off_t`,
-///   `CURL_FORMAT_CURL_OFF_T` and `CURL_TYPEOF_CURL_SOCKLEN_T` from a
-///   cascade of compiler and OS probes; there is nothing for a generator to
-///   render.
-/// * `stdcheaders.h` (35) declares four libc prototypes and includes only
-///   `<sys/types.h>`.
-/// * `curlver.h` (78) is entirely `#define`, including the function-like
-///   `CURL_VERSION_BITS(x, y, z)` and `CURL_AT_LEAST_VERSION(x, y, z)`.
-/// * `typecheck-gcc.h` (958) holds the `curlcheck_` macro family that gives
-///   `curl_easy_setopt`'s variadic arguments compile-time type checking. It
-///   is hand-maintained and shipped verbatim beside the generated headers,
-///   and it must stay correct because all 129 programs in `docs/examples/`
-///   compile with it active.
 ///
 /// [`guard_write_target`] checks this list immediately before every write.
 /// The check exists because a safety property that depends on nobody making
@@ -709,15 +592,6 @@ const MULTI_H_ITEMS: &[&str] = &[
 
 /// Items owned by `urlapi.h`: none.
 ///
-/// The third empty partition, alongside [`HEADER_H_ITEMS`] and
-/// [`MPRINTF_H_ITEMS`], and empty for the same measured reason as `header.h`:
-/// every construct this header declares is one cbindgen cannot render to the
-/// frozen bytes. The two enums and all six prototypes are therefore carried
-/// by [`URLAPI_H_DECLS`] and [`URLAPI_H_POST`], and each of the five names
-/// that would otherwise be generated is listed in this header's
-/// [`HeaderSpec::verbatim`] so no pass -- including `curl.h`'s -- emits a
-/// second declaration.
-///
 /// MEASURED, by rendering this header with the five names owned and diffing
 /// against `include/curl/urlapi.h`. Seven divergences, in four families:
 ///
@@ -751,20 +625,6 @@ const MULTI_H_ITEMS: &[&str] = &[
 /// from the typedef name and cbindgen would emit `typedef struct CURLU CURLU;`
 /// -- valid C that introduces a DIFFERENT incomplete type from the one
 /// libcurl's own translation units define.
-///
-/// `curl_url_get` and `curl_url_set` were already verbatim too, and for a
-/// reason that survives this change: their `CURLUPart what` parameter must
-/// stay a `CURLUPart` in the header while the Rust definition takes a `c_int`,
-/// because a C caller may legally pass a value outside `0..=10` and curl
-/// answers it with `CURLUE_UNKNOWN_PART` (`lib/urlapi.c:1626-1628`,
-/// `:1773-1774` and `:1873-1874`). Rendering that parameter as the Rust enum
-/// would make a DEFINED C input an invalid Rust value. This is the same
-/// arrangement `curl_version_info(CURLversion)` and
-/// `curl_easy_option_by_id(CURLoption)` already use.
-///
-/// An empty list is load-bearing rather than inert, exactly as it is for
-/// `header.h`: `apply_partition` sets `export.include` to it and appends every
-/// observed name to `export.exclude`, so this pass generates nothing at all.
 const URLAPI_H_ITEMS: &[&str] = &[
     // The two enums, the 16 CURLU_* flag bits and the handle typedef are in
     // URLAPI_H_DECLS; the six prototypes are in URLAPI_H_POST.
@@ -791,13 +651,6 @@ const OPTIONS_H_ITEMS: &[&str] = &[
 /// would otherwise be generated is listed in this header's
 /// [`HeaderSpec::verbatim`] so no pass -- including `curl.h`'s -- emits a
 /// second declaration.
-///
-/// An empty list is load-bearing rather than inert. `apply_partition` sets
-/// `export.include` to it and appends every observed name to
-/// `export.exclude`, so this pass generates nothing at all; and because
-/// `curl.h`'s suppression list is built from `observed` intersected with the
-/// SIBLING ITEM LISTS, a name dropped from here without being added to
-/// `verbatim` would migrate into the umbrella instead of disappearing.
 const HEADER_H_ITEMS: &[&str] = &[];
 
 /// Items owned by `websockets.h`: nine flag bits and four functions.
@@ -867,12 +720,6 @@ const VERBATIM_CARRIERS: [(&str, &[&str]); 8] = [
 ];
 
 /// The macro names a block of verbatim text `#define`s.
-///
-/// Block comments are tracked so a `#define` mentioned inside an explanatory
-/// comment is not mistaken for a real declaration -- without that, the guard
-/// this feeds would raise a false failure that reads exactly like a real one.
-/// Only a directive starting its own line counts, which is the form every
-/// carrier uses.
 fn verbatim_defines(text: &str) -> Vec<&str> {
     let mut names = Vec::new();
     let mut in_comment = false;
@@ -911,31 +758,11 @@ fn verbatim_defines(text: &str) -> Vec<&str> {
 
 // Section 4: the verbatim per-header text
 //
-// WHAT THIS SECTION CAN AND CANNOT DO.
-//
 // A prologue and an epilogue can place text before and after the generated
 // block. They cannot interleave text *within* it. `cbindgen.toml` states
 // where the excluded declarations are put back: ":968-975" assigns this
 // script the per-header split and says in so many words that it is "also
 // where the verbatim blocks excluded above are spliced back in".
-//
-// TWO MECHANISMS EXIST, AND CONFUSING THEM IS THE TRAP.
-//
-// The first is source order. `cbindgen.toml` sets `sort_by = "None"`, so
-// cbindgen emits items in the order `curl-rs-ffi/src/ffi/*.rs` declares
-// them. A name that is EXPORTED therefore lands wherever the Rust source
-// puts it, and no splice is needed. `CURLWS_PONG (1 << 6)`
-// (websockets.h:58) relies on exactly this: it appears *after*
-// `curl_ws_recv` while its five siblings appear before it, and source order
-// reproduces that for free.
-//
-// The second is this section. A name listed under `[export] exclude` is
-// removed in `Library::remove_excluded` BEFORE dependency collection and
-// before anything is written, so source order can never place it -- it is
-// simply gone. Every excluded name must therefore be written out here or it
-// is absent from the ABI contract. That was measured rather than reasoned
-// about: compiling `#include <curl/curl.h>` reported `unknown type name`
-// for the excluded declarations until they were spliced.
 //
 // Three groups needed splicing INSIDE a header's declarations rather than
 // at a boundary, and each is placed at the nearest boundary instead:
@@ -948,21 +775,6 @@ fn verbatim_defines(text: &str) -> Vec<&str> {
 //   * curl.h's twelve tag-form structs and five tag-form enums are spread
 //     through 3,000 lines. They move to `CURL_H_FORWARD` when something
 //     generated names them by value, and to `CURL_H_VERBATIM` otherwise.
-//
-// A prototype's POSITION within a header is not part of the ABI: no
-// consumer can observe it, and `docs/libcurl/*.md` synopses name functions,
-// not line numbers. What IS observable -- the declaration's spelling, its
-// parameter list, its deprecation attribute -- is reproduced byte for byte
-// from the C header. The positional difference is recorded here because it is
-// the one difference a reader diffing the two headers will see.
-//
-// A violation of the observable part is caught by compiling all 129 programs
-// in `docs/examples/` against the generated headers and comparing the exported
-// symbol set against `lib/libcurl.def`. That gate is the ABI leg in
-// `.github/workflows/rust-abi.yml`, which is on disk and runs both legs. The
-// checks in this build script are still written to fail closed rather than
-// warn, because they run on every build rather than only in continuous
-// integration.
 
 /// The `extern "C"` opening block, identical in all eight headers.
 ///
@@ -1000,18 +812,6 @@ struct curl_blob {
 /// single trailing pointer while the header must keep the `...` the C ABI
 /// declares. Being excluded, they cannot arrive by source order, and
 /// `cbindgen.toml`'s partitioning note assigns their splice to this script.
-///
-/// Reproduced byte for byte from `easy.h:42` and `easy.h:46-59`, comment
-/// included. The comment is part of the frozen file and
-/// `.github/scripts/verify-synopsis.pl` reads the tree's documentation
-/// against these declarations, so dropping it would be an unrequested
-/// change.
-///
-/// Position differs from the C header: `curl_easy_setopt` sits at `:42`
-/// between `curl_easy_init` and `curl_easy_perform`, and lands here after
-/// all of easy.h's generated prototypes instead. `CURLoption` and `CURLINFO`
-/// are both complete by this point -- `curl.h` includes `easy.h` from its
-/// own trailer, after `CURL_H_VERBATIM` -- so the declarations compile.
 const EASY_H_POST: &str = r#"
 CURL_EXTERN CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...);
 
@@ -1084,9 +884,6 @@ const MULTI_H_INCLUDES: &str = r#"
 /// generated block. Both halves are legal C89 and the resulting type is
 /// identical; only the position of the definition differs from the C
 /// header.
-///
-/// `struct curl_waitfd` (multi.h:114) depends on nothing generated --
-/// `curl_socket_t` comes from `curl.h` -- so it is declared here in full.
 ///
 /// `struct curl_pushheaders` (multi.h:500) is an opaque handle the library
 /// never defines publicly. It is excluded in `cbindgen.toml`, so it cannot
@@ -1169,9 +966,6 @@ struct curl_pushheaders;  /* forward declaration only */
 /// `multi.h`, after the generated block: the definition whose forward
 /// declaration is above, then the three excluded prototypes.
 ///
-/// `struct CURLMsg` is placed here because it names the generated `CURLMSG`
-/// enum, and a struct definition may follow every use of a pointer to it.
-///
 /// `curl_multi_socket` (multi.h:317) and `curl_multi_socket_all` (:325) are
 /// deprecated in the headers and still exported -- both are in the
 /// 100-symbol parity set, and a deprecated exported symbol may not be
@@ -1182,10 +976,6 @@ struct curl_pushheaders;  /* forward declaration only */
 /// cannot produce `CURL_DEPRECATED(7.19.5, "...")` with an unquoted version
 /// token. The attribute placement here -- after the return type, on its own
 /// line, with the function name beginning the next -- is `multi.h`'s own.
-///
-/// `curl_multi_setopt` (multi.h:422-430) is the third C-variadic setter, so
-/// it is excluded for the same reason as easy.h's two, and its block comment
-/// is reproduced with it.
 const MULTI_H_POST: &str = r#"
 struct CURLMsg {
   CURLMSG msg;       /* what this message means */
@@ -1240,16 +1030,6 @@ CURL_EXTERN const char *curl_multi_strerror(CURLMcode);
 /// `struct curl_header **` and return `struct curl_header *`, a complete
 /// type to refer to.
 ///
-/// The five `origin` bits are here for a different and stronger reason:
-/// they are `pub(crate)` in `ffi::codes::curlh_origin`, and cbindgen emits
-/// only `pub` items, so NO pass can generate them however the partition is
-/// arranged. Measured on the one comparable constant that is `pub` --
-/// `CURLOT_FLAG_ALIAS` in `ffi/opts.rs` -- cbindgen does keep the
-/// `(1 << n)` expression, but it writes a single space after the name and
-/// lifts the Rust doc comment into a block comment ABOVE the `#define`. That
-/// loses both the frozen four-space macro column and the per-bit trailing
-/// comments, and the bytes of a public header are frozen.
-///
 /// `CURLHcode` is spliced for the reason that governs every comment in this
 /// file's output: cbindgen renders `documentation = true` faithfully, and
 /// `ffi::codes::CURLHcode` carries a Rust doc comment per member. Generated,
@@ -1261,43 +1041,6 @@ CURL_EXTERN const char *curl_multi_strerror(CURLMcode);
 /// remedy: it is a GLOBAL key in `cbindgen.toml` and the other seven headers
 /// depend on it. So this header owns its enumeration, exactly as
 /// `mprintf.h` owns all ten of its prototypes.
-///
-/// Splicing it does NOT weaken the integer pinning AAP 0.6.1 requires; three
-/// independent mechanisms still assert it, and the text below is the fourth
-/// party to the same agreement rather than an unchecked copy:
-/// `ffi::codes::CURLHcode` writes all eight discriminants explicitly and
-/// exposes them as `ABI_VALUES`; `curl_rs_lib::error::CURLHcode` does the
-/// same and is bridged to it by exhaustive `match` in both directions, so a
-/// divergence cannot compile; and every one of the 129 `docs/examples/`
-/// programs compiles against this text, where a missing or misspelled
-/// `CURLHcode` is `unknown type name` in all of them at once, because
-/// `curl_easy_header` below returns it.
-///
-/// The two prototypes -- the only two of the 100 exported symbols this header
-/// declares -- are spliced for the comment reason above and for a second,
-/// independent one. Measured: cbindgen puts `[fn] prefix` on a LINE OF ITS
-/// OWN, so it emitted `CURL_EXTERN` and then `CURLHcode curl_easy_header(`
-/// beneath it. That is valid C and still wrong, because it moves the open
-/// paren from column 39 to column 27 and so re-indents all six continuation
-/// lines. Their alignment is part of the frozen bytes, and
-/// `docs/libcurl/curl_easy_header.md`'s `# SYNOPSIS` block is cross-checked
-/// against this declaration by `.github/scripts/verify-synopsis.pl`.
-///
-/// Their deliberate ASYMMETRY is reproduced rather than tidied:
-/// `curl_easy_header` returns `CURLHcode` and yields the record through a
-/// `struct curl_header **hout` out-parameter, while `curl_easy_nextheader`
-/// returns `struct curl_header *` directly and signals exhaustion with NULL.
-/// Harmonising them would change two of the 100 public signatures.
-///
-/// WHAT THIS BLOCK DELIBERATELY DOES NOT CONTAIN: any explanation of itself.
-/// Everything above is Rust documentation, read by whoever maintains this
-/// script; none of it reaches `include/curl/header.h`, which ships to
-/// consumers and is compiled by all 129 programs under `docs/examples/`.
-/// A previous form of this constant embedded seven lines of build-script
-/// commentary INSIDE the emitted string, so a note about cbindgen dropping
-/// `L` suffixes and rewriting hex was published in the ABI contract -- where
-/// it was also simply untrue, `(1 << n)` having neither an `L` suffix nor a
-/// hexadecimal literal anywhere in it.
 const HEADER_H_DECLS: &str = r#"
 struct curl_header {
   char *name;    /* this might not use the same case */
@@ -1409,10 +1152,6 @@ const URLAPI_H_INCLUDES: &str = "\n\n#include \"curl.h\"\n";
 /// header. Identical in kind to what was measured for `header.h`'s two
 /// prototypes; see [`VERBATIM_FUNCTIONS`].
 ///
-/// The other three were here already: `curl_url_get`, `curl_url_set` and
-/// `curl_url_strerror` name a URL-API enum in a parameter while the Rust
-/// definitions must take a `c_int`. See cbindgen.toml, "Group 5e".
-///
 /// The rule they share, and why it is a rule rather than three coincidences: a
 /// C caller may pass any value of an enum parameter's compatible integer type,
 /// and libcurl ANSWERS an out-of-range one -- `curl_url_strerror` with
@@ -1424,16 +1163,6 @@ const URLAPI_H_INCLUDES: &str = "\n\n#include \"curl.h\"\n";
 /// the header's spelling is preserved here, exactly as it is for
 /// `curl_version_info(CURLversion)` in `curl.h` and
 /// `curl_easy_option_by_id(CURLoption)` in `options.h`.
-///
-/// Every byte below is `include/curl/urlapi.h:109-149`, character for
-/// character. Three spellings there are load-bearing and easy to "tidy" by
-/// accident: the `const` on `curl_url_get`'s handle is ABI-visible
-/// documentation that the call does not mutate and `curl_url_set`'s handle
-/// deliberately lacks it; `curl_url_dup`'s parameter is named `in`, which is a
-/// Rust keyword and therefore a name no Rust definition can carry; and
-/// `curl_url_strerror`'s parameter is UNNAMED, which
-/// `.github/scripts/verify-synopsis.pl` compiles
-/// `docs/libcurl/curl_url_strerror.md` against.
 const URLAPI_H_POST: &str = r#"
 /*
  * curl_url() creates a new CURLU handle and returns a pointer to it.
@@ -1618,21 +1347,6 @@ struct curl_ws_frame {
 "#;
 
 /// `mprintf.h`, before the `extern "C"` open.
-///
-/// Three includes that `no_includes` suppresses, so they are verbatim.
-/// The inline comments explain why each is needed and are preserved.
-///
-/// THE LEADING BLANK LINE IS LOAD-BEARING AND WAS MEASURED, not styled.
-/// [`sibling_prologue`] appends this text to a banner that carries no
-/// trailing newline, so whatever separates `***/` from the first directive
-/// here is the whole separator. With a single newline the render put
-/// `#include <stdarg.h>` on the line immediately after the banner, which
-/// `include/curl/mprintf.h:26-27` does not: it has one blank line there.
-/// The asymmetry is per header rather than a rule, which is why it is
-/// spelled out in each constant instead of normalised in one place --
-/// `MULTI_H_INCLUDES` deliberately has ONE newline because
-/// `include/curl/multi.h:25-26` runs `***/` straight into its `/*` comment
-/// with no blank line at all.
 const MPRINTF_H_INCLUDES: &str = r#"
 
 #include <stdarg.h>
@@ -1832,18 +1546,6 @@ fn before_extern_c(file: &str) -> &'static str {
 
 // Section 4b: curl.h's own verbatim text
 //
-// `cbindgen.toml` supplies curl.h's `header` (148 lines) and `trailer` (37
-// lines) and deliberately leaves `after_includes` empty; ":1280" records it
-// as unused there precisely because this script overrides it per header.
-// The two constants below fill that gap for the umbrella.
-//
-// Every block is reproduced BYTE FOR BYTE from `include/curl/curl.h` at
-// commit 54cf587b9c, `LIBCURL_VERSION "8.19.0-DEV"`. Each carries its source
-// line range so it can be checked with `sed -n 'A,Bp'`. Nothing
-// here is retyped, reformatted, re-indented or re-commented: the public
-// headers are frozen, and a "tidier" spelling of a frozen file is an
-// unrequested change.
-//
 // WHY EACH BLOCK IS HERE RATHER THAN GENERATED. Two independent reasons,
 // both measured:
 //
@@ -1867,28 +1569,13 @@ fn before_extern_c(file: &str) -> &'static str {
 //      `curl_sslbackend`, `CURLformoption`, `CURLFORMcode`, `CURLINFO` and
 //      the `curl_form*` trio all carry such attributes.
 //
-// SPLIT BETWEEN THE TWO CONSTANTS. A block goes in `CURL_H_FORWARD`, before
-// the generated body, when something generated names it BY VALUE -- an
-// incomplete type will not do there, and a C enum cannot be forward
-// declared at all. Measured cases: `curl_global_sslset` takes
-// `curl_sslbackend` and a `const curl_ssl_backend ***`; `curl_sshkeycallback`
-// takes `enum curl_khmatch`; the `curl_mime_*` prototypes take `curl_mime *`
-// and `curl_mimepart *`; and the generated `CURLoption` enum expands the
-// `CURLOPT` macro. Everything else goes in `CURL_H_VERBATIM`, after the
-// body, where it can name generated types freely.
-//
-// WHAT IS DELIBERATELY NOT HERE.
-//
-//   * `CURLoption` (curl.h:1138-2262) and its 17 `#define` aliases. Option
-//     identity has one source of truth, `curl-rs-ffi/src/ffi/opts.rs`, which
-//     must emit both the enumeration and the metadata array and does not
-//     exist yet. Splicing 1,125 lines of enumeration here would create a
-//     second population, and two populations drift silently.
-//     `cbindgen.toml` lists `CURLoption` under `[export] exclude`;
-//     `curl_h_export_exclusions` lifts that one exclusion for the umbrella
-//     pass so the enumeration is generated from `opts.rs` instead. The
-//     generator macros it expands ARE here, which is what
-//     `cbindgen.toml`'s "deliberately not here" note asks for.
+// * `CURLoption` (curl.h:1138-2262) and its 17 `#define` aliases. Splicing
+//   1,125 lines of enumeration here would create a second population, and two
+//   populations drift silently. `cbindgen.toml` lists `CURLoption` under
+//   `[export] exclude`; `curl_h_export_exclusions` lifts that one exclusion
+//   for the umbrella pass so the enumeration is generated from `opts.rs`
+//   instead. The generator macros it expands ARE here, which is what
+//   `cbindgen.toml`'s "deliberately not here" note asks for.
 //   * `include/curl/curl.h`'s own text is never READ by this script. The
 //     header is an OUTPUT of this build, so parsing it would close a cycle
 //     (header <- build.rs <- header) and reintroduce exactly that drift.
@@ -1899,25 +1586,8 @@ fn before_extern_c(file: &str) -> &'static str {
 ///
 /// These cannot be generated. cbindgen emits no preprocessor conditionals at
 /// all, and the frozen header wraps most of these aliases in `#ifndef
-/// CURL_NO_OLDIES` guards (include/curl/curl.h:650-736 and :2264-2295) with
-/// `#undef CURLOPT_DNS_USE_GLOBAL_CACHE` in the `#else` branch. Emitting the
-/// aliases without their guards would change observable behaviour for an
-/// application that defines `CURL_NO_OLDIES` -- it would keep receiving every
-/// retired spelling it asked not to have -- and AAP 0.8.1 freezes the C ABI.
-///
-/// Carrying them verbatim does NOT create the second population AAP 0.1.2
-/// warns about, and that is the whole reason this is safe: every alias here
-/// expands to an IDENTIFIER, never to a literal, so each one resolves THROUGH
-/// the generated `CURLcode` and `CURLoption` enumerations. Change a value in
-/// `ffi/codes.rs` or `ffi/opts.rs` and every alias below follows it
-/// automatically. The two exceptions are numeric by design in the frozen
-/// header itself -- `CURLE_ALREADY_COMPLETE 99999` and the pair
-/// `CURLOPT_OBSOLETE72`/`CURLOPT_OBSOLETE40 9999`, retired slots that no
-/// longer have an enumerator to point at.
-///
-/// The alias -> target mapping is still held in Rust, in
-/// `ffi/opts.rs`'s `OPTION_ALIASES`, where a test asserts that all 19
-/// `CURLOPT_*` aliases resolve to the integers AAP 0.6.1 requires.
+/// CURL_NO_OLDIES` guards (include/curl/curl.h:650-736 and:2264-2295) with
+/// `#undef CURLOPT_DNS_USE_GLOBAL_CACHE` in the `#else` branch.
 ///
 /// Placement. Everything here is a `#define`, so it is valid anywhere the
 /// preprocessor sees it before use; it goes after the generated body because
@@ -1926,14 +1596,6 @@ fn before_extern_c(file: &str) -> &'static str {
 /// `typedef enum` in the original, which is a position cbindgen cannot write
 /// into. `CURLOPT_RTSPHEADER` (curl.h:2306) is unguarded in the frozen header
 /// and stays unguarded here.
-///
-/// NOT here, deliberately: the `CURLFTPSSL_*` block (curl.h:972-984) and the
-/// `CURLAUTH_NTLM_WB` guard (curl.h:838-843). Both alias identifiers that no
-/// Rust module declares yet -- `CURLUSESSL_*` and the `CURLAUTH_*` family --
-/// and splicing a `#define` whose target does not exist would hand consumers
-/// a macro that fails to compile on use. They arrive with the types they
-/// depend on. Every target named below was verified present in the generated
-/// header before this block was added.
 const CURL_H_OLDIES: &str = r#"#ifndef CURL_NO_OLDIES /* define this to test if your app builds with all
                           the obsolete stuff removed! */
 
@@ -2068,11 +1730,6 @@ const CURL_H_OLDIES: &str = r#"#ifndef CURL_NO_OLDIES /* define this to test if 
 /// inside the block; and with `no_includes = true` and empty include lists
 /// cbindgen's include section early-returns unless `after_includes` is
 /// `Some`, so setting it is also what makes the section emit at all.
-///
-/// No leading newline. cbindgen calls `new_line_if_not_start()` before this
-/// block and that call does emit a separator, so a leading newline here
-/// produces two consecutive blank lines, which `scripts/spacecheck.pl`
-/// rejects.
 const CURL_H_FORWARD: &str = r#"
 /* Tag forward declarations. These twelve are the only synthetic lines in
    any generated header: curl.h itself has no need of them, because it
@@ -2217,11 +1874,6 @@ typedef struct curl_ssl_backend curl_ssl_backend;
 ///   `typedef CURLcode curl_ssls_export_cb(..);`, whose use site reads
 ///   `curl_ssls_export_cb *export_fn`. Rust has no type for a bare C function
 ///   type, so generating it turned that into a pointer to a function pointer.
-///
-/// The other 32 callback typedefs are generated from
-/// `curl-rs-ffi/src/ffi/types.rs`. These three are spliced verbatim above, in
-/// the authority's own formatting and line order, and are named here so that
-/// the "nothing is both generated and written verbatim" invariant still holds.
 const CURL_H_VERBATIM_NAMES: &[&str] = &[
     "CURL_NETRC_OPTION",
     "CURL_TLSAUTH",
@@ -2240,15 +1892,6 @@ const CURL_H_VERBATIM_NAMES: &[&str] = &[
 /// includes the seven siblings and `typecheck-gcc.h`. Ordering inside this
 /// constant follows curl.h's own line order, so relative order is faithful
 /// even though the generated body now sits above all of it.
-///
-/// Nineteen blocks, each with its curl.h line range. Reproduced byte for
-/// byte; the ranges are exact so `diff <(sed -n 'A,Bp' include/curl/curl.h)`
-/// against the generated header is a one-line review step.
-///
-/// No leading newline, and none at the end: cbindgen separates the trailer
-/// with `new_line_if_not_start()` and appends exactly one newline when the
-/// trailer lacks it (`language_backend/mod.rs:220-227`), which is the single
-/// end-of-file newline `scripts/spacecheck.pl` wants.
 const CURL_H_VERBATIM: &str = r#"struct curl_httppost {
   struct curl_httppost *next;       /* next entry in the list */
   char *name;                       /* pointer to allocated name */
@@ -2751,18 +2394,6 @@ CURL_EXTERN const char *curl_share_strerror(CURLSHcode);
 /// guard is deliberately NOT reproduced -- cbindgen emits it, and a second
 /// copy would be skipped because the macro is already defined by this point,
 /// which would silently drop every constant below it.
-///
-/// Multi-line comments are carried whole. Several of these directives end in a
-/// comment that continues onto following lines, so extracting the directive
-/// line alone leaves an unterminated `/*` that swallows everything after it --
-/// measured as gcc rejecting the header with `unknown type name 'network'`
-/// while 12 `CURLAUTH_*`, `CURLFTPSSL_*` and `CURL_SSLVERSION_*` constants
-/// silently vanished from a consumer's view.
-///
-/// Emitted between [`CURL_H_VERBATIM`] and [`CURL_H_OLDIES`]. Placement is
-/// free: a macro body is expanded at its use site, so a constant naming an
-/// enumerator or another macro does not require that name to be declared
-/// first.
 const CURL_H_CONSTS: &str = r#"/* aliases for library clones and renames */
 #define CURLSSLBACKEND_AWSLC CURLSSLBACKEND_OPENSSL
 #define CURLSSLBACKEND_BORINGSSL CURLSSLBACKEND_OPENSSL
@@ -3250,12 +2881,9 @@ const EXTERN_C_CLOSE_BARE: &str = "}";
 // IT RUN AND FAIL. So there is no advantage anywhere in claiming more than
 // is built, and a real cost to it.
 //
-// Both renderers below read these two tables, so `curl-config --features`
-// and `libcurl.pc`'s `supported_features` cannot disagree with each other.
-//
 // AND THEY CANNOT DISAGREE WITH THE RUNTIME BANNER EITHER, because the feature
 // tokens are no longer written down here at all: they are DERIVED from
-// `curl-rs-lib/src/version.rs`, which specification 0.4.1 designates as the
+// `curl-rs-lib/src/version.rs`, which is the
 // authority for the feature and protocol banner. A local 23-row table here,
 // beside a note that the two "cannot be unified in code" and that "the peer is
 // named so the correspondence is checkable", is not equivalent: the check does
@@ -3290,9 +2918,10 @@ enum Gate {
     Unix,
     /// `CURL_OFF_T_SIZE > 4` -- gated on the width of `curl_off_t`.
     LargeFile,
-    /// `ENGINE_X.is_present()` -- gated on whether the engine module that owns
-    /// the capability has actually been written. Resolved at parse time by
-    /// reading the `Engine::present`/`Engine::absent` constructor of the named
+    /// `ENGINE_X.is_present()` -- gated on whether the engine that owns the
+    /// capability can actually EXECUTE it, which is not the same question as
+    /// whether its module has been written. Resolved at parse time by reading
+    /// the `Engine::working`/`inert`/`unwritten` constructor of the named
     /// constant in the engine's version module, so the answer is a constant
     /// here exactly as it is a `const fn` there.
     Engine(bool),
@@ -3326,12 +2955,6 @@ struct RuntimeFeature {
 }
 
 /// One row read from the engine's protocol table.
-///
-/// A `Protocol` row is a strict subset of a `Feature` row: it carries a name
-/// and a `compiled_in:` gate but no `present:` probe, because a scheme this
-/// build serves is served unconditionally once compiled in. There is
-/// therefore no [`Probe`] field to resolve, and no runtime-only case to
-/// withhold.
 struct RuntimeProtocol {
     /// The scheme name, LOWER case, exactly as the engine spells it.
     token: String,
@@ -3341,12 +2964,19 @@ struct RuntimeProtocol {
 
 /// Where the engine's capability tables live, relative to this crate.
 ///
-/// One file owns both the feature table and the protocol table, because
-/// specification 0.4.1 makes `version.rs` the authority for the whole
-/// `curl --version` banner. Reading it here rather than mirroring it is what
-/// makes the generated consumer metadata and the runtime banner two
-/// projections of one list.
+/// Reading it here rather than mirroring it is what makes the generated
+/// consumer metadata and the runtime banner two projections of one list.
 const ENGINE_VERSION_RS: &str = "../curl-rs-lib/src/version.rs";
+
+/// Where the "headers not regenerated" notice is written inside `OUT_DIR`.
+///
+/// A fixed name so a workflow or a reader can find the live export-surface
+/// figure at a derivable path. It replaces two `cargo:warning=` lines that
+/// specification 0.8.4's zero-warning gate could not accommodate, and it is
+/// not warning-class: the condition it reports is unwritten work, not a fault.
+/// Removed when the surface completes, so it can never describe a state that
+/// has passed.
+const HEADER_NOTICE: &str = "include-curl-not-regenerated.txt";
 
 /// Read the engine module that owns the capability tables.
 fn engine_authority() -> Result<String, Box<dyn Error>> {
@@ -3387,15 +3017,9 @@ fn engine_table<'a>(
 /// Read and interpret every row of the engine's `FEATURES` table.
 ///
 /// The engine's table is the single authority for what this build advertises
-/// (specification 0.4.1). This reads it rather than mirroring it, so the static
+///. This reads it rather than mirroring it, so the static
 /// consumer metadata and the runtime `--version` banner are two projections of
 /// one list and cannot describe different products.
-///
-/// Everything is checked rather than assumed. An unreadable file, a missing
-/// table, an empty table, a duplicate token, an unrecognised gate and an
-/// unresolvable probe are each a hard error that names what it found. The one
-/// thing this must never do is guess: a misread gate either invents a capability
-/// or drops a real one.
 fn runtime_feature_rows() -> Result<Vec<RuntimeFeature>, Box<dyn Error>> {
     let source = engine_authority()?;
     let table = engine_table(&source, "pub const FEATURES: &[Feature] = &[")?;
@@ -3469,17 +3093,6 @@ fn row_token(chunk: &str, ctor: &str) -> Result<String, Box<dyn Error>> {
 }
 
 /// Read and interpret every row of the engine's `PROTOCOLS` table.
-///
-/// Derived from the same authority as the feature set, for the same reason: a
-/// hand-mirrored copy here and a live table in the engine are two statements
-/// that can disagree, and a consumer reading the generated metadata would then
-/// be told about a different product than `curl --version` describes. The two
-/// copies happened to agree when this derivation replaced the mirror, which is
-/// exactly why the mirror had to go before they drifted.
-///
-/// Every scheme name is asserted to be lower case, because the metadata this
-/// feeds is upper case and the transformation between them must be a checked
-/// rule rather than an assumption -- see [`advertised_protocols`].
 fn runtime_protocol_rows() -> Result<Vec<RuntimeProtocol>, Box<dyn Error>> {
     let source = engine_authority()?;
     let table = engine_table(&source, "pub const PROTOCOLS: &[Protocol] = &[")?;
@@ -3538,13 +3151,6 @@ fn classify_gate(
 }
 
 /// The maximum number of `supports_*()` indirections this script will follow.
-///
-/// A predicate whose body is another predicate is legitimate and expected --
-/// that is what makes one capability table possible -- but a cycle would spin
-/// forever, and `const fn` recursion is not rejected outright by the compiler
-/// in every shape. Four is far above the deepest real chain (a predicate whose
-/// body is a conjunction of a feature and two engine tests is depth one) and
-/// still terminates promptly on a mistake.
 const MAX_PREDICATE_DEPTH: usize = 4;
 
 /// [`classify_gate`] plus the indirection counter.
@@ -3626,11 +3232,6 @@ fn classify_conjunct(
     // `supports_brotli()` means would recreate exactly the duplication those
     // predicates removed, and this file's own history (a 23-row table that
     // drifted from the engine's in five places) is the argument against that.
-    //
-    // The closed grammar is not weakened: the predicate's BODY must itself
-    // parse, so an unrecognised shape inside one still fails the build. What is
-    // added is one level of indirection, bounded by
-    // [`MAX_PREDICATE_DEPTH`].
     if let Some(name) = expr
         .strip_prefix("supports_")
         .and_then(|rest| rest.strip_suffix("()"))
@@ -3662,17 +3263,6 @@ fn classify_conjunct(
 }
 
 /// Extract the body expression of a `pub const fn supports_x() -> bool`.
-///
-/// The predicates are single-expression `const fn`s by construction, which is
-/// what lets this script read them as data instead of executing them -- the same
-/// technique [`engine_is_present`] uses on the `ENGINE_*` constants.
-///
-/// Everything about the extraction is checked rather than assumed: the
-/// declaration must exist, it must be `const` (a non-`const` predicate could
-/// consult the environment and would have no build-time answer at all), the body
-/// must be brace-balanced, and it must contain no `;` or `return`. A predicate
-/// that grew a statement body would still have a well-defined value, but not one
-/// this parser could see, so it is rejected loudly rather than half-read.
 fn predicate_body(
     predicate: &str,
     source: &str,
@@ -3749,12 +3339,30 @@ fn predicate_body(
 /// Read whether an `ENGINE_*` constant in the engine's version module was
 /// declared present.
 ///
-/// The constants are written `Engine::present("path")` or
-/// `Engine::absent("path")`, so the state is a literal in the source and this
-/// script resolves it without executing the engine. An unknown constructor is
-/// an error rather than a guess, for the same reason the gate grammar is
-/// closed: silently reading an engine as present would advertise a capability
-/// that does not exist, and the harness would then run fixtures against it.
+/// The constants are written with one of THREE constructors, so the state is a
+/// literal in the source and this script resolves it without executing the
+/// engine:
+///
+/// * `Engine::working("path")` -- the module exists and the work executes.
+///   Present.
+/// * `Engine::inert("path")` -- the module exists but nothing calls it. NOT
+///   present.
+/// * `Engine::unwritten("path")` -- the module is not in the tree. NOT present.
+///
+/// Only the first advertises. The other two are distinguished in the engine so
+/// that "what would clear this row" is recorded correctly -- write a file, or
+/// wire one that already exists -- and that distinction is deliberately
+/// FLATTENED here, because a consumer reading `curl-config --protocols` cares
+/// only whether the capability works. Both therefore map to `false`, and mapping
+/// either to `true` would be the over-report AAP 0.6.5 measures as fatal.
+///
+/// An unknown constructor is an error rather than a guess, for the same reason
+/// the gate grammar is closed: silently reading an engine as present would
+/// advertise a capability that does not exist, and the harness would then run
+/// fixtures against it. That is also why the check is `starts_with` on each
+/// exact constructor rather than a negative test for `working`: a future
+/// `Engine::partial(..)` would fail loudly here instead of being read as absent
+/// by default and then quietly as present by some later edit.
 fn engine_is_present(
     konst: &str,
     source: &str,
@@ -3777,16 +3385,19 @@ fn engine_is_present(
                 "{konst} in {ENGINE_VERSION_RS} has no terminated initialiser"
             )
             })?;
-    if body.starts_with("Engine::present(") {
+    if body.starts_with("Engine::working(") {
         return Ok(true);
     }
-    if body.starts_with("Engine::absent(") {
+    if body.starts_with("Engine::inert(")
+        || body.starts_with("Engine::unwritten(")
+    {
         return Ok(false);
     }
     Err(format!(
         "{konst} in {ENGINE_VERSION_RS} is initialised with `{body}`, which is \
-         neither `Engine::present(..)` nor `Engine::absent(..)`; {token}'s \
-         capability cannot be resolved without executing the engine"
+         none of `Engine::working(..)`, `Engine::inert(..)` or \
+         `Engine::unwritten(..)`; {token}'s capability cannot be resolved \
+         without executing the engine"
     )
     .into())
 }
@@ -3909,10 +3520,10 @@ fn gate_holds(gate: &Gate) -> Result<bool, Box<dyn Error>> {
         Gate::LargeFile => {
             let width =
                 env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_default();
-            // All four mandated targets are 64-bit (specification 0.8.3), and
-            // the engine derives this row from the width of curl_off_t. A
-            // narrower target would need the engine consulted rather than
-            // assumed, so it is rejected instead of guessed.
+            // All four mandated targets are 64-bit, and the engine derives
+            // this row from the width of curl_off_t. A narrower target would
+            // need the engine consulted rather than assumed, so it is rejected
+            // instead of guessed.
             match width.as_str() {
                 "64" => Ok(true),
                 "" => Err("CARGO_CFG_TARGET_POINTER_WIDTH is unset, so the \
@@ -3933,25 +3544,8 @@ fn gate_holds(gate: &Gate) -> Result<bool, Box<dyn Error>> {
 /// advertise, each with the reason. Checked at build time by
 /// [`run_self_checks`] against what [`advertised_features`] actually derives,
 /// so a token cannot reappear through a careless edit to the engine's table.
-///
-/// `rustls` is absent from this list because it IS advertised, and that
-/// deserves its own note, resolved in favour of accuracy. The harness sets
-/// `$feature{"rustls"}` from a
-/// `rustls-ffi` token in the banner (tests/runtests.pl:585-586), not from
-/// the word `rustls`. Emitting `rustls-ffi` would unlock the rustls-gated
-/// fixtures but would misdescribe the implementation, which uses rustls
-/// natively rather than through its C FFI, and `deny.toml` bans the
-/// `rustls-ffi` crate outright for exactly that reason. So the truthful
-/// token is emitted and the resulting skips are accepted, consistent with
-/// under-reporting being the safe direction.
 const WITHHELD: [(&str, &str); 17] = [
     // ---- The cross-artifact contract with curl-rs-lib/src/version.rs -------
-    //
-    // BOTH ARE WITHHELD UNCONDITIONALLY, NOT GATED ON `memdebug`. They were
-    // gated once, on the reasoning that leaving the tokens unreachable would
-    // make the `memdebug` feature inert. That reasoning was wrong on two
-    // independent counts, and gating them created a disagreement between the
-    // two artifacts this workspace ships.
     //
     // 1. THE GATE COULD NEVER TAKE EFFECT WHERE IT MATTERS.
     //    `tests/runtests.pl` reads capabilities from `curl --version`, which
@@ -3980,7 +3574,7 @@ const WITHHELD: [(&str, &str); 17] = [
     // its own tests. What it must not do is claim a capability whose full
     // semantics -- the internal behaviour changes a C DEBUGBUILD also makes,
     // which the 98 `Debug`-gated fixtures exercise -- do not exist. That is
-    // exactly specification 0.8.6 ambiguity A5's resolution, and the cost is
+    // exactly the recorded A5 resolution, and the cost is
     // stated rather than buried: 98 fixtures skip, the 28 `<limits>` fixtures
     // go inert, and `make torture-test` is inapplicable because it dies
     // without `TrackMemory` (`tests/runtests.pl:847-849`).
@@ -4034,25 +3628,9 @@ const WITHHELD: [(&str, &str); 17] = [
 ];
 
 /// The sole TLS backend, as `curl-config --ssl-backends` reports it.
-///
-/// Lower case, matching how libcurl names a backend at run time. Noted for
-/// the record: `CMakeLists.txt:2059` spells the CMake-side label `Rustls`,
-/// so the two differ in case; the lower-case spelling is the required one
-/// here. `CURLSSLBACKEND_RUSTLS = 14` already exists in `curl_sslbackend`
-/// (curl.h:166), so `curl_global_sslset` reports a rustls backend without
-/// inventing an enumerant.
 const SSL_BACKENDS: &str = "rustls";
 
 // Measured ground truth for the option table.
-//
-// This script deliberately does NOT reimplement `lib/optiontable.pl`, and
-// deliberately does NOT parse `include/curl/curl.h`. In the C build the
-// public header was the source of truth and `lib/Makefile.am:179-180`
-// derived the option table from it; here the arrow reverses, Rust source is
-// the source of truth and the header is an output. Reading the header back
-// in would close the loop and reintroduce the drift that the
-// single-source rule exists to prevent, and the drift would stay invisible
-// until a consumer asked for an option by name and got the wrong id.
 //
 // `curl-rs-ffi/src/ffi/opts.rs` is the sole source of truth for the
 // CURLoption identifiers AND for the `curl_easyoption` metadata array that
@@ -4060,16 +3638,6 @@ const SSL_BACKENDS: &str = "rustls";
 // `curl_easy_option_next` (note that last spelling: it is
 // `curl_easy_option_next`, not `_by_next`, confirmed in `lib/libcurl.def`).
 // That module is on disk, and cbindgen renders both from it.
-//
-// The facts below come from RUNNING the C generator,
-// `perl lib/optiontable.pl < include/curl/curl.h`, so that `opts.rs` can be
-// checked against them without re-deriving anything. They are constants
-// rather than prose because two build-time checks consume them, and prose
-// can be consumed by neither: [`run_self_checks`] asserts the relationships
-// BETWEEN them, and [`option_table_ground_truth`] asserts each one against
-// the row data in `src/ffi/opts.rs`. The second is the one that matters --
-// internally consistent arithmetic over the wrong numbers is exactly the
-// defect these constants previously carried.
 
 /// Rows the C generator emits, including the terminating sentinel
 /// `{ NULL, CURLOPT_LASTENTRY, CURLOT_LONG, 0 }`. Measured: 324.
@@ -4087,22 +3655,9 @@ const SSL_BACKENDS: &str = "rustls";
 ///     generator emits below the table.
 ///   * A per-line regex yields 301, because the longer rows wrap onto a
 ///     second line.
-///
-/// This constant previously read 323, which is neither of those numbers: it
-/// is the count EXCLUDING the sentinel, and so contradicted its own
-/// documentation. That count is [`OPTION_TABLE_REAL_ROWS`].
 const OPTION_TABLE_ROWS: usize = 324;
 
 /// Rows flagged `CURLOT_FLAG_ALIAS`. Measured: 15.
-///
-/// Not 17, and the arithmetic is worth spelling out because the discrepancy
-/// looks like an error until it is traced. `include/curl/curl.h` has 19
-/// `#define CURLOPT_` lines. Two are numeric rather than aliases
-/// (`CURLOPT_OBSOLETE72 9999` at `:733` and `CURLOPT_OBSOLETE40 9999` at
-/// `:734`), leaving 17 true aliases. Of those, two point at an obsolete
-/// option (`CURLOPT_WRITEINFO` to `CURLOPT_OBSOLETE40` at `:731` and
-/// `CURLOPT_CLOSEPOLICY` to `CURLOPT_OBSOLETE72` at `:732`) and the
-/// generator skips them. 17 - 2 = 15.
 const OPTION_TABLE_ALIAS_ROWS: usize = 15;
 
 /// Rows describing something, excluding the sentinel. Measured: 323.
@@ -4114,13 +3669,6 @@ const OPTION_TABLE_REAL_ROWS: usize = OPTION_TABLE_ROWS - 1;
 
 /// Rows describing a preferred option -- neither an alias nor the sentinel.
 /// Measured: 308.
-///
-/// This is the number that has to agree with the enumeration, and AAP 0.6.1
-/// reconciles it independently as 291 `CURLOPT(...)` invocations plus 17
-/// `CURLOPTDEPRECATED(...)` invocations. Two populations, one number: the
-/// enumeration comes from the frozen header and the table comes from
-/// `lib/optiontable.pl`, so their agreement is evidence rather than
-/// restatement. `ffi/opts.rs` asserts the same equality on the data itself.
 const OPTION_TABLE_TRUE_OPTIONS: usize =
     OPTION_TABLE_REAL_ROWS - OPTION_TABLE_ALIAS_ROWS;
 
@@ -4147,10 +3695,6 @@ const EXPORTED_SYMBOLS: usize = 100;
 /// (`cbindgen.toml`, "Group 5e"), the two whose parameter names a public enum,
 /// the two the header API declares and the three remaining URL-API
 /// constructors. 4 + 5 + 10 + 12 + 2 + 2 + 3 = 38.
-///
-/// The two that name a public enum are `curl_url_get` and `curl_url_set`,
-/// whose `CURLUPart what` must survive into the header while the Rust
-/// definition takes a `c_int`. [`URLAPI_H_POST`] records why.
 ///
 /// The next two are `curl_easy_header` and `curl_easy_nextheader`. They were
 /// generated until the render of `include/curl/header.h` was measured against
@@ -4187,30 +3731,10 @@ const VERBATIM_FUNCTIONS: usize = 38;
 //     sound; it just does not recover `curl_easytype`.)
 //   * `CURLOT_FLAG_ALIAS (1 << 0)` (include/curl/options.h:47) is the only
 //     flag bit defined.
-//
-// And one compile-order fact that looks like style but is not:
-// `include/curl/options.h` contains NO `#include` at all and depends on
-// `curl.h` having already defined `CURLoption` and `CURL_EXTERN`. Measured
-// across the tree, the same is true of `easy.h`, `header.h` and
-// `websockets.h`. That is why the umbrella include order in `curl.h`'s
-// trailer is load-bearing.
 
 // Entry point
 
 /// WHY THIS IS NOT `fn main() -> Result<(), Box<dyn Error>>`.
-///
-/// A `Result`-returning `main` is reported by the standard library's
-/// `Termination` implementation, which formats the error with `Debug`. For a
-/// `Box<dyn Error>` built from a `String` that renders as
-/// `Error: "line one\nline two"` -- the whole message collapsed onto one line
-/// with every newline escaped and the text wrapped in quotes.
-///
-/// That is not cosmetic here. [`variadic_abi_verdict`] refuses the build on
-/// `aarch64-apple-darwin` with a multi-line escalation that sets out the three
-/// options AAP 0.8.6 A4 leaves open, and the reader has to be able to read it.
-/// Printing with `Display` and exiting non-zero keeps cargo's own framing
-/// (`error: failed to run custom build command for ...`) while leaving the body
-/// of the message ours, formatted as written.
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -4254,7 +3778,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     // reaches, before a single artifact is written. See Section 14b.
     validate_environment_substitutions()?;
 
-    emit_link_args();
+    emit_link_args(&manifest)?;
 
     // Needs the repository root, so it cannot live in run_self_checks. Runs
     // before any render: a symbol the headers would not declare is a defect in
@@ -4266,6 +3790,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     // `src/ffi/opts.rs`; this is what makes that description enforceable
     // instead of merely asserted.
     option_table_ground_truth(&manifest)?;
+
+    // Needs the repository root for the same reason. Runs before any render
+    // because `curl-config --cc` is one of the things about to be rendered.
+    check_cross_toolchain_agreement(&root)?;
+
+    // Likewise root-relative, and likewise before any render: the blocked-gate
+    // declarations describe the dependency graph this artifact was built from,
+    // so they must be current before anything describes that artifact.
+    check_blocked_aap_gates(&root)?;
 
     let facts = VersionFacts::read(&root)?;
 
@@ -4287,12 +3820,6 @@ fn env_var(key: &str) -> Result<String, Box<dyn Error>> {
 // Build-time invariants
 
 /// Assert the internal consistency of the tables above.
-///
-/// These run on every build rather than living in a `#[cfg(test)]` module,
-/// and that is deliberate. `cargo test` does not compile or execute tests
-/// declared inside a build script, so a test module here would be dead
-/// weight that never caught anything. Checking at build time is the only
-/// way to make these machine-enforced rather than review-enforced.
 fn run_self_checks() -> Result<(), Box<dyn Error>> {
     // The partition must be disjoint. Two headers declaring the same item
     // is a duplicate C declaration, which is a hard compile error in the
@@ -4438,11 +3965,6 @@ fn run_self_checks() -> Result<(), Box<dyn Error>> {
 
     // No capability may be both advertised and withheld. This is the check
     // that stops `Debug` or `OpenSSL` reappearing through a careless edit.
-    //
-    // Now asked of what is ACTUALLY ADVERTISED, derived from the engine's table,
-    // rather than of a local list of what might be. That closes the hole the
-    // previous form left open: a token could be absent from the local table --
-    // and so pass this check trivially -- while the engine advertised it anyway.
     let advertised = advertised_features()?;
     for token in advertised.split_whitespace() {
         if let Some((name, reason)) = WITHHELD.iter().find(|(t, _)| *t == token)
@@ -4459,9 +3981,6 @@ fn run_self_checks() -> Result<(), Box<dyn Error>> {
 
     // Two tokens must never appear, for reasons that outlive any single row.
     //
-    // `Debug` gates ALL memory checking in the harness (tests/runtests.pl:1759
-    // via :660), and specification 0.6.6 records the deliberate decision to
-    // withhold it so the 28 `<limits>` fixtures go inert rather than fail.
     // `TrackMemory` is not a curl feature token at all: the harness DERIVES it
     // from `/Debug/i`, so emitting it standalone would advertise a vocabulary
     // curl does not have. Both were emitted by the previous hand-maintained
@@ -4477,6 +3996,127 @@ fn run_self_checks() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Every arm of the static-metadata probe decision, asserted directly.
+    //
+    // Two of the three are unreachable in a default build -- no row of the
+    // engine's table currently resolves to `Constant(false)` or reaches a
+    // `Dynamic` probe with its gate holding -- so nothing would notice if an
+    // arm were inverted. That is exactly how the `Dynamic` arm came to discard
+    // the compile-time GSS fact: the code path had no witness. It has one now.
+    for (probe, permitted, why) in [
+        (
+            Probe::Absent,
+            true,
+            "C's NULL is present whenever compiled in",
+        ),
+        (
+            Probe::Constant(true),
+            true,
+            "a probe fixed true for this build has the same static answer",
+        ),
+        (
+            Probe::Constant(false),
+            false,
+            "the engine withholds it at run time, so metadata claiming it \
+             would describe a different product",
+        ),
+        (
+            Probe::Dynamic("gss_present".to_string()),
+            true,
+            "curl-config --features and libcurl.pc report what the build was \
+             built to do; C answers the same question from HAVE_GSSAPI at \
+             configure time (configure.ac:5175-5200) and never re-examines \
+             the host",
+        ),
+    ] {
+        if probe_permits_static_metadata(&probe) != permitted {
+            return Err(format!(
+                "probe_permits_static_metadata({probe:?}) must be \
+                 {permitted}: {why}"
+            )
+            .into());
+        }
+    }
+
+    // The three GSS tokens are advertised exactly when their gate holds, and
+    // never on the strength of the probe alone. Asserted as an equivalence in
+    // both directions so that neither the previous defect (compile-time fact
+    // discarded) nor its opposite (token emitted with the feature off) can
+    // pass.
+    {
+        let advertised_now = advertised_features()?;
+        for row in runtime_feature_rows()? {
+            if !["GSS-API", "SPNEGO", "Kerberos"].contains(&row.token.as_str())
+            {
+                continue;
+            }
+            let gate = gate_holds(&row.gate)?;
+            let named =
+                advertised_now.split_whitespace().any(|t| t == row.token);
+            if gate != named {
+                return Err(format!(
+                    "{} is {} static metadata while its compile-time gate is \
+                     {gate}. The two must agree: the gate is the whole of the \
+                     question these files answer, and the runtime probe \
+                     belongs to the live banner alone.",
+                    row.token,
+                    if named { "named in" } else { "absent from" }
+                )
+                .into());
+            }
+        }
+    }
+
+    // The target-compiler table describes the four mandated targets and
+    // invents nothing.
+    //
+    // The row that matters most is the one that cannot be observed on a Linux
+    // runner: an Apple entry derived as `<triple>-gcc` names a driver that has
+    // never existed, and `curl-config --cc` is consumed by a consumer that
+    // will run it. So the shape is asserted rather than trusted.
+    {
+        let mandated = [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+        ];
+        for triple in mandated {
+            let command = target_compiler(triple).ok_or_else(|| {
+                format!(
+                    "{triple} is mandated by specification 0.8.3 but has no \
+                     TARGET_COMPILERS row, so curl-config --cc would have to \
+                     invent one"
+                )
+            })?;
+            if command.trim().is_empty() {
+                return Err(format!(
+                    "{triple}'s compiler command is empty; a consumer \
+                     substituting it would run its next argument as a program"
+                )
+                .into());
+            }
+            if command.starts_with(triple) {
+                return Err(format!(
+                    "{triple}'s compiler command {command:?} is derived from \
+                     the Rust triple. That is the defect this table replaces: \
+                     GNU drops the vendor field and Apple has no \
+                     triple-prefixed driver at all."
+                )
+                .into());
+            }
+        }
+        for (triple, _) in TARGET_COMPILERS {
+            if !mandated.contains(&triple) {
+                return Err(format!(
+                    "TARGET_COMPILERS carries {triple}, which is outside the \
+                     four targets specification 0.8.3 mandates"
+                )
+                .into());
+            }
+        }
+    }
+
     // The option-table facts have to agree with each other. Prose cannot be
     // checked; arithmetic can.
     if OPTION_TABLE_REAL_ROWS + 1 != OPTION_TABLE_ROWS {
@@ -4485,8 +4125,6 @@ fn run_self_checks() -> Result<(), Box<dyn Error>> {
     if OPTION_TABLE_ALIAS_ROWS >= OPTION_TABLE_REAL_ROWS {
         return Err("alias rows cannot outnumber real option rows".into());
     }
-    // 291 CURLOPT(...) + 17 CURLOPTDEPRECATED(...) per AAP 0.6.1, arrived at
-    // from the other direction: 324 rows - 1 sentinel - 15 alias rows.
     if OPTION_TABLE_TRUE_OPTIONS != 308 {
         return Err(format!(
             "the metadata table describes {OPTION_TABLE_TRUE_OPTIONS} \
@@ -4585,15 +4223,6 @@ fn run_self_checks() -> Result<(), Box<dyn Error>> {
 }
 
 /// Exercise the two encoders and the two validators on adversarial input.
-///
-/// Every branch below has a real destination behind it, and the values are the
-/// ones that were actually measured against `sh` and `pkg-config 1.8.1` rather
-/// than invented. Running on every build rather than under `cargo test` is not
-/// a compromise here: `cargo test` never compiles a build script, so a test
-/// module would be the coverage that never runs, and NUL in particular cannot
-/// be exercised any other way -- a POSIX environment variable cannot contain
-/// one, so no child process can carry it in. This is the only place that path
-/// is reachable at all.
 fn self_check_substitution_encoders() -> Result<(), Box<dyn Error>> {
     // The shell encoder. The payload is the one that demonstrably executed
     // `id -u` when substituted raw into `echo '...'`.
@@ -4752,10 +4381,7 @@ fn self_check_variadic_inventory() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Only the verbatim text is searched. The generated portion of each header
-    // is produced by cbindgen from source that does not exist yet for these
-    // symbols, so searching it would assert nothing today and would silently
-    // start passing for the wrong reason later.
+    // Only the verbatim text is searched.
     let declared =
         [MPRINTF_H_DECLS, EASY_H_POST, MULTI_H_POST, CURL_H_VERBATIM].concat();
 
@@ -4785,31 +4411,6 @@ fn self_check_variadic_inventory() -> Result<(), Box<dyn Error>> {
 }
 
 /// Check the measured option-table facts against the canonical Rust data.
-///
-/// The five `OPTION_TABLE_*` constants above are the output of
-/// `perl lib/optiontable.pl < include/curl/curl.h`. `src/ffi/opts.rs` is the
-/// sole source of truth for the option identifiers and for the
-/// `curl_easyoption` metadata array. Until this function existed, those were
-/// two independent hand-maintained populations and the module documentation's
-/// claim that `opts.rs` "is checked against" the measured facts was not true
-/// of anything: nothing compared them, and the review that found the counts
-/// off by one found them off by one in exactly this gap.
-///
-/// # Why the file is read as TEXT
-///
-/// A build script cannot `use` the crate it builds, so the array cannot be
-/// counted by evaluating it. Reading the Rust source and counting
-/// `EasyOptionRow {` constructions is the available alternative, and it is
-/// sound for this purpose because the array is a flat literal with one
-/// construction per row -- a shape [`run_self_checks`] cannot verify but this
-/// function can, and does, by rejecting a body whose row and identifier
-/// counts disagree.
-///
-/// This does NOT reintroduce the generation loop the module documentation
-/// forbids. That prohibition is on reading the GENERATED `include/curl/*.h`
-/// back in as an input, which would make the output its own authority. This
-/// reads the hand-authored Rust source that IS the authority, in the same way
-/// [`preflight_modules`] and [`public_enum_reprs`] already do.
 ///
 /// # What a failure means
 ///
@@ -4954,10 +4555,7 @@ fn option_table_ground_truth(manifest: &Path) -> Result<(), Box<dyn Error>> {
 
 /// Every symbol name `lib/libcurl.def` exports.
 ///
-/// `EXPORTS` on line 1, then one bare name per line. The file is read rather
-/// than trusted to a constant because it is the AUTHORITY: AAP 0.1.1 settles
-/// the export count from it ("The binding requirement is 100, not 52"), and
-/// AAP 0.8.4 gate 7 compares `nm` output against it.
+/// `EXPORTS` on line 1, then one bare name per line.
 fn exported_symbols(root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     let path = root.join("lib").join("libcurl.def");
     let text = fs::read_to_string(&path).map_err(|e| {
@@ -5054,16 +4652,6 @@ fn strip_c_noise(text: &str) -> String {
 /// ```c
 /// #define curl_multi_socket(x,y,z) curl_multi_socket_action(x,y,0,z)
 /// ```
-///
-/// whose REPLACEMENT LIST mentions `curl_multi_socket_action` as a USE. A use
-/// is not a declaration, and counting it as one made a correct partition look
-/// like a double declaration -- a false failure indistinguishable from a real
-/// one. Stripping comments and string literals is therefore necessary but not
-/// sufficient: a macro body is a third source of a name that declares nothing.
-///
-/// So a preprocessor logical line contributes exactly the name being defined,
-/// and nothing else on it counts. Backslash continuations are tracked, because
-/// `curl.h`'s `CURLAUTH_ANY` proves the carriers use them.
 fn verbatim_callables(text: &str) -> Vec<String> {
     let clean = strip_c_noise(text);
     let mut names = Vec::new();
@@ -5131,27 +4719,19 @@ fn callables_on(line: &str) -> Vec<String> {
 /// partition, and therefore generated, or present as a verbatim prototype,
 /// and therefore hand-written -- never both and never neither.
 ///
-/// Measured today: 62 claimed, 38 verbatim, disjoint, union 100 of 100,
-/// nothing unaccounted. The 38 are the four C-variadic setters, the five
+/// Measured today, and CHECKED rather than dated -- `check_export_coverage`
+/// below fails the build if either figure moves: 62 claimed, 38 verbatim,
+/// disjoint, union 100 of 100, nothing unaccounted. These two describe how each
+/// of the 100 DECLARATIONS reaches the header, and say nothing about how many
+/// symbols the crate currently defines; that is
+/// [`undefined_abi_exports`]'s figure, and confusing the two has misled a
+/// review once. The 38 are the four C-variadic setters, the five
 /// deprecated prototypes, the ten `curl_m*printf` functions, the twelve
 /// whose frozen signature names a type this crate's Rust spelling cannot ask
 /// cbindgen to produce (cbindgen.toml, "Group 5e"), the two `urlapi.h`
 /// declares with a `CURLUPart` parameter, the two `header.h` declares and the
 /// three remaining `urlapi.h` constructors, which matches
 /// [`VERBATIM_FUNCTIONS`] exactly.
-///
-/// This check is not defence in depth; it earns its place. Emptying
-/// `header.h`'s partition without adding its two prototypes to
-/// [`HEADER_H_DECLS`] made it fail immediately and by name -- "2 of the 100
-/// symbols ... are neither claimed by a header partition nor written
-/// verbatim: curl_easy_header, curl_easy_nextheader" -- which is the exact
-/// gap it exists to find.
-///
-/// This is a declaration-coverage check, not an export check: it asserts the
-/// public headers will DECLARE all 100. Whether the library EXPORTS all 100 is
-/// AAP 0.8.4 gate 7's job, asserted by `nm` in
-/// `.github/workflows/rust-abi.yml`, because a build script cannot inspect a
-/// binary it has not yet produced.
 fn check_export_coverage(root: &Path) -> Result<(), Box<dyn Error>> {
     let symbols = exported_symbols(root)?;
 
@@ -5293,6 +4873,12 @@ fn emit_rerun_directives(manifest: &Path) -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../Cargo.toml");
     println!("cargo:rerun-if-changed=../Cargo.lock");
+    // The cross-toolchain authority, PARSED by
+    // check_cross_toolchain_agreement. It names the aarch64 Linux `linker`,
+    // and `curl-config --cc` must report the same command for that triple, so
+    // renaming the linker there has to fail this build rather than silently
+    // leave the two ends of one toolchain disagreeing.
+    println!("cargo:rerun-if-changed=../.cargo/config.toml");
 
     for key in tracked_env_keys() {
         println!("cargo:rerun-if-env-changed={key}");
@@ -5301,16 +4887,13 @@ fn emit_rerun_directives(manifest: &Path) -> Result<(), Box<dyn Error>> {
     // cbindgen.toml is an AUTHORITY, not a convenience, so its absence is
     // FATAL rather than a warning.
     //
-    // It was a `cargo:warning=` that said "header generation will fail" and
-    // then let the build carry on regardless. That was wrong twice over.
-    //
     // It fails OPEN, which is the exact defect class this guard
     // names: a missing authority item has to stop the build, because the
     // thing this file is missing is not decoration. cbindgen.toml carries the
     // verbatim header prologue that pins `typedef void CURL;`,
     // `typedef void CURLSH;`, `typedef void CURLM;`,
     // `typedef struct Curl_URL CURLU;` and `typedef struct CURLMsg CURLMsg;`
-    // exactly as the frozen headers spell them (AAP section 0.6.3). Without
+    // exactly as the frozen headers spell them. Without
     // it cbindgen emits `typedef struct CURL CURL;` for the first three, which
     // changes the type of every handle-passing call and breaks the widespread
     // idiom of assigning a `CURL *` to a `void *` -- silently, in the
@@ -5319,11 +4902,6 @@ fn emit_rerun_directives(manifest: &Path) -> Result<(), Box<dyn Error>> {
     // `#define`s byte-identical to the authority. A build that proceeded
     // without it would either fail with a less obvious message or, worse,
     // succeed and promote headers that no longer match.
-    //
-    // And it emits a WARNING, which breaks validation gate 1 -- a build with
-    // zero warnings on all four targets (AAP section 0.8.4). A diagnostic that
-    // announces a fatal condition while returning success is over-reporting in
-    // one direction and under-reporting in the other.
     let config = manifest.join("cbindgen.toml");
     if !config.is_file() {
         return Err(format!(
@@ -5344,7 +4922,7 @@ fn emit_rerun_directives(manifest: &Path) -> Result<(), Box<dyn Error>> {
 /// One directive, artifact-scoped, spelled for the target platform. See the
 /// module documentation for the three measurements behind each of those
 /// three words.
-fn emit_link_args() {
+fn emit_link_args(manifest: &Path) -> Result<(), Box<dyn Error>> {
     // CARGO_CFG_TARGET_OS, never cfg!(target_os). A build script is
     // compiled for the host, so cfg! would describe the machine doing the
     // building and would silently emit a Linux flag when cross-compiling to
@@ -5368,6 +4946,11 @@ fn emit_link_args() {
                 "cargo:rustc-link-arg-cdylib=-Wl,--soname={}",
                 linux_soname()
             );
+
+            // The six assembled labels rustc cannot see. ELF only, and only
+            // here: see Trap 3 above for the measurement, and
+            // MACH_O_EXPORT_GAP for why the Darwin arm has no counterpart.
+            promote_assembled_exports(manifest)?;
         }
         "macos" => {
             // Verified rather than assumed. Built a cdylib for both
@@ -5380,6 +4963,18 @@ fn emit_link_args() {
                 "cargo:rustc-link-arg-cdylib=-Wl,-install_name,{}",
                 apple_install_name()
             );
+
+            // THE ASYMMETRY WITH THE LINUX ARM IS DELIBERATE, and this is the
+            // only place a reader will look for it. The six `global_asm!`
+            // labels the Linux arm promotes stay ABSENT from a Mach-O dylib's
+            // export table, so Darwin's dynamic ceiling is six lower than
+            // ELF's. ld64's mechanism is `-exported_symbols_list <file>`,
+            // which SETS the export list rather than extending it, so handing
+            // it the six would hide the fifty-three rustc put there -- a
+            // strictly worse artifact. There is no additive spelling: the
+            // per-symbol form builds the same single list, and a second list
+            // replaces the first. Nothing is emitted here rather than
+            // something being emitted that makes it worse.
         }
         other => {
             // Silence here would be the wrong answer twice over: the
@@ -5396,10 +4991,6 @@ fn emit_link_args() {
 
     // The aarch64-apple-darwin variadic hazard used to be escalated from here
     // with a `cargo:warning=`. It no longer is, for two measured reasons.
-    //
-    // The warning broke specification 0.8.4 gate 1, which requires a build with
-    // ZERO warnings on all four targets -- so on the very target it was warning
-    // about, it was itself the gate failure.
     //
     // And it was inaccurate. It asserted that "the C ABI shim's setopt and
     // getinfo entry points are non-variadic and read a register", but no such
@@ -5435,20 +5026,150 @@ fn emit_link_args() {
     // true of the eleventh, `curl_formadd`, is unchanged, and what remains open
     // about the ten is narrower and is stated where it belongs: the Apple
     // prologues are cross-assembled here but have never been executed.
+
+    Ok(())
 }
 
-// MEASURED FINDING, Trap 3: the five assembled printf entry points cannot be
-// exported from this crate's shared library at the declared minimum Rust
-// version, and no linker flag changes that. Recorded here rather than acted on,
-// because every available action is worse than the gap.
+/// The directory holding the invoking toolchain's own `ld.lld`, if it has one.
+///
+/// `<sysroot>/lib/rustlib/<HOST>/bin/gcc-ld` is where rustup lays out the
+/// `rust-lld` shims that `-fuse-ld=lld` finds through `-B`. Two details are
+/// load-bearing:
+///
+/// * The triple is the **host**, not the target. LLD cross-links, so the host
+///   copy serves the `aarch64-unknown-linux-gnu` leg -- measured, producing a
+///   genuine `ELF 64-bit LSB shared object, ARM aarch64`. Reaching for a
+///   target-triple directory would find nothing on any cross build.
+/// * The sysroot is asked of `$RUSTC`, the compiler cargo is actually invoking,
+///   rather than of whatever `rustc` is first on `PATH`. Those differ whenever
+///   the build is `cargo +1.75.0`, and the 1.75.0 sysroot is exactly the one
+///   whose LLD makes the MSRV row of the table above work.
+///
+/// `None` when the toolchain ships no LLD -- a distribution rustc, or a rustup
+/// toolchain installed without the `rust-lld` component. Both pinned
+/// toolchains, 1.97.1 from `rust-toolchain.toml` and the 1.75.0 MSRV floor,
+/// were measured to have it.
+fn lld_search_dir() -> Option<PathBuf> {
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let sysroot = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let sysroot = String::from_utf8(sysroot.stdout).ok()?;
+    let host = env::var("HOST").ok()?;
+    let dir = PathBuf::from(sysroot.trim())
+        .join("lib")
+        .join("rustlib")
+        .join(host)
+        .join("bin")
+        .join("gcc-ld");
+    if dir.join("ld.lld").is_file() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// Whether this build is adding the `global_asm!` labels to the cdylib's
+/// dynamic export table.
+///
+/// Exactly [`promote_assembled_exports`]'s own precondition, factored out so
+/// that [`implemented_exports`] answers about the artifact this build produces
+/// rather than about the one it would have produced without LLD. Both pinned
+/// toolchains ship `ld.lld` in their own sysroot, so on this project's supported
+/// configurations the answer is yes and the six labels are exported.
+fn assembled_exports_are_promoted() -> bool {
+    lld_search_dir().is_some()
+}
+
+/// Add the `global_asm!` labels to the cdylib's dynamic export table.
+///
+/// rustc builds a cdylib's export list from Rust items carrying `#[no_mangle]`
+/// or `#[export_name]` and hands the linker `{ global: <those>; local: *; };`.
+/// An assembled `.globl` label matches nothing in `global:`, falls to the
+/// wildcard and is localised -- then, being unreferenced, discarded outright.
+/// Six of the hundred exported symbols are such labels, because
+/// `extern "C" fn f(x: T, ...)` is `error[E0658]` at the declared MSRV, so
+/// without this the shared library can never exceed 94 however much else is
+/// written. See Trap 3 above for the full measurement, including the routes
+/// that do not work and why.
+///
+/// Three arguments are emitted, all `-cdylib` scoped so that neither
+/// command-line binary nor any test binary sees them:
+///
+/// 1. `-B<dir>` so the `cc` driver can find the toolchain's linker shims.
+/// 2. `-fuse-ld=lld`, because GNU ld refuses a second version script with
+///    `anonymous version tag cannot be combined with other version tags` while
+///    LLD merges the two additively.
+/// 3. `-Wl,--version-script=<OUT_DIR>/assembled-exports.map`.
+///
+/// # Emitting nothing is a supported outcome
+///
+/// When no LLD is available the function emits nothing and says nothing. It
+/// must not emit the version script alone: that is a hard link failure, so a
+/// toolchain without LLD would stop building altogether rather than build the
+/// artifact it built before. And it must not warn, because a warning would
+/// break the zero-warning build gate for a condition neither pinned toolchain
+/// can reach. The consequence is visible where it belongs -- the export census
+/// this script prints, and the ABI parity gate -- rather than invented here.
+///
+/// The names are read out of the source on every build rather than listed, for
+/// the same reason every other count in this file is derived: a literal list
+/// would be a second source of truth and would go stale the first time a
+/// seventh label was added or the sixth removed.
+///
+/// # Errors
+///
+/// If the source tree cannot be scanned, or `$OUT_DIR` cannot be written.
+fn promote_assembled_exports(manifest: &Path) -> Result<(), Box<dyn Error>> {
+    let names = assembled_export_names(manifest)?;
+    if names.is_empty() {
+        // Nothing to promote. Reached only if every trampoline becomes a Rust
+        // item, which is the outcome this whole mechanism exists to survive.
+        return Ok(());
+    }
+
+    let Some(dir) = lld_search_dir() else {
+        return Ok(());
+    };
+
+    let out = PathBuf::from(env_var("OUT_DIR")?).join("assembled-exports.map");
+    let mut script = String::from(
+        "/* Generated by curl-rs-ffi/build.rs. The labels below are defined \
+         with\n * global_asm! and are invisible to rustc's own export list, \
+         which\n * localises them. Merged additively with that list by LLD. \
+         */\n{\n  global:\n",
+    );
+    for name in &names {
+        script.push_str("    ");
+        script.push_str(name);
+        script.push_str(";\n");
+    }
+    script.push_str("};\n");
+    fs::write(&out, script)
+        .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+
+    println!("cargo:rustc-link-arg-cdylib=-B{}", dir.display());
+    println!("cargo:rustc-link-arg-cdylib=-fuse-ld=lld");
+    println!(
+        "cargo:rustc-link-arg-cdylib=-Wl,--version-script={}",
+        out.display()
+    );
+
+    Ok(())
+}
+
+// MEASURED FINDING, Trap 3: the six assembled entry points ARE exportable from
+// this crate's shared library, on both Linux targets and at the declared
+// minimum Rust version. `promote_assembled_exports` does it. This block records
+// the defect, the route, and -- at the end -- the one row whose absence made an
+// earlier revision of this comment conclude the opposite.
 //
 // WHAT WAS OBSERVED. `src/ffi/printf.rs` defines its five plain-variadic forms
-// with `global_asm!`, for the reason `check_printf_trampolines` sets out. On
+// with `global_asm!`, for the reason `check_printf_trampolines` sets out, and
+// `src/ffi/form.rs` does the same for `curl_formadd`. On
 // x86_64-unknown-linux-gnu, in BOTH profiles:
-//
-//   nm -D --defined-only target/release/libcurl.so | grep -c curl_m.*printf  -> 5
-//   nm -a               target/release/libcurl.so | grep -c curl_mprintf     -> 0
-//   nm --defined-only   target/release/libcurl.a  | grep -c ' T curl_m.*printf' -> 10
 //
 // Five, not ten, and the missing five were not merely hidden: localised and then
 // unreferenced, they were discarded outright, absent from a `.symtab` of 2703
@@ -5479,18 +5200,55 @@ fn emit_link_args() {
 // | a named version tag                    | LINK ERROR  | -        | -              |
 //
 // The link error is `anonymous version tag cannot be combined with other version
-// tags`. The one route that works, works on exactly ONE of the four required
-// targets, and only because rustc passes `-fuse-ld=lld` for
-// x86_64-unknown-linux-gnu from 1.9x onward; LLD merges version scripts and GNU
-// ld refuses to. It was implemented and verified end to end here -- 29 defined
-// exports became 34, exactly the five, all `curl_`-prefixed, soname intact, and a
-// `-Wall -Wextra -Werror` C driver linked against the shared library exercised all
-// ten forms correctly -- and then REMOVED, because it fails
-// `cargo +1.75.0 build --workspace` and it fails
-// `--target aarch64-unknown-linux-gnu` on rustc 1.97.1. A flag that breaks three
-// of four required targets is not a fix.
+// tags`. Every route but the second version script fails because a symbol that
+// rustc's own script has already matched against `local: *` stays local: the
+// dynamic-list options ADD to a set that the version script then overrides, so
+// they add nothing.
 //
-// THE THREE ALTERNATIVES, AND WHY EACH IS WORSE THAN THE GAP.
+// THE ROW THAT WAS MISSING, AND THAT CHANGES THE CONCLUSION. Every cell above
+// was measured with the linker `cc` happens to select. That is GNU ld on rustc
+// 1.75.0 and on the `aarch64-linux-gnu-gcc` cross driver, and LLD on rustc
+// 1.9x for the x86_64 host -- which is why the table reads as though the route
+// worked on one target only. The linker is not fate: both pinned toolchains
+// ship LLD in their own sysroot, at
+// `<sysroot>/lib/rustlib/<HOST>/bin/gcc-ld/ld.lld`, and selecting it
+// explicitly with `-B<that directory> -fuse-ld=lld` makes the route work
+// everywhere it is emitted. Measured here, over a probe cdylib holding two
+// Rust items and three assembled labels:
+//
+// | Route (probe: 2 Rust + 3 assembled = 5)      | exported | leaked |
+// |----------------------------------------------|----------|--------|
+// | 1.75.0 x86_64, baseline                      | 2 of 5   | 0      |
+// | 1.75.0 x86_64, 2nd script, default linker    | LINK ERROR        |
+// | 1.75.0 x86_64, 2nd script + sysroot ld.lld   | 5 of 5   | 0      |
+// | 1.97.1 x86_64, baseline                      | 2 of 5   | 0      |
+// | 1.97.1 x86_64, 2nd script + sysroot ld.lld   | 5 of 5   | 0      |
+// | 1.97.1 aarch64, baseline                     | 2 of 5   | 0      |
+// | 1.97.1 aarch64, 2nd script, cross GNU ld     | LINK ERROR        |
+// | 1.97.1 aarch64, 2nd script + sysroot ld.lld  | 5 of 5   | 0      |
+//
+// The aarch64 artifact is a genuine `ELF 64-bit LSB shared object, ARM
+// aarch64`: LLD cross-links, so the host toolchain's copy serves the cross leg
+// too. `readelf -d` reports `Library soname: [libprobe.so.4]` in every success,
+// so the soname argument and the version script coexist; `readelf -V` shows no
+// version DEFINITION node, so nothing invents a `CURL_...` tag. A
+// `-Wall -Wextra -Werror` C driver compiled against the probe's own header,
+// linked with `-lprobe` and run against the shared object, called all three
+// promoted labels and got the right answers back (`one=12 two=22 three=32`).
+//
+// WHAT IS EMITTED, THEREFORE. `promote_assembled_exports` writes the six names
+// into `$OUT_DIR/assembled-exports.map` and emits three cdylib-scoped link
+// arguments. It is silent -- emitting nothing at all -- when the ELF route does
+// not apply or LLD is not there to select, because a `--version-script` without
+// LLD is a hard link failure and a partial artifact is worse than a documented
+// gap. The Mach-O side is untouched and stays at 53: ld64 takes an
+// `-exported_symbols_list` FILE that REPLACES the list rather than adding to
+// it, so the same trick there would hide the fifty-three to reveal the six.
+// That gap is recorded at the Darwin arm of `emit_link_args`, where the
+// asymmetry is visible, and is not a silent one.
+//
+// THE THREE ALTERNATIVES CONSIDERED BEFORE THE ROUTE WAS FOUND, AND WHY EACH
+// IS STILL WORSE THAN IT.
 //
 // 1. A Rust item whose body is one `asm!(..., options(noreturn))` block. The
 //    symbol IS exported. But a prologue is emitted -- `push %rax` in release,
@@ -5499,36 +5257,35 @@ fn emit_link_args() {
 //    wrong by an unspecified, profile-dependent amount. `#[naked]`, which is
 //    what would make it exact, is stable at 1.88 and this crate declares 1.75.
 //
-// 2. Declaring the register-resident variadic arguments as ordinary parameters.
-//    This is ABI-correct, needs no assembly, is exported on all four targets, and
-//    would even close A4's Apple hazard for these five. It caps the argument
-//    count: measured, `addr_of!` of the last stack-passed parameter is the
-//    caller's slot in debug and a callee-local COPY in release (debug read the
-//    true 6 7 8 9, release read 6 455266533382 0 0), so the overflow area is
-//    unreachable and only explicitly declared slots can be consumed. A capped
-//    printf silently mis-renders a legal C call, which specification 0.8.1
-//    forbids, and eagerly copying N slots of the caller's frame invites a report
-//    from the AddressSanitizer gate.
+// 2. Declaring the register-resident variadic arguments as ordinary
+//    parameters. This is ABI-correct, needs no assembly, is exported on all
+//    four targets, and would even close A4's Apple hazard for these five. It
+//    caps the argument count: measured, `addr_of!` of the last stack-passed
+//    parameter is the caller's slot in debug and a callee-local COPY in
+//    release (debug read the true 6 7 8 9, release read 6 455266533382 0 0),
+//    so the overflow area is unreachable and only explicitly declared slots
+//    can be consumed.
 //
-// 3. A `cc`-compiled C shim, which is route (b) of the ambiguity as filed. NEW
-//    FINDING: it does not solve THIS problem at all. The version script governs
-//    the whole link, so a C object's symbols are localised exactly as an
-//    assembled label is. Route (b) answers the varargs question and is silent on
-//    the export question.
+// 3. A `cc`-compiled C shim, which is route (b) of the ambiguity as filed. It
+//    does not solve THIS problem at all. The version script governs the whole
+//    link, so a C object's symbols are localised exactly as an assembled label
+//    is. Route (b) answers the varargs question and is silent on the export
+//    question.
 //
-// WHAT WAS CHOSEN, AND WHY IT IS THE LEAST BAD. Keep the trampolines; emit no
-// flag. The two failure modes are not equivalent. Absence from the shared library
-// is LOUD -- an undefined symbol at link or load time, and the specification 0.8.4
-// parity gate fails on it by design. A capped argument list is SILENT, and
-// specification 0.6.2 says of precisely this class of hazard that "silent
-// acceptance is the worst option." The static library carries all ten and is
-// correct; the shared library carries the five `va_list` forms.
+// WHAT IS CHOSEN. Keep the trampolines -- they are ABI-exact where a Rust body
+// cannot be -- and promote their labels with the measured link argument. That is
+// strictly better than the three alternatives: it changes no argument-passing
+// convention, caps no argument list, adds no C to the build, and leaks nothing.
+// The static library carried all six before and still does; the shared library
+// now carries them too on ELF.
 //
-// The only complete remedy makes the five Rust items, which means raising the
-// minimum Rust version -- and that is the user decision ambiguity A4 already
-// reserves, not a decision for this build script. What this finding adds to A4 is
-// that the obstacle is wider than first filed: it is not only Apple's variadic
-// ABI, it is Rust's cdylib export model, and it applies on every target.
+// What remains open is narrower than it was, and is stated where it belongs. On
+// Mach-O the six are still absent, for the additive-versus-replacing reason
+// above. And ambiguity A4 is untouched by any of this: it is about the four
+// option-identifier entry points reading a register an Apple arm64 variadic
+// caller never writes, which no linker flag addresses. The earlier claim that
+// the export obstacle "applies on every target" was measured wrong and is
+// withdrawn: it applies to Mach-O, and to a build whose toolchain ships no LLD.
 
 /// Refuses to build a configuration whose variadic ABI is known to be wrong.
 ///
@@ -5544,11 +5301,12 @@ fn emit_link_args() {
 ///    Rust version on any target, so the existence of a module purporting to
 ///    implement them is itself the thing that must not ship unremarked.
 ///
-/// Both are released by the same recorded decision, `CURL_RS_A4_VARIADIC_DECISION
-/// = accept-unsupported-varargs`, because both are the same ambiguity. Nothing
-/// here chooses for the user: an unset variable produces a refusal that states
-/// the three options, and the only value accepted is the one that names which
-/// option was taken.
+/// **Neither is releasable from the environment.** Both used to be, through
+/// `CURL_RS_A4_VARIADIC_DECISION = accept-unsupported-varargs`; that bypass
+/// produced a release artifact carrying the fault described in condition 1 and
+/// has been removed. Setting the variable is now itself refused, so an
+/// environment that still carries it fails loudly rather than appearing to be
+/// honoured. [`variadic_abi_verdict`] argues the removal in full.
 fn check_variadic_abi(manifest: &Path) -> Result<(), Box<dyn Error>> {
     // CARGO_CFG_TARGET_OS and _ARCH, never cfg!(...), for the reason spelled
     // out in `emit_link_args`: a build script is compiled for the host, so
@@ -5567,78 +5325,67 @@ fn check_variadic_abi(manifest: &Path) -> Result<(), Box<dyn Error>> {
         .filter(|relative| manifest.join(relative).exists())
         .collect();
 
-    match variadic_abi_verdict(&os, &arch, &decision, &present)? {
-        Some(warning) => {
-            println!("cargo:warning={warning}");
-            Ok(())
-        }
-        None => Ok(()),
-    }
+    variadic_abi_verdict(&os, &arch, &decision, &present)?;
+    Ok(())
 }
 
 /// The verdict itself: no environment, no filesystem, no output.
 ///
 /// Split out from [`check_variadic_abi`] so every combination of target,
-/// recorded decision and implementation state can be asserted directly. The
-/// three outcomes are distinct on purpose:
+/// recorded decision and implementation state can be reasoned about directly.
+/// There are exactly two outcomes, and there used to be three:
 ///
 /// * `Err(_)` -- refuse the build. The string is the whole diagnostic.
-/// * `Ok(Some(_))` -- build, but emit this as a `cargo:warning`.
-/// * `Ok(None)` -- build silently.
+/// * `Ok(())` -- build silently.
 ///
-/// A warning is produced **only when the recorded decision actually suppressed
-/// a refusal**, and this is the one subtle part of the policy, so it is worth
-/// stating why. Validation gate 1 of specification 0.8.4 requires a
-/// warning-free build on all four targets. If acceptance warned
-/// unconditionally, then in any configuration where the decision was on record
-/// gate 1 would break on all four targets at once -- including the three whose
-/// variadic ABI is entirely sound -- which would be noise, and noise is how a
-/// real signal gets filtered out.
+/// # Why acceptance was removed
 ///
-/// Warning only when acceptance is load-bearing gives the honest result
-/// instead: the three sound targets stay silent and pass gate 1, and
-/// `aarch64-apple-darwin` cannot pass gate 1 by either route -- unset, the
-/// build fails; accepted, it warns. That is not a defect in this gate. It is
-/// open ambiguity A4 being undisguisable, which is the entire point of
-/// escalating it rather than picking a side.
+/// An `Ok(Some(warning))` arm used to exist, reached when
+/// `CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs` was set: the
+/// `aarch64-apple-darwin` refusal became a `cargo:warning` and the build
+/// produced the artifact. That was a **release-producing bypass of a
+/// memory-safety fault**, and it is gone.
 ///
-/// WHAT NO WORKFLOW DOES, stated explicitly because the opposite is the
-/// natural assumption. **No workflow in this repository sets
-/// `CURL_RS_A4_VARIADIC_DECISION`**, measured: the only occurrences under
-/// `.github/workflows/` are comments, and `rust-build.yml:209-214` names adding
-/// such a line as one of the three options A4 leaves open rather than as
-/// something already done. `rust-clippy.yml:170` and `rust-miri.yml:132` record
-/// the same absence explicitly. The consequence is that the
-/// `aarch64-apple-darwin` leg REFUSES rather than warns, `Ok(Some(_))` is
-/// unreachable in CI as configured, and the assertion step in
-/// `rust-build.yml` asserts the advisory is ABSENT everywhere. A comment
-/// claiming the variable is universally set would tell a reader the refusal
-/// cannot happen, which is precisely backwards.
+/// The reasoning behind it was that an opt-in makes a limitation a recorded
+/// decision rather than a hidden one, which is true of a limitation. It is not
+/// true of this one. What the bypass produced was a shared library whose four
+/// option-identifier entry points read register `x2` for an argument that an
+/// Apple arm64 variadic caller places on the stack -- an uninitialised register
+/// read, interpreted as a caller-supplied option value, with no diagnostic at
+/// build time and none at run time. A build-time variable cannot change an
+/// argument-passing convention. It could only decide whether the unsafe
+/// artifact got built, and there is no correct value for that.
+///
+/// So the refusal is now unconditional, and setting the variable is itself
+/// refused with an explanation, so that an environment carrying it fails
+/// loudly instead of appearing to be honoured. Specification 0.8.6 A4 keeps
+/// exactly two available options -- raise the MSRV, or drop the triple -- and
+/// both are edits to this repository, made by whoever owns the requirements.
+///
+/// The consequence for validation gate 1 (a warning-free build on all four
+/// targets, specification 0.8.4) is unchanged in substance and simpler in
+/// shape: three targets build silently and pass, and `aarch64-apple-darwin`
+/// fails outright with the diagnosis. It cannot be made to pass by any
+/// environment setting, which is what "escalated" is supposed to mean.
+///
+/// **No workflow in this repository sets `CURL_RS_A4_VARIADIC_DECISION`**,
+/// measured: the only occurrences under `.github/workflows/` are comments.
+/// That was already true when the variable still did something, and it now
+/// matters in the other direction -- a workflow that set it would fail every
+/// leg rather than quietly certifying one.
 fn variadic_abi_verdict(
     os: &str,
     arch: &str,
     decision: &str,
     implementations_present: &[&str],
-) -> Result<Option<String>, String> {
+) -> Result<(), String> {
     let decision = decision.trim();
-    let accepted = decision == A4_ACCEPTED;
-
-    // A misspelling must not read as consent. Silently treating an
-    // unrecognised value as "not accepted" would be defensible, but it would
-    // also mean a workflow that sets `accept_unsupported_varargs` (underscores)
-    // fails with the long A4 refusal below and sends the reader looking for a
-    // target problem that does not exist.
-    if !accepted && !decision.is_empty() {
-        return Err(format!(
-            "{A4_DECISION_ENV} is set to {decision:?}, which is not a \
-             recognised A4 decision. The only accepted value is the exact \
-             string {A4_ACCEPTED:?}. An unrecognised value is refused rather \
-             than ignored, so that a typo cannot read as consent."
-        ));
-    }
 
     // Condition 1: the target whose variadic ABI is known-wrong.
-    if !accepted && os == "macos" && arch == "aarch64" {
+    //
+    // UNCONDITIONAL. No environment variable is consulted, and that is the
+    // whole point -- see the doc comment's "why acceptance was removed".
+    if os == "macos" && arch == "aarch64" {
         return Err(format!(
             "aarch64-apple-darwin cannot be built: its variadic ABI is \
              known-wrong (specification 0.8.6, open ambiguity A4).\n\
@@ -5651,24 +5398,54 @@ fn variadic_abi_verdict(
              silent at run time -- no Linux or x86-64 macOS test run can \
              surface it.\n\
              \n\
-             A4 requires a decision this build script cannot make:\n\
+             THERE IS NO OPT-IN. {A4_DECISION_ENV}={A4_ACCEPTED} used to \
+             release this refusal and no longer does, because a build-time \
+             variable cannot make a memory-safety fault safe: it can only \
+             produce the artifact that carries it. A4 requires a decision \
+             this build script cannot make, and only two of its three options \
+             are decisions this repository can encode:\n\
              \x20 1. Raise the minimum supported Rust version above 1.75 and \
-             implement the four with c_variadic / VaList::next_arg.\n\
-             \x20 2. Drop aarch64-apple-darwin from the target matrix.\n\
-             \x20 3. Accept that this target's varargs entry points are \
-             unsupported, by setting {A4_DECISION_ENV}={A4_ACCEPTED}.\n\
+             implement the four with c_variadic / VaList::next_arg. That means \
+             rust-toolchain.toml's channel, Cargo.toml's rust-version and \
+             clippy.toml's msrv, together.\n\
+             \x20 2. Drop aarch64-apple-darwin from the target matrix, which \
+             means amending specification 0.1.1 goal G8 and every place the \
+             four-target matrix is enumerated.\n\
              \n\
-             Option 3 is a recorded limitation, not a fix. Lifting this \
-             refusal for the right reason means demonstrating option 1: a C \
-             driver on aarch64-apple-darwin that calls all four through the \
-             variadic prototype in the generated header and round-trips every \
-             argument class.",
+             Lifting this refusal for the right reason means demonstrating \
+             option 1: a C driver on aarch64-apple-darwin that calls all four \
+             through the variadic prototype in the generated header and \
+             round-trips every argument class.",
             VARIADIC_TRAILING_POINTER.join(", ")
         ));
     }
 
-    // Condition 2: a module claiming to implement the eleven has appeared.
-    if !accepted && !implementations_present.is_empty() {
+    // Condition 2: the decision variable is set, on a target where it can no
+    // longer change anything.
+    //
+    // Refused rather than ignored. A build that sets it is a build whose
+    // author believes an artifact is being released that is not, and silence
+    // would confirm the belief -- which is the same failure mode the typo
+    // check this replaces was written for, one step earlier.
+    if !decision.is_empty() {
+        return Err(format!(
+            "{A4_DECISION_ENV} is set to {decision:?}, and no value of it \
+             does anything any more.\n\
+             \n\
+             It formerly released the aarch64-apple-darwin refusal above when \
+             set to the exact string {A4_ACCEPTED:?}. That bypass has been \
+             removed: it could emit a release artifact whose variadic entry \
+             points read a register an Apple arm64 caller never writes. \
+             Unset the variable. If the intent was to record A4's option 3, \
+             note that option 3 was the bypass, and it is gone; the remaining \
+             options are to raise the MSRV or to drop the triple, both of \
+             which are edits to this repository rather than environment \
+             settings."
+        ));
+    }
+
+    // Condition 3: a module claiming to implement the eleven has appeared.
+    if !implementations_present.is_empty() {
         return Err(format!(
             "{} present, but the variadic exports those modules own have no \
              ABI-correct expression at the declared minimum Rust version on \
@@ -5686,35 +5463,17 @@ fn variadic_abi_verdict(
              either: they are eleven of the 100 exported symbols, and symbol \
              parity is a whole-artifact gate.\n\
              \n\
-             Either raise the minimum supported Rust version and implement \
-             them, or record the decision to ship without them by setting \
-             {A4_DECISION_ENV}={A4_ACCEPTED}.",
+             Raise the minimum supported Rust version and implement them. \
+             There is no environment setting that records a decision to ship \
+             without them: {A4_DECISION_ENV} no longer releases any refusal in \
+             this script.",
             implementations_present.join(" and "),
             VARIADIC_UNIMPLEMENTABLE.join(", "),
             VARIADIC_TRAILING_POINTER.join(", ")
         ));
     }
 
-    // Acceptance warns only where it is load-bearing. See the doc comment.
-    let suppressed_a_refusal = accepted
-        && ((os == "macos" && arch == "aarch64")
-            || !implementations_present.is_empty());
-    if suppressed_a_refusal {
-        return Ok(Some(format!(
-            "A4 decision on record ({A4_DECISION_ENV}={A4_ACCEPTED}): this \
-             artifact is NOT a drop-in replacement for {} of the 100 exported \
-             symbols. {} have no expression as a Rust function at the declared \
-             minimum and are assembled instead, so six of them reach \
-             libcurl.a and not libcurl.so; on aarch64-apple-darwin {} are \
-             additionally not ABI-correct. Specification 0.8.6 records this as \
-             an accepted limitation, not as a fix.",
-            VARIADIC_UNIMPLEMENTABLE.len(),
-            VARIADIC_UNIMPLEMENTABLE.join(", "),
-            VARIADIC_TRAILING_POINTER.join(", ")
-        )));
-    }
-
-    Ok(None)
+    Ok(())
 }
 
 // Section 10: version facts, read the way configure.ac read them
@@ -5739,10 +5498,6 @@ impl VersionFacts {
     /// which is why `curl-config --vernum` prints `081300` and not
     /// `0x081300`. `--vernum` echoes the value raw, so getting this wrong
     /// silently changes what every consumer's version comparison sees.
-    ///
-    /// Reading this header is not the prohibited round trip. The
-    /// prohibition is on parsing `include/curl/curl.h`, which this script
-    /// generates; `curlver.h` is never generated, so there is no loop.
     fn read(root: &Path) -> Result<Self, Box<dyn Error>> {
         let path = root.join("include").join("curl").join("curlver.h");
         let text = fs::read_to_string(&path).map_err(|e| {
@@ -5787,24 +5542,20 @@ impl VersionFacts {
         // just as the environment-derived values are, so it is validated in
         // the same spirit -- Section 14b covers the reasoning, and this is the
         // one substitution that reaches a context single quotes do not
-        // protect. `curl-config.in:110`, `:111` and `:114` place it inside
-        // BACKTICKS (`vmajor=`echo '@CURLVERSION@' | cut -d. -f1``) and `:130`
-        // places it inside DOUBLE quotes, where `$` and a backtick are live.
-        // libcurl.pc:124 makes it the `Version:` field, where a `#` truncates.
-        //
-        // The set below admits every version curl has ever carried --
-        // `8.19.0-DEV`, `8.4.0`, a `-rc1` suffix -- and excludes every
-        // metacharacter of both grammars. The provenance is a tracked header
-        // rather than the environment, which lowers the likelihood but not the
-        // consequence, and the check costs nothing.
+        // protect. `curl-config.in`'s --checkfor arm places it inside BACKTICKS
+        // (`vmajor=`echo '@CURLVERSION@' | cut -d. -f1``) and its "requested
+        // version" diagnostic places it inside DOUBLE quotes, where `$` and a
+        // backtick are live. In `libcurl.pc` it is the `Version:` field, where
+        // a `#` truncates.
         if let Some(bad) = version.chars().find(|c| {
             !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
         }) {
             return Err(format!(
                 "LIBCURL_VERSION is {version:?}, which contains {bad:?}. Only \
                  ASCII alphanumerics and '.', '-', '_' and '+' are accepted, \
-                 because this string is substituted into backticks at \
-                 curl-config.in:110 and into libcurl.pc's Version: field, \
+                 because this string is substituted into backticks in \
+                 curl-config's --checkfor arm and into libcurl.pc's Version: \
+                 field, \
                  where a shell or pkg-config metacharacter would be \
                  interpreted rather than printed."
             )
@@ -5833,13 +5584,6 @@ impl VersionFacts {
 
 /// Refuse to write any of the four headers that must be carried verbatim.
 ///
-/// This is the "machine-enforced, not review-enforced" principle applied to
-/// file output. A comment saying "do not generate system.h" is a hope; a
-/// check that aborts the build is a guarantee. It runs immediately before
-/// every write and also once at start-up over the whole header table, so a
-/// mistake is caught before any file is touched rather than after some have
-/// been.
-///
 /// A panic rather than an `Err` is deliberate: this cannot be a recoverable
 /// condition. Reaching it means the header table is wrong, and continuing
 /// would corrupt a reviewed ABI contract.
@@ -5866,25 +5610,6 @@ fn guard_write_target(path: &Path) {
 /// one filesystem. The root `.gitignore` covers `include/curl/*.new` and
 /// `include/curl/*.tmp` while deliberately NOT ignoring `include/curl/*.h`,
 /// since those are the reviewed ABI contract.
-///
-/// WHY THE NAME CARRIES A PID AND A SERIAL rather than being the fixed
-/// `foo.h.new` this function used to return. Cargo runs one build script per
-/// target, and the four targets AAP 0.8.3 mandates are routinely built from
-/// one checkout -- `.github/workflows/rust-build.yml` does exactly that.
-/// Every one of those processes computes the same `include/curl` destination,
-/// because that path comes from the repository root and not from `OUT_DIR`.
-/// With a fixed staging name they would all write the same
-/// `include/curl/curl.h.new`: two processes interleaving there produce a file
-/// that is half of one render and half of another, and `rename` then
-/// publishes it atomically, so the corruption arrives in the tracked header
-/// looking like a successful write. The PID separates processes and the
-/// serial separates writes within a process, which together make a collision
-/// impossible rather than unlikely.
-///
-/// The leading dot keeps the artifact out of the way of a `*.h` glob, and the
-/// `.new` suffix is retained so the existing `.gitignore` entry still covers
-/// it. Verified by measurement rather than assumed: `git status --porcelain`
-/// reports nothing for a file of this shape.
 fn staging_path(path: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -5935,29 +5660,6 @@ struct StagedHeader {
 }
 
 /// An all-or-nothing set of header writes.
-///
-/// WHY THE HEADERS ARE PROMOTED AS A SET. The eight generated headers are
-/// not eight independent files; they are one partition of one ABI contract,
-/// and `curl.h` `#include`s the other seven. Promoting them one at a time --
-/// which is what this script used to do, calling `write_if_changed` from
-/// inside the generation loop -- means a validation failure on the sixth
-/// sibling leaves five new headers and three old ones on disk. That mixture
-/// has never been reviewed and need not even be valid C: a name moved from
-/// `curl.h` to `easy.h` between two runs would be declared twice, or not at
-/// all, in exactly the window a consumer might compile in. Nothing may
-/// therefore be promoted unless every
-/// header passes".
-///
-/// Staging every header first and renaming only after the last validation has
-/// passed makes the failure mode leave the tracked headers BYTE-UNCHANGED,
-/// which is the property the discrimination probes assert.
-///
-/// The promotion loop itself is not atomic across files -- POSIX offers no
-/// such primitive for eight renames -- but each individual `rename` is, and
-/// by the time the loop runs every byte has already been written and
-/// validated. What remains is a sequence of metadata operations that can only
-/// fail for reasons unrelated to content (a vanished directory, a full inode
-/// table), and that residual case is reported rather than swallowed.
 struct HeaderTransaction {
     pending: Vec<StagedHeader>,
 }
@@ -6028,15 +5730,6 @@ impl HeaderTransaction {
 
 impl Drop for HeaderTransaction {
     /// Remove every staging file that was never promoted.
-    ///
-    /// This is the half of the transaction that runs on the failure path.
-    /// `generate_headers` returns `Err` from a dozen places after the first
-    /// header has been staged, and every one of those early returns drops
-    /// this value; without the cleanup each failed build would leave another
-    /// `.curl.h.<pid>.<n>.new` behind in a tracked directory. Errors are
-    /// deliberately ignored: this runs while another error is already
-    /// propagating, and masking that error with a cleanup failure would hide
-    /// the diagnosis the developer actually needs.
     fn drop(&mut self) {
         for header in self.pending.drain(..) {
             let _ = fs::remove_file(&header.staged);
@@ -6057,8 +5750,6 @@ impl Drop for HeaderTransaction {
 ///   header on disk -- a corrupted ABI contract in a tracked file. Writing
 ///   to a sibling and promoting by `rename` makes the swap atomic, so the
 ///   destination is only ever the old content or the new content.
-///
-/// Returns whether the destination changed.
 fn write_if_changed(
     path: &Path,
     contents: &str,
@@ -6120,13 +5811,6 @@ const MODE_SCRIPT: u32 = 0o755;
 const MODE_DATA: u32 = 0o644;
 
 /// Reject text that is malformed for any consumer, before it reaches disk.
-///
-/// These four rules hold for every artifact this script writes, generated C
-/// and rendered template alike: a file must not be empty, must end with
-/// exactly one newline, must not contain a carriage return, and must not
-/// contain two consecutive blank lines. `scripts/spacecheck.pl`, which runs
-/// at `.github/workflows/hygiene.yml:164-165` and from `Makefile.am:175`,
-/// enforces all four on the tree, and its allow-lists name nothing here.
 fn check_text_hygiene(label: &str, text: &str) -> Result<(), Box<dyn Error>> {
     if text.is_empty() {
         return Err(format!("{label} rendered empty").into());
@@ -6163,9 +5847,6 @@ fn check_text_hygiene(label: &str, text: &str) -> Result<(), Box<dyn Error>> {
 /// `Requires: @LIBCURL_PC_REQUIRES@` necessarily leaves `Requires: ` with a
 /// trailing space, exactly as `configure_file` leaves it in the CMake build,
 /// and the template's bytes are frozen so it must not be trimmed.
-///
-/// `scripts/checksrc.pl:29` sets the cap at 79 columns and `:588` exempts a
-/// line carrying a URL; `:176` is the LONGLINE message.
 fn check_source_hygiene(
     label: &str,
     text: &str,
@@ -6206,21 +5887,6 @@ fn check_source_hygiene(
 }
 
 /// Reject a header that closes a braced typedef on a trailing comma.
-///
-/// The independent half of the guarantee [`normalise_generated_c`] documents.
-/// That function REMOVES the construct; this one PROVES it is gone, and the
-/// separation is the whole point: the rewrite recognises the comma only when
-/// the very next line closes the typedef, so anything a future cbindgen
-/// interposes there -- a blank line, a documentation block, an attribute --
-/// would make the rewrite silently stop applying while every other check here
-/// still passed. The result would be a public header that compiles under the
-/// project's own `-std=c99` builds and fails for any consumer using
-/// `-std=c89 -pedantic -Werror`, which is precisely the class of regression
-/// AAP 0.4.1's C89-declaration-compatibility requirement exists to prevent.
-///
-/// Scoped to C source for the same reason the column cap is: `libcurl.pc` and
-/// `curl-config` have no enumerations, and a comma at the end of one of their
-/// lines is ordinary data.
 fn check_no_terminal_enumerator_comma(
     label: &str,
     text: &str,
@@ -6261,34 +5927,12 @@ fn check_no_terminal_enumerator_comma(
 
 /// Reject a header whose C block comments are not well formed.
 ///
-/// This closes a failure mode that is invisible to every other check here, and
-/// it was a live defect before it was added rather than a hypothetical one.
-///
-/// `documentation = true` in `cbindgen.toml` transcribes each exported item's
-/// Rust doc comment into the generated header inside a `/* ... */` block. A
-/// doc comment is ordinary Rust prose, so nothing stops it containing a
-/// literal comment-close sequence -- and quoting a C preprocessor line such as
-/// the `#else` arm of a conditional is a natural way to end up with one. When
-/// that happens the emitted block ends early and every following line of prose
-/// becomes stray C tokens.
-///
-/// Measured: a doc comment on `curl_global_sslset` that quoted `#else` together
-/// with its trailing comment produced a `curl.h` that gcc rejected with
-/// `error: stray '`' in program` followed by `error: unknown type name
-/// 'answer'`. The build itself still succeeded, because a build script does not
-/// compile the header it writes, so the breakage would have reached a consumer.
-///
 /// Three conditions are checked, each of which makes the header invalid C:
 ///
 /// * a `*/` with no open block -- the signature of the failure above,
 /// * a `/*` opened inside an already-open block, which C does not nest and
 ///   which gcc warns about, and
 /// * a block still open at end of file.
-///
-/// A `//` line comment is not considered: `documentation_style = "c"` never
-/// emits one, and `scripts/checksrc.pl:162` (CPPCOMMENTS) already forbids it.
-/// String and character literals are skipped, so a `"*/"` inside a literal --
-/// which is legal C -- is not mistaken for a delimiter.
 fn validate_comments(label: &str, text: &str) -> Result<(), Box<dyn Error>> {
     let bytes = text.as_bytes();
     let mut index = 0usize;
@@ -6386,13 +6030,6 @@ const HEADER_MAX_COLUMNS: usize = 79;
 /// prologue is `curl.h:1-148` verbatim, whose lines 3 to 25 are the banner;
 /// the two lines before it are the include guard, which every header spells
 /// with its own macro and which is therefore composed per header.
-///
-/// The banner is load-bearing beyond decoration. It carries the
-/// `Copyright (C) Daniel Stenberg` line that `scripts/checksrc.pl:161`
-/// requires, and the licence-identifier line that `reuse lint` reads in the
-/// `REUSE check` step of `.github/workflows/hygiene.yml:49-52`. Both are
-/// asserted here, because a silently banner-less header would fail two live
-/// gates far from the cause.
 fn shared_banner(base: &cbindgen::Config) -> Result<String, Box<dyn Error>> {
     let header = base.header.as_deref().ok_or_else(|| {
         "cbindgen.toml sets no `header`, so the shared banner cannot be \
@@ -6478,8 +6115,6 @@ fn sibling_prologue(spec: &HeaderSpec, banner: &str) -> String {
 /// blank separator, so adding one here produced two consecutive blank lines
 /// -- which `scripts/spacecheck.pl` rejects and which the hygiene check
 /// caught on the first run.
-///
-/// Also returned without a trailing newline, for the reason above.
 fn sibling_after_includes(spec: &HeaderSpec) -> String {
     let mut out = String::new();
     out.push_str(CPP_OPEN);
@@ -6492,13 +6127,6 @@ fn sibling_after_includes(spec: &HeaderSpec) -> String {
 
 /// Compose a sibling header's epilogue: this header's trailing verbatim
 /// declarations, the `extern "C"` close and the guard close.
-///
-/// No leading newline, for the same measured reason as
-/// [`sibling_after_includes`]: cbindgen's `new_line_if_not_start()` before
-/// the trailer already separates it from the last declaration.
-/// Ends without a newline: cbindgen adds exactly one when the trailer lacks
-/// it (`language_backend/mod.rs:220-227`), which is what
-/// `scripts/spacecheck.pl` wants -- one newline at end of file, not two.
 fn sibling_epilogue(spec: &HeaderSpec) -> String {
     let mut out = String::new();
     // The postamble constants open with a newline so they read naturally
@@ -6610,14 +6238,6 @@ fn all_verbatim_names() -> Vec<&'static str> {
 /// * `typedef Ret (*Name)(args);`
 /// * `CURL_EXTERN Ret Name(args);` -- the prefix comes from `[fn] prefix`
 /// * `#define Name value`
-///
-/// Used to build the partition and then to check it. It is defence in depth,
-/// not the authority: the authority is compiling the 129 `docs/examples/`
-/// programs, where a duplicated or missing declaration is a hard error from
-/// the C compiler across every one of them. That gate is the ABI leg in
-/// `.github/workflows/rust-abi.yml`. This check runs on every build rather
-/// than only in continuous integration, so it is applied unconditionally
-/// rather than only when discovery found something.
 fn declared_names(body: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut inside_braced_typedef = false;
@@ -6670,10 +6290,6 @@ fn declared_names(body: &str) -> Vec<String> {
         //     CURL_EXTERN
         //     void *curl_easy_nextheader(void *_easy,
         //                                int _origin,
-        //
-        // so the name has to be taken from the following line. The C tree
-        // does the same thing wherever CURL_DEPRECATED intervenes, which is
-        // why the guard below also skips that macro.
         if line == "CURL_EXTERN" {
             awaiting_prototype = true;
             continue;
@@ -6752,20 +6368,6 @@ fn generated_region<'a>(
 }
 
 /// Set one pass's export partition.
-///
-/// `[export] include` is ADDITIVE: cbindgen only writes a type reachable
-/// from an exported signature, and this list forces the rest. `[export]
-/// exclude` is the blacklist, applied in `Library::remove_excluded` BEFORE
-/// dependency collection, so an excluded item cannot be pulled back in by a
-/// signature that mentions it. The partition therefore has to be expressed
-/// as an exclusion of everything the header does not own.
-///
-/// `curl.h` is the DEFAULT OWNER, and that asymmetry is the point: it is
-/// excluded from writing only what a sibling claims, so an item nobody
-/// claimed still appears exactly once, in `curl.h`. Making `curl.h` a
-/// whitelist instead would silently drop every unclaimed item, and silent
-/// dropping of a public declaration is the failure mode this whole file
-/// exists to prevent.
 fn apply_partition(
     config: &mut cbindgen::Config,
     owned: &[&str],
@@ -6787,13 +6389,9 @@ fn apply_partition(
 
 /// The one name whose exclusion this script lifts, and why.
 ///
-/// `cbindgen.toml` lists `CURLoption` under `[export] exclude`, and this
-/// script overrides that for the umbrella pass. Option identity has exactly
-/// one source of truth, `curl-rs-ffi/src/ffi/opts.rs`, which emits both the
-/// enumeration and the `curl_easyoption` metadata array. The enumeration is
-/// therefore GENERATED from that module rather than spliced verbatim.
-///
-/// That module is on disk and carries the whole mechanism, so no macro
+/// `CURLoption` is excluded by `cbindgen.toml` so that no pass emits it by
+/// accident, and re-admitted here for the one pass that owns it: `src/ffi/opts.rs`
+/// is its single source of truth. That module carries the whole mechanism, so no macro
 /// expansion is required of cbindgen: `#[repr(C)] pub enum CURLoption` writes
 /// all 309 discriminants out as explicit integer literals (308 preferred
 /// options plus `CURLOPT_LASTENTRY`), `EASY_OPTIONS` is the 324-row
@@ -6802,25 +6400,6 @@ fn apply_partition(
 /// `cbindgen.toml` is empty on purpose -- expansion would shell out to
 /// `cargo expand` -- so an enumeration that only existed as a macro
 /// invocation could not be rendered at all.
-///
-/// That resolves `cbindgen.toml`'s intent rather than contradicting it: the
-/// file delegates the per-header export partition to this script, and deciding
-/// which pass owns `CURLoption` is part of the partition. The alternative --
-/// splicing curl.h:1138-2262 verbatim -- would put the 308 option identifiers
-/// in two places, and two populations drift silently. The first symptom is a
-/// consumer asking for an option by name and getting the wrong id.
-///
-/// The generator macros `CURLoption` expands (`CURLOPT`, `CURLOPTDEPRECATED`,
-/// the five `CURLOPTTYPE_*` bases and their four aliases) remain verbatim in
-/// [`CURL_H_FORWARD`], which is what `cbindgen.toml`'s "deliberately not here"
-/// note asks for. The integers must be asserted against curl 8.19.0-DEV so
-/// that generation is checked rather than trusted, and they are: `opts.rs`
-/// carries an `ANCHORS` table transcribed BY HAND from the frozen
-/// `include/curl/curl.h`, independently of whatever wrote the enumeration, so
-/// a generator defect and a later hand-edit both have to survive it.
-/// AAP 0.3.1 additionally places a whole-artifact assertion in
-/// `tests-rs/abi/enum_values.rs`; that file does not exist yet, and the
-/// in-crate anchors are what stands in for it until it does.
 const CURL_H_GENERATED_DESPITE_EXCLUSION: &[&str] = &["CURLoption"];
 
 // Section 12a: making cbindgen's diagnostics fatal
@@ -6836,10 +6415,6 @@ const CURL_H_GENERATED_DESPITE_EXCLUSION: &[&str] = &["CURLoption"];
 // `generate()` returns `Ok` and the caller sees a successful build that has
 // silently dropped a module -- the reported failure emitted 6,672 bytes with
 // neither `CURLE_OK` nor `curl_easy_init` in it and still exited 0.
-//
-// Installing a collecting logger converts every such diagnostic into a build
-// failure. This is the whole mechanism: no subprocess, no stderr redirection
-// and no `unsafe`.
 
 /// Diagnostics cbindgen emitted during the current generation pass.
 static CBINDGEN_DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -6981,16 +6556,6 @@ fn classify_diagnostic(record: &str) -> Diagnostic<'_> {
 /// missing module is not a degraded render, it is the silent deletion of an
 /// entire ABI surface, and it is indistinguishable in the output from a
 /// module that legitimately declares nothing.
-///
-/// Checking here rather than relying on cbindgen has two advantages. The
-/// error names the file that is missing and the declaration that asked for
-/// it, which a cbindgen warning does not; and it runs BEFORE any pass, so
-/// there is no window in which a truncated render exists at all.
-///
-/// A `#[cfg(...)]`-gated declaration is deliberately still required to have a
-/// file. cbindgen follows `mod` declarations while parsing and does not
-/// evaluate this crate's feature resolution, so a gated module whose file is
-/// absent produces the same warning as an ungated one.
 fn preflight_modules(manifest: &Path) -> Result<(), Box<dyn Error>> {
     let root = manifest.join("src").join("lib.rs");
     if !root.is_file() {
@@ -7071,13 +6636,6 @@ fn preflight_modules(manifest: &Path) -> Result<(), Box<dyn Error>> {
 
 /// The four exported functions whose C prototype is genuinely variadic and
 /// whose argument count is nevertheless fixed at three.
-///
-/// `include/curl/curl.h:3328-3341` corroborates the membership of this list
-/// from the other side: it defines three-argument enforcement macros for
-/// exactly these four and for none of the other eleven variadic or `va_list`
-/// symbols, because only these four take a fixed argument count. That is what
-/// makes the trailing-pointer design possible for them and impossible for the
-/// rest.
 const VARIADIC_ENTRY_POINTS: [&str; 4] = [
     "curl_easy_setopt",
     "curl_easy_getinfo",
@@ -7102,7 +6660,7 @@ const VARIADIC_ENTRY_POINTS: [&str; 4] = [
 ///
 /// A plain non-variadic `extern "C" fn` callee compiles to `mov x0, x2; ret`
 /// on aarch64 -- it reads x2. On the first three targets caller and callee
-/// agree. On `aarch64-apple-darwin`, which specification 0.8.3 requires, the
+/// agree. On `aarch64-apple-darwin`, one of the four required targets, the
 /// callee would read a register the caller never populated, and the failure is
 /// silent: no crash, no diagnostic, just a wrong option value.
 ///
@@ -7119,36 +6677,15 @@ const VARIADIC_ENTRY_POINTS: [&str; 4] = [
 ///     br   x16
 /// ```
 ///
-/// `bl` does not modify `sp`, so `[sp]` on entry is exactly the slot the
-/// caller stored to. This was compiled and disassembled on stable 1.97.1 **and
-/// on 1.75.0**, and needs neither a newer toolchain nor a C compiler, so it
-/// costs none of the three trade-offs specification 0.8.6 lists under open
-/// ambiguity A4. `llvm-nm` shows the trampoline as a global `T` and the
-/// implementation as a local `t`, so the private symbol does not join the
-/// export set.
-///
 /// # Why this is a hard check and no longer a warning
 ///
-/// This function replaces a `cargo:warning=` that fired on every
-/// `aarch64-apple-darwin` build. That warning had two faults. It broke
-/// specification 0.8.4 gate 1, which requires a build with zero warnings on
-/// all four targets. And it was inaccurate: it described a mismatch in
-/// entry-point definitions that do not exist yet, so it reported a defect
-/// that was not present -- the reporting equivalent of the over-advertisement
-/// specification 0.6.5 rules out.
-///
-/// A check is strictly stronger than a warning here. It fails the build the
-/// moment the hazard is actually introduced, it fails on every target rather
-/// than only on the affected one -- so a developer on Linux cannot land it
+/// A `cargo:warning=` here would break the zero-warnings build gate, and it
+/// would fire on every `aarch64-apple-darwin` build for a hazard that is not
+/// yet present. A check is strictly stronger: it fails the build the moment
+/// the hazard is actually introduced, it fails on every target rather than
+/// only on the affected one -- so a developer on Linux cannot land it
 /// unnoticed -- and it cannot be satisfied by a comment, because the token it
 /// looks for is the assembly label that defines the global symbol.
-///
-/// It is one half of the policy, not the whole of it. This check makes a
-/// DEFINITION of one of the four sound wherever it appears;
-/// [`check_variadic_abi`] escalates open ambiguity A4 itself, which outlives
-/// the trampoline because the eleven printf and `va_list` exports have no
-/// ABI-correct expression at the declared minimum on any target and because
-/// none of the four has a Rust body to trampoline yet.
 fn check_variadic_strategy(manifest: &Path) -> Result<(), Box<dyn Error>> {
     let sources = rust_sources(&manifest.join("src"))?;
 
@@ -7224,13 +6761,6 @@ const PRINTF_TRAMPOLINES: [(&str, &str); 5] = [
 
 /// The two `.globl` spellings a trampoline macro must emit, and the object
 /// format each one serves.
-///
-/// Mach-O decorates every symbol with a leading underscore and ELF does not, so
-/// a macro that emits only one spelling exports nothing on half the required
-/// targets. Measured, not assumed: cross-assembling the ELF form for
-/// `x86_64-apple-darwin` also rejects `.type` and `.size` with
-/// `error: unknown directive`, which is why the two dialects need separate
-/// macro arms in the first place.
 const GLOBL_SPELLINGS: [(&str, &str); 2] = [
     (r#"".globl ", $name"#, "ELF"),
     (r#"".globl _", $name"#, "Mach-O"),
@@ -7238,17 +6768,12 @@ const GLOBL_SPELLINGS: [(&str, &str); 2] = [
 
 /// Require the five plain-variadic printf forms to be trampolines, per symbol.
 ///
-/// # Why this is stricter than the file-level gate it replaced
+/// # Why this is stricter than a per-file veto
 ///
-/// [`VARIADIC_IMPLEMENTATION_FILES`] used to list `src/ffi/printf.rs` and refuse
-/// the build outright the moment it appeared, on every target, unless a decision
-/// was recorded in the environment. That was the right instrument while nothing
-/// had been built: it made "shipped without anyone deciding" impossible.
-///
-/// It is the wrong instrument once something *has* been built, because it cannot
-/// tell a correct implementation from an incorrect one -- it only counts files,
-/// and an environment variable silences it. This check cannot be silenced and
-/// looks at each symbol individually. It refuses, for every one of the five:
+/// [`VARIADIC_IMPLEMENTATION_FILES`] can only count files, so it cannot tell a
+/// correct implementation from an incorrect one, and an environment variable
+/// silences it. This check cannot be silenced and looks at each symbol
+/// individually. It refuses, for every one of the five:
 ///
 /// 1. a plain Rust `extern "C" fn` definition, which is the actual A4 hazard --
 ///    a non-variadic callee reached through a variadic prototype reads a
@@ -7257,14 +6782,6 @@ const GLOBL_SPELLINGS: [(&str, &str); 2] = [
 /// 3. a trampoline wired to the wrong `va_list` sibling, or to one that does not
 ///    exist as a Rust export;
 /// 4. a macro that emits only one object format's `.globl` spelling.
-///
-/// The trampoline is recognised by the `export = "name"` argument rather than by
-/// the label, because the label is assembled with `concat!` and so never appears
-/// literally in the source. Point 4 is what keeps that indirection honest: it
-/// pins the fact that the argument does become a `.globl`, in both spellings.
-///
-/// Inert until the module exists, so this cannot fail a tree that has not
-/// reached it yet.
 fn check_printf_trampolines(manifest: &Path) -> Result<(), Box<dyn Error>> {
     if !manifest.join(PRINTF_MODULE).exists() {
         return Ok(());
@@ -7375,13 +6892,6 @@ const FORMADD_TRAMPOLINE: (&str, &str) = ("curl_formadd", "formadd_va");
 ///    unit's symbol of that name;
 /// 4. only one object format's `.globl` spelling, which would leave half the
 ///    required targets with no exporter at all.
-///
-/// Point 4 uses the literal labels rather than a macro argument, because unlike
-/// the printf family this module writes its four prologues out directly -- one
-/// per ABI, with no macro between -- so the label IS the source text.
-///
-/// Inert until the module exists, so this cannot fail a tree that has not reached
-/// it yet.
 fn check_formadd_trampoline(manifest: &Path) -> Result<(), Box<dyn Error>> {
     if !manifest.join(FORM_MODULE).exists() {
         return Ok(());
@@ -7516,11 +7026,6 @@ fn rust_sources(dir: &Path) -> Result<Vec<(PathBuf, String)>, Box<dyn Error>> {
 
 /// Blank out Rust comments so a scan sees code only.
 ///
-/// Without this, prose naming a function -- and this crate's documentation
-/// names all four variadic entry points repeatedly -- would read as a
-/// definition. Replacing rather than deleting keeps byte offsets stable, which
-/// matters for any caller that reports a position.
-///
 /// String literals are deliberately **kept**, and the reason is worth
 /// recording because the first version of this function removed them and
 /// thereby made [`check_variadic_strategy`] vacuous. The pattern that check
@@ -7622,19 +7127,6 @@ fn declared_modules(text: &str) -> Vec<String> {
 /// recognises `typedef Underlying Name;`. The Rust build stays green and every
 /// unit test passes. Only the SHAPE changes -- and with it the C type of every
 /// parameter declared as that enum.
-///
-/// WHY THE REPRESENTATION IS RETURNED RATHER THAN FILTERED ON. The first
-/// version of this function returned only the `#[repr(C)]` enums, and the
-/// discrimination probe for the defect above did not fire. The reason is worth
-/// recording, because it is the same vacuity: deriving the
-/// expected set from the attribute means the injection REMOVES the name from
-/// the set it is checked against, so the check skips exactly the enum that
-/// broke. A gate whose authority is the thing under test cannot fail. The set
-/// is therefore keyed on `pub enum`, which does not move when the
-/// representation changes, and the representation is checked as data.
-///
-/// Scanned from source rather than listed by hand so that adding an enum
-/// cannot forget to add it here.
 fn public_enum_reprs(
     manifest: &Path,
 ) -> Result<Vec<(String, String)>, Box<dyn Error>> {
@@ -7761,14 +7253,6 @@ fn all_verbatim_carried() -> Vec<&'static str> {
 }
 
 /// Reduce a pass's diagnostics to the ones that must fail the build.
-///
-/// Each benign shape is CHECKED against this script's own tables rather than
-/// allow-listed by text, which is the difference between a gate and a
-/// rubber stamp: the allowance for a skipped item is conditional on no
-/// partition claiming it, and the allowance for an unresolved type is
-/// conditional on that type being withheld on purpose. Change the partition
-/// so that a skipped name becomes owned, and this starts failing without
-/// anyone having to remember to update it.
 fn fatal_diagnostics(records: &[String], excluded: &[String]) -> Vec<String> {
     let claimed = all_partition_items();
     let verbatim = all_verbatim_carried();
@@ -7813,15 +7297,8 @@ fn fatal_diagnostics(records: &[String], excluded: &[String]) -> Vec<String> {
 
 /// Run one cbindgen pass and return its text.
 ///
-/// The `?` below catches a parse failure, and that is the only failure mode it
-/// catches. It is specifically NOT sufficient on its own, and the reason is
-/// worth stating because trusting it was a real defect: when a module named by
-/// `mod` cannot be resolved, cbindgen writes "can't find mod ffi" to stderr,
-/// returns `Ok`, and yields a body containing no declarations. The pass looks
-/// like a success and produces a structurally valid, nearly empty header.
-///
-/// That case is not handled here, deliberately. An emptiness test at this level
-/// would be wrong: `mprintf.h` owns zero partition items, so a *correct* render
+/// A pass that silently renders nothing is deliberately NOT caught here. An
+/// emptiness test at this level would be wrong: `mprintf.h` owns zero partition items, so a *correct* render
 /// of it legitimately contributes no generated declarations, and rejecting an
 /// empty body would fail a healthy build. The condition is instead caught in
 /// [`generate_headers`], where the expected item set is known -- the
@@ -7895,16 +7372,6 @@ fn render_binding(
 /// whole generated set that C89 rejects, so removing it is sufficient as well
 /// as necessary.
 ///
-/// It has to be removed rather than tolerated because AAP 0.4.1 requires the
-/// generated headers to "remain C89-declaration-compatible", and because the
-/// frozen curl 8.19.0-DEV headers this set replaces contain no such comma:
-/// publishing one would be a regression in the public ABI surface's
-/// portability, visible to any consumer that compiles with `-std=c89`. There
-/// is no cbindgen setting for it -- `ir/enumeration.rs` writes the separator
-/// after every variant with no terminal special case -- so, exactly as with
-/// the `//` comment above, the construct is unavoidable in cbindgen's output
-/// and has to be normalised here.
-///
 /// The rewrite is deliberately narrow, in the same spirit as the comment
 /// rewrite: the comma is dropped only when the NEXT line is precisely
 /// `} <identifier>;`, which is the closing line of a `style = "type"` braced
@@ -7917,13 +7384,6 @@ fn render_binding(
 ///
 /// # The `//` comment closing a preprocessor conditional
 ///
-/// Measured, with the cause traced rather than guessed. cbindgen writes
-/// `#endif // __STDC_VERSION__ >= 202311L` at
-/// `ir/enumeration.rs:798`, and it takes that path for every enum carrying an
-/// explicit `#[repr(iN)]` -- which is EVERY public enum here, because
-/// integer-exact ABI parity is implemented by pinning the representation.
-/// The construct is therefore unavoidable, not incidental.
-///
 /// `scripts/checksrc.pl:162` defines CPPCOMMENTS and `:666` checks it, and
 /// `include/curl/Makefile.am:36` runs checksrc over exactly these files,
 /// reached from the root `make checksrc` target at `Makefile.am:166-172`,
@@ -7934,11 +7394,6 @@ fn render_binding(
 /// reasoning where it declines to use `cpp_compat`, which would have emitted
 /// `}  // extern "C"`, so converting the comment form honours that intent
 /// rather than inventing a new policy.
-///
-/// That rewrite is deliberately narrow: only a line whose first character is
-/// `#`, and only a `//` that is not part of a `://` scheme separator, so a
-/// URL in a doc comment cannot be mangled. Everything else is passed
-/// through untouched.
 fn normalise_generated_c(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
 
@@ -8007,8 +7462,6 @@ fn rewrite_preprocessor_comment(line: &str) -> String {
 
 /// Collect every symbol this crate actually defines as a C export.
 ///
-/// Two mechanisms produce one, and both are recognised.
-///
 /// # A Rust function
 ///
 /// A name is counted only when `#[no_mangle]` and an `extern "C"` definition
@@ -8036,13 +7489,54 @@ fn rewrite_preprocessor_comment(line: &str) -> String {
 /// contains `global_asm!`, so prose or a table of names cannot be mistaken for
 /// an emission.
 ///
+/// # THE TWO MECHANISMS DO NOT REACH THE SAME ARTIFACT
+///
+/// This is the distinction [`ExportKind`] exists for, and it is measured
+/// rather than reasoned about. A `#[no_mangle] pub extern "C"` function is in
+/// rustc's export list for the `cdylib`, so it lands in **both**
+/// `libcurl.so` and `libcurl.a`. A `global_asm!` label is not: rustc computes
+/// the `cdylib` export list from Rust items and specification 0.6.4 measured
+/// that this list "takes precedence" over anything a linker script asks for, so
+/// an assembled label reaches `libcurl.a` and stops there.
+///
+/// Measured on this tree at the commit that introduced [`ExportKind`]:
+/// `nm --defined-only libcurl.a` reports 59 `curl_*` symbols while
+/// `nm -D --defined-only libcurl.so` reports 53, and the six in the archive
+/// alone are exactly the assembled ones -- `curl_formadd`, `curl_maprintf`,
+/// `curl_mfprintf`, `curl_mprintf`, `curl_msnprintf`, `curl_msprintf`.
+///
+/// So "implemented" has two honest meanings and the caller must say which it
+/// wants. Both are counted for accounting, because 59 really are defined and a
+/// scan that could not see the assembled six would understate what ships in the
+/// archive. Only the dynamic set may gate header promotion, because a header is
+/// a promise about `libcurl.so`: with the assembled names counted, this scan
+/// would reach 100 of 100 and regenerate the public headers while the shared
+/// object still exported 94, and every one of the 129 programs under
+/// `docs/examples/` that called one of the six would fail to link against a
+/// header that had just declared it.
+///
 /// The scan is textual on purpose. A build script cannot ask the compiler for
 /// this set -- the crate has not been compiled yet, and the whole point of the
-/// check is to run before anything is rendered.
-fn implemented_exports(manifest: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+/// check is to run before anything is rendered. The post-link measurement is
+/// still performed, by `.github/workflows/rust-abi.yml`'s leg A, which compares
+/// `nm -D` over the built `cdylib` against `lib/libcurl.def` symmetrically;
+/// that leg is the authority on what actually shipped, and this function is
+/// what stops a header from being promoted before that leg could ever pass.
+fn implemented_exports(
+    manifest: &Path,
+    kind: ExportKind,
+) -> Result<Vec<String>, Box<dyn Error>> {
     let src = manifest.join("src");
     let mut names = Vec::new();
     let mut queue = vec![src.clone()];
+    // `Any` is every mechanism, so it always counts an assembled label.
+    // `Dynamic` counts one only while `promote_assembled_exports` is actually
+    // promoting it: the label reaches `libcurl.so` because that version script
+    // reaches the linker, and if no LLD is available it emits nothing and the
+    // label stays archive-only. Deriving the answer from the same condition the
+    // promotion uses is what keeps this parser and `nm -D` from disagreeing.
+    let counts_assembled =
+        kind == ExportKind::Any || assembled_exports_are_promoted();
 
     while let Some(current) = queue.pop() {
         let entries = fs::read_dir(&current)
@@ -8066,7 +7560,9 @@ fn implemented_exports(manifest: &Path) -> Result<Vec<String>, Box<dyn Error>> {
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
-            names.extend(assembled_exports(&text));
+            if counts_assembled {
+                names.extend(assembled_exports(&text));
+            }
 
             // `#[no_mangle]` may be separated from the signature by further
             // attributes and doc comments, so the flag persists until a line
@@ -8113,9 +7609,56 @@ fn implemented_exports(manifest: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(names)
 }
 
+/// Which artifact a caller of [`implemented_exports`] is asking about.
+///
+/// Not a boolean, because the two answers are not "more" and "less" of one
+/// thing: they describe two different files, and the whole defect this enum
+/// fixes was one number being used for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportKind {
+    /// Every symbol the crate defines by any mechanism -- what reaches
+    /// `libcurl.a`. Honest accounting; NOT eligible to gate header promotion.
+    Any,
+    /// What reaches `libcurl.so`, which is what a public header promises:
+    /// the symbols rustc places in the `cdylib` export list, plus the
+    /// `global_asm!` labels while [`promote_assembled_exports`] is adding them
+    /// to it. When no LLD is available nothing is promoted and this is the
+    /// smaller set again, which is the whole reason it is derived rather than
+    /// assumed.
+    Dynamic,
+}
+
+/// Every C export this crate establishes through `global_asm!`, tree-wide.
+///
+/// The union of [`assembled_exports`] over `src/`, which is the subset of
+/// [`implemented_exports`] that rustc's cdylib export list cannot see.
+/// [`promote_assembled_exports`] writes exactly these names into the version
+/// script it hands the linker, so the two can never disagree about which
+/// symbols need promoting.
+///
+/// Measured today: six -- `curl_formadd` from `src/ffi/form.rs` and the five
+/// plain-variadic `curl_m*printf` forms from `src/ffi/printf.rs`. The figure is
+/// derived on every build rather than asserted, so it follows the source.
+///
+/// # Errors
+///
+/// If the source tree cannot be read.
+fn assembled_export_names(
+    manifest: &Path,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut names = Vec::new();
+    for (_, text) in rust_sources(&manifest.join("src"))? {
+        names.extend(assembled_exports(&text));
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 /// The C exports one source file establishes through `global_asm!`.
 ///
-/// Documented at length on [`implemented_exports`], which is the only caller.
+/// Documented at length on [`implemented_exports`]. Also reached by
+/// [`assembled_export_names`], which unions it over the tree.
 /// Kept separate so the two mechanisms can be reasoned about -- and tested --
 /// independently of each other.
 fn assembled_exports(text: &str) -> Vec<String> {
@@ -8155,7 +7698,12 @@ fn assembled_exports(text: &str) -> Vec<String> {
 ///
 /// This is the number every human-facing diagnostic must quote, because it is
 /// the number that decides whether the artifact is a drop-in replacement.
-/// Measured today: 76.
+///
+/// **Do not quote a literal for it.** Every build prints the live figure as a
+/// `cargo:warning`, and that is the number to read; a figure written into a doc
+/// comment is correct on the day it is written and misleading afterwards, which
+/// is how an earlier revision of this comment came to claim 76 while the build
+/// was printing 41. The count moves with every export that lands.
 ///
 /// No carrier subtraction. A previous version of this function filtered out
 /// the verbatim carriers before filtering out the implemented names, on the
@@ -8164,19 +7712,37 @@ fn assembled_exports(text: &str) -> Vec<String> {
 /// TRUNCATION and wrong about the gate: a header that DECLARES a function the
 /// library does not EXPORT does not produce a shorter header, it produces an
 /// undefined reference in every one of the 129 programs under `docs/examples/`
-/// that calls it. Subtracting the carriers made the advisory report 57 where
-/// 76 symbols were undefined, and made this function contradict the rule
-/// [`generate_headers`] documents as "while any of the 100 symbols in
-/// `lib/libcurl.def` is undefined in this crate, generate nothing".
+/// that calls it. Subtracting the carriers made the advisory report the smaller
+/// [`declaration_gap`] figure in place of this one, and made this function
+/// contradict the rule [`generate_headers`] documents as "while any of the 100
+/// symbols in `lib/libcurl.def` is undefined in this crate, generate nothing".
+/// The two differ by the number of undefined names that are carriers, which the
+/// build prints alongside both.
 ///
 /// The truncation-only subset is still worth knowing, and is
 /// [`declaration_gap`].
+///
+/// # Why the DYNAMIC set, not every definition
+///
+/// [`ExportKind::Dynamic`] is deliberate and is the whole of this function's
+/// correctness. A header is a promise about `libcurl.so`; asking whether a name
+/// is defined *anywhere* answers a question about `libcurl.a` instead. The six
+/// `global_asm!` labels are defined and do reach the archive, and counting them
+/// here would let this function report 0 undefined -- and regenerate the public
+/// headers -- while the shared object was still six short. That is a
+/// fail-OPEN, and the symbols it would silently declare are precisely the ones
+/// no `docs/examples/` program could then link against.
+///
+/// Those six are therefore reported as undefined until they have
+/// cdylib-exportable definitions, which is not a fiction about the archive:
+/// [`static_only_abi_exports`] names them separately so the two facts stay
+/// distinguishable, and the advisory quotes both.
 fn undefined_abi_exports(
     manifest: &Path,
     root: &Path,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let expected = exported_symbols(root)?;
-    let implemented = implemented_exports(manifest)?;
+    let implemented = implemented_exports(manifest, ExportKind::Dynamic)?;
 
     Ok(expected
         .into_iter()
@@ -8184,13 +7750,442 @@ fn undefined_abi_exports(
         .collect())
 }
 
+/// The exported symbols this crate defines ONLY in `global_asm!`, and which
+/// therefore reach `libcurl.a` but not `libcurl.so`.
+///
+/// The difference between the two [`ExportKind`] answers, intersected with the
+/// 100 names `lib/libcurl.def` requires so that an assembled helper which is
+/// not part of the ABI cannot appear here. Measured today: EMPTY, because
+/// [`promote_assembled_exports`] puts all six labels in the cdylib's export
+/// table. It becomes the six again on a toolchain with no `ld.lld`, which is
+/// the configuration this accounting exists for.
+///
+/// Reported beside [`undefined_abi_exports`] rather than folded into it. The two
+/// are different obligations with different remedies -- an undefined symbol
+/// needs writing, whereas one of these needs a `#[no_mangle] pub extern "C"`
+/// definition to replace or wrap its label -- and a reader who is told only
+/// "undefined" for a name they can see in the archive will go looking for the
+/// wrong thing.
+fn static_only_abi_exports(
+    manifest: &Path,
+    root: &Path,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let expected = exported_symbols(root)?;
+    let any = implemented_exports(manifest, ExportKind::Any)?;
+    let dynamic = implemented_exports(manifest, ExportKind::Dynamic)?;
+
+    Ok(any
+        .into_iter()
+        .filter(|name| !dynamic.iter().any(|d| d == name))
+        .filter(|name| expected.iter().any(|e| e == name))
+        .collect())
+}
+
+/// Assert that the blocked-gate declarations still describe this workspace.
+///
+/// `[workspace.metadata.curl-rs.blocked-aap-gates]` records, per row, a
+/// requirement of the frozen specification that this build does NOT satisfy,
+/// together with what it delivers instead. The value of that table depends
+/// entirely on its being current, and the failure mode is silent: a pin gets
+/// bumped, the row keeps describing the old one, and a reader is told a gate is
+/// blocked when it has in fact been closed - or, worse, is told which version is
+/// delivered and given the wrong one.
+///
+/// That is not a hypothetical risk in this tree. `curl-rs-lib/src/version.rs`
+/// carried "the file does not exist" about `mime/mod.rs` and
+/// `util/parsedate.rs` long after both had landed, and only a review caught it.
+/// A prose comment cannot be checked; a `delivered` string that must appear
+/// verbatim in the manifest can.
+///
+/// So each row's `delivered = "..."` is required to be a literal substring of
+/// the workspace manifest. That is deliberately a weaker claim than parsing the
+/// dependency graph and a much stronger one than a comment: it pins the row to
+/// the exact text it is a statement about, so the two cannot drift apart
+/// without failing this build.
+///
+/// # What it does NOT do
+///
+/// It does not re-verify that the blocked gate is still blocked - that a version
+/// is still yanked, or an advisory still unpatched. Those are properties of
+/// crates.io and the advisory database, and a build script has no business
+/// reaching for either. `cargo deny` and `cargo audit` own that question, and
+/// each row carries the exact command and output that established it so a reader
+/// can re-run it.
+fn check_blocked_aap_gates(root: &Path) -> Result<(), Box<dyn Error>> {
+    let path = root.join("Cargo.toml");
+    let manifest = fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+
+    let table = "[workspace.metadata.curl-rs.blocked-aap-gates";
+    if !manifest.contains(table) {
+        return Err(format!(
+            "{} declares no {table}] table. Every specification requirement \
+             this build does not satisfy is recorded there; an empty workspace \
+             would be a claim of full compliance, and if that is genuinely the \
+             case the table should say so explicitly rather than be deleted.",
+            path.display()
+        )
+        .into());
+    }
+
+    // One pass over the rows, reading only the two fields this check is about.
+    // A TOML parser would be the obvious tool and is deliberately not used:
+    // adding a build-dependency to assert a property of the manifest would put
+    // a crate in the graph for the sake of describing the graph.
+    let mut rows = 0usize;
+    let mut current: Option<&str> = None;
+
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+
+        if let Some(rest) = trimmed.strip_prefix(&format!("{table}.")) {
+            current = rest.strip_suffix(']');
+            if current.is_some() {
+                rows += 1;
+            }
+            continue;
+        }
+        // Any other table header ends the block; the rows are contiguous.
+        if trimmed.starts_with('[') && !trimmed.starts_with(table) {
+            current = None;
+            continue;
+        }
+
+        let Some(name) = current else { continue };
+        let Some(value) = trimmed.strip_prefix("delivered = ") else {
+            continue;
+        };
+
+        // The value is a TOML basic string. Exactly ONE delimiter is stripped
+        // from each end and only then are the escapes resolved, in that order:
+        // `trim_matches('"')` would eat the closing delimiter and leave the
+        // backslash of a trailing `\"` behind, turning
+        // `"russh = \"=0.54.5\""` into `russh = \"=0.54.5\` -- a literal that
+        // matches nothing and fails this check on a row that is perfectly
+        // correct. Measured, on the first run of this function.
+        let body = value.trim();
+        let body = body.strip_prefix('"').unwrap_or(body);
+        let body = body.strip_suffix('"').unwrap_or(body);
+        let literal = body.replace("\\\"", "\"");
+        if literal.is_empty() {
+            return Err(format!(
+                "blocked-aap-gates row {name:?} declares an empty `delivered`, \
+                 so it says nothing about what this build actually ships"
+            )
+            .into());
+        }
+
+        // A row whose `delivered` is prose rather than a pin is legitimate --
+        // mime_guess's and hickory-dns's are sentences, because what is
+        // delivered in those two cases is code and a feature name rather than a
+        // dependency -- so the substring test applies only to rows that quote a
+        // manifest pin, identified by the `= "=` of an exact version
+        // requirement. The quoted text must be a substring and NOT a whole line,
+        // because a pin may carry `default-features` and `features` after its
+        // version and a row should not have to restate them to stay honest about
+        // the version.
+        if literal.contains("= \"=") && !manifest.contains(&literal) {
+            return Err(format!(
+                "blocked-aap-gates row {name:?} says this build delivers \
+                 `{literal}`, but that line is not in {}. The row has gone \
+                 stale: either the pin moved and the row must move with it, or \
+                 the gate is no longer blocked and the row must be removed.",
+                path.display()
+            )
+            .into());
+        }
+    }
+
+    if rows == 0 {
+        return Err(format!(
+            "{} declares the blocked-aap-gates table but no rows under it. An \
+             empty table is indistinguishable from a forgotten one; state full \
+             compliance explicitly if that is what is meant.",
+            path.display()
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Assert that the two [`ExportKind`] answers are still different answers.
+///
+/// The distinction they draw is the only thing standing between
+/// [`undefined_abi_exports`] and a fail-open, and it is one condition wide:
+/// `implemented_exports` skips [`assembled_exports`] under
+/// [`ExportKind::Dynamic`]. A refactor that "simplified" that condition away
+/// would restore the original defect exactly, and nothing would notice --
+/// the build would still succeed, the headers would still be withheld today,
+/// and only once the last Rust-defined export landed would the gate promote a
+/// header six symbols ahead of the shared object.
+///
+/// So the property is asserted while it is cheap: as long as this crate
+/// assembles at least one ABI label with no `#[no_mangle]` definition, the two
+/// sets MUST differ. The check is self-retiring rather than a fixed count --
+/// giving one of the eleven a `#[no_mangle]` wrapper legitimately moves it into
+/// the dynamic set, and when the last one moves the sets coincide and this
+/// check stops asserting anything, which is correct because by then there is
+/// nothing left to distinguish.
+fn check_export_kinds_are_distinguished(
+    manifest: &Path,
+    root: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let any = implemented_exports(manifest, ExportKind::Any)?;
+    let dynamic = implemented_exports(manifest, ExportKind::Dynamic)?;
+
+    for name in &dynamic {
+        if !any.contains(name) {
+            return Err(format!(
+                "{name} is counted as a dynamic export but not as a \
+                 definition at all, which is impossible: ExportKind::Dynamic \
+                 must be a subset of ExportKind::Any"
+            )
+            .into());
+        }
+    }
+
+    let static_only = static_only_abi_exports(manifest, root)?;
+    if static_only.is_empty() && any.len() == dynamic.len() {
+        // Both sets agree AND no ABI name is archive-only. Either every
+        // trampoline now has a Rust definition -- in which case there is
+        // nothing to distinguish and this is the finished state -- or the
+        // distinction has been lost. Tell them apart by looking for the
+        // trampolines themselves rather than assuming.
+        if crate_assembles_abi_labels(manifest)?
+            && !assembled_exports_are_promoted()
+        {
+            return Err("this crate still assembles exported ABI labels in \
+                 global_asm!, yet ExportKind::Any and ExportKind::Dynamic \
+                 report the same set. A global_asm! label reaches libcurl.a \
+                 and not libcurl.so, so collapsing the two would let \
+                 undefined_abi_exports reach 100 of 100 and promote a public \
+                 header while the shared object was still short -- the \
+                 fail-open ExportKind exists to prevent. Restore the \
+                 ExportKind::Any condition in implemented_exports."
+                .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether this crate assembles at least one exported ABI label.
+///
+/// The companion to [`check_export_kinds_are_distinguished`]: it is what
+/// distinguishes "the trampolines are gone" from "the accounting stopped
+/// seeing them". Scans for the labels themselves, over the same source walk
+/// [`implemented_exports`] performs, so the two cannot disagree about which
+/// files exist.
+fn crate_assembles_abi_labels(manifest: &Path) -> Result<bool, Box<dyn Error>> {
+    let mut queue = vec![manifest.join("src")];
+
+    while let Some(current) = queue.pop() {
+        let entries = fs::read_dir(&current)
+            .map_err(|e| format!("cannot read {}: {e}", current.display()))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| {
+                    format!(
+                        "cannot read a directory entry under {}: {e}",
+                        current.display()
+                    )
+                })?
+                .path();
+            if path.is_dir() {
+                queue.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            if !assembled_exports(&text).is_empty() {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Publish the ABI export inventory where a consumer can READ it, and return
+/// whether the surface is complete.
+///
+/// # Why a printed warning is not enough
+///
+/// While the export surface is incomplete, [`generate_headers`] writes no
+/// header and says so with `cargo:warning`. That is the right behaviour and the
+/// wrong interface. A `cargo:warning` is text on a terminal: nothing downstream
+/// can branch on it, so a continuous-integration job that packages a software
+/// development kit, or one that asserts a header was regenerated, has no way to
+/// discover that generation was WITHHELD rather than unnecessary. Both then do
+/// the wrong thing confidently -- one ships frozen headers declaring 100
+/// symbols beside a library defining fewer, the other fails for a reason it
+/// cannot name.
+///
+/// So the same facts are published three ways, each for a different consumer,
+/// and all three from this one computation so they cannot disagree:
+///
+/// 1. `$OUT_DIR/abi-inventory.txt`, a stable line-oriented format for shell and
+///    for continuous integration. `cargo build --message-format=json` reports
+///    `out_dir` on the `build-script-executed` record, which is how a job
+///    locates it without guessing a hash directory.
+/// 2. `cargo:rustc-env` values, which make the counts available to
+///    `env!()` inside this crate -- see `ABI_EXPORTS_REQUIRED` and its
+///    siblings in `src/lib.rs`. This is the half that a Rust consumer, and this
+///    crate's own tests, can assert on at COMPILE time.
+/// 3. The existing `cargo:warning` lines, kept because a human reading a build
+///    log is also a consumer.
+///
+/// # Format
+///
+/// One `key=value` per line, then one `missing-export=<name>` per undefined
+/// export in `lib/libcurl.def` order. Deliberately not JSON: every consumer of
+/// it is a shell or an `awk` script, and a format they can read with `grep`
+/// needs no parser to be trusted.
+///
+/// The per-name key is spelled differently from the `missing` COUNT on purpose.
+/// Sharing one key made `grep -c '^missing='` return the count plus one, which
+/// is the kind of off-by-one a consumer discovers late and blames on the tree.
+///
+/// ```text
+/// required=100
+/// defined=59
+/// missing=41
+/// declaration-gap=35
+/// headers-generated=0
+/// missing-family=multi 21
+/// missing-family=easy 13
+/// missing-family=ws 4
+/// missing-family=share 3
+/// missing-export=curl_easy_cleanup
+/// ...
+/// ```
+///
+/// That is the real output of this checkout, copied from
+/// `$OUT_DIR/abi-inventory.txt` rather than composed here -- the first draft of
+/// this block listed the families alphabetically and so contradicted the
+/// ordering the paragraph below specifies.
+///
+/// The `missing-family` lines are a grouping of the same names by the `curl_`
+/// prefix segment that follows, emitted highest count first with ties broken
+/// alphabetically so the output is stable across builds. They exist because
+/// "41 undefined" and "41 undefined, falling in four families whose modules are
+/// three absent files plus one partly-written one" are different pieces of
+/// information, and only the second says what has to happen. A name with no
+/// second underscore-separated segment is grouped under its whole spelling
+/// rather than dropped, so the family counts always sum to `missing` --
+/// [`crate::abi_inventory`]'s siblings in `src/lib.rs` assert that.
+///
+/// `headers-generated` is the field the packaging and header gates turn on. It
+/// is `1` only when this run promoted a complete set of headers, so it answers
+/// "is this build's C surface trustworthy" rather than "did a file happen to
+/// change".
+///
+/// # Errors
+///
+/// If the export list or this crate's sources cannot be read, or `$OUT_DIR`
+/// cannot be written.
+fn publish_abi_inventory(
+    manifest: &Path,
+    root: &Path,
+) -> Result<bool, Box<dyn Error>> {
+    let required = exported_symbols(root)?;
+    let missing = undefined_abi_exports(manifest, root)?;
+    let truncating = declaration_gap(&missing);
+    let complete = missing.is_empty();
+
+    let mut inventory = String::new();
+    inventory.push_str(&format!("required={}\n", required.len()));
+    inventory
+        .push_str(&format!("defined={}\n", required.len() - missing.len()));
+    inventory.push_str(&format!("missing={}\n", missing.len()));
+    inventory.push_str(&format!("declaration-gap={}\n", truncating.len()));
+    inventory.push_str(&format!("headers-generated={}\n", u8::from(complete)));
+    for (family, count) in missing_families(&missing) {
+        inventory.push_str(&format!("missing-family={family} {count}\n"));
+    }
+    for name in &missing {
+        inventory.push_str(&format!("missing-export={name}\n"));
+    }
+
+    let out = PathBuf::from(env_var("OUT_DIR")?).join("abi-inventory.txt");
+    write_if_changed(&out, &inventory)?;
+
+    // The compile-time half. Emitted unconditionally, including when the
+    // surface is complete, so that a consumer's `env!` never has to cope with
+    // the variable being absent.
+    println!("cargo:rustc-env=CURL_RS_ABI_REQUIRED={}", required.len());
+    println!(
+        "cargo:rustc-env=CURL_RS_ABI_DEFINED={}",
+        required.len() - missing.len()
+    );
+    println!(
+        "cargo:rustc-env=CURL_RS_ABI_HEADERS_GENERATED={}",
+        u8::from(complete)
+    );
+
+    Ok(complete)
+}
+
+/// Group undefined export names by API family, largest family first.
+///
+/// The family is the segment after the `curl_` prefix -- `easy` from
+/// `curl_easy_init`, `multi` from `curl_multi_socket_action`. That is the same
+/// partition the target design uses to assign one module per family, which is
+/// what makes the grouping actionable: a family's count is the number of entry
+/// points one file has to define.
+///
+/// A name that does not fit the pattern is grouped under its own full spelling
+/// rather than discarded, so the counts always sum to the input length. This is
+/// not defensive padding -- six of the currently undefined names are
+/// `curl_mprintf` and its siblings, which have no second segment at all, and an
+/// implementation that dropped them would report a total that quietly
+/// disagreed with `missing`.
+///
+/// Ordering is by descending count then ascending name, so the output is a
+/// function of the input alone and does not move between builds on the same
+/// tree. `write_if_changed` compares file contents, so an unstable order would
+/// rewrite `$OUT_DIR` on every build and invalidate the crate's cache.
+fn missing_families(undefined: &[String]) -> Vec<(String, usize)> {
+    let mut families: Vec<(String, usize)> = Vec::new();
+
+    for name in undefined {
+        let family = family_of(name);
+        match families.iter_mut().find(|(seen, _)| *seen == family) {
+            Some((_, count)) => *count += 1,
+            None => families.push((family, 1)),
+        }
+    }
+
+    families.sort_by(|left, right| {
+        right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+    });
+    families
+}
+
+/// The API family an exported name belongs to.
+///
+/// `curl_easy_init` is `easy`; `curl_mprintf`, which has nothing after the
+/// prefix to split on, is `curl_mprintf`. See [`missing_families`] for why the
+/// fallback returns the whole name rather than nothing.
+fn family_of(name: &str) -> String {
+    name.strip_prefix("curl_")
+        .and_then(|rest| rest.split_once('_'))
+        .map_or_else(|| name.to_string(), |(family, _)| family.to_string())
+}
+
 /// The subset of [`undefined_abi_exports`] whose absence would make a
 /// generated header SHORT, as opposed to making it declare an export that
-/// does not exist. Measured today: 57 of the 76.
+/// does not exist.
 ///
 /// A verbatim carrier's declaration is literal text spliced into the prologue,
-/// so the header declares it whatever the crate contains; the remaining 19 of
-/// the 76 are carriers and are therefore not in this set. Reported alongside
+/// so the header declares it whatever the crate contains; the undefined names
+/// that ARE carriers are therefore not in this set. Both figures are printed by
+/// every build rather than written here, for the reason
+/// [`undefined_abi_exports`] gives. Reported alongside
 /// the export gap rather than instead of it, because the two numbers answer
 /// different questions and quoting either one alone has already misled a
 /// review once.
@@ -8216,9 +8211,6 @@ fn declaration_gap(undefined: &[String]) -> Vec<String> {
 /// exclusion lists could only name items this file happens to enumerate,
 /// and anything else would be emitted into all eight headers at once.
 ///
-/// The four headers under [`NEVER_GENERATED`] are not passes and cannot
-/// become passes: [`guard_write_target`] runs before every write.
-///
 /// Nothing is written until every header has been rendered AND validated, and
 /// nothing is written at all while the export surface is incomplete. Four
 /// checks stand between a cbindgen pass and the tracked files, in increasing
@@ -8242,29 +8234,11 @@ fn declaration_gap(undefined: &[String]) -> Vec<String> {
 ///    scoped to observed items on purpose: an item that was never emitted is
 ///    already reported by check 3, and reporting it again per header would bury
 ///    the cause in noise.
-///
-/// Only then does the transaction promote the complete set.
 fn generate_headers(
     manifest: &Path,
     root: &Path,
 ) -> Result<(), Box<dyn Error>> {
     // PREFLIGHT FIRST, AHEAD OF THE EXPORT-SURFACE GATE BELOW.
-    //
-    // Both of these inspect THIS CRATE'S OWN SOURCE, and neither depends on
-    // the export surface being complete. They used to sit after the gate's
-    // early return, which made them INERT for the whole migration: with 76 of
-    // the 100 symbols still undefined the gate returns first, so a module
-    // declared but missing from disk -- the measured cause of the fail-open
-    // that Section 12a documents -- would not have been caught until the last
-    // export landed. That is precisely backwards: a defect in this crate's
-    // source is worth reporting at every build, and a defect that only
-    // surfaces once the tree is otherwise finished is a defect that surfaces
-    // too late to be cheap.
-    //
-    // A missing module is fatal here rather than a warning. cbindgen's own
-    // `can't find mod X` is a recoverable `warn!` that a library consumer
-    // never sees (Section 12a), so this is the only place the condition can be
-    // made to stop a build.
     preflight_modules(manifest)?;
     // Likewise preflight: a variadic strategy this target's ABI cannot honour
     // must stop the build before any header advertises symbols it cannot keep.
@@ -8276,6 +8250,9 @@ fn generate_headers(
     // than format-driven but whose exported name is assembled for the same
     // reason.
     check_formadd_trampoline(manifest)?;
+    // And the invariant that keeps the eleven from being counted as shared
+    // exports, which is what decides whether the gate below can fail open.
+    check_export_kinds_are_distinguished(manifest, root)?;
 
     // THE SECOND THING THIS FUNCTION DOES, AND DELIBERATELY BEFORE ANY RENDER.
     //
@@ -8297,31 +8274,83 @@ fn generate_headers(
     // to write NOTHING and say so. `rerun-if-changed=src` means the moment
     // the surface completes, this guard stops firing and generation resumes
     // with no further intervention.
+    //
+    // HOW IT SAYS SO, AND WHY NOT AS A WARNING. This used to be two
+    // `cargo:warning=` lines. That channel was wrong for it: specification
+    // 0.8.4's first gate is a ZERO-WARNING build, and a `cargo:warning=` is a
+    // warning-class diagnostic, so a normal build could not satisfy the gate
+    // and the only way to call it satisfied was to allow-list these two lines
+    // -- which is not a zero-warning gate, it is a zero-unapproved-warning
+    // gate. The message is not a warning in any case: it reports unwritten
+    // work, and nothing in the build is wrong.
+    //
+    // So it goes to a channel that carries state rather than fault, and both
+    // halves of that are load-bearing. `eprintln!` puts it in the build log
+    // where `cargo build -vv` and any failing build already show it. The
+    // OUT_DIR file makes it durable and greppable at a fixed path, so a
+    // workflow or a reader can consult the live figure without re-running the
+    // build and without parsing cargo's output. Neither is warning-class, and
+    // the gate is now something a normal build can actually pass.
+    //
+    // AND WHY THERE IS ALSO A HARD GATE. A build-script diagnostic on any
+    // channel is text: `-D warnings` reaches rustc and clippy and does not
+    // reach a build script, so nothing in the pipeline could FAIL on an
+    // artifact short of the 100 names in `lib/libcurl.def`. `STRICT_ABI_ENV`
+    // closes that. The legs whose job is to certify the artifact set it and
+    // get a hard error naming every missing symbol; everybody else gets the
+    // state report above and a working build.
+    // Publish the inventory BEFORE the decision it describes, so that the
+    // withholding below is a fact a consumer can read rather than a warning it
+    // has to notice. See `publish_abi_inventory` for why the printed warning
+    // alone left both the packaging gate and the header gate unable to tell
+    // "withheld" from "unnecessary".
+    let complete = publish_abi_inventory(manifest, root)?;
+
     let missing = undefined_abi_exports(manifest, root)?;
+    debug_assert_eq!(complete, missing.is_empty());
     if !missing.is_empty() {
         let total = exported_symbols(root)?.len();
         let truncating = declaration_gap(&missing).len();
-        println!(
-            "cargo:warning=include/curl/ NOT regenerated: {} of the {} \
-             exported symbols in lib/libcurl.def are not yet defined in this \
-             crate. {} of those {} are rendered from Rust items, so every \
-             generated header would be short by exactly those; the remaining \
-             {} are carried verbatim and would still be DECLARED, which is \
-             worse rather than better -- a declaration without an export is \
-             an undefined reference in every docs/examples program that calls \
-             it. The existing headers are left untouched and remain the ABI \
-             contract. Generation resumes automatically once the export \
-             surface is complete.",
+        if env::var_os(STRICT_ABI_ENV).is_some_and(|value| !value.is_empty()) {
+            // The same facts as the warning below, as an error, and with the
+            // whole list rather than a preview: a gate failure is read once by
+            // somebody who needs to act on it, so truncating it would only
+            // send them back to the build script.
+            return Err(format!(
+                "{STRICT_ABI_ENV} is set and the export surface is \
+                 incomplete: {} of the {} symbols in lib/libcurl.def are not \
+                 defined in this crate, so libcurl.so.4 cannot be a drop-in \
+                 replacement and include/curl/ was not regenerated. {} of the \
+                 {} are rendered from Rust items. Missing: {}",
+                missing.len(),
+                total,
+                truncating,
+                missing.len(),
+                missing.join(", ")
+            )
+            .into());
+        }
+        let static_only = static_only_abi_exports(manifest, root)?;
+        let preview: Vec<&str> =
+            missing.iter().take(8).map(String::as_str).collect();
+
+        let mut notice = format!(
+            "include/curl/ NOT regenerated: {} of the {} exported symbols in \
+             lib/libcurl.def do not yet have a definition that reaches \
+             libcurl.so. {} of those {} are rendered from Rust items, so \
+             every generated header would be short by exactly those; the \
+             remaining {} are carried verbatim and would still be DECLARED, \
+             which is worse rather than better -- a declaration without an \
+             export is an undefined reference in every docs/examples program \
+             that calls it. The existing headers are left untouched and \
+             remain the ABI contract. Generation resumes automatically once \
+             the export surface is complete.\n\
+             first missing exports: {}{}\n",
             missing.len(),
             total,
             truncating,
             missing.len(),
-            missing.len() - truncating
-        );
-        let preview: Vec<&str> =
-            missing.iter().take(8).map(String::as_str).collect();
-        println!(
-            "cargo:warning=include/curl/ first missing exports: {}{}",
+            missing.len() - truncating,
             preview.join(", "),
             if missing.len() > preview.len() {
                 format!(", and {} more", missing.len() - preview.len())
@@ -8329,7 +8358,52 @@ fn generate_headers(
                 String::new()
             }
         );
+
+        // Counted among the missing above, and named again here because the
+        // remedy differs. These have a definition -- it just does not reach a
+        // cdylib -- so a reader who found them with `nm` on libcurl.a and was
+        // told only "not yet defined" would go looking for the wrong thing.
+        if !static_only.is_empty() {
+            notice.push_str(&format!(
+                "of those, {} are defined in global_asm! and reach \
+                 libcurl.a but NOT libcurl.so, because rustc computes the \
+                 cdylib export list from Rust items: {}. They are counted as \
+                 missing on purpose -- a header promoted on the strength of \
+                 an archive-only definition would declare a symbol the \
+                 shared object does not export. Each needs a \
+                 #[no_mangle] pub extern \"C\" definition, or a wrapper that \
+                 has one.\n",
+                static_only.len(),
+                static_only.join(", ")
+            ));
+        }
+
+        // The log copy. Build-script stderr is not a warning class, so this
+        // costs the zero-warning gate nothing.
+        eprint!("{notice}");
+
+        // The durable copy, at a path derived from OUT_DIR rather than guessed.
+        let out_dir = PathBuf::from(env_var("OUT_DIR")?);
+        let notice_path = out_dir.join(HEADER_NOTICE);
+        fs::write(&notice_path, &notice).map_err(|e| {
+            format!("cannot write {}: {e}", notice_path.display())
+        })?;
+
         return Ok(());
+    }
+
+    // The surface is complete, so any notice from a previous build describes a
+    // state that no longer holds. Removed rather than left behind: a stale file
+    // saying the headers were not regenerated, sitting beside headers that were,
+    // is worse than no file at all.
+    {
+        let out_dir = PathBuf::from(env_var("OUT_DIR")?);
+        let notice_path = out_dir.join(HEADER_NOTICE);
+        if notice_path.exists() {
+            fs::remove_file(&notice_path).map_err(|e| {
+                format!("cannot remove {}: {e}", notice_path.display())
+            })?;
+        }
     }
 
     // The source-level half of the declared-FORM assertion, and the half that
@@ -8410,14 +8484,6 @@ fn generate_headers(
     // `observed` is exactly what a dropped module produces. The 205-item
     // assertion that was supposed to be the oracle could therefore pass
     // over a header containing nothing at all.
-    //
-    // The expected set is DERIVED rather than listed: every `#[repr(C)] pub
-    // enum` in the FFI tree that some partition also claims. Measured today
-    // that is 30 of the 32 such enums, the two exceptions being
-    // `curl_sslbackend` and `CURLoption`, which are emitted but claimed by no
-    // partition -- so listing all 32 would false-fire. The derivation is
-    // non-vacuous in the way that matters: a module that fails to parse drops
-    // all 30 at once.
     let expected: Vec<&str> = every_item
         .iter()
         .copied()
@@ -8604,12 +8670,6 @@ fn generate_headers(
 
     // Every header rendered and every check passed. Only now does anything
     // reach the tracked directory.
-    //
-    // The staged count is asserted BEFORE promotion rather than after, because
-    // publishing a partial set would leave a mixed ABI contract on disk -- some
-    // headers describing the new surface and the rest the old one -- and a
-    // check that ran after the renames could not undo them. On this path the
-    // transaction's `Drop` discards every staging file instead.
     let expected_files = 1 + SIBLING_HEADERS.len();
     let staged = transaction.staged_count();
     if staged != expected_files {
@@ -8633,7 +8693,8 @@ fn generate_headers(
 /// braced typedef; `declared_names` recognises that form, so the name is
 /// still reported as declared and every existing completeness check passes.
 /// The C type of every parameter declared as that enum has nonetheless
-/// changed, which is precisely the integer-exactness failure AAP 0.6.1 exists
+/// changed, which is precisely the integer-exactness failure the pinning rule
+/// exists
 /// to prevent.
 ///
 /// Two independent assertions, because either alone can be satisfied by an
@@ -8679,8 +8740,6 @@ fn check_declared_forms(
 
 // Template substitution
 
-/// Placeholders in `curl-config.in`, measured with `grep -o`: 18 distinct
-/// tokens across 30 occurrences.
 const CURL_CONFIG_PLACEHOLDERS: usize = 18;
 
 /// Placeholders in `libcurl.pc.in`: 14 distinct tokens, one occurrence each.
@@ -8729,15 +8788,6 @@ fn collect_placeholders(text: &str) -> Vec<String> {
 }
 
 /// Replace every `@KEY@` with its value.
-///
-/// GLOBAL, not first-match, and that is not a stylistic choice. Measured in
-/// `curl-config.in`, counting occurrences rather than lines because a single
-/// line can carry the same token twice: `@CURLVERSION@` occurs five times
-/// (`:98`, `:110`, `:111`, `:114`, `:130`), `@includedir@` three times
-/// (`:33`, `:144`, `:147`) and `@libdir@` four times across three lines
-/// (twice on `:152`, then `:153` and `:170`). A first-match substitution
-/// would leave live placeholders in the `--checkfor` arithmetic, where they
-/// would produce shell errors rather than a verdict.
 fn substitute(template: &str, values: &[(&str, String)]) -> String {
     let mut out = template.to_string();
     for (key, value) in values {
@@ -8860,30 +8910,65 @@ fn advertised_features() -> Result<String, Box<dyn Error>> {
         if !gate_holds(&row.gate)? {
             continue;
         }
-        match row.probe {
-            // C's NULL, or a probe whose answer is fixed for this build: the
-            // static answer equals the runtime one, so it can be advertised.
-            Probe::Absent | Probe::Constant(true) => {
-                tokens.push(row.token);
-            }
-            // The engine withholds it at run time, so metadata that claimed it
-            // would describe a different product.
-            Probe::Constant(false) => {}
-            // GENUINELY RUNTIME, therefore WITHHELD from static metadata.
-            //
-            // A file written at build time cannot know whether a library that
-            // resolves at run time will be there -- this is the `GSS-API`,
-            // `Kerberos` and `SPNEGO` case, where `negotiate` may be compiled
-            // in on a host with no usable mechanism. Specification 0.6.5 makes
-            // the choice for us: under-reporting only causes a fixture to skip,
-            // while over-reporting makes it run and fail. So the token is
-            // omitted here and left to `curl --version`, which can ask.
-            Probe::Dynamic(_) => {}
+        if probe_permits_static_metadata(&row.probe) {
+            tokens.push(row.token);
         }
     }
 
     tokens.sort_by_key(|token| token.to_lowercase());
     Ok(tokens.join(" "))
+}
+
+/// Whether a row's `present:` probe allows the token into STATIC metadata.
+///
+/// The compile-time half of the decision is [`gate_holds`] and is applied by
+/// the caller; this answers only what the probe adds. Extracted from
+/// [`advertised_features`] so [`run_self_checks`] can assert all three arms
+/// directly, because two of them are unreachable in a default build and an
+/// arm nothing exercises is an arm nothing protects.
+fn probe_permits_static_metadata(probe: &Probe) -> bool {
+    match probe {
+        // C's NULL, or a probe whose answer is fixed for this build: the
+        // static answer equals the runtime one, so it can be advertised.
+        Probe::Absent | Probe::Constant(true) => true,
+        // The engine withholds it at run time, so metadata that claimed it
+        // would describe a different product.
+        Probe::Constant(false) => false,
+        // GENUINELY RUNTIME -- and still advertised, because the question
+        // these two files answer is not the one the probe answers.
+        //
+        // This is the `GSS-API`, `Kerberos` and `SPNEGO` case: `negotiate`
+        // may be compiled in on a host with no usable mechanism, so
+        // `crate::version`'s banner conjoins a runtime probe before naming
+        // the token. `curl-config --features` and `libcurl.pc`'s
+        // `supported_features` are **compile-time** interfaces, and C
+        // answers them from configure-time detection alone. Measured in
+        // this tree: `configure.ac:5175-5177` appends `GSS-API` under
+        // `test "$HAVE_GSSAPI" = "1"`, and `:5194-5200` appends `SPNEGO`
+        // and `Kerberos` under that same variable conjoined with their
+        // `CURL_DISABLE_` switches. `HAVE_GSSAPI` is decided when configure
+        // finds the library, and nothing re-examines the host afterwards.
+        // A consumer running `curl-config --features` is asking what this
+        // libcurl was BUILT to do, which is exactly what the gate above
+        // already decided.
+        //
+        // Withholding it here was the defect, not the caution. It made the
+        // two interfaces incapable of ever reporting the three names at any
+        // feature setting, so a build WITH `negotiate` described itself as a
+        // build without it -- and the gate that would have kept the claim
+        // honest, `gate_holds`, had already run and already said yes. The
+        // runtime probe stays where it can actually be performed, in the
+        // live banner, and nothing here weakens it.
+        //
+        // Specification 0.6.5's asymmetry is not violated by this, because
+        // the tokens these files carry are not the tokens
+        // `tests/runtests.pl` reads: the harness parses the `Features:`
+        // line of `curl --version` (`:640-730`), which is rendered from the
+        // engine's own predicate WITH the probe folded in, and never parses
+        // `curl-config` or `libcurl.pc` at all. So no fixture can be moved
+        // from skip to run-and-fail by this arm.
+        Probe::Dynamic(_) => true,
+    }
 }
 
 /// The protocol tokens this build honestly supports, space separated.
@@ -8892,23 +8977,6 @@ fn advertised_features() -> Result<String, Box<dyn Error>> {
 /// the protocol list without the case-insensitive flag. Every token is
 /// upper-case, so the two orders coincide; the distinction is preserved
 /// because the C build drew it.
-///
-/// The 24 registered-but-unimplemented schemes are absent, and that is the
-/// whole point. `tests/runtests.pl` reads this list to decide which fixtures
-/// are eligible, so the 283 fixtures targeting those schemes skip cleanly
-/// instead of running and failing. They are absent here because they are
-/// absent from the engine's table, not because a second list omits them.
-///
-/// THE CASE CHANGE IS DELIBERATE AND AUTHORITY-BACKED. The engine stores
-/// scheme names in lower case, because that is how `curl --version` spells its
-/// `Protocols:` line. `curl-config --protocols` spells them in UPPER case:
-/// `configure.ac:5327` appends `HTTP`, `FTP`, `FILE` and the rest upper-cased
-/// into `SUPPORT_PROTOCOLS`, and `CMakeLists.txt:1994` builds the same variable
-/// from upper-case items -- deriving a *separate* lower-case variable at
-/// :1995 purely for its status message, which is what proves the upper-case
-/// spelling is the one consumers get. So one list serves both surfaces and
-/// this function applies the documented transformation, having first asserted
-/// in [`runtime_protocol_rows`] that the input really is lower case.
 fn advertised_protocols() -> Result<String, Box<dyn Error>> {
     let mut tokens: Vec<String> = Vec::new();
 
@@ -8950,28 +9018,12 @@ fn configure_options() -> Result<String, Box<dyn Error>> {
     // precisely the drift shape the single-source-of-truth rule exists to
     // prevent: two policies that agree today and silently disagree after one
     // of them is edited.
-    //
-    // `reject_unquoted_shell_metacharacters`, which guards the same three
-    // unquoted arms from Section 14b's side, reads that one constant too, for
-    // exactly this reason: two entry points, one character class.
-    //
-    // The early call is kept because `TARGET` is externally supplied, and
-    // failing at the point of construction names the value's origin instead of
-    // reporting it from a generic loop several hundred lines away.
     check_shell_context("CONFIGURE_OPTIONS", &rendered)?;
 
     Ok(rendered)
 }
 
 // Section 14a: injection safety for the two generated consumer files
-//
-// WHY THIS SECTION EXISTS, and why it validates in one place and escapes in
-// another rather than doing one thing everywhere. `curl-config` is an
-// executable POSIX shell script and `libcurl.pc` is a pkg-config file; both
-// are produced by substituting `@TOKEN@` placeholders, and three of those
-// values come from the environment. Substituted raw, a single quote in a
-// prefix closes the shell string it lands in and everything after it is
-// executed by every consumer that runs `curl-config --libs`.
 //
 // THE MEASUREMENT THAT DECIDES THE DESIGN. The tokens do not all sit in one
 // grammar. Counted across `curl-config.in`, they appear in three distinct
@@ -8984,36 +9036,8 @@ fn configure_options() -> Result<String, Box<dyn Error>> {
 //                   echo "@LIBCURL_PC_CFLAGS@ -I@includedir@"  :147
 //   unquoted        for feature in @SUPPORT_FEATURES@   :85
 //                   echo @CONFIGURE_OPTIONS@            :178
-//
-// and SOME TOKENS APPEAR IN MORE THAN ONE: `@includedir@` is double-quoted at
-// :33, :144 and :147, `@CURLVERSION@` is single-quoted at :98 and :110 but
-// double-quoted at :130. A single escaping transform therefore cannot be
-// correct for every token -- `'` -> `'\''` is right inside single quotes and
-// produces four literal characters inside double quotes -- and the template
-// text is frozen by AAP 0.8.1, so the quoting cannot be normalised either.
-//
-// What makes the problem tractable is a second measurement: each of the THREE
-// EXTERNALLY-DERIVED tokens appears EXACTLY ONCE, and always inside single
-// quotes. So POSIX single-quote escaping is provably correct for exactly those
-// three, and [`check_single_quoted_context`] asserts that precondition against
-// the template on every build rather than trusting this comment.
-//
-// Everything else is validated instead of escaped, which is the right posture
-// for a build script: a prefix containing a newline is a mistake to report,
-// not a value to accommodate.
 
 /// Control characters rejected in every substituted value, in both files.
-///
-/// CR, LF and NUL each matter, and the reason differs per file. In
-/// `curl-config` a newline ends a shell command, so a value carrying one adds
-/// a line of script. In `libcurl.pc` a newline ends a field, so a value
-/// carrying one adds a metadata field -- a `prefix` of
-/// `/tmp\nLibs: -L/tmp/evil -lcurl` rewrites the link line of every consumer.
-/// NUL truncates for any reader that uses C strings, which pkg-config does.
-///
-/// The whole C0 range plus DEL is rejected rather than only those three: none
-/// of them is legitimate in a path, a compiler name or a flag, and rejecting
-/// the class removes the need to argue about each member.
 fn check_control_chars(
     file: &str,
     token: &str,
@@ -9038,13 +9062,6 @@ fn check_control_chars(
 }
 
 /// The `curl-config.in` tokens whose values come from the environment.
-///
-/// Each is measured to appear exactly once, inside single quotes, which is
-/// what makes [`shell_single_quoted_body`] the correct transform for it and only
-/// it. `@SUPPORT_FEATURES@`, `@SUPPORT_PROTOCOLS@` and `@CONFIGURE_OPTIONS@`
-/// are also externally influenced but are deliberately UNQUOTED in the
-/// template so they word-split, so they are validated character-by-character
-/// instead.
 const SHELL_QUOTED_TOKENS: [&str; 3] = ["prefix", "CC", "CURL_CA_BUNDLE"];
 
 /// The POSIX-shell quoting state a position in a line sits in.
@@ -9062,21 +9079,13 @@ enum ShellQuote {
 /// The quoting state at `col` bytes into `line`.
 ///
 /// A REAL SCANNER, NOT AN ADJACENCY TEST, and the difference is not academic.
-/// The first attempt at this checked whether a quote character sat immediately
-/// before or after the token, and it misclassified `curl-config.in:170`:
+/// An adjacency test -- checking whether a quote character sits immediately
+/// before or after the token -- misclassifies the --static-libs line of
+/// `curl-config.in`:
 ///
 /// ```text
 /// echo "@libdir@/libcurl.@libext@ @LIBCURL_PC_LDFLAGS_PRIVATE@ ..."
 /// ```
-///
-/// where `@libext@` is genuinely inside double quotes but has a `.` before it
-/// and a space after it. Quoting is a property of the enclosing string, so it
-/// has to be computed by scanning from the start of the line.
-///
-/// Only what this template needs is modelled: the two quote forms and a
-/// backslash escape outside single quotes. Neither `$'...'` nor a here-document
-/// appears in `curl-config.in`, and a value never spans a line because
-/// [`check_control_chars`] has already rejected every line break.
 fn quote_state_at(line: &str, col: usize) -> ShellQuote {
     let mut state = ShellQuote::Unquoted;
     let mut escaped = false;
@@ -9135,10 +9144,6 @@ fn token_contexts(template: &str, token: &str) -> Vec<(usize, ShellQuote)> {
 /// * Each token classified as unquoted really does appear unquoted, so
 ///   [`check_shell_context`]'s narrow character class is guarding something.
 /// * Each token classified as double-quoted really does appear double-quoted.
-///
-/// A table that drifts into describing a template that no longer exists is the
-/// same class of silent mismatch as an unescaped value: the check still runs,
-/// against the wrong grammar.
 fn check_single_quoted_context(template: &str) -> Result<(), Box<dyn Error>> {
     for token in SHELL_QUOTED_TOKENS.iter() {
         let contexts = token_contexts(template, token);
@@ -9258,13 +9263,6 @@ fn check_single_quoted_context(template: &str) -> Result<(), Box<dyn Error>> {
 
 /// Tokens the template leaves UNQUOTED so the shell word-splits them.
 ///
-/// `curl-config.in:85` and `:92` are `for feature in @SUPPORT_FEATURES@ ''` and
-/// `for protocol in @SUPPORT_PROTOCOLS@`, which depend on word splitting to
-/// print one token per line, and `:178` is `echo @CONFIGURE_OPTIONS@`. Their
-/// values cannot be quoted without changing what the script does, so they are
-/// validated character by character instead -- the same treatment
-/// `@CONFIGURE_OPTIONS@` already had, extended to the two that lacked it.
-///
 /// These three are assembled from a static capability table rather than read
 /// from the environment, so nothing hostile reaches them today. The check is
 /// here because that table will grow: a capability token acquiring a `*`, a
@@ -9275,15 +9273,6 @@ const SHELL_UNQUOTED_TOKENS: [&str; 3] =
     ["SUPPORT_FEATURES", "SUPPORT_PROTOCOLS", "CONFIGURE_OPTIONS"];
 
 /// Tokens the template places inside DOUBLE quotes.
-///
-/// `curl-config.in:31`, `:33`, `:147`, `:153`, `:158` and `:170`. A
-/// double-quoted string in POSIX shell still expands `$` and backticks, and
-/// that is DELIBERATE for these: `exec_prefix="${prefix}"` and
-/// `libdir="${exec_prefix}/lib"` are meant to be expanded when the script runs,
-/// which is why `$` cannot simply be banned here. A backtick and a `$(` cannot
-/// be deliberate -- neither appears in any value this script produces -- so
-/// those are refused, closing the command-substitution route while leaving
-/// parameter expansion intact.
 const SHELL_DOUBLE_QUOTED_TOKENS: [&str; 6] = [
     "exec_prefix",
     "includedir",
@@ -9294,12 +9283,6 @@ const SHELL_DOUBLE_QUOTED_TOKENS: [&str; 6] = [
 ];
 
 /// Characters permitted in a value the template leaves unquoted.
-///
-/// Deliberately narrow: alphanumerics plus the punctuation that appears in a
-/// path, a compiler flag or a capability token. Everything else -- `*` `?` `[`
-/// `;` `&` `|` `$` `` ` `` `(` `)` `<` `>` `\` `'` `"` `{` `}` `~` `!` `#` --
-/// is either a glob character, a control operator or an expansion introducer in
-/// an unquoted word.
 const SHELL_UNQUOTED_SAFE: &str = "-_=,./+: ";
 
 /// Validate a value against the shell context the template puts it in.
@@ -9342,14 +9325,6 @@ fn check_shell_context(token: &str, value: &str) -> Result<(), Box<dyn Error>> {
 
 /// Reject a value that would break the pkg-config grammar.
 ///
-/// pkg-config has no escaping mechanism for a variable definition: the value
-/// runs to the end of the line. Two characters therefore have to be refused
-/// rather than encoded. `#` starts a comment, so everything after it is
-/// discarded and the field silently loses its tail. `$` begins a variable
-/// reference, so an unintended one either expands to something else or makes
-/// `pkg-config` fail with "Variable not defined", which surfaces at the
-/// consumer as an unexplained build failure.
-///
 /// `allow_variables` exists because this file's own values legitimately use
 /// the mechanism: `exec_prefix=${prefix}` and `libdir=${exec_prefix}/lib` are
 /// deliberate, and the template's `Libs: -L${libdir}` depends on them.
@@ -9386,11 +9361,6 @@ fn check_pkgconfig_value(
 
 /// Every native library a static consumer of `libcurl.a` must also link.
 ///
-/// ONE AUTHORITY, feeding both `curl-config --static-libs` and
-/// `libcurl.pc`'s `Libs.private`. The two
-/// under-reported their inputs; having them read the same function is what
-/// stops them from disagreeing again.
-///
 /// A Rust `staticlib` is not self-contained. It carries no reference to the
 /// Rust standard library's own dependencies, so a C program linking it must
 /// name them itself, and omitting one produces a wall of undefined symbols
@@ -9404,12 +9374,8 @@ fn check_pkgconfig_value(
 ///   rest add nothing there.
 /// * The two Apple frameworks come from the dependency graph rather than from
 ///   that print, because `--print native-static-libs` cannot be run for a
-///   Darwin target in this environment. `cargo tree --target
-///   aarch64-apple-darwin` shows `security-framework 3.6.0` and
-///   `core-foundation 0.10.1` present, and their `-sys` crates declare
-///   `#[link(name = "Security", kind = "framework")]` and
-///   `#[link(name = "CoreFoundation", kind = "framework")]`. They arrive
-///   through `rustls-native-certs`, which reads the platform trust store.
+///   Darwin target in this environment. They arrive through
+///   `rustls-native-certs`, which reads the platform trust store.
 /// * The `negotiate` arm follows the platform, never the feature alone. On
 ///   Linux MIT Kerberos provides `libgssapi_krb5`, whose own `DT_NEEDED`
 ///   entries pull `krb5`, `k5crypto` and `com_err`, so naming the one is
@@ -9468,21 +9434,6 @@ fn private_libs(target_os: &str) -> Result<String, Box<dyn Error>> {
 }
 
 /// The install prefix the rendered artifacts describe.
-///
-/// Only `CURL_RS_PREFIX` is consulted, then the same `/usr/local` default
-/// Autotools used.
-///
-/// WHY THE BARE `PREFIX` FALLBACK WAS REMOVED. `PREFIX` is not a Cargo
-/// variable and carries no agreement about what it means. It is set for
-/// unrelated reasons by Homebrew, by pkgsrc, by many `Makefile`s that export
-/// their own `PREFIX` into a recursive `$(MAKE)`, and by developers who
-/// exported it once for something else. Inheriting it means a build in such
-/// an environment silently reports install paths that libcurl was never
-/// installed to, and every consumer that runs `curl-config --prefix` is
-/// misdirected -- with no diagnostic, because an inherited value is
-/// indistinguishable from an intended one. The generic inherited fallback is
-/// the specific hazard; a namespaced variable cannot be
-/// set by accident, so the ambiguity disappears rather than being managed.
 fn install_prefix() -> String {
     env::var("CURL_RS_PREFIX").unwrap_or_else(|_| DEFAULT_PREFIX.to_string())
 }
@@ -9509,16 +9460,44 @@ fn install_prefix() -> String {
 ///   3. `TARGET_CC`, which applies to whatever the target happens to be
 ///   4. `CC`, the generic fallback
 ///
-/// and when none is set it derives a name from the triple. The derivation
-/// here is deliberately narrower than `cc-rs`'s full table: `<triple>-gcc`
-/// when cross-compiling, plain `cc` when `HOST == TARGET`. That is right for
-/// the four mandated targets -- `aarch64-linux-gnu-gcc` is what the installed
-/// cross toolchain is called -- and any other triple gets a name a reader can
-/// recognise as derived rather than a silently wrong host compiler.
+/// and when none is set it derives a name from the triple.
 ///
-/// Never empty: a consumer substituting an empty `--cc` into a command line
-/// would run its first argument as a program.
-fn compiler() -> String {
+/// WHY THE DERIVATION IS A TABLE AND NOT A FORMAT STRING. This function used
+/// to fall back to `format!("{target}-gcc")` whenever `HOST != TARGET`. For
+/// the two Linux triples that happens to produce something real, and for the
+/// two Apple ones it produces a compiler that has never existed on any
+/// machine: `x86_64-apple-darwin-gcc`, `aarch64-apple-darwin-gcc`. A consumer
+/// following `curl-config --cc` would run a command not found, which is a
+/// worse outcome than reporting nothing, because it looks like a broken
+/// installation rather than an unconfigured build.
+///
+/// The four mandated targets of specification 0.8.3 are therefore mapped
+/// explicitly, and each entry is the command that can really produce objects
+/// for that triple:
+///
+///   * `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` -- the GNU
+///     cross prefix, which is NOT the Rust triple: GNU spells it
+///     `aarch64-linux-gnu-gcc`, with the `unknown` vendor field dropped. That
+///     is the same command `.cargo/config.toml` names as this triple's
+///     `linker`, so the two authorities cannot disagree about which toolchain
+///     targets aarch64 Linux.
+///   * `x86_64-apple-darwin`, `aarch64-apple-darwin` -- `clang` with the
+///     architecture named. One Xcode `clang` targets both architectures, and
+///     `-arch` is how it is told which; there is no `-apple-darwin-` prefixed
+///     driver to name instead. The SDK needs no flag here because `clang` on
+///     macOS resolves it itself, and hard-coding an `-isysroot` path would
+///     pin a specific Xcode installation into a file consumers read.
+///
+/// A triple outside the four gets NO invented name. It is an error, because
+/// this build script has no way to know what compiles for it and a guess is
+/// what produced the Apple defect. `cc-rs` has a full table for that job; if
+/// a fifth target is ever added, the honest fix is to add its row here or to
+/// export `CC_<target>`, both of which the precedence above already supports.
+///
+/// Never empty, and never a name that cannot be run: a consumer substituting
+/// an empty `--cc` into a command line would run its first argument as a
+/// program, and one substituting a fabricated name gets `command not found`.
+fn compiler() -> Result<String, Box<dyn Error>> {
     let target = env::var("TARGET").unwrap_or_default();
     let host = env::var("HOST").unwrap_or_default();
 
@@ -9540,21 +9519,156 @@ fn compiler() -> String {
         // literally would report a compiler name of "".
         if let Ok(value) = env::var(key) {
             if !value.trim().is_empty() {
-                return value;
+                return Ok(value.trim().to_string());
             }
         }
     }
 
-    if !target.is_empty() && !host.is_empty() && target != host {
-        format!("{target}-gcc")
-    } else {
-        "cc".to_string()
+    // A native build needs no table at all: the driver rustc itself invokes is
+    // correct by construction, and `cc` is the name every POSIX system has.
+    // Checked before the table so that a host build of a mandated triple is
+    // not reported under a cross name it does not need.
+    if !target.is_empty() && target == host {
+        return Ok("cc".to_string());
     }
+
+    target_compiler(&target).map(str::to_string).ok_or_else(|| {
+        format!(
+            "no target compiler is known for {target:?}, and inventing one is \
+             what this function exists to stop: a derived `{target}-gcc` is a \
+             real command for the GNU triples and a command that has never \
+             existed for the Apple ones, so a consumer following \
+             `curl-config --cc` would get `command not found`. Either add \
+             {target:?} to TARGET_COMPILERS beside the four targets \
+             specification 0.8.3 mandates, or export CC_{underscored} for \
+             this build"
+        )
+        .into()
+    })
+}
+
+/// The C compiler that produces objects for each mandated target.
+///
+/// Separate from [`compiler`] so the mapping is a value the tests can walk
+/// rather than a branch they have to reach through the environment, and so
+/// that the set is visibly the four of specification 0.8.3 and not a wildcard.
+///
+/// The Linux rows are cross-prefix names and are only reached when
+/// `HOST != TARGET`; a native build never consults this table.
+const TARGET_COMPILERS: [(&str, &str); 4] = [
+    ("x86_64-unknown-linux-gnu", "x86_64-linux-gnu-gcc"),
+    ("aarch64-unknown-linux-gnu", "aarch64-linux-gnu-gcc"),
+    ("x86_64-apple-darwin", "clang -arch x86_64"),
+    // `arm64`, not `aarch64`: `-arch` takes Apple's own architecture spelling,
+    // and `clang -arch aarch64` is rejected as an unknown architecture.
+    ("aarch64-apple-darwin", "clang -arch arm64"),
+];
+
+/// The [`TARGET_COMPILERS`] row for a triple, or `None` when it has no row.
+fn target_compiler(target: &str) -> Option<&'static str> {
+    TARGET_COMPILERS
+        .iter()
+        .find(|(triple, _)| *triple == target)
+        .map(|(_, command)| *command)
+}
+
+/// One authority for which toolchain targets aarch64 Linux, checked against
+/// the other end of it.
+///
+/// `.cargo/config.toml` names that triple's `linker`, and a consumer following
+/// `curl-config --cc` must reach the same toolchain: objects from a different
+/// cross gcc are not necessarily linkable by the one rustc will invoke. Two
+/// authorities for one toolchain is precisely how a cross consumer ends up
+/// compiling against the wrong architecture, so the agreement is asserted here
+/// rather than maintained by hand in two files.
+///
+/// Deliberately a build-time check and not a `#[cfg(test)]` test, for the
+/// reason [`run_self_checks`] records: `cargo test` never compiles a build
+/// script's test module. Kept out of `run_self_checks` itself only because it
+/// needs the repository root, which that function does not receive.
+fn check_cross_toolchain_agreement(root: &Path) -> Result<(), Box<dyn Error>> {
+    let config = root.join(".cargo").join("config.toml");
+    let text = fs::read_to_string(&config)
+        .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
+
+    // The file declares exactly one `linker`, under
+    // `[target.aarch64-unknown-linux-gnu]`; the other three tables set no
+    // linker at all, which the file itself explains. Finding more than one
+    // would mean that layout changed and this check is reasoning about the
+    // wrong row, so it is an error rather than a first-match win.
+    let linkers: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("linker = \""))
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+
+    let linker = match linkers.as_slice() {
+        [only] => *only,
+        [] => {
+            return Err(format!(
+                "{} names no linker. The aarch64 Linux cross toolchain is \
+                 named there, and curl-config --cc must agree with it.",
+                config.display()
+            )
+            .into())
+        }
+        many => {
+            return Err(format!(
+                "{} names {} linkers ({}). This check assumes the single \
+                 aarch64 Linux entry the file documents; re-derive it \
+                 per-triple before adding another.",
+                config.display(),
+                many.len(),
+                many.join(", ")
+            )
+            .into())
+        }
+    };
+
+    let reported =
+        target_compiler("aarch64-unknown-linux-gnu").unwrap_or_default();
+    if reported != linker {
+        return Err(format!(
+            "curl-config --cc would report {reported:?} for \
+             aarch64-unknown-linux-gnu while {} names {linker:?} as its \
+             linker. One toolchain must have one name.",
+            config.display()
+        )
+        .into());
+    }
+
+    // The third end of the same authority. The file's `[env]` table also names
+    // a C compiler for this triple, for cc-rs's benefit, and that value takes
+    // PRECEDENCE over the table above inside `compiler()` -- it arrives as
+    // `CC_aarch64_unknown_linux_gnu`. So if the two disagreed, the table would
+    // be silently unreachable on the one leg it exists for, and the check
+    // above would be asserting something no build ever consults.
+    let env_cc = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("CC_aarch64_unknown_linux_gnu = \""))
+        .and_then(|rest| rest.split('"').next());
+
+    if let Some(env_cc) = env_cc {
+        if env_cc != reported {
+            return Err(format!(
+                "{} sets CC_aarch64_unknown_linux_gnu to {env_cc:?} while \
+                 TARGET_COMPILERS names {reported:?}. The environment value \
+                 wins inside compiler(), so the disagreement would make the \
+                 table unreachable on the only leg it serves.",
+                config.display()
+            )
+            .into());
+        }
+    }
+
+    Ok(())
 }
 
 /// The CA bundle path to report, or an empty string when none is configured.
 ///
-/// Empty is a legitimate answer: `curl-config.in:72` prints whatever it is
+/// Empty is a legitimate answer: curl-config's --ca arm prints whatever it is
 /// given, and this build reads trust anchors through rustls rather than from
 /// a compiled-in path unless one is supplied.
 fn ca_bundle() -> String {
@@ -9564,22 +9678,6 @@ fn ca_bundle() -> String {
 // Section 14c: where the generated consumer metadata goes
 
 /// Every path a rendered consumer file is written to, product path first.
-///
-/// WHY NOT THE SOURCE ROOT, WHICH IS WHERE THESE USED TO GO. Both files are
-/// target-specific and feature-specific: `curl-config --cc` names the target's
-/// compiler, `--static-libs` and `Libs.private` name that platform's native
-/// libraries, and `--features` names the selected Cargo features. There is
-/// exactly ONE `curl-config` path in the source root, so the four-target
-/// matrix of AAP 0.8.3 had four builds writing four different files to one
-/// name. Whichever finished last won; the other three were destroyed. On a
-/// parallel matrix they also raced, so a consumer could read a half-written
-/// script.
-///
-/// The concealment made it worse rather than better. `.gitignore` listed both
-/// names, so `git status --porcelain` stayed empty while the build wrote into
-/// a tracked directory -- the clean-tree assertions of AAP 0.8.4 gate 1 could
-/// pass over exactly the writes they exist to catch. Those two `.gitignore`
-/// lines are removed, so an accidental source-root write is now VISIBLE.
 ///
 /// The paths returned, in order:
 ///
@@ -9667,20 +9765,6 @@ fn publish_metadata(
 // script's control, and all of them are interpolated into text that another
 // program then PARSES.
 //
-// THE TWO DESTINATIONS ARE DIFFERENT LANGUAGES AND MUST NOT SHARE ONE
-// ESCAPER. That is not a stylistic claim; both halves were measured here.
-//
-// curl-config is a POSIX shell script, and every environment-derived value
-// lands inside SINGLE quotes: `prefix='@prefix@'` (:28),
-// `echo '@CURL_CA_BUNDLE@'` (:73), `echo '@CC@'` (:77). Inside single quotes
-// `$`, a backtick and `"` are inert -- verified by running them -- so the
-// apostrophe is the ONLY character that needs encoding, and `'\''` is the
-// POSIX way to encode it. Measured, with `id -u` as the payload: the raw value
-// `x'; id -u; echo 'y` substituted into `echo '...'` EXECUTES, printing `0`;
-// the same value encoded prints the literal `x'; id -u; echo 'y` and executes
-// nothing. Every later use of the prefix is a `"$prefix"` expansion, which a
-// POSIX shell does not re-parse, so encoding it once at :28 is sufficient.
-//
 // libcurl.pc is read by pkg-config, whose grammar is unrelated. Measured
 // against pkg-config 1.8.1:
 //   * `#` SILENTLY TRUNCATES the value -- `/opt/a#b` reads back as `/opt/a`.
@@ -9738,14 +9822,6 @@ fn reject_control_characters(
 }
 
 /// Encode a value for a POSIX shell SINGLE-quoted context.
-///
-/// The template supplies the surrounding quotes, so this returns the body
-/// only. `'` becomes `'\''` -- close the literal, emit an escaped apostrophe,
-/// reopen it -- which is the sole POSIX-portable way to place an apostrophe
-/// inside single quotes. Nothing else is touched, because nothing else is
-/// special there -- not `$`, not a backtick, not a backslash -- which is
-/// precisely why the frozen template's choice of single quotes is worth
-/// preserving rather than replacing with double quotes.
 fn shell_single_quoted_body(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
@@ -9798,18 +9874,6 @@ fn pkg_config_variable_body(
 }
 
 /// Reject anything unsafe in a value the template leaves UNQUOTED.
-///
-/// `curl-config.in:178` is `echo @CONFIGURE_OPTIONS@` and `:85` and `:92` loop
-/// over `@SUPPORT_FEATURES@` and `@SUPPORT_PROTOCOLS@` without quotes, on
-/// purpose, so that each word becomes one token. Word splitting is the
-/// feature; glob expansion and command substitution are not, and there is no
-/// encoding that keeps the first while removing the others. So these values
-/// are validated rather than encoded, and the allowed set is deliberately
-/// small.
-///
-/// This is the single definition of that rule. It began as an inline check on
-/// `@CONFIGURE_OPTIONS@` alone, which left the two loop arms trusting values
-/// that also depend on the environment through `CARGO_FEATURE_*`.
 fn reject_unquoted_shell_metacharacters(
     label: &str,
     value: &str,
@@ -9829,22 +9893,10 @@ fn reject_unquoted_shell_metacharacters(
 }
 
 /// Validate every environment-derived value against BOTH grammars, up front.
-///
-/// The prefix is the only value that reaches both artifacts, and the two
-/// grammars do not accept the same set. Validating inside each renderer would
-/// therefore write a perfectly good `curl-config` and only then refuse
-/// `libcurl.pc`, leaving a half-rendered pair on disk after a failed build.
-/// Measured: with an apostrophe in the prefix, `curl-config` was written with
-/// the apostrophe correctly encoded before `libcurl.pc` refused. So the whole
-/// environment is checked against the whole set of destinations before
-/// anything is written at all.
-///
-/// The renderers still encode -- they must, since the encodings differ -- but
-/// by then nothing can be refused.
 fn validate_environment_substitutions() -> Result<(), Box<dyn Error>> {
     let prefix = install_prefix();
     let ca_bundle = ca_bundle();
-    let compiler = compiler();
+    let compiler = compiler()?;
 
     // Control characters first: they are refused for every destination, so
     // there is no point asking a grammar about them.
@@ -9880,12 +9932,6 @@ fn validate_environment_substitutions() -> Result<(), Box<dyn Error>> {
 }
 
 /// Confirm the template really wraps a token in single quotes.
-///
-/// The shell encoder above is correct only for a single-quoted context, so the
-/// context is asserted rather than assumed. `curl-config.in` is frozen text
-/// that this script does not own; if a future edit changed `echo '@CC@'` to
-/// `echo @CC@`, the encoding would become both wrong and dangerous, and
-/// nothing else would notice.
 fn assert_single_quoted_context(
     template_name: &str,
     template: &str,
@@ -9928,11 +9974,6 @@ fn assert_single_quoted_context(
 // projects find libcurl -- so leaving them as unsubstituted templates would
 // break every consumer. This script already holds the version, the soname
 // and the honest capability set, so it is the right place.
-//
-// One shared rule governs both: SUBSTITUTE ONLY `@...@` TOKENS AND CHANGE
-// NOTHING ELSE. The shell logic of curl-config and the field structure of
-// libcurl.pc are frozen; every line between the tokens is reproduced exactly
-// as the template has it.
 
 /// Render `<root>/curl-config` from `<root>/curl-config.in`.
 ///
@@ -9964,7 +10005,7 @@ fn render_curl_config(
     // disappears rather than being managed.
     let prefix = install_prefix();
     let ca_bundle = ca_bundle();
-    let compiler = compiler();
+    let compiler = compiler()?;
     for (label, value) in [
         ("the install prefix (CURL_RS_PREFIX)", &prefix),
         ("CURL_CA_BUNDLE", &ca_bundle),
@@ -9984,15 +10025,15 @@ fn render_curl_config(
     reject_unquoted_shell_metacharacters("@SUPPORT_PROTOCOLS@", &protocols)?;
 
     let values: Vec<(&str, String)> = vec![
-        // curl-config.in:28, inside single quotes.
+        // Assigned at the head of the script, inside single quotes.
         ("prefix", shell_single_quoted_body(&prefix)),
         // CMakeLists.txt:2079 sets this to the literal ${prefix}, which the
         // script then expands at run time. Reproduced exactly, because
-        // curl-config.in:31 assigns it and later arms expand it.
+        // curl-config.in assigns it and later arms expand it.
         ("exec_prefix", "${prefix}".to_string()),
-        // curl-config.in:33, expanded by the --cflags arm at :144.
+        // Assigned at the head of the script and expanded by the --cflags arm.
         ("includedir", "${prefix}/include".to_string()),
-        // Used by --libs (:152) and --static-libs (:170).
+        // Used by the --libs and --static-libs arms.
         ("libdir", "${exec_prefix}/lib".to_string()),
         // Both yes: curl-rs-ffi/Cargo.toml sets
         // crate-type = ["cdylib", "staticlib"], so both artifacts exist.
@@ -10002,22 +10043,22 @@ fn render_curl_config(
         // CMakeLists.txt:2093 derives the same value by stripping the dot
         // from CMAKE_STATIC_LIBRARY_SUFFIX.
         ("libext", "a".to_string()),
-        // Drives --ca (:72). Empty unless configured. Single-quoted at :73.
+        // Drives --ca. Empty unless configured, and single-quoted there.
         ("CURL_CA_BUNDLE", shell_single_quoted_body(&ca_bundle)),
-        // Drives --cc (:76). Single-quoted at :77.
+        // Drives --cc, single-quoted there.
         ("CC", shell_single_quoted_body(&compiler)),
-        // Drives --feature/--features (:84-89), which loops over the value
-        // unquoted so that it word-splits into one token per line. Validated
-        // above rather than encoded, because the word splitting is wanted.
+        // Drives --feature/--features, which loops over the value unquoted so
+        // that it word-splits into one token per line. Validated above rather
+        // than encoded, because the word splitting is wanted.
         ("SUPPORT_FEATURES", features),
-        // Drives --protocols (:90-96). curl-config.in:91 carries a
-        // `# shellcheck disable=SC2043` immediately before the loop.
+        // Drives --protocols, whose loop carries a
+        // `# shellcheck disable=SC2043` immediately before it.
         ("SUPPORT_PROTOCOLS", protocols),
         // include/curl/curlver.h:35. Every parity claim in this work is
         // against this exact string.
         ("CURLVERSION", facts.version.clone()),
         // curlver.h:61 with the 0x removed, exactly as configure.ac:141
-        // captured it. --vernum (:134) echoes it raw.
+        // captured it. The --vernum arm echoes it raw.
         ("VERSIONNUM", facts.vernum.clone()),
         // rustls and nothing else. Note the spelling: CMakeLists.txt:2059
         // capitalises its backend names, but the truthful token here is the
@@ -10026,12 +10067,12 @@ fn render_curl_config(
         // Empty: consumers need no extra flags to include the public
         // headers beyond the -I the --cflags arm already prints.
         ("LIBCURL_PC_CFLAGS", String::new()),
-        // Printed by --static-libs (:170). One authority, shared with
+        // Printed by --static-libs. One authority, shared with
         // libcurl.pc's Libs.private, so the two cannot disagree.
         ("LIBCURL_PC_LIBS_PRIVATE", private_libs(&target_os)?),
         // Empty: a Rust cdylib needs no extra link-time flags of its own.
         ("LIBCURL_PC_LDFLAGS_PRIVATE", String::new()),
-        // Printed unquoted by --configure (:178), hence validated.
+        // Printed unquoted by --configure, hence validated.
         ("CONFIGURE_OPTIONS", configure_options()?),
     ];
 
@@ -10103,7 +10144,7 @@ fn render_libcurl_pc(
     check_pkgconfig_value("prefix", &prefix, false)?;
 
     let values: Vec<(&str, String)> = vec![
-        // libcurl.pc.in:56-59, the same four directories curl-config uses.
+        // The same four directories curl-config uses.
         ("prefix", prefix),
         ("exec_prefix", "${prefix}".to_string()),
         ("libdir", "${exec_prefix}/lib".to_string()),
@@ -10175,8 +10216,8 @@ fn render_libcurl_pc(
     // varies per platform -- so the check belongs on the grammar, not on
     // provenance. `${...}` is allowed only for the three tokens whose values
     // ARE deliberate pkg-config variable references; `"` is rejected for the
-    // two fields the template double-quotes (`libcurl.pc.in:112-113`), where a
-    // quote would end the value early and leave the rest as stray text.
+    // two `supported_*` fields the template double-quotes, where a quote would
+    // end the value early and leave the rest as stray text.
     const PKGCONFIG_VARIABLE_TOKENS: [&str; 3] =
         ["exec_prefix", "libdir", "includedir"];
     const PKGCONFIG_QUOTED_FIELDS: [&str; 2] =

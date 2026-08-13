@@ -398,7 +398,6 @@ pub(crate) trait StdinAccess {
 
 /// [`StdinAccess`] over the real process standard input.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct ProcessStdin {
     stdin: io::Stdin,
 }
@@ -411,7 +410,6 @@ impl Default for ProcessStdin {
 
 impl ProcessStdin {
     /// Binds the process's standard input.
-    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::default()
     }

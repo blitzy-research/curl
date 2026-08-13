@@ -26,99 +26,9 @@
 //! seam.
 //!
 //! This is the module root of the resolution subsystem. It supersedes the
-//! cache, key-formation, entry-lifecycle, address-list, address-formatting
-//! and `CURLOPT_RESOLVE` portions of `lib/hostip.c` and `lib/hostip.h`,
-//! together with the address-list shape of `lib/curl_addrinfo.{c,h}`. The
-//! resolution decision tree and its timeout live in `resolver.rs`; the
-//! division is recorded under *Who owns which message string* below,
-//! because a string emitted twice would break the byte-exact fixture
-//! comparison AAP 0.6.7 measures.
-//!
-//! Every claim here is cited, per AAP 0.7 (*"Claims are evidenced, not
-//! asserted"*). The lines cited are `lib/hostip.h:36`, `:38-39`, `:49-54`,
-//! `:56-73` and `:146-158`; `lib/hostip.c:76`, `:78`, `:118-179`,
-//! `:203-227`, `:233-244`, `:246-275`, `:298-363`, `:374-476`, `:492-557`,
-//! `:560-667`, `:671-746`, `:752-796`, `:860-1012`, `:1242-1272`,
-//! `:1279-1470` and `:1570-1589`; `lib/curl_addrinfo.h` for the
-//! `Curl_addrinfo` shape and `lib/curl_addrinfo.c:407-440` for the literal
-//! probes; `lib/urldata.h:124` for `MAX_IPADR_LEN`;
-//! `include/curl/curl.h:1033-1035` for the ALPN integers; and
-//! `lib/fake_addrinfo.c:170` with `lib/fake_addrinfo.h:33-35` for the
-//! `CURL_DNS_SERVER` note.
-//!
-//! # Five conclusions recorded here so nobody re-derives them
-//!
-//! **(a) Pruning is ORDER-INDEPENDENT, and must never become an LRU.**
-//! `crate::util::hash` asks this module for that answer directly, because
-//! `HashMap` iteration order is randomised per process in Rust while C
-//! walked buckets in index order. [`DnsCache::prune`] performs a FULL scan,
-//! removes every entry whose (possibly doubled) age meets the limit, and
-//! folds `oldest` as a maximum - there is no positional selection and no
-//! "first N", so a randomised visit order cannot change the surviving set.
-//! The size cap of `MAX_DNS_CACHE_SIZE` is enforced by repeatedly HALVING
-//! the age limit (`lib/hostip.c:325-353`), not by evicting the least
-//! recently used. An LRU would be order-dependent, which is the second and
-//! independent reason not to introduce one.
-//!
-//! **(b) `CURL_HOSTENT_SIZE` is deliberately not ported.**
-//! `lib/hostip.h:36` defines it as 9000 to size the scratch buffer
-//! `gethostbyname_r` writes its `struct hostent` into, with a comment
-//! citing Stevens for the 8192-byte alias area. Nothing in this
-//! implementation calls a `_r` resolver variant with a caller-supplied
-//! buffer, so the constant has no Rust analogue. It is absent on purpose;
-//! do not go looking for it.
-//!
-//! **(c) `lib/fake_addrinfo.c` is c-ares-only, and `CURL_DNS_SERVER` has no
-//! effect.** That file is wrapped in `USE_FAKE_GETADDRINFO`, which
-//! `lib/fake_addrinfo.h:33-35` defines only when `CURL_MEMDEBUG` *and*
-//! `HAVE_GETADDRINFO` *and* `USE_ARES` *and* `ARES_VERSION >= 0x011a00`
-//! all hold; it includes `<ares.h>` and exports only `r_getaddrinfo()` and
-//! `r_freeaddrinfo()`. c-ares is dropped by AAP 0.5.2, so the one portable
-//! idea in it - the `CURL_DNS_SERVER` environment override at
-//! `lib/fake_addrinfo.c:170`, which the harness sets for c-ares builds - has
-//! nothing to configure. This implementation reads that variable nowhere and
-//! ignoring it is correct rather than an oversight.
-//!
-//! **(d) The ALPN wire parser lives HERE, and `conn/mod.rs` must delegate.**
-//! `enum alpnid` is declared at `lib/hostip.h:49-54`, a source of this file,
-//! so [`AlpnId`] and its [`AlpnId::from_wire`] constructor belong together.
-//! C's parser `Curl_alpn2alpnid` sits in `lib/connect.c:73-87`, whose
-//! successor is `crate::conn`; that successor MUST call
-//! [`AlpnId::from_wire`] rather than reimplement the table. A second copy
-//! would drift, and the integers are load-bearing (see [`AlpnId`]).
-//!
-//! **(e) [`DnsCache`] carries NO internal lock, by design.**
-//! `lib/hostip.c:298-319` shows `dnscache_lock`/`dnscache_unlock` taking
-//! `Curl_share_lock(data, CURL_LOCK_DATA_DNS, CURL_LOCK_ACCESS_SINGLE)`
-//! **only** when the selected cache is the share's - a multi handle's own
-//! cache is never locked, because a multi handle is single-threaded. The
-//! sharing policy therefore belongs to `crate::share`, which will wrap this
-//! type in interior mutability and own the `CURLSHOPT_SHARE` mechanics.
-//! Adding a `Mutex` here would double-lock the shared case and put the
-//! policy in the wrong module. That contract is stated for the benefit of
-//! whoever authors `share/`.
-//!
-//! # What the C's ownership machinery becomes
-//!
-//! `struct Curl_dns_entry` carries `size_t refcount` with the comment
-//! *"reference counter, entry is freed on reaching 0"* (`lib/hostip.h:63`),
-//! and two functions decrement it - `Curl_resolv_unlink` (`:1242-1254`) and
-//! `dnscache_entry_dtor` (`:1256-1263`). Both become [`Arc`]: the counter is
-//! not hand-rolled, `dnscache_entry_free` (`:184-194`) becomes `Drop`, and
-//! there is consequently nothing to free by hand. **Do not add a manual
-//! release path.** The header comment of `Curl_dnscache_mk_entry`
-//! (`lib/hostip.h:146-158`) promises that the call *"takes ownership of
-//! `addr`, even in case of failure, and always clears `*paddr`"*; in Rust
-//! ownership transfer is what passing a value by value already means, so the
-//! out-parameter and its clearing clause simply do not exist here.
-//!
-//! The intrusive singly-linked `Curl_addrinfo` list becomes a
-//! [`Vec<ResolvedAddr>`], as AAP 0.6.9 requires. **Its order is
-//! behaviourally significant** and is preserved everywhere in this module:
-//! `conn/happy_eyeballs.rs`, superseding `lib/cf-ip-happy.c`, races the two
-//! families, so the sequence a resolver produces is observable. The
-//! synthesised localhost list is the clearest case - see
-//! [`localhost_addrs`].
+//! cache, key-formation, entry-lifecycle, address-list, address-formatting and
+//! `CURLOPT_RESOLVE` portions of `lib/hostip.c` and `lib/hostip.h`, together
+//! with the address-list shape of `lib/curl_addrinfo.{c,h}`.
 //!
 //! # Who owns which message string
 //!
@@ -133,39 +43,9 @@
 //! quoted. Both are reproduced, at their own call sites, and they are
 //! deliberately not unified.
 //!
-//! # Injection, not global state
-//!
-//! `lib/hostip.c:365-370` keeps `static sigjmp_buf curl_jmpenv;` beside
-//! `static curl_simple_lock curl_jmpenv_lock;` under a comment that admits
-//! *"Beware this is a global and unique instance ... This is not thread-safe
-//! stuff."* Nothing of that shape survives. Per AAP 0.3.3 P12 the clock, the
-//! resolver, the entropy source, the IPv6 probe, the DoH transport and the
-//! trace sink are all **injected**: this module declares no `static mut`, no
-//! singleton and no lazily initialised mutable global. The one `OnceLock` it
-//! uses ([`Ipv6Support`]) is write-once immutable shared state owned by the
-//! caller's handle, which is the distinction `crate::util::timeval` draws
-//! for the same reason.
-//!
-//! Time comes from `crate::util::timeval`, which owns the clock seam and
-//! enforces it with a repository-wide grep gate; this module never reads a
-//! wall or monotonic clock directly. Case folding comes from
-//! `crate::util::strcase` and is ASCII-only: using Unicode-aware
-//! lowercasing would change *which hostnames collide in the cache*, so it is
-//! a correctness requirement rather than a preference. Address text comes
-//! from `crate::util::inet`, never from `std::net`'s `Display`, because curl
-//! diverges from it twice - IPv4-compatible addresses render as
-//! `::a.b.c.d`, and a single zero word is not compressed.
-//!
 //! # Visibility
 //!
-//! Everything here is `pub(crate)`. AAP 0.4.2 replaces C's
-//! `extern CURLcode Curl_xyz(...)` - private by convention, visible to the
-//! linker - with private by enforcement. Nothing is re-exported to make
-//! `tests/libtest` or `tests/unit` link; AAP 0.8.7 records their inability
-//! to link as a deliberate deviation, and re-exporting internals to satisfy
-//! them *"would defeat the encapsulation that makes the zero-`unsafe`
-//! guarantee possible."* The coverage those C programs provided is
-//! relocated into the `#[cfg(test)]` module at the foot of this file.
+//! Everything here is `pub(crate)`.
 
 use core::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -194,49 +74,12 @@ pub(crate) mod if2ip;
 
 // THE FOUR SUBMODULES OF THIS DIRECTORY -- THREE DECLARED, ONE SPECIFIED.
 //
-// AAP 0.3.1's layout line for this directory is
-// `curl-rs-lib/src/dns/{mod,resolver,doh,httpsrr,if2ip}.rs`, so the target
-// design is exactly four children and no more. A `mod` line without its file
-// is E0583 -- a hard error that no `#[allow]` can reach, because module
-// resolution never gets far enough to produce a lint. Each declaration
-// therefore arrives WITH its file in the unit of work that creates it, and
-// the ones still to come are DESCRIBED here with the declaration each takes.
-// This is the same discipline `curl-rs-lib/src/lib.rs` states for its own
-// not-yet-written subsystems, and it was verified by compiling: declaring a
-// child that does not exist breaks the whole crate, so describing it is the
-// only way this module root could be delivered at all.
-//
 // `if2ip` is declared immediately above; `resolver`, `httpsrr` and `doh` are
 // declared below. `doh` was the last child to arrive, and it arrived with the
 // declaration this comment had reserved for it verbatim:
 //
 //     #[cfg(feature = "doh")]
 //     pub(crate) mod doh;
-//
-// That gate is the ONLY one on the module. `doh` is one of the fifteen
-// features and is default-ON, and gating both here and inside the file would
-// mean two places to keep in step for no gain.
-//
-// --- resolver (pub(crate)) -- DECLARED BELOW -----------------------------
-// The resolution engine, described in full on its declaration below.
-//
-// --- httpsrr (pub(crate)) -- DECLARED BELOW ------------------------------
-// `lib/httpsrr.c` and `lib/httpsrr.h`: the HTTPS resource record, whose
-// `Curl_https_rrinfo` successor is [`httpsrr::HttpsRrInfo`], the type
-// [`DnsEntry`] carries in its `hinfo` field. Compiled UNCONDITIONALLY --
-// `httpsrr` is not one of the fifteen features; only its advertisement in
-// the version banner is conditional, and that belongs to `crate::version`.
-// It stores [`AlpnId`] values as raw bytes in a four-element array and
-// dedupes them with `memchr` (`lib/httpsrr.c:57-61`), which is why the
-// integers below are not free to change, and it reads them back through
-// [`AlpnId::from_u8`].
-//
-// --- doh (pub(crate), behind the default-ON `doh` feature) ---------------
-// `lib/doh.c`: DNS-over-HTTPS. Feature-gated because `doh` is one of the
-// fifteen and gates a whole capability. It performs its transfers through
-// the injected [`DohTransport`] below and must never write
-// `use crate::protocols`: a `dns -> protocols -> dns` import cycle is
-// exactly what that seam exists to avoid.
 
 /// The resolution engine: the decision tree, the system resolver and the
 /// deadline.
@@ -247,37 +90,15 @@ pub(crate) mod if2ip;
 /// `lib/asyn.h`, `lib/asyn-base.c`, `lib/asyn-thrdd.c` and
 /// `lib/curl_threads.c`. It implements the [`Resolver`] trait declared below
 /// and declares no second one.
-///
-/// This is where AAP 0.6.9 deletes the `alarm()` plus
-/// `sigsetjmp`/`siglongjmp` timeout outright in favour of
-/// `tokio::time::timeout`, and where the thread abstraction of
-/// `lib/curl_threads.c` is subsumed by `tokio::task::spawn_blocking`.
-/// `hickory-dns` support is `#[cfg(feature = "hickory-dns")]` INSIDE that
-/// file - there is no `hickory.rs` and none may be created.
 pub(crate) mod resolver;
 
 pub(crate) mod httpsrr;
 
 /// DNS-over-HTTPS, behind the default-ON `doh` feature.
-///
-/// Supersedes `lib/doh.c` and `lib/doh.h`. Feature-gated because `doh` is one
-/// of the fifteen and gates a whole capability; the gate is here and nowhere
-/// else. It performs its transfers through the injected [`DohTransport`]
-/// declared at the foot of this file and must never write
-/// `use crate::protocols`: a `dns -> protocols -> dns` import cycle is exactly
-/// what that seam exists to avoid.
 #[cfg(feature = "doh")]
 pub(crate) mod doh;
 
 /// The size of C's cache-key buffer, and therefore the truncation rule.
-///
-/// `lib/hostip.c:76`: `#define MAX_HOSTCACHE_LEN (255 + 7)`, commented
-/// *"max FQDN + colon + port number + zero"* - so 262. In C this sizes a
-/// stack array; here it survives as a **truncation rule**, because the
-/// truncation is observable: two hosts sharing their first
-/// [`MAX_HOSTCACHE_HOST_LEN`] bytes collide in the cache. Keeping the C
-/// spelling of the constant is what makes the derivation below readable.
-// No consumer yet; named for the derivation below and by resolver.rs.
 #[allow(dead_code)]
 pub(crate) const MAX_HOSTCACHE_LEN: usize = 255 + 7;
 
@@ -287,14 +108,13 @@ pub(crate) const MAX_HOSTCACHE_LEN: usize = 255 + 7;
 /// with `buflen == MAX_HOSTCACHE_LEN`. The seven reserved bytes are the
 /// colon, up to five decimal digits of port, and the terminator that C needs
 /// and Rust does not.
-// No consumer yet; read by the key builder's tests and by conn/.
 #[allow(dead_code)]
 pub(crate) const MAX_HOSTCACHE_HOST_LEN: usize = MAX_HOSTCACHE_LEN - 7;
 
 /// The entry count above which [`DnsCache::prune`] halves its age limit.
 ///
 /// `lib/hostip.c:78`: `#define MAX_DNS_CACHE_SIZE 29999`.
-#[allow(dead_code)] // No consumer yet; Read by DnsCache::prune and by share/.
+#[allow(dead_code)] // Read by DnsCache::prune and by share/.
 pub(crate) const MAX_DNS_CACHE_SIZE: usize = 29999;
 
 /// Seconds allowed for one name resolution: 300.
@@ -304,18 +124,10 @@ pub(crate) const MAX_DNS_CACHE_SIZE: usize = 29999;
 /// `struct timeval maxtime = { CURL_TIMEOUT_RESOLVE, 0 }` in
 /// `lib/asyn-base.c`. `resolver.rs` consumes this as its ceiling and must
 /// not redefine it.
-#[allow(dead_code)] // No consumer yet; resolver.rs consumes it as its ceiling.
+#[allow(dead_code)] // resolver.rs consumes it as its ceiling.
 pub(crate) const CURL_TIMEOUT_RESOLVE: i64 = 300;
 
 /// The longest printable address plus its terminator: 46.
-///
-/// `lib/urldata.h:124` defines `MAX_IPADR_LEN` as
-/// `sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")` -
-/// 45 characters and a NUL. Retained because it is also the length bound
-/// C's `CURLOPT_RESOLVE` parser passes to `curlx_str_until` for a bracketed
-/// host (`lib/hostip.c:1300`, `:1339`), where it is a genuine input limit
-/// rather than a buffer size.
-// No consumer yet; also conn/'s bound when it formats an address.
 #[allow(dead_code)]
 pub(crate) const MAX_IPADR_LEN: usize = 46;
 
@@ -324,71 +136,50 @@ pub(crate) const MAX_IPADR_LEN: usize = 46;
 /// `lib/hostip.c:143-146` initialises each `dynbuf` with `curlx_dyn_init(d,
 /// 1024)`, and exceeding it is what produces the
 /// [`msg::TOO_MANY_IP`] line rather than a longer one.
-#[allow(dead_code)] // No consumer yet; Read by show_resolve_info.
+#[allow(dead_code)] // Read by show_resolve_info.
 const SHOW_RESOLVE_BUDGET: usize = 1024;
 
 /// The longest address literal a `CURLOPT_RESOLVE` entry may carry: 64.
 ///
 /// C's buffer is `char address[64]` (`lib/hostip.c:1327`) and the guard is
-/// `if(curlx_strlen(&target) >= sizeof(address)) goto err;` (`:1382-1383`),
-/// so 64 bytes or more is an error and 63 is the longest accepted. The bound
-/// is part of the frozen `CURLOPT_RESOLVE` syntax (AAP 0.8.1) and must not
-/// be relaxed.
-#[allow(dead_code)] // No consumer yet; Read by parse_resolve_addresses.
+/// `if(curlx_strlen(&target) >= sizeof(address)) goto err;` (`:1382-1383`), so
+/// 64 bytes or more is an error and 63 is the longest accepted. The bound is
+/// part of the frozen `CURLOPT_RESOLVE` syntax and must not be relaxed.
+#[allow(dead_code)] // Read by parse_resolve_addresses.
 const RESOLVE_ADDRESS_MAX: usize = 64;
 
 /// The non-bracketed host bound C's `CURLOPT_RESOLVE` parser passes: 4096.
 ///
 /// `lib/hostip.c:1306`, `:1345`. Bracketed hosts get [`MAX_IPADR_LEN`]
 /// instead, which is a much tighter limit and is measured, not assumed.
-#[allow(dead_code)] // No consumer yet; Read by both CURLOPT_RESOLVE branches.
+#[allow(dead_code)] // Read by both CURLOPT_RESOLVE branches.
 const RESOLVE_HOST_MAX: usize = 4096;
 
 /// The largest port a `CURLOPT_RESOLVE` entry may name: `0xffff`.
 ///
 /// The `max` argument of every `curlx_str_number` call in
 /// `Curl_loadhostpairs` (`lib/hostip.c:1315`, `:1348`).
-#[allow(dead_code)] // No consumer yet; Read by both CURLOPT_RESOLVE branches.
+#[allow(dead_code)] // Read by both CURLOPT_RESOLVE branches.
 const RESOLVE_PORT_MAX: i64 = 0xffff;
 
 /// The longest `sun_path` an `AF_UNIX` address can hold.
-///
-/// `sizeof(struct sockaddr_un::sun_path)`, which
-/// `Curl_unix2addr` (`lib/curl_addrinfo.c:466-471`) compares
-/// `strlen(path) + 1` against. It is 104 on Apple platforms and 108 on
-/// Linux, and both of the mandated operating systems appear here explicitly
-/// rather than through a `libc` constant, because `libc` is confined to
-/// `crate::ffi` (AAP 0.8.5 conflict C3). No other platform is in the
-/// four-target matrix of AAP 0.1.1 G8.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-#[allow(dead_code)] // No consumer yet; conn/socket.rs consumes it.
+#[allow(dead_code)] // conn/socket.rs consumes it.
 pub(crate) const UNIX_PATH_MAX: usize = 104;
 
 /// The longest `sun_path` an `AF_UNIX` address can hold - see the Apple arm.
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-#[allow(dead_code)] // No consumer yet; conn/socket.rs consumes it.
+#[allow(dead_code)] // conn/socket.rs consumes it.
 pub(crate) const UNIX_PATH_MAX: usize = 108;
 
 /// The observable text this module emits, frozen.
-///
-/// AAP 0.8.1 freezes `--verbose` and `--trace` output, and AAP 0.6.7
-/// measures the comparison that enforces it: `compareparts` joins both
-/// sides into one string, so casing, spacing and punctuation are all
-/// significant. `#[rustfmt::skip]` therefore covers the whole module: these
-/// are wire bytes wearing the costume of source code, and a formatter that
-/// rewrapped one of them would change program output.
-///
-/// Each item is transcribed from the C source and carries its locator. The
-/// parameterised ones are functions rather than format strings because
-/// `crate::trace::infof` requires a literal format string, and one
-/// definition per message beats a template duplicated at its call site.
 #[rustfmt::skip]
 pub(crate) mod msg {
     /// `"Hostname %s was found in DNS cache"` - `lib/hostip.c:904`.
     ///
     /// **Unquoted.** The sibling at `:1491` quotes its `%s`; see
     /// [`found_in_cache_quoted`]. The two are deliberately not unified.
-    #[allow(dead_code)] // No consumer yet; resolver.rs emits it on a cache hit.
+    #[allow(dead_code)] // resolver.rs emits it on a cache hit.
     pub(crate) fn found_in_cache(host: &str) -> String {
         format!("Hostname {host} was found in DNS cache")
     }
@@ -398,48 +189,47 @@ pub(crate) mod msg {
     /// **Quoted**, and emitted from the async re-check path, which is
     /// `resolver.rs`. It lives here so that both spellings sit side by side
     /// and neither can be "corrected" into the other by accident.
-    // No consumer yet; resolver.rs emits it from the async re-check.
     #[allow(dead_code)]
     pub(crate) fn found_in_cache_quoted(host: &str) -> String {
         format!("Hostname '{host}' was found in DNS cache")
     }
 
     /// `"Hostname in DNS cache was stale, zapped"` - `lib/hostip.c:411`.
-    #[allow(dead_code)] // No consumer yet; Emitted by DnsCache::fetch_addr.
+    #[allow(dead_code)] // Emitted by DnsCache::fetch_addr.
     pub(crate) const STALE_ZAPPED: &str =
         "Hostname in DNS cache was stale, zapped";
 
     /// `"Hostname in DNS cache does not have needed family, zapped"` -
     /// `lib/hostip.c:437`.
-    #[allow(dead_code)] // No consumer yet; Emitted by DnsCache::fetch_addr.
+    #[allow(dead_code)] // Emitted by DnsCache::fetch_addr.
     pub(crate) const FAMILY_ZAPPED: &str =
         "Hostname in DNS cache does not have needed family, zapped";
 
     /// `"Host %s:%d was resolved."` - `lib/hostip.c:138-139`.
     ///
     /// The trailing period is C's and is preserved.
-    #[allow(dead_code)] // No consumer yet; Emitted by show_resolve_info.
+    #[allow(dead_code)] // Emitted by show_resolve_info.
     pub(crate) fn host_was_resolved(host: &str, port: u16) -> String {
         format!("Host {host}:{port} was resolved.")
     }
 
     /// The `"(none)"` an absent name or an empty accumulator renders as -
     /// `lib/hostip.c:139`, `:168`, `:172`.
-    #[allow(dead_code)] // No consumer yet; Emitted by show_resolve_info.
+    #[allow(dead_code)] // Emitted by show_resolve_info.
     pub(crate) const NONE: &str = "(none)";
 
     /// `"too many IP, cannot show"` - `lib/hostip.c:157`.
-    #[allow(dead_code)] // No consumer yet; Emitted by show_resolve_info.
+    #[allow(dead_code)] // Emitted by show_resolve_info.
     pub(crate) const TOO_MANY_IP: &str = "too many IP, cannot show";
 
     /// `"IPv6: %s"` - `lib/hostip.c:167-168`. Emitted BEFORE the IPv4 line.
-    #[allow(dead_code)] // No consumer yet; Emitted by show_resolve_info.
+    #[allow(dead_code)] // Emitted by show_resolve_info.
     pub(crate) fn ipv6_line(list: &str) -> String {
         format!("IPv6: {list}")
     }
 
     /// `"IPv4: %s"` - `lib/hostip.c:171-172`. Emitted AFTER the IPv6 line.
-    #[allow(dead_code)] // No consumer yet; Emitted by show_resolve_info.
+    #[allow(dead_code)] // Emitted by show_resolve_info.
     pub(crate) fn ipv4_line(list: &str) -> String {
         format!("IPv4: {list}")
     }
@@ -447,20 +237,19 @@ pub(crate) mod msg {
     /// The `", "` between addresses on one line - `lib/hostip.c:151`.
     ///
     /// A comma AND a space; `curlx_dyn_addn(d, ", ", 2)` names the length.
-    #[allow(dead_code)] // No consumer yet; Read by show_resolve_info.
+    #[allow(dead_code)] // Read by show_resolve_info.
     pub(crate) const ADDR_SEPARATOR: &str = ", ";
 
     /// `"Shuffling %i addresses"` - `lib/hostip.c:515`.
     ///
     /// `%i` renders as a plain decimal, which is what `{}` does for an
     /// `usize`, so the rendered bytes are identical.
-    #[allow(dead_code)] // No consumer yet; Emitted by shuffle_addrs.
+    #[allow(dead_code)] // Emitted by shuffle_addrs.
     pub(crate) fn shuffling(count: usize) -> String {
         format!("Shuffling {count} addresses")
     }
 
     /// `"Resolve address '%s' found illegal"` - `lib/hostip.c:1394`.
-    // No consumer yet; emitted by the CURLOPT_RESOLVE loader.
     #[allow(dead_code)]
     pub(crate) fn address_illegal(address: &str) -> String {
         format!("Resolve address '{address}' found illegal")
@@ -469,14 +258,13 @@ pub(crate) mod msg {
     /// `"Could not parse CURLOPT_RESOLVE entry '%s'"` -
     /// `lib/hostip.c:1412`. A `failf`, paired with
     /// [`crate::error::CURLcode::SetoptOptionSyntax`].
-    #[allow(dead_code)] // No consumer yet; Emitted by unparsable_entry.
+    #[allow(dead_code)] // Emitted by unparsable_entry.
     pub(crate) fn resolve_unparsable(entry: &str) -> String {
         format!("Could not parse CURLOPT_RESOLVE entry '{entry}'")
     }
 
     /// `"RESOLVE %.*s:%<off_t> - old addresses discarded"` -
     /// `lib/hostip.c:1428-1430`.
-    // No consumer yet; emitted by the CURLOPT_RESOLVE loader.
     #[allow(dead_code)]
     pub(crate) fn resolve_replaced(host: &str, port: u16) -> String {
         format!("RESOLVE {host}:{port} - old addresses discarded")
@@ -487,7 +275,6 @@ pub(crate) mod msg {
     ///
     /// The final `%s` is `permanent ? "" : " (non-permanent)"`, so both
     /// forms are reachable and both are reproduced.
-    // No consumer yet; emitted by the CURLOPT_RESOLVE loader.
     #[allow(dead_code)]
     pub(crate) fn resolve_added(
         host: &str,
@@ -500,7 +287,6 @@ pub(crate) mod msg {
     }
 
     /// `"RESOLVE *:%<off_t> using wildcard"` - `lib/hostip.c:1464-1465`.
-    // No consumer yet; emitted by the CURLOPT_RESOLVE loader.
     #[allow(dead_code)]
     pub(crate) fn resolve_wildcard(port: u16) -> String {
         format!("RESOLVE *:{port} using wildcard")
@@ -511,7 +297,7 @@ pub(crate) mod msg {
     /// Emitted by `resolver.rs`, whose `store_negative_resolve` successor
     /// inserts the no-address entry that [`super::DnsEntry`] ages at double
     /// rate. The text lives here with its siblings.
-    #[allow(dead_code)] // No consumer yet; resolver.rs emits it.
+    #[allow(dead_code)] // resolver.rs emits it.
     pub(crate) fn store_negative(host: &str, port: u16) -> String {
         format!("Store negative name resolve for {host}:{port}")
     }
@@ -519,7 +305,7 @@ pub(crate) mod msg {
     /// `"Negative DNS entry"` - `lib/hostip.c:976`.
     ///
     /// Emitted by `resolver.rs` when a cache hit carries no addresses.
-    #[allow(dead_code)] // No consumer yet; resolver.rs emits it.
+    #[allow(dead_code)] // resolver.rs emits it.
     pub(crate) const NEGATIVE_ENTRY: &str = "Negative DNS entry";
 
     /// `"Not resolving .onion address (RFC 7686)"` - `lib/hostip.c:892`.
@@ -527,7 +313,7 @@ pub(crate) mod msg {
     /// A `failf`, emitted by `resolver.rs`, which also owns the measured
     /// `hostname_len >= 7` guard that lets a bare six-byte `".onion"`
     /// through.
-    #[allow(dead_code)] // No consumer yet; resolver.rs emits it.
+    #[allow(dead_code)] // resolver.rs emits it.
     pub(crate) const NO_ONION: &str =
         "Not resolving .onion address (RFC 7686)";
 }
@@ -555,8 +341,6 @@ pub(crate) mod msg {
 /// advertised protocols survive deduplication. They are also the bits the
 /// public `CURLOPT_ALTSVC_CTRL` mask uses, which is why they are powers of
 /// two with a gap below them.
-///
-/// `#[repr(u8)]` is sound for every value here because the largest is 32.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub(crate) enum AlpnId {
@@ -577,27 +361,6 @@ impl AlpnId {
     }
 
     /// Recovers an identifier from the byte [`Self::as_u8`] produced.
-    ///
-    /// The inverse of [`Self::as_u8`], and it lives here for the reason that
-    /// constructor does: the four integers are declared above, so the only
-    /// place that can convert without copying them is this one. C needs no
-    /// counterpart because C's `unsigned char alpns[4]`
-    /// (`lib/httpsrr.h:52`) and its `enum alpnid` are the same integers with
-    /// a cast between them; Rust's enumeration is a distinct type, so the
-    /// cast becomes this function.
-    ///
-    /// [`None`] for any other byte, which is a *rejection* and not
-    /// [`AlpnId::None`]: `dns/httpsrr.rs` reads back an array whose writer it
-    /// does not control, so "zero, the terminator" and "a byte no
-    /// enumerator claims" have to be distinguishable. `AlpnId::None` itself
-    /// therefore round-trips as `Some(AlpnId::None)`.
-    ///
-    /// No `_` arm over the enumeration: the `match` is on the byte, so a
-    /// fifth identifier added above will not silently fail to decode -- the
-    /// two functions sit next to each other precisely so that adding one
-    /// means editing both in the same edit.
-    ///
-    /// [`None`]: Option::None
     pub(crate) const fn from_u8(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::None),
@@ -624,20 +387,6 @@ impl AlpnId {
     /// }
     /// return ALPN_none; /* unknown, probably rubbish input */
     /// ```
-    ///
-    /// Three consequences are measured rather than assumed, and each has a
-    /// test below. The comparison is `memcmp`, so it is **case-sensitive**
-    /// and `"HTTP/1.1"` yields [`AlpnId::None`]. Only lengths two and eight
-    /// are examined at all, so a three-byte input is rejected without its
-    /// content being looked at. And an unknown two-byte token such as
-    /// `"h4"` is [`AlpnId::None`] rather than an error, which is what lets a
-    /// server advertise a protocol this client has never heard of without
-    /// failing the connection.
-    ///
-    /// **`crate::conn` must call this rather than reimplement the table.**
-    /// The type is declared in `lib/hostip.h`, a source of this file, so its
-    /// constructor belongs beside it; a second copy in the module that
-    /// supersedes `lib/connect.c` would drift from this one.
     pub(crate) fn from_wire(name: &[u8]) -> Self {
         match name.len() {
             2 => match name {
@@ -660,7 +409,7 @@ impl AlpnId {
 /// are pinned, so `curl-rs-ffi` can convert without a lookup table.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[repr(i32)]
-#[allow(dead_code)] // No consumer yet; resolver.rs and conn/ consume it.
+#[allow(dead_code)] // resolver.rs and conn/ consume it.
 pub(crate) enum IpVersion {
     /// `CURL_IPRESOLVE_WHATEVER 0L` - the default; every family is
     /// acceptable. C's comment reads *"uses addresses to all IP versions
@@ -675,7 +424,7 @@ pub(crate) enum IpVersion {
 
 impl IpVersion {
     /// The public ABI integer.
-    #[allow(dead_code)] // No consumer yet; curl-rs-ffi converts through it.
+    #[allow(dead_code)] // curl-rs-ffi converts through it.
     pub(crate) const fn as_i32(self) -> i32 {
         self as i32
     }
@@ -685,7 +434,7 @@ impl IpVersion {
     /// A `Result` would be the wrong shape: `lib/setopt.c` rejects an
     /// out-of-range `CURLOPT_IPRESOLVE` with its own code, so the decision
     /// belongs to the option setter rather than here.
-    #[allow(dead_code)] // No consumer yet; easy/setopt.rs converts through it.
+    #[allow(dead_code)] // easy/setopt.rs converts through it.
     pub(crate) const fn from_i32(raw: i32) -> Option<Self> {
         match raw {
             0 => Some(Self::Whatever),
@@ -701,7 +450,7 @@ impl IpVersion {
     /// (`lib/hostip.c:419-426`): `PF_INET` by default, and `PF_INET6` when
     /// the request is [`IpVersion::V6`]. C's `#ifdef PF_INET6` guard around
     /// the assignment has no counterpart - every mandated target has IPv6.
-    #[allow(dead_code)] // No consumer yet; Read by DnsCache::fetch_addr.
+    #[allow(dead_code)] // Read by DnsCache::fetch_addr.
     pub(crate) const fn required_family(self) -> Option<AddressFamily> {
         match self {
             Self::Whatever => None,
@@ -712,15 +461,8 @@ impl IpVersion {
 }
 
 /// The address family of one resolved address.
-///
-/// C reads `ai_family` and compares it against `AF_INET`, `AF_INET6` or
-/// `AF_UNIX`, whose numeric values differ across the mandated operating
-/// systems - `AF_INET6` is 10 on Linux and 30 on Apple platforms. Naming
-/// them as an enumeration keeps those platform integers out of the engine
-/// entirely; they belong to `crate::ffi` and to the socket crate, and the
-/// gate in `crate::lib`'s `source_policy` exists to keep them there.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)] // No consumer yet; conn/happy_eyeballs.rs consumes it.
+#[allow(dead_code)] // conn/happy_eyeballs.rs consumes it.
 pub(crate) enum AddressFamily {
     /// `AF_INET`.
     Inet,
@@ -733,16 +475,8 @@ pub(crate) enum AddressFamily {
 }
 
 /// The socket type of one resolved address.
-///
-/// Every address this module constructs is `SOCK_STREAM`, which is not an
-/// accident worth eliding: `ip2addr` (`lib/curl_addrinfo.c:375`),
-/// `get_localhost` (`lib/hostip.c:733`), `get_localhost6` (`:695`) and
-/// `Curl_unix2addr` (`lib/curl_addrinfo.c:475`, commented *"assume reliable
-/// transport for HTTP"*) all set it. [`SockType::Dgram`] exists because a
-/// system resolver may report it for a service and because the QUIC filter
-/// will need it.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-#[allow(dead_code)] // No consumer yet; conn/socket.rs consumes it.
+#[allow(dead_code)] // conn/socket.rs consumes it.
 pub(crate) enum SockType {
     /// `SOCK_STREAM`.
     #[default]
@@ -752,16 +486,8 @@ pub(crate) enum SockType {
 }
 
 /// The transport protocol of one resolved address.
-///
-/// `get_localhost` and `get_localhost6` set `ai_protocol = IPPROTO_TCP`
-/// explicitly (`lib/hostip.c:734`, `:696`), whereas `ip2addr` leaves the
-/// field at the zero its `calloc` produced (`lib/curl_addrinfo.c:366-377`) -
-/// that is `IPPROTO_IP`, meaning "unspecified, let the socket type
-/// decide". The distinction is preserved because it is a real difference
-/// between two C functions this module supersedes, and eliding it would
-/// silently change what a filter chain sees.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-#[allow(dead_code)] // No consumer yet; conn/socket.rs consumes it.
+#[allow(dead_code)] // conn/socket.rs consumes it.
 pub(crate) enum IpProto {
     /// `IPPROTO_IP`, the zero a `calloc`ed `Curl_addrinfo` carries.
     #[default]
@@ -773,14 +499,8 @@ pub(crate) enum IpProto {
 }
 
 /// Where one resolved address points.
-///
-/// `struct Curl_addrinfo` stores a `struct sockaddr *ai_addr` with an
-/// `ai_addrlen`, and every consumer casts it to `sockaddr_in`,
-/// `sockaddr_in6` or `sockaddr_un` after reading `ai_family`. That cast is
-/// the pattern AAP 0.6.9 removes: the discriminant and the payload travel
-/// together here, so no consumer can read the wrong one.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)] // No consumer yet; conn/socket.rs consumes it.
+#[allow(dead_code)] // conn/socket.rs consumes it.
 pub(crate) enum ResolvedSockAddr {
     /// An IPv4 or IPv6 endpoint with its port.
     Ip(SocketAddr),
@@ -813,23 +533,11 @@ pub(crate) enum ResolvedSockAddr {
 /// Four of those eight members disappear rather than being translated, and
 /// each disappearance is a deliberate simplification of an unsafe pattern:
 ///
-/// * `ai_next` is gone - the intrusive list becomes a
-///   [`Vec<ResolvedAddr>`], as AAP 0.6.9 requires. **The order of that
-///   vector is behaviour, not an implementation detail.**
-/// * `ai_addrlen` is gone - it existed only to tell a `connect(2)` how many
-///   bytes of the `sockaddr` union are meaningful, which the discriminant of
-///   [`ResolvedSockAddr`] now answers.
-/// * `ai_family` is gone as a stored field and becomes
-///   [`ResolvedAddr::family`], computed from the address so that the two can
-///   never disagree. In C they could, and a mismatch was undefined
-///   behaviour.
-/// * `ai_addr` is gone as a raw pointer - the address is stored inline.
-///
 /// `ai_flags` is retained because a system resolver reports it and because
 /// C carries it through `Curl_addrinfo_copy`; nothing in this module reads
 /// it, which is why it has an explicit allowance rather than being dropped.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // No consumer yet; conn/ and resolver.rs consume it.
+#[allow(dead_code)] // conn/ and resolver.rs consume it.
 pub(crate) struct ResolvedAddr {
     /// Where it points, family and payload together.
     pub(crate) addr: ResolvedSockAddr,
@@ -843,7 +551,7 @@ pub(crate) struct ResolvedAddr {
     /// (`lib/curl_addrinfo.c:373`), so it is usually present.
     pub(crate) canonname: Option<String>,
     /// `ai_flags`, carried for fidelity with a system resolver's answer.
-    #[allow(dead_code)] // Carried for fidelity; conn/ will read it.
+    #[allow(dead_code)] // Carried for fidelity; conn/ reads it.
     pub(crate) flags: i32,
 }
 
@@ -872,7 +580,7 @@ impl ResolvedAddr {
     }
 
     /// The IP endpoint, when this is one.
-    #[allow(dead_code)] // No consumer yet; conn/socket.rs consumes it.
+    #[allow(dead_code)] // conn/socket.rs consumes it.
     pub(crate) fn socket_addr(&self) -> Option<SocketAddr> {
         match &self.addr {
             ResolvedSockAddr::Ip(addr) => Some(*addr),
@@ -900,11 +608,6 @@ impl ResolvedAddr {
     ///   where the standard library does not, and curl declines to compress
     ///   a single zero word where the standard library compresses it. Both
     ///   divergences reach `--verbose` output.
-    ///
-    /// C writes into a caller-supplied `char buf[MAX_IPADR_LEN]`; the
-    /// returned [`String`] can never exceed [`MAX_IPADR_LEN`] minus its
-    /// terminator, which [`Self::printable_address_fits_the_c_buffer`]
-    /// asserts.
     pub(crate) fn printable_address(&self) -> String {
         match &self.addr {
             ResolvedSockAddr::Ip(SocketAddr::V4(v4)) => {
@@ -924,26 +627,13 @@ impl ResolvedAddr {
     /// states an invariant `crate::conn` will want to rely on when it writes
     /// an address into a fixed-size field, and because a `debug_assert` in a
     /// caller reads better than a re-derivation of the bound.
-    #[allow(dead_code)] // No consumer yet; conn/ asserts with it.
+    #[allow(dead_code)] // conn/ asserts with it.
     pub(crate) fn printable_address_fits_the_c_buffer(&self) -> bool {
         self.printable_address().len() < MAX_IPADR_LEN
     }
 }
 
 /// True when `hostname` is a numeric IPv4 or IPv6 address.
-///
-/// Supersedes `Curl_host_is_ipnum` (`lib/hostip.c:783-796`), which is two
-/// `curlx_inet_pton` probes joined by `||`, and - byte for byte the same
-/// logic - `Curl_is_ipaddr` (`lib/curl_addrinfo.c:426-440`). The C tree
-/// carries both because they live in different translation units; there is
-/// no reason to carry two here, so [`is_ipaddr`] delegates.
-///
-/// The probes are curl's own parsers, not the standard library's. That
-/// matters for acceptance as well as for rendering: `crate::util::inet`
-/// reproduces curl's `inet_pton`, which is stricter than a permissive
-/// parser about leading zeroes and about trailing junk, and the strictness
-/// decides whether a host is treated as a literal or handed to a resolver.
-// No consumer yet; resolver.rs and show_resolve_info consume it.
 #[allow(dead_code)]
 pub(crate) fn host_is_ipnum(hostname: &[u8]) -> bool {
     pton4(hostname).is_some() || pton6(hostname).is_some()
@@ -954,32 +644,17 @@ pub(crate) fn host_is_ipnum(hostname: &[u8]) -> bool {
 /// Supersedes `Curl_is_ipaddr` (`lib/curl_addrinfo.c:426-440`). Delegates to
 /// [`host_is_ipnum`] because the two C functions are the same two probes; a
 /// second implementation could only drift.
-#[allow(dead_code)] // No consumer yet; resolver.rs consumes it.
+#[allow(dead_code)] // resolver.rs consumes it.
 pub(crate) fn is_ipaddr(address: &[u8]) -> bool {
     host_is_ipnum(address)
 }
 
 /// Builds one address from a numeric literal and a port.
 ///
-/// Supersedes `Curl_str2addr` (`lib/curl_addrinfo.c:407-423`) together with
-/// the `ip2addr` helper it calls (`:341-401`). IPv4 is tried first, then
-/// IPv6, and neither matching yields the C's own choice of code:
-/// `CURLE_BAD_FUNCTION_ARGUMENT`, commented *"bad input format"*. This is
-/// what the `CURLOPT_RESOLVE` loader calls for each address literal, and a
-/// failure there produces [`msg::address_illegal`].
-///
-/// `ip2addr` sets `ai_socktype = SOCK_STREAM` and copies the dotted text
-/// into `ai_canonname`, leaving `ai_protocol` and `ai_flags` at the zero its
-/// `calloc` produced. All four are reproduced, including the protocol being
-/// [`IpProto::Unspecified`] rather than [`IpProto::Tcp`] - that is a real
-/// difference from `get_localhost`, which sets `IPPROTO_TCP` explicitly, and
-/// eliding it would change what a filter chain observes.
-///
 /// # Errors
 ///
 /// [`CURLcode::BadFunctionArgument`] when `dotted` is neither an IPv4 nor an
 /// IPv6 literal.
-// No consumer yet; the CURLOPT_RESOLVE loader and resolver.rs.
 #[allow(dead_code)]
 pub(crate) fn str2addr(dotted: &[u8], port: u16) -> CodeResult<ResolvedAddr> {
     // The canonical name is the literal itself. It is only nameable when the
@@ -1007,29 +682,12 @@ pub(crate) fn str2addr(dotted: &[u8], port: u16) -> CodeResult<ResolvedAddr> {
 
 /// Builds one `AF_UNIX` address from a socket path.
 ///
-/// Supersedes `Curl_unix2addr` (`lib/curl_addrinfo.c:447-485`). C signals an
-/// over-long path through a `bool *longpath` out-parameter beside a NULL
-/// return, so that the caller can distinguish it from an allocation failure
-/// and report a different message. Rust needs neither: an over-long path is
-/// the only failure mode left, so it is the only error this returns, and the
-/// out-parameter disappears.
-///
-/// The bound is C's: `strlen(path) + 1 > sizeof(sun_path)`, so the path plus
-/// its terminator must fit in [`UNIX_PATH_MAX`]. An abstract socket's name
-/// starts at offset one of `sun_path`, which C arranges by copying
-/// `path_len - 1` bytes to `sun_path + 1`; the leading zero is the name, not
-/// padding, so the length available is unchanged and `abstract_ns` is
-/// recorded rather than folded into the path.
-///
-/// This is the reason a [`DnsEntry`]'s hostname may be empty: C's comment at
-/// `lib/hostip.h:67` says the name *"may be NULL (Unix domain sockets)"*.
-///
 /// # Errors
 ///
 /// [`CURLcode::BadFunctionArgument`] when the path does not fit. C's caller
 /// turns `longpath` into its own diagnostic, which is why no message is
 /// emitted here.
-#[allow(dead_code)] // No consumer yet; conn/socket.rs consumes it.
+#[allow(dead_code)] // conn/socket.rs consumes it.
 pub(crate) fn unix2addr(
     path: &Path,
     abstract_ns: bool,
@@ -1075,49 +733,12 @@ pub(crate) fn unix2addr(
 /// return curl_msnprintf(&ptr[len], 7, ":%u", port) + len;
 /// ```
 ///
-/// so the key is `<ascii-lowercased-truncated-host>:<port>`.
-///
-/// # The lowercasing is required, not cosmetic
-///
-/// `Curl_dnscache_init` builds the table with `Curl_hash_str` and
-/// `curlx_str_key_compare` (`lib/hostip.c:1270-1271`), and that comparator
-/// is **case-sensitive** - it is an exact-length byte comparison.
-/// Case-insensitive lookup is therefore achieved by normalising at the call
-/// site, which is exactly what this function is. The folding is ASCII-only,
-/// through [`crate::util::strcase::strntolower`], whose `raw_tolower` is the
-/// identity for every byte in `0x80..=0xFF`. Using Rust's Unicode-aware
-/// lowercasing instead would change *which hostnames collide in the cache*:
-/// it would fold `U+0130` and other non-ASCII letters, and it can change a
-/// string's length. That is a correctness requirement.
-///
-/// # The truncation is observable
-///
-/// A host longer than [`MAX_HOSTCACHE_HOST_LEN`] is cut to exactly 255
-/// bytes, so two hosts differing only after byte 255 share a cache entry.
-/// That is C's behaviour and it is reproduced rather than repaired: a
-/// hostname that long is invalid under RFC 1035 anyway, and "repairing" it
-/// would make this cache disagree with curl's.
-///
-/// # The trailing NUL: a decision, not an accident
-///
-/// Every lookup, insert and delete in C passes `entry_len + 1`, deliberately
-/// **including the terminator** (`lib/hostip.c:392`, `:399`, `:413`, `:439`,
-/// `:633`, `:660`). The key returned here omits it. That is safe and is
-/// chosen on three grounds. A [`Vec<u8>`] carries its own length, so the
-/// separator the NUL provided in C is structural here. The comparator is an
-/// exact-length byte comparison, so a byte appended to every key uniformly
-/// cannot change which keys collide. And there is no persisted, on-disk or
-/// cross-process DNS-cache format anywhere in curl - the cache lives and
-/// dies with a multi or share handle - so no external consumer can observe
-/// the difference. Were a serialised format ever added, appending `0u8` here
-/// would restore byte-for-byte parity with C in one line.
-///
 /// # Panics
 ///
 /// Never. `nlen` is expressed as the caller passing the exact byte slice it
 /// means, which removes C's `nlen ? nlen : strlen(name)` branch along with
 /// the class of defect where the two disagree.
-#[allow(dead_code)] // No consumer yet; The cache and the loader consume it.
+#[allow(dead_code)] // The cache and the loader consume it.
 pub(crate) fn create_dnscache_id(host: &[u8], port: u16) -> Vec<u8> {
     // `if(len > (buflen - 7)) len = buflen - 7;`
     let len = host.len().min(MAX_HOSTCACHE_HOST_LEN);
@@ -1147,13 +768,7 @@ pub(crate) fn create_dnscache_id(host: &[u8], port: u16) -> Vec<u8> {
 }
 
 /// The cache key for the wildcard entry `CURLOPT_RESOLVE`'s `*` creates.
-///
-/// C forms it with `create_dnscache_id("*", 1, port, ...)`
-/// (`lib/hostip.c:396`), passing an explicit length of one. Named here so
-/// that the two call sites - the wildcard lookup in [`DnsCache::fetch_addr`]
-/// and the wildcard insert in [`load_host_pairs`] - cannot disagree about
-/// what the wildcard host is.
-#[allow(dead_code)] // No consumer yet; fetch_addr and the loader consume it.
+#[allow(dead_code)] // fetch_addr and the loader consume it.
 pub(crate) fn wildcard_dnscache_id(port: u16) -> Vec<u8> {
     create_dnscache_id(WILDCARD_HOST, port)
 }
@@ -1163,7 +778,6 @@ pub(crate) fn wildcard_dnscache_id(port: u16) -> Vec<u8> {
 /// `lib/hostip.c:1463` tests the parsed host with
 /// `curlx_str_casecompare(&source, "*")`, and `:396` looks the entry up
 /// under the one-byte name `"*"`.
-// No consumer yet; read by the wildcard key and its test.
 #[allow(dead_code)]
 const WILDCARD_HOST: &[u8] = b"*";
 
@@ -1173,7 +787,7 @@ const WILDCARD_HOST: &[u8] = b"*";
 /// buffer, so the C allocates nothing here. A five-byte array plus a length
 /// is the same trade, and it keeps [`create_dnscache_id`] free of a
 /// temporary [`String`] on a path that runs once per lookup.
-#[allow(dead_code)] // No consumer yet; Read by create_dnscache_id.
+#[allow(dead_code)] // Read by create_dnscache_id.
 fn itoa_u16(value: u16) -> impl AsRef<str> {
     /// Five digits is the widest a `u16` can be: 65535.
     struct Decimal {
@@ -1235,41 +849,19 @@ fn itoa_u16(value: u16) -> impl AsRef<str> {
 /// };
 /// ```
 ///
-/// # `refcount` is [`Arc`], not a field
-///
-/// The counter is gone. `Curl_resolv_unlink` (`lib/hostip.c:1242-1254`) and
-/// `dnscache_entry_dtor` (`:1256-1263`) both decrement and free at zero, and
-/// `dnscache_entry_free` (`:184-194`) releases the address list, then the
-/// HTTPS-RR record, then the entry itself. Every one of those becomes
-/// [`Arc`] plus `Drop`. **Nothing here needs a manual free and none may be
-/// added**: an entry the cache still holds and a caller still holds is one
-/// `Arc` with two owners, and it disappears when the second of them does.
-/// Handles are [`DnsEntryRef`].
-///
-/// # `hostname` is a `String` that may be empty
-///
-/// C's flexible array is always present, and the code tests `dns->hostname[0]`
-/// rather than the pointer - at `lib/hostip.c:131-134` to decide whether to
-/// print anything, and at `:138-139` to substitute `"(none)"`. The empty
-/// string is therefore the faithful representation of the comment's *"may be
-/// NULL (Unix domain sockets)"* case, and an [`Option`] would force every
-/// consumer to re-decide which of `None` and `Some("")` C meant.
-///
 /// # The HTTPS-RR slot
 ///
-/// C carries `struct Curl_https_rrinfo *hinfo` under `USE_HTTPSRR`; in Rust
-/// the handling is unconditional, so the field takes no `cfg`. Its type is
-/// owned by [`httpsrr`], which arrived with the field, so nothing here
-/// duplicates a definition that file would then have to displace - the drift
-/// AAP 0.1.2 forbids.
+/// C carries `struct Curl_https_rrinfo *hinfo` under `USE_HTTPSRR`; here the
+/// handling is unconditional, so the field takes no `cfg`. Its type is owned by
+/// [`httpsrr`], so nothing here duplicates a definition that module would then
+/// have to displace.
 ///
-/// The addition is additive in the strict sense: nothing in this module
-/// reads `hinfo`, because nothing in `lib/hostip.c` does either beyond
-/// freeing it (`:188-190`). Its writer is the DoH path
+/// Nothing in this module reads `hinfo`, because nothing in `lib/hostip.c` does
+/// either beyond freeing it (`:188-190`). Its writer is the DoH path
 /// (`lib/doh.c:1274`) and its reader is the HTTPS connection filter
 /// (`lib/cf-https-connect.c:670`), so this struct only carries it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // No consumer yet; resolver.rs and conn/ consume it.
+#[allow(dead_code)] // resolver.rs and conn/ consume it.
 pub(crate) struct DnsEntry {
     /// C's `addr`. **Empty means a negative entry**, which is what
     /// `store_negative_resolve` (`lib/hostip.c:822-845`) inserts after a
@@ -1291,14 +883,6 @@ pub(crate) struct DnsEntry {
     /// C's `hinfo`, unconditional here. Released by `Drop`, which is what
     /// replaces `dnscache_entry_free`'s explicit `Curl_httpsrr_cleanup` plus
     /// `curlx_free` pair (`lib/hostip.c:188-190`).
-    ///
-    /// [`None`] is C's `NULL`: the entry was resolved without an HTTPS
-    /// record, which is every entry [`DnsCache::mk_entry`] builds -- C's
-    /// `Curl_dnscache_mk_entry` leaves the field as its `calloc` found it
-    /// and the DoH path fills it in afterwards (`lib/doh.c:1274`).
-    ///
-    /// Boxed because the record is several times the size of the rest of this
-    /// struct and almost always absent, so the common entry stays small.
     pub(crate) hinfo: Option<Box<httpsrr::HttpsRrInfo>>,
 }
 
@@ -1308,7 +892,7 @@ impl DnsEntry {
     /// `lib/hostip.h:61`: *"timestamp == 0 -- permanent CURLOPT_RESOLVE
     /// entry (does not time out)"*, tested in the C as
     /// `if(dns->timestamp.tv_sec || dns->timestamp.tv_usec)`.
-    #[allow(dead_code)] // No consumer yet; Read by DnsEntry::staleness.
+    #[allow(dead_code)] // Read by DnsEntry::staleness.
     pub(crate) fn is_permanent(&self) -> bool {
         self.timestamp.is_zero()
     }
@@ -1318,7 +902,6 @@ impl DnsEntry {
     /// C's `if(!dns->addr)`. Named because it appears in two places with two
     /// different meanings: it doubles the ageing rate here, and it is what
     /// makes `resolver.rs` report [`msg::NEGATIVE_ENTRY`] on a cache hit.
-    // No consumer yet; read by staleness and by resolver.rs.
     #[allow(dead_code)]
     pub(crate) fn is_negative(&self) -> bool {
         self.addrs.is_empty()
@@ -1329,20 +912,12 @@ impl DnsEntry {
     /// The linear scan of `fetch_addr`'s fourth step
     /// (`lib/hostip.c:428-435`), which walks `ai_next` looking for a single
     /// match and stops at the first.
-    #[allow(dead_code)] // No consumer yet; Read by DnsCache::fetch_addr.
+    #[allow(dead_code)] // Read by DnsCache::fetch_addr.
     pub(crate) fn has_family(&self, family: AddressFamily) -> bool {
         self.addrs.iter().any(|addr| addr.family() == family)
     }
 
     /// The staleness decision, and the age that fed it.
-    ///
-    /// Supersedes `dnscache_entry_is_stale` (`lib/hostip.c:258-275`), whose
-    /// contract is stated in its own comment at `:255-257`: *"Returning
-    /// non-zero means remove the entry, return 0 to keep it in the cache."*
-    /// The returned [`Staleness`] carries both halves of what C's callback
-    /// communicated - its `int` return and the `oldest_ms` it wrote back
-    /// through the shared `struct dnscache_prune_data` (`:246-250`) - so the
-    /// scratch struct disappears without losing anything.
     ///
     /// The four steps, in C's order:
     ///
@@ -1362,15 +937,7 @@ impl DnsEntry {
     ///    returned first. `oldest` is consequently the age of the oldest
     ///    entry still in the cache, which is exactly what
     ///    [`DnsCache::prune`] needs to halve.
-    ///
-    /// The multiplication in step 3 saturates. C's `timediff_t` is a signed
-    /// 64-bit integer and doubling it can overflow only for an age of more
-    /// than 146 million years, where C would wrap into a negative value and
-    /// wrongly keep the entry; saturating keeps it stale instead, which is
-    /// the answer the code plainly intends. The divergence is unreachable
-    /// from any clock this crate can read and is recorded rather than left
-    /// implicit.
-    #[allow(dead_code)] // No consumer yet; Read by DnsCache::prune_once.
+    #[allow(dead_code)] // Read by DnsCache::prune_once.
     pub(crate) fn staleness(
         &self,
         now: CurlTime,
@@ -1401,7 +968,7 @@ impl DnsEntry {
     ///
     /// The `int` half of C's callback return, for the callers that do not
     /// need the age.
-    #[allow(dead_code)] // No consumer yet; Read by DnsCache::fetch_addr.
+    #[allow(dead_code)] // Read by DnsCache::fetch_addr.
     pub(crate) fn is_stale(&self, now: CurlTime, max_age_ms: TimeDiff) -> bool {
         self.staleness(now, max_age_ms).is_remove()
     }
@@ -1414,7 +981,7 @@ impl DnsEntry {
 /// rule of [`DnsEntry::staleness`] a property of the type rather than of the
 /// order two statements happen to appear in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // No consumer yet; Returned by DnsEntry::staleness.
+#[allow(dead_code)] // Returned by DnsEntry::staleness.
 pub(crate) enum Staleness {
     /// C's `return FALSE` - keep the entry. `age_ms` is the age that
     /// [`DnsCache::prune`] folds into `oldest`, and is zero for a permanent
@@ -1426,13 +993,12 @@ pub(crate) enum Staleness {
 
 impl Staleness {
     /// True for [`Staleness::Remove`], which is C's non-zero return.
-    #[allow(dead_code)] // No consumer yet; Read by DnsEntry::is_stale.
+    #[allow(dead_code)] // Read by DnsEntry::is_stale.
     pub(crate) const fn is_remove(self) -> bool {
         matches!(self, Self::Remove { .. })
     }
 
     /// The age this decision measured, in milliseconds.
-    // No consumer yet; share/ reports the oldest age through it.
     #[allow(dead_code)]
     pub(crate) const fn age_ms(self) -> TimeDiff {
         match self {
@@ -1442,13 +1008,7 @@ impl Staleness {
 }
 
 /// A shared handle on a cache entry.
-///
-/// C's `struct Curl_dns_entry *` with its manual `refcount`. Every C
-/// function that hands one out increments the counter and documents that
-/// *"The returned data *MUST* be 'released' with Curl_resolv_unlink() after
-/// use, or we will leak memory!"* (`lib/hostip.h:81-82`, `:172-173`). Here
-/// the release is [`Drop`], so the warning has nothing to warn about.
-#[allow(dead_code)] // No consumer yet; resolver.rs and conn/ consume it.
+#[allow(dead_code)] // resolver.rs and conn/ consume it.
 pub(crate) type DnsEntryRef = Arc<DnsEntry>;
 
 /// The value `CURLOPT_DNS_CACHE_TIMEOUT` takes to mean "never expire".
@@ -1457,19 +1017,10 @@ pub(crate) type DnsEntryRef = Arc<DnsEntry>;
 /// (forever)"* and both `Curl_dnscache_prune` (`:330`) and `fetch_addr`
 /// (`:408`) test for exactly `-1` rather than for any negative value. The
 /// literal is named so that neither test can be written as `< 0` by mistake.
-// No consumer yet; read by prune, fetch_addr and easy/setopt.
 #[allow(dead_code)]
 pub(crate) const DNS_CACHE_TIMEOUT_FOREVER: TimeDiff = -1;
 
 /// The DNS cache: hostname and port to addresses.
-///
-/// Supersedes `struct Curl_dnscache` (`lib/hostip.h:71-73`), which is one
-/// `struct Curl_hash entries` built by `Curl_dnscache_init`
-/// (`lib/hostip.c:1268-1272`) with `Curl_hash_str` as its hash,
-/// `curlx_str_key_compare` as its comparator and `dnscache_entry_dtor` as its
-/// destructor. All three become properties of the Rust types:
-/// [`crate::util::hash::StrHash`] carries the first two, and the third is
-/// [`Arc`]'s `Drop`.
 ///
 /// # No interior locking - read this before adding a `Mutex`
 ///
@@ -1495,30 +1046,12 @@ pub(crate) const DNS_CACHE_TIMEOUT_FOREVER: TimeDiff = -1;
 /// interior mutability and implement the caller's `CURLSHOPT_LOCKFUNC`
 /// contract. A lock inside this type would double-lock the shared case and
 /// would put the policy in the module that cannot see the `specifier` bit.
-///
-/// The selection itself - share, else multi, else none - also belongs
-/// outside. `crate::easy` and `crate::multi` own the handles; a missing cache
-/// is what makes C return `CURLE_FAILED_INIT` from `Curl_dnscache_add`
-/// (`:651`) and `Curl_loadhostpairs` (`:1286`), and those codes are produced
-/// by the caller that discovers the absence, not by this type.
-///
-/// # Ordering
-///
-/// [`Self::prune`] is order-independent; the module documentation records the
-/// full argument and the reason an LRU must not replace it.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // No consumer yet; multi/ and share/ own an instance.
+#[allow(dead_code)] // multi/ and share/ own an instance.
 pub(crate) struct DnsCache {
     /// C's `struct Curl_hash entries`, keyed by [`create_dnscache_id`].
     entries: StrHash<DnsEntryRef>,
     /// C's `data->state.wildcard_resolve` (`lib/hostip.c:1287`, `:395`).
-    ///
-    /// It lives here rather than on a transfer's state because it describes
-    /// the cache's contents: it is set by [`load_host_pairs`] when a
-    /// `CURLOPT_RESOLVE` entry named `*`, and read by [`Self::fetch_addr`] to
-    /// decide whether a miss is worth a second lookup. Keeping the flag with
-    /// the entries it describes is what stops the two from disagreeing after
-    /// a [`Self::clear`].
     wildcard_resolve: bool,
 }
 
@@ -1528,7 +1061,7 @@ impl DnsCache {
     /// C's `Curl_dnscache_init(dns, size)` takes a slot-count hint, which
     /// `Curl_hash_init` uses to size its bucket array. Use
     /// [`Self::with_size`] when a hint is meaningful.
-    #[allow(dead_code)] // No consumer yet; The owning handle constructs it.
+    #[allow(dead_code)] // The owning handle constructs it.
     pub(crate) fn new() -> Self {
         Self {
             entries: StrHash::new(),
@@ -1542,7 +1075,6 @@ impl DnsCache {
     /// is a bucket count; here it is a capacity hint, which is the closest
     /// faithful reading - both exist to avoid rehashing a cache whose
     /// expected population is known.
-    // No consumer yet; multi/ sizes the cache at handle init.
     #[allow(dead_code)]
     pub(crate) fn with_size(size: usize) -> Self {
         Self {
@@ -1555,19 +1087,19 @@ impl DnsCache {
     ///
     /// C's `Curl_hash_count(&dnscache->entries)`, which
     /// `Curl_dnscache_prune` compares against [`MAX_DNS_CACHE_SIZE`].
-    #[allow(dead_code)] // No consumer yet; Read by DnsCache::prune.
+    #[allow(dead_code)] // Read by DnsCache::prune.
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True when the cache holds nothing.
-    #[allow(dead_code)] // No consumer yet; share/ reports emptiness through it.
+    #[allow(dead_code)] // share/ reports emptiness through it.
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Whether a `CURLOPT_RESOLVE` wildcard entry is in force.
-    #[allow(dead_code)] // No consumer yet; resolver.rs reads the flag.
+    #[allow(dead_code)] // resolver.rs reads the flag.
     pub(crate) fn wildcard_resolve(&self) -> bool {
         self.wildcard_resolve
     }
@@ -1579,7 +1111,6 @@ impl DnsCache {
     /// the entries, because the entry it described is one of the entries
     /// being removed - leaving it set would make [`Self::fetch_addr`] perform
     /// a second lookup that can no longer succeed.
-    // No consumer yet; share/ backs CURLSHOPT_UNSHARE with it.
     #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
@@ -1587,14 +1118,7 @@ impl DnsCache {
     }
 
     /// Removes one entry by key, returning it when it was present.
-    ///
-    /// C's `Curl_hash_delete(&dnscache->entries, entry_id, entry_len + 1)`,
-    /// whose return is `void` and whose callers all ignore whether anything
-    /// was there - `Curl_loadhostpairs` comments *"delete entry, ignore if it
-    /// did not exist"* (`lib/hostip.c:1319`). The value is returned here
-    /// anyway, because a caller that wants to know can now ask and the tests
-    /// below do.
-    #[allow(dead_code)] // No consumer yet; Read by fetch_addr and the loader.
+    #[allow(dead_code)] // Read by fetch_addr and the loader.
     pub(crate) fn remove(&mut self, key: &[u8]) -> Option<DnsEntryRef> {
         self.entries.remove(key)
     }
@@ -1613,17 +1137,7 @@ impl DnsCache {
     ///   into a Rust map does not report allocation failure; the process
     ///   aborts instead. Nothing is lost, because there is no recovery path
     ///   in C either beyond propagating the code.
-    ///
-    /// `entry->refcount++` becomes cloning the [`Arc`], which is what
-    /// returning the handle while the map keeps its own does.
-    ///
-    /// The key is built from the entry's own `hostname` and `hostport`, as
-    /// C's `create_dnscache_id(entry->hostname, 0, entry->hostport, ...)`
-    /// does with an explicit zero length so that `strlen` supplies it.
-    ///
-    /// Returns the previous entry for this key when one was replaced, which
-    /// C's `Curl_hash_add` also does implicitly by destroying it.
-    #[allow(dead_code)] // No consumer yet; Read by DnsCache::add_addrs.
+    #[allow(dead_code)] // Read by DnsCache::add_addrs.
     pub(crate) fn add(&mut self, entry: DnsEntry) -> DnsEntryRef {
         let key = create_dnscache_id(entry.hostname.as_bytes(), entry.hostport);
         let shared: DnsEntryRef = Arc::new(entry);
@@ -1645,15 +1159,6 @@ impl DnsCache {
     /// > takes ownership of `addr`, even in case of failure, and always
     /// > clears `*paddr`. It makes a copy of `hostname`.
     ///
-    /// Two clauses of that contract vanish in Rust rather than being
-    /// emulated. "Takes ownership ... and always clears `*paddr`" is what
-    /// passing `addrs` by value already means, so there is no out-parameter
-    /// to clear and no way for a caller to keep a stale alias to a freed
-    /// list. "Makes a copy of `hostname`" is likewise the meaning of taking a
-    /// [`String`]. A caller that wants to build without inserting uses
-    /// [`Self::mk_entry`] and then [`Self::add`], which is C's split
-    /// preserved.
-    ///
     /// # Errors
     ///
     /// Whatever the entropy source reports when shuffling is requested. C
@@ -1661,7 +1166,7 @@ impl DnsCache {
     /// see [`shuffle_addrs`] for what replaces that.
     // Seven parameters: C's own five plus the clock and entropy seams that
     // replace its `struct Curl_easy *data`. The threshold is nine.
-    #[allow(dead_code)] // No consumer yet; resolver.rs and the loader.
+    #[allow(dead_code)] // resolver.rs and the loader.
     pub(crate) fn add_addrs(
         &mut self,
         hostname: &str,
@@ -1680,23 +1185,11 @@ impl DnsCache {
 
     /// Builds an entry without inserting it.
     ///
-    /// Supersedes `Curl_dnscache_mk_entry` (`lib/hostip.c:560-608`). The
-    /// order of the two steps is C's and matters: **the shuffle happens
-    /// first**, before the entry exists, because C shuffles through the
-    /// `paddr` out-parameter and bails out of entry creation entirely if it
-    /// fails (`:571-576`).
-    ///
-    /// `permanent` selects the timestamp, exactly as `:590-596` does: the
-    /// all-zero reading for a permanent entry - C writes both fields
-    /// explicitly and comments each *"an entry that never goes stale"* - and
-    /// otherwise the current instant from the **injected** clock, which is
-    /// C's `*Curl_pgrs_now(data)`.
-    ///
     /// # Errors
     ///
     /// Whatever the entropy source reports when shuffling is requested.
     // Seven parameters, as [`Self::add_addrs`] explains.
-    #[allow(dead_code)] // No consumer yet; resolver.rs builds then inserts.
+    #[allow(dead_code)] // resolver.rs builds then inserts.
     pub(crate) fn mk_entry(
         hostname: &str,
         port: u16,
@@ -1739,13 +1232,6 @@ impl DnsCache {
     /// `dnscache_lock` then [`Self::fetch_addr`] then `dns->refcount++` then
     /// `dnscache_unlock`. The locking is `crate::share`'s, and the reference
     /// count is the [`Arc`] clone this returns.
-    ///
-    /// C's documentation of why this exists is worth keeping: *"Curl_resolv()
-    /// checks initially and multi_runsingle() checks each time it discovers
-    /// the handle in the state WAITRESOLVE whether the hostname has already
-    /// been resolved ... This short circuits waiting for a lot of pending
-    /// lookups for the same hostname requested by different handles."*
-    // No consumer yet; resolver.rs performs the cache lookup.
     #[allow(dead_code)]
     pub(crate) fn get(
         &mut self,
@@ -1776,18 +1262,7 @@ impl DnsCache {
     /// 4. **On a hit, and only when a specific family was requested**, scan
     ///    for it. Its absence produces [`msg::FAMILY_ZAPPED`] and a delete
     ///    (`:417-441`).
-    ///
-    /// # The subtlety in steps 3 and 4
-    ///
-    /// Both delete using `entry_id`, which is **the last key computed** -
-    /// C reuses one stack buffer and step 2 overwrote it. So when the
-    /// wildcard path supplied the hit, it is the **wildcard entry** that gets
-    /// zapped, not the exact-host entry that was never there. That is
-    /// measured, not inferred, and it is reproduced here by tracking which
-    /// key produced the hit. It also happens to be the only sensible
-    /// behaviour: deleting the exact key would remove nothing and leave the
-    /// stale wildcard entry to be found again on the next lookup.
-    #[allow(dead_code)] // No consumer yet; Read by DnsCache::get.
+    #[allow(dead_code)] // Read by DnsCache::get.
     pub(crate) fn fetch_addr(
         &mut self,
         hostname: &[u8],
@@ -1873,10 +1348,7 @@ impl DnsCache {
     ///   Permanent entries survive any limit, so a cache holding more than
     ///   [`MAX_DNS_CACHE_SIZE`] permanent entries stays over the cap rather
     ///   than looping forever - which is also exactly what C does.
-    ///
-    /// Returns the age in milliseconds of the oldest surviving entry, which
-    /// is `dnscache_prune`'s own return value.
-    #[allow(dead_code)] // No consumer yet; multi/ prunes between transfers.
+    #[allow(dead_code)] // multi/ prunes between transfers.
     pub(crate) fn prune(
         &mut self,
         max_age_ms: TimeDiff,
@@ -1909,20 +1381,7 @@ impl DnsCache {
     }
 
     /// One full scan, removing every stale entry.
-    ///
-    /// Supersedes `dnscache_prune` (`lib/hostip.c:280-296`), which fills a
-    /// `struct dnscache_prune_data` and hands it to
-    /// `Curl_hash_clean_with_criterium`. That struct is not reproduced: its
-    /// `now` and `max_age_ms` are parameters, and its `oldest_ms` is the
-    /// return value, so a mutable scratch record shared with a callback
-    /// becomes a captured local.
-    ///
-    /// [`crate::util::hash::StrHash::clean_with_criterium`] keeps **curl's
-    /// polarity**, where the predicate returning `true` means REMOVE. That is
-    /// the opposite of [`std::collections::HashMap::retain`], and the single
-    /// inversion lives inside that method so a transliterated consumer such
-    /// as this one is correct without having to notice.
-    #[allow(dead_code)] // No consumer yet; Read by DnsCache::prune.
+    #[allow(dead_code)] // Read by DnsCache::prune.
     fn prune_once(&mut self, max_age_ms: TimeDiff, now: CurlTime) -> TimeDiff {
         let mut oldest_ms: TimeDiff = 0;
         self.entries.clean_with_criterium(|entry| {
@@ -1944,16 +1403,6 @@ impl DnsCache {
 
 /// The synthesised address list for a loopback name.
 ///
-/// Supersedes the pair `get_localhost` (`lib/hostip.c:708-745`) and
-/// `get_localhost6` (`:671-702`), which C keeps apart only because the second
-/// is compiled out without IPv6. Both build a `SOCK_STREAM` /`IPPROTO_TCP`
-/// entry carrying the requested port and setting `ai_canonname` to the
-/// requested name. IPv6 zeroes `sin6_flowinfo` and `sin6_scope_id`
-/// explicitly (`:685-688`) and IPv4 `memset`s the whole `sockaddr_in` to
-/// clear `sin_zero` (`:719-720`) - all of which
-/// [`std::net::SocketAddr`] already guarantees, since it has no
-/// uninitialised padding to leak.
-///
 /// # The order is IPv6 first, and it is behaviour
 ///
 /// `lib/hostip.c:741-745` is the whole of it:
@@ -1965,26 +1414,6 @@ impl DnsCache {
 /// ca6->ai_next = ca;
 /// return ca6;
 /// ```
-///
-/// The IPv6 entry is prepended, so **`::1` is first and `127.0.0.1` is
-/// second**, and if IPv6 synthesis fails only the IPv4 entry is returned.
-/// This is not cosmetic: `conn/happy_eyeballs.rs`, superseding
-/// `lib/cf-ip-happy.c`, races the families in list order, so reversing these
-/// two would change which family a `localhost` connection prefers. Preserved
-/// exactly.
-///
-/// Synthesis cannot fail here - C's only failure mode was `calloc` returning
-/// NULL - so the IPv4-only outcome is unreachable and the return is a plain
-/// [`Vec`] rather than a [`Result`]. That is recorded rather than silently
-/// simplified, because a reader comparing against the C will look for the
-/// missing branch.
-///
-/// Which names trigger this is `Curl_resolv`'s decision and therefore
-/// `resolver.rs`'s: C matches `"localhost"`, `"localhost."`, any
-/// `*.localhost` and any `*.localhost.`, all case-insensitively
-/// (`lib/hostip.c:938-944`). The synthesis lives here because the addresses
-/// do.
-// No consumer yet; resolver.rs decides which names trigger it.
 #[allow(dead_code)]
 pub(crate) fn localhost_addrs(port: u16, name: &str) -> Vec<ResolvedAddr> {
     let canonname = Some(name.to_owned());
@@ -2020,16 +1449,7 @@ pub(crate) fn localhost_addrs(port: u16, name: &str) -> Vec<ResolvedAddr> {
 /// }
 /// return CURLE_OK;
 /// ```
-///
-/// It is a trait rather than a free function for two reasons that AAP 0.3.3
-/// P12 makes non-negotiable. A unit test must be able to state that IPv6 does
-/// not work without disabling it on the host, which is what
-/// [`DnsCache::fetch_addr`]'s family filtering and
-/// [`can_resolve_ip_version`] need in order to be tested at all. And Miri
-/// cannot perform a real syscall, so a test of anything above this line would
-/// otherwise have to be excluded from the Miri gate - the seam is what keeps
-/// it in.
-#[allow(dead_code)] // No consumer yet; resolver.rs consumes it.
+#[allow(dead_code)] // resolver.rs consumes it.
 pub(crate) trait Ipv6Probe: fmt::Debug {
     /// True when a `PF_INET6` datagram socket could be created.
     ///
@@ -2042,17 +1462,8 @@ pub(crate) trait Ipv6Probe: fmt::Debug {
 }
 
 /// The production [`Ipv6Probe`]: it really opens a socket.
-///
-/// Uses `socket2`, which is what AAP 0.8.5 conflict C3 prescribes so that no
-/// `unsafe` block and no `libc` name is needed for a socket option or a
-/// socket creation. `Domain::IPV6` and `Type::DGRAM` are the crate's spellings
-/// of `PF_INET6` and `SOCK_DGRAM`, and the socket closes when the value is
-/// dropped, which is `sclose(s)`.
-///
-/// C passes `0` as the protocol, meaning "the default for this type"; that is
-/// `socket2`'s `None`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)] // No consumer yet; multi/ wires it in at handle init.
+#[allow(dead_code)] // multi/ wires it in at handle init.
 pub(crate) struct SocketIpv6Probe;
 
 impl Ipv6Probe for SocketIpv6Probe {
@@ -2096,7 +1507,6 @@ impl Ipv6Probe for SocketIpv6Probe {
 /// knows IPv6 is absent should be able to say so without a syscall. It is
 /// also what makes every test above this line runnable under Miri.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-// No consumer yet; resolver.rs and the tests below wire it in.
 #[allow(dead_code)]
 pub(crate) struct FixedIpv6Probe(pub(crate) CodeResult<bool>);
 
@@ -2113,22 +1523,15 @@ impl Ipv6Probe for FixedIpv6Probe {
 /// that IPv6 status does not come and go during a program's lifetime so we
 /// only probe the first time and then we have the info kept for fast
 /// reuse."* `Curl_ipv6works` (`:771-776`) is then a plain field read.
-///
-/// The memoisation is an [`OnceLock`] **owned by the handle that owns this
-/// value**, never a process-global. That distinction is the one
-/// `crate::util::timeval` draws for its own baseline: written once and never
-/// again is immutable shared state, which is not what AAP 0.3.3 P12
-/// prohibits. A `static mut`, a `lazy_static`-style singleton or anything a
-/// second handle could observe would be.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // No consumer yet; multi/ owns one per handle.
+#[allow(dead_code)] // multi/ owns one per handle.
 pub(crate) struct Ipv6Support {
     works: OnceLock<bool>,
 }
 
 impl Ipv6Support {
     /// An unprobed instance.
-    #[allow(dead_code)] // No consumer yet; The owning handle constructs it.
+    #[allow(dead_code)] // The owning handle constructs it.
     pub(crate) fn new() -> Self {
         Self {
             works: OnceLock::new(),
@@ -2136,7 +1539,6 @@ impl Ipv6Support {
     }
 
     /// One with the answer already known, probing never.
-    // No consumer yet; resolver.rs and the tests construct it.
     #[allow(dead_code)]
     pub(crate) fn known(works: bool) -> Self {
         let cell = OnceLock::new();
@@ -2149,9 +1551,6 @@ impl Ipv6Support {
 
     /// The answer, probing at most once.
     ///
-    /// Supersedes `Curl_ipv6works` (`lib/hostip.c:771-776`) over
-    /// `Curl_probeipv6` (`:752-766`).
-    ///
     /// # Errors
     ///
     /// Whatever the probe reports. Note that C sets `multi->ipv6_works =
@@ -2160,7 +1559,7 @@ impl Ipv6Support {
     /// believing IPv6 is unavailable. That is reproduced: the memoised value
     /// becomes `false` and the error still propagates, so a caller that
     /// ignores the code sees the same state C would have left behind.
-    #[allow(dead_code)] // No consumer yet; Read by can_resolve_ip_version.
+    #[allow(dead_code)] // Read by can_resolve_ip_version.
     pub(crate) fn works(&self, probe: &dyn Ipv6Probe) -> CodeResult<bool> {
         if let Some(known) = self.works.get() {
             return Ok(*known);
@@ -2179,7 +1578,6 @@ impl Ipv6Support {
     }
 
     /// The memoised answer without probing, when one has been taken.
-    // No consumer yet; resolver.rs reads it without probing.
     #[allow(dead_code)]
     pub(crate) fn cached(&self) -> Option<bool> {
         self.works.get().copied()
@@ -2196,19 +1594,10 @@ impl Ipv6Support {
 ///   return FALSE;
 /// ```
 ///
-/// C's `#elif defined(CURLRES_IPV4)` arm - where any `CURL_IPRESOLVE_V6`
-/// request fails outright - has no counterpart, because every mandated target
-/// has IPv6 and the build is never IPv4-only. Requesting
-/// [`IpVersion::V4`] or [`IpVersion::Whatever`] always proceeds.
-///
-/// The caller turns `false` into [`CURLcode::CouldntResolveHost`], which is
-/// what `Curl_resolv` does at `lib/hostip.c:951-955`; that lives in
-/// `resolver.rs` so that the diagnostic accompanies it.
-///
 /// # Errors
 ///
 /// Whatever [`Ipv6Support::works`] reports.
-#[allow(dead_code)] // No consumer yet; resolver.rs gates its lookup on it.
+#[allow(dead_code)] // resolver.rs gates its lookup on it.
 pub(crate) fn can_resolve_ip_version(
     ip_version: IpVersion,
     support: &Ipv6Support,
@@ -2221,10 +1610,6 @@ pub(crate) fn can_resolve_ip_version(
 }
 
 /// Shuffles an address list in place, Fisher-Yates.
-///
-/// Supersedes `Curl_shuffle_addr` (`lib/hostip.c:492-557`), which
-/// `CURLOPT_DNS_SHUFFLE_ADDRESSES` enables and which C annotates
-/// `@unittest: 1608` - so AAP 0.8.7 relocates that unit test into this file.
 ///
 /// The algorithm is reproduced exactly, including its direction and its
 /// modulus (`:533-537`):
@@ -2260,18 +1645,15 @@ pub(crate) fn can_resolve_ip_version(
 ///   with the order intact. The allocation failures themselves have no
 ///   counterpart.
 ///
-/// The entropy source is **injected**, per AAP 0.3.3 P12: a closure filling a
-/// caller-supplied buffer, which is C's `Curl_rand(data, buf, len)` with the
-/// handle replaced by whatever the closure captured. It is deliberately not a
-/// new trait - `crate::crypto::rand` already owns the crate's random-number
-/// seam, and a second abstraction here would fragment it - and deliberately
-/// not an import of that module, so that this file names no subsystem it does
-/// not depend on.
+/// The seam is deliberately not a new trait -- `crate::crypto::rand` already
+/// owns the crate's random-number seam, and a second abstraction here would
+/// fragment it -- and deliberately not an import of that module either, so
+/// that this file names no subsystem it does not depend on.
 ///
 /// # Errors
 ///
 /// Whatever the entropy source reports.
-#[allow(dead_code)] // No consumer yet; DnsCache::mk_entry consumes it.
+#[allow(dead_code)] // DnsCache::mk_entry consumes it.
 pub(crate) fn shuffle_addrs(
     addrs: &mut [ResolvedAddr],
     entropy: &mut dyn FnMut(&mut [u8]) -> CodeResult<()>,
@@ -2353,13 +1735,6 @@ pub(crate) fn shuffle_addrs(
 ///   each rendering [`msg::NONE`] when its accumulator is empty. The order is
 ///   the reverse of the slot order, which is exactly the sort of detail a
 ///   reimplementation gets wrong.
-///
-/// The `"was resolved."` line carries a trailing period and substitutes
-/// [`msg::NONE`] for an empty name (`:138-139`) - unreachable behind the
-/// gate above, and reproduced anyway because the gate and the substitution
-/// are two separate statements in the C and a future edit to one should not
-/// silently change the other.
-// No consumer yet; resolver.rs calls it once a lookup lands.
 #[allow(dead_code)]
 pub(crate) fn show_resolve_info(entry: &DnsEntry, tracer: &mut Tracer<'_>) {
     // `if(!data->set.verbose || !dns->hostname[0] ||
@@ -2380,14 +1755,6 @@ pub(crate) fn show_resolve_info(entry: &DnsEntry, tracer: &mut Tracer<'_>) {
 
     // `struct dynbuf out[2]`, each `curlx_dyn_init(&out[i], 1024)`. Index 0
     // is IPv4 and index 1 is IPv6, from `(a->ai_family != PF_INET)`.
-    //
-    // The 1024 is a CEILING, not a capacity: `curlx_dyn_init`'s second
-    // parameter is `toobig`, and crossing it is what produces the message
-    // below. Building these with the crate's own `DynBuf` rather than a bare
-    // `String` is what keeps the accounting identical, terminator byte
-    // included -- C's ceiling test is `fit > s->toobig` (`dynbuf.c:82`)
-    // where `fit = len + idx + 1`, glossed in the source itself as
-    // "new string + old string + zero byte" (`lib/curlx/dynbuf.c:72`).
     let mut lists = [
         DynBuf::new(SHOW_RESOLVE_BUDGET),
         DynBuf::new(SHOW_RESOLVE_BUDGET),
@@ -2426,13 +1793,7 @@ pub(crate) fn show_resolve_info(entry: &DnsEntry, tracer: &mut Tracer<'_>) {
 }
 
 /// One accumulated address list as text, or `"(none)"` when it is empty.
-///
-/// C's `(curlx_dyn_len(&out[i]) ? curlx_dyn_ptr(&out[i]) : "(none)")`
-/// (`lib/hostip.c:168`, `:172`). The bytes are always ASCII - they came from
-/// [`crate::util::inet`]'s converters and from `", "` - so the UTF-8 check
-/// cannot fail; it is written as a fallible conversion with a fall-back rather
-/// than an assertion because no path in this crate may panic on data.
-#[allow(dead_code)] // No consumer yet; read by show_resolve_info.
+#[allow(dead_code)] // read by show_resolve_info.
 fn rendered_list(list: &DynBuf) -> String {
     if list.is_empty() {
         return msg::NONE.to_owned();
@@ -2443,14 +1804,8 @@ fn rendered_list(list: &DynBuf) -> String {
 }
 
 /// Which endpoint a resolution failure names.
-///
-/// C's `const char *host_or_proxy` and the `CURLcode` beside it
-/// (`lib/hostip.c:1572-1584`). The two always travel together - the literal
-/// `"host"` accompanies `CURLE_COULDNT_RESOLVE_HOST` and `"proxy"`
-/// accompanies `CURLE_COULDNT_RESOLVE_PROXY` - so pairing them in one type
-/// removes the possibility of reporting one with the other's code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // No consumer yet; resolver.rs consumes it.
+#[allow(dead_code)] // resolver.rs consumes it.
 pub(crate) enum ResolveTarget {
     /// C's `"host"` with `CURLE_COULDNT_RESOLVE_HOST`.
     Host,
@@ -2461,7 +1816,7 @@ pub(crate) enum ResolveTarget {
 
 impl ResolveTarget {
     /// The literal C interpolates as the first `%s`.
-    #[allow(dead_code)] // No consumer yet; Read by resolver_error_message.
+    #[allow(dead_code)] // Read by resolver_error_message.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Host => "host",
@@ -2470,7 +1825,7 @@ impl ResolveTarget {
     }
 
     /// The code C returns alongside it.
-    #[allow(dead_code)] // No consumer yet; resolver.rs returns it.
+    #[allow(dead_code)] // resolver.rs returns it.
     pub(crate) const fn code(self) -> CURLcode {
         match self {
             Self::Host => CURLcode::CouldntResolveHost,
@@ -2500,7 +1855,7 @@ impl ResolveTarget {
 /// the `CURLOPT_ERRORBUFFER` interaction; the formatting lives here so that
 /// the conditional parenthesisation exists once. [`ResolveTarget::code`]
 /// supplies the code that accompanies it.
-#[allow(dead_code)] // No consumer yet; resolver.rs emits it.
+#[allow(dead_code)] // resolver.rs emits it.
 pub(crate) fn resolver_error_message(
     target: ResolveTarget,
     name: &str,
@@ -2517,10 +1872,7 @@ pub(crate) fn resolver_error_message(
 
 /// Pre-seeds the cache from `CURLOPT_RESOLVE`.
 ///
-/// Supersedes `Curl_loadhostpairs` (`lib/hostip.c:1279-1470`). **This syntax
-/// is frozen.** AAP 0.8.1 places CLI flag semantics outside this migration's
-/// authority, and `--resolve` maps straight onto this option, so no prefix may
-/// be added, no bound relaxed and no silent skip turned into an error.
+/// Supersedes `Curl_loadhostpairs` (`lib/hostip.c:1279-1470`).
 ///
 /// # The grammar, as measured
 ///
@@ -2531,10 +1883,6 @@ pub(crate) fn resolver_error_message(
 ///      host := '[' <up to 46 bytes> ']' | <up to 4096 bytes>
 ///   address := '[' <up to 46 bytes> ']' | <up to 4096 bytes>
 /// ```
-///
-/// with a port bounded by [`RESOLVE_PORT_MAX`] and each address literal
-/// bounded by [`RESOLVE_ADDRESS_MAX`] - 64 bytes, C's `char address[64]`,
-/// where **64 or more is an error and 63 is the longest accepted**.
 ///
 /// # The four behaviours a reimplementation gets wrong
 ///
@@ -2556,23 +1904,6 @@ pub(crate) fn resolver_error_message(
 ///
 /// # Two branches of the C that are deliberately absent
 ///
-/// C guards an IPv6 literal with `#ifndef USE_IPV6` and, in an IPv4-only
-/// build, reports `"Ignoring resolve address '%.*s', missing IPv6 support."`
-/// and skips it (`:1370-1378`). Every target in AAP 0.1.1 G8 has IPv6, so
-/// that branch is unreachable and is not implemented; the omission is
-/// recorded here rather than left for a reader to wonder about. Likewise
-/// C's `if(!dnscache) return CURLE_FAILED_INIT;` (`:1285-1286`) has no
-/// counterpart, because the cache is the receiver - the caller that selects
-/// between the share's cache and the multi's is the one that discovers the
-/// absence and returns that code.
-///
-/// # Reference counting
-///
-/// C creates each entry with a reference and then immediately drops it,
-/// commenting *"release the returned reference; the cache itself will keep the
-/// entry alive"* (`:1447-1450`). Here the handle [`DnsCache::add`] returns is
-/// simply not bound, which is the same thing.
-///
 /// # Errors
 ///
 /// [`CURLcode::SetoptOptionSyntax`] for a malformed ADD entry, after
@@ -2583,7 +1914,7 @@ pub(crate) fn resolver_error_message(
 /// here in practice: it is C's response to a failed allocation, and the only
 /// fallible step this path has is the address shuffle, which pre-seeding does
 /// not perform.
-#[allow(dead_code)] // No consumer yet; easy/ calls it before a transfer starts.
+#[allow(dead_code)] // easy/ calls it before a transfer starts.
 pub(crate) fn load_host_pairs<'a, I>(
     cache: &mut DnsCache,
     entries: I,
@@ -2620,7 +1951,7 @@ where
 ///
 /// `lib/hostip.c:1296-1323`. The bracketed form exists so that an IPv6
 /// literal, which contains colons, can be named unambiguously.
-#[allow(dead_code)] // No consumer yet; Read by load_host_pairs.
+#[allow(dead_code)] // Read by load_host_pairs.
 fn delete_host_pair(cache: &mut DnsCache, rest: &[u8]) {
     let mut cursor = rest;
 
@@ -2668,7 +1999,7 @@ fn delete_host_pair(cache: &mut DnsCache, rest: &[u8]) {
 /// `err:` label, which reports [`msg::resolve_unparsable`] and returns
 /// [`CURLcode::SetoptOptionSyntax`]; the two failures *at* the host are bare
 /// `continue`s, like the delete branch, and are reproduced as such.
-#[allow(dead_code)] // No consumer yet; Read by load_host_pairs.
+#[allow(dead_code)] // Read by load_host_pairs.
 fn add_host_pair(
     cache: &mut DnsCache,
     entry: &str,
@@ -2781,21 +2112,10 @@ fn add_host_pair(
 /// }
 /// ```
 ///
-/// `Curl_freeaddrinfo(head)` has no counterpart: the partially built list is
-/// an owned [`Vec`] that is dropped on the way out, so the leak this line
-/// exists to prevent cannot occur.
-///
-/// The return type is the caller's so that every failure site reads
-/// `return unparsable_entry(entry, tracer);` - one statement, with the
-/// message and the code inseparable. **The code is
-/// [`CURLcode::SetoptOptionSyntax`] and not
-/// [`CURLcode::BadFunctionArgument`]**; the two are easy to confuse and the C
-/// is unambiguous.
-///
 /// # Errors
 ///
 /// Always [`CURLcode::SetoptOptionSyntax`].
-#[allow(dead_code)] // No consumer yet; Read by add_host_pair.
+#[allow(dead_code)] // Read by add_host_pair.
 fn unparsable_entry(entry: &str, tracer: &mut Tracer<'_>) -> CodeResult<()> {
     failf!(tracer, "{}", msg::resolve_unparsable(entry));
     Err(CURLcode::SetoptOptionSyntax)
@@ -2821,7 +2141,7 @@ fn unparsable_entry(entry: &str, tracer: &mut Tracer<'_>) -> CodeResult<()> {
 /// into [`CURLcode::SetoptOptionSyntax`] with its message. The unit error is
 /// deliberate: there is exactly one failure outcome and inventing a richer
 /// one here would imply a distinction the frozen syntax does not make.
-#[allow(dead_code)] // No consumer yet; Read by add_host_pair.
+#[allow(dead_code)] // Read by add_host_pair.
 fn parse_resolve_addresses(
     cursor: &mut &[u8],
     port: u16,
@@ -2874,27 +2194,10 @@ fn parse_resolve_addresses(
 }
 
 /// The future a [`Resolver`] returns.
-///
-/// A boxed, pinned, `Send` future rather than `impl Future`, and the choice
-/// is forced rather than stylistic. `&dyn Resolver` is required - every
-/// consumer holds an injected resolver whose concrete type it must not know,
-/// which is the whole point of the seam - and a trait with a
-/// return-position `impl Trait` method is **not object-safe at any Rust
-/// version**, so `dyn Resolver` would not exist. Return-position `impl
-/// Trait` in traits did stabilise in exactly 1.75, the MSRV floor, so it was
-/// available; it was rejected on object safety, and the choice was confirmed
-/// by compiling this file with `cargo +1.75.0`.
-///
-/// `Send` is required because `resolver.rs` runs the blocking system resolver
-/// through `tokio::task::spawn_blocking`, and because the multi handle drives
-/// transfers on a multi-thread runtime (AAP 0.8.3).
-#[allow(dead_code)] // No consumer yet; Named by both seams below.
+#[allow(dead_code)] // Named by both seams below.
 pub(crate) type ResolveFuture<'a, T> =
     Pin<Box<dyn core::future::Future<Output = CodeResult<T>> + Send + 'a>>;
 
-/// The name-resolution seam: one of the three injection points AAP 0.3.3 P12
-/// names at the crate root.
-///
 /// Supersedes `Curl_resolv` (`lib/hostip.c:860-1012`) as a *contract*, and
 /// with it all six entry points of `lib/asyn.h` -
 /// `Curl_async_global_cleanup`, `Curl_async_get_impl`, `Curl_async_pollset`,
@@ -2906,14 +2209,6 @@ pub(crate) type ResolveFuture<'a, T> =
 /// `Curl_async_shutdown`.
 ///
 /// # Why this exists at all
-///
-/// AAP 0.8.4 requires at least 80% line coverage on
-/// `curl-rs-lib/src/protocols/` and `curl-rs-lib/src/transfer/`. Neither is
-/// reachable if a protocol test needs a live DNS server, so the resolver has
-/// to be substitutable. That is the gate this trait serves, and it is why the
-/// trait is the **only** path by which `crate::conn` may obtain an address:
-/// a module that calls a system resolver directly makes itself untestable and
-/// takes the coverage gate down with it.
 ///
 /// # How `conn` is expected to consume it
 ///
@@ -2930,30 +2225,9 @@ pub(crate) type ResolveFuture<'a, T> =
 ///   reordering within either family. This is the shape the cache wants,
 ///   because a cache entry holds one list for all families and
 ///   [`DnsEntry::has_family`] scans it.
-///
-/// The combined order itself is significant and must not be sorted: for a
-/// loopback name it is the `::1`-then-`127.0.0.1` sequence
-/// [`localhost_addrs`] fixes, and for a system answer it is whatever the
-/// resolver returned, which encodes the host's own address-selection policy.
-///
-/// # What must NOT appear in an implementation
-///
-/// `lib/hostip.c:365-370`'s process-global `sigjmp_buf` behind a spinlock,
-/// and the `SIGALRM` handler at `:1042-1052` that jumps into it - by curl's
-/// own admission causing *"the remainder of the application to run within a
-/// signal handler which is nonportable and could lead to problems."* None of
-/// it survives. An implementation bounds the wait with
-/// `tokio::time::timeout` and holds no global mutable state whatsoever.
-// No consumer yet; resolver.rs implements it; conn/ consumes it.
 #[allow(dead_code)]
 pub(crate) trait Resolver: fmt::Debug + Send + Sync {
     /// Resolves `host` and `port` to addresses.
-    ///
-    /// `ip_version` restricts the families returned, and an implementation
-    /// must check [`can_resolve_ip_version`] before attempting a
-    /// [`IpVersion::V6`]-only lookup on a host without IPv6 - C's
-    /// `can_resolve_ip_version` gate at `lib/hostip.c:807-820`, whose failure
-    /// is [`CURLcode::CouldntResolveHost`].
     ///
     /// # Errors
     ///
@@ -2978,7 +2252,7 @@ pub(crate) trait Resolver: fmt::Debug + Send + Sync {
 /// (`lib/cf-ip-happy.c`), which is where the two "balls" of Happy Eyeballs
 /// come from.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)] // No consumer yet; conn/happy_eyeballs.rs consumes it.
+#[allow(dead_code)] // conn/happy_eyeballs.rs consumes it.
 pub(crate) struct AddrFamilies {
     /// The `AF_INET6` addresses, in the order the resolver produced them.
     pub(crate) v6: Vec<ResolvedAddr>,
@@ -2995,10 +2269,7 @@ pub(crate) struct AddrFamilies {
 /// sorted: a resolver's ordering within a family encodes the host's
 /// address-selection policy, and a race that reordered it would connect to a
 /// different address than curl does.
-///
-/// `AF_UNIX` addresses belong to neither list and are dropped, exactly as
-/// `show_resolve_info` skips them: a Unix socket has no family to race.
-#[allow(dead_code)] // No consumer yet; conn/happy_eyeballs.rs consumes it.
+#[allow(dead_code)] // conn/happy_eyeballs.rs consumes it.
 pub(crate) fn split_families(addrs: &[ResolvedAddr]) -> AddrFamilies {
     let mut split = AddrFamilies::default();
     for addr in addrs {
@@ -3012,25 +2283,9 @@ pub(crate) fn split_families(addrs: &[ResolvedAddr]) -> AddrFamilies {
 }
 
 /// The DNS-over-HTTPS transport seam.
-///
-/// `dns/doh.rs` must implement DoH *"via the crate's own HTTP client"*
-/// (AAP 0.4.1) while never writing `use crate::protocols`: a
-/// `dns -> protocols -> dns` import cycle is precisely what AAP 0.3.3 P12's
-/// injection avoids, and the cycle is real rather than hypothetical, since a
-/// DoH request is an HTTPS transfer whose own hostname has to be resolved.
-///
-/// The seam is deliberately narrow. `lib/doh.c` builds a DNS wire query,
-/// POSTs it with `Content-Type: application/dns-message`, and parses the wire
-/// response; only the middle step needs a protocol stack. So this trait
-/// carries bytes and nothing else - no header map, no status code, no
-/// redirect policy - which keeps every decision that is DNS's in `doh.rs` and
-/// every decision that is HTTP's in the implementation the caller injects.
-#[allow(dead_code)] // No consumer yet; doh.rs consumes it.
+#[allow(dead_code)] // doh.rs consumes it.
 pub(crate) trait DohTransport: fmt::Debug + Send + Sync {
     /// POSTs a DNS wire query to a DoH endpoint and returns the response.
-    ///
-    /// `url` is `CURLOPT_DOH_URL`. `query` is a complete DNS message, and the
-    /// return is a complete DNS response; neither is interpreted here.
     ///
     /// # Errors
     ///
@@ -3046,6 +2301,45 @@ pub(crate) trait DohTransport: fmt::Debug + Send + Sync {
     ) -> ResolveFuture<'a, Vec<u8>>;
 }
 
+/// Every PRODUCTION [`DohTransport`] this build registers, and the authority
+/// [`crate::version::supports_doh`] consults.
+///
+/// It is empty, and empty is the honest state: `dns/doh.rs` carries the RFC 8484
+/// query builder, the response parser and the probe pairing in full, and every
+/// implementor of this trait anywhere in the tree is a `#[cfg(test)]` double.
+/// A production one needs an HTTPS transfer, which needs
+/// `curl-rs-lib/src/protocols/http1.rs`; that file does not exist.
+///
+/// **Why a registry rather than a comment.** `supports_doh()` previously rested
+/// on `ENGINE_DOH` being hand-marked `Engine::inert`. That is correct today and
+/// stays correct only for as long as somebody remembers it: the marker is a
+/// judgement written in one file about code in another, and the first person to
+/// land a transport would have to know to go and change it. Conjoining this
+/// count instead makes the claim unmakeable while the slice is empty and makes
+/// it available the moment an entry is added -- the same construction
+/// `protocols::EXECUTORS` uses for scheme runnability, for the same reason.
+/// Advertising DoH with no transport is exactly the over-report specification
+/// 0.6.5 forbids: the harness would run the DoH fixtures instead of skipping
+/// them.
+pub(crate) const DOH_TRANSPORTS: &[&'static dyn DohTransport] = &[];
+
+/// Whether [`DOH_TRANSPORTS`] holds at least one entry.
+///
+/// Written as a slice pattern rather than as `!is_empty()` or `len() > 0`, and
+/// the reason is worth recording because two other spellings were tried first.
+/// Every lint clippy has for this shape is *correct*: `const_is_empty` objects
+/// that `is_empty()` on a `const` slice has a constant answer, and
+/// `absurd_extreme_comparisons` objects that `> 0` against a constant `0` --
+/// which is `usize::MIN` -- is always false. Both are true, and both are the
+/// point: the answer is constant today and must become the other constant on
+/// its own the moment an entry is added. `matches!` states exactly that,
+/// compiles at the 1.75 floor, and needs no `allow` -- verified by compiling
+/// all three spellings under `cargo +1.75.0` and `clippy -D warnings` before
+/// choosing this one.
+pub(crate) const fn doh_transport_registered() -> bool {
+    matches!(DOH_TRANSPORTS, [_, ..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3053,20 +2347,9 @@ mod tests {
     use crate::util::timeval::TestClock;
     use std::time::Duration;
 
-    // AAP 0.8.7 relocates the coverage of `tests/unit` and `tests/libtest`
-    // into the crate, because a Rust static library does not export
-    // `pub(crate)` items and no quality of implementation makes those C
-    // programs link. `Curl_shuffle_addr` carries `@unittest: 1608` in the C
+    // `Curl_shuffle_addr` carries `@unittest: 1608` in the C
     // (`lib/hostip.c:505`), so its unit test in particular is a relocation
     // rather than an addition.
-    //
-    // Every test here runs without a network and without a syscall, because
-    // the resolver, the clock, the entropy source, the IPv6 probe and the
-    // trace sink are all injected. That is what makes the suite runnable
-    // under Miri, which cannot perform a real syscall. The three exceptions
-    // are marked `#[cfg_attr(miri, ignore = ...)]` with their reason at the
-    // point of use, and in each case the reason is cost or a deliberate real
-    // syscall rather than a seam that should have existed.
 
     /// A tracer over a capture buffer, verbose, running `body`.
     ///
@@ -3133,9 +2416,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------
     // Key formation -- `create_dnscache_id`, lib/hostip.c:233-244.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn a_key_is_the_lowercased_host_then_a_colon_then_the_port() {
@@ -3234,9 +2515,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------
     // Staleness -- lib/hostip.c:258-275.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn an_entry_is_fresh_one_millisecond_before_the_limit() {
@@ -3336,9 +2615,7 @@ mod tests {
         assert!(!entry.staleness(later, 10_000).is_remove());
     }
 
-    // ---------------------------------------------------------------------
     // Cache hit, miss and pruning.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn a_cache_hit_returns_the_entry_and_a_miss_returns_nothing() {
@@ -3715,9 +2992,7 @@ mod tests {
         assert_eq!(held.addrs.len(), 1);
     }
 
-    // ---------------------------------------------------------------------
     // CURLOPT_RESOLVE -- lib/hostip.c:1279-1470. The syntax is frozen.
-    // ---------------------------------------------------------------------
 
     /// Loads `entries` into a fresh cache, discarding the trace.
     fn load(entries: &[&str], clock: &TestClock) -> (DnsCache, CodeResult<()>) {
@@ -4174,9 +3449,7 @@ mod tests {
         assert!(cache.is_empty());
     }
 
-    // ---------------------------------------------------------------------
     // AlpnId -- lib/hostip.h:49-54 and include/curl/curl.h:1033-1035.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn the_alpn_integers_are_the_public_altsvc_bits() {
@@ -4228,9 +3501,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------
     // IpVersion -- include/curl/curl.h:2300-2303.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn the_ip_version_integers_are_the_public_abi_values() {
@@ -4252,9 +3523,7 @@ mod tests {
         assert_eq!(IpVersion::V6.required_family(), Some(AddressFamily::Inet6));
     }
 
-    // ---------------------------------------------------------------------
     // Localhost synthesis -- lib/hostip.c:671-746.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn localhost_synthesis_puts_the_ipv6_entry_first() {
@@ -4287,20 +3556,13 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------
     // The shuffle -- lib/hostip.c:492-557, C's @unittest: 1608.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn the_shuffle_reproduces_a_hand_computed_fisher_yates() {
         // Entropy words, little-endian: rnd = [7, 0, 1, 2]. Element zero is
         // drawn and never read, because the loop runs from num_addrs-1 down to
         // 1 and indexes rnd[i].
-        //
-        //   start        [A, B, C, D]
-        //   i = 3: j = 2 % 4 = 2  swap(3,2)  [A, B, D, C]
-        //   i = 2: j = 1 % 3 = 1  swap(2,1)  [A, D, B, C]
-        //   i = 1: j = 0 % 2 = 0  swap(1,0)  [D, A, B, C]
         let words: [u32; 4] = [7, 0, 1, 2];
         let mut stream: Vec<u8> = Vec::new();
         for word in words {
@@ -4466,9 +3728,7 @@ mod tests {
         assert!(cache.is_empty(), "nothing was inserted");
     }
 
-    // ---------------------------------------------------------------------
     // Address text -- lib/hostip.c:203-227, through crate::util::inet.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn an_unknown_family_renders_as_the_empty_string() {
@@ -4547,9 +3807,7 @@ mod tests {
         assert!(v4(255, 80).printable_address_fits_the_c_buffer());
     }
 
-    // ---------------------------------------------------------------------
     // Literal probes -- lib/hostip.c:783-796, lib/curl_addrinfo.c:407-440.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn a_numeric_address_is_recognised_and_a_name_is_not() {
@@ -4662,9 +3920,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
     // show_resolve_info -- lib/hostip.c:118-179.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn resolve_info_prints_the_ipv6_line_before_the_ipv4_line() {
@@ -4773,9 +4029,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
     // Curl_resolver_error -- lib/hostip.c:1570-1589.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn the_resolver_error_parenthesises_a_detail_and_omits_it_otherwise() {
@@ -4871,9 +4125,7 @@ mod tests {
         assert_eq!(msg::NO_ONION, "Not resolving .onion address (RFC 7686)");
     }
 
-    // ---------------------------------------------------------------------
     // The IPv6 probe and can_resolve_ip_version -- lib/hostip.c:752-820.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn the_ipv6_answer_is_memoised_after_one_probe() {
@@ -4975,9 +4227,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
     // split_families -- the contract conn/happy_eyeballs.rs inherits.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn splitting_preserves_the_order_within_each_family() {
@@ -5011,9 +4261,7 @@ mod tests {
         assert_eq!(split.v4[0].printable_address(), "127.0.0.1");
     }
 
-    // ---------------------------------------------------------------------
     // Constants, measured against the C.
-    // ---------------------------------------------------------------------
 
     #[test]
     fn the_constants_are_the_measured_c_values() {
@@ -5141,6 +4389,45 @@ mod tests {
         assert_eq!(
             block_on(injected.post("http://doh.example/dns-query", b"wire")),
             Err(CURLcode::CouldntResolveHost)
+        );
+
+        // The registry's element type accepts a real implementor, so the
+        // emptiness asserted below is a measurement of this build and not a
+        // shape that could never hold anything.
+        let populated: &[&dyn DohTransport] = &[&Echo];
+        assert_eq!(populated.len(), 1);
+    }
+
+    /// No production DoH transport is registered, so DoH is not advertised --
+    /// and the second fact follows from the first by construction.
+    ///
+    /// This is the guarantee, not a restatement of it. If a transport is
+    /// registered while `ENGINE_DOH` is still `Engine::inert`, the first
+    /// assertion fails and names the omission; if the marker is advanced while
+    /// the registry is empty, `supports_doh()` still answers `false` and cannot
+    /// over-report. Only both together turn the capability on.
+    #[test]
+    fn doh_is_not_advertised_because_no_transport_is_registered() {
+        assert_eq!(DOH_TRANSPORTS.len(), 0);
+        assert!(!doh_transport_registered());
+        assert!(!crate::version::supports_doh());
+
+        // The feature is default-on, so the conjunct that withholds the label
+        // is one of the other two rather than the feature. Asserted in an
+        // anonymous constant because `assert!` on a `cfg!` is a constant
+        // expression and `clippy::assertions_on_constants` rejects it under
+        // `-D warnings` -- the form the lint's own help text suggests.
+        const _: () = assert!(cfg!(feature = "doh"));
+
+        // The two remaining conjuncts, so a future change to either is visible
+        // here rather than silently absorbed.
+        assert!(
+            !crate::version::ENGINE_DOH.is_present(),
+            "no response is received, so no DoH query completes"
+        );
+        assert!(
+            crate::version::ENGINE_DOH.is_written(),
+            "dns/doh.rs is on disk: this is inert, not unwritten"
         );
     }
 

@@ -24,28 +24,11 @@
 
 //! The share interface: state deliberately shared between easy handles.
 //!
-//! Supersedes `lib/curl_share.c` (299 lines) and `lib/curl_share.h`
-//! (77 lines), and backs four of the 100 exported symbols of
-//! `lib/libcurl.def` -- rows 81 to 84, `curl_share_cleanup`,
-//! `curl_share_init`, `curl_share_setopt` and `curl_share_strerror` -- which
-//! `curl-rs-ffi/src/ffi/share.rs` surfaces to C.
-//!
-//! Every claim below carries the locator it was measured from, in the C tree
-//! at commit `54cf587b9c` (curl/libcurl 8.19.0-DEV,
-//! `LIBCURL_VERSION_NUM 0x081300`). The principal ones:
-//!
-//! * `lib/curl_share.c` -- the four functions and their orderings.
-//! * `lib/curl_share.h:36-40` -- the validity tag and the two convenience
-//!   predicates; `:42-66` -- `struct Curl_share`, carrying the comment
-//!   *"this struct is libcurl-private, do not export details"*; `:68-70` --
-//!   the two internal entry points.
-//! * `include/curl/curl.h:110` -- `typedef void CURLSH;`, which is a `void`
-//!   and not an opaque struct.
-//! * `include/curl/curl.h:3026-3077` -- `curl_lock_data`,
-//!   `curl_lock_access`, `curl_lock_function`, `curl_unlock_function`,
-//!   `CURLSHcode` and `CURLSHoption`.
-//! * `lib/strerror.c:411` -- this family's distinct fallback message,
-//!   `"CURLSHcode unknown"`, which `crate::error` owns.
+//! Supersedes `lib/curl_share.c` and `lib/curl_share.h`, and backs four of the
+//! 100 exported symbols of `lib/libcurl.def` -- rows 81 to 84,
+//! `curl_share_cleanup`, `curl_share_init`, `curl_share_setopt` and
+//! `curl_share_strerror` -- which `curl-rs-ffi/src/ffi/share.rs` surfaces to
+//! C.
 //!
 //! # What is shared, and who owns each store
 //!
@@ -68,11 +51,6 @@
 //! Alt-Svc and `.netrc` are deliberately absent: there is no
 //! `CURL_LOCK_DATA_ALTSVC` in `include/curl/curl.h:3026-3040` and no netrc
 //! kind either, so neither is shareable and neither is added here.
-//!
-//! `CURL_LOCK_DATA_SHARE` = 1 is the seventh kind and stores nothing: the C
-//! comment at `include/curl/curl.h:3028-3031` records that it *"is used
-//! internally to say that the locking is just made to change the internal
-//! state of the share itself"*. It guards the reference count.
 //!
 //! # Interior mutability, and why the user callbacks are not the protection
 //!
@@ -124,55 +102,128 @@
 //! operation proceeds, because C has no notion of poisoning and a share that
 //! stopped working would be a behaviour change.
 //!
-//! # `Send` and `Sync`: measured, and one blocker ESCALATED
+//! ## The lifecycle is serialised, where the C's is not
 //!
-//! Five of the six stores are `Send + Sync` as their own modules define them,
-//! and this module's metadata is too. The sixth,
-//! [`crate::conn::pool::ConnectionPool`], is neither, because it holds
+//! `struct Curl_share` has two states: `magic == CURL_GOOD_SHARE` and the zero
+//! `curl_share_cleanup` writes at `lib/curl_share.c:263`. It has no state for
+//! *"a teardown has been claimed but has not finished"*, and the consequence
+//! is measurable in the C's own text: `curl_share_cleanup` tests the tag at
+//! `:224`, reads `share->dirty` at `:231` and clears the tag at `:263`, none
+//! of it synchronised, so two threads entering together both pass the test,
+//! both read a zero count and both return `CURLSHE_OK`. In the C that frees
+//! one allocation twice; here it would call `Box::from_raw` twice. The same
+//! gap lets a `CURLOPT_SHARE` on another thread raise the count between `:231`
+//! and the teardown at `:237`, so a store is destroyed while a handle holds
+//! it.
+//!
+//! `Lifecycle` adds the missing middle state and closes both. The teardown
+//! is *claimed* with one compare-and-exchange, so exactly one caller can ever
+//! reach the free; [`ShareCore::attach`] refuses while the claim is held, so
+//! the count cannot rise behind it; [`ShareCore::detach`] and the
+//! notifications are still admitted, because a lost decrement would be
+//! permanent and because the C's own teardown notifies. Nothing an
+//! application can observe changes for a program that does what
+//! `docs/libcurl/curl_share_cleanup.md` requires
+//! -- *"Passing in a share pointer that is in use"* is its own error -- and a
+//! program that races gets a defined [`CURLSHcode`] where the C gave it
+//! undefined behaviour.
+//!
+//! ## Ownership changes are transactions, not return values
+//!
+//! `lib/setopt.c:1493-1550` performs the count change **and** the easy
+//! handle's repointing inside one `CURL_LOCK_DATA_SHARE` critical section:
+//! attach increments at `:1527` and then repoints at `:1529-1547`, detach
+//! repoints at `:1497-1512` and then decrements at `:1514`. That placement is
+//! observable, because the application's lock callback is what serialises an
+//! attaching handle's view of the shared stores against every other handle's.
+//! [`ShareCore::attach`] and [`ShareCore::detach`] therefore take the caller's
+//! ownership change as a closure and run it inside the bracket, in the C's
+//! order, rather than returning a mask for the caller to act on after the
+//! unlock -- which would deliver a critical section that ends before the work
+//! it is supposed to cover.
+//!
+//! # `Send` and `Sync`: delivered over the split, and asserted rather than
+//! claimed
+//!
+//! **[`Share`] is `Send + Sync`, and a static assertion in this file's tests
+//! fails the build if that ever stops being true.** That is what makes one
+//! `CURLSH` usable from two threads, which is supported C behaviour:
+//! `tests/libtest/lib506.c` drives one share from two threads with
+//! `CURL_LOCK_DATA_COOKIE` and `CURL_LOCK_DATA_DNS`, `lib3207.c` does the same
+//! with `CURL_LOCK_DATA_SSL_SESSION`, and
+//! `docs/libcurl/opts/CURLSHOPT_SHARE.md` is written for exactly that.
+//!
+//! Two changes together deliver it, and the history is worth keeping because
+//! it explains the shape of both this module and `conn/`.
+//!
+//! ## The split: where the state lives
+//!
+//! * [`ShareCore`] carries the validity tag, the metadata -- specifier,
+//!   reference count, callbacks, user pointer -- and five of the six stores:
+//!   DNS, cookies, the Public Suffix List, HSTS and the TLS session cache,
+//!   together with every operation on them.
+//! * [`Share`] is the owner: an [`Arc<ShareCore>`] plus the connection pool
+//!   and the `ShareAdmin` that destroys it. It is the value `curl_share_init`
+//!   hands out and `curl_share_cleanup` frees, and it [`Deref`]s to the core
+//!   so no call site reads differently.
+//! * `Share::stores` is the seam between them: it hands another thread an
+//!   [`Arc<ShareCore>`] -- the same state under the same locks delivering the
+//!   same notifications, never a copy. `crate::easy` and `crate::multi` reach
+//!   a share from a worker task through it.
+//!
+//! ## The bounds: why the sixth store now travels too
+//!
+//! Five of the six stores were `Send + Sync` from the start, as their own
+//! modules define them. The sixth,
+//! [`crate::conn::pool::ConnectionPool`], was not, because it holds
 //! `Box<dyn ShutdownTimer>`, `Option<Box<dyn ProtocolDisconnect>>` and a
 //! `FilterChains` of `Box<dyn ConnFilter>`, and none of those three traits
-//! carries a `Send` bound. `struct Curl_share` holds the pool by value
-//! (`lib/curl_share.h:52`), so [`Share`] holds it too, and [`Share`] is
-//! therefore neither `Send` nor `Sync` at this commit.
+//! carried a `Send` bound. `struct Curl_share` holds the pool by value
+//! (`lib/curl_share.h:52`), so [`Share`] holds it too and inherited the
+//! affinity. There is no unsafe-free way to hold a `!Send` value inside a
+//! `Send + Sync` container, and `#![deny(unsafe_code)]` makes an
+//! `unsafe impl Send` unavailable by design rather than by preference. Leaving
+//! the pool out of the share was equally unavailable: it would make
+//! `CURLSHOPT_SHARE` with `CURL_LOCK_DATA_CONNECT` set a bit and share
+//! nothing -- a stub rather than an implementation. So the faithful model was
+//! kept and the three traits were bound instead.
 //!
-//! This was measured rather than assumed, in both directions. A probe
-//! asserting `Send + Sync` for each store individually passes for the five
-//! and fails only for the pool. Adding `+ Send` to those three traits
-//! produced **925 errors with 23 distinct root causes**, spanning
-//! `conn/socket.rs` (nine `Rc<dyn ...>` seams), `conn/filters.rs`
-//! (`Rc<RefCell<...>>` state and test helpers), `crate::tls`'s
-//! `<B as TlsBackend>::State` and `util/bufq.rs`'s
-//! `Rc<RefCell<ChunkPool>>`. That is a crate-wide architectural change owned
-//! by `conn/` and `tls/`, not by this module.
+//! What that cost, measured on this tree rather than estimated: `Send` on
+//! `ConnFilter`, `ShutdownTimer` and `ProtocolDisconnect`, and `Send + Sync`
+//! on the injected seams behind them -- `ConnMeta`, `Deadline`,
+//! `ExpireScheduler`, `TransportProvider`, `OpenSocket`, `CloseSocket`,
+//! `SockOpt`, `MultiCloseObserver`, `ConnState`, `ReadinessProbe`,
+//! `BindResolver` and `If2Ip` -- plus `Send + Sync` on `TlsBackend` and `Send`
+//! on its `State`. That turned every `Rc<dyn Seam>` in `conn/socket.rs`,
+//! `conn/happy_eyeballs.rs`, `conn/filters.rs`, `conn/shutdown.rs` and
+//! `crate::tls` into an [`Arc`], and `util/bufq.rs`'s `SharedPool` from
+//! `Rc<RefCell<ChunkPool>>` into `Arc<Mutex<ChunkPool>>` -- the one
+//! substitution that file's own documentation had already pre-authorised,
+//! because all three of its pool call sites already treated acquisition as
+//! fallible. No `unsafe` was added anywhere, and no lock was added to the
+//! connection pool: `CURL_LOCK_DATA_CONNECT` is still owned here, and the pool
+//! still exposes mutation through `&mut self` alone.
 //!
-//! There is no unsafe-free way to hold a `!Send` value inside a
-//! `Send + Sync` container, and the alternative -- leaving the pool out of
-//! the share -- would make `CURLSHOPT_SHARE` with `CURL_LOCK_DATA_CONNECT`
-//! set a bit and share nothing, which is a stub rather than an
-//! implementation. So the faithful model is kept and the limitation is
-//! escalated here rather than hidden:
+//! The pool therefore stays where the C puts it, and the split stays because
+//! it is the seam a worker task reaches a share through. Two consequences are
+//! worth stating so they are not rediscovered:
 //!
-//! * **What it costs.** An application using one `CURLSH` from two threads is
-//!   supported C behaviour -- `tests/libtest/lib506.c` drives one share from
-//!   two threads with `CURL_LOCK_DATA_COOKIE` and `CURL_LOCK_DATA_DNS`, and
-//!   `lib3207.c` does the same with `CURL_LOCK_DATA_SSL_SESSION`. Until
-//!   [`Share`] is `Sync`, `curl-rs-ffi/src/ffi/share.rs` cannot form a shared
-//!   reference for a second thread soundly, so it must treat `CURLSH` as
-//!   thread-affine and say so in its own safety comment.
-//! * **What it does not cost.** The `threadsafe` capability
-//!   `crate::version` advertises is *not* about shares.
-//!   `docs/libcurl/curl_version_info.md:345-351` defines it as
+//! * **`curl-rs-ffi/src/ffi/share.rs` may treat `CURLSH` as shareable.** It
+//!   can form a shared reference for a second thread soundly, because the type
+//!   is `Sync`; it does not have to document thread affinity in its safety
+//!   comment.
+//! * **The `threadsafe` capability `crate::version` advertises is still not
+//!   about shares.** `docs/libcurl/curl_version_info.md:345-351` defines it as
 //!   *"thread-safety support (Atomic or SRWLOCK) to protect curl
-//!   initialization"*, and `crate::version` gates it on its global-init
-//!   engine token accordingly. This limitation therefore does not turn that
-//!   token into an over-report, which
+//!   initialization"*, and `crate::version` gates it on its global-init engine
+//!   token accordingly. This module being `Sync` neither adds to nor
+//!   subtracts from that token, so no over-report was introduced that
 //!   `tests/runtests.pl` would punish.
-//! * **How it is fixed.** Bound `ConnFilter`, `ShutdownTimer` and
-//!   `ProtocolDisconnect` with `Send` and replace the `Rc<RefCell<...>>`
-//!   seams behind them. [`Share`] then becomes `Send + Sync` with no change
-//!   to this file, because every other field already is. The AAP's own
-//!   directive of a multi-thread Tokio runtime for the multi handle points
-//!   the same way, since a connection driven by such a task must be `Send`.
+//!
+//! The AAP's own directive of a multi-thread Tokio runtime for the multi
+//! handle (section 0.8.3) points the same way: a connection driven by such a
+//! task must be `Send`, so this was load-bearing for `multi/` and not only
+//! for shares.
 //!
 //! # Visibility, and the `error[E0446]` this module resolves
 //!
@@ -230,7 +281,12 @@
 //!    [`Share::cleanup`] therefore takes `&self`, cannot consume, and
 //!    reports [`CURLSHcode::InUse`] or [`CURLSHcode::Invalid`] with the
 //!    object intact and still usable. Only [`CURLSHcode::Ok`] permits the
-//!    free.
+//!    free -- and **at most one caller can ever receive it for a given
+//!    share**, because the teardown is claimed with a single
+//!    compare-and-exchange (`ShareCore::claim_cleanup`). Two threads calling
+//!    `curl_share_cleanup` on one handle therefore produce one `Ok` and one
+//!    [`CURLSHcode::Invalid`], never two frees, where the C's three
+//!    unsynchronised steps produce two `CURLSHE_OK`s.
 //! 5. **The four symbols** must appear in `nm` output to satisfy rows 81
 //!    (`curl_share_cleanup`), 82 (`curl_share_init`), 83
 //!    (`curl_share_setopt`) and 84 (`curl_share_strerror`) of
@@ -264,6 +320,30 @@
 //! here are usable from it: a multi handle's own store is simply one with no
 //! notification attached, which is what `LockData`-keyed notification with an
 //! absent callback already expresses.
+//!
+//! Link targets for the prose above.
+//!
+//! Written as Markdown reference definitions with absolute paths, because
+//! this module carries its documentation in two places -- an outer `///`
+//! block on `pub mod share` in the crate root and this inner one -- and
+//! rustdoc resolves the merged result in the crate root's scope, where a
+//! bare `Share` is not in scope. The prose therefore reads unqualified and
+//! still links.
+//!
+//! [`Share`]: crate::share::Share
+//! [`ShareCore`]: crate::share::ShareCore
+//! [`Arc<ShareCore>`]: crate::share::ShareCore
+//! [`ShareCore::attach`]: crate::share::ShareCore::attach
+//! [`ShareCore::detach`]: crate::share::ShareCore::detach
+//! [`Share::cleanup`]: crate::share::Share::cleanup
+//! [`ShareOption`]: crate::share::ShareOption
+//! [`CURLSHcode`]: crate::error::CURLSHcode
+//! [`CURLSHcode::Ok`]: crate::error::CURLSHcode::Ok
+//! [`CURLSHcode::InUse`]: crate::error::CURLSHcode::InUse
+//! [`CURLSHcode::Invalid`]: crate::error::CURLSHcode::Invalid
+//! [`Mutex`]: std::sync::Mutex
+//! [`RwLock`]: std::sync::RwLock
+//! [`Deref`]: core::ops::Deref
 
 use core::fmt;
 use core::ops::{Deref, DerefMut};
@@ -275,13 +355,20 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 // `:89`), and that cache lives behind the `cookies` feature because
 // `crate::cookies` declares its `psl` child there. Gated with it so that a
 // build without cookies imports nothing it cannot use.
+//
+// Both guards are named because both phases exist: the writer is the
+// exclusive refresh of `lib/psl.c:58-88`, and the reader is what the caller is
+// handed afterwards, matching the shared notification of `:89` and the
+// `const psl_ctx_t *` of `:94`.
 #[cfg(feature = "cookies")]
-use std::sync::{RwLock, RwLockWriteGuard};
+use std::sync::{RwLock, RwLockReadGuard};
 
 #[cfg(feature = "cookies")]
 use publicsuffix::List;
 
+use crate::conn::filters::{CallCtx, ConnId, FilterChains};
 use crate::conn::pool::ConnectionPool;
+use crate::conn::shutdown::{ShutdownHandle, ShutdownHost, ShutdownQueue};
 #[cfg(feature = "hsts")]
 use crate::cookies::hsts::HstsCache;
 #[cfg(feature = "cookies")]
@@ -289,19 +376,15 @@ use crate::cookies::psl::{PslCache, PslSource};
 #[cfg(feature = "cookies")]
 use crate::cookies::CookieInfo;
 use crate::dns::DnsCache;
-use crate::error::CURLSHcode;
+use crate::error::{CURLMcode, CURLSHcode};
 use crate::tls::session_cache::SessionCache;
+use crate::trace::TimerId;
+use crate::util::timediff::TimeDiff;
 #[cfg(feature = "cookies")]
 use crate::util::timeval::Clock;
+use crate::util::timeval::SystemClock;
 
 // The public vocabulary: the two enumerations an application's callbacks see
-//
-// Both are transcriptions of `include/curl/curl.h`, and both write EVERY
-// discriminant explicitly. The C writes only `CURL_LOCK_DATA_NONE = 0` and
-// the three `CURL_LOCK_ACCESS_*` values; every other value comes from
-// declaration order. An application compiled against curl 8.19.0-DEV holds
-// the INTEGERS, so ordinal inference is prohibited: a reordering here would
-// silently hand a callback the wrong kind, with no diagnostic anywhere.
 
 /// Which shared datum a lock or unlock notification is about.
 ///
@@ -314,7 +397,7 @@ use crate::util::timeval::Clock;
 /// (`include/curl/curl.h:3028-3031`) is that it *"is used internally to say
 /// that the locking is just made to change the internal state of the share
 /// itself"*, which here means the reference count that
-/// [`Share::attach`] and [`Share::detach`] maintain.
+/// [`ShareCore::attach`] and [`ShareCore::detach`] maintain.
 ///
 /// Both out-of-band tokens are retained as variants rather than dropped,
 /// because an application may pass either to `CURLSHOPT_SHARE` and both must
@@ -365,14 +448,6 @@ impl LockData {
     }
 
     /// The token for `raw`, or [`None`] when `raw` names none.
-    ///
-    /// The total function `lib/curl_share.c` lacks: its `type` comes straight
-    /// from `va_arg(param, int)` (`:81`, `:149`) and is then used to build
-    /// `1 << type`, which for a negative or large value is undefined
-    /// behaviour in C. Rejecting the value here is what lets this module
-    /// route it to [`CURLSHcode::BadOption`] -- the arm the C's `default:`
-    /// reaches for every value it does recognise -- without ever performing
-    /// that shift.
     #[must_use]
     pub const fn from_i32(raw: i32) -> Option<Self> {
         match raw {
@@ -391,11 +466,6 @@ impl LockData {
 
     /// The C spelling, for diagnostics and for tests that compare against the
     /// header.
-    ///
-    /// An exhaustive `match` rather than a parallel array of strings, which
-    /// is the pattern `crate::trace` establishes: adding a token becomes a
-    /// compile error here instead of an index that silently names the wrong
-    /// thing.
     #[must_use]
     pub const fn c_name(self) -> &'static str {
         match self {
@@ -451,7 +521,7 @@ impl fmt::Display for LockData {
 /// Only two values are ever passed. Thirty-eight of the C tree's 39
 /// `Curl_share_lock` call sites request [`Self::Single`]; the one exception is
 /// `lib/psl.c`, which is the only user of [`Self::Shared`] and requests both
-/// during the refresh sequence [`Share::psl_use`] reproduces. The other two
+/// during the refresh sequence [`ShareCore::psl_use`] reproduces. The other two
 /// tokens exist so that the vocabulary is complete rather than partly
 /// invented.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -509,14 +579,6 @@ impl fmt::Display for LockAccess {
 }
 
 // The two opaque application pointers, as integer tokens
-//
-// `curl_lock_function` receives a `CURL *handle` and a `void *userptr`
-// (`include/curl/curl.h:3050-3053`), and this crate never dereferences
-// either. Both are therefore carried as integers, which is the pattern
-// `crate::multi::events`'s `CallbackData` already establishes for
-// `CURLMOPT_SOCKETDATA` and `curl_multi_assign`: only `curl-rs-ffi` converts
-// between an integer and a pointer, and it does so inside a documented safety
-// block. Zero is the null pointer in both cases.
 
 /// The `CURL *handle` argument of a lock or unlock notification.
 ///
@@ -561,16 +623,6 @@ impl LockOwner {
 }
 
 /// The `void *userptr` a lock or unlock notification receives.
-///
-/// `share->clientdata` (`lib/curl_share.h:50`), set by `CURLSHOPT_USERDATA`
-/// (`lib/curl_share.c:206-209`) and passed to both callbacks as their last
-/// argument. Independent of the callbacks themselves: the C stores three
-/// separate fields, so setting the user pointer without a callback is
-/// remembered, and clearing a callback leaves the user pointer alone.
-///
-/// [`Self::NONE`] is the null pointer a freshly initialised share carries,
-/// since `curl_share_init` allocates with `curlx_calloc`
-/// (`lib/curl_share.c:35`).
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ShareUserData(usize);
 
@@ -603,18 +655,6 @@ impl ShareUserData {
 /// `void (*)(CURL *handle, curl_lock_data data, curl_lock_access locktype,
 /// void *userptr)` (`include/curl/curl.h:3050-3053`). All four arguments
 /// survive, because all four are observable.
-///
-/// [`Arc`] rather than [`Box`] for a specific reason: the notification must be
-/// delivered *without* this module's metadata lock held, or a callback that
-/// reached back into the share would deadlock and a callback that panicked
-/// would poison the one lock every entry point needs. A [`Box`] cannot be
-/// cloned out from behind a guard; an [`Arc`] can, so the guard is released
-/// first and the callback runs unlocked.
-///
-/// `Fn` rather than `FnMut`, and `Send + Sync`, because the C installs a plain
-/// function pointer that may be entered re-entrantly from several threads. A
-/// function pointer plus an integer satisfies both bounds, so this costs
-/// `curl-rs-ffi` nothing.
 pub type LockCallback =
     Arc<dyn Fn(LockOwner, LockData, LockAccess, ShareUserData) + Send + Sync>;
 
@@ -630,11 +670,6 @@ pub type UnlockCallback =
     Arc<dyn Fn(LockOwner, LockData, ShareUserData) + Send + Sync>;
 
 /// Which data kinds a share is sharing: `share->specifier`.
-///
-/// `lib/curl_share.h:45` -- an `unsigned int` used as a bitmask indexed by
-/// `1 << curl_lock_data`, which [`LockData::bit`] reproduces. Exposed as a
-/// value rather than as an integer so that the two convenience predicates the
-/// C spells as macros travel with it.
 ///
 /// Bit 1, [`LockData::Share`], is set by `curl_share_init`
 /// (`lib/curl_share.c:38`) and no code path in this module clears it
@@ -711,22 +746,6 @@ impl fmt::Display for Specifier {
 /// One `curl_share_setopt` call: the option identifier fused with its single
 /// payload.
 ///
-/// `CURLSHoption` (`include/curl/curl.h:3068-3077`) names six options and a
-/// bound, and `curl_share_setopt` (`:3080-3081`) is variadic in its
-/// declaration but takes **exactly one** trailing argument in practice -- the
-/// public header macro-ises the call to precisely three arguments in both
-/// branches of its selector (`:3337-3338`,
-/// `include/curl/typecheck-gcc.h:265-266`). Fusing the identifier with that
-/// one argument makes an ill-formed pair unrepresentable, and makes
-/// [`Share::setopt`] a single exhaustive `match` mirroring
-/// `lib/curl_share.c:78-214` arm for arm.
-///
-/// The integers themselves are **not** restated here. `curl-rs-ffi`'s option
-/// table is the single source of truth for option identity, and a second copy
-/// would drift. This enumeration is the vocabulary; the shim performs the
-/// mapping from `CURLSHoption` to a variant, and from the trailing slot to
-/// that variant's payload.
-///
 /// # The two payload shapes
 ///
 /// [`Self::Share`] and [`Self::Unshare`] carry a raw [`i32`] rather than a
@@ -736,12 +755,6 @@ impl fmt::Display for Specifier {
 /// arm does. Accepting the raw integer keeps that decision -- and the
 /// undefined-behaviour-free rejection [`LockData::from_i32`] performs -- in one
 /// place instead of asking the shim to guess.
-///
-/// The remaining three carry an [`Option`], because all three are clearable
-/// with a null pointer: `tests/libtest/lib3207.c:154-155` clears
-/// `CURLSHOPT_LOCKFUNC` and `CURLSHOPT_UNLOCKFUNC` that way, and the C stores
-/// whatever `va_arg` yields with no validation at all
-/// (`lib/curl_share.c:196-209`).
 pub enum ShareOption {
     /// `CURLSHOPT_NONE`: *"do not use"*
     /// (`include/curl/curl.h:3069`). Reaches the C's `default:` arm at
@@ -779,11 +792,6 @@ pub enum ShareOption {
 impl fmt::Debug for ShareOption {
     /// Hand-written because the three callback payloads are function values
     /// and no function value implements [`fmt::Debug`].
-    ///
-    /// A callback is reported as `Some` or `None` -- which is the only thing
-    /// about it that is observable and the only thing a test needs -- and
-    /// every other payload is reported in full. The variant names are the C
-    /// option spellings so that a failure message reads like the header.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::None => f.write_str("CURLSHOPT_NONE"),
@@ -816,11 +824,6 @@ impl fmt::Debug for ShareOption {
 
 /// The DNS cache's slot count: `Curl_dnscache_init(&share->dnscache, 23)`
 /// (`lib/curl_share.c:39`).
-///
-/// Passed eagerly, at construction, because the C initialises the cache in
-/// `curl_share_init` rather than lazily in `curl_share_setopt` -- which is
-/// why `CURLSHOPT_SHARE` with `CURL_LOCK_DATA_DNS` is a no-op that only sets
-/// the specifier bit (`lib/curl_share.c:84-85`).
 pub(crate) const DNS_CACHE_SLOTS: usize = 23;
 
 /// The TLS session cache's peer capacity: the first argument of
@@ -835,13 +838,6 @@ pub(crate) const SCACHE_MAX_SESSIONS_PER_PEER: usize = 2;
 /// The connection pool's slot count: the last argument of
 /// `Curl_cpool_init(&share->cpool, share->admin, share, 103)`
 /// (`lib/curl_share.c:130`).
-///
-/// Recorded but not passed, because there is nothing to pass it to.
-/// `ConnectionPool::new` takes no size: the C's argument is a hash bucket
-/// count and the Rust pool indexes destinations with a `BTreeMap`, which has
-/// no bucket count to size -- `crate::conn::pool` states that reasoning at its
-/// own constructor. The value is kept here so that the measurement survives
-/// and is asserted by test rather than being lost when the C is deleted.
 #[allow(dead_code)] // No consumer: ConnectionPool::new takes no size.
 pub(crate) const CPOOL_SLOTS: usize = 103;
 
@@ -852,7 +848,7 @@ pub(crate) const CPOOL_SLOTS: usize = 103;
 /// read and written together: every entry point reads the specifier and the
 /// callbacks, and the two that change anything change the count.
 ///
-/// `magic` is deliberately **not** here; see [`Share::magic`].
+/// `magic` is deliberately **not** here; see [`ShareCore::magic`].
 struct Meta {
     /// `share->specifier` (`lib/curl_share.h:45`).
     specifier: u32,
@@ -884,11 +880,6 @@ struct Meta {
 impl Meta {
     /// The state `curlx_calloc` leaves, plus the one bit
     /// `curl_share_init` sets.
-    ///
-    /// `lib/curl_share.c:35` allocates zeroed and `:38` performs
-    /// `share->specifier |= (1 << CURL_LOCK_DATA_SHARE)`, so a new share is
-    /// already sharing its own internal state before an application sets
-    /// anything.
     fn new() -> Self {
         Self {
             specifier: LockData::Share.bit(),
@@ -940,24 +931,345 @@ impl Meta {
     }
 }
 
-/// A share: state deliberately shared between easy handles.
+/// The share's internal handle: `share->admin` (`lib/curl_share.h:51`).
 ///
-/// Supersedes `struct Curl_share` (`lib/curl_share.h:43-66`), which carries
-/// the comment *"this struct is libcurl-private, do not export details"*
-/// (`:42`). That comment is this type's specification as much as its
-/// documentation: the C hands applications a `void *`
-/// (`include/curl/curl.h:110`), and every field here is private for the same
-/// reason.
+/// `curl_share_init` creates one eagerly -- `share->admin = curl_easy_init()`
+/// (`lib/curl_share.c:40`), with `mid = 0` and `state.internal = TRUE`
+/// (`:46-47`) -- and `Curl_cpool_init(&share->cpool, share->admin, share, 103)`
+/// (`:130`) hands it to the connection pool as its `idata`. The pool then
+/// drives every disposal through it, which is what makes
+/// `Curl_cpool_destroy`'s guard `if(cpool && cpool->initialised &&
+/// cpool->idata)` (`lib/conncache.c:233`) meaningful: **without a retained
+/// admin context the C does not destroy the pool at all**, it merely frees the
+/// structure around it.
 ///
-/// # Ownership at the C boundary
+/// This is that context, reduced to what the destroy actually consults. It is
+/// not an easy handle: `crate::easy` has no handle type at this commit, and
+/// none of the eleven questions [`ShutdownHost`] asks needs one. What it does
+/// need is somewhere to answer them from, and somewhere to keep the
+/// [`ShutdownQueue`] and the clock the disposal path takes as arguments.
 ///
-/// `curl_share_init` performs `Box::into_raw` on one of these and
-/// `curl_share_cleanup` performs `Box::from_raw` -- but **only** after
-/// [`Self::cleanup`] has returned [`CURLSHcode::Ok`]. Every entry point takes
-/// `&self`, so the object can never be consumed by an operation that is
-/// supposed to fail leaving it usable, which
-/// `docs/libcurl/curl_share_cleanup.md:59-60` requires: *"If an error occurs,
-/// then the share object is not deleted."*
+/// # The answers, and why each is the C's
+///
+/// * **`has_admin` -- `false`.** `data->multi && data->multi->admin`
+///   (`lib/cshutdn.c:139`): a share's admin handle has no multi handle, so
+///   the conjunct is false in the C too.
+/// * **`has_multi` -- `false`.** `data->multi` (`:157`, `:161`), likewise.
+///   This one is load-bearing: with no multi handle `cpool_discard_conn`
+///   terminates each connection in place instead of queueing it, which is
+///   what makes a synchronous destroy correct.
+/// * **`is_internal` -- `true`.** `data->state.internal` (`:51`), which
+///   `lib/curl_share.c:47` sets on exactly this handle. It is what caps a
+///   blocking disposal at the internal budget rather than the transfer's.
+/// * **`set_operation_timeout_ms` and `restart_operation_timing` -- no-ops.**
+///   `data->set.timeout` and `Curl_pgrsTime(data, TIMER_STARTOP)`
+///   (`:52-53`) are writes into a handle, and there is no handle here to
+///   write into; the external cap in `run_conn_handler` enforces the same
+///   budget regardless.
+/// * **`socket_cb_installed` -- `false`.** `cshutdn->multi->socket_cb`
+///   (`:411`): no multi handle, no socket callback, so no event state to
+///   maintain.
+/// * **`assess_conn` -- [`CURLMcode::Ok`].** Reached through
+///   `cshutdn_update_ev` (`:380-393`), which the C skips entirely when no
+///   socket callback is installed.
+/// * **`conn_done`, `connchanged` and `expire` -- no-ops.** All three act on
+///   the multi handle (`:158`, `:163`, `:263`) and are gated on
+///   `data->multi`.
+/// * **`max_total_connections` -- `0`.** `multi->max_total_connections`
+///   (`lib/multihandle.h:152`); zero is the C's *unlimited*, and a share has
+///   no such option of its own.
+///
+/// A share's admin is therefore the *simplest* host the shutdown layer
+/// admits, and every simplification is one the C makes for the same reason.
+struct ShareAdmin {
+    /// The queue `ConnectionPool::destroy` takes.
+    ///
+    /// Owned rather than borrowed because the C's lives on the multi handle
+    /// (`&data->multi->cshutdn`) and a share has none. It stays empty:
+    /// `ShareAdminHost::has_multi` is false, so `lib/conncache.c:225-228`
+    /// takes the
+    /// `Curl_cshutdn_terminate` branch for every connection and never reaches
+    /// `Curl_cshutdn_add`. Kept anyway, because the parameter is not optional
+    /// and because a queue that silently could not be reached would be worse
+    /// than one that provably is not.
+    queue: ShutdownQueue,
+    /// The clock the disposal path measures with.
+    ///
+    /// The production clock, zero-sized, so retaining it costs nothing. C
+    /// reads `curlx_now()` through the same handle it attributes everything
+    /// else to.
+    clock: SystemClock,
+}
+
+impl ShareAdmin {
+    /// The admin context `curl_share_init` creates (`lib/curl_share.c:40-47`).
+    fn new() -> Self {
+        Self {
+            queue: ShutdownQueue::new(),
+            clock: SystemClock,
+        }
+    }
+
+    /// Destroys `pool` -- `Curl_cpool_destroy` (`lib/conncache.c:231-254`).
+    ///
+    /// Every remaining connection goes through the pool's own disposal path,
+    /// which sends the protocol farewell, shuts the filter chains down and
+    /// closes the socket, in the C's order. The alternative -- dropping the
+    /// pool -- reclaims the same memory while performing none of that, which
+    /// is what this method exists to stop.
+    ///
+    /// # Driving an `async` teardown from a synchronous ABI function
+    ///
+    /// `curl_share_cleanup` is synchronous and `ConnectionPool::destroy` is
+    /// `async`, exactly as the C's disposal is synchronous and blocks. The
+    /// future is therefore driven to completion here, and *how* is chosen so
+    /// that neither outcome the module forbids -- a panic or a hang -- is
+    /// reachable:
+    ///
+    /// * **Inside a `tokio` context**, the ambient runtime's time driver is in
+    ///   scope, so `futures::executor::block_on` can drive the one timer the
+    ///   path may arm: `ShuttingDownConnection::run_conn_handler` documents
+    ///   that `tokio::time::timeout` is reached exactly when the handle is
+    ///   internal -- which a share's admin is -- and the scheme has a
+    ///   disconnect handler.
+    /// * **Outside one**, a `current_thread` runtime with the time driver is
+    ///   built for the call, so that same cap still works. It is dropped when
+    ///   the call returns.
+    /// * If a runtime cannot be built at all, the future is driven without
+    ///   one. That path reaches no timer for a connection whose scheme has no
+    ///   disconnect handler, which is every connection at this commit.
+    ///
+    /// What is NOT this method's business is the readiness of sockets
+    /// registered with the engine's own runtime; their wakeups come from that
+    /// runtime's driver, which the FFI keeps alive for the lifetime of the
+    /// library. `docs/libcurl/curl_share_cleanup.md` already requires that
+    /// this call not race the transfers using the share.
+    fn destroy_pool(&mut self, pool: &mut ConnectionPool) {
+        let Self { queue, clock } = self;
+        let mut cx = CallCtx::new(clock);
+        // The host's answers are constants, so it is a separate zero-sized
+        // value rather than this one: `destroy` takes the host and the queue as
+        // two independent `&mut` borrows, and both live here.
+        let mut host = ShareAdminHost;
+        let destroy = pool.destroy(&mut cx, &mut host, queue);
+        match tokio::runtime::Handle::try_current() {
+            // Already inside a runtime: its time driver is in scope.
+            Ok(_) => futures::executor::block_on(destroy),
+            Err(_) => {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(destroy),
+                    // No runtime could be built. Every connection whose scheme
+                    // has no disconnect handler completes without one.
+                    Err(_) => futures::executor::block_on(destroy),
+                }
+            }
+        }
+    }
+}
+
+/// The [`ShutdownHost`] answers a share's admin handle gives.
+///
+/// A separate zero-sized type rather than an `impl` on [`ShareAdmin`] itself,
+/// because `ConnectionPool::destroy` takes the host and the queue as two
+/// independent `&mut` borrows and [`ShareAdmin`] owns both. Splitting the
+/// answers out is what lets one call site hold both without fighting the
+/// borrow checker, and it costs nothing: every answer is a constant, for the
+/// reasons [`ShareAdmin`] tabulates.
+#[derive(Clone, Copy, Debug, Default)]
+struct ShareAdminHost;
+
+impl ShutdownHost for ShareAdminHost {
+    /// `data->multi && data->multi->admin` (`lib/cshutdn.c:139`): a share's
+    /// admin handle has no multi handle.
+    fn has_admin(&self) -> bool {
+        false
+    }
+
+    /// `data->multi` (`lib/cshutdn.c:157`, `:161`). False, which is what makes
+    /// every connection terminate in place rather than being queued
+    /// (`lib/conncache.c:225-228`).
+    fn has_multi(&self) -> bool {
+        false
+    }
+
+    /// `data->state.internal` (`lib/cshutdn.c:51`), which
+    /// `lib/curl_share.c:47` sets on exactly this handle.
+    fn is_internal(&self, _handle: ShutdownHandle) -> bool {
+        true
+    }
+
+    /// `data->set.timeout = DEFAULT_SHUTDOWN_TIMEOUT_MS`
+    /// (`lib/cshutdn.c:52`).
+    ///
+    /// There is no handle to write; `ShareAdmin`'s table records what a
+    /// handle would have been given, and the external cap in
+    /// `run_conn_handler` enforces the same budget regardless.
+    fn set_operation_timeout_ms(
+        &mut self,
+        _handle: ShutdownHandle,
+        _timeout_ms: TimeDiff,
+    ) {
+    }
+
+    /// `Curl_pgrsTime(data, TIMER_STARTOP)` (`lib/cshutdn.c:53`).
+    fn restart_operation_timing(&mut self, _handle: ShutdownHandle) {}
+
+    /// `cshutdn->multi->socket_cb` (`lib/cshutdn.c:411`): no multi handle, so
+    /// no socket callback and no event state to maintain.
+    fn socket_cb_installed(&self) -> bool {
+        false
+    }
+
+    /// `Curl_multi_ev_assess_conn` (`lib/multi_ev.h:59`), reached through
+    /// `cshutdn_update_ev` (`lib/cshutdn.c:380-393`) only when a socket
+    /// callback is installed. Unreachable here, and success is the answer that
+    /// keeps a connection on the ordinary disposal path if it ever is reached.
+    fn assess_conn(
+        &mut self,
+        _handle: ShutdownHandle,
+        _id: ConnId,
+        _cx: &mut CallCtx<'_, '_>,
+        _chains: &mut FilterChains,
+    ) -> CURLMcode {
+        CURLMcode::Ok
+    }
+
+    /// `Curl_multi_ev_conn_done` (`lib/cshutdn.c:158`), gated on
+    /// `data->multi`.
+    fn conn_done(
+        &mut self,
+        _handle: ShutdownHandle,
+        _id: ConnId,
+        _cx: &mut CallCtx<'_, '_>,
+        _chains: &mut FilterChains,
+    ) {
+    }
+
+    /// `Curl_multi_connchanged` (`lib/cshutdn.c:163`), which wakes transfers
+    /// parked for want of a connection. There is no multi handle to wake.
+    fn connchanged(&mut self) {}
+
+    /// `Curl_expire_ex(data, milli, id)` (`lib/cshutdn.c:263`), which arms a
+    /// timer on the multi handle.
+    fn expire(
+        &mut self,
+        _handle: ShutdownHandle,
+        _timeout_ms: TimeDiff,
+        _timer: TimerId,
+    ) {
+    }
+
+    /// `multi->max_total_connections` (`lib/multihandle.h:152`): zero is the
+    /// C's "unlimited", and a share has no such option.
+    fn max_total_connections(&self) -> usize {
+        0
+    }
+}
+
+/// Where a share is in its life, as its validity tag records it.
+///
+/// The C has only two of these three states -- `CURL_GOOD_SHARE` and the zero
+/// `curl_share_cleanup` writes at `lib/curl_share.c:263` -- and the missing
+/// middle is what lets two concurrent `curl_share_cleanup` calls both succeed
+/// there. [`ShareCore::claim_cleanup`] states the full argument;
+/// [`ShareCore::CLEANING_MAGIC`] is the tag value that carries
+/// [`Self::Cleaning`].
+///
+/// Which entry points accept which phase is deliberate and is the whole of the
+/// lifecycle serialisation:
+///
+/// | Phase | `setopt`, accessors, `attach` | `detach`, `lock`, `unlock` |
+/// |-------|-------------------------------|----------------------------|
+/// | [`Self::Live`] | accepted | accepted |
+/// | [`Self::Cleaning`] | refused | accepted |
+/// | [`Self::Dead`] | refused | refused |
+///
+/// *Refused* is [`CURLSHcode::Invalid`] where the entry point returns a code
+/// and [`None`] where it returns an [`Option`]. `cleanup` is the fourth
+/// column and does not fit one: it *claims* in [`Self::Live`] and reports
+/// [`CURLSHcode::Invalid`] in the other two.
+///
+/// `detach` is deliberately accepted while a teardown is in progress: a
+/// refusal there would swallow a decrement the caller has already committed
+/// to -- `lib/setopt.c:1514` and `lib/url.c:292` both perform it
+/// unconditionally once they hold the lock -- and leave a count that no
+/// later cleanup could ever bring to zero. `lock` and `unlock` are accepted
+/// for the same reason the C accepts them: its tag is still
+/// `CURL_GOOD_SHARE` throughout the teardown, and the teardown itself
+/// delivers notifications (`lib/conncache.c:41-60`, reached from
+/// `Curl_cpool_destroy`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Lifecycle {
+    /// `magic == CURL_GOOD_SHARE`: `GOOD_SHARE_HANDLE` holds.
+    Live,
+    /// A [`Share::cleanup`] has claimed this share and is running.
+    Cleaning,
+    /// `magic == 0`: the teardown finished, and the FFI may free.
+    Dead,
+}
+
+impl Lifecycle {
+    /// Classifies a tag read.
+    ///
+    /// Any value that is neither of the two known tags is [`Self::Dead`],
+    /// which is the same conservative answer `GOOD_SHARE_HANDLE`
+    /// (`lib/curl_share.h:37`) gives for a tag it does not recognise. The
+    /// tag is private and only this module writes it, so no other value is
+    /// reachable; classifying it anyway keeps the function total without a
+    /// panicking arm.
+    fn of(magic: u32) -> Self {
+        match magic {
+            ShareCore::GOOD_MAGIC => Self::Live,
+            ShareCore::CLEANING_MAGIC => Self::Cleaning,
+            _ => Self::Dead,
+        }
+    }
+
+    /// Whether this share still exists as far as a notification is concerned.
+    ///
+    /// True for [`Self::Live`] and [`Self::Cleaning`]: the C's tag is
+    /// `CURL_GOOD_SHARE` for both, so `Curl_share_lock` and
+    /// `Curl_share_unlock` (`lib/curl_share.c:269-299`) deliver in both.
+    fn is_present(self) -> bool {
+        !matches!(self, Self::Dead)
+    }
+}
+
+/// The thread-safe part of a share: everything but the connection pool.
+///
+/// The state of `struct Curl_share` (`lib/curl_share.h:43-66`) minus its
+/// `cpool` and `admin` members, which is exactly the part that is
+/// `Send + Sync` -- and therefore exactly the part one share can genuinely
+/// serve to several threads with, which
+/// `docs/libcurl/opts/CURLSHOPT_SHARE.md` and `tests/libtest/lib506.c` and
+/// `lib3207.c` require of `CURL_LOCK_DATA_DNS`, `CURL_LOCK_DATA_SSL_SESSION`,
+/// `CURL_LOCK_DATA_COOKIE`, `CURL_LOCK_DATA_HSTS` and `CURL_LOCK_DATA_PSL`.
+/// [`Share`] owns one of these behind an [`Arc`] and hands clones out through
+/// `Share::stores`.
+///
+/// # Why this type exists at all
+///
+/// Because `crate::conn::pool::ConnectionPool` is not `Send`, and a container
+/// holding a `!Send` value is not `Send` either. Splitting the share in two
+/// confines that to the one datum that causes it instead of letting it decide
+/// the thread-safety of all six, and it does so without weakening anything:
+/// the pool stays a real pool, owned by [`Share`], reachable through
+/// `Share::pool`, destroyed by [`Share::cleanup`]. The module documentation
+/// carries the measurement, the exact blockers and what removing them
+/// requires.
+///
+/// # `pub`, and why that does not export any store
+///
+/// [`Share`] dereferences to this type, so it must be at least as visible.
+/// Its `pub` surface is the same shape as [`Share`]'s -- the validity check,
+/// the specifier, the reference count and the two ownership transactions --
+/// and every accessor that names a `pub(crate)` store type is itself
+/// `pub(crate)`, which is what keeps `error[E0446]` away. Its fields are all
+/// private, exactly as `struct Curl_share`'s are *"libcurl-private, do not
+/// export details"* (`lib/curl_share.h:42`).
 ///
 /// # Locking layout
 ///
@@ -969,13 +1281,18 @@ impl Meta {
 /// making a nested `CURL_LOCK_DATA_COOKIE`-then-`CURL_LOCK_DATA_PSL` sequence
 /// -- which `lib/cookie.c` performs around `Curl_psl_use` -- deadlock.
 ///
-/// Lock ordering is fixed and shallow: metadata is taken and released before
-/// any store lock, never with one held, and a store lock is never taken while
-/// another store lock is held except for the one nesting the C itself
-/// performs, cookie then PSL. That is what keeps the callbacks non-nested per
-/// kind, which `tests/libtest/lib506.c`'s double-lock detector proves the C
-/// guarantees.
-pub struct Share {
+/// Lock ordering is fixed and shallow. Metadata is always taken **before** a
+/// store lock and never after one: [`Share::setopt`] holds the metadata across
+/// the whole `CURLSHOPT_SHARE` switch, whose arms take a store lock, so the
+/// pair `meta -> store` occurs and the pair `store -> meta` must not. That is
+/// why `ShareGuard` and `PslGuard` declare their store guard before their
+/// unlock token: the store lock is released first, and the metadata the
+/// notification needs is taken only after it is gone. A store lock is never
+/// taken while another store lock is held except for the one nesting the C
+/// itself performs, cookie then PSL. That is what keeps the callbacks
+/// non-nested per kind, which `tests/libtest/lib506.c`'s double-lock detector
+/// proves the C guarantees.
+pub struct ShareCore {
     /// `share->magic` (`lib/curl_share.h:44`): the validity tag.
     ///
     /// An [`AtomicU32`] and not part of [`Meta`], because the C reads it
@@ -988,13 +1305,6 @@ pub struct Share {
     meta: Mutex<Meta>,
     /// `share->dnscache` (`lib/curl_share.h:53`): held **by value** in the C
     /// and initialised eagerly, so there is no [`Option`] here.
-    ///
-    /// `Curl_dnscache_init(&share->dnscache, 23)` runs in `curl_share_init`
-    /// (`lib/curl_share.c:39`), which is why `CURLSHOPT_SHARE` with
-    /// `CURL_LOCK_DATA_DNS` has nothing to do (`:84-85`) and why
-    /// `CURLSHOPT_UNSHARE` with it has nothing to undo (`:152-153`). Only the
-    /// specifier bit distinguishes a shared cache from an unshared one, which
-    /// is exactly what `dnscache_get` tests (`lib/hostip.c:300`).
     dnscache: Mutex<DnsCache>,
     /// `share->cookies` (`lib/curl_share.h:55`): a **pointer** in the C, so an
     /// [`Option`] here.
@@ -1005,12 +1315,6 @@ pub struct Share {
     cookies: Mutex<Option<CookieInfo>>,
     /// `share->psl` (`lib/curl_share.h:58`): held **by value** in the C, and
     /// -- uniquely -- never initialised by any code path.
-    ///
-    /// `curl_share_init` leaves it as `curlx_calloc` made it and
-    /// `CURLSHOPT_SHARE` with `CURL_LOCK_DATA_PSL` does nothing but set the
-    /// specifier bit (`lib/curl_share.c:134-138`); the zeroed state is stale
-    /// by construction, so the first use refreshes it. `curl_share_cleanup`
-    /// destroys it unconditionally (`:258`), regardless of the bit.
     ///
     /// An [`RwLock`] rather than a [`Mutex`] because this is the only datum
     /// the C ever asks for with `CURL_LOCK_ACCESS_SHARED`
@@ -1026,14 +1330,53 @@ pub struct Share {
     hsts: Mutex<Option<HstsCache>>,
     /// `share->ssl_scache` (`lib/curl_share.h:64`): a **pointer** in the C, so
     /// an [`Option`] here.
-    ///
-    /// Created lazily with 25 peers and 2 sessions each
-    /// (`lib/curl_share.c:113-121`) and destroyed by `CURLSHOPT_UNSHARE`
-    /// (`:178-181`). Unconditional in Rust: the C guards it with
-    /// `#ifdef USE_SSL`, and there is no TLS feature to gate on because TLS is
-    /// not optional here. `CURL_LOCK_DATA_SSL_SESSION` can therefore never
-    /// yield [`CURLSHcode::NotBuiltIn`].
     ssl_scache: Mutex<Option<SessionCache>>,
+}
+
+/// A share: state deliberately shared between easy handles.
+///
+/// Supersedes `struct Curl_share` (`lib/curl_share.h:43-66`), which carries
+/// the comment *"this struct is libcurl-private, do not export details"*
+/// (`:42`). That comment is this type's specification as much as its
+/// documentation: the C hands applications a `void *`
+/// (`include/curl/curl.h:110`), and every field here is private for the same
+/// reason.
+///
+/// # What this type is, and what [`ShareCore`] is
+///
+/// This is the **owner**: the value `curl_share_init` hands out and
+/// `curl_share_cleanup` frees. It holds the two members that cannot travel --
+/// the connection pool and the admin context that destroys it -- and an
+/// [`Arc`] of the rest. Everything in that rest is `Send + Sync`, so a clone
+/// of it, which `Share::stores` returns, serves one share to as many threads
+/// as the application has. This type is neither, because
+/// `crate::conn::pool::ConnectionPool` is not `Send`; the module
+/// documentation carries the measurement and what removing that requires.
+///
+/// It dereferences to [`ShareCore`], so every operation on the shared state --
+/// [`ShareCore::attach`], [`ShareCore::detach`], the store accessors, the
+/// notifications, the specifier and the reference count -- is available
+/// directly on a [`Share`] and reads exactly as it did before the split.
+///
+/// # Ownership at the C boundary
+///
+/// `curl_share_init` performs `Box::into_raw` on one of these and
+/// `curl_share_cleanup` performs `Box::from_raw` -- but **only** after
+/// [`Self::cleanup`] has returned [`CURLSHcode::Ok`], and at most one caller
+/// per share can ever receive it. Every entry point takes `&self`, so the
+/// object can never be consumed by an operation that is supposed to fail
+/// leaving it usable, which `docs/libcurl/curl_share_cleanup.md:59-60`
+/// requires: *"If an error occurs, then the share object is not deleted."*
+pub struct Share {
+    /// The shared, thread-safe state: the metadata and five of the six stores.
+    ///
+    /// An [`Arc`] rather than a plain value so that [`Self::stores`] can hand
+    /// a second thread a handle to the same state. The count also decides
+    /// when the state is reclaimed, which is strictly safer than the C's
+    /// `curlx_free(share)` at `lib/curl_share.c:264`: a handle that outlives
+    /// the `CURLSH` sees a retired share and reports
+    /// [`CURLSHcode::Invalid`], where the C would read freed memory.
+    core: Arc<ShareCore>,
     /// `share->cpool` (`lib/curl_share.h:52`): held **by value** in the C but
     /// guarded by its own `cpool.initialised` flag, which an [`Option`]
     /// expresses without a second field.
@@ -1045,9 +1388,38 @@ pub struct Share {
     /// destroyed at cleanup only when the specifier bit is still set
     /// (`:237-239`).
     ///
-    /// This is the field that makes [`Share`] neither `Send` nor `Sync`; the
-    /// module documentation records the measurement and the escalation.
+    /// This was the field that made [`Share`] neither `Send` nor `Sync`. The
+    /// connection layer's seam traits now carry `Send`/`Send + Sync` bounds and
+    /// share their injected objects through [`Arc`], so a pool is [`Send`] and
+    /// a `Mutex` of one is `Send + Sync`. The module documentation records what
+    /// changed and where.
     cpool: Mutex<Option<ConnectionPool>>,
+    /// `share->admin` (`lib/curl_share.h:51`): the internal handle the pool's
+    /// disposal path is driven through.
+    ///
+    /// Created eagerly, as `curl_share_init` creates its
+    /// (`lib/curl_share.c:40`), and retained for the whole life of the share
+    /// because that is what `Curl_cpool_destroy`'s `cpool->idata` guard
+    /// (`lib/conncache.c:233`) requires: a pool with no admin context is a
+    /// pool the C does not destroy. [`ShareAdmin`] records what it answers and
+    /// why each answer is the C's. It sits beside the pool, not in the core,
+    /// because it exists only to destroy the pool.
+    admin: Mutex<ShareAdmin>,
+}
+
+impl Deref for Share {
+    type Target = ShareCore;
+
+    /// The shared state, so that a [`Share`] answers every question
+    /// [`ShareCore`] answers.
+    ///
+    /// This is what makes the split invisible to a caller: `share.attach(..)`,
+    /// `share.specifier()`, `share.cookies(..)` and the rest resolve here,
+    /// while `share.pool(..)` and `share.cleanup()` -- the two that need the
+    /// pool -- resolve on [`Share`] itself.
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
 }
 
 impl Default for Share {
@@ -1058,32 +1430,27 @@ impl Default for Share {
     }
 }
 
-impl fmt::Debug for Share {
+/// `Some(true)` present, `Some(false)` absent, [`None`] locked.
+///
+/// Free rather than nested inside a `fmt` method because both [`Share`] and
+/// [`ShareCore`] report their slots this way.
+fn presence<T>(slot: &Mutex<Option<T>>) -> Option<bool> {
+    slot.try_lock().ok().map(|guard| guard.is_some())
+}
+
+/// `<locked>` for a lock the caller could not take.
+fn describe(state: Option<bool>) -> &'static str {
+    match state {
+        Some(true) => "present",
+        Some(false) => "absent",
+        None => "<locked>",
+    }
+}
+
+impl fmt::Debug for ShareCore {
     /// Hand-written for two reasons.
-    ///
-    /// The callbacks are function values, which do not implement
-    /// [`fmt::Debug`]; and a derived implementation would block on every
-    /// lock, so formatting a share from inside a critical section -- which is
-    /// exactly when a diagnostic is wanted -- would deadlock. Every lock is
-    /// therefore probed with `try_lock` and reported as `<locked>` when it is
-    /// held, which makes this safe to call from anywhere including a panic
-    /// handler in a test.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        /// `Some(true)` present, `Some(false)` absent, [`None`] locked.
-        fn presence<T>(slot: &Mutex<Option<T>>) -> Option<bool> {
-            slot.try_lock().ok().map(|guard| guard.is_some())
-        }
-
-        /// `<locked>` for a lock this call could not take.
-        fn describe(state: Option<bool>) -> &'static str {
-            match state {
-                Some(true) => "present",
-                Some(false) => "absent",
-                None => "<locked>",
-            }
-        }
-
-        let mut out = f.debug_struct("Share");
+        let mut out = f.debug_struct("ShareCore");
         out.field("magic", &format_args!("{:#x}", self.magic()))
             .field("valid", &self.is_valid());
         match self.meta.try_lock() {
@@ -1114,15 +1481,44 @@ impl fmt::Debug for Share {
         #[cfg(feature = "hsts")]
         out.field("hsts", &describe(presence(&self.hsts)));
         out.field("ssl_scache", &describe(presence(&self.ssl_scache)))
+            .finish()
+    }
+}
+
+impl fmt::Debug for Share {
+    /// The shared state, plus the one store this type owns.
+    ///
+    /// [`ShareCore`]'s implementation does the work and states why every lock
+    /// is probed rather than taken; this adds the connection pool, reported the
+    /// same way.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Share")
+            .field("core", &self.core)
             .field("cpool", &describe(presence(&self.cpool)))
             .finish()
     }
 }
 
-impl Share {
+impl ShareCore {
     /// `CURL_GOOD_SHARE` (`lib/curl_share.h:36`): the validity tag a live
     /// share carries.
     pub const GOOD_MAGIC: u32 = 0x7e11_7a1e;
+
+    /// The tag a share carries while its teardown is in progress.
+    ///
+    /// **No C counterpart.** The C has two states, `CURL_GOOD_SHARE` and the
+    /// zero `lib/curl_share.c:263` writes, and therefore no way to say *"a
+    /// teardown has been claimed but has not finished"* -- which is why two
+    /// threads can both pass its `GOOD_SHARE_HANDLE` check and both reach
+    /// `CURLSHE_OK`. [`ShareCore::claim_cleanup`] records the full argument.
+    ///
+    /// The one's complement of [`Self::GOOD_MAGIC`], so it can collide with
+    /// neither the tag nor the zero, and so that a value seen in a debugger is
+    /// recognisably derived from the C's rather than arbitrary. It is private:
+    /// nothing outside this module has a use for it, and
+    /// `GOOD_SHARE_HANDLE`'s answer for it is `false`, which
+    /// [`ShareCore::is_valid`] delivers.
+    const CLEANING_MAGIC: u32 = Self::GOOD_MAGIC ^ u32::MAX;
 
     /// `curl_share_init` (`lib/curl_share.c:33-55`).
     ///
@@ -1141,7 +1537,9 @@ impl Share {
     /// The C returns `NULL` from two paths: a failed `curlx_calloc` (`:36`
     /// falls through to `return share`, which is the null it just got) and a
     /// failed `curl_easy_init` for the admin handle (`:41-44`). Neither has a
-    /// Rust counterpart -- an allocation failure aborts rather than yielding a
+    /// Rust counterpart -- the `calloc` is one fixed-size struct whose size this
+    /// crate chooses, so it is not an externally sized allocation and there is
+    /// no stable fallible spelling for it; a refusal aborts rather than yielding a
     /// null, and there is no admin handle to fail. `curl_share_init`
     /// consequently never returns `NULL` in this implementation, which is a
     /// divergence a caller cannot observe except by no longer taking a branch
@@ -1149,19 +1547,15 @@ impl Share {
     ///
     /// # The `admin` handle, and why it has no counterpart here
     ///
-    /// `lib/curl_share.c:40-47` creates a `struct Curl_easy`, gives it
-    /// `mid = 0` and sets `state.internal = TRUE`, so that the connection pool
-    /// and the trace machinery have a handle to attribute callbacks and
-    /// diagnostics to. Neither consumer exists to be attributed:
-    /// `crate::easy` has no handle type at this commit, and
-    /// `ConnectionPool::new` takes neither an owner nor a share --
-    /// `crate::conn::pool` states outright that *"This type is just the
-    /// pool"*. The two jobs the admin handle does in the C are therefore
-    /// carried differently here. The `CURL *handle` a callback receives is
-    /// supplied per call as a [`LockOwner`], because it varies per call and
-    /// the C varies it too -- `Curl_share_lock` passes the transfer's handle
-    /// while `curl_share_cleanup` passes `NULL`. Trace attribution has no
-    /// subject because this module emits no diagnostics; `lib/curl_share.c`
+    /// `lib/curl_share.c:40-47` creates a `struct Curl_easy`, gives it `mid =
+    /// 0` and sets `state.internal = TRUE`, so that the connection pool and
+    /// the trace machinery have a handle to attribute callbacks and
+    /// diagnostics to. The two jobs the admin handle does in the C are
+    /// therefore carried differently here. The `CURL *handle` a callback
+    /// receives is supplied per call as a [`LockOwner`], because it varies per
+    /// call and the C varies it too -- `Curl_share_lock` passes the transfer's
+    /// handle while `curl_share_cleanup` passes `NULL`. Trace attribution has
+    /// no subject because this module emits no diagnostics; `lib/curl_share.c`
     /// emits none either.
     ///
     /// `:48-51`'s `#ifdef DEBUGBUILD` block, which sets `set.verbose` when
@@ -1171,8 +1565,15 @@ impl Share {
     /// carry a diagnostic default would add a build configuration for
     /// something with no observable effect on any contract. It also has
     /// nothing to act on, for the same reason the admin handle does not.
-    #[must_use]
-    pub fn new() -> Self {
+    ///
+    /// This constructs the shared half; [`Share::new`] is the entry point and
+    /// adds the connection pool and the admin context to it.
+    ///
+    /// Private, and deliberately not `Default`: a bare [`ShareCore`] is not a
+    /// share. `curl_share_init` returns one thing, and here that is a
+    /// [`Share`] -- the owner that holds the pool and the admin context this
+    /// leaves out.
+    fn new() -> Self {
         Self {
             // C: lib/curl_share.c:37.
             magic: AtomicU32::new(Self::GOOD_MAGIC),
@@ -1192,16 +1593,13 @@ impl Share {
             hsts: Mutex::new(None),
             // C: lib/curl_share.h:64 -- a null pointer after calloc.
             ssl_scache: Mutex::new(None),
-            // C: lib/curl_share.h:52 -- `cpool.initialised` is false after
-            // calloc, which `None` expresses.
-            cpool: Mutex::new(None),
         }
     }
 
     /// The validity tag as it stands: `share->magic`
     /// (`lib/curl_share.h:44`).
     ///
-    /// [`Self::GOOD_MAGIC`] for a live share and zero once [`Self::cleanup`]
+    /// [`Self::GOOD_MAGIC`] for a live share and zero once [`Share::cleanup`]
     /// has succeeded, which is the transition `lib/curl_share.c:263` performs
     /// immediately before `curlx_free`.
     #[must_use]
@@ -1216,9 +1614,6 @@ impl Share {
 
     /// `GOOD_SHARE_HANDLE(share)` (`lib/curl_share.h:37`).
     ///
-    /// The C macro is `((x) && (x)->magic == CURL_GOOD_SHARE)`; the null test
-    /// belongs to the shim, which has a pointer, and the tag test is this.
-    ///
     /// # This is a heuristic in C and remains one here
     ///
     /// It exists so that a second `curl_share_cleanup` on the same pointer
@@ -1229,19 +1624,87 @@ impl Share {
     /// guarantee the C offers and no more. What is guaranteed is the ordering:
     /// the tag is cleared before the object is dropped, never after, so the
     /// window in which a stale pointer reads as valid is empty.
+    ///
+    /// # One window where this answers `false` and the C answers `true`
+    ///
+    /// While a [`Share::cleanup`] is in progress the tag holds
+    /// `Lifecycle::Cleaning`'s value, so this reports `false` where the C --
+    /// which does not zero `magic` until `:263`, after the teardown -- would
+    /// still report `true`. That window is reachable only by calling an entry
+    /// point concurrently with `curl_share_cleanup`, which in the C races the
+    /// teardown into freed memory. Answering [`CURLSHcode::Invalid`] there is
+    /// the defined result where the C has none, and it is what makes the
+    /// claim below able to serialise the lifecycle.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.magic() == Self::GOOD_MAGIC
+        self.lifecycle() == Lifecycle::Live
+    }
+
+    /// Which phase of its life this share is in.
+    ///
+    /// The tag is read once and classified once, so that a caller cannot see
+    /// two different answers from two reads of the same value.
+    fn lifecycle(&self) -> Lifecycle {
+        Lifecycle::of(self.magic())
+    }
+
+    /// Claims the right to tear this share down, exactly once.
+    ///
+    /// The whole of [`Share::cleanup`]'s serialisation, and the reason the
+    /// FFI's `Box::from_raw` cannot run twice. `curl_share_cleanup`
+    /// (`lib/curl_share.c:221-267`) tests `GOOD_SHARE_HANDLE` at `:224`,
+    /// reads `share->dirty` at `:231` and clears the tag at `:263` -- three
+    /// unsynchronised steps, so two threads entering it together both pass
+    /// `:224`, both read a zero count and both reach `:266` with
+    /// `CURLSHE_OK`. Under the FFI's ownership rule that is two
+    /// `Box::from_raw` calls on one allocation.
+    ///
+    /// A single compare-and-exchange from [`Lifecycle::Live`] to
+    /// [`Lifecycle::Cleaning`] closes it: the loser observes
+    /// [`Lifecycle::Cleaning`] or [`Lifecycle::Dead`] and reports
+    /// [`CURLSHcode::Invalid`], which is the code the C reports for the
+    /// second cleanup of a share it has already freed. It closes the other
+    /// half too: [`Self::attach`] refuses while the claim is held, so the
+    /// count this function's caller goes on to read cannot be raised behind
+    /// it.
+    ///
+    /// `AcqRel` on success so that everything the winner does next is ordered
+    /// after every attach that preceded the claim; `Acquire` on failure so
+    /// that a loser which observes [`Lifecycle::Dead`] also observes the
+    /// teardown that produced it.
+    fn claim_cleanup(&self) -> bool {
+        self.magic
+            .compare_exchange(
+                Self::GOOD_MAGIC,
+                Self::CLEANING_MAGIC,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Gives the claim back, leaving the share exactly as it was.
+    ///
+    /// The [`CURLSHcode::InUse`] path of `curl_share_cleanup`
+    /// (`lib/curl_share.c:231-235`), which `docs/libcurl/curl_share_cleanup.md`
+    /// requires to leave the object usable: *"If an error occurs, then the
+    /// share object is not deleted."* A share that refused to be cleaned up
+    /// must therefore return to [`Lifecycle::Live`] and accept everything it
+    /// accepted before, this call included.
+    fn release_claim(&self) {
+        self.magic.store(Self::GOOD_MAGIC, Ordering::Release);
+    }
+
+    /// Retires the share: `share->magic = 0` (`lib/curl_share.c:263`).
+    ///
+    /// Called only by the thread holding the claim, and only after the
+    /// teardown, so `Release` publishes that teardown to whoever next reads
+    /// the tag.
+    fn finish_cleanup(&self) {
+        self.magic.store(0, Ordering::Release);
     }
 
     /// The metadata lock, recovering from poisoning rather than panicking.
-    ///
-    /// `PoisonError::into_inner` is the idiom `crate::util::timeval` uses, and
-    /// the reasoning is stronger here: a poisoned lock would otherwise make
-    /// every later operation on this share fail permanently, which is a
-    /// behaviour C -- having no notion of poisoning -- cannot produce. The
-    /// data behind the lock is a bitmask, a counter and two callback slots,
-    /// none of which can be left in a state a later reader mis-reads.
     fn meta(&self) -> MutexGuard<'_, Meta> {
         self.meta.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1285,12 +1748,6 @@ impl Share {
 
     /// `Curl_share_lock` (`lib/curl_share.c:269-284`).
     ///
-    /// Delivers the application's lock notification for `kind` when -- and
-    /// only when -- the kind's specifier bit is set and a callback is
-    /// installed. Otherwise nothing is delivered and the call still succeeds:
-    /// the C's comment at `:281` is *"else if we do not share this, pretend
-    /// successful lock"*.
-    ///
     /// # Return value
     ///
     /// The C's `if(!share) return CURLSHE_INVALID` (`:274-275`) tests the easy
@@ -1301,6 +1758,14 @@ impl Share {
     /// arm is an addition, and it can only fire where the C would already have
     /// been reading freed memory; its effect is that a stale share delivers no
     /// callback rather than an unpredictable one.
+    ///
+    /// A share whose teardown is in progress still delivers, because the C's
+    /// tag is still `CURL_GOOD_SHARE` until `:263` and its own teardown
+    /// notifies through this path: `Curl_cpool_destroy` brackets its removal
+    /// loop with `CPOOL_LOCK`/`CPOOL_UNLOCK` (`lib/conncache.c:41-60`), which
+    /// are `Curl_share_lock` and `Curl_share_unlock` for
+    /// `CURL_LOCK_DATA_CONNECT`. [`Lifecycle`] tabulates which phase each
+    /// entry point accepts.
     ///
     /// # This does not take a Rust lock
     ///
@@ -1318,7 +1783,7 @@ impl Share {
         kind: LockData,
         access: LockAccess,
     ) -> CURLSHcode {
-        if !self.is_valid() {
+        if !self.lifecycle().is_present() {
             return CURLSHcode::Invalid;
         }
         // The notification is chosen under the metadata lock and delivered
@@ -1345,7 +1810,7 @@ impl Share {
         owner: LockOwner,
         kind: LockData,
     ) -> CURLSHcode {
-        if !self.is_valid() {
+        if !self.lifecycle().is_present() {
             return CURLSHcode::Invalid;
         }
         let notification = self.meta().unlock_notification(kind);
@@ -1372,38 +1837,80 @@ impl Share {
     /// ```
     ///
     /// The count and the bracketing live here so that `crate::easy` and
-    /// `crate::multi` cannot get them wrong. The repointing does not: it
-    /// writes to the easy handle's own fields, and no easy handle type exists
-    /// at this commit. What the C decides the repointing from is the
-    /// specifier -- `:1530` tests the shared cookie jar, `:1538` the shared
-    /// HSTS cache and `:1545` the `CURL_LOCK_DATA_PSL` bit -- so the specifier
-    /// is returned, read inside the same critical section as the increment. A
-    /// caller therefore needs one call rather than a call plus a racing query.
+    /// `crate::multi` cannot get them wrong. What the C decides the repointing
+    /// from is the specifier -- `:1530` tests the shared cookie jar, `:1538`
+    /// the shared HSTS cache and `:1545` the `CURL_LOCK_DATA_PSL` bit -- so
+    /// the specifier is read inside the critical section and handed to
+    /// `repoint`.
     ///
-    /// An invalid share yields [`Specifier::EMPTY`] and changes nothing, which
-    /// is the C's `GOOD_SHARE_HANDLE(set)` guard at `:1520`: a share that
-    /// fails it is never assigned and never counted.
-    #[must_use]
-    pub fn attach(&self, owner: LockOwner) -> Specifier {
+    /// # Why the repointing is a closure and not a returned mask
+    ///
+    /// Because `lib/setopt.c` performs it **between** the lock and the unlock,
+    /// and that placement is observable: the application's lock callback is
+    /// what serialises an attaching handle's view of the shared stores against
+    /// every other handle's. Returning the mask for the caller to act on after
+    /// the unlock would deliver a critical section that ends before the work
+    /// it is supposed to cover -- the shared jar could be replaced, or the
+    /// share torn down, between the two.
+    ///
+    /// `repoint` therefore runs inside the bracket, in the C's order:
+    /// `dirty++` first (`:1527`), then the repointing (`:1529-1547`). It runs
+    /// with none of this module's own locks held, so it may call back into the
+    /// share for a different datum -- which is what the C does when it reads
+    /// `share->cookies` -- and the unlock notification is delivered by
+    /// `Release`, so a `repoint` that panics cannot leave an application
+    /// mutex held for the rest of the process.
+    ///
+    /// # Returns
+    ///
+    /// `Some(repoint's value)` when the handle was registered, [`None`] when
+    /// the share refused it and `repoint` was never called. That refusal is
+    /// the C's `GOOD_SHARE_HANDLE(set)` guard at `:1520` -- a share that fails
+    /// it is never assigned and never counted -- plus the one case the C
+    /// cannot express: a share whose teardown has already been claimed, which
+    /// must not acquire a new reference behind the claim.
+    /// `ShareCore::claim_cleanup` gives the full argument.
+    pub fn attach<R>(
+        &self,
+        owner: LockOwner,
+        repoint: impl FnOnce(Specifier) -> R,
+    ) -> Option<R> {
+        // C: lib/setopt.c:1520 -- `if(GOOD_SHARE_HANDLE(set))`.
         if !self.is_valid() {
-            return Specifier::EMPTY;
+            return None;
         }
         // C: lib/setopt.c:1525.
         self.lock(owner, LockData::Share, LockAccess::Single);
+        // C: lib/setopt.c:1549, on every path out of this scope from here on,
+        // unwinding included.
+        let _release = Release {
+            core: self,
+            owner,
+            kind: LockData::Share,
+        };
         let specifier = {
             let mut meta = self.meta();
-            // C: lib/setopt.c:1527. `saturating_add` rather than `+= 1`
-            // because this file contains no arithmetic that can panic; the
-            // saturation point is 4,294,967,295 concurrent handles, which no
-            // reachable program approaches, and saturating there is strictly
-            // better than wrapping to zero and letting `cleanup` free a share
-            // that is still in use.
-            meta.dirty = meta.dirty.saturating_add(1);
+            // Re-tested under the metadata lock, because the test above and
+            // the increment below are not one step: a cleanup claimed in
+            // between must not be handed a new reference it has already
+            // decided it does not have. This is the half of the
+            // stale-snapshot race that lives on the attaching side.
+            if !self.is_valid() {
+                return None;
+            }
+            // C: lib/setopt.c:1527 -- `data->share->dirty++` on an
+            // `unsigned int`, which wraps. `wrapping_add` is that arithmetic
+            // exactly, and it cannot panic in any build. The wrap point is
+            // 4,294,967,296 concurrent handles; under the balanced lifecycle
+            // this API enforces -- one attach per handle, one detach per
+            // close -- it is unreachable, and diverging from C there would be
+            // a behaviour change rather than a safeguard.
+            meta.dirty = meta.dirty.wrapping_add(1);
             Specifier(meta.specifier)
         };
-        // C: lib/setopt.c:1549.
-        self.unlock(owner, LockData::Share);
-        specifier
+        // C: lib/setopt.c:1529-1547 -- inside the bracket, after the
+        // increment.
+        Some(repoint(specifier))
     }
 
     /// Deregisters an easy handle, returning what it must stop pointing at.
@@ -1413,38 +1920,156 @@ impl Share {
     /// three steps: take `CURL_LOCK_DATA_SHARE` exclusively, decrement, and
     /// release.
     ///
-    /// The specifier is returned for the same reason [`Self::attach`] returns
-    /// it, and it matters more here: `lib/setopt.c:1509-1512` unlinks **both**
-    /// of the handle's resolver entries when the `CURL_LOCK_DATA_DNS` bit is
-    /// set, and `:1497-1507` nulls the cookie and HSTS pointers and repoints
-    /// the PSL cache at the multi handle's or at nothing. All of those
-    /// decisions are the caller's to carry out on its own fields, and all of
-    /// them are read from the mask this returns.
+    /// `unlink` runs inside the bracket for the same reason [`Self::attach`]'s
+    /// `repoint` does, and it matters more here: `lib/setopt.c:1509-1512`
+    /// unlinks **both** of the handle's resolver entries when the
+    /// `CURL_LOCK_DATA_DNS` bit is set, and `:1497-1507` nulls the cookie and
+    /// HSTS pointers and repoints the PSL cache at the multi handle's or at
+    /// nothing. Every one of those touches state the share still owns, so
+    /// doing them after the unlock notification would race the next handle --
+    /// or a cleanup -- for the stores being let go of.
+    ///
+    /// # The order is the C's, and the C's order is the safe one
+    ///
+    /// `unlink` runs **before** the decrement, because `lib/setopt.c` does the
+    /// repointing at `:1497-1512` and the `dirty--` at `:1514`. That way the
+    /// handle has finished letting go of every shared store before the count
+    /// can reach zero and permit a teardown. `Curl_close`'s path
+    /// (`lib/url.c:291-293`) has no repointing at all, which a closure that
+    /// does nothing expresses exactly.
     ///
     /// # Underflow
     ///
     /// The C writes `dirty--` on an `unsigned int`, so an unbalanced call
-    /// would wrap to `UINT_MAX` and make the share permanently un-cleanable.
-    /// Both C call sites are guarded by `if(data->share)`, so libcurl itself
-    /// never reaches it. `saturating_sub` keeps this file free of panicking
-    /// arithmetic and turns the unreachable case into the harmless one; the
-    /// divergence is confined to inputs the C leaves broken.
-    #[must_use]
-    pub fn detach(&self, owner: LockOwner) -> Specifier {
-        if !self.is_valid() {
-            return Specifier::EMPTY;
+    /// wraps to `UINT_MAX` and the share can never be cleaned up again. Both C
+    /// call sites are guarded by `if(data->share)`, so libcurl itself never
+    /// reaches it. `wrapping_sub` is that arithmetic exactly -- it cannot
+    /// panic in any build, and it keeps the consequence the C's rather than
+    /// inventing a friendlier one, which under a frozen API would be a
+    /// behaviour change: an application that unbalanced its handles would
+    /// otherwise see a share that cleans up here and refuses to in curl 8.x.
+    ///
+    /// # Returns
+    ///
+    /// `Some(unlink's value)`, or [`None`] when the share is already retired --
+    /// in which case there is no count to lower and nothing for `unlink` to
+    /// let go of. A teardown in progress is **not** a refusal: see
+    /// `Lifecycle`.
+    pub fn detach<R>(
+        &self,
+        owner: LockOwner,
+        unlink: impl FnOnce(Specifier) -> R,
+    ) -> Option<R> {
+        if !self.lifecycle().is_present() {
+            return None;
         }
         // C: lib/setopt.c:1494, lib/url.c:291.
         self.lock(owner, LockData::Share, LockAccess::Single);
-        let specifier = {
-            let mut meta = self.meta();
-            // C: lib/setopt.c:1514, lib/url.c:292.
-            meta.dirty = meta.dirty.saturating_sub(1);
-            Specifier(meta.specifier)
+        // C: lib/setopt.c:1516, lib/url.c:293, on every path out from here.
+        let _release = Release {
+            core: self,
+            owner,
+            kind: LockData::Share,
         };
-        // C: lib/setopt.c:1516, lib/url.c:293.
-        self.unlock(owner, LockData::Share);
-        specifier
+        let specifier = self.specifier();
+        // C: lib/setopt.c:1497-1512 -- inside the bracket, before the
+        // decrement.
+        let outcome = unlink(specifier);
+        // C: lib/setopt.c:1514, lib/url.c:292.
+        let mut meta = self.meta();
+        meta.dirty = meta.dirty.wrapping_sub(1);
+        drop(meta);
+        Some(outcome)
+    }
+}
+
+// `curl_share_init` (`lib/curl_share.c:33-55`), and the handle a second thread
+// holds
+
+impl Share {
+    /// `CURL_GOOD_SHARE` (`lib/curl_share.h:36`): the validity tag a live
+    /// share carries.
+    ///
+    /// The same constant as [`ShareCore::GOOD_MAGIC`], which is where the tag
+    /// itself lives. It is restated here because an associated constant is not
+    /// reached through [`Deref`], and `curl-rs-ffi` compares against
+    /// `Share::GOOD_MAGIC`.
+    pub const GOOD_MAGIC: u32 = ShareCore::GOOD_MAGIC;
+
+    /// `curl_share_init` (`lib/curl_share.c:33-55`).
+    ///
+    /// The observable sequence, in the C's order:
+    ///
+    /// 1. `:35` allocate zeroed.
+    /// 2. `:37` `share->magic = CURL_GOOD_SHARE`.
+    /// 3. `:38` `share->specifier |= (1 << CURL_LOCK_DATA_SHARE)` -- bit 1 is
+    ///    set from birth, before an application asks for anything.
+    /// 4. `:39` `Curl_dnscache_init(&share->dnscache, 23)` -- the DNS cache is
+    ///    the one store built eagerly.
+    /// 5. `:40-47` create the internal `admin` handle, `mid = 0` and
+    ///    `state.internal = TRUE`, which the connection pool's disposal path is
+    ///    driven through. `ShareAdmin` is that context.
+    ///
+    /// Steps 2 to 4 belong to `ShareCore::new`; this adds the two members
+    /// that cannot be shared between threads, the pool and its admin.
+    ///
+    /// # Why this cannot fail
+    ///
+    /// The C returns `NULL` from two paths: a failed `curlx_calloc` (`:36`
+    /// falls through to `return share`, which is the null it just got) and a
+    /// failed `curl_easy_init` for the admin handle (`:41-44`). Neither has a
+    /// Rust counterpart -- an allocation failure aborts rather than yielding a
+    /// null, and the admin context here is infallible. `curl_share_init`
+    /// consequently never returns `NULL` in this implementation, which is a
+    /// divergence a caller cannot observe except by no longer taking a branch
+    /// it was already required to handle.
+    ///
+    /// `:48-51`'s `#ifdef DEBUGBUILD` block, which sets `set.verbose` when
+    /// `CURL_DEBUG` is in the environment, is deliberately **omitted**. There
+    /// is no debug-build feature in this crate's fifteen to gate it on -- the
+    /// vocabulary is fixed and contains no `debug` -- and inventing one to
+    /// carry a diagnostic default would add a build configuration for
+    /// something with no observable effect on any contract.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            // C: lib/curl_share.c:37-39.
+            core: Arc::new(ShareCore::new()),
+            // C: lib/curl_share.h:52 -- `cpool.initialised` is false after
+            // calloc, which `None` expresses.
+            cpool: Mutex::new(None),
+            // C: lib/curl_share.c:40-47 -- `share->admin = curl_easy_init()`,
+            // eager, with `mid = 0` and `state.internal = TRUE`.
+            admin: Mutex::new(ShareAdmin::new()),
+        }
+    }
+
+    /// A handle on this share's thread-safe state, for another thread.
+    ///
+    /// The answer to the requirement `docs/libcurl/opts/CURLSHOPT_SHARE.md`
+    /// states and `tests/libtest/lib506.c` and `lib3207.c` exercise: **one
+    /// share, several threads**. lib506 drives one share from two threads with
+    /// `CURL_LOCK_DATA_COOKIE` and `CURL_LOCK_DATA_DNS`, and lib3207 does the
+    /// same with `CURL_LOCK_DATA_SSL_SESSION`; every kind those two programs
+    /// use lives in [`ShareCore`], which is `Send + Sync`, so a clone of this
+    /// handle serves them.
+    ///
+    /// What it does **not** carry is `CURL_LOCK_DATA_CONNECT`. The connection
+    /// pool is not `Send`, so it stays with the [`Share`] and is reachable only
+    /// through [`Self::pool`] on the thread that owns the handle. The module
+    /// documentation records the measurement, names the three trait objects
+    /// that cause it and states exactly what removing them requires; nothing
+    /// in this file needs to change when they are.
+    ///
+    /// The handle keeps the state alive. A clone that outlives the `CURLSH`
+    /// observes a retired share -- [`ShareCore::is_valid`] answers `false` and
+    /// every operation reports [`CURLSHcode::Invalid`] -- where the C would
+    /// read freed memory, so an application that gets its teardown order wrong
+    /// gets a diagnosis rather than corruption.
+    #[allow(dead_code)] // consumers: crate::easy, crate::multi, curl-rs-ffi
+    #[must_use]
+    pub(crate) fn stores(&self) -> Arc<ShareCore> {
+        Arc::clone(&self.core)
     }
 }
 
@@ -1465,15 +2090,6 @@ impl Share {
     ///    options while one or more handles are already using this share"*.
     /// 3. `:76`-`:214` the switch.
     /// 4. `:216-218` return.
-    ///
-    /// Steps 2 and 3 run under one hold of the metadata lock, so the refusal
-    /// and the change it guards cannot be separated by another thread. The C
-    /// reads `share->dirty` unlocked at `:71`; taking the lock cannot change a
-    /// result the C reaches and closes a window the C leaves open.
-    ///
-    /// `:57`'s `#undef curl_share_setopt` has no counterpart: it exists only
-    /// because the public header macro-ises the name, which is
-    /// `curl-rs-ffi`'s concern.
     pub fn setopt(&self, option: ShareOption) -> CURLSHcode {
         // C: lib/curl_share.c:68-69.
         if !self.is_valid() {
@@ -1515,31 +2131,6 @@ impl Share {
     }
 
     /// `CURLSHOPT_SHARE` (`lib/curl_share.c:79-145`).
-    ///
-    /// `raw` is what `:81`'s `va_arg(param, int)` yielded. A value naming no
-    /// kind reaches the same [`CURLSHcode::BadOption`] the C's inner
-    /// `default:` reaches at `:140-141`, and -- as in the C -- no specifier bit
-    /// is touched, because `:143`'s `if(!res)` guards the update. Unlike the
-    /// C, no shift is performed on an unvalidated value, so the undefined
-    /// behaviour `1 << type` invites for a negative or large `type` cannot
-    /// occur.
-    ///
-    /// # The bit is set only on success
-    ///
-    /// `:143-144` is `if(!res) share->specifier |= (unsigned int)(1 << type);`.
-    /// This is the asymmetry with [`Self::unshare_kind`], whose clear is
-    /// unconditional, and it is reproduced rather than made uniform.
-    ///
-    /// # Idempotency is required
-    ///
-    /// `docs/libcurl/opts/CURLSHOPT_SHARE.md` states that *"You can set
-    /// CURLSHOPT_SHARE(3) multiple times with different data arguments"*, the
-    /// connection arm's own comment at `:128` is *"It is safe to set this
-    /// option several times on a share."*, and
-    /// `tests/libtest/lib1905.c:44-45` sets `CURL_LOCK_DATA_COOKIE` twice.
-    /// Every arm below therefore creates its store only when the slot is
-    /// empty, exactly as the C's `if(!share->cookies)`, `if(!share->hsts)`,
-    /// `if(!share->ssl_scache)` and `if(!share->cpool.initialised)` do.
     fn share_kind(&self, meta: &mut Meta, raw: i32) -> CURLSHcode {
         // C: lib/curl_share.c:81, made total.
         let Some(kind) = LockData::from_i32(raw) else {
@@ -1551,15 +2142,16 @@ impl Share {
             // only the specifier bit distinguishes shared from unshared.
             LockData::Dns => CURLSHcode::Ok,
             // C: lib/curl_share.c:87-97.
-            LockData::Cookie => self.share_cookies(),
+            LockData::Cookie => self.core.share_cookies(),
             // C: lib/curl_share.c:99-109.
-            LockData::Hsts => self.share_hsts(),
+            LockData::Hsts => self.core.share_hsts(),
             // C: lib/curl_share.c:111-125.
-            LockData::SslSession => self.share_ssl_scache(),
-            // C: lib/curl_share.c:127-132.
+            LockData::SslSession => self.core.share_ssl_scache(),
+            // C: lib/curl_share.c:127-132. The one arm this type serves
+            // itself, because the pool is the one store it owns.
             LockData::Connect => self.share_cpool(),
             // C: lib/curl_share.c:134-138.
-            LockData::Psl => Self::share_psl(),
+            LockData::Psl => ShareCore::share_psl(),
             // C: lib/curl_share.c:140-141 -- the inner `default:`. Note that
             // `CURL_LOCK_DATA_SHARE` lands here too: the C's inner switch has
             // no case for it, so asking to share the share's own internal
@@ -1575,12 +2167,45 @@ impl Share {
         res
     }
 
+    /// `CURL_LOCK_DATA_CONNECT` under `CURLSHOPT_SHARE`
+    /// (`lib/curl_share.c:127-132`).
+    ///
+    /// The C's `if(!share->cpool.initialised)` is the [`Option`] being empty,
+    /// which is why no separate flag is kept. Its size argument,
+    /// [`CPOOL_SLOTS`], has nothing to receive it: `ConnectionPool::new` takes
+    /// none, because the C's value is a hash bucket count and the Rust pool
+    /// keys destinations with a `BTreeMap`.
+    ///
+    /// The one `CURLSHOPT_SHARE` arm that belongs to this type rather than to
+    /// [`ShareCore`], because the pool is the one store the owner keeps.
+    fn share_cpool(&self) -> CURLSHcode {
+        let mut slot =
+            self.cpool.lock().unwrap_or_else(PoisonError::into_inner);
+        // C: lib/curl_share.c:129-131.
+        if slot.is_none() {
+            *slot = Some(ConnectionPool::new());
+        }
+        CURLSHcode::Ok
+    }
+}
+
+// The stores' own `CURLSHOPT_SHARE` and `CURLSHOPT_UNSHARE` arms
+//
+// Every arm below builds or destroys one of the five `Send + Sync` stores and
+// nothing else, so it is a [`ShareCore`] method: the state it touches is the
+// core's. [`Share::setopt`] still arbitrates -- the C refuses every option
+// while any handle is attached (`lib/curl_share.c:71-74`), which keeps these
+// out of reach of a second thread by construction rather than by convention.
+
+impl ShareCore {
     /// `CURL_LOCK_DATA_COOKIE` under `CURLSHOPT_SHARE`
     /// (`lib/curl_share.c:87-97`).
     ///
-    /// The C's `CURLSHE_NOMEM` at `:92` is unreachable here: it reports a
-    /// failed `Curl_cookie_init`, and `CookieInfo::new` cannot fail because a
-    /// Rust allocation failure aborts rather than returning null.
+    /// The C's `CURLSHE_NOMEM` at `:92` is unreachable here: it reports a failed
+    /// `Curl_cookie_init`, and `CookieInfo::new` allocates one fixed-size store
+    /// whose size this crate chooses -- not an externally sized allocation, and
+    /// with no stable fallible spelling at the declared minimum Rust version.
+    /// The variant stays in [`CURLSHcode`] because it is public ABI.
     #[cfg(feature = "cookies")]
     fn share_cookies(&self) -> CURLSHcode {
         let mut slot =
@@ -1594,12 +2219,6 @@ impl Share {
     }
 
     /// The `#else` arm of `lib/curl_share.c:94-96`.
-    ///
-    /// The C guard is
-    /// `#if !defined(CURL_DISABLE_HTTP) && !defined(CURL_DISABLE_COOKIES)`,
-    /// whose Rust counterpart is the `cookies` feature -- there is no separate
-    /// `http` feature in this crate's fifteen, and `crate::cookies` gates the
-    /// engine on `cookies` alone.
     #[cfg(not(feature = "cookies"))]
     fn share_cookies(&self) -> CURLSHcode {
         CURLSHcode::NotBuiltIn
@@ -1629,19 +2248,6 @@ impl Share {
 
     /// `CURL_LOCK_DATA_SSL_SESSION` under `CURLSHOPT_SHARE`
     /// (`lib/curl_share.c:111-125`).
-    ///
-    /// The capacities are the C's, and its comment at `:114-118` explains
-    /// them: *"There is no way (yet) for the application to configure the
-    /// session cache size, shared between many transfers. As for curl itself,
-    /// a high session count will impact startup time. Also, the scache is not
-    /// optimized for several hundreds of peers. So, keep it at a reasonable
-    /// level."* Hence [`SCACHE_MAX_PEERS`] peers with
-    /// [`SCACHE_MAX_SESSIONS_PER_PEER`] sessions each.
-    ///
-    /// Unconditional, where the C has `#ifdef USE_SSL`: TLS is not optional in
-    /// this crate and there is no feature to gate on, so `:122-123`'s
-    /// `CURLSHE_NOT_BUILT_IN` has no reachable counterpart. This kind can
-    /// never report it.
     fn share_ssl_scache(&self) -> CURLSHcode {
         let mut slot = self
             .ssl_scache
@@ -1660,37 +2266,8 @@ impl Share {
         CURLSHcode::Ok
     }
 
-    /// `CURL_LOCK_DATA_CONNECT` under `CURLSHOPT_SHARE`
-    /// (`lib/curl_share.c:127-132`).
-    ///
-    /// The C's `if(!share->cpool.initialised)` is the [`Option`] being empty,
-    /// which is why no separate flag is kept. Its size argument,
-    /// [`CPOOL_SLOTS`], has nothing to receive it: `ConnectionPool::new` takes
-    /// none, because the C's value is a hash bucket count and the Rust pool
-    /// keys destinations with a `BTreeMap`.
-    fn share_cpool(&self) -> CURLSHcode {
-        let mut slot =
-            self.cpool.lock().unwrap_or_else(PoisonError::into_inner);
-        // C: lib/curl_share.c:129-131.
-        if slot.is_none() {
-            *slot = Some(ConnectionPool::new());
-        }
-        CURLSHcode::Ok
-    }
-
     /// `CURL_LOCK_DATA_PSL` under `CURLSHOPT_SHARE`
     /// (`lib/curl_share.c:134-138`).
-    ///
-    /// The whole arm is
-    /// `#ifndef USE_LIBPSL res = CURLSHE_NOT_BUILT_IN; #endif break;` -- so
-    /// where the list is available this **succeeds while initialising
-    /// nothing**, and only the specifier bit changes. The cache is a
-    /// by-value, `calloc`-zeroed member (`lib/curl_share.h:58`) that no code
-    /// path ever initialises; zeroed means stale, so the first use refreshes
-    /// it.
-    ///
-    /// An associated function rather than a method because there is no state
-    /// to touch, which is the point.
     #[cfg(feature = "cookies")]
     fn share_psl() -> CURLSHcode {
         CURLSHcode::Ok
@@ -1706,19 +2283,17 @@ impl Share {
     fn share_psl() -> CURLSHcode {
         CURLSHcode::NotBuiltIn
     }
+}
 
+// `CURLSHOPT_UNSHARE`'s dispatcher, which the owner performs
+//
+// The dispatcher stays with [`Share`] for the same reason its counterpart does:
+// `CURL_LOCK_DATA_CONNECT` names the pool, which only the owner holds.
+
+impl Share {
     /// `CURLSHOPT_UNSHARE` (`lib/curl_share.c:147-194`).
     ///
-    /// Two measured quirks live here. Both are reproduced. Neither is
-    /// corrected: libcurl's observable behaviour is frozen, and a behavioural
-    /// improvement in this function would be a defect.
-    ///
     /// # Quirk 1: the specifier bit is cleared unconditionally
-    ///
-    /// `:150` is `share->specifier &= ~(unsigned int)(1 << type);` and it runs
-    /// **before** the switch and is **not** guarded by the result. An unshare
-    /// that returns [`CURLSHcode::BadOption`] has therefore already cleared the
-    /// bit. Do not move the clear after the switch and do not guard it.
     ///
     /// This is also how the `CURL_LOCK_DATA_SHARE` bit -- set at birth by
     /// `curl_share_init` (`:38`) and never cleared deliberately -- can be
@@ -1726,21 +2301,9 @@ impl Share {
     /// clears bit 1 at `:150` and then falls to `default:` for
     /// [`CURLSHcode::BadOption`], because the switch has no case for it. That
     /// is precisely why [`Self::cleanup`] delivers its notifications without
-    /// consulting the specifier while [`Self::lock`] consults it: after such a
+    /// consulting the specifier while [`ShareCore::lock`] consults it: after
+    /// such a
     /// call the two would otherwise disagree.
-    ///
-    /// # Quirk 2: `CURL_LOCK_DATA_PSL` is a bad option here
-    ///
-    /// The switch has cases for DNS, cookies, HSTS, TLS sessions and
-    /// connections, and **no case for the Public Suffix List**, so it reaches
-    /// `default:` at `:190-192` and returns [`CURLSHcode::BadOption`] -- while
-    /// having cleared the PSL bit, per quirk 1.
-    ///
-    /// `docs/libcurl/opts/CURLSHOPT_UNSHARE.md` says the opposite in both
-    /// directions: it documents a `## CURL_LOCK_DATA_PSL` section (*"The
-    /// Public Suffix List is no longer shared"*) and omits
-    /// `CURL_LOCK_DATA_HSTS` entirely, where the code handles HSTS and not the
-    /// PSL. **The documentation is stale; the code is the specification.**
     fn unshare_kind(&self, meta: &mut Meta, raw: i32) -> CURLSHcode {
         // C: lib/curl_share.c:149, made total. An unrecognised value performs
         // no clear, because there is no bit to name -- the C would shift by it
@@ -1757,11 +2320,11 @@ impl Share {
             // only the bit distinguishes shared from unshared.
             LockData::Dns => CURLSHcode::Ok,
             // C: lib/curl_share.c:155-164.
-            LockData::Cookie => self.unshare_cookies(),
+            LockData::Cookie => self.core.unshare_cookies(),
             // C: lib/curl_share.c:166-174.
-            LockData::Hsts => self.unshare_hsts(),
+            LockData::Hsts => self.core.unshare_hsts(),
             // C: lib/curl_share.c:176-185.
-            LockData::SslSession => self.unshare_ssl_scache(),
+            LockData::SslSession => self.core.unshare_ssl_scache(),
             // C: lib/curl_share.c:187-188 -- a bare `break`. The pool is
             // deliberately NOT destroyed: only `curl_share_cleanup` destroys
             // it, and only when the bit is still set.
@@ -1775,14 +2338,13 @@ impl Share {
             | LockData::Last => CURLSHcode::BadOption,
         }
     }
+}
 
+// The stores' own `CURLSHOPT_UNSHARE` arms
+
+impl ShareCore {
     /// `CURL_LOCK_DATA_COOKIE` under `CURLSHOPT_UNSHARE`
     /// (`lib/curl_share.c:155-164`).
-    ///
-    /// `Curl_cookie_cleanup(share->cookies)` then `share->cookies = NULL`.
-    /// The explicit emptier runs before the drop so that the C's call is
-    /// mirrored rather than merely its effect; dropping alone would reclaim
-    /// the same memory.
     #[cfg(feature = "cookies")]
     fn unshare_cookies(&self) -> CURLSHcode {
         let mut slot =
@@ -1860,6 +2422,21 @@ impl Share {
     /// 5. `:261-262` deliver the unlock notification.
     /// 6. `:263` zero the validity tag.
     ///
+    /// # Exactly one caller can ever reach step 4
+    ///
+    /// Step 1 is not a test here but a **claim**: a single
+    /// compare-and-exchange takes the share from `Lifecycle::Live` to
+    /// `Lifecycle::Cleaning`, and only its winner continues.
+    /// `ShareCore::claim_cleanup` states why that matters -- the C's three
+    /// unsynchronised steps let two concurrent callers both return
+    /// `CURLSHE_OK`, which under the FFI's ownership rule is two
+    /// `Box::from_raw` calls on one allocation -- and it closes the other side
+    /// of the same race too: while the claim is held [`ShareCore::attach`]
+    /// refuses,
+    /// so the count read at step 3 cannot be raised behind this function.
+    /// A claim that ends in [`CURLSHcode::InUse`] is given back, because the
+    /// share must survive that path intact.
+    ///
     /// # The caller frees, and only on success
     ///
     /// This takes `&self` and cannot consume, because
@@ -1886,26 +2463,27 @@ impl Share {
     /// cleared -- [`Self::unshare_kind`] records exactly how -- and after that
     /// the two behave differently. The C's asymmetry is therefore reproduced
     /// by delivering these three notifications directly rather than through
-    /// [`Self::lock`] and [`Self::unlock`].
+    /// [`ShareCore::lock`] and [`ShareCore::unlock`].
     pub fn cleanup(&self) -> CURLSHcode {
-        // C: lib/curl_share.c:224-225. No lock is taken first.
-        if !self.is_valid() {
+        // C: lib/curl_share.c:224-225. No lock is taken first -- and the
+        // validity test and the claim are one atomic step rather than two, so
+        // that two threads entering here together cannot both proceed. The
+        // loser gets the code the C gives the second cleanup of an
+        // already-freed share; `claim_cleanup` records the argument in full.
+        if !self.claim_cleanup() {
             return CURLSHcode::Invalid;
         }
 
-        // One critical section for everything the rest of this function needs,
-        // so that the reference count it acts on and the callbacks it delivers
-        // are consistent with each other. The C reads all five unlocked, one
-        // at a time. The callbacks are cloned out so that they run with no
-        // lock of ours held.
-        let (lockfunc, unlockfunc, clientdata, dirty, specifier) = {
+        // The callbacks and the user pointer are read once and cloned out, so
+        // that the notifications below run with no lock of ours held. They
+        // cannot change underneath this function: `setopt` is the only writer
+        // and it refuses while the claim is held.
+        let (lockfunc, unlockfunc, clientdata) = {
             let meta = self.meta();
             (
                 meta.lockfunc.clone(),
                 meta.unlockfunc.clone(),
                 meta.clientdata,
-                meta.dirty,
-                Specifier(meta.specifier),
             )
         };
 
@@ -1920,11 +2498,28 @@ impl Share {
             );
         }
 
+        // C: lib/curl_share.c:231 and `:237` -- read AFTER the notification,
+        // exactly where the C reads them, and under one hold so the count and
+        // the mask agree. The count is stable from here: the claim above bars
+        // `attach`, so nothing can raise it, and this is the whole of the
+        // stale-snapshot fix. A concurrent `detach` may still lower it, which
+        // is the same benign race the C has at `:231` and costs at most one
+        // refused cleanup that the application repeats.
+        let (dirty, specifier) = {
+            let meta = self.meta();
+            (meta.dirty, Specifier(meta.specifier))
+        };
+
         // C: lib/curl_share.c:231-235.
         if dirty != 0 {
             if let Some(callback) = &unlockfunc {
                 callback(LockOwner::NONE, LockData::Share, clientdata);
             }
+            // `docs/libcurl/curl_share_cleanup.md:59-60` -- *"If an error
+            // occurs, then the share object is not deleted."* Nothing was torn
+            // down, so the claim goes back and the share is exactly as usable
+            // as it was, this call included.
+            self.release_claim();
             return CURLSHcode::InUse;
         }
 
@@ -1936,12 +2531,13 @@ impl Share {
         }
 
         // C: lib/curl_share.c:263 -- `share->magic = 0`, immediately before
-        // `curlx_free(share)` at `:264`. `Release` pairs with the `Acquire` in
-        // `Share::magic` so that a thread seeing the tag cleared also sees the
-        // teardown above it.
-        self.magic.store(0, Ordering::Release);
+        // `curlx_free(share)` at `:264`. The store pairs with the `Acquire`
+        // in `ShareCore::magic` so that a thread seeing the tag cleared also
+        // sees the teardown above it.
+        self.finish_cleanup();
 
-        // C: lib/curl_share.c:266.
+        // C: lib/curl_share.c:266. Reached by exactly one caller per share, so
+        // `curl-rs-ffi`'s `Box::from_raw` runs exactly once.
         CURLSHcode::Ok
     }
 
@@ -1966,14 +2562,87 @@ impl Share {
     /// destroy is reproduced here because it is what the C does, and Rust's
     /// drop glue then reclaims the pool when the [`Share`] itself is dropped.
     /// No API result differs; the C's leak simply does not happen.
+    ///
+    /// # The pool is DESTROYED, not dropped
+    ///
+    /// `Curl_cpool_destroy` (`lib/conncache.c:231-254`) is not a free: it
+    /// moves every remaining connection through `cpool_discard_conn`, which
+    /// sends the protocol farewell, shuts the filter chains down and closes
+    /// the socket -- and it does all of that inside a
+    /// `CURL_LOCK_DATA_CONNECT` critical section, because `CPOOL_LOCK` and
+    /// `CPOOL_UNLOCK` (`lib/conncache.c:41-60`) are `Curl_share_lock` and
+    /// `Curl_share_unlock` for that datum whenever
+    /// `CURL_SHARE_KEEP_CONNECT` holds, which on this path it does by
+    /// construction. Dropping the pool instead would reclaim the same memory
+    /// while delivering neither notification and performing none of the
+    /// shutdown, so an application's close callbacks would never fire and a
+    /// peer would see a truncated connection rather than a farewell.
+    /// [`ShareAdmin`] is the retained context that makes the real destroy
+    /// reachable, exactly as `cpool->idata` is in the C.
     fn teardown(&self, specifier: Specifier) {
         // C: lib/curl_share.c:237-239 -- `Curl_cpool_destroy`, conditional.
         if specifier.keep_connect() {
+            // C: lib/conncache.c:243 -- `CPOOL_LOCK(cpool, cpool->idata)`,
+            // whose handle argument is the admin context.
+            self.lock(LockOwner::NONE, LockData::Connect, LockAccess::Single);
+            // C: lib/conncache.c:251 -- `CPOOL_UNLOCK`, on every path out.
+            // Declared before the store locks so that it is dropped after
+            // them: the notification that ends the critical section must
+            // follow the release of our own locks, which is the discipline
+            // `ShareGuard` documents and the order `CPOOL_UNLOCK` itself uses
+            // (`(c)->locked = FALSE;` then `Curl_share_unlock`).
+            let _release = Release {
+                core: self,
+                owner: LockOwner::NONE,
+                kind: LockData::Connect,
+            };
             let mut slot =
                 self.cpool.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(pool) = slot.as_mut() {
+                // C: lib/conncache.c:245-250 -- the removal loop, driven
+                // through the admin context.
+                self.admin
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .destroy_pool(pool);
+            }
+            // C: lib/conncache.c:253 --
+            // `Curl_hash_destroy(&cpool->dest2bundle)` leaves the pool
+            // unusable; the slot is emptied for the same reason, and
+            // `Curl_cpool_destroy` is never called twice.
             *slot = None;
         }
 
+        // C: lib/curl_share.c:241-258 -- the five stores the core owns. They
+        // are destroyed through the core rather than here because the core is
+        // what an `Arc` handle can still reach: emptying them is what makes a
+        // surviving handle harmless.
+        self.core.teardown_stores();
+    }
+}
+
+// The five stores are destroyed by the core that owns them
+//
+// `Curl_share_cleanup`'s remaining destroys (`lib/curl_share.c:241-258`) touch
+// only state that lives in [`ShareCore`], so they are performed by it. The
+// division is load-bearing rather than tidy: a [`ShareCore`] handed to another
+// thread by [`Share::stores`] keeps the allocation alive after its [`Share`] is
+// gone, and what makes that harmless is that teardown has already emptied every
+// store and marked the lifecycle dead. The handle then refuses every operation
+// against zero remaining state, which is the isolation SHARE-1 asks for.
+
+impl ShareCore {
+    /// The store half of `Curl_share_cleanup` (`lib/curl_share.c:241-258`).
+    ///
+    /// Called by [`Share::teardown`] once the pool half is complete, in the
+    /// C's order and with the C's conditionality: only the connection pool is
+    /// gated on a specifier bit, and every store below is destroyed whether it
+    /// was shared or not, because the C destroys members it may never have
+    /// initialised.
+    ///
+    /// Every store is left empty rather than merely released, so a surviving
+    /// [`Arc<ShareCore>`] holds nothing.
+    fn teardown_stores(&self) {
         // C: lib/curl_share.c:241 -- `Curl_dnscache_destroy`, unconditional
         // and not gated on the DNS bit. The cache is a by-value member, so
         // what the C destroys is its contents, which is `clear`.
@@ -2032,18 +2701,6 @@ impl Share {
 }
 
 // The stores, reached through RAII guards
-//
-// Each accessor answers the question the C's selector answers -- is this datum
-// shared? -- and then does what the C's lock helper does: deliver the lock
-// notification and enter the critical section. Dropping the guard leaves it.
-//
-// The predicate is the specifier bit alone, which is exactly what the C tests:
-// `dnscache_get` (`lib/hostip.c:300`), `CURL_SHARE_KEEP_CONNECT`
-// (`lib/curl_share.h:39-40`) and `CURL_SHARE_ssl_scache` (`:73-75`) all read
-// the mask and nothing else. That is sound because a bit implies its store: a
-// bit is set only by a successful `CURLSHOPT_SHARE`, which creates the store
-// first (`lib/curl_share.c:143-144` is guarded by `if(!res)`), and
-// `CURLSHOPT_UNSHARE` clears the bit in the same call that destroys it.
 
 /// The unlock notification a guard owes when its critical section ends.
 ///
@@ -2053,8 +2710,8 @@ impl Share {
 /// (`lib/vtls/vtls_scache.c:1079`, `:1095-1096`, `:1136-1138`) does exactly
 /// that, because it has nine exit paths.
 struct Release<'a> {
-    /// The share whose callback is owed the notification.
-    share: &'a Share,
+    /// The shared state whose callback is owed the notification.
+    core: &'a ShareCore,
     /// The handle the notification names, which the lock notification named
     /// too.
     owner: LockOwner,
@@ -2066,22 +2723,11 @@ impl Drop for Release<'_> {
     /// `Curl_share_unlock`, on every path out of the scope -- early return,
     /// `?` propagation and unwinding included.
     fn drop(&mut self) {
-        self.share.unlock(self.owner, self.kind);
+        self.core.unlock(self.owner, self.kind);
     }
 }
 
 /// A shared store, locked, with its unlock notification pending.
-///
-/// [`Deref`] and [`DerefMut`] to the store so that a locked store reads as the
-/// store it is.
-///
-/// # Drop order is load-bearing
-///
-/// The fields are declared so that `inner` is dropped before `release`, which
-/// Rust guarantees for struct fields. The internal lock is therefore released
-/// *before* the application's unlock notification is delivered, so that a
-/// callback which reached back into this share for the same datum would block
-/// on nothing of ours. Reordering these two fields would change that.
 ///
 /// # For the lazily created stores, the payload is an [`Option`]
 ///
@@ -2126,7 +2772,7 @@ impl<T: fmt::Debug> fmt::Debug for ShareGuard<'_, T> {
     }
 }
 
-impl Share {
+impl ShareCore {
     /// Delivers the lock notification for `kind` and enters `slot`.
     ///
     /// The two halves of every C lock helper in one place:
@@ -2145,7 +2791,7 @@ impl Share {
         ShareGuard {
             inner: slot.lock().unwrap_or_else(PoisonError::into_inner),
             release: Release {
-                share: self,
+                core: self,
                 owner,
                 kind,
             },
@@ -2160,9 +2806,6 @@ impl Share {
     /// notification delivered. A multi handle's own cache is never locked at
     /// all, which is why the selection between the two belongs to the caller
     /// and not here.
-    ///
-    /// The payload is the cache itself and not an [`Option`], because the C
-    /// holds it by value and builds it in `curl_share_init`.
     #[allow(dead_code)] // consumers: crate::dns, crate::easy, crate::multi
     pub(crate) fn dnscache(
         &self,
@@ -2175,14 +2818,6 @@ impl Share {
     }
 
     /// The shared cookie jar, or [`None`] when cookies are not shared.
-    ///
-    /// The datum `lib/cookie.c` takes with `CURL_LOCK_ACCESS_SINGLE` around
-    /// every load and every mutation, and that `lib/setopt.c:1530-1535`
-    /// repoints an attaching handle at.
-    ///
-    /// Every jar operation needs exclusive access, so there is no shared-access
-    /// variant: the C requests [`LockAccess::Single`] at all four of
-    /// `lib/cookie.c`'s call sites and at all three of `lib/setopt.c`'s.
     #[cfg(feature = "cookies")]
     #[allow(dead_code)] // consumers: crate::cookies, crate::easy, crate::multi
     pub(crate) fn cookies(
@@ -2196,12 +2831,6 @@ impl Share {
     }
 
     /// The shared HSTS cache, or [`None`] when HSTS is not shared.
-    ///
-    /// `Curl_hsts_loadfiles` (`lib/hsts.c:554-570`) takes
-    /// `CURL_LOCK_DATA_HSTS` with `CURL_LOCK_ACCESS_SINGLE`, and exclusive is
-    /// the only access this datum ever needs: `crate::cookies::hsts` records
-    /// that even its lookup mutates, because it prunes expired entries as it
-    /// goes.
     #[cfg(feature = "hsts")]
     #[allow(dead_code)] // consumers: crate::cookies::hsts, crate::easy
     pub(crate) fn hsts(
@@ -2244,7 +2873,18 @@ impl Share {
         }
         Some(self.guard(owner, LockData::SslSession, &self.ssl_scache))
     }
+}
 
+// The connection pool is reached through the owner, not the core
+//
+// Every accessor above is a [`ShareCore`] method because its store is
+// `Send + Sync` and therefore safe to reach from any thread holding an
+// [`Arc<ShareCore>`]. The pool is the one store that is not, so its accessor
+// stays on [`Share`], which is the thread-affine owner. That is the whole shape
+// of the isolation: the type system, not a comment, decides which stores a
+// second thread can name.
+
+impl Share {
     /// The shared connection pool, or [`None`] when connections are not
     /// shared.
     ///
@@ -2255,19 +2895,6 @@ impl Share {
     /// a re-entrancy assertion rather than a lock; `crate::conn::pool`
     /// deliberately has no such field and states that
     /// `CURL_LOCK_DATA_CONNECT` is this module's to own.
-    ///
-    /// Exclusive access is the only kind, and the pool's own contract requires
-    /// it: it exposes mutation through `&mut self` and expects the sharing
-    /// layer to hold the external lock across the whole critical section,
-    /// including any matching callback that runs inside it.
-    ///
-    /// The bit and the pool can disagree in one direction: `CURLSHOPT_UNSHARE`
-    /// clears the bit without destroying the pool
-    /// (`lib/curl_share.c:150`, `:187-188`), so a pool may outlive its bit.
-    /// This returns [`None`] then, which is what `CURL_SHARE_KEEP_CONNECT`
-    /// answers, and the pool becomes reachable again if the option is set once
-    /// more -- without being rebuilt, exactly as the C's
-    /// `if(!share->cpool.initialised)` arranges.
     #[allow(dead_code)] // consumers: crate::conn, crate::easy, crate::multi
     pub(crate) fn pool(
         &self,
@@ -2290,29 +2917,26 @@ impl Share {
 /// `crate::cookies::psl` records the same requirement from the other side,
 /// down to *"dropping the borrow is the release"*.
 ///
-/// # Why the internal lock is exclusive when the notification says shared
+/// # The internal lock matches the notification: a reader is a reader
 ///
-/// The list can only be reached through `PslCache::use_list`, which takes
-/// `&mut self` -- its own documentation states it *"must be called with
-/// exclusive access held"*, because it may refresh. So the Rust lock held
-/// across the return is a writer even in the phase the C spends as a reader.
-/// The application sees no difference: the notifications are
-/// `CURL_LOCK_ACCESS_SHARED` exactly where the C's are. What it costs is
-/// concurrency between two readers, and performance is not a goal here --
-/// where a faster design and a more faithful one disagree, the faithful one
-/// wins. What it cannot cost is a deadlock: the lock ordering is unchanged and
-/// a second reader blocks only until the first guard is dropped.
+/// The guard holds a **read** lock, because the phase it represents is the
+/// C's shared one: `lib/psl.c:89` re-takes `CURL_LOCK_ACCESS_SHARED` before
+/// `:91` reads `pslcache->psl` and `:94` returns it, and that read mutates
+/// nothing. Every mutation the C performs -- the recheck and the load at
+/// `:60-87` -- happens in the exclusive phase, which [`ShareCore::psl_use`]
+/// completes before this guard exists.
+///
+/// That is load-bearing rather than cosmetic. A guard that held a writer
+/// while the application had been told `CURL_LOCK_ACCESS_SHARED` would let a
+/// refresh run under a notification that promised no writer, which is
+/// precisely the promise an application's read-write lock acts on: its
+/// readers would be running against a mutating cache. Holding a reader also
+/// restores the concurrency the C has -- two transfers may hold the list at
+/// once, exactly as two `Curl_psl_use` callers may.
 #[cfg(feature = "cookies")]
 pub(crate) struct PslGuard<'a> {
     /// The locked cache. Declared first so that it is released first.
-    inner: RwLockWriteGuard<'a, PslCache>,
-    /// The clock [`Self::list`] passes on, so that a caller does not have to
-    /// supply it twice. `lib/psl.c:52` and `:62` read
-    /// `Curl_pgrs_now(easy)->tv_sec`, which is monotonic.
-    clock: &'a dyn Clock,
-    /// The list source [`Self::list`] passes on: `psl_latest()` and
-    /// `psl_builtin()` (`lib/psl.c:69`, `:79`).
-    source: &'a dyn PslSource,
+    inner: RwLockReadGuard<'a, PslCache>,
     /// The unlock notification, delivered when this goes out of scope --
     /// `Curl_psl_release`.
     release: Release<'a>,
@@ -2322,23 +2946,20 @@ pub(crate) struct PslGuard<'a> {
 impl PslGuard<'_> {
     /// The cached list -- what `Curl_psl_use` returns.
     ///
-    /// Never [`None`] in practice: [`Share::psl_use`] releases the guard and
+    /// `pslcache->psl` as `lib/psl.c:91` reads it and `:94` returns it: the
+    /// selection is already made, so this refreshes nothing, reads no clock
+    /// and takes no source. `&self`, because a reader is all the C holds here
+    /// and all this needs.
+    ///
+    /// Never [`None`] in practice: [`ShareCore::psl_use`] releases the lock and
     /// yields [`None`] itself when no list could be obtained
     /// (`lib/psl.c:92-93`), so a guard exists only when a list does. The
-    /// [`Option`] survives because `PslCache::use_list` is the only route to
-    /// the list and it is fallible by signature, and answering that with an
-    /// `expect` would put a panic on the path to a C caller.
-    ///
-    /// `&mut self` for the same reason: the borrow is produced by a `&mut`
-    /// method, which is how the compiler is told that the exclusive access the
-    /// refresh needed is still held.
-    ///
-    /// Calling this after [`Share::psl_use`] has already refreshed costs one
-    /// clock read and no work: the deadline is in the future, so
-    /// `PslCache::use_list` returns the cached list immediately.
+    /// [`Option`] survives because `PslCache::list` is fallible by signature,
+    /// and answering that with an `expect` would put a panic on the path to a
+    /// C caller.
     #[allow(dead_code)] // consumer: crate::cookies' public-suffix checks
-    pub(crate) fn list(&mut self) -> Option<&List> {
-        self.inner.use_list(self.clock, self.source)
+    pub(crate) fn list(&self) -> Option<&List> {
+        self.inner.list()
     }
 }
 
@@ -2370,7 +2991,7 @@ impl fmt::Debug for PslGuard<'_> {
 }
 
 #[cfg(feature = "cookies")]
-impl Share {
+impl ShareCore {
     /// `Curl_psl_use` (`lib/psl.c:42-95`), notification for notification.
     ///
     /// The only entry point that emits more than one notification, and the
@@ -2384,10 +3005,6 @@ impl Share {
     /// | `:58` | lock, exclusive | *"Update cache: this needs an exclusive lock."* |
     /// | `:88` | unlock | *"Release exclusive lock."* |
     /// | `:89` | lock, shared | so the returned list stays valid |
-    ///
-    /// A cache that is still fresh takes the first step only, and the returned
-    /// guard owes exactly one unlock. A stale one takes all five, and still
-    /// owes exactly one, so the notifications remain balanced on both paths.
     ///
     /// # Returns
     ///
@@ -2404,16 +3021,6 @@ impl Share {
     /// safety"* and drop the cookie. It must not read it as *"no public-suffix
     /// checking is configured"*, which is a different question with a
     /// different answer.
-    ///
-    /// # Injection
-    ///
-    /// The clock and the source are parameters rather than global state, which
-    /// is what makes the 72-hour refresh deadline testable without waiting
-    /// three days. The clock must be the monotonic reading:
-    /// `lib/psl.c:52` and `:62` read `Curl_pgrs_now(easy)->tv_sec`, which is
-    /// `CLOCK_MONOTONIC`, where this module's three sibling caches use the wall
-    /// clock. `crate::cookies::psl` records why getting that backwards would
-    /// make the deadline depend on wall-clock jumps.
     #[allow(dead_code)] // consumer: crate::cookies' public-suffix checks
     pub(crate) fn psl_use<'a>(
         &'a self,
@@ -2447,9 +3054,11 @@ impl Share {
                 let mut cache =
                     self.psl.write().unwrap_or_else(PoisonError::into_inner);
                 // C: lib/psl.c:60-87 -- the recheck and the load, which
-                // `PslCache::use_list` is the whole of. Its return is the
-                // list, which this phase does not need; the borrow ends here
-                // so that the lock can be released next.
+                // `PslCache::use_list` is the whole of. This is the ONLY place
+                // the cache is mutated, and it sits inside the exclusive
+                // notification, which is what makes the shared one honest.
+                // Its return is the list, which this phase does not need; the
+                // borrow ends here so that the lock can be released next.
                 let _ = cache.use_list(clock, source);
             }
             // C: lib/psl.c:88.
@@ -2458,15 +3067,16 @@ impl Share {
             self.lock(owner, LockData::Psl, LockAccess::Shared);
         }
 
-        // The guard the caller receives. A writer rather than a reader for the
-        // reason `PslGuard` documents: `use_list` is the only route to the
-        // list and it needs exclusive access.
-        let cache = self.psl.write().unwrap_or_else(PoisonError::into_inner);
+        // The guard the caller receives: a READER, matching the shared
+        // notification the application has just been given, and matching the
+        // `const psl_ctx_t *` the C returns. `PslGuard` records why that
+        // matters.
+        let cache = self.psl.read().unwrap_or_else(PoisonError::into_inner);
 
         // C: lib/psl.c:91-93 -- `psl = pslcache->psl; if(!psl)
         // Curl_share_unlock(...)`, then `return psl`. A missing list releases
         // the lock before returning, so the caller owes nothing.
-        if !cache.has_list() {
+        if cache.list().is_none() {
             drop(cache);
             self.unlock(owner, LockData::Psl);
             return None;
@@ -2476,10 +3086,8 @@ impl Share {
         // `Curl_psl_release` (`:97-100`) later releases. Here that is `Drop`.
         Some(PslGuard {
             inner: cache,
-            clock,
-            source,
             release: Release {
-                share: self,
+                core: self,
                 owner,
                 kind: LockData::Psl,
             },
@@ -2488,13 +3096,6 @@ impl Share {
 }
 
 // Tests
-//
-// Three C programs cover this code and none of them can link here.
-// `tests/libtest/lib506.c`, `lib1905.c` and `lib3207.c` link a debug static
-// libcurl and call internal `Curl_*` symbols; a Rust static library does not
-// export `pub(crate)` items, so their coverage moves into this module, which
-// AAP 0.8.7 records as a documented deviation rather than a gap. The fixtures
-// that drive the binary are unaffected.
 //
 // What is asserted here, and why each group exists:
 //
@@ -2513,19 +3114,28 @@ impl Share {
 //     one kind -- which is what `lib506.c`'s own callback checks.
 //   * That `cleanup` never consumes on an error path, because the object must
 //     survive for `curl-rs-ffi` to be allowed to free it only on success.
-//   * The measured `Send`/`Sync` state of every component, so that the
-//     escalation in the module documentation is a fact under test rather than
-//     a claim in prose.
+//   * That [`Share`] itself, and every component of it, is `Send + Sync`, so
+//     that the claim in the module documentation is a fact under test rather
+//     than prose -- and so that a later change which reintroduces a
+//     thread-affine value anywhere in the connection or TLS graph fails here
+//     rather than in somebody's application.
+//   * One share driven from four threads at once through the lock callbacks,
+//     which is the half of `lib506.c` that a `!Sync` share could not express.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Barrier, Condvar};
 
+    use crate::conn::filters::{ShutdownTimer, SocketIndex};
+    use crate::conn::pool::ConnectionSpec;
+    use crate::conn::shutdown::{DisconnectFuture, ProtocolDisconnect};
     #[cfg(feature = "cookies")]
     use crate::cookies::psl::MemoryPslSource;
+    use crate::util::timeval::CurlTime;
     #[cfg(feature = "cookies")]
-    use crate::util::timeval::{CurlTime, TestClock};
+    use crate::util::timeval::TestClock;
 
     /// A handle for the notifications to name, distinct from
     /// [`LockOwner::NONE`] so that a test can tell the two apart.
@@ -2544,16 +3154,6 @@ mod tests {
     }
 
     /// The recording mock, modelled on `tests/libtest/lib506.c`'s callbacks.
-    ///
-    /// It records every notification in order and, like `lib506.c:71-76`,
-    /// detects a lock taken twice for one datum without an intervening
-    /// release -- the C prints `"lock: double locked %s"` there. It also
-    /// detects the mirror image, which `lib506.c:112-116` checks as
-    /// `"unlock: double unlocked %s"`.
-    ///
-    /// `held` is a stack of kinds rather than an array indexed by the
-    /// discriminant, which is what `lib3207.c:135` uses; a stack needs no
-    /// indexing and so cannot itself panic.
     #[derive(Debug, Default)]
     struct Recorder {
         events: Mutex<Vec<Event>>,
@@ -2682,6 +3282,81 @@ mod tests {
         install(&share, &recorder);
         let _ = recorder.drain();
         (share, recorder)
+    }
+
+    // Fixtures for the connection pool's teardown
+
+    /// A shutdown deadline that never starts and never expires.
+    ///
+    /// The real one belongs to `conn/mod.rs`. Nothing this module drives reads
+    /// a deadline -- the disposal path consults the handler's cap instead --
+    /// so a null implementation is honest rather than lazy. It is the same
+    /// fixture `crate::conn::pool`'s own tests use, for the same reason.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NullTimer;
+
+    impl ShutdownTimer for NullTimer {
+        fn started(&self, _sockindex: SocketIndex) -> bool {
+            false
+        }
+
+        fn start(&mut self, _sockindex: SocketIndex, _timeout_ms: TimeDiff) {}
+
+        fn time_left_ms(&self, _sockindex: SocketIndex) -> TimeDiff {
+            0
+        }
+
+        fn clear(&mut self, _sockindex: SocketIndex) {}
+    }
+
+    /// A scheme disconnect handler that records having been asked.
+    ///
+    /// `conn->scheme->run->disconnect` (`lib/urldata.h:427-512`), which
+    /// `Curl_cshutdn_terminate` calls for every connection the C disposes of
+    /// (`lib/cshutdn.c:62`). It is what distinguishes a **destroyed** pool from
+    /// a dropped one: dropping reclaims the memory and asks no scheme
+    /// anything.
+    #[derive(Debug)]
+    struct RecordingDisconnect {
+        /// How many times `disconnect` was awaited, and with what `dead` flag.
+        calls: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl ProtocolDisconnect for RecordingDisconnect {
+        fn disconnect<'a>(
+            &'a mut self,
+            _cx: &'a mut CallCtx<'_, '_>,
+            _chains: &'a mut FilterChains,
+            dead: bool,
+        ) -> DisconnectFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(dead);
+                Ok(())
+            })
+        }
+    }
+
+    /// A pooled connection to `destination`, with a recording disconnect
+    /// handler when `calls` is supplied.
+    fn connection(
+        destination: &str,
+        calls: Option<&Arc<Mutex<Vec<bool>>>>,
+    ) -> ConnectionSpec {
+        let spec = ConnectionSpec::new(
+            destination,
+            FilterChains::new(None),
+            Box::new(NullTimer),
+            CurlTime::new(10, 0),
+        );
+        match calls {
+            Some(calls) => spec.with_handler(Box::new(RecordingDisconnect {
+                calls: Arc::clone(calls),
+            })),
+            None => spec,
+        }
     }
 
     // The frozen integers
@@ -2858,12 +3533,6 @@ mod tests {
 
     /// The three capacities `lib/curl_share.c` passes to its store
     /// constructors.
-    ///
-    /// The DNS cache's 23 (`:39`) and the session cache's 25 by 2 (`:119`) are
-    /// passed through and are observable in the constructed stores. The pool's
-    /// 103 (`:130`) has nothing to receive it -- `ConnectionPool::new` takes no
-    /// size because a `BTreeMap` has no bucket count -- so the measurement is
-    /// asserted here instead of being lost.
     #[test]
     fn the_measured_capacities_are_the_c_values() {
         assert_eq!(DNS_CACHE_SLOTS, 23);
@@ -2891,16 +3560,16 @@ mod tests {
     /// behind this: `curl_easy_duphandle` does **not** copy the share pointer,
     /// so a duplicated handle starts with no share and does not increment
     /// anybody's count. This module offers no propagation operation at all --
-    /// [`Share::attach`] is the only thing that increments -- and this test
+    /// [`ShareCore::attach`] is the only thing that increments -- and this test
     /// pins the consequence: counting one share never touches another.
     #[test]
     fn shares_are_independent_and_nothing_propagates_a_share() {
         let first = Share::new();
         let second = Share::new();
-        let _ = first.attach(OWNER);
+        let _ = first.attach(OWNER, |_| ());
         assert_eq!(first.dirty(), 1);
         assert_eq!(second.dirty(), 0);
-        let _ = first.detach(OWNER);
+        let _ = first.detach(OWNER, |_| ());
         assert_eq!(first.dirty(), 0);
         assert_eq!(second.dirty(), 0);
     }
@@ -3021,12 +3690,6 @@ mod tests {
 
     /// Un-sharing destroys the store the C destroys, and leaves the two it
     /// leaves.
-    ///
-    /// The cookie jar (`:157-160`), the HSTS cache (`:168-170`) and the TLS
-    /// session cache (`:178-181`) are torn down. The DNS cache (`:152-153`)
-    /// and the connection pool (`:187-188`) are **not**: both are bare
-    /// `break`s, so only the bit changes and the store survives to be reused
-    /// if the option is set again.
     #[test]
     fn unsharing_destroys_only_what_the_c_destroys() {
         let share = Share::new();
@@ -3079,14 +3742,6 @@ mod tests {
 
     /// Setting the same datum twice succeeds twice and does not rebuild the
     /// store.
-    ///
-    /// `docs/libcurl/opts/CURLSHOPT_SHARE.md` permits it, the connection arm's
-    /// own comment at `lib/curl_share.c:128` is *"It is safe to set this
-    /// option several times on a share."*, and
-    /// `tests/libtest/lib1905.c:44-45` sets `CURL_LOCK_DATA_COOKIE` twice in a
-    /// row. Each arm's `if(!share->...)` is what makes the second call a
-    /// no-op, and a marker written into the store before the second call is
-    /// what proves it here.
     #[test]
     fn sharing_a_datum_twice_is_idempotent_and_keeps_the_store() {
         let share = Share::new();
@@ -3179,15 +3834,6 @@ mod tests {
 
     /// Every diagnostic spelling is exercised, including the tokens the share
     /// path never reaches.
-    ///
-    /// A `Display` nobody calls is a `Display` nobody has checked, and these
-    /// strings are what a failing assertion or a `--trace` line puts in front
-    /// of a reader. `CURL_LOCK_DATA_NONE` (`include/curl/curl.h:3027`),
-    /// `CURL_LOCK_DATA_LAST` (`:3039`), `CURL_LOCK_ACCESS_NONE` (`:3044`) and
-    /// `CURL_LOCK_ACCESS_LAST` (`:3047`) are all real header tokens even
-    /// though no arm of `curl_share_setopt` accepts them, so a wrong spelling
-    /// here would misname something in a diagnostic without any other test
-    /// noticing.
     #[test]
     fn every_diagnostic_spelling_is_the_header_spelling() {
         assert_eq!(LockData::None.c_name(), "CURL_LOCK_DATA_NONE");
@@ -3229,13 +3875,6 @@ mod tests {
     }
 
     /// A writer that fails is propagated, never unwrapped.
-    ///
-    /// The no-panic policy reaches the formatters too: every `write_str` in
-    /// `Display for Specifier` is followed by `?`, and a `format!` cannot
-    /// exercise those arms because `String`'s `fmt::Write` is infallible. A
-    /// writer that fails on demand is the only way to prove the error arm is a
-    /// return rather than a panic -- and a panic here would be reachable from
-    /// a trace line, on any thread, at any time.
     #[test]
     fn a_failing_writer_is_propagated_rather_than_unwrapped() {
         /// Succeeds `remaining` times, then fails for good.
@@ -3315,16 +3954,6 @@ mod tests {
     }
 
     /// Un-sharing a datum that was never shared succeeds and touches nothing.
-    ///
-    /// Reachable from any application: `CURLSHOPT_UNSHARE` on a fresh handle.
-    /// The C survives it because every teardown it reaches there is a no-op on
-    /// a null pointer -- `Curl_cookie_cleanup(NULL)` at `:158`,
-    /// `Curl_hsts_cleanup(&NULL)` at `:169` and
-    /// `Curl_ssl_scache_destroy(NULL)` at `:180` -- while the DNS
-    /// (`:152-153`) and connection (`:187-188`) arms are bare `break`s that
-    /// never had anything to release. The bit was already clear, so
-    /// `:150`'s unconditional clear is a no-op too, and the result is the same
-    /// `CURLSHE_OK` the shared case returns.
     #[test]
     fn unsharing_a_datum_that_was_never_shared_is_still_successful() {
         let expected_cookie = if cfg!(feature = "cookies") {
@@ -3500,17 +4129,6 @@ mod tests {
 
     /// QUIRK 2: un-sharing the Public Suffix List is a bad option, and clears
     /// its bit anyway.
-    ///
-    /// `lib/curl_share.c:147-192` has cases for DNS, cookies, HSTS, TLS
-    /// sessions and connections, and **no case for
-    /// `CURL_LOCK_DATA_PSL`** -- so it falls to `default:` at `:190-192`,
-    /// after `:150` has already cleared the bit.
-    ///
-    /// `docs/libcurl/opts/CURLSHOPT_UNSHARE.md` documents the opposite in both
-    /// directions: it has a `## CURL_LOCK_DATA_PSL` section and omits
-    /// `CURL_LOCK_DATA_HSTS`, where the code handles HSTS and not the PSL. The
-    /// documentation is stale; this test exists so that a reader who trusts it
-    /// finds out here rather than in a behaviour change.
     #[test]
     fn unshare_with_the_public_suffix_list_is_a_bad_option_and_still_clears() {
         let share = Share::new();
@@ -3546,11 +4164,6 @@ mod tests {
 
     /// `CURL_LOCK_DATA_SSL_SESSION` can never report
     /// `CURLSHE_NOT_BUILT_IN`.
-    ///
-    /// The C guards both of its arms with `#ifdef USE_SSL`
-    /// (`lib/curl_share.c:112`, `:177`), and this crate has no TLS feature
-    /// because TLS is not optional -- so `:123` and `:183` have no reachable
-    /// counterpart at any feature setting.
     #[test]
     fn tls_session_sharing_is_never_reported_as_missing() {
         let share = Share::new();
@@ -3657,18 +4270,18 @@ mod tests {
     fn attaching_and_detaching_move_the_reference_count() {
         let share = Share::new();
         assert_eq!(share.dirty(), 0);
-        let _ = share.attach(OWNER);
-        let _ = share.attach(LockOwner::from_bits(0x2000));
+        let _ = share.attach(OWNER, |_| ());
+        let _ = share.attach(LockOwner::from_bits(0x2000), |_| ());
         assert_eq!(share.dirty(), 2);
         assert!(share.is_in_use());
-        let _ = share.detach(LockOwner::from_bits(0x2000));
+        let _ = share.detach(LockOwner::from_bits(0x2000), |_| ());
         assert_eq!(share.dirty(), 1);
-        let _ = share.detach(OWNER);
+        let _ = share.detach(OWNER, |_| ());
         assert_eq!(share.dirty(), 0);
         assert!(!share.is_in_use());
     }
 
-    /// Both operations return the mask the caller needs for its repointing.
+    /// Both operations hand the caller the mask it needs for its repointing.
     ///
     /// `lib/setopt.c:1530`, `:1538` and `:1545` read the shared cookie jar,
     /// the shared HSTS cache and the `CURL_LOCK_DATA_PSL` bit to decide what an
@@ -3678,52 +4291,249 @@ mod tests {
     fn attach_and_detach_report_the_specifier_the_caller_must_act_on() {
         let share = Share::new();
         assert_eq!(share.setopt(ShareOption::Share(3)), CURLSHcode::Ok);
-        let on_attach = share.attach(OWNER);
+        let on_attach = share.attach(OWNER, |mask| mask).expect("registered");
         assert!(on_attach.contains(LockData::Dns));
         assert!(on_attach.contains(LockData::Share));
-        assert_eq!(share.detach(OWNER), on_attach);
+        assert_eq!(
+            share.detach(OWNER, |mask| mask).expect("deregistered"),
+            on_attach
+        );
     }
 
-    /// An unbalanced detach saturates at zero instead of wrapping.
+    /// The repointing runs **inside** the user-visible `CURL_LOCK_DATA_SHARE`
+    /// critical section, on both operations.
     ///
-    /// The C writes `dirty--` on an `unsigned int`, so this would become
-    /// `UINT_MAX` and the share could never be cleaned up again. Both C call
-    /// sites are guarded by `if(data->share)` so libcurl never reaches it;
-    /// saturating keeps this file free of panicking arithmetic and makes the
-    /// unreachable case harmless.
+    /// This is the placement `lib/setopt.c` gives it and it is observable: the
+    /// application's lock callback is what serialises an attaching handle's
+    /// view of the shared stores. Attach does `dirty++` at `:1527` and then
+    /// the repointing at `:1529-1547`; detach does the repointing at
+    /// `:1497-1512` and then `dirty--` at `:1514`. The closure therefore sees
+    /// the count already raised on attach and not yet lowered on detach, and
+    /// in both cases sees the lock notification delivered and the unlock still
+    /// owed.
     #[test]
-    fn a_detach_with_nothing_attached_saturates_at_zero() {
+    fn the_ownership_change_happens_inside_the_share_lock() {
+        let (share, recorder) = recorded();
+        assert_eq!(share.setopt(ShareOption::Share(3)), CURLSHcode::Ok);
+        let _ = recorder.drain();
+
+        let seen = share
+            .attach(OWNER, |mask| {
+                // C: lib/setopt.c:1527 has already run.
+                assert_eq!(share.dirty(), 1);
+                // The lock notification has been delivered and the unlock has
+                // not.
+                assert_eq!(
+                    recorder.events(),
+                    vec![Event::Lock(
+                        OWNER,
+                        LockData::Share,
+                        LockAccess::Single,
+                        USERDATA
+                    )],
+                    "the repointing must run inside the bracket"
+                );
+                // A different datum is reachable from inside it, which is what
+                // `lib/setopt.c:1530-1535` does when it reads `share->cookies`.
+                assert!(share.dnscache(OWNER).is_some());
+                mask
+            })
+            .expect("registered");
+        assert!(seen.contains(LockData::Dns));
+        assert_eq!(
+            recorder.drain().last().copied(),
+            Some(Event::Unlock(OWNER, LockData::Share, USERDATA)),
+            "the unlock closes the bracket after the repointing"
+        );
+
+        share
+            .detach(OWNER, |_| {
+                // C: lib/setopt.c:1514 has NOT run yet -- the handle lets go of
+                // every shared store before the count can reach zero.
+                assert_eq!(share.dirty(), 1);
+                assert_eq!(
+                    recorder.events(),
+                    vec![Event::Lock(
+                        OWNER,
+                        LockData::Share,
+                        LockAccess::Single,
+                        USERDATA
+                    )]
+                );
+            })
+            .expect("deregistered");
+        assert_eq!(share.dirty(), 0);
+        assert_eq!(
+            recorder.drain().last().copied(),
+            Some(Event::Unlock(OWNER, LockData::Share, USERDATA))
+        );
+        recorder.assert_balanced();
+    }
+
+    /// An unbalanced detach wraps to `UINT_MAX`, exactly as the C's does.
+    ///
+    /// `lib/setopt.c:1514` and `lib/url.c:292` write `dirty--` on an
+    /// `unsigned int`, so a decrement with nothing attached wraps and the
+    /// share can never be cleaned up again -- `lib/curl_share.c:231-235`
+    /// reports `CURLSHE_IN_USE` for ever after. Both C call sites are guarded
+    /// by `if(data->share)`, so libcurl itself never reaches it, and this API
+    /// makes it reachable only by an unbalanced caller.
+    ///
+    /// Reproduced rather than softened: `wrapping_sub` cannot panic in any
+    /// build, so nothing is bought by saturating, while the consequence an
+    /// application observes stays the one curl 8.x produces.
+    #[test]
+    fn a_detach_with_nothing_attached_wraps_exactly_as_the_c_does() {
         let share = Share::new();
-        let _ = share.detach(OWNER);
+        share.detach(OWNER, |_| ()).expect("a live share");
+        assert_eq!(share.dirty(), u32::MAX);
+        assert!(share.is_in_use());
+        assert_eq!(share.cleanup(), CURLSHcode::InUse);
+        // Refused, so the object is intact and the claim was given back.
+        assert!(share.is_valid());
+        assert_eq!(share.magic(), Share::GOOD_MAGIC);
+
+        // The matching attach restores the balance, and cleanup then succeeds.
+        share.attach(OWNER, |_| ()).expect("a live share");
         assert_eq!(share.dirty(), 0);
         assert_eq!(share.cleanup(), CURLSHcode::Ok);
     }
 
-    /// An invalid share is not counted and reports nothing.
+    /// An invalid share is not counted and runs no transaction.
     ///
     /// `lib/setopt.c:1520`'s `if(GOOD_SHARE_HANDLE(set))`: a share that fails
-    /// the check is never assigned to the handle and never counted.
+    /// the check is never assigned to the handle and never counted. Both
+    /// operations answer [`None`] and neither closure runs, so a caller cannot
+    /// repoint itself at a store that no longer exists.
     #[test]
     fn attaching_to_a_torn_down_share_changes_nothing() {
         let share = Share::new();
         assert_eq!(share.cleanup(), CURLSHcode::Ok);
         assert!(!share.is_valid());
-        assert_eq!(share.attach(OWNER), Specifier::EMPTY);
-        assert_eq!(share.detach(OWNER), Specifier::EMPTY);
+        let ran = AtomicUsize::new(0);
+        assert!(share
+            .attach(OWNER, |_| ran.fetch_add(1, Ordering::Relaxed))
+            .is_none());
+        assert!(share
+            .detach(OWNER, |_| ran.fetch_add(1, Ordering::Relaxed))
+            .is_none());
+        assert_eq!(ran.load(Ordering::Relaxed), 0, "neither closure ran");
         assert_eq!(share.dirty(), 0);
+    }
+
+    /// While a teardown is claimed, nothing can take a new reference, no
+    /// option can be set and a second teardown is refused -- but a detach and
+    /// the notifications still land.
+    ///
+    /// The claim is the whole of [`Share::cleanup`]'s serialisation and the
+    /// state the C does not have: its `magic` is `CURL_GOOD_SHARE` from
+    /// `lib/curl_share.c:224` right up to `:263`, so two threads in that span
+    /// both pass the validity test, both read `share->dirty` and both reach
+    /// `CURLSHE_OK`. The transition is driven directly here rather than raced,
+    /// because that makes the property a deterministic assertion rather than a
+    /// probabilistic one; `crate::share`'s multi-threaded test covers the
+    /// contended case.
+    ///
+    /// The three admissions are as deliberate as the three refusals.
+    /// [`ShareCore::detach`] must land or a decrement the caller has already
+    /// committed to is lost for ever, leaving a count no cleanup can bring to
+    /// zero; and `lock`/`unlock` must still deliver, because the C's own
+    /// teardown notifies through them -- `Curl_cpool_destroy` brackets its
+    /// loop with `CPOOL_LOCK`/`CPOOL_UNLOCK` (`lib/conncache.c:41-60`).
+    #[test]
+    fn a_claimed_teardown_refuses_new_references_and_a_second_cleanup() {
+        let (share, recorder) = recorded();
+        assert_eq!(share.setopt(ShareOption::Share(3)), CURLSHcode::Ok);
+        share.attach(OWNER, |_| ()).expect("a live share");
+        let _ = recorder.drain();
+
+        assert!(share.claim_cleanup(), "the first claim wins");
+
+        // Refused: a second claim, every option, every store accessor and any
+        // new reference.
+        assert!(!share.claim_cleanup(), "the second claim loses");
+        assert_eq!(share.cleanup(), CURLSHcode::Invalid);
+        assert!(!share.is_valid());
+        // `CURL_LOCK_DATA_SSL_SESSION`, which is the one datum no feature can
+        // turn off, so this reads the same in every build.
+        assert_eq!(share.setopt(ShareOption::Share(4)), CURLSHcode::Invalid);
+        assert!(share.dnscache(OWNER).is_none());
+        assert!(share.attach(OWNER, |_| ()).is_none(), "no new reference");
+        assert_eq!(share.dirty(), 1, "and therefore no new count");
+
+        // Admitted: the notifications, so that a teardown can notify.
+        assert_eq!(
+            share.lock(OWNER, LockData::Dns, LockAccess::Single),
+            CURLSHcode::Ok
+        );
+        assert_eq!(share.unlock(OWNER, LockData::Dns), CURLSHcode::Ok);
+        assert_eq!(
+            recorder.drain(),
+            vec![
+                Event::Lock(OWNER, LockData::Dns, LockAccess::Single, USERDATA),
+                Event::Unlock(OWNER, LockData::Dns, USERDATA),
+            ]
+        );
+
+        // Admitted: the detach, so no decrement is lost.
+        assert!(share.detach(OWNER, |_| ()).is_some());
+        assert_eq!(share.dirty(), 0);
+        let _ = recorder.drain();
+
+        // Giving the claim back restores everything, which is what the
+        // `CURLSHE_IN_USE` path does.
+        share.release_claim();
+        assert!(share.is_valid());
+        assert_eq!(share.magic(), Share::GOOD_MAGIC);
+        assert_eq!(share.setopt(ShareOption::Share(4)), CURLSHcode::Ok);
+        assert!(share.attach(OWNER, |_| ()).is_some());
+        assert!(share.detach(OWNER, |_| ()).is_some());
+        assert_eq!(share.cleanup(), CURLSHcode::Ok);
+
+        // And once retired, even the notifications stop.
+        assert_eq!(
+            share.lock(OWNER, LockData::Dns, LockAccess::Single),
+            CURLSHcode::Invalid
+        );
+        assert_eq!(share.unlock(OWNER, LockData::Dns), CURLSHcode::Invalid);
+        assert!(share.detach(OWNER, |_| ()).is_none());
+        recorder.assert_balanced();
+    }
+
+    /// The three lifecycle phases are exactly the three tag values, and the
+    /// middle one has no C counterpart.
+    ///
+    /// `CURL_GOOD_SHARE` is `0x7e117a1e` (`lib/curl_share.h:36`) and
+    /// `lib/curl_share.c:263` writes zero; the claim's tag is the one's
+    /// complement of the first, so it can collide with neither.
+    #[test]
+    fn the_lifecycle_tags_are_distinct_and_classified() {
+        assert_eq!(Share::GOOD_MAGIC, 0x7e11_7a1e);
+        assert_eq!(ShareCore::CLEANING_MAGIC, 0x81ee_85e1);
+        assert_ne!(ShareCore::CLEANING_MAGIC, Share::GOOD_MAGIC);
+        assert_ne!(ShareCore::CLEANING_MAGIC, 0);
+
+        assert_eq!(Lifecycle::of(Share::GOOD_MAGIC), Lifecycle::Live);
+        assert_eq!(
+            Lifecycle::of(ShareCore::CLEANING_MAGIC),
+            Lifecycle::Cleaning
+        );
+        assert_eq!(Lifecycle::of(0), Lifecycle::Dead);
+        // Any other value is classified conservatively, exactly as
+        // `GOOD_SHARE_HANDLE` classifies it.
+        assert_eq!(Lifecycle::of(0xdead_beef), Lifecycle::Dead);
+
+        assert!(Lifecycle::Live.is_present());
+        assert!(Lifecycle::Cleaning.is_present());
+        assert!(!Lifecycle::Dead.is_present());
     }
 
     /// **Every** option is refused while a handle is attached, including the
     /// three that only install callbacks.
-    ///
-    /// `lib/curl_share.c:71-74` returns `CURLSHE_IN_USE` before `va_start` and
-    /// before the switch, so no arm is reachable. Its comment is *"do not
-    /// allow setting options while one or more handles are already using this
-    /// share"*.
     #[test]
     fn every_option_is_refused_while_the_share_is_in_use() {
         let share = Share::new();
-        let _ = share.attach(OWNER);
+        let _ = share.attach(OWNER, |_| ());
         assert!(share.is_in_use());
         for option in [
             ShareOption::None,
@@ -3750,7 +4560,7 @@ mod tests {
         assert_eq!(share.specifier().bits(), LockData::Share.bit());
 
         // And the refusal lifts when the last handle detaches.
-        let _ = share.detach(OWNER);
+        let _ = share.detach(OWNER, |_| ());
         assert_eq!(share.setopt(ShareOption::Share(3)), CURLSHcode::Ok);
     }
 
@@ -3766,7 +4576,7 @@ mod tests {
     fn cleanup_refuses_while_in_use_and_leaves_the_share_intact() {
         let (share, recorder) = recorded();
         assert_eq!(share.setopt(ShareOption::Share(3)), CURLSHcode::Ok);
-        let _ = share.attach(OWNER);
+        let _ = share.attach(OWNER, |_| ());
         let _ = recorder.drain();
 
         assert_eq!(share.cleanup(), CURLSHcode::InUse);
@@ -3794,7 +4604,7 @@ mod tests {
         assert!(share.dnscache(OWNER).is_some());
 
         // Once the handle detaches, cleanup succeeds.
-        let _ = share.detach(OWNER);
+        let _ = share.detach(OWNER, |_| ());
         let _ = recorder.drain();
         assert_eq!(share.cleanup(), CURLSHcode::Ok);
         assert!(!share.is_valid());
@@ -3814,7 +4624,7 @@ mod tests {
     fn cleanup_refuses_while_in_use_with_no_callbacks_installed() {
         let share = Share::new();
         assert_eq!(share.setopt(ShareOption::Share(3)), CURLSHcode::Ok);
-        let _ = share.attach(OWNER);
+        let _ = share.attach(OWNER, |_| ());
 
         assert_eq!(share.cleanup(), CURLSHcode::InUse);
 
@@ -3825,7 +4635,7 @@ mod tests {
         assert_eq!(share.dirty(), 1);
         assert!(share.dnscache(OWNER).is_some());
 
-        let _ = share.detach(OWNER);
+        let _ = share.detach(OWNER, |_| ());
         assert_eq!(share.cleanup(), CURLSHcode::Ok);
         assert!(!share.is_valid());
     }
@@ -3880,11 +4690,6 @@ mod tests {
 
     /// Cleanup tears down all six stores, and does so even for data whose
     /// specifier bit is clear.
-    ///
-    /// `lib/curl_share.c:237-259`. The DNS cache (`:241`), the cookie jar
-    /// (`:243-245`), the HSTS cache (`:247-249`), the session cache
-    /// (`:251-256`) and the Public Suffix List (`:258`) are all unconditional;
-    /// only the connection pool (`:237-239`) is gated on its bit.
     #[test]
     fn cleanup_tears_down_every_store() {
         let share = Share::new();
@@ -3933,13 +4738,6 @@ mod tests {
 
     /// The connection pool's teardown is gated on its bit, exactly as the C's
     /// is.
-    ///
-    /// `lib/curl_share.c:237-239` destroys the pool only when
-    /// `share->specifier & (1 << CURL_LOCK_DATA_CONNECT)` still holds. Since
-    /// `CURLSHOPT_UNSHARE` clears that bit without destroying the pool, the C
-    /// then frees the enclosing structure at `:264` with the pool's members
-    /// never released -- a leak this reproduces the conditional half of, while
-    /// Rust's drop glue reclaims what the C loses.
     #[test]
     fn the_pool_is_destroyed_only_while_its_bit_is_set() {
         let share = Share::new();
@@ -3963,6 +4761,225 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_none());
+    }
+
+    /// The shared pool is **destroyed** at cleanup -- every connection is asked
+    /// to disconnect -- and the destroy runs inside the connect notification.
+    ///
+    /// `Curl_cpool_destroy` (`lib/conncache.c:231-254`) is not a free: it moves
+    /// every remaining connection through `cpool_discard_conn`, which sends the
+    /// protocol farewell (`lib/cshutdn.c:62`), and it does so between
+    /// `CPOOL_LOCK` and `CPOOL_UNLOCK` (`lib/conncache.c:41-60`) -- a
+    /// `CURL_LOCK_DATA_CONNECT` / `CURL_LOCK_ACCESS_SINGLE` pair naming
+    /// `cpool->idata`, the admin handle. Dropping the pool instead would
+    /// reclaim the same memory while asking no scheme anything and telling the
+    /// application nothing, so this test asserts both halves: the handler was
+    /// called, and the bracket was delivered.
+    ///
+    /// The handle the connect notification names is [`LockOwner::NONE`] rather
+    /// than a pointer, because there is no easy handle to name:
+    /// `crate::easy` has no handle type at this commit, and
+    /// `curl_share_cleanup` already delivers its own notifications with
+    /// `NULL`
+    /// (`lib/curl_share.c:228`). Fabricating a non-null value an application
+    /// might dereference would be worse than the honest null.
+    #[test]
+    fn cleanup_destroys_the_shared_pool_through_the_retained_admin() {
+        let (share, recorder) = recorded();
+        assert_eq!(share.setopt(ShareOption::Share(5)), CURLSHcode::Ok);
+        let calls: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Populate it the way `crate::protocols` will.
+        {
+            let clock = SystemClock;
+            let mut cx = CallCtx::new(&clock);
+            let mut guard = share.pool(OWNER).expect("connections are shared");
+            let pool = guard.as_mut().expect("a set bit implies a pool");
+            for destination in ["a:80", "b:80"] {
+                pool.add(&mut cx, connection(destination, Some(&calls)));
+            }
+            assert_eq!(pool.count(), 2);
+        }
+        let _ = recorder.drain();
+
+        assert_eq!(share.cleanup(), CURLSHcode::Ok);
+
+        // Both connections were asked to disconnect, with `dead = false`:
+        // `cpool_discard_conn(cpool, idata, conn, FALSE)`
+        // (`lib/conncache.c:247`) passes `aborted = FALSE`, so a farewell is
+        // sent rather than suppressed.
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_slice(),
+            [false, false],
+            "a destroyed pool asks every scheme; a dropped one asks none"
+        );
+
+        // C: :227-229, then the pool's own bracket, then :261-262.
+        assert_eq!(
+            recorder.drain(),
+            vec![
+                Event::Lock(
+                    LockOwner::NONE,
+                    LockData::Share,
+                    LockAccess::Single,
+                    USERDATA
+                ),
+                Event::Lock(
+                    LockOwner::NONE,
+                    LockData::Connect,
+                    LockAccess::Single,
+                    USERDATA
+                ),
+                Event::Unlock(LockOwner::NONE, LockData::Connect, USERDATA),
+                Event::Unlock(LockOwner::NONE, LockData::Share, USERDATA),
+            ],
+            "lib/conncache.c:243-252 nested inside lib/curl_share.c:227-262"
+        );
+        recorder.assert_balanced();
+        assert!(share
+            .cpool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none());
+    }
+
+    /// A pool whose bit was cleared keeps its connections, because the C skips
+    /// it.
+    ///
+    /// The other half of `lib/curl_share.c:237-239`. `CURLSHOPT_UNSHARE` clears
+    /// the bit without destroying the pool (`:150`, `:187-188`), so no scheme
+    /// is asked anything and no notification is delivered -- and in the C the
+    /// pool's members are then leaked at `:264`. Rust's drop glue reclaims them
+    /// instead, which is the one divergence [`Share::teardown`] records.
+    #[test]
+    fn an_unshared_pool_is_neither_destroyed_nor_notified() {
+        let (share, recorder) = recorded();
+        assert_eq!(share.setopt(ShareOption::Share(5)), CURLSHcode::Ok);
+        let calls: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let clock = SystemClock;
+            let mut cx = CallCtx::new(&clock);
+            let mut guard = share.pool(OWNER).expect("connections are shared");
+            let pool = guard.as_mut().expect("a set bit implies a pool");
+            pool.add(&mut cx, connection("a:80", Some(&calls)));
+        }
+        assert_eq!(share.setopt(ShareOption::Unshare(5)), CURLSHcode::Ok);
+        let _ = recorder.drain();
+
+        assert_eq!(share.cleanup(), CURLSHcode::Ok);
+
+        assert!(
+            calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "lib/curl_share.c:237-239 skips a pool whose bit is clear"
+        );
+        // Only the share's own pair: no connect bracket at all.
+        assert_eq!(
+            recorder.drain(),
+            vec![
+                Event::Lock(
+                    LockOwner::NONE,
+                    LockData::Share,
+                    LockAccess::Single,
+                    USERDATA
+                ),
+                Event::Unlock(LockOwner::NONE, LockData::Share, USERDATA),
+            ]
+        );
+        // And the pool itself survived the teardown, connection included.
+        let slot = share.cpool.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            slot.as_ref().expect("the pool was not destroyed").count(),
+            1
+        );
+        drop(slot);
+        recorder.assert_balanced();
+    }
+
+    /// The retained admin context empties a pool through the disposal path.
+    ///
+    /// `Curl_cpool_destroy`'s loop (`lib/conncache.c:242-249`) takes the first
+    /// connection out and discards it until none is left, and its guard --
+    /// `if(cpool && cpool->initialised && cpool->idata)` (`:233`) -- is why the
+    /// admin context has to be retained: a pool with no `idata` is a pool the C
+    /// does not destroy at all.
+    ///
+    /// This also exercises the driver [`ShareAdmin::destroy_pool`] chooses. The
+    /// connections carry a disconnect handler and the admin reports itself
+    /// internal, which is exactly the pair that reaches
+    /// `tokio::time::timeout` in `run_conn_handler`; the test runs in a plain
+    /// `#[test]` with no ambient runtime, so it passes only because the driver
+    /// supplies a time driver of its own.
+    #[test]
+    fn the_admin_context_destroys_a_pool_rather_than_dropping_it() {
+        let mut admin = ShareAdmin::new();
+        let clock = SystemClock;
+        let mut pool = ConnectionPool::new();
+        let calls: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut cx = CallCtx::new(&clock);
+            for destination in ["a:80", "a:80", "b:80"] {
+                pool.add(&mut cx, connection(destination, Some(&calls)));
+            }
+        }
+        assert_eq!(pool.count(), 3);
+        assert_eq!(pool.destinations(), 2);
+
+        admin.destroy_pool(&mut pool);
+
+        assert!(pool.is_empty(), "lib/conncache.c:242-249 empties the pool");
+        assert_eq!(pool.destinations(), 0);
+        assert_eq!(
+            calls.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            3,
+            "every connection was asked to disconnect"
+        );
+    }
+
+    /// The admin answers the eleven questions the C's admin handle answers.
+    ///
+    /// `share->admin` is an internal handle with no multi handle
+    /// (`lib/curl_share.c:40-47`), and every answer follows from that pair.
+    /// [`ShareAdmin`] tabulates the C locator for each; this pins them so a
+    /// later edit cannot quietly turn the share's teardown into a multi
+    /// handle's.
+    #[test]
+    fn the_admin_reports_an_internal_handle_with_no_multi_handle() {
+        let mut host = ShareAdminHost;
+
+        // C: lib/cshutdn.c:139 and :157 -- no multi handle, so no admin
+        // substitution and no multi notifications.
+        assert!(!host.has_admin());
+        assert!(!host.has_multi());
+        // C: lib/curl_share.c:47 -- `share->admin->state.internal = TRUE`,
+        // which is what caps a blocking disconnect handler.
+        assert!(host.is_internal(ShutdownHandle::Caller));
+        assert!(host.is_internal(ShutdownHandle::Admin));
+        // C: lib/cshutdn.c:411 -- no socket callback, so no event state.
+        assert!(!host.socket_cb_installed());
+        // C: lib/multihandle.h:152 -- zero is "unlimited".
+        assert_eq!(host.max_total_connections(), 0);
+
+        // The four that act on a multi handle are no-ops, and the assessment
+        // succeeds so that a connection stays on the ordinary path.
+        let clock = SystemClock;
+        let mut cx = CallCtx::new(&clock);
+        let mut chains = FilterChains::new(None);
+        let id = ConnId::new(1);
+        assert_eq!(
+            host.assess_conn(ShutdownHandle::Admin, id, &mut cx, &mut chains),
+            CURLMcode::Ok
+        );
+        host.conn_done(ShutdownHandle::Admin, id, &mut cx, &mut chains);
+        host.connchanged();
+        host.expire(ShutdownHandle::Admin, 0, TimerId::Shutdown);
+        host.set_operation_timeout_ms(ShutdownHandle::Admin, 2_000);
+        host.restart_operation_timing(ShutdownHandle::Admin);
     }
 
     /// Cleanup's notifications ignore the specifier, unlike every other
@@ -4069,13 +5086,6 @@ mod tests {
 
     /// Each store accessor delivers one exclusive lock on entry and one unlock
     /// on drop.
-    ///
-    /// `CPOOL_LOCK` (`lib/conncache.c:41-50`), `dnscache_lock`
-    /// (`lib/hostip.c:307-312`), `Curl_ssl_scache_lock`
-    /// (`lib/vtls/vtls_scache.c:585-589`), `Curl_hsts_loadfiles`
-    /// (`lib/hsts.c:559`) and `lib/cookie.c`'s four sites all request
-    /// `CURL_LOCK_ACCESS_SINGLE`, which is why there is no shared-access
-    /// accessor.
     #[test]
     fn every_store_accessor_brackets_its_critical_section() {
         let (share, recorder) = recorded();
@@ -4159,12 +5169,6 @@ mod tests {
 
     /// The callbacks are clearable with a null pointer, and their absence is
     /// tolerated.
-    ///
-    /// `tests/libtest/lib3207.c:154-155` clears both by passing `NULL`, and
-    /// the C stores whatever `va_arg` yields with no validation
-    /// (`lib/curl_share.c:196-209`). The user pointer is independent of both:
-    /// clearing a callback leaves it, and setting it without a callback is
-    /// remembered.
     #[test]
     fn the_callbacks_are_clearable_and_their_absence_is_tolerated() {
         let (share, recorder) = recorded();
@@ -4246,10 +5250,6 @@ mod tests {
     /// A Public Suffix List with one rule per section, which is the minimum
     /// `publicsuffix` accepts: the section markers are load-bearing, because
     /// the parser stores no rule until it has seen one.
-    ///
-    /// Reduced from the list `crate::cookies::psl`'s own tests use, since
-    /// nothing here depends on any particular suffix -- only on a list
-    /// parsing.
     #[cfg(feature = "cookies")]
     const PSL_LIST: &str = concat!(
         "// ===BEGIN ICANN DOMAINS===\n",
@@ -4260,11 +5260,6 @@ mod tests {
 
     /// A fresh cache takes the shared lock once and keeps it until the guard
     /// is dropped.
-    ///
-    /// `lib/psl.c:51` then `:91-94`: with nothing stale there is no upgrade, so
-    /// the whole sequence is one `CURL_LOCK_ACCESS_SHARED` notification and,
-    /// later, one unlock -- which `Curl_psl_release` (`:97-100`) performs and
-    /// which is [`Drop`] here.
     #[cfg(feature = "cookies")]
     #[test]
     fn a_fresh_public_suffix_list_takes_the_shared_lock_once() {
@@ -4280,7 +5275,7 @@ mod tests {
         let _ = recorder.drain();
 
         // The second is not: the deadline is 72 hours out.
-        let mut guard = share.psl_use(OWNER, &clock, &source).expect("a list");
+        let guard = share.psl_use(OWNER, &clock, &source).expect("a list");
         assert_eq!(
             recorder.drain(),
             vec![Event::Lock(
@@ -4303,11 +5298,6 @@ mod tests {
 
     /// A stale cache performs the C's five-step upgrade and ends holding a
     /// shared lock.
-    ///
-    /// `lib/psl.c:51`, `:55`, `:58`, `:88`, `:89` -- shared, release,
-    /// exclusive, release, shared -- and then one unlock owed by the guard. The
-    /// C's comment at `:54` explains the release: *"Let a chance to other
-    /// threads to do the job: avoids deadlock."*
     #[cfg(feature = "cookies")]
     #[test]
     fn a_stale_public_suffix_list_performs_the_upgrade_sequence() {
@@ -4344,6 +5334,91 @@ mod tests {
         let _ = recorder.drain();
         let guard = share.psl_use(OWNER, &clock, &source).expect("a list");
         assert_eq!(recorder.drain().len(), 5, "a second upgrade");
+        drop(guard);
+        recorder.assert_balanced();
+    }
+
+    /// Nothing is mutated while the application has been told
+    /// `CURL_LOCK_ACCESS_SHARED`.
+    ///
+    /// This is the whole point of the guard being a reader. `Curl_psl_use`
+    /// refreshes only between `lib/psl.c:58` and `:88`, under
+    /// `CURL_LOCK_ACCESS_SINGLE`; from `:89` onwards it holds a shared lock,
+    /// reads `pslcache->psl` at `:91` and returns it as a `const psl_ctx_t *`
+    /// at `:94`. So once a caller holds the returned list:
+    ///
+    /// * the cache's state cannot change under it -- not even when the
+    ///   deadline passes while the guard is alive, which this test forces;
+    /// * no further notification is delivered, because no phase change
+    ///   happens; and
+    /// * a second reader still fits, which is the concurrency the C has
+    ///   between two `Curl_psl_use` callers and which a writer would have
+    ///   destroyed.
+    ///
+    /// The last point is asserted through the lock itself rather than by
+    /// taking a second guard, because a second guard would deliver a second
+    /// `CURL_LOCK_DATA_PSL` notification and the recorder -- modelled on
+    /// `lib506.c`'s strict per-kind detector -- would report it as a double
+    /// lock.
+    #[cfg(feature = "cookies")]
+    #[test]
+    fn a_held_public_suffix_list_is_never_refreshed_under_the_shared_lock() {
+        let (share, recorder) = recorded();
+        assert_eq!(share.setopt(ShareOption::Share(6)), CURLSHcode::Ok);
+        let clock = TestClock::new(CurlTime::new(1_000, 0));
+        let source = MemoryPslSource::latest(PSL_LIST);
+
+        // One refresh, so that what follows starts from a fresh cache.
+        drop(share.psl_use(OWNER, &clock, &source).expect("a list"));
+        let _ = recorder.drain();
+
+        let guard = share.psl_use(OWNER, &clock, &source).expect("a list");
+        let deadline = guard.expires();
+        assert_eq!(deadline, 1_000 + 72 * 3600, "lib/psl.c:72-73");
+
+        // The guard holds a READER: another reader fits, a writer does not.
+        assert!(
+            share.psl.try_read().is_ok(),
+            "lib/psl.c:89 holds CURL_LOCK_ACCESS_SHARED, so readers still fit"
+        );
+        assert!(
+            share.psl.try_write().is_err(),
+            "and the cache is genuinely locked for the guard's lifetime"
+        );
+
+        // Go stale underneath the held guard. The C cannot refresh here and
+        // neither can this: `list` reads `pslcache->psl` and nothing else.
+        clock.advance(std::time::Duration::from_secs(72 * 3600 + 1));
+        assert!(guard.list().is_some(), "the selection survives the return");
+        assert!(guard.list().is_some(), "and repeats without side effects");
+        assert_eq!(guard.expires(), deadline, "no refresh happened");
+        assert!(guard.is_dynamic());
+        assert_eq!(
+            recorder.events(),
+            vec![Event::Lock(
+                OWNER,
+                LockData::Psl,
+                LockAccess::Shared,
+                USERDATA
+            )],
+            "one shared phase, so no notification beyond its own lock"
+        );
+
+        drop(guard);
+        assert_eq!(
+            recorder.drain(),
+            vec![
+                Event::Lock(OWNER, LockData::Psl, LockAccess::Shared, USERDATA),
+                Event::Unlock(OWNER, LockData::Psl, USERDATA),
+            ]
+        );
+        recorder.assert_balanced();
+
+        // The next call is the one that refreshes, because it can take the
+        // exclusive phase: five notifications, per `lib/psl.c:51-89`.
+        let guard = share.psl_use(OWNER, &clock, &source).expect("a list");
+        assert_eq!(recorder.drain().len(), 5);
+        assert!(guard.expires() > deadline, "now it moved");
         drop(guard);
         recorder.assert_balanced();
     }
@@ -4400,17 +5475,6 @@ mod tests {
     // Robustness: poisoning, formatting and the measured thread-safety state
 
     /// A panic that poisons a store lock does not break the share.
-    ///
-    /// Every lock in this file is taken with
-    /// `unwrap_or_else(PoisonError::into_inner)`, which is the idiom
-    /// `crate::util::timeval` uses. The reasoning is stronger here than there:
-    /// a poisoned lock that propagated would make every later operation on
-    /// this share fail permanently, and C -- which has no notion of poisoning
-    /// -- cannot produce that outcome.
-    ///
-    /// The panic hook is silenced for the duration so that the expected panic
-    /// does not print a backtrace into the test output, and restored
-    /// afterwards.
     #[test]
     fn a_poisoned_store_lock_is_recovered_rather_than_propagated() {
         let (share, recorder) = recorded();
@@ -4449,8 +5513,6 @@ mod tests {
         assert_eq!(share.cleanup(), CURLSHcode::Ok);
     }
 
-    /// Formatting a share never blocks on a lock somebody else holds.
-    ///
     /// A derived [`fmt::Debug`] would take every lock, so formatting from
     /// inside a critical section -- which is exactly when a diagnostic is
     /// wanted -- would deadlock. Every lock is probed with `try_lock` instead
@@ -4476,21 +5538,51 @@ mod tests {
         assert!(text.contains("ssl_scache: \"present\""), "{text}");
     }
 
-    /// Every component of a share is `Send + Sync` except the connection pool.
+    /// [`Share`], [`ShareCore`] and every component of them is `Send + Sync`.
     ///
-    /// This is the escalation in the module documentation, as a fact under
-    /// test. The five stores, the metadata and both callback types satisfy the
-    /// bounds; [`crate::conn::pool::ConnectionPool`] does not, because
-    /// `ConnFilter`, `ShutdownTimer` and `ProtocolDisconnect` carry no `Send`
-    /// bound, and adding one produced 925 errors across `conn/socket.rs`,
-    /// `conn/filters.rs`, `crate::tls` and `util/bufq.rs`. `Share` is
-    /// therefore neither, and the fix belongs to those modules -- at which
-    /// point it becomes both with no change here, because everything below
-    /// already qualifies.
+    /// The first assertion is the one that matters and the one an application
+    /// depends on: a `CURLSH` is usable from two threads
+    /// (`tests/libtest/lib506.c`, `lib3207.c`), so the type backing it must be
+    /// `Send + Sync`. The component assertions below it are diagnosis rather
+    /// than contract -- when the first line fails, they say which store
+    /// regressed instead of leaving a reader to bisect a type graph.
+    ///
+    /// [`ShareCore`] is asserted separately because it is the value
+    /// `Share::stores` hands another thread, and
+    /// `one_share_serves_two_threads_through_its_core` drives one share from
+    /// two threads through exactly that handle.
+    ///
+    /// [`crate::conn::pool::ConnectionPool`] is included deliberately. It was
+    /// the one component that did not qualify, because `ConnFilter`,
+    /// `ShutdownTimer` and `ProtocolDisconnect` carried no `Send` bound and the
+    /// seams behind them held `Rc`. Those bounds now exist, so a change that
+    /// reintroduces a thread-affine value anywhere in the connection or TLS
+    /// graph fails here -- which is the whole point of asserting the pool
+    /// rather than only the share.
     #[test]
-    fn every_component_but_the_connection_pool_is_send_and_sync() {
+    fn the_share_and_every_component_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
 
+        // The contract.
+        assert_send_sync::<Share>();
+
+        // The handle a second thread holds.
+        assert_send_sync::<ShareCore>();
+        assert_send_sync::<Arc<ShareCore>>();
+
+        // The diagnosis, innermost first.
+        //
+        // The pool is asserted `Send` and NOT `Sync`, which is exact rather
+        // than lenient: its `Box<dyn ConnFilter>`, `Box<dyn ShutdownTimer>`
+        // and `Option<Box<dyn ProtocolDisconnect>>` carry `Send` and not
+        // `Sync`, because the pool exposes mutation through `&mut self` alone
+        // and never needs to be aliased. `Mutex<T>: Sync` needs only
+        // `T: Send`, so the field below supplies the `Sync` that `Share`
+        // requires. Asserting the pool itself `Sync` would demand a bound
+        // nothing uses.
+        fn assert_send<T: Send>() {}
+        assert_send::<ConnectionPool>();
+        assert_send_sync::<Mutex<Option<ConnectionPool>>>();
         assert_send_sync::<LockData>();
         assert_send_sync::<LockAccess>();
         assert_send_sync::<LockOwner>();
@@ -4503,6 +5595,7 @@ mod tests {
         assert_send_sync::<AtomicU32>();
         assert_send_sync::<Mutex<DnsCache>>();
         assert_send_sync::<Mutex<Option<SessionCache>>>();
+        assert_send_sync::<Mutex<Option<ConnectionPool>>>();
         #[cfg(feature = "cookies")]
         assert_send_sync::<Mutex<Option<CookieInfo>>>();
         #[cfg(feature = "cookies")]
@@ -4511,21 +5604,122 @@ mod tests {
         assert_send_sync::<Mutex<Option<HstsCache>>>();
     }
 
-    /// Several threads drive one share each and one callback, concurrently.
+    /// One share, four threads, the whole of `lib506.c`'s shape.
     ///
-    /// What is being asserted is the half of `tests/libtest/lib506.c` and
-    /// `lib3207.c` that is expressible while [`Share`] is not `Sync`: that the
-    /// callback plumbing -- an [`Arc`] of a `Fn` closure over shared state,
-    /// which is what `curl-rs-ffi` will install -- is sound and balanced under
-    /// genuine concurrency, and that a share's state is entirely its own.
+    /// This is the half that a `!Sync` share could not express, and it is now
+    /// the primary concurrency assertion: `tests/libtest/lib506.c` drives ONE
+    /// share from several threads with `CURL_LOCK_DATA_COOKIE` and
+    /// `CURL_LOCK_DATA_DNS`, and `lib3207.c` does the same with
+    /// `CURL_LOCK_DATA_SSL_SESSION`. Each thread attaches, takes all four
+    /// shared stores in turn, and detaches, `ROUNDS` times.
     ///
-    /// The half that is **not** expressible is one share reached from two
-    /// threads, which those two C programs do and which needs
-    /// `Share: Sync`. The module documentation escalates that with its
-    /// measurement; the test above pins which component blocks it. Each thread
-    /// therefore gets its own share and its own balance checker, while one
-    /// counter shared by every callback proves the closures really did run on
-    /// different threads.
+    /// Three properties are being asserted, and each one would have been
+    /// unobservable before:
+    ///
+    /// * **Soundness under contention.** Every store is reached through this
+    ///   module's locks from several threads at once. This is the test Miri and
+    ///   the AddressSanitizer gate have something to say about.
+    /// * **The callbacks fire exactly as often as the guards are taken.**
+    ///   `lib506.c:71-76` carries double-lock detection, so the C's contract is
+    ///   that notifications are balanced and never nested for one kind. The
+    ///   counter is incremented from every thread and compared against the
+    ///   arithmetic, which pins both.
+    /// * **No notification is lost or duplicated.** The count is exact, not a
+    ///   bound: a lost wake-up or a double delivery moves it.
+    ///
+    /// The pool is included in the stores taken, deliberately: it is the store
+    /// whose `!Send` seams were what made a share thread-affine, so a test that
+    /// took the other three and skipped it would pass without touching the
+    /// thing that changed.
+    #[test]
+    fn four_threads_drive_one_shared_handle() {
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 64;
+
+        let share = Share::new();
+        let unlocks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&unlocks);
+        assert_eq!(
+            share.setopt(ShareOption::UnlockFunc(Some(Arc::new(
+                move |_owner, _kind, _userdata| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            )))),
+            CURLSHcode::Ok
+        );
+        // `CURL_LOCK_DATA_DNS` (3), `SSL_SESSION` (4) and `CONNECT` (5) are the
+        // three the C's own two-thread tests share.
+        for kind in [3, 4, 5] {
+            assert_eq!(share.setopt(ShareOption::Share(kind)), CURLSHcode::Ok);
+        }
+
+        // `&Share` crossing a scope boundary is the property under test: it
+        // compiles only because `Share` is `Sync`.
+        let shared: &Share = &share;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        // The ownership change runs inside the
+                        // `CURL_LOCK_DATA_SHARE` bracket
+                        // (`lib/setopt.c:1493-1550`); a handle with nothing
+                        // to repoint passes a closure that does nothing, as
+                        // `lib/url.c:291-293` does.
+                        let _ = shared.attach(OWNER, |_| ());
+                        drop(shared.dnscache(OWNER));
+                        drop(shared.ssl_scache(OWNER));
+                        drop(shared.pool(OWNER));
+                        let _ = shared.detach(OWNER, |_| ());
+                    }
+                });
+            }
+        });
+
+        // Every easy handle detached again, so the share is free to go.
+        assert_eq!(share.dirty(), 0);
+        // Five unlocks per round -- attach, three stores, detach -- across
+        // every thread. Exact, not a bound.
+        assert_eq!(
+            unlocks.load(Ordering::Relaxed),
+            THREADS * ROUNDS * 5,
+            "one notification per guard, from every thread"
+        );
+        // `cleanup` delivers TWO more, and the second one is the point of
+        // sharing `CURL_LOCK_DATA_CONNECT` here. The first is the specifier
+        // teardown's own `CURL_LOCK_DATA_SHARE` bracket
+        // (`lib/curl_share.c:227-262`); the second is the
+        // `CURL_LOCK_DATA_CONNECT` bracket that `CPOOL_LOCK`/`CPOOL_UNLOCK`
+        // (`lib/conncache.c:41-60`) place around `Curl_cpool_destroy`
+        // (`:243-252`), which runs nested inside the first because the pool bit
+        // is set. A share without that bit gets one, which
+        // `an_unshared_pool_is_neither_destroyed_nor_notified` pins.
+        assert_eq!(share.cleanup(), CURLSHcode::Ok);
+        assert_eq!(unlocks.load(Ordering::Relaxed), THREADS * ROUNDS * 5 + 2);
+    }
+
+    /// Several threads drive one share each, one callback, and one pool each.
+    ///
+    /// The owner-side half of `tests/libtest/lib506.c` and `lib3207.c`: the
+    /// full lifecycle -- `CURLSHOPT_SHARE`, attach, the store accessors, the
+    /// **connection pool**, detach and `curl_share_cleanup` -- performed
+    /// concurrently on as many threads as there are shares, with one counter
+    /// shared by every callback proving the closures really did run on
+    /// different threads. A share per thread is the right shape here and not a
+    /// concession: the pool is the one store that cannot be reached from
+    /// another thread at all, so exercising it concurrently means exercising
+    /// one per thread.
+    ///
+    /// The other half -- **one** share reached from two threads, which is what
+    /// those two C programs actually do -- is
+    /// `one_share_serves_two_threads_through_its_core`, which drives the five
+    /// kinds that [`ShareCore`] carries through a single [`Arc<ShareCore>`].
+    /// Between them the two tests cover every kind: five shared across
+    /// threads, and the sixth exercised on its own.
+    ///
+    /// [`several_threads_drive_one_shared_handle`] adds a third shape: one
+    /// share reached from four threads including its **pool**, which only
+    /// compiles because [`Share`] is `Sync`. Independent shares would pass
+    /// even if [`Share`] were merely `Send`, so both are needed.
     #[test]
     fn many_threads_drive_one_callback_and_independent_shares() {
         const THREADS: usize = 4;
@@ -4562,11 +5756,11 @@ mod tests {
                     let _ = recorder.drain();
 
                     for _ in 0..ROUNDS {
-                        let _ = share.attach(OWNER);
+                        let _ = share.attach(OWNER, |_| ());
                         drop(share.dnscache(OWNER));
                         drop(share.ssl_scache(OWNER));
                         drop(share.pool(OWNER));
-                        let _ = share.detach(OWNER);
+                        let _ = share.detach(OWNER, |_| ());
                     }
 
                     recorder.assert_balanced();
@@ -4577,7 +5771,502 @@ mod tests {
         });
 
         // Five unlocks per round -- attach, three stores, detach -- plus the
-        // one `cleanup` delivers per thread.
-        assert_eq!(unlocks.load(Ordering::Relaxed), THREADS * (ROUNDS * 5 + 1));
+        // two `cleanup` delivers per thread: its own `CURL_LOCK_DATA_SHARE`
+        // pair (`lib/curl_share.c:261-262`) and the
+        // `CURL_LOCK_DATA_CONNECT` pair the pool's destroy runs inside
+        // (`lib/conncache.c:41-60`, reached from `Curl_cpool_destroy`), because
+        // these shares have the connect bit set.
+        assert_eq!(unlocks.load(Ordering::Relaxed), THREADS * (ROUNDS * 5 + 2));
+    }
+
+    /// The application's callbacks as `lib506.c` actually writes them: a lock
+    /// that blocks.
+    ///
+    /// `tests/libtest/lib506.c:47-63` and `:100-116` install
+    /// `pthread_mutex_lock` and `pthread_mutex_unlock` per datum, so the
+    /// callback pair **is** the mutual exclusion -- the C keeps no internal
+    /// lock of its own. [`Recorder`] on its own cannot stand in for that under
+    /// real concurrency: it records and returns, so two threads would both be
+    /// told they hold one datum and its `lib506.c`-modelled detector would
+    /// rightly report a double lock. This gate supplies the blocking half, and
+    /// the two compose -- gate first, then record -- so the detector stays
+    /// meaningful.
+    ///
+    /// A [`Condvar`] over a stack of held kinds rather than a mutex per kind,
+    /// because a [`MutexGuard`] cannot be held between two separate callback
+    /// invocations the way a raw `pthread_mutex_t` can.
+    ///
+    /// That this cannot deadlock against the module is a property of the
+    /// module, and is the second thing the test using it proves: every
+    /// notification is delivered with no internal lock held --
+    /// [`ShareCore::lock`] and [`ShareCore::unlock`] release the metadata
+    /// before calling out, [`ShareCore::guard`] notifies before taking the
+    /// store, and [`ShareGuard`] releases the store before the unlock
+    /// notification.
+    #[derive(Debug, Default)]
+    struct Gate {
+        /// The kinds currently held, in acquisition order.
+        held: Mutex<Vec<LockData>>,
+        /// Signalled on every release.
+        wake: Condvar,
+    }
+
+    impl Gate {
+        /// Blocks until nobody holds `kind`, then takes it.
+        fn acquire(&self, kind: LockData) {
+            let mut held =
+                self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            while held.contains(&kind) {
+                held = self
+                    .wake
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            held.push(kind);
+        }
+
+        /// Gives `kind` back and wakes whoever is waiting for it.
+        fn release(&self, kind: LockData) {
+            let mut held =
+                self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(at) = held.iter().rposition(|entry| *entry == kind) {
+                held.remove(at);
+            }
+            drop(held);
+            self.wake.notify_all();
+        }
+    }
+
+    /// Installs a gated recorder: the callbacks record *and* mutually exclude.
+    fn install_gated(
+        share: &Share,
+        recorder: &Arc<Recorder>,
+        gate: &Arc<Gate>,
+    ) {
+        let for_lock = Arc::clone(recorder);
+        let lock_gate = Arc::clone(gate);
+        assert_eq!(
+            share.setopt(ShareOption::LockFunc(Some(Arc::new(
+                move |owner, kind, access, userdata| {
+                    lock_gate.acquire(kind);
+                    for_lock.on_lock(owner, kind, access, userdata);
+                }
+            )))),
+            CURLSHcode::Ok
+        );
+        let for_unlock = Arc::clone(recorder);
+        let unlock_gate = Arc::clone(gate);
+        assert_eq!(
+            share.setopt(ShareOption::UnlockFunc(Some(Arc::new(
+                move |owner, kind, userdata| {
+                    for_unlock.on_unlock(owner, kind, userdata);
+                    unlock_gate.release(kind);
+                }
+            )))),
+            CURLSHcode::Ok
+        );
+        assert_eq!(
+            share.setopt(ShareOption::UserData(USERDATA)),
+            CURLSHcode::Ok
+        );
+    }
+
+    /// ONE share, two easy-handle stand-ins, two threads -- `lib506.c`'s shape.
+    ///
+    /// The test the split exists for. `tests/libtest/lib506.c` runs two
+    /// threads against a single share with `CURL_LOCK_DATA_COOKIE` and
+    /// `CURL_LOCK_DATA_DNS`, and `lib3207.c` does the same with
+    /// `CURL_LOCK_DATA_SSL_SESSION`; both are supported libcurl behaviour, so
+    /// a test giving each thread its own share would not stand in for them.
+    /// Here each thread holds an [`Arc<ShareCore>`] from [`Share::stores`] --
+    /// the same state, the same locks, the same callbacks -- and drives every
+    /// kind [`ShareCore`] carries.
+    ///
+    /// Four things are asserted:
+    ///
+    /// 1. **It is one share.** A [`Barrier`] makes both threads attach before
+    ///    either proceeds, so the reference count read after it is exactly
+    ///    [`THREADS`] rather than 1. Two independent shares would each read 1.
+    /// 2. **Every shared store is reachable from both threads**, including the
+    ///    cookie-then-Public-Suffix-List nesting `lib/cookie.c` performs.
+    /// 3. **The notifications stay balanced and never double-lock** under a
+    ///    callback that really blocks, which is what [`Gate`] supplies.
+    /// 4. **The count returns to zero**, so `curl_share_cleanup` then
+    ///    succeeds -- the C's `CURLSHE_IN_USE` guard is not tripped by a
+    ///    decrement lost to a race.
+    ///
+    /// The connection pool is absent on purpose: it is the one kind that
+    /// cannot cross a thread boundary, which
+    /// `the_shared_core_is_send_and_sync_and_the_owner_is_not` records and
+    /// `many_threads_drive_one_callback_and_independent_shares` exercises
+    /// instead.
+    #[test]
+    fn one_share_serves_two_threads_through_its_core() {
+        const THREADS: usize = 2;
+        const ROUNDS: usize = 32;
+
+        let share = Share::new();
+        let recorder = Recorder::new();
+        let gate = Arc::new(Gate::default());
+        install_gated(&share, &recorder, &gate);
+
+        // Every kind the core carries. Cookies, the Public Suffix List and
+        // HSTS are feature-gated, so a build without them shares fewer kinds
+        // rather than failing.
+        for kind in [LockData::Dns, LockData::SslSession] {
+            assert_eq!(
+                share.setopt(ShareOption::Share(kind.as_i32())),
+                CURLSHcode::Ok
+            );
+        }
+        #[cfg(feature = "cookies")]
+        for kind in [LockData::Cookie, LockData::Psl] {
+            assert_eq!(
+                share.setopt(ShareOption::Share(kind.as_i32())),
+                CURLSHcode::Ok
+            );
+        }
+        #[cfg(feature = "hsts")]
+        assert_eq!(
+            share.setopt(ShareOption::Share(LockData::Hsts.as_i32())),
+            CURLSHcode::Ok
+        );
+        let _ = recorder.drain();
+
+        // One handle per thread on the SAME state, which is what
+        // `Share::stores` is for.
+        let core = share.stores();
+        let barrier = Barrier::new(THREADS);
+        std::thread::scope(|scope| {
+            for slot in 0..THREADS {
+                let core = Arc::clone(&core);
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    // A distinct handle per thread, as two easy handles are
+                    // distinct: the notifications name whoever caused them.
+                    let owner = LockOwner::from_bits(0x0001_0000 + slot);
+
+                    // C: lib/setopt.c:1520-1550 -- the attach every easy
+                    // handle performs when `CURLOPT_SHARE` is set.
+                    let specifier = core
+                        .attach(owner, |specifier| specifier)
+                        .expect("a live share accepts a reference");
+                    assert!(specifier.contains(LockData::Dns));
+                    assert!(specifier.contains(LockData::SslSession));
+
+                    // Both references are now on ONE counter, which is the
+                    // whole claim being tested.
+                    barrier.wait();
+                    assert_eq!(
+                        core.dirty(),
+                        THREADS as u32,
+                        "one share, {THREADS} handles"
+                    );
+
+                    for _ in 0..ROUNDS {
+                        assert!(
+                            core.dnscache(owner)
+                                .expect("DNS is shared")
+                                .is_empty(),
+                            "nothing resolves in this test"
+                        );
+                        drop(
+                            core.ssl_scache(owner)
+                                .expect("TLS sessions are shared"),
+                        );
+                        #[cfg(feature = "cookies")]
+                        {
+                            // The C's own nesting: the cookie lock held while
+                            // the Public Suffix List is consulted
+                            // (`lib/cookie.c:795-802`).
+                            let jar = core.cookies(owner).expect("cookies");
+                            let clock = TestClock::new(CurlTime::new(1_000, 0));
+                            let source = MemoryPslSource::latest(PSL_LIST);
+                            let list = core
+                                .psl_use(owner, &clock, &source)
+                                .expect("a list");
+                            assert!(list.list().is_some());
+                            drop(list);
+                            drop(jar);
+                        }
+                        #[cfg(feature = "hsts")]
+                        drop(core.hsts(owner).expect("HSTS is shared"));
+                    }
+
+                    // C: lib/url.c:289-294 -- the detach `Curl_close`
+                    // performs.
+                    assert!(
+                        core.detach(owner, |_| ()).is_some(),
+                        "a live share accepts the release"
+                    );
+                });
+            }
+        });
+
+        recorder.assert_balanced();
+        assert_eq!(share.dirty(), 0, "every reference was given back");
+
+        // The list those threads loaded is the SHARE's own and not a copy of
+        // it: a reader arriving afterwards with the same clock finds it fresh,
+        // so it takes one `CURL_LOCK_ACCESS_SHARED` notification and performs
+        // no upgrade -- which is only true if a worker's refresh landed in this
+        // cache.
+        #[cfg(feature = "cookies")]
+        {
+            let _ = recorder.drain();
+            let clock = TestClock::new(CurlTime::new(1_000, 0));
+            let source = MemoryPslSource::latest(PSL_LIST);
+            let guard = share.psl_use(OWNER, &clock, &source).expect("a list");
+            assert_eq!(
+                recorder.drain(),
+                vec![Event::Lock(
+                    OWNER,
+                    LockData::Psl,
+                    LockAccess::Shared,
+                    USERDATA
+                )],
+                "lib/psl.c:51 only -- the cache the workers filled is fresh"
+            );
+            drop(guard);
+            recorder.assert_balanced();
+        }
+
+        assert_eq!(share.cleanup(), CURLSHcode::Ok);
+    }
+
+    /// Two threads race for one teardown, and exactly one wins.
+    ///
+    /// The contended form of
+    /// `a_claimed_teardown_refuses_new_references_and_a_second_cleanup`, which
+    /// can only be driven in sequence because [`Share::cleanup`] lives
+    /// on the owner. The claim itself lives on [`ShareCore`], which is
+    /// `Send + Sync`, so the race can be run for real -- and it is the race
+    /// `curl_share_cleanup` (`lib/curl_share.c:221-267`) loses: its
+    /// `GOOD_SHARE_HANDLE` test at `:224`, its `share->dirty` read at `:231`
+    /// and its `share->magic = 0` at `:263` are three unsynchronised steps, so
+    /// two threads entering together both return `CURLSHE_OK` and the
+    /// application frees one allocation twice.
+    ///
+    /// Every thread arrives at a [`Barrier`] first so that the
+    /// compare-and-exchange is genuinely contended rather than merely
+    /// sequential, and the winner count is asserted to be exactly one.
+    #[test]
+    fn two_threads_race_one_teardown_claim() {
+        const THREADS: usize = 8;
+
+        let share = Share::new();
+        let core = share.stores();
+        let winners = Arc::new(AtomicUsize::new(0));
+        let barrier = Barrier::new(THREADS);
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let core = Arc::clone(&core);
+                let winners = Arc::clone(&winners);
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    if core.claim_cleanup() {
+                        winners.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            winners.load(Ordering::Relaxed),
+            1,
+            "exactly one caller may ever reach `Box::from_raw`"
+        );
+        assert_eq!(core.lifecycle(), Lifecycle::Cleaning);
+        assert!(
+            core.attach(OWNER, |_| ()).is_none(),
+            "a claimed share accepts no new reference"
+        );
+
+        // The winner's teardown is what `Share::cleanup` performs; here the
+        // claim is handed back so that the owner can run the real one, which
+        // proves the share survived the race intact.
+        core.release_claim();
+        assert_eq!(share.cleanup(), CURLSHcode::Ok);
+        assert_eq!(core.lifecycle(), Lifecycle::Dead);
+    }
+
+    /// A lock callback that really locks, as `lib3207.c:135`'s
+    /// `curl_mutex_t mutexes[CURL_LOCK_DATA_LAST - 1]` does.
+    ///
+    /// [`Recorder`] is a *recorder*: it notes a second lock of one kind as the
+    /// fault `lib506.c:71-76` prints, which is the right check when one thread
+    /// drives one share. It is the wrong double for several threads driving
+    /// ONE share, because in C the second thread does not fault -- it BLOCKS
+    /// inside the application's callback until the first releases. Substituting
+    /// a recorder for a mutex there would report a fault the C never sees.
+    ///
+    /// So this is a real mutual exclusion, per kind, built from a held-set and
+    /// a [`Condvar`] rather than from one [`Mutex`] per kind, because a
+    /// `MutexGuard` cannot be parked between the lock and unlock callbacks
+    /// without either `unsafe` or a self-referential type, and this module
+    /// permits neither. The exclusion it provides is the same, and it is what
+    /// makes the accounting below meaningful: `locks` and `unlocks` can only
+    /// balance if every acquisition was serialised.
+    #[derive(Debug, Default)]
+    struct KindMutexes {
+        held: Mutex<Vec<LockData>>,
+        released: Condvar,
+        locks: AtomicUsize,
+        unlocks: AtomicUsize,
+        faults: Mutex<Vec<String>>,
+    }
+
+    impl KindMutexes {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        /// Blocks until this kind is free, then takes it.
+        fn acquire(&self, kind: LockData) {
+            let mut held =
+                self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            while held.contains(&kind) {
+                held = self
+                    .released
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            held.push(kind);
+            drop(held);
+            self.locks.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Releases this kind, waking any thread waiting for it.
+        ///
+        /// An unlock for a kind that is not held is `lib506.c:112-116`'s
+        /// `"unlock: double unlocked %s"` and is recorded as a fault rather
+        /// than ignored.
+        fn release(&self, kind: LockData) {
+            let mut held =
+                self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            match held.iter().rposition(|entry| *entry == kind) {
+                Some(at) => {
+                    held.remove(at);
+                }
+                None => self
+                    .faults
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(format!("unlock: double unlocked {}", kind.c_name())),
+            }
+            drop(held);
+            self.unlocks.fetch_add(1, Ordering::Relaxed);
+            self.released.notify_all();
+        }
+
+        fn assert_idle(&self) {
+            let faults =
+                self.faults.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(faults.is_empty(), "callback faults: {faults:?}");
+            let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(held.is_empty(), "still held at the end: {held:?}");
+        }
+    }
+
+    /// One share, several threads -- `tests/libtest/lib506.c`'s actual shape.
+    ///
+    /// `lib506.c` drives a single `CURLSH` from two threads with
+    /// `CURL_LOCK_DATA_COOKIE` and `CURL_LOCK_DATA_DNS`, and `lib3207.c` does
+    /// the same with `CURL_LOCK_DATA_SSL_SESSION`. This is that contract
+    /// expressed against this module directly, and it is the test that
+    /// exercises `Sync` rather than merely `Send`: every thread holds a
+    /// `&Share` to the *same* share and reaches every store through it. Before
+    /// the seam bounds landed, the `scope.spawn` below did not compile.
+    ///
+    /// Four properties are asserted, and each would fail differently:
+    ///
+    /// * **No deadlock.** The store accessors take the internal lock and
+    ///   invoke the application callback around it. An inversion -- a
+    ///   notification delivered while the internal lock is held -- would hang
+    ///   here rather than in a consumer, because [`KindMutexes`] is a real
+    ///   mutual exclusion.
+    /// * **Mutual exclusion per kind is honoured, and balanced.** Every
+    ///   acquisition is matched, nothing is left held, and no kind is released
+    ///   without having been taken.
+    /// * **The refcount is exact.** `THREADS * ROUNDS` attaches and as many
+    ///   detaches leave `dirty` at zero, so `cleanup` is permitted. An
+    ///   increment that escaped its lock would leave a non-zero remainder and
+    ///   turn the final `cleanup` into `CURLSHE_IN_USE`.
+    /// * **No notification was lost or duplicated.** Five locks and five
+    ///   unlocks per round -- attach, the three stores, detach -- counted
+    ///   across every thread.
+    #[test]
+    fn several_threads_drive_one_shared_handle() {
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 64;
+
+        let share = Share::new();
+        let gate = KindMutexes::new();
+
+        let for_lock = Arc::clone(&gate);
+        assert_eq!(
+            share.setopt(ShareOption::LockFunc(Some(Arc::new(
+                move |_owner, kind, _access, _userdata| {
+                    for_lock.acquire(kind);
+                }
+            )))),
+            CURLSHcode::Ok
+        );
+        let for_unlock = Arc::clone(&gate);
+        assert_eq!(
+            share.setopt(ShareOption::UnlockFunc(Some(Arc::new(
+                move |_owner, kind, _userdata| {
+                    for_unlock.release(kind);
+                }
+            )))),
+            CURLSHcode::Ok
+        );
+
+        // DNS, TLS sessions and connections -- the three kinds every build
+        // has, independent of the `cookies` and `hsts` features.
+        for kind in [3, 4, 5] {
+            assert_eq!(share.setopt(ShareOption::Share(kind)), CURLSHcode::Ok);
+        }
+        gate.assert_idle();
+        gate.locks.store(0, Ordering::Relaxed);
+        gate.unlocks.store(0, Ordering::Relaxed);
+
+        // `&Share` crossing a thread boundary is what needs `Sync`.
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let share: &Share = &share;
+                scope.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        // `attach` and `detach` run the caller's ownership
+                        // change inside the `CURL_LOCK_DATA_SHARE` bracket,
+                        // the way `lib/setopt.c:1493-1550` does; a handle
+                        // with nothing to repoint passes a closure that does
+                        // nothing, as `lib/url.c:291-293` does.
+                        let _ = share.attach(OWNER, |_| ());
+                        drop(share.dnscache(OWNER));
+                        drop(share.ssl_scache(OWNER));
+                        drop(share.pool(OWNER));
+                        let _ = share.detach(OWNER, |_| ());
+                    }
+                });
+            }
+        });
+
+        gate.assert_idle();
+        assert_eq!(share.dirty(), 0, "every attach was matched by a detach");
+        let expected = THREADS * ROUNDS * 5;
+        assert_eq!(
+            gate.locks.load(Ordering::Relaxed),
+            expected,
+            "no lock notification was lost or duplicated across threads"
+        );
+        assert_eq!(
+            gate.unlocks.load(Ordering::Relaxed),
+            expected,
+            "no unlock notification was lost or duplicated across threads"
+        );
+        assert_eq!(share.cleanup(), CURLSHcode::Ok);
     }
 }

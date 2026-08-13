@@ -24,11 +24,6 @@
 
 //! Dual-stack connection racing -- "Happy Eyeballs".
 //!
-//! Supersedes `lib/cf-ip-happy.c` (982 lines) and `lib/cf-ip-happy.h`
-//! (56 lines), with context from `lib/cf-socket.h`, `lib/vquic/vquic.h`,
-//! `lib/urldata.h`, `lib/curl_trc.c`, `lib/connect.c`, `lib/cfilters.h` and
-//! the public `CURL_IPRESOLVE_*` constants of `include/curl/curl.h`.
-//!
 //! The five regions of the C file map onto the five sections below:
 //!
 //! * `lib/cf-ip-happy.c:61-106` -- the `transport_providers[]` table,
@@ -88,7 +83,7 @@
 
 use core::fmt;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -108,9 +103,7 @@ use crate::trace::{trc_cf, TimerId, TraceFilter};
 use crate::util::timediff::{mstotv, TimeDiff};
 use crate::util::timeval::{timediff_ms, timediff_us, CurlTime};
 
-// =========================================================================
 // Constants -- the ones that cross a boundary and must not drift
-// =========================================================================
 
 /// `CURL_IPRESOLVE_WHATEVER 0L` (`include/curl/curl.h:2299-2300`): every
 /// address family the system allows.
@@ -135,37 +128,17 @@ pub(crate) const CURL_IPRESOLVE_V6: i32 = 2;
 
 /// `CURL_HET_DEFAULT 200L` (`include/curl/curl.h:967`): the default delay, in
 /// milliseconds, before a second address family is tried.
-///
-/// **Zero is a valid configured value and does not mean "unset".** It means
-/// the next attempt is eligible immediately, which
-/// `curlx_ptimediff_ms(...) >= bs->attempt_delay_ms` accepts on its first
-/// evaluation (`lib/cf-ip-happy.c:405-407`). Nothing in this module treats
-/// zero as absent, and [`a_zero_delay_starts_the_next_attempt_at_once`]
-/// proves it.
 #[allow(dead_code)] // Consumed by easy/setopt.rs as the option default.
 pub(crate) const CURL_HET_DEFAULT: TimeDiff = 200;
 
 /// `EXPIRE_HAPPY_EYEBALLS_DNS`, index 5 of `expire_id`
 /// (`lib/urldata.h:886-905`), named `"HAPPY_EYEBALLS_DNS"` at index 5 of
 /// `Curl_trc_timer_names[]` (`lib/curl_trc.c:281-296`).
-///
-/// The resolver half of dual-stack racing. It is NOT armed here -- the C arms
-/// it from the asynchronous resolver, as its own comment *"See asyn-ares.c"*
-/// records -- and it is declared anyway because the two indices are adjacent
-/// and index-aligned with their names. Pinning both is what stops a later
-/// insertion into `expire_id` from silently renaming this module's timer;
-/// [`timer_identities_are_index_aligned_with_their_names`] asserts the
-/// alignment against [`TimerId`].
 #[allow(dead_code)] // Declared to pin the index; armed by dns/resolver.rs.
 pub(crate) const EXPIRE_HAPPY_EYEBALLS_DNS: u8 = 5;
 
 /// `EXPIRE_HAPPY_EYEBALLS`, index 6 of `expire_id` (`lib/urldata.h:887-903`),
 /// named `"HAPPY_EYEBALLS"` at index 6 of `Curl_trc_timer_names[]`.
-///
-/// The connect half, and the one timer this module arms. Note the spelling:
-/// the timer has UNDERSCORES while the filter of nearly the same name is
-/// hyphenated (`"HAPPY-EYEBALLS"`, [`HAPPY_EYEBALLS_FILTER_NAME`]). Both
-/// strings reach trace output, so neither may be regularised.
 pub(crate) const EXPIRE_HAPPY_EYEBALLS: u8 = 6;
 
 // The two indices, proven against the enumeration that carries them, AT COMPILE
@@ -179,18 +152,6 @@ const _: () =
 const _: () = assert!(EXPIRE_HAPPY_EYEBALLS == TimerId::HappyEyeballs as u8);
 
 /// The one timer this filter arms, selected BY ITS `expire_id` INDEX.
-///
-/// Every `Curl_expire`/`Curl_expire_done` call in this module goes through
-/// this constant rather than naming [`TimerId::HappyEyeballs`] directly, which
-/// makes the index from `lib/urldata.h:887-903` the thing that CHOOSES the
-/// identity instead of merely being checked against it. That is strictly
-/// stronger than the assertion above: the two cannot disagree by construction,
-/// so a renumbering of `expire_id` cannot leave this module arming a timer the
-/// C does not. The assertion is retained because it is what proves
-/// [`TimerId::ALL`] is index-aligned with the discriminants, which is the
-/// premise this derivation rests on, and
-/// [`timer_identities_are_index_aligned_with_their_names`] pins the names to
-/// the same indices.
 const HAPPY_EYEBALLS_TIMER: TimerId =
     TimerId::ALL[EXPIRE_HAPPY_EYEBALLS as usize];
 
@@ -210,12 +171,6 @@ pub(crate) const HAPPY_EYEBALLS_FILTER_NAME: &str = "HAPPY-EYEBALLS";
 pub(crate) const HAPPY_EYEBALLS_LOG_LEVEL: i32 = CURL_LOG_LVL_NONE;
 
 /// One filter-attributed trace line -- `CURL_TRC_CF`.
-///
-/// [`crate::conn::filters`] has an identical private wrapper, and it is
-/// private, so this module carries its own rather than reaching for it. The
-/// three conditions [`trc_cf`] needs are the same as there: a tracer on the
-/// transfer, a registered identity for the filter, and a verbose level for
-/// that identity.
 macro_rules! trc {
     (
         $cx:expr, $filter:expr, $sockindex:expr,
@@ -231,9 +186,7 @@ macro_rules! trc {
     }};
 }
 
-// =========================================================================
 // The transport providers -- `transport_providers[]` and `get_cf_create()`
-// =========================================================================
 
 /// Creates the filter that makes one "ip" connection.
 ///
@@ -256,7 +209,18 @@ macro_rules! trc {
 /// socket index yet. [`IpAttempt::new`] stamps both onto every node of it,
 /// which is the `for(wcf = a->cf; wcf; wcf = wcf->next)` walk of
 /// `lib/cf-ip-happy.c:213-217`.
-pub(crate) trait TransportProvider: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait TransportProvider: fmt::Debug + Send + Sync {
     /// Builds an unattached candidate for `addr`.
     ///
     /// # Errors
@@ -280,7 +244,7 @@ struct TransportSlot {
     /// The `transport` member.
     transport: Transport,
     /// The `cf_create` member, absent while no provider has been installed.
-    provider: Option<Rc<dyn TransportProvider>>,
+    provider: Option<Arc<dyn TransportProvider>>,
 }
 
 /// The `transport_providers[]` table, injected rather than global.
@@ -333,7 +297,7 @@ pub(crate) struct TransportRegistry {
 
 impl TransportRegistry {
     /// An empty table, for a caller that installs every provider itself.
-    #[allow(dead_code)] // No consumer yet; used by tests and by protocols/.
+    #[allow(dead_code)] // used by tests and by protocols/.
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -346,14 +310,14 @@ impl TransportRegistry {
     /// deliberately CANNOT add a row -- a substitution that silently invented a
     /// transport would defeat the purpose of the gate in
     /// [`no_udp_provider_is_advertised`].
-    #[allow(dead_code)] // No consumer yet; used by tests and by bespoke tables.
+    #[allow(dead_code)] // used by tests and by bespoke tables.
     #[must_use]
     pub(crate) fn with_row(
         mut self,
         transport: Transport,
-        provider: Rc<dyn TransportProvider>,
+        provider: Arc<dyn TransportProvider>,
     ) -> Self {
-        if !self.set_provider(transport, Rc::clone(&provider)) {
+        if !self.set_provider(transport, Arc::clone(&provider)) {
             self.slots.push(TransportSlot {
                 transport,
                 provider: Some(provider),
@@ -364,12 +328,7 @@ impl TransportRegistry {
 
     /// The table `transport_providers[]` declares, over the real transports of
     /// [`crate::conn::socket`].
-    ///
-    /// `hooks` and `settings` are the two bundles every socket filter is built
-    /// with; they are cloned per candidate, which is correct and not merely
-    /// convenient -- each attempt gets its own socket and must not share the
-    /// mutable state of another's.
-    #[allow(dead_code)] // No consumer yet; conn/mod.rs builds the chain with it.
+    #[allow(dead_code)] // conn/mod.rs builds the chain with it.
     pub(crate) fn sockets(
         hooks: SocketHooks,
         settings: SocketSettings,
@@ -377,7 +336,7 @@ impl TransportRegistry {
         // `{ TRNSPRT_TCP, Curl_cf_tcp_create }` -- unconditional.
         let tcp = TransportSlot {
             transport: Transport::Tcp,
-            provider: Some(Rc::new(SocketProvider {
+            provider: Some(Arc::new(SocketProvider {
                 transport: Transport::Tcp,
                 hooks: hooks.clone(),
                 settings: settings.clone(),
@@ -395,16 +354,11 @@ impl TransportRegistry {
 
     /// `Curl_debug_set_transport_provider` (`lib/cf-ip-happy.c:89-103`):
     /// replaces the provider of an EXISTING row.
-    ///
-    /// Reports whether a row was found. The C returns `void` and silently does
-    /// nothing for a transport that is not in the table -- its loop simply
-    /// finds no match -- so this reports the same outcome without changing it,
-    /// and a test can then assert that a UDP substitution really is refused.
-    #[allow(dead_code)] // No consumer yet; protocols/http3.rs installs QUIC with it.
+    #[allow(dead_code)] // protocols/http3.rs installs QUIC with it.
     pub(crate) fn set_provider(
         &mut self,
         transport: Transport,
-        provider: Rc<dyn TransportProvider>,
+        provider: Arc<dyn TransportProvider>,
     ) -> bool {
         for slot in &mut self.slots {
             if slot.transport == transport {
@@ -417,15 +371,10 @@ impl TransportRegistry {
 
     /// `get_cf_create` (`lib/cf-ip-happy.c:80-88`): the provider for
     /// `transport`, or [`None`].
-    ///
-    /// [`None`] covers both of the C's ways of having no provider: a transport
-    /// with no row, and -- new here -- a row whose provider has not been
-    /// installed. Both mean the same thing to the caller, which turns them into
-    /// [`CURLcode::UnsupportedProtocol`].
     pub(crate) fn provider(
         &self,
         transport: Transport,
-    ) -> Option<Rc<dyn TransportProvider>> {
+    ) -> Option<Arc<dyn TransportProvider>> {
         self.slots
             .iter()
             .find(|slot| slot.transport == transport)
@@ -437,7 +386,7 @@ impl TransportRegistry {
     /// Distinct from [`Self::provider`] on purpose: an unfilled QUIC row is a
     /// transport this build KNOWS about and cannot yet serve, which is a
     /// different fact from UDP, which it does not know about at all.
-    #[allow(dead_code)] // No consumer yet; read by tests and by protocols/http3.rs.
+    #[allow(dead_code)] // read by tests and by protocols/http3.rs.
     pub(crate) fn has_row(&self, transport: Transport) -> bool {
         self.slots.iter().any(|slot| slot.transport == transport)
     }
@@ -491,7 +440,7 @@ fn unix_row(
 ) -> Option<TransportSlot> {
     Some(TransportSlot {
         transport: Transport::Unix,
-        provider: Some(Rc::new(SocketProvider {
+        provider: Some(Arc::new(SocketProvider {
             transport: Transport::Unix,
             hooks,
             settings,
@@ -550,9 +499,7 @@ impl TransportProvider for SocketProvider {
     }
 }
 
-// =========================================================================
 // The two remaining injected seams
-// =========================================================================
 
 /// The two `Curl_expire` calls this module makes.
 ///
@@ -564,10 +511,21 @@ impl TransportProvider for SocketProvider {
 /// `conn/`, so they arrive as a seam -- the same arrangement
 /// [`crate::conn::shutdown`] uses for `EXPIRE_SHUTDOWN`.
 ///
-/// Both methods take `&self`: the filter holds this behind an [`Rc`] alongside
+/// Both methods take `&self`: the filter holds this behind an [`Arc`] alongside
 /// the connection, so shared access with interior mutability is the shape the
 /// ownership graph permits.
-pub(crate) trait ExpireScheduler: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait ExpireScheduler: fmt::Debug + Send + Sync {
     /// `Curl_expire(data, timeout_ms, timer)`: arm `timer` to fire in
     /// `timeout_ms` milliseconds.
     fn expire(&self, timeout_ms: TimeDiff, timer: TimerId);
@@ -578,19 +536,23 @@ pub(crate) trait ExpireScheduler: fmt::Debug {
 
 /// The connection and transfer facts this module reads.
 ///
-/// The successor of every `cf->conn->...` and `data->...` read in
-/// `lib/cf-ip-happy.c`, enumerated rather than summarised so that a reviewer
-/// can check the list against the C. A back pointer is the one thing a safe
-/// ownership graph cannot reproduce -- the connection owns the chain, so the
-/// chain cannot own the connection -- so the facts travel as a seam, exactly as
-/// [`crate::conn::socket::ConnState`] does for the socket filter.
-///
 /// The readings are DELIBERATELY RAW. `is_connected()` composes its failure
 /// message from three separate decisions -- which hostname, which port, which
 /// proxy -- and those decisions belong to this module, because the message they
 /// build is frozen output. An implementor that pre-decided them could not be
 /// checked against `lib/cf-ip-happy.c:637-676`.
-pub(crate) trait ConnMeta: fmt::Debug {
+///
+/// # The `Send + Sync` supertraits
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`), and one `CURLSH` is usable from two threads --
+/// `tests/libtest/lib506.c` and `lib3207.c` both do it -- so
+/// [`crate::share::Share`] must be `Send + Sync`, which it statically asserts.
+/// Everything the pool reaches must therefore be `Send`, and an injected seam
+/// held behind an [`std::sync::Arc`] must be `Send + Sync` for that handle to
+/// be `Send`. AAP section 0.8.3's multi-thread Tokio runtime for the multi
+/// handle requires the same of anything a transfer task drives.
+pub(crate) trait ConnMeta: fmt::Debug + Send + Sync {
     /// `cf->conn->ip_version` (`lib/cf-ip-happy.c:721`), one of the three
     /// `CURL_IPRESOLVE_*` values.
     fn ip_version(&self) -> IpVersion;
@@ -603,8 +565,6 @@ pub(crate) trait ConnMeta: fmt::Debug {
 
     /// `data->state.dns[cf->sockindex]->addr` (`:702-705`), in the order the
     /// resolver produced it.
-    ///
-    /// [`None`] is C's `if(!dns)`, which is [`CURLcode::FailedInit`].
     ///
     /// **The order is behaviour.** Nothing in this module sorts, deduplicates
     /// or normalises the list: a resolver's ordering within a family encodes
@@ -648,14 +608,6 @@ pub(crate) trait ConnMeta: fmt::Debug {
     fn is_ssh_family(&self) -> bool;
 
     /// `SOCKETIMEDOUT == data->state.os_errno` (`:686-688`).
-    ///
-    /// A PREDICATE rather than the integer, because `SOCKETIMEDOUT` is
-    /// `WSAETIMEDOUT` on Windows and `ETIMEDOUT` elsewhere
-    /// (`lib/curl_setup.h:1111`, `:1128`) and this file may not name a
-    /// platform errno -- the engine speaks in fixed-width Rust integers and
-    /// leaves the C widths and the platform constants to
-    /// `curl-rs-lib/src/ffi/`. The comparison itself is one line in the
-    /// implementor and the DECISION it feeds stays here.
     fn os_error_is_timeout(&self) -> bool;
 
     /// `data->progress.t_startsingle` (`:678`, `:502`): when the current single
@@ -671,16 +623,9 @@ pub(crate) trait ConnMeta: fmt::Debug {
     fn mark_app_connect_time(&self);
 }
 
-// =========================================================================
 // Address iteration -- `struct cf_ai_iter`
-// =========================================================================
 
 /// One family's addresses, walked once.
-///
-/// The successor of `struct cf_ai_iter` (`lib/cf-ip-happy.c:105-157`). C walks
-/// the single `ai_next` list twice with a different `ai_family` test each time,
-/// keeping `head`, `last` and a counter `n` whose `-1` means "not started"; the
-/// list is shared, so neither iterator owns anything.
 ///
 /// Here the two families are separated ONCE, by
 /// [`crate::dns::split_families`], and each iterator owns its own vector with a
@@ -696,9 +641,6 @@ pub(crate) trait ConnMeta: fmt::Debug {
 ///   the cursor**. That is load-bearing: the race consults it to decide whether
 ///   to alternate families and whether to arm a timer, both of which must not
 ///   consume an address.
-///
-/// The vector is never sorted and never deduplicated; see
-/// [`ConnMeta::resolved`].
 #[derive(Clone, Debug)]
 struct AddrIter {
     /// The addresses of this family, in resolver order.
@@ -725,22 +667,11 @@ impl AddrIter {
 
     /// `cf_ai_iter_init(iter, NULL, family)`: an iterator that yields nothing
     /// but still names its family.
-    ///
-    /// This is how the C suppresses a family: `CURL_IPRESOLVE_V6` initialises
-    /// the IPv4 iterator over `NULL` rather than skipping it
-    /// (`lib/cf-ip-happy.c:325-328`), so every later `has_more` and `next` on
-    /// it is well defined and answers "nothing".
     fn empty(family: AddressFamily) -> Self {
         Self::new(Vec::new(), family)
     }
 
     /// The `iter->n < 0` test: has anything been yielded yet?
-    ///
-    /// C needs the distinction because its `has_more` has to know whether to
-    /// look from `head` or from `last->ai_next`; over an owned vector with an
-    /// index both collapse into one comparison, so nothing in the race consults
-    /// this. It is part of the iterator's contract all the same, and
-    /// [`the_address_iterator_reproduces_the_c_cursor`] asserts it.
     #[allow(dead_code)] // Read by tests; folded into the index comparison here.
     fn started(&self) -> bool {
         self.yielded > 0
@@ -752,10 +683,6 @@ impl AddrIter {
     /// [`Self::has_more`] and [`Self::started`] have no counterpart there, and
     /// a borrowing `Iterator::next` would conflict with the race's need to
     /// mutate the attempt list in the same statement.
-    ///
-    /// Cloned rather than borrowed for that same reason. The clone is what the
-    /// attempt then owns, which removes the C's dependency on the DNS entry
-    /// outliving the race.
     fn next_addr(&mut self) -> Option<ResolvedAddr> {
         let addr = self.addrs.get(self.yielded)?;
         let addr = addr.clone();
@@ -774,9 +701,7 @@ impl AddrIter {
     }
 }
 
-// =========================================================================
 // What the C reaches through `cf` -- bundled once
-// =========================================================================
 
 /// The facts and seams the race needs, gathered off the filter.
 ///
@@ -784,7 +709,7 @@ impl AddrIter {
 /// `cf->conn`, `cf->sockindex` and `cf->cft` out of it. Here the race is a
 /// separate value ([`Ballers`]) owned BY the filter, so it cannot borrow the
 /// filter while the filter borrows it mutably. Handing it this bundle -- with
-/// the three seams as [`Rc`] clones rather than references -- resolves the
+/// the three seams as [`Arc`] clones rather than references -- resolves the
 /// borrow without copying anything that matters.
 #[derive(Debug)]
 struct RaceCtx {
@@ -795,11 +720,11 @@ struct RaceCtx {
     /// `cf->cft`'s trace identity, for `CURL_TRC_CF`.
     identity: Option<TraceFilter>,
     /// The connection's own facts.
-    meta: Rc<dyn ConnMeta>,
+    meta: Arc<dyn ConnMeta>,
     /// `Curl_timeleft_ms(data)`.
-    deadline: Rc<dyn Deadline>,
+    deadline: Arc<dyn Deadline>,
     /// `Curl_expire` and `Curl_expire_done`.
-    expiry: Rc<dyn ExpireScheduler>,
+    expiry: Arc<dyn ExpireScheduler>,
 }
 
 impl RaceCtx {
@@ -809,9 +734,7 @@ impl RaceCtx {
     }
 }
 
-// =========================================================================
 // One candidate -- `struct cf_ip_attempt`
-// =========================================================================
 
 /// One address being tried, with the subchain trying it.
 ///
@@ -838,32 +761,14 @@ struct IpAttempt {
     /// The candidate's private subchain, possibly several filters deep.
     chain: FilterChain,
     /// `cf_create`, retained because a restart builds a REPLACEMENT filter.
-    provider: Rc<dyn TransportProvider>,
+    provider: Arc<dyn TransportProvider>,
     /// `struct curltime started; /* start of current attempt */`.
-    ///
-    /// C declares this member and never assigns it -- nothing in
-    /// `lib/cf-ip-happy.c` reads or writes `a->started`, the race timing all
-    /// hanging off `bs->last_attempt_started` instead. It is kept, and here it
-    /// is actually set, so the field is truthful rather than misleading; no
-    /// decision depends on it, so setting it changes nothing observable.
     #[allow(dead_code)]
     // Read by tests; C declares the member and never assigns it.
     started: CurlTime,
     /// `CURLcode result`, with [`CURLcode::Ok`] meaning "still running".
-    ///
-    /// A code rather than an [`Error`], because that is exactly what the C
-    /// keeps and what the final message needs: the failure line renders
-    /// `curl_easy_strerror(result)` (`:682`), the GENERIC string for the code,
-    /// and any specific line a candidate wrote was already cleared by
-    /// `Curl_reset_fail` before the next attempt started.
     result: CURLcode,
     /// `int ai_family`.
-    ///
-    /// Written and never read, in the C as here: the alternation reads
-    /// `bs->last_attempt_ai_family`, which the race records separately, and no
-    /// decision consults the family of an individual candidate. Kept because the
-    /// C keeps it and because a test can then check that a candidate was started
-    /// for the family the race intended.
     #[allow(dead_code)]
     // Read by tests; C declares the member and only writes it.
     family: AddressFamily,
@@ -892,13 +797,6 @@ struct IpAttempt {
 impl IpAttempt {
     /// `cf_ip_attempt_new` (`lib/cf-ip-happy.c:185-224`).
     ///
-    /// The provider builds an unattached candidate and it is then installed
-    /// into this attempt's own chain, which stamps the connection identity and
-    /// socket index onto EVERY node -- the C's *"the new filter might have
-    /// sub-filters"* walk at `:213-217`. A node left holding a stale identity
-    /// would report the wrong socket index in every trace line it emits, and a
-    /// multi-node QUIC candidate is the ordinary case rather than a corner one.
-    ///
     /// # Errors
     ///
     /// Whatever the provider reports. The C frees the half-built attempt on
@@ -910,7 +808,7 @@ impl IpAttempt {
         addr: ResolvedAddr,
         family: AddressFamily,
         transport: Transport,
-        provider: Rc<dyn TransportProvider>,
+        provider: Arc<dyn TransportProvider>,
     ) -> CurlResult<Self> {
         let head = provider.create(&addr, rc.sockindex)?;
         let mut chain = FilterChain::new(rc.conn, rc.sockindex);
@@ -973,17 +871,6 @@ impl IpAttempt {
     /// `cf_ip_attempt_restart` (`lib/cf-ip-happy.c:262-290`): try this address
     /// again with a NEW filter.
     ///
-    /// The ordering is the whole point and the C says why: *"When restarting, we
-    /// tear down and existing filter \*after\* we started up the new one. This
-    /// gives us a new socket number and probably a new local port. Which may
-    /// prevent confusion."* So the previous subchain is detached but held, the
-    /// replacement is created and stepped, and only then is the previous one
-    /// destroyed. Holding it in a local is what makes that safe: every exit
-    /// path below destroys it exactly once.
-    ///
-    /// The three flags are cleared first, so a restarted candidate is neither
-    /// connected nor inconclusive nor failed until its replacement says so.
-    ///
     /// # Errors
     ///
     /// Only what the PROVIDER reports, which the C treats as a *"serious
@@ -1034,9 +921,7 @@ impl IpAttempt {
     }
 }
 
-// =========================================================================
 // The race -- `struct cf_ip_ballers` and `cf_ip_ballers_run()`
-// =========================================================================
 
 /// What one pass over the running list found.
 ///
@@ -1091,7 +976,7 @@ struct Ballers {
     /// has IPv6.
     ipv6_iter: AddrIter,
     /// `cf_ip_connect_create *cf_create` -- *"for creating cf"*.
-    provider: Rc<dyn TransportProvider>,
+    provider: Arc<dyn TransportProvider>,
     /// `struct curltime started` -- when the first candidate was started, set
     /// once and only when nothing is ongoing (`:395-397`).
     started: CurlTime,
@@ -1118,7 +1003,7 @@ impl Ballers {
     /// which is what lets [`HappyEyeballs::close`] reset the race by replacing
     /// it (`lib/cf-ip-happy.c:828-842`).
     fn empty(
-        provider: Rc<dyn TransportProvider>,
+        provider: Arc<dyn TransportProvider>,
         transport: Transport,
     ) -> Self {
         Self {
@@ -1149,8 +1034,6 @@ impl Ballers {
     ///   suppresses a family by giving its iterator an EMPTY list rather than by
     ///   skipping the iterator, so every later `has_more` on it is well defined.
     ///
-    /// Neither stream is sorted or deduplicated; see [`ConnMeta::resolved`].
-    ///
     /// # Errors
     ///
     /// [`CURLcode::UnsupportedProtocol`] for `TRNSPRT_UNIX` where the target
@@ -1159,7 +1042,7 @@ impl Ballers {
     fn init(
         ip_version: IpVersion,
         addrs: &[ResolvedAddr],
-        provider: Rc<dyn TransportProvider>,
+        provider: Arc<dyn TransportProvider>,
         transport: Transport,
         attempt_delay_ms: TimeDiff,
     ) -> CurlResult<Self> {
@@ -1230,11 +1113,6 @@ impl Ballers {
 
     /// One pass over the running list -- the `for(panchor = &bs->running; ...)`
     /// walk of `lib/cf-ip-happy.c:340-388`.
-    ///
-    /// Stops at the FIRST candidate that reports connected, which is what makes
-    /// the winner deterministic when two become ready in the same reactor turn:
-    /// the earlier position in the running list wins, and the running list is in
-    /// start order.
     fn poll_running(&mut self, cx: &mut CallCtx<'_, '_>) -> RunPass {
         let mut pass = RunPass {
             winner_at: None,
@@ -1260,11 +1138,6 @@ impl Ballers {
 
     /// Declares the candidate at `index` the winner and frees every loser
     /// (`lib/cf-ip-happy.c:363-374`).
-    ///
-    /// The winner is removed from the running list FIRST, so the sweep that
-    /// follows cannot reach it. The C achieves that by splicing it out and
-    /// clearing its `next`; removing it from an owned collection has the same
-    /// effect and cannot be got wrong by omission.
     fn take_winner(&mut self, cx: &mut CallCtx<'_, '_>, index: usize) {
         let winner = self.running.remove(index);
         self.clear_running(cx);
@@ -1284,16 +1157,6 @@ impl Ballers {
     ///   ai_family = bs->addr_iter.ai_family;
     /// }
     /// ```
-    ///
-    /// Read closely, because the two conditions are not symmetric. IPv6 is tried
-    /// when the LAST attempt was IPv4 **or** when no IPv4 address remains -- the
-    /// second disjunct is what drains a family that outlives the other. IPv4 is
-    /// then tried only if that produced nothing, which covers both "IPv6 was
-    /// never even consulted" and "IPv6 is exhausted".
-    ///
-    /// The family reported is the ITERATOR's family and not the address's, which
-    /// matters for the suppressed-family case: an iterator initialised over an
-    /// empty list still names its family, and the C reads it unconditionally.
     fn pick_next(&mut self) -> Option<(ResolvedAddr, AddressFamily)> {
         let v6_family = self.ipv6_iter.family;
         let v4_family = self.addr_iter.family;
@@ -1314,19 +1177,6 @@ impl Ballers {
 impl Ballers {
     /// `cf_ip_ballers_run` (`lib/cf-ip-happy.c:344-532`): make progress, and
     /// report whether a candidate has won.
-    ///
-    /// The C is one function with two labels; this is the same control flow with
-    /// the two labels named. `loop` is the `evaluate` label, the tail of the body
-    /// is `out`, and [`Step`] says which of the two a decision reached.
-    ///
-    /// # Termination
-    ///
-    /// Every `continue` follows an event that moved the race forward: a candidate
-    /// was started (so `last_attempt_started` advanced and one address was
-    /// consumed), a candidate was restarted (likewise), or the attempt delay was
-    /// found to be due with an address still to try (so the next pass starts
-    /// one). The address streams are finite and each pass consumes at most one
-    /// address, so the loop cannot spin.
     ///
     /// # Errors
     ///
@@ -1409,9 +1259,6 @@ impl Ballers {
 
     /// The `if(do_more)` block of `cf_ip_ballers_run` (`:413-495`).
     ///
-    /// Three outcomes, in the C's own order: start the next address, restart an
-    /// inconclusive candidate, or conclude that the race has failed.
-    ///
     /// # Errors
     ///
     /// The failures [`Self::run`] documents. Each corresponds to a `goto out`
@@ -1446,7 +1293,7 @@ impl Ballers {
                 addr,
                 family,
                 self.transport,
-                Rc::clone(&self.provider),
+                Arc::clone(&self.provider),
             );
             // The C traces the CURLcode it is about to act on, whether or not it
             // is a failure, so the code is taken before the `?`.
@@ -1521,10 +1368,6 @@ impl Ballers {
 
     /// The `else if(inconclusive)` block (`lib/cf-ip-happy.c:455-484`).
     ///
-    /// Every address has been tried and some candidate failed inconclusively, so
-    /// the race waits out the remainder of the inter-attempt delay and then
-    /// restarts ONE candidate -- the FIRST inconclusive one in running order.
-    ///
     /// # Errors
     ///
     /// A provider failure while rebuilding, which the C calls a *"serious
@@ -1592,24 +1435,6 @@ impl Ballers {
 
     /// The `out:` block's `if(!result)` half (`lib/cf-ip-happy.c:497-530`):
     /// decide when this filter needs to be called again.
-    ///
-    /// Reports `true` for the C's `goto evaluate`, meaning the delay is already
-    /// due and another pass should run at once.
-    ///
-    /// # The one place a deadline of zero is folded rather than compared
-    ///
-    /// `Curl_timeleft_ms` returns ZERO for "no limit" and a NEGATIVE value for
-    /// "already elapsed" (`lib/connect.c:98-101`). The C then computes
-    /// `CURLMIN(next_expire_ms, expire_ms)`, which for a no-limit transfer is
-    /// `CURLMIN(0, expire_ms) == 0`, takes the `<= 0` branch and re-evaluates
-    /// immediately -- spinning until the delay elapses. That is unreachable
-    /// through curl's own deadline, because `Curl_timeleft_now_ms` applies
-    /// `DEFAULT_CONNECT_TIMEOUT` while a transfer is connecting and fakes an
-    /// exact zero to `-1` so that it can never report "no limit" here. An
-    /// INJECTED deadline can report zero, so the fold honours the convention and
-    /// waits out the attempt delay instead: identical semantics, without the
-    /// busy loop. [`crate::conn::filters::FilterChain::connect`] resolves the
-    /// same C expression the same way, and for the same reason.
     ///
     /// # Errors
     ///
@@ -1683,10 +1508,6 @@ impl Ballers {
     ///   them to preserve.
     /// * The return is ALWAYS success. Only `done` carries information, and it is
     ///   false exactly while at least one candidate is still saying goodbye.
-    ///
-    /// The C calls `a->cf->cft->do_shutdown(a->cf, ...)` -- the head filter's own
-    /// method -- and not `Curl_conn_shutdown`, so no driver is involved and the
-    /// subchain below the head is not walked.
     fn shutdown(&mut self, cx: &mut CallCtx<'_, '_>) -> bool {
         let mut done = true;
         for attempt in &mut self.running {
@@ -1713,11 +1534,6 @@ impl Ballers {
 
     /// `cf_ip_ballers_pollset` (`lib/cf-ip-happy.c:557-568`): collect what every
     /// live candidate is waiting for.
-    ///
-    /// Each candidate is driven through its OWN subchain driver, because the
-    /// outer walk cannot see a filter it does not own. A candidate that has
-    /// already failed contributes nothing, and the walk stops at the first
-    /// error.
     ///
     /// # Errors
     ///
@@ -1758,14 +1574,6 @@ impl Ballers {
 
     /// `cf_ip_ballers_max_time` (`lib/cf-ip-happy.c:585-601`): the LATEST of one
     /// timer across every candidate.
-    ///
-    /// Zero readings are skipped, because zero is the C's "not set"
-    /// (`if((t.tv_sec || t.tv_usec) && ...)`), and the comparison is
-    /// `curlx_ptimediff_us(&t, &tmax) > 0` -- strictly later, so the first
-    /// candidate to report a given instant keeps it. A candidate that does not
-    /// answer contributes nothing. Unlike [`Self::pollset`] and
-    /// [`Self::pending`], a FAILED candidate is still asked: the C does not skip
-    /// one here, and its timers are legitimate history.
     fn max_time(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -1832,9 +1640,7 @@ fn unix_iter(_addrs: &[ResolvedAddr]) -> CurlResult<AddrIter> {
     ))
 }
 
-// =========================================================================
 // The filter -- `struct Curl_cftype Curl_cft_ip_happy`
-// =========================================================================
 
 /// `cf_connect_state` (`lib/cf-ip-happy.c:619-623`).
 ///
@@ -1862,24 +1668,16 @@ enum ConnectState {
 #[derive(Clone, Debug)]
 pub(crate) struct HappyEyeballsSeams {
     /// The connection's own facts.
-    pub(crate) meta: Rc<dyn ConnMeta>,
+    pub(crate) meta: Arc<dyn ConnMeta>,
     /// `Curl_timeleft_ms(data)`, owned by `conn/mod.rs`.
-    pub(crate) deadline: Rc<dyn Deadline>,
+    pub(crate) deadline: Arc<dyn Deadline>,
     /// `Curl_expire` and `Curl_expire_done`.
-    pub(crate) expiry: Rc<dyn ExpireScheduler>,
+    pub(crate) expiry: Arc<dyn ExpireScheduler>,
     /// `transport_providers[]`.
-    pub(crate) registry: Rc<TransportRegistry>,
+    pub(crate) registry: Arc<TransportRegistry>,
 }
 
 /// The dual-stack racing filter -- `Curl_cft_ip_happy`.
-///
-/// The successor of `struct cf_ip_happy_ctx` (`lib/cf-ip-happy.c:625-631`)
-/// together with the eleven `cf_ip_happy_*` callbacks and the filter-type table
-/// they are registered in (`:903-919`).
-///
-/// The state that C keeps behind `void *ctx` is TYPED here and sits beside
-/// [`FilterBase`], which is the whole of the translation: there is no cast at
-/// any boundary and no way to reach this state through the wrong type.
 #[derive(Debug)]
 pub(crate) struct HappyEyeballs {
     /// The chain link, socket index and two state flags.
@@ -1888,7 +1686,7 @@ pub(crate) struct HappyEyeballs {
     transport: Transport,
     /// `cf_ip_connect_create *cf_create`, resolved from the registry once, at
     /// construction, exactly as `cf_ip_happy_insert_after` resolves it.
-    provider: Rc<dyn TransportProvider>,
+    provider: Arc<dyn TransportProvider>,
     /// `cf_connect_state state`.
     state: ConnectState,
     /// `struct cf_ip_ballers ballers`.
@@ -1906,25 +1704,19 @@ pub(crate) struct HappyEyeballs {
     /// socket becomes ready. The asynchronous driver here waits, so it needs a
     /// way for an owner to say "conditions changed, look again" -- a
     /// `CURLOPT_TIMEOUT` lowered mid-connect, or `curl_multi_wakeup`.
-    wake: Rc<Notify>,
+    wake: Arc<Notify>,
 }
 
 impl HappyEyeballs {
     /// `cf_ip_happy_create` (`lib/cf-ip-happy.c:921-959`) plus the provider
     /// lookup that `cf_ip_happy_insert_after` performs before calling it.
     ///
-    /// The two are merged because the lookup is the only failure either has that
-    /// survives translation -- the C's `CURLE_OUT_OF_MEMORY` does not, a failure
-    /// to allocate aborting instead -- and merging them means a constructed
-    /// filter always has a provider, which removes an [`Option`] that could
-    /// otherwise be `None` at connect time.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::UnsupportedProtocol`] for a transport the registry has no
     /// provider for, which is `get_cf_create` returning `NULL`
     /// (`lib/cf-ip-happy.c:968-972`).
-    #[allow(dead_code)] // No consumer yet; conn/mod.rs builds the chain with it.
+    #[allow(dead_code)] // conn/mod.rs builds the chain with it.
     pub(crate) fn new(
         cx: &mut CallCtx<'_, '_>,
         transport: Transport,
@@ -1935,10 +1727,8 @@ impl HappyEyeballs {
         let identity =
             TraceFilter::from_name(HAPPY_EYEBALLS_FILTER_NAME.as_bytes());
         let Some(provider) = seams.registry.provider(transport) else {
-            // C attributes this line to `cf_at`, the filter being inserted
-            // after, because the new filter does not exist yet. Here it is
-            // attributed to this filter's own identity, which is the closest
-            // available and carries the identical text.
+            // Here it is attributed to this filter's own identity, which is
+            // the closest available and carries the identical text.
             trc!(
                 cx,
                 identity,
@@ -1957,26 +1747,22 @@ impl HappyEyeballs {
         Ok(Self {
             base,
             transport,
-            provider: Rc::clone(&provider),
+            provider: Arc::clone(&provider),
             state: ConnectState::Init,
             ballers: Ballers::empty(provider, transport),
             started: CurlTime::ZERO,
             seams,
-            wake: Rc::new(Notify::new()),
+            wake: Arc::new(Notify::new()),
         })
     }
 
     /// `cf_ip_happy_insert_after` (`lib/cf-ip-happy.c:961-982`): build the
     /// filter and install it immediately below the filter at `index`.
     ///
-    /// The C asserts `cf_at` is non-`NULL` -- *"Need to be first"* -- which a
-    /// position cannot express; [`FilterChain::insert_after`] reports
-    /// [`CURLcode::BadFunctionArgument`] for a position with no filter instead.
-    ///
     /// # Errors
     ///
     /// As [`Self::new`], plus whatever [`FilterChain::insert_after`] reports.
-    #[allow(dead_code)] // No consumer yet; conn/mod.rs installs the chain with it.
+    #[allow(dead_code)] // conn/mod.rs installs the chain with it.
     pub(crate) fn insert_after(
         cx: &mut CallCtx<'_, '_>,
         chain: &mut FilterChain,
@@ -1992,13 +1778,13 @@ impl HappyEyeballs {
     /// The signal [`Self::race`] waits on, for an owner that needs to interrupt
     /// it.
     ///
-    /// Handing out the [`Rc`] rather than a `wake()` method is deliberate: the
+    /// Handing out the [`Arc`] rather than a `wake()` method is deliberate: the
     /// waker outlives any single borrow of the filter, and an owner that has to
     /// borrow the filter in order to wake it could not wake it from the task
     /// that is currently racing.
     #[allow(dead_code)] // No consumer yet; conn/mod.rs and multi/ wake the race.
-    pub(crate) fn waker(&self) -> Rc<Notify> {
-        Rc::clone(&self.wake)
+    pub(crate) fn waker(&self) -> Arc<Notify> {
+        Arc::clone(&self.wake)
     }
 
     /// The bundle the race is driven with, gathered off this filter.
@@ -2007,9 +1793,9 @@ impl HappyEyeballs {
             sockindex: self.base.sockindex(),
             conn: self.base.conn(),
             identity: self.trace_filter(),
-            meta: Rc::clone(&self.seams.meta),
-            deadline: Rc::clone(&self.seams.deadline),
-            expiry: Rc::clone(&self.seams.expiry),
+            meta: Arc::clone(&self.seams.meta),
+            deadline: Arc::clone(&self.seams.deadline),
+            expiry: Arc::clone(&self.seams.expiry),
         }
     }
 
@@ -2052,7 +1838,7 @@ impl HappyEyeballs {
         self.ballers = Ballers::init(
             self.seams.meta.ip_version(),
             &addrs,
-            Rc::clone(&self.provider),
+            Arc::clone(&self.provider),
             self.transport,
             self.seams.meta.happy_eyeballs_timeout_ms(),
         )?;
@@ -2093,14 +1879,6 @@ impl HappyEyeballs {
 
     /// The `failf` of `is_connected` (`lib/cf-ip-happy.c:637-689`), and the one
     /// place the reported code may change.
-    ///
-    /// The C's format string is
-    /// `"Failed to connect to %s %s %s%s%safter %" FMT_TIMEDIFF_T " ms: %s"`,
-    /// whose middle three conversions are the proxy clause and are all empty
-    /// when there is no proxy -- so the text reads `"... port 80 after 12 ms:
-    /// ..."` without one and `"... port 80 via proxy.example after 12 ms: ..."`
-    /// with one. The trailing message is `curl_easy_strerror(result)`, the
-    /// GENERIC string for the code, which is [`CURLcode::message`].
     ///
     /// The translation at the end is the C's, verbatim in effect: an
     /// operating-system error of `SOCKETIMEDOUT` makes the reported code
@@ -2157,17 +1935,6 @@ impl HappyEyeballs {
     }
 
     /// Promotes the winner into this filter's own `next` (`:788-818`).
-    ///
-    /// The sequence is the C's, in the C's order: mark done, mark connected,
-    /// TRANSFER the winner's subchain, destroy every remaining candidate,
-    /// disarm the timer, clear the accumulated failure, mark the application
-    /// connect time for the SSH family, trace, and count the connection.
-    ///
-    /// The transfer is what leaves the attempt empty, so the `ctx_clear` that
-    /// follows cannot destroy the chain it just handed over -- the C achieves
-    /// the same by assigning `ctx->ballers.winner->cf = NULL` and relies on the
-    /// reader noticing; here the chain is MOVED and the emptiness is a
-    /// consequence rather than a convention.
     ///
     /// # Errors
     ///
@@ -2264,16 +2031,6 @@ impl HappyEyeballs {
     ///    one place that decision lives.
     /// 4. **An explicit wake** on [`Self::waker`].
     ///
-    /// The wait is additionally bounded by a ceiling, 10 milliseconds when no
-    /// candidate has a socket to wait on and 1000 when one does. Those are the
-    /// C's own two numbers from the equivalent bound in `Curl_conn_connect`
-    /// (`lib/cfilters.c:577`), and the small one matters: a candidate making
-    /// progress on buffered data alone still gets stepped promptly.
-    ///
-    /// `biased` orders the arms so that an explicit wake is observed before a
-    /// timer that came due in the same turn, which makes the loop's behaviour
-    /// reproducible rather than dependent on a random poll order.
-    ///
     /// # Errors
     ///
     /// Whatever [`ConnFilter::connect`] reports, plus a failure of the wait
@@ -2283,7 +2040,7 @@ impl HappyEyeballs {
     ///
     /// Requires a `tokio` runtime with the time driver, as every wait in
     /// [`crate::conn::select`] does.
-    #[allow(dead_code)] // No consumer yet; conn/mod.rs drives the connect with it.
+    #[allow(dead_code)] // conn/mod.rs drives the connect with it.
     pub(crate) async fn race(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -2312,7 +2069,7 @@ impl HappyEyeballs {
             }
             let wait = wait.max(0);
             let span = mstotv(wait).unwrap_or(Duration::ZERO);
-            let wake = Rc::clone(&self.wake);
+            let wake = Arc::clone(&self.wake);
 
             tokio::select! {
                 biased;
@@ -2333,15 +2090,6 @@ impl ConnFilter for HappyEyeballs {
     }
 
     /// The `flags` member: **exactly `0`** (`lib/cf-ip-happy.c:905`).
-    ///
-    /// Written out rather than left to the trait default, because the zero is
-    /// load-bearing and surprising. This filter does NOT declare
-    /// [`crate::conn::filters::CF_TYPE_IP_CONNECT`] even though its whole
-    /// purpose is to obtain an IP connection: the capability belongs to the
-    /// winner it installs, and declaring it here would stop
-    /// `Curl_conn_is_ip_connected`'s upward walk at this filter, which reports
-    /// "not connected" for a filter that provides the connection and is not
-    /// itself connected.
     fn cf_type(&self) -> CfType {
         CfType::NONE
     }
@@ -2369,12 +2117,6 @@ impl ConnFilter for HappyEyeballs {
     }
 
     /// `cf_ip_happy_connect` (`lib/cf-ip-happy.c:762-825`).
-    ///
-    /// The `SCFST_INIT` arm ends in a `FALLTHROUGH()` into `SCFST_WAITING`, so
-    /// starting the race and taking its first step happen in ONE call. That is
-    /// not cosmetic: a race whose first attempt would connect immediately -- a
-    /// Unix socket, an in-memory transport -- completes without ever needing a
-    /// second call.
     ///
     /// # Errors
     ///
@@ -2459,14 +2201,6 @@ impl ConnFilter for HappyEyeballs {
 
     /// `cf_ip_happy_adjust_pollset` (`lib/cf-ip-happy.c:748-759`).
     ///
-    /// Drives EACH candidate's own subchain rather than passing the pollset to
-    /// `next`. That is not a violation of
-    /// [`ConnFilter::adjust_pollset`]'s pure-no-op default: a filter owning a
-    /// private subchain is the one sanctioned case, because the outer walk
-    /// cannot see filters it does not own. Once connected there is nothing to
-    /// add -- the installed winner is part of the main chain and the driver
-    /// reaches it directly.
-    ///
     /// # Errors
     ///
     /// As [`Ballers::pollset`].
@@ -2496,13 +2230,6 @@ impl ConnFilter for HappyEyeballs {
     }
 
     /// `cf_ip_happy_data_pending` (`lib/cf-ip-happy.c:844-853`).
-    ///
-    /// Before a winner exists the question is asked of every live candidate;
-    /// afterwards it is delegated to the winner. The C dereferences `cf->next`
-    /// unchecked on the second path, relying on "connected implies an installed
-    /// winner" -- an invariant [`Self::install_winner`] is the only writer of.
-    /// It is asserted here and answered `false` in a release build rather than
-    /// panicking.
     fn data_pending(&mut self, cx: &CallCtx<'_, '_>) -> bool {
         if !self.base.is_connected() {
             return self.ballers.pending(cx);
@@ -2518,11 +2245,6 @@ impl ConnFilter for HappyEyeballs {
     }
 
     /// `cf_ip_happy_query` (`lib/cf-ip-happy.c:855-888`).
-    ///
-    /// While racing, three questions are answered by AGGREGATING the candidates
-    /// -- the earliest first response and the latest of each connect timer --
-    /// because no single candidate is yet the connection. Everything else, and
-    /// everything once connected, is delegated to the installed winner.
     ///
     /// # Errors
     ///
@@ -2563,9 +2285,7 @@ impl ConnFilter for HappyEyeballs {
     }
 }
 
-// =========================================================================
 // Tests
-// =========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -2576,10 +2296,21 @@ mod tests {
     };
     use crate::dns::{unix2addr, IpProto, ResolvedSockAddr, SockType};
     use crate::trace::{TraceConfig, TraceLevel, Tracer, WriterSink};
+    use crate::util::sync_cell::SyncCell;
     use crate::util::timeval::TestClock;
-    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Arc;
+
+    /// Overwrites a [`Mutex`]-guarded test-double field.
+    ///
+    /// These fields were `RefCell`s before the seam traits gained their
+    /// `Send + Sync` supertraits. `crate::util::sync_cell::SyncCell` keeps
+    /// `RefCell`'s API over an `RwLock`, so the assignment is written through
+    /// `borrow_mut` exactly as it was written through `borrow_mut` before.
+    fn set_meta<T>(slot: &SyncCell<T>, value: T) {
+        *slot.borrow_mut() = value;
+    }
 
     // -- the shared event log ---------------------------------------------
 
@@ -2591,10 +2322,10 @@ mod tests {
     /// translation. A shared log is therefore the only way a test can observe
     /// the ORDER of events across two different candidates, which is exactly
     /// what the restart ordering requires.
-    type EventLog = Rc<RefCell<Vec<String>>>;
+    type EventLog = Arc<SyncCell<Vec<String>>>;
 
     fn new_log() -> EventLog {
-        Rc::new(RefCell::new(Vec::new()))
+        Arc::new(SyncCell::new(Vec::new()))
     }
 
     fn events(log: &EventLog) -> Vec<String> {
@@ -2698,7 +2429,7 @@ mod tests {
         pollsets: usize,
     }
 
-    type Candidate = Rc<RefCell<CandidateState>>;
+    type Candidate = Arc<SyncCell<CandidateState>>;
 
     impl CandidateState {
         fn note(&self, what: &str) {
@@ -2872,19 +2603,19 @@ mod tests {
     /// opens a socket, resolves a name, or waits on a real clock.
     #[derive(Debug)]
     struct Factory {
-        scripts: RefCell<HashMap<String, VecDeque<Script>>>,
-        created: RefCell<Vec<(String, Candidate)>>,
-        creations: Cell<usize>,
+        scripts: SyncCell<HashMap<String, VecDeque<Script>>>,
+        created: SyncCell<Vec<(String, Candidate)>>,
+        creations: SyncCell<usize>,
         log: EventLog,
     }
 
     impl Factory {
         fn new(log: &EventLog) -> Self {
             Self {
-                scripts: RefCell::new(HashMap::new()),
-                created: RefCell::new(Vec::new()),
-                creations: Cell::new(0),
-                log: Rc::clone(log),
+                scripts: SyncCell::new(HashMap::new()),
+                created: SyncCell::new(Vec::new()),
+                creations: SyncCell::new(0),
+                log: Arc::clone(log),
             }
         }
 
@@ -2923,7 +2654,7 @@ mod tests {
             for (built, state) in created.iter() {
                 if *built == key {
                     if seen == nth {
-                        return Rc::clone(state);
+                        return Arc::clone(state);
                     }
                     seen += 1;
                 }
@@ -2951,17 +2682,17 @@ mod tests {
             self.log.borrow_mut().push(format!("create:{label}"));
 
             let nodes = script.nodes.max(1);
-            let state: Candidate = Rc::new(RefCell::new(CandidateState {
+            let state: Candidate = Arc::new(SyncCell::new(CandidateState {
                 script,
                 label: label.clone(),
-                log: Rc::clone(&self.log),
+                log: Arc::clone(&self.log),
                 connects: 0,
                 closes: 0,
                 destroys: 0,
                 shutdowns: 0,
                 pollsets: 0,
             }));
-            self.created.borrow_mut().push((key, Rc::clone(&state)));
+            self.created.borrow_mut().push((key, Arc::clone(&state)));
 
             // Built from the bottom up, so the head is the node the race drives
             // and every lower node is reached through it. The head carries the
@@ -2969,21 +2700,22 @@ mod tests {
             // stacked candidate's socket does before its upper layers negotiate.
             let mut lower_chain: Option<FilterLink> = None;
             for depth in (1..nodes).rev() {
-                let lower: Candidate = Rc::new(RefCell::new(CandidateState {
-                    script: Script::default(),
-                    label: format!("{label}/{depth}"),
-                    log: Rc::clone(&self.log),
-                    connects: 0,
-                    closes: 0,
-                    destroys: 0,
-                    shutdowns: 0,
-                    pollsets: 0,
-                }));
+                let lower: Candidate =
+                    Arc::new(SyncCell::new(CandidateState {
+                        script: Script::default(),
+                        label: format!("{label}/{depth}"),
+                        log: Arc::clone(&self.log),
+                        connects: 0,
+                        closes: 0,
+                        destroys: 0,
+                        shutdowns: 0,
+                        pollsets: 0,
+                    }));
                 let mut node = MemFilter::new(sockindex, lower);
                 node.base.set_next(lower_chain.take());
                 lower_chain = Some(link(node));
             }
-            let mut head = MemFilter::new(sockindex, Rc::clone(&state));
+            let mut head = MemFilter::new(sockindex, Arc::clone(&state));
             head.base.set_next(lower_chain);
             Ok(link(head))
         }
@@ -2994,43 +2726,43 @@ mod tests {
     /// Every fact [`ConnMeta`] names, settable and observable.
     #[derive(Debug)]
     struct TestMeta {
-        ip_version: Cell<IpVersion>,
-        delay_ms: Cell<TimeDiff>,
-        addrs: RefCell<Option<Vec<ResolvedAddr>>>,
-        host: RefCell<String>,
-        connect_to_host: RefCell<Option<String>>,
-        unix_path: RefCell<Option<String>>,
-        secondary_port: Cell<u16>,
-        connect_to_port: Cell<Option<u16>>,
-        remote_port: Cell<u16>,
-        socks_proxy: RefCell<Option<String>>,
-        http_proxy: RefCell<Option<String>>,
-        ssh: Cell<bool>,
-        os_timeout: Cell<bool>,
-        started_at: Cell<CurlTime>,
-        connections: Cell<usize>,
-        app_connect_marks: Cell<usize>,
+        ip_version: SyncCell<IpVersion>,
+        delay_ms: SyncCell<TimeDiff>,
+        addrs: SyncCell<Option<Vec<ResolvedAddr>>>,
+        host: SyncCell<String>,
+        connect_to_host: SyncCell<Option<String>>,
+        unix_path: SyncCell<Option<String>>,
+        secondary_port: SyncCell<u16>,
+        connect_to_port: SyncCell<Option<u16>>,
+        remote_port: SyncCell<u16>,
+        socks_proxy: SyncCell<Option<String>>,
+        http_proxy: SyncCell<Option<String>>,
+        ssh: SyncCell<bool>,
+        os_timeout: SyncCell<bool>,
+        started_at: SyncCell<CurlTime>,
+        connections: SyncCell<usize>,
+        app_connect_marks: SyncCell<usize>,
     }
 
     impl Default for TestMeta {
         fn default() -> Self {
             Self {
-                ip_version: Cell::new(IpVersion::Whatever),
-                delay_ms: Cell::new(CURL_HET_DEFAULT),
-                addrs: RefCell::new(Some(Vec::new())),
-                host: RefCell::new(String::from("example.com")),
-                connect_to_host: RefCell::new(None),
-                unix_path: RefCell::new(None),
-                secondary_port: Cell::new(2_121),
-                connect_to_port: Cell::new(None),
-                remote_port: Cell::new(80),
-                socks_proxy: RefCell::new(None),
-                http_proxy: RefCell::new(None),
-                ssh: Cell::new(false),
-                os_timeout: Cell::new(false),
-                started_at: Cell::new(CurlTime::new(1_000, 0)),
-                connections: Cell::new(0),
-                app_connect_marks: Cell::new(0),
+                ip_version: SyncCell::new(IpVersion::Whatever),
+                delay_ms: SyncCell::new(CURL_HET_DEFAULT),
+                addrs: SyncCell::new(Some(Vec::new())),
+                host: SyncCell::new(String::from("example.com")),
+                connect_to_host: SyncCell::new(None),
+                unix_path: SyncCell::new(None),
+                secondary_port: SyncCell::new(2_121),
+                connect_to_port: SyncCell::new(None),
+                remote_port: SyncCell::new(80),
+                socks_proxy: SyncCell::new(None),
+                http_proxy: SyncCell::new(None),
+                ssh: SyncCell::new(false),
+                os_timeout: SyncCell::new(false),
+                started_at: SyncCell::new(CurlTime::new(1_000, 0)),
+                connections: SyncCell::new(0),
+                app_connect_marks: SyncCell::new(0),
             }
         }
     }
@@ -3107,8 +2839,8 @@ mod tests {
     /// Every `Curl_expire` and `Curl_expire_done` this module made.
     #[derive(Debug, Default)]
     struct TestExpiry {
-        armed: RefCell<Vec<(TimeDiff, TimerId)>>,
-        disarmed: RefCell<Vec<TimerId>>,
+        armed: SyncCell<Vec<(TimeDiff, TimerId)>>,
+        disarmed: SyncCell<Vec<TimerId>>,
     }
 
     impl ExpireScheduler for TestExpiry {
@@ -3124,7 +2856,7 @@ mod tests {
     /// `Curl_timeleft_ms`, under the test's control.
     #[derive(Debug, Default)]
     struct TestDeadline {
-        left: Cell<TimeDiff>,
+        left: SyncCell<TimeDiff>,
     }
 
     impl Deadline for TestDeadline {
@@ -3139,10 +2871,10 @@ mod tests {
     /// [`CallCtx`] can borrow it.
     #[derive(Debug)]
     struct Rig {
-        meta: Rc<TestMeta>,
-        expiry: Rc<TestExpiry>,
-        deadline: Rc<TestDeadline>,
-        factory: Rc<Factory>,
+        meta: Arc<TestMeta>,
+        expiry: Arc<TestExpiry>,
+        deadline: Arc<TestDeadline>,
+        factory: Arc<Factory>,
         log: EventLog,
     }
 
@@ -3154,10 +2886,10 @@ mod tests {
             // `Ballers::schedule` is exercised on its ordinary path.
             deadline.left.set(30_000);
             Self {
-                meta: Rc::new(TestMeta::default()),
-                expiry: Rc::new(TestExpiry::default()),
-                deadline: Rc::new(deadline),
-                factory: Rc::new(Factory::new(&log)),
+                meta: Arc::new(TestMeta::default()),
+                expiry: Arc::new(TestExpiry::default()),
+                deadline: Arc::new(deadline),
+                factory: Arc::new(Factory::new(&log)),
                 log,
             }
         }
@@ -3171,12 +2903,12 @@ mod tests {
         /// which is the whole point of the injected table.
         fn seams(&self, transport: Transport) -> HappyEyeballsSeams {
             let registry = TransportRegistry::new()
-                .with_row(transport, Rc::clone(&self.factory) as _);
+                .with_row(transport, Arc::clone(&self.factory) as _);
             HappyEyeballsSeams {
-                meta: Rc::clone(&self.meta) as _,
-                deadline: Rc::clone(&self.deadline) as _,
-                expiry: Rc::clone(&self.expiry) as _,
-                registry: Rc::new(registry),
+                meta: Arc::clone(&self.meta) as _,
+                deadline: Arc::clone(&self.deadline) as _,
+                expiry: Arc::clone(&self.expiry) as _,
+                registry: Arc::new(registry),
             }
         }
 
@@ -3319,7 +3051,7 @@ mod tests {
         let log = new_log();
         let mut registry = registry;
         let installed =
-            registry.set_provider(Transport::Udp, Rc::new(Factory::new(&log)));
+            registry.set_provider(Transport::Udp, Arc::new(Factory::new(&log)));
         assert!(!installed);
         assert!(registry.provider(Transport::Udp).is_none());
 
@@ -3360,7 +3092,8 @@ mod tests {
         let log = new_log();
         let mut registry = registry;
         assert_eq!(
-            registry.set_provider(Transport::Quic, Rc::new(Factory::new(&log))),
+            registry
+                .set_provider(Transport::Quic, Arc::new(Factory::new(&log))),
             cfg!(feature = "http3")
         );
         assert_eq!(
@@ -3457,7 +3190,7 @@ mod tests {
         let ballers = Ballers::init(
             IpVersion::Whatever,
             &addrs,
-            Rc::new(Factory::new(&new_log())),
+            Arc::new(Factory::new(&new_log())),
             Transport::Tcp,
             CURL_HET_DEFAULT,
         )
@@ -3592,9 +3325,10 @@ mod tests {
         let addrs = vec![v4("192.0.2.1:80"), socket.clone()];
         rig.addrs(&addrs);
         rig.factory.script(&socket, Script::default());
-        rig.meta
-            .unix_path
-            .replace(Some(String::from("/tmp/curl-rs-happy.sock")));
+        set_meta(
+            &rig.meta.unix_path,
+            Some(String::from("/tmp/curl-rs-happy.sock")),
+        );
 
         let mut filter = rig.filter(&mut cx, Transport::Unix);
         assert!(
@@ -4643,8 +4377,6 @@ mod tests {
 
         let mut filter = rig.filter(&mut cx, Transport::Tcp);
         assert!(!filter.connect(&mut cx).expect("the race starts"));
-        // Racing, and `IpInfo` is not one of the three aggregated questions, so
-        // it falls through to a `next` that does not exist yet.
         let error = filter
             .query(&mut cx, CfQuery::IpInfo)
             .expect_err("nothing to delegate to");
@@ -4807,10 +4539,10 @@ mod tests {
         let connect_to_clock = clock();
         let connect_to = Rig::new();
         connect_to.meta.started_at.set(CurlTime::new(1_000, 0));
-        connect_to
-            .meta
-            .connect_to_host
-            .replace(Some(String::from("interim.example")));
+        set_meta(
+            &connect_to.meta.connect_to_host,
+            Some(String::from("interim.example")),
+        );
         connect_to.meta.connect_to_port.set(Some(8_080));
         assert_eq!(
             failure_message(&connect_to, &connect_to_clock),
@@ -4821,10 +4553,10 @@ mod tests {
         // 3. A Unix domain socket replaces the port clause entirely.
         let unix_clock = clock();
         let over_unix = Rig::new();
-        over_unix
-            .meta
-            .unix_path
-            .replace(Some(String::from("/var/run/curl.sock")));
+        set_meta(
+            &over_unix.meta.unix_path,
+            Some(String::from("/var/run/curl.sock")),
+        );
         assert_eq!(
             failure_message(&over_unix, &unix_clock),
             "Failed to connect to example.com over /var/run/curl.sock \
@@ -4835,14 +4567,14 @@ mod tests {
         //    spacing.
         let socks_clock = clock();
         let via_socks = Rig::new();
-        via_socks
-            .meta
-            .socks_proxy
-            .replace(Some(String::from("socks.example")));
-        via_socks
-            .meta
-            .http_proxy
-            .replace(Some(String::from("http.example")));
+        set_meta(
+            &via_socks.meta.socks_proxy,
+            Some(String::from("socks.example")),
+        );
+        set_meta(
+            &via_socks.meta.http_proxy,
+            Some(String::from("http.example")),
+        );
         assert_eq!(
             failure_message(&via_socks, &socks_clock),
             "Failed to connect to example.com port 80 via socks.example \
@@ -4852,10 +4584,10 @@ mod tests {
         // 5. An HTTP proxy alone.
         let http_clock = clock();
         let via_http = Rig::new();
-        via_http
-            .meta
-            .http_proxy
-            .replace(Some(String::from("http.example")));
+        set_meta(
+            &via_http.meta.http_proxy,
+            Some(String::from("http.example")),
+        );
         assert_eq!(
             failure_message(&via_http, &http_clock),
             "Failed to connect to example.com port 80 via http.example \
@@ -5044,10 +4776,6 @@ mod tests {
     /// The whole race, driven by [`HappyEyeballs::race`] and therefore by
     /// [`tokio::select!`], with NO network of any kind: no socket is opened, no
     /// name is resolved, and the only clock is the injected one.
-    ///
-    /// The runtime's timer is PAUSED, so the inter-attempt delay and the wait
-    /// ceiling cost no real time; the injected clock is advanced by hand, which
-    /// is what makes the delay elapse.
     #[tokio::test(start_paused = true)]
     async fn the_whole_race_needs_no_network() {
         let clock = clock();

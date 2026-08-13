@@ -22,8 +22,8 @@
 //
 //***************************************************************************
 
-//! The base64 codec -- supersedes `lib/curlx/base64.c` (267 lines) and
-//! `lib/curlx/base64.h` (41 lines).
+//! The base64 codec -- supersedes `lib/curlx/base64.c` and
+//! `lib/curlx/base64.h`.
 //!
 //! Three C entry points map onto three functions here, and the `curlx_`
 //! prefix is dropped because a Rust module path already carries it:
@@ -48,153 +48,27 @@
 //! * The alt-svc and HSTS caches and the TLS session cache's serialised
 //!   form (`lib/altsvc.c`, `lib/hsts.c`, `lib/vtls/vtls_scache.c`).
 //!
-//! 1,476 of the 1,914 fixtures under `tests/data/` carry a `<protocol>`
-//! block, and the harness joins both sides into one string and compares
-//! them whole (AAP 0.6.7). A codec that produced *valid* base64 rather than
-//! *curl's* base64 would fail those fixtures without being wrong in any way
-//! a specification would recognise, so the transcription below is
-//! deliberately literal.
-//!
-//! The rejection behaviour is equally observable. A malformed
-//! server-supplied token must yield `CURLE_BAD_CONTENT_ENCODING` and not a
-//! different code and not a lenient parse, because callers compare against
-//! that exact value.
-//!
-//! # Why the `base64` crate is not used
-//!
-//! `curl-rs-lib/Cargo.toml` does declare `base64 0.23.0`, so reaching for
-//! it was the obvious first move. It was rejected on measurement, not on
-//! taste: **curl does not require the unused trailing bits of the final
-//! quantum to be zero.** The real `lib/curlx/base64.c` was compiled and
-//! run, and it decodes `"AB=="` to a single `0x00` byte -- silently
-//! discarding the four low bits `'B'` contributed. The crate's
-//! canonical-padding decoders reject exactly that input as
-//! `InvalidLastSymbol`.
-//!
-//! Two further inputs measured the same way: `"AAB="` and `"AAC="` both
-//! decode to `[0x00, 0x00]`. Any of the three arriving from a server would
-//! turn a transfer that curl 8.19.0-DEV completes into a failure. AAP 0.1.1
-//! makes faithfulness the tie-breaker over every other consideration, so
-//! the decoder is written out from the C rather than delegated.
-//!
-//! # The decoder's four rejections, and the one code they share
-//!
-//! Reading `lib/curlx/base64.c:60-163` there are exactly four ways in, and
-//! all four leave through the same door -- `CURLE_BAD_CONTENT_ENCODING`,
-//! which is [`CURLcode::BadContentEncoding`]:
-//!
-//! | # | Condition | C site |
-//! |---|-----------|--------|
-//! | a | empty input, or a length that is not a multiple of four | `:79-80` |
-//! | b | more than two trailing `=` | `:83-89` |
-//! | c | a symbol the lookup table calls invalid | `:116-117`, `:141-142` |
-//! | d | a `=` inside the final quantum beyond the trailing run | `:135-137` |
-//!
-//! Splitting these into finer codes would be a behaviour change, which AAP
-//! 0.8.2 prohibits, so they are not split.
-//!
-//! Rejection (a) is what makes canonical padding *mandatory* on input:
-//! `"QQ"` is refused and `"QQ=="` accepted. Rejection (d) is the one a
-//! naive implementation passes; `"A=B="` is the worked example, and
-//! [`tests::a_misplaced_pad_is_rejected`] carries it.
-//!
-//! # base64url emits no padding at all
-//!
-//! `lib/curlx/base64.c:243-263` calls one static encoder twice, differing
-//! in *two* arguments rather than one. The alphabet swap is the visible
-//! difference; the padding byte is the consequential one. Standard
-//! encoding passes `'='`, base64url passes `0`, and every pad write in the
-//! encoder is guarded by `if(padbyte)` (`:202`, `:211`). A zero padding
-//! byte therefore emits **nothing**: base64url output is unpadded and its
-//! length is 2, 3 or 4 characters per quantum rather than always 4.
-//!
-//! Measured against the C: `url_encode(b"f")` is `"Zg"`, `url_encode(b"fo")`
-//! is `"Zm8"`, and `url_encode(b"fooba")` is `"Zm9vYmE"`.
-//!
-//! # Divergences from the C, each deliberate
-//!
-//! * **Input length.** `curlx_base64_decode` takes a NUL-terminated
-//!   `const char *` and calls `strlen`, so an embedded NUL truncates the
-//!   input -- measured: `"QQ==\0QQ=="` decodes to one byte. [`decode`]
-//!   takes a `&[u8]` and uses the slice's own length, because a Rust slice
-//!   already carries it and no caller in the C tree passes an embedded NUL.
-//!   No NUL scan is added: adding one would invent a rejection curl does
-//!   not have.
-//! * **No terminator.** The C allocates `rawlen + 1` and writes a NUL past
-//!   the data (`:99`, `:153`), then reports `rawlen` separately. Here the
-//!   `Vec` length *is* `rawlen` and there is no terminator. Nothing is lost
-//!   -- the C's terminator is unreachable through the reported length.
-//! * **No `goto bad`.** The C allocates before it validates and frees on
-//!   the failure path (`:160-163`). Dropping a `Vec` does that, so the
-//!   label has no counterpart.
-//!
-//! # Two stale comments in the C, recorded rather than reproduced
-//!
-//! Both were checked against the code rather than trusted:
-//!
-//! * `:57` says "When decoded data length is 0, returns NULL in `*outptr`."
-//!   That is unreachable. Rejection (a) guarantees `srclen >= 4`, so
-//!   `numQuantums >= 1` and `rawlen = numQuantums * 3 - padding >= 1`. No
-//!   successful decode ever yields zero bytes, and no dead branch for it
-//!   is written here.
-//! * `:256` says "Input length of 0 indicates input buffer holds a
-//!   null-terminated string." The code contradicts it two lines into the
-//!   shared encoder: `if(!insize) return CURLE_OK;` (`:177-178`) returns
-//!   immediately with an empty result. The measured behaviour is
-//!   reproduced; the comment is not.
-//!
 //! # Visibility
 //!
-//! Everything is `pub(crate)`. `grep -i base64 lib/libcurl.def` finds
-//! nothing: no exported libcurl symbol is backed from this file, so the
-//! private-module / public-re-export idiom that `parsedate` and `strcase`
-//! need does not apply, and AAP 0.8.7 forbids widening a surface merely so
-//! that `tests/unit/unit1302.c` could link against it. That fixture's
-//! coverage is relocated into [`tests`] below instead, which is where the
-//! `@unittest: 1302` annotation on all three C functions now leads.
+//! Everything is `pub(crate)`. That fixture's coverage is relocated into
+//! [`tests`] below instead, which is where the `@unittest: 1302` annotation on
+//! all three C functions now leads.
 
 use crate::error::CURLcode;
+use crate::util::fallible;
 
 /// The standard base64 alphabet: RFC 4648 section 4.
-///
-/// Transcribed from `curlx_base64encdec` (`lib/curlx/base64.c:32-33`). The
-/// C spells it `extern` rather than `static` and `lib/curlx/base64.h:34`
-/// declares it, because `lib/mime.c:376-379` and `:403-406` index it
-/// directly: the MIME encoder streams base64 a quantum at a time instead of
-/// calling the whole-buffer function, so it needs the alphabet and not the
-/// codec. `pub(crate)` here for that consumer, `crate::mime`.
-///
-/// The type is `&[u8; 64]`, so a transcription of the wrong length is a
-/// compile error rather than a test failure.
 pub(crate) const BASE64_ENCDEC: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// The URL and filename safe alphabet: RFC 4648 section 5.
-///
-/// Transcribed from `base64url` (`lib/curlx/base64.c:37-38`), which the C
-/// spells `static`. It is written out in full rather than derived from
-/// [`BASE64_ENCDEC`] by replacing the last two entries, even though the two
-/// differ *only* at indices 62 and 63 -- `+/` against `-_`. Both are
-/// wire-bearing, and a table built at run time from another table can be
-/// corrupted by a refactor that looks harmless; two literals cannot.
-///
-/// The relationship is asserted rather than assumed:
-/// [`tests::the_two_alphabets_differ_only_in_their_last_two_entries`].
 pub(crate) const BASE64_URL: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// The largest input [`encode`] and [`url_encode`] accept, in bytes.
 ///
-/// `CURL_MAX_BASE64_INPUT` (`lib/curlx/base64.h:36-38`), whose comment is
-/// its whole rationale: "maximum input length acceptable to base64 encode,
-/// here to catch and prevent mistakes."
-///
-/// A decimal round number and deliberately *not* a power of two, so it is
-/// written with digit separators that keep it readable as 16 million and
-/// pinned by [`tests::the_input_cap_is_the_c_headers_decimal_constant`].
-///
 /// **The cap applies to encoding only.** `curlx_base64_decode` has no
-/// equivalent check anywhere in its 103 lines, and adding one here would
+/// equivalent check anywhere, and adding one here would
 /// reject input that curl 8.19.0-DEV accepts --
 /// [`tests::decode_has_no_length_cap`] pins that asymmetry.
 pub(crate) const CURL_MAX_BASE64_INPUT: usize = 16_000_000;
@@ -208,22 +82,9 @@ pub(crate) const CURL_MAX_BASE64_INPUT: usize = 16_000_000;
 const INVALID_SYMBOL: u8 = 0xff;
 
 /// The byte the seed table below starts at.
-///
-/// `lib/curlx/base64.c:106` is `memcpy(&lookup['+'], decodetable,
-/// sizeof(decodetable))`, so the seed lands at the index of `+`. The value
-/// is written as a literal because `usize::from` is not a `const fn` and
-/// this is needed during const evaluation; the equivalence is proven by
-/// [`tests::the_seed_lands_where_the_c_memcpy_puts_it`] rather than left to
-/// the reader.
 const FIRST_SYMBOL: usize = 43;
 
 /// The 80 values `lib/curlx/base64.c:40-46` copies into the lookup table.
-///
-/// Transcribed verbatim, keeping the C's 16-values-per-row grouping so the
-/// two can be read side by side, with each row annotated by the span of
-/// input bytes it covers. `#[rustfmt::skip]` is not cosmetic: this table is
-/// wire-bearing, and a formatter that reflowed it would destroy the only
-/// property that makes the transcription reviewable.
 ///
 /// Reading the rows against the byte values they land on:
 ///
@@ -253,18 +114,6 @@ const DECODE_TABLE_SEED: [u8; 80] = [
 ];
 
 /// Builds the 256-entry lookup at compile time.
-///
-/// Reproduces `lib/curlx/base64.c:105-106` exactly -- fill with
-/// [`INVALID_SYMBOL`], then overlay [`DECODE_TABLE_SEED`] starting at
-/// [`FIRST_SYMBOL`]. The C rebuilds this on the stack on *every* call to
-/// `curlx_base64_decode`; doing it once in a `const fn` is the one place
-/// this module differs from the C for a reason other than faithfulness, and
-/// it changes no observable behaviour because the table is a pure function
-/// of two constants.
-///
-/// Const evaluation also makes the bound a compile-time proof: the highest
-/// index written is `43 + 79 = 122`, and an out-of-range write in a `const`
-/// initialiser fails the build rather than the test suite.
 const fn build_decode_table() -> [u8; 256] {
     let mut table = [INVALID_SYMBOL; 256];
     let mut index = 0;
@@ -286,41 +135,20 @@ const fn build_decode_table() -> [u8; 256] {
 const DECODE_TABLE: [u8; 256] = build_decode_table();
 
 /// Appends one alphabet symbol to `out`.
-///
-/// `index` is always in `0..=63` because every caller masks or shifts it
-/// into six bits, so the lookup cannot leave the alphabet -- the four
-/// expressions are the C's own, at `lib/curlx/base64.c:190-193`,
-/// `:199-201` and `:209-210`.
-///
-/// The symbol becomes a `char` through `From<u8> for char`, which is
-/// infallible, and every alphabet entry is ASCII
-/// ([`tests::both_alphabets_are_ascii`]), so exactly one byte is appended
-/// per call. That is what makes [`encode`]'s `String` length equal the C's
-/// `outlen` and what removes any fallible conversion from the encoder.
 fn push_symbol(out: &mut String, alphabet: &[u8; 64], index: u8) {
     out.push(char::from(alphabet[usize::from(index)]));
 }
 
 /// The encoder both public entry points share.
 ///
-/// Supersedes the static `base64_encode` (`lib/curlx/base64.c:165-226`),
-/// whose two variable arguments are the two parameters here: `alphabet` is
-/// the C's `table64` and `pad` is its `padbyte`, with `None` standing for
-/// the C's `0`.
-///
-/// Modelling the padding byte as an `Option<u8>` rather than a `u8` is the
-/// one shape change, and it is made because the C's zero is not a padding
-/// character -- it is a flag meaning "emit none", tested by `if(padbyte)`
-/// at `:202` and `:211`. `Option` says that in the type, so neither call
-/// site can accidentally emit a NUL byte onto the wire.
-///
 /// # Errors
 ///
 /// [`CURLcode::TooLarge`] when `input` is longer than
 /// [`CURL_MAX_BASE64_INPUT`]. That is the only error this function can
-/// return: `curl_easy_setopt`-style validation happens in the caller, and
-/// the C's `CURLE_OUT_OF_MEMORY` arm (`:186-187`) has no counterpart
-/// because a failed Rust allocation aborts rather than returning.
+/// return other than [`CURLcode::OutOfMemory`], which is the C's own
+/// `:186-187` arm: the output buffer is four thirds of a caller-chosen length,
+/// so it is allocated through [`crate::util::fallible`] and a refusal is
+/// reported rather than fatal.
 fn encode_with(
     alphabet: &[u8; 64],
     pad: Option<u8>,
@@ -355,7 +183,11 @@ fn encode_with(
     // the expression is total on its own terms rather than on the reader's
     // memory of a check twenty lines up.
     let capacity = input.len().div_ceil(3).saturating_mul(4);
-    let mut out = String::with_capacity(capacity);
+    // Fallible: `capacity` is four thirds of a length the caller chose, and the
+    // C's `curlx_malloc` failing at `:186-187` is `CURLE_OUT_OF_MEMORY`. See
+    // `crate::util::fallible`.
+    let mut out =
+        fallible::string_with_capacity(capacity).map_err(fallible::oom)?;
 
     // `while(insize >= 3)` (:189-196). `chunks_exact(3)` yields precisely
     // the groups that loop visits, and `remainder()` is precisely the
@@ -419,16 +251,6 @@ fn encode_with(
 
 /// Encodes `input` with the standard alphabet and `=` padding.
 ///
-/// Supersedes `curlx_base64_encode` (`lib/curlx/base64.c:241-246`), which
-/// is `base64_encode(curlx_base64encdec, '=', ...)` and nothing else.
-///
-/// The result is always ASCII, so the `String` needs no validation and its
-/// `len()` is the C's `outlen` -- the count that *excludes* the terminator
-/// the C writes (`:223`).
-///
-/// An empty input yields an empty string and `Ok`, matching the C exactly:
-/// this is not an error condition. See [`encode_with`] for why.
-///
 /// # Errors
 ///
 /// [`CURLcode::TooLarge`] when `input` exceeds [`CURL_MAX_BASE64_INPUT`].
@@ -447,26 +269,15 @@ fn encode_with(
 /// encode(b"fooba")  == Ok("Zm9vYmE=".to_owned())
 /// encode(b"foobar") == Ok("Zm9vYmFy".to_owned())
 /// ```
-// Every consumer of this codec is a later unit of work -- `auth/{basic,
-// digest,ntlm,negotiate}`, `protocols/ws`, `mime`, `tls/session_cache`,
-// `cookies/{altsvc,hsts}` -- so the allowance is written at the item, and
-// removing it once the first of them lands restores the warning for
-// anything still unused. A module- or crate-level attribute would instead
-// silence the next unreferenced item somebody adds; `src/lib.rs`
-// (`mod source_policy`) enforces that distinction as a test.
+// A module- or crate-level attribute would instead silence the next
+// unreferenced item somebody adds; `src/lib.rs` (`mod source_policy`) enforces
+// that distinction as a test.
 #[allow(dead_code)]
 pub(crate) fn encode(input: &[u8]) -> Result<String, CURLcode> {
     encode_with(BASE64_ENCDEC, Some(b'='), input)
 }
 
 /// Encodes `input` with the URL and filename safe alphabet, **unpadded**.
-///
-/// Supersedes `curlx_base64url_encode` (`lib/curlx/base64.c:263-267`),
-/// which is `base64_encode(base64url, 0, ...)`. The `0` is the whole
-/// difference beyond the alphabet, and it means no `=` is ever appended --
-/// see the module documentation. Output length is therefore
-/// `input.len().div_ceil(3) * 4` minus one or two characters when the last
-/// quantum is short, not always a multiple of four.
 ///
 /// # Errors
 ///
@@ -483,7 +294,6 @@ pub(crate) fn encode(input: &[u8]) -> Result<String, CURLcode> {
 /// url_encode(&[0xfb, 0xff])   == Ok("-_8".to_owned())
 /// url_encode(&[0xff, 0xef])   == Ok("_-8".to_owned())
 /// ```
-// See the note on [`encode`]: the consumers are later units of work.
 // `protocols/ws` reaches this one first, for `Sec-WebSocket-Key`.
 #[allow(dead_code)]
 pub(crate) fn url_encode(input: &[u8]) -> Result<String, CURLcode> {
@@ -506,18 +316,11 @@ pub(crate) fn url_encode(input: &[u8]) -> Result<String, CURLcode> {
 ///   to `[0x00]` and `"AAB="` to `[0x00, 0x00]`. The `base64` crate rejects
 ///   both; see the module documentation for why that ruled the crate out.
 ///
-/// There is **no** base64url decoder. The C has none, `-` and `_` are
-/// invalid symbols in the table, and adding one would be a behaviour
-/// addition rather than a migration.
-///
-/// The returned `Vec`'s length is the C's `rawlen`, computed the C's way as
-/// `quantums * 3 - padding` (`:96`) rather than counted from the bytes that
-/// happened to be written -- and then cross-checked against them.
-///
 /// # Errors
 ///
-/// [`CURLcode::BadContentEncoding`], and only that, for every malformed
-/// input. Callers match on this exact value.
+/// [`CURLcode::BadContentEncoding`] for every malformed input -- callers match
+/// on that exact value -- or [`CURLcode::OutOfMemory`] for a refused output
+/// buffer, which is the C's `:99-100` arm. Nothing else.
 ///
 /// # Examples
 ///
@@ -528,9 +331,6 @@ pub(crate) fn url_encode(input: &[u8]) -> Result<String, CURLcode> {
 /// decode(b"A=B=")     == Err(CURLcode::BadContentEncoding)
 /// decode(b"QQ")       == Err(CURLcode::BadContentEncoding)
 /// ```
-// See the note on [`encode`]: `auth/{basic,digest,ntlm,negotiate}`,
-// `protocols/ws`, `tls/session_cache` and `cookies/{altsvc,hsts}` are the
-// consumers, and each is a later unit of work.
 #[allow(dead_code)]
 pub(crate) fn decode(input: &[u8]) -> Result<Vec<u8>, CURLcode> {
     // Rejection (a), `if(!srclen || srclen % 4)` (:79-80). The C reaches
@@ -565,7 +365,11 @@ pub(crate) fn decode(input: &[u8]) -> Result<Vec<u8>, CURLcode> {
     let full_quantums = num_quantums - usize::from(padding != 0);
     let raw_len = num_quantums * 3 - padding;
 
-    let mut out = Vec::with_capacity(raw_len);
+    // Fallible for the same reason `encode_with`'s is: `raw_len` is three
+    // quarters of a length the caller chose, and `:99-100` returns
+    // `CURLE_OUT_OF_MEMORY` for a refused `curlx_calloc`.
+    let mut out: Vec<u8> =
+        fallible::vec_with_capacity(raw_len).map_err(fallible::oom)?;
 
     for (index, quantum) in input.chunks_exact(4).enumerate() {
         if padding != 0 && index == full_quantums {
@@ -659,18 +463,6 @@ mod tests {
     const BAD: CURLcode = CURLcode::BadContentEncoding;
 
     /// `curlx_base64_encode` of every one of the 256 single-byte inputs.
-    ///
-    /// Measured from the real `lib/curlx/base64.c`, compiled verbatim with
-    /// only its two `#include` lines removed and the allocator, assertion
-    /// and result-code macros supplied. Each row covers sixteen consecutive
-    /// byte values at four characters each, so row `r` column `c` is the
-    /// encoding of byte `r * 16 + c`.
-    ///
-    /// This table is exhaustive over something that matters more than its
-    /// size suggests: `in[0] >> 2` ranges over all of `0..=63` as the input
-    /// byte ranges over `0..=255`, so these 256 rows exercise **every entry
-    /// of the alphabet**, including indices 62 and 63 -- visible as `+A==`
-    /// and `/A==` at the end of the last row.
     const ORACLE_ONE_BYTE_STD: [&str; 16] = [
         "AA==AQ==Ag==Aw==BA==BQ==Bg==Bw==CA==CQ==Cg==Cw==DA==DQ==Dg==Dw==",
         "EA==EQ==Eg==Ew==FA==FQ==Fg==Fw==GA==GQ==Gg==Gw==HA==HQ==Hg==Hw==",
@@ -691,17 +483,6 @@ mod tests {
     ];
 
     /// `curlx_base64url_encode` of every one of the 256 single-byte inputs.
-    ///
-    /// Measured the same way as [`ORACLE_ONE_BYTE_STD`], sixteen byte
-    /// values per row at **two** characters each rather than four -- which
-    /// is this table's real subject. A single input byte is one short
-    /// quantum, so the standard encoder emits two symbols and two `=` while
-    /// base64url emits the two symbols and stops. The row lengths are the
-    /// proof that no padding is written.
-    ///
-    /// The last row ends `-A-Q-g-w_A_Q_g_w`, which is where the two
-    /// alphabets part company: indices 62 and 63 are `-` and `_` here where
-    /// [`ORACLE_ONE_BYTE_STD`] has `+` and `/`.
     const ORACLE_ONE_BYTE_URL: [&str; 16] = [
         "AAAQAgAwBABQBgBwCACQCgCwDADQDgDw",
         "EAEQEgEwFAFQFgFwGAGQGgGwHAHQHgHw",
@@ -791,17 +572,6 @@ mod tests {
     ];
 
     /// The `badecode[]` table of `tests/unit/unit1302.c:102-125`.
-    ///
-    /// Relocated with the C's own comments carried across as the second
-    /// column, because they name *which* of the four rejections each row
-    /// exercises and that is what makes the table a specification rather
-    /// than a list. The C passes only the string -- its numeric fields are
-    /// unused on this path, since `curlx_base64_decode` takes a
-    /// NUL-terminated pointer -- so only the string is reproduced.
-    ///
-    /// Note the four identical `====` rows in the C, which differ only in
-    /// an unused length field. They are kept as one row here; keeping four
-    /// copies would suggest four distinct cases that do not exist.
     const UNIT1302_BAD_DECODE: [(&[u8], &str); 19] = [
         (b"", "no data means error"),
         (b"a", "data is too short"),
@@ -826,12 +596,6 @@ mod tests {
 
     /// The base64 value of `byte`, derived from the ALPHABET rather than
     /// from [`DECODE_TABLE_SEED`].
-    ///
-    /// This is the independence that makes
-    /// [`the_decode_table_is_the_alphabets_exact_inverse`] worth running: a
-    /// mistyped digit anywhere in the 80-entry seed produces a table that
-    /// disagrees with this function, whereas a check written against the
-    /// seed itself would agree with the typo.
     fn value_from_the_alphabet(byte: u8) -> u8 {
         match byte {
             b'A'..=b'Z' => byte - b'A',
@@ -861,9 +625,7 @@ mod tests {
         out
     }
 
-    // ----------------------------------------------------------------
     // The constants, and the transcription of the two wire-bearing tables
-    // ----------------------------------------------------------------
 
     #[test]
     fn the_input_cap_is_the_c_headers_decimal_constant() {
@@ -1039,16 +801,14 @@ mod tests {
     #[test]
     fn the_two_reachable_error_codes_hold_their_c_integers() {
         // This module can produce exactly two codes, and a caller compares
-        // against their numbers rather than their names (AAP 0.6.1).
+        // against their numbers rather than their names.
         assert_eq!(BAD.as_i32(), 61);
         assert_eq!(CURLcode::TooLarge.as_i32(), 100);
         assert_eq!(BAD.c_name(), "CURLE_BAD_CONTENT_ENCODING");
         assert_eq!(CURLcode::TooLarge.c_name(), "CURLE_TOO_LARGE");
     }
 
-    // ----------------------------------------------------------------
     // Encoding
-    // ----------------------------------------------------------------
 
     #[test]
     fn an_empty_encode_is_success_not_an_error() {
@@ -1279,9 +1039,7 @@ mod tests {
         assert!(produced.ends_with("AA=="));
     }
 
-    // ----------------------------------------------------------------
     // Decoding: the four rejections, each with its exact code
-    // ----------------------------------------------------------------
 
     #[test]
     fn rejection_a_empty_or_unaligned_input() {
@@ -1474,14 +1232,10 @@ mod tests {
     )]
     fn decode_has_no_length_cap() {
         // The encoder's cap is encode-only: `curlx_base64_decode` has no
-        // length check anywhere in its 103 lines. A decode input longer than
+        // length check at all. A decode input longer than
         // CURL_MAX_BASE64_INPUT must therefore succeed, and in particular
         // must not return CURLE_TOO_LARGE, which is what adding a symmetric
         // cap would have done.
-        //
-        // Sized just past the cap rather than far past it: 16,000,004
-        // characters in and 12,000,003 bytes out is enough to be past it
-        // and cheap enough to run in a unit test.
         let oversized = vec![b'A'; CURL_MAX_BASE64_INPUT + 4];
         assert!(oversized.len() > CURL_MAX_BASE64_INPUT);
         let decoded = decode(&oversized).expect("no cap applies to decoding");
@@ -1489,9 +1243,7 @@ mod tests {
         assert!(decoded.iter().all(|&byte| byte == 0));
     }
 
-    // ----------------------------------------------------------------
     // Round trips and adversarial input
-    // ----------------------------------------------------------------
 
     #[test]
     fn every_input_length_up_to_sixteen_round_trips() {
@@ -1665,11 +1417,6 @@ mod tests {
         // characters before it. This function is handed a slice and honours
         // its length, so the NUL is byte four of an eight-byte input and is
         // refused as an invalid symbol.
-        //
-        // No caller in the C tree passes an interior NUL, which is why no
-        // NUL scan is added to recreate the truncation: doing so would
-        // invent a silent-truncation path in a codec that feeds
-        // authentication.
         let with_nul = b"QQ==\0\0\0\0";
         assert_eq!(with_nul.len(), 8);
         assert_eq!(decode(with_nul), Err(BAD));

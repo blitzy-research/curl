@@ -22,20 +22,13 @@
 //
 //***************************************************************************
 
-// THE BANNER ABOVE -- 23 lines, and why the licence tag appears exactly once.
+// THE BANNER ABOVE, and why the licence tag appears exactly once.
 //
-// The block is the banner measured at `lib/llist.c:1-23`, rendered as Rust
-// line comments in the stripped form the rest of this crate already uses:
-// `src/lib.rs:1-23`, `src/error.rs:1-23` and `src/util/mod.rs:1-23` are
-// byte-identical to it. `reuse lint` runs in continuous integration and
-// requires the licence-identifier tag naming `curl`, which is on line 21.
-//
-// That tag spelling is never repeated anywhere else in this file, and the
-// omission is deliberate rather than stylistic. `reuse` scans every line for
-// the tag's colon form and parses whatever follows it as a licence
-// expression, so a second, prose mention becomes a parse error instead of
-// prose. `src/util/mod.rs:33-42` records the two verbatim diagnostics that
-// established this. Line 21 is therefore the only place in this file where
+// The licence-identifier tag on line 21 is never repeated anywhere else in
+// this file, and the omission is deliberate rather than stylistic. `reuse`
+// scans every line for the tag's colon form and parses whatever follows it as
+// a licence expression, so a second, prose mention becomes a parse error
+// instead of prose. Line 21 is therefore the only place in this file where
 // that spelling occurs, which is exactly what the tool needs.
 
 // NO `unsafe` HERE, AND NO EXEMPTION FOR IT.
@@ -58,31 +51,22 @@
 // island. A fifth forbids a `dead_code` lint level on a module or crate root,
 // which is why every unreferenced item below carries its own allowance.
 
-// `dead_code` allowances, item by item, and why there are so many.
-//
 // `util` is the base of this crate's module graph: everything depends on it
 // and it depends on nothing, so its consumers are the last code to exist.
 // Until they land, every item here is legitimately unreferenced and the
-// zero-warnings gate would otherwise fail on code that is correct. Measured
-// on the pinned toolchain (rustc 1.97.1) rather than assumed: an unreferenced
+// zero-warnings gate would otherwise fail on code that is correct. Measured on
+// the pinned toolchain (rustc 1.97.1) rather than assumed: an unreferenced
 // `pub(crate) const` is reported individually, one allowance on the struct
 // covers the struct and its fields, and one on the `impl` block covers all of
 // its associated items. A `#[cfg(test)]` use does not count, because the lint
 // is evaluated for the non-test build -- which is also why these are `allow`
-// and not `expect`. Each one is removed when its consumer lands, and
-// `MAX_DYNBUF_SIZE` carries none because `DynBuf::new` really does read it.
+// and not `expect`.
 
 //! The growable, size-capped byte buffer.
 //!
-//! Supersedes `lib/curlx/dynbuf.c` (292 lines) and its interface
-//! `lib/curlx/dynbuf.h` (83 lines). `docs/internals/DYNBUF.md` documents the
-//! C original and names this file as its specified successor.
-//!
-//! A `dynbuf` accumulates bytes behind a hard ceiling. The C tree uses it for
-//! HTTP request assembly, header accumulation, cookie, alt-svc and HSTS file
-//! lines, FTP command construction, DNS-over-HTTPS responses, certificate and
-//! CRL file loading, trailers, proxy CONNECT headers, qlog file names and
-//! `aprintf`.
+//! Supersedes `lib/curlx/dynbuf.c` and its interface `lib/curlx/dynbuf.h`.
+//! `docs/internals/DYNBUF.md` documents the C original and names this file as
+//! its specified successor.
 //!
 //! # The ceiling is behaviour, not tuning
 //!
@@ -130,14 +114,6 @@
 //!   constructible. The value is named here so that a reader diffing against
 //!   the C can find the correspondence.
 //!
-//! Three of the C's other `DEBUGASSERT`s go the same way and are listed so
-//! their absence reads as deliberate: `DEBUGASSERT(s)` (a reference cannot be
-//! null), `DEBUGASSERT(!s->leng || s->bufr)` (the container upholds it) and
-//! `DEBUGASSERT(!len || mem)` (a `&[u8]` cannot be null). A fourth,
-//! `DEBUGASSERT(a <= s->toobig)` at `lib/curlx/dynbuf.c:79`, is dropped for a
-//! different and more interesting reason recorded at [`DynBuf::nappend`]. The
-//! asserts that *do* still say something are reproduced as `debug_assert!`.
-//!
 //! # No trailing zero is stored
 //!
 //! **The Rust buffer holds exactly the bytes appended to it and no
@@ -160,81 +136,6 @@
 //! [`DynBuf::nappend`]: the comparison is against `len + current + 1`, the
 //! `+ 1` being the C's zero byte, and dropping it would shift every
 //! `CURLE_TOO_LARGE` boundary in libcurl by one byte.
-//!
-//! # Why `Vec<u8>` and not `BytesMut`
-//!
-//! The specification names `bytes::BytesMut` and `Vec<u8>` together as the
-//! replacement for the C tree's hand-managed buffers, leaving the choice per
-//! module. `Vec<u8>` is chosen here, on four measured grounds:
-//!
-//! 1. **Nothing in this API splits, freezes or shares.** All fourteen entry
-//!    points of `lib/curlx/dynbuf.h:37-60` were read; not one has a split,
-//!    freeze or reference-count analogue. `BytesMut`'s distinguishing
-//!    capabilities would be dead weight.
-//! 2. **`take` is a whole-allocation ownership transfer.**
-//!    `curlx_dyn_take` hands the caller the pointer and resets the struct;
-//!    `core::mem::take` on a `Vec` is that operation exactly.
-//!    The `BytesMut` spelling would be `freeze()`, which yields a
-//!    shared immutable `Bytes` -- a different contract from the C's
-//!    "caller has ownership".
-//! 3. **Only `Vec` offers `reserve_exact`.** The C computes an allocation
-//!    size and passes it to `realloc`; `reserve_exact` is the request for
-//!    that size, which is what lets the growth policy below be read against
-//!    the C line for line. `BytesMut::reserve` has no exact form and applies
-//!    its own amortisation.
-//! 4. **`free` must release the allocation.** Replacing the field with an
-//!    empty `Vec` does that; `BytesMut` has no shrink-to-fit.
-//!
-//! # The size-policy table
-//!
-//! Transcribed verbatim from `lib/curlx/dynbuf.h:63-82` so that a reader can
-//! diff this block against the header directly. Each row is declared
-//! individually below with its measured consumer.
-//!
-//! ```text
-//! #define MAX_DYNBUF_SIZE (SIZE_MAX / 2)
-//!
-//! #define DYN_DOH_RESPONSE    3000
-//! #define DYN_DOH_CNAME       256
-//! #define DYN_PAUSE_BUFFER    (64 * 1024 * 1024)
-//! #define DYN_HAXPROXY        2048
-//! #define DYN_HTTP_REQUEST    (1024 * 1024)
-//! #define DYN_APRINTF         8000000
-//! #define DYN_RTSP_REQ_HEADER (64 * 1024)
-//! #define DYN_TRAILERS        (64 * 1024)
-//! #define DYN_PROXY_CONNECT_HEADERS 16384
-//! #define DYN_QLOG_NAME       1024
-//! #define DYN_H1_TRAILER      4096
-//! #define DYN_PINGPPONG_CMD   (64 * 1024)
-//! #define DYN_IMAP_CMD        (64 * 1024)
-//! #define DYN_MQTT_RECV       (64 * 1024)
-//! #define DYN_MQTT_SEND       0xFFFFFFF
-//! #define DYN_CRLFILE_SIZE    (400 * 1024 * 1024) /* 400MiB */
-//! #define DYN_CERTFILE_SIZE   (100 * 1024) /* 100KiB */
-//! #define DYN_KEYFILE_SIZE    (100 * 1024) /* 100KiB */
-//! ```
-//!
-//! Nineteen rows, counted rather than eyeballed. This expression
-//!
-//! ```text
-//! grep -cE '^#define (DYN_|MAX_DYNBUF_SIZE)' lib/curlx/dynbuf.h
-//! ```
-//!
-//! returns 19, and nineteen constants are declared below.
-//!
-//! The names keep their `DYN_` prefix and their upper-snake spelling, against
-//! the usual Rust preference for dropping a redundant prefix, so that
-//! `grep DYN_HTTP_REQUEST` still lands in both trees. The arithmetic form is
-//! kept too -- `64 * 1024 * 1024` rather than `67108864` -- because it is
-//! self-documenting and because a pre-multiplied literal cannot be diffed
-//! against the header by eye.
-//!
-//! Most of these are consumed by modules well outside `util`, which is why
-//! they live beside the type that enforces them rather than at each call
-//! site: DNS-over-HTTPS, HTTP/1.1, HTTP/2, HTTP/3, the chunked decoder, FTP
-//! and IMAP command construction, MQTT, RTSP, the HAProxy filter, the proxy
-//! CONNECT tunnel, the paused-transfer writer, `aprintf` and the TLS file
-//! loaders.
 //!
 //! # Not implemented here: `curlx_dyn_vprintf`
 //!
@@ -261,10 +162,6 @@ use crate::error::{CURLcode, CodeResult};
 /// `0x7fff_ffff_ffff_ffff`. Thirty-two-bit support is a deliberate forfeit
 /// recorded in the specification, so no narrower reading of `SIZE_MAX` is
 /// reproduced.
-///
-/// It is not a limit any buffer actually uses. Its sole consumer in the C is
-/// the sanity check in `curlx_dyn_init` (`lib/curlx/dynbuf.c:42`), annotated
-/// there "catch crazy mistakes", which [`DynBuf::new`] reproduces.
 pub(crate) const MAX_DYNBUF_SIZE: usize = usize::MAX / 2;
 
 /// A DNS-over-HTTPS response -- `DYN_DOH_RESPONSE`,
@@ -292,11 +189,6 @@ pub(crate) const DYN_HAXPROXY: usize = 2048;
 
 /// An outgoing HTTP request -- `DYN_HTTP_REQUEST`,
 /// `lib/curlx/dynbuf.h:69`.
-///
-/// The most widely used row in the table, and the one whose ceiling is most
-/// visible to a caller. Consumed by `lib/http.c`, `lib/http1.h`,
-/// `lib/http2.c`, `lib/cf-h1-proxy.c`, `lib/cf-h2-proxy.c`,
-/// `lib/vquic/curl_ngtcp2.c` and `lib/vquic/curl_quiche.c`.
 #[allow(dead_code)]
 pub(crate) const DYN_HTTP_REQUEST: usize = 1024 * 1024;
 
@@ -379,10 +271,6 @@ pub(crate) const DYN_MQTT_SEND: usize = 0xFFFFFFF;
 /// A certificate revocation list file -- `DYN_CRLFILE_SIZE`,
 /// `lib/curlx/dynbuf.h:80`, annotated there `/* 400MiB */`. Consumed by
 /// `lib/vtls/rustls.c`.
-///
-/// The largest limit in the table. Its consumer is curl's existing rustls
-/// backend, which is the closest reference the C tree offers for this
-/// workspace's TLS layer.
 #[allow(dead_code)]
 pub(crate) const DYN_CRLFILE_SIZE: usize = 400 * 1024 * 1024;
 
@@ -408,10 +296,6 @@ const MIN_FIRST_ALLOC: usize = 32;
 
 /// A growable byte buffer with a hard, caller-supplied ceiling.
 ///
-/// Supersedes `struct dynbuf` (`lib/curlx/dynbuf.h:27-35`). Two fields where
-/// the C had four plus a debug-only fifth; the module documentation records
-/// what each disappearance bought.
-///
 /// # Lifecycle, and why there are three ways to empty it
 ///
 /// Rust would naturally offer one. All three are kept because the C call
@@ -424,27 +308,15 @@ const MIN_FIRST_ALLOC: usize = 32;
 /// | [`free`](Self::free)   | dropped | released   | yes      |
 /// | `drop`                 | dropped | released   | gone     |
 ///
-/// [`reset`](Self::reset) is the hot path -- a line reader calls it once per
-/// line and wants the allocation back for the next one. [`free`](Self::free)
-/// is what a failed append performs internally, and what a caller performs
-/// when it is done with the contents but intends to keep appending later; the
-/// C comment at `lib/curlx/dynbuf.c:53-54` is explicit that the struct "can
-/// be reused to add data to again" afterwards. `Drop` is end-of-life and
-/// needs no code at all: the container releases its own allocation, which is
-/// the whole of what `curlx_dyn_free` had to be called by hand for.
-///
-/// The ceiling survives all three. Nothing short of dropping the value
-/// changes it, so a buffer that has been emptied still refuses the same
-/// oversized append it refused before.
-///
 /// # Errors
 ///
 /// Every fallible method returns one of exactly three codes, and no other:
 ///
 /// - `CURLcode::TooLarge` -- the append would have carried the buffer past
 ///   its ceiling. The buffer is emptied.
-/// - `CURLcode::OutOfMemory` -- an allocation was refused. Near-unreachable
-///   in Rust; see [`Self::nappend`].
+/// - `CURLcode::OutOfMemory` -- an allocation was refused, exactly as a null
+///   `realloc` is refused in the C. The buffer is emptied. See
+///   [`Self::nappend`].
 /// - `CURLcode::BadFunctionArgument` -- [`tail`](Self::tail) or
 ///   [`setlen`](Self::setlen) was asked for more bytes than the buffer holds.
 #[allow(dead_code)]
@@ -464,14 +336,6 @@ pub(crate) struct DynBuf {
 }
 
 /// Reports the buffer's shape without dumping its contents.
-///
-/// Deliberately hand-written rather than derived. `#[derive(Debug)]` would
-/// render the `Vec<u8>` element by element, so a failed assertion on a
-/// `DYN_CRLFILE_SIZE` buffer could emit four hundred mebibytes of decimal
-/// integers into a panic message. The three numbers below are what a reader
-/// debugging a limit or a growth question actually needs, and `capacity` is
-/// included precisely because it is *not* part of the API contract and is
-/// therefore otherwise unobservable.
 impl fmt::Debug for DynBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DynBuf")
@@ -485,11 +349,6 @@ impl fmt::Debug for DynBuf {
 #[allow(dead_code)]
 impl DynBuf {
     /// Creates an empty buffer with `toobig` as its ceiling.
-    ///
-    /// Supersedes `curlx_dyn_init` (`lib/curlx/dynbuf.c:38-50`), which
-    /// "cannot fail" and allocates nothing. Neither does this: the first
-    /// allocation happens on the first append, exactly as in the C, where
-    /// `bufr` starts as `NULL` and `allc` as zero.
     ///
     /// # Panics
     ///
@@ -570,30 +429,26 @@ impl DynBuf {
     /// to append: whatever the buffer had accumulated is destroyed and the
     /// allocation released. Callers depend on it, so it is reproduced exactly.
     ///
-    /// # The out-of-memory path is near-dead, and kept anyway
+    /// # The out-of-memory path is live
     ///
-    /// The C's second failure is `realloc` returning null. Rust's global
-    /// allocator aborts the process instead of reporting failure, so
-    /// `CURLcode::OutOfMemory` is not reachable from the growth performed
-    /// here. It stays in the documented error set of this module because
-    /// callers match on it and because [`Self::addf`] does reach it, by a
-    /// different route: a `Display` implementation that fails without
-    /// recording a code of its own. `try_reserve` was considered as a way to
-    /// make the growth path reachable too and rejected: it cannot be adopted
-    /// without changing what the success path does, and the specification
-    /// makes faithfulness the tie-breaker.
+    /// The C's second failure is `realloc` returning null, and
+    /// `lib/curlx/dynbuf.c:105-109` turns it into `curlx_dyn_free(s)` plus
+    /// `CURLE_OUT_OF_MEMORY`. The growth below uses
+    /// [`Vec::try_reserve_exact`] and reproduces both halves, so
+    /// `CURLcode::OutOfMemory` is reachable from this function and not merely
+    /// from [`Self::addf`]'s failing `Display`.
+    ///
+    /// An earlier revision used the infallible `reserve_exact` and recorded
+    /// that `try_reserve` had been "considered and rejected" because it could
+    /// not be adopted without changing the success path. That was measurably
+    /// wrong: the two ask the allocator for the same total capacity and a
+    /// served request is indistinguishable, so the success path is unchanged
+    /// and only the failure differs -- an aborted process becoming the code the
+    /// C returns. A dynbuf's length comes from whatever the caller appended, so
+    /// this is one of the externally sized allocations
+    /// [`crate::util::fallible`] exists for.
     ///
     /// # Growth
-    ///
-    /// The three-branch first allocation and the doubling loop are
-    /// reproduced in the C's own shape rather than replaced by the
-    /// container's amortised growth. Capacity is not observable through this
-    /// interface, so a different policy would be undetectable and the code
-    /// would be faster to write; it is written this way so that it can be
-    /// read against the C line for line, and because performance is an
-    /// explicit non-goal. The three branches matter individually -- the first
-    /// of them, `MIN_FIRST_ALLOC > toobig`, is the only thing that keeps a
-    /// buffer whose ceiling is under 32 bytes from over-allocating past it.
     ///
     /// Two differences from the C are deliberate and neither is observable:
     ///
@@ -686,34 +541,33 @@ impl DynBuf {
         // than `allc` there, so that test is a grow test, and `reserve_exact`
         // is its counterpart -- it asks for a total capacity of `a` and never
         // shrinks.
-        //
-        // The argument is an increment over the current length, not a total.
-        // The guard establishes `a > capacity() >= len() == idx`, so the
-        // subtraction cannot underflow; `saturating_sub` states that in code
-        // rather than in a comment, and a zero would merely reserve nothing.
         if a > self.buf.capacity() {
-            self.buf.reserve_exact(a.saturating_sub(idx));
+            // `try_reserve_exact` and not `reserve_exact`: `a` is derived from
+            // `mem.len()`, which for a caller like `curlx_dyn_addn` on a
+            // server-supplied header or an application-supplied body is a
+            // length this library did not choose. The C's `realloc` returning
+            // null becomes `CURLE_OUT_OF_MEMORY` at `lib/curlx/dynbuf.c:105-109`
+            // -- including its `curlx_dyn_free(s)` -- and that is reproduced
+            // here rather than aborting the process.
+            //
+            // The success path is bit-for-bit what `reserve_exact` did: the
+            // same total capacity is requested, and a served request behaves
+            // identically. Only the failure changes, from an abort to a code
+            // the caller already handles.
+            if self.buf.try_reserve_exact(a.saturating_sub(idx)).is_err() {
+                self.free();
+                return Err(CURLcode::OutOfMemory);
+            }
         }
 
         // `lib/curlx/dynbuf.c:114-117`, in one line. This is the C's `memcpy`
         // and its by-hand `s->leng = idx + len`, and the terminator write it
         // ends with has no counterpart here.
-        //
-        // An empty `mem` is not special-cased and must not be. The C runs the
-        // whole of the above for a zero-length append -- ceiling test,
-        // allocation and all -- and returns success, and a caller uses that to
-        // force a buffer into existence. Everything before this point has
-        // already happened by the time an empty slice arrives, and appending
-        // it is the no-op the C's skipped `memcpy` is.
         self.buf.extend_from_slice(mem);
         Ok(())
     }
 
     /// Appends a byte slice.
-    ///
-    /// Supersedes `curlx_dyn_addn` (`lib/curlx/dynbuf.c:162-168`), which is
-    /// the same thin wrapper over the core append. The C's separate `len`
-    /// parameter is the slice's own length here.
     ///
     /// # Errors
     ///
@@ -743,23 +597,9 @@ impl DynBuf {
 
     /// Appends formatted output.
     ///
-    /// Supersedes **both** `curlx_dyn_addf` (`lib/curlx/dynbuf.c:220-232`)
-    /// and `curlx_dyn_vaddf` (`:187-215`). The C needs two functions because
-    /// one takes `...` and the other the `va_list` it was packed into;
-    /// `format_args!` is Rust's `va_list`, already packed by the caller, so
-    /// one function covers both. Call it as
-    ///
     /// ```text
     /// buf.addf(format_args!("{scheme}://{host}:{port}"))?;
     /// ```
-    ///
-    /// Prefer [`add`](Self::add) for a bare string. The C carries
-    /// `DEBUGASSERT(strcmp(fmt, "%s"))` at `lib/curlx/dynbuf.c:227` with the
-    /// comment "use curlx_dyn_add instead", guarding against a formatting
-    /// pass that does nothing but copy. There is no runtime counterpart --
-    /// `fmt::Arguments` does not expose its template -- and no attempt is made
-    /// to inspect the literal at compile time either; the guidance lives in
-    /// this sentence instead.
     ///
     /// # Errors
     ///
@@ -813,34 +653,12 @@ impl DynBuf {
     }
 
     /// Drops the content and keeps the allocation.
-    ///
-    /// Supersedes `curlx_dyn_reset` (`lib/curlx/dynbuf.c:125-133`), whose
-    /// comment reads "Clears the string, keeps the allocation. This can also
-    /// be called on a buffer that already was freed."
-    ///
-    /// Both halves of that comment are reproduced. `Vec::clear` truncates to
-    /// zero and is documented to have no effect on capacity, which is the
-    /// "keeps the allocation" half and is what makes this the right call in a
-    /// loop -- a line reader calls it once per line and the next line reuses
-    /// the same buffer. And it is total: clearing an already-empty buffer,
-    /// including one that [`free`](Self::free) has just emptied, does nothing
-    /// and cannot panic, so the C's second sentence needs no special case
-    /// here either.
-    ///
-    /// Contrast [`free`](Self::free), which releases the allocation as well.
-    /// The lifecycle table on [`DynBuf`] sets the three operations side by
-    /// side.
     pub(crate) fn reset(&mut self) {
         self.buf.clear();
     }
 
     /// Drops the content and releases the allocation, leaving the buffer
     /// reusable.
-    ///
-    /// Supersedes `curlx_dyn_free` (`lib/curlx/dynbuf.c:56-62`), which
-    /// releases `bufr` and zeroes `leng` and `allc` while leaving `toobig` --
-    /// and the debug sentinel -- alone, so that, in the C's words, "this
-    /// buffer can be reused to add data to again".
     ///
     /// **This is deliberately not `Drop`.** Call sites invoke it mid-life and
     /// then keep appending, and the internal failure paths invoke it on a
@@ -849,13 +667,6 @@ impl DynBuf {
     /// container releases its own allocation when the value goes out of
     /// scope, which is the entire reason `curlx_dyn_free` had to be called by
     /// hand in the first place.
-    ///
-    /// Replacing the field is what releases the memory: the outgoing `Vec` is
-    /// dropped here, and the incoming one holds no allocation, so `capacity`
-    /// returns to zero. That matters beyond tidiness -- it restores the
-    /// `allc == 0` state that [`Self::nappend`] tests for, so the next append
-    /// takes the C's first-invoke branch, exactly as it would after
-    /// `curlx_dyn_free`.
     pub(crate) fn free(&mut self) {
         self.buf = Vec::new();
     }
@@ -874,10 +685,6 @@ impl DynBuf {
     /// | equal to `len`     | success, no change |
     /// | zero               | success, empty -- the C calls `reset` here |
     /// | otherwise          | the tail moves to the front |
-    ///
-    /// The `trail == 0` case routing through [`reset`](Self::reset) rather
-    /// than `free` is not incidental: the allocation is kept, which is what
-    /// the C does.
     ///
     /// # Errors
     ///
@@ -906,9 +713,6 @@ impl DynBuf {
         // overlapping ranges, which this one is whenever `trail` exceeds half
         // the length -- and `truncate` is the by-hand `s->leng = trail` that
         // follows it. The terminator write the C ends with has no counterpart.
-        //
-        // `len - trail` cannot underflow: the two guards above have
-        // established `trail < len`.
         self.buf.copy_within(len - trail.., 0);
         self.buf.truncate(trail);
         Ok(())
@@ -921,13 +725,6 @@ impl DynBuf {
     /// rather than growing to meet it, because the bytes between the old
     /// length and the new one would have no defined content. To keep the
     /// *trailing* bytes instead, use [`tail`](Self::tail).
-    ///
-    /// A note for anyone diffing against the C: `curlx_dyn_setlen(s, 0)` on a
-    /// buffer that has never been appended to writes `s->bufr[0]` with `bufr`
-    /// still null (`lib/curlx/dynbuf.c:290`). `Vec::truncate(0)` on an empty
-    /// container is well defined and does nothing, so the successor is
-    /// strictly better behaved on an input the C cannot survive. No valid C
-    /// caller reaches that state, so nothing observable changes.
     ///
     /// # Errors
     ///
@@ -981,16 +778,6 @@ impl DynBuf {
     }
 
     /// Borrows the accumulated bytes mutably, for in-place editing.
-    ///
-    /// The mutable counterpart of [`as_slice`](Self::as_slice), for the C
-    /// callers that write through `curlx_dyn_ptr`'s result rather than only
-    /// reading it. In-place editing only: the slice cannot change the length,
-    /// so it cannot reach past the ceiling, which is why this needs no limit
-    /// check and cannot fail.
-    ///
-    /// Everything said about [`as_slice`](Self::as_slice) applies -- empty
-    /// rather than null, no terminator, and the borrow checker enforcing the
-    /// invalidation rule the C could only document.
     #[must_use]
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buf
@@ -1008,16 +795,6 @@ impl DynBuf {
     }
 
     /// Whether the buffer holds no bytes.
-    ///
-    /// The C has no counterpart -- its callers compare `curlx_dyn_len` against
-    /// zero, or test the pointer for null. Provided because
-    /// `self.len() == 0` is the clearer thing to say as `self.is_empty()`,
-    /// and because a length accessor without one reads as an oversight to
-    /// every Rust reader and to the linter.
-    ///
-    /// True both for a buffer that has never been appended to and for one that
-    /// [`reset`](Self::reset) or [`free`](Self::free) has emptied; those
-    /// states differ only in capacity, which is not part of this interface.
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.buf.is_empty()
@@ -1030,21 +807,6 @@ impl DynBuf {
     /// returns `bufr` and the length through an out-parameter, then sets
     /// `bufr` to null and `leng` and `allc` to zero -- transferring ownership
     /// of the allocation and leaving `toobig` in place.
-    ///
-    /// All of that is one operation on an owned container. The out-parameter
-    /// disappears because the returned `Vec` carries its own length, and the
-    /// three-field reset is what `core::mem::take` leaves behind: an empty
-    /// container with no allocation. The ceiling is untouched, so the buffer
-    /// keeps enforcing the same limit on everything appended afterwards.
-    ///
-    /// The state left behind is [`free`](Self::free)'s, not
-    /// [`reset`](Self::reset)'s -- capacity goes with the bytes, because the
-    /// caller now owns the allocation they were in.
-    ///
-    /// A note for anyone diffing against the C: `curlx_dyn_take` is the one
-    /// entry point that omits `DEBUGASSERT(!s->leng || s->bufr)`. Nothing
-    /// follows from that here, since the invariant it was checking is the
-    /// container's.
     #[must_use]
     pub(crate) fn take(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.buf)
@@ -1052,19 +814,6 @@ impl DynBuf {
 }
 
 /// The formatting sink behind [`DynBuf::addf`].
-///
-/// `fmt::Write` is implemented here rather than on [`DynBuf`] itself, and that
-/// is the point of the type existing. `fmt::Write::write_str` can report only
-/// `fmt::Error`, which carries nothing, so a `DynBuf` implementing the trait
-/// directly would let `write!` collapse `CURLcode::TooLarge` and
-/// `CURLcode::OutOfMemory` into one indistinguishable failure -- and
-/// `docs/internals/DYNBUF.md` is explicit that confusing those two is a
-/// behaviour change, because one means the caller asked for more than the
-/// buffer may hold and the other means the allocator refused.
-///
-/// The sink keeps the real code in a field and hands `fmt::Error` to the
-/// formatting machinery purely as a stop signal, so [`DynBuf::addf`] can
-/// recover the code afterwards and no caller is offered the lossy route.
 struct FmtSink<'a> {
     /// The buffer being appended to.
     buf: &'a mut DynBuf,
@@ -1102,23 +851,6 @@ mod tests {
 
     /// The nineteen size limits, each paired with the value the C header
     /// spells, transcribed a second time and independently.
-    ///
-    /// Two things are asserted here that no single `assert_eq!` could be.
-    ///
-    /// The **count** is asserted by the type: `[_; 19]` makes a missing row or
-    /// a twentieth one a compile error rather than a test failure, which is
-    /// the check `grep -cE '^#define (DYN_|MAX_DYNBUF_SIZE)'
-    /// lib/curlx/dynbuf.h` performs against the header.
-    ///
-    /// The **values** are asserted against a second transcription. The
-    /// constants above keep the C's arithmetic form so that they can be diffed
-    /// against the header by eye; the third column here is the same number
-    /// written out, so a slip in either spelling disagrees with the other. The
-    /// `MAX_DYNBUF_SIZE` row is the one exception -- its C spelling is
-    /// `(SIZE_MAX / 2)` rather than a literal, so the second transcription is
-    /// necessarily the same expression, and
-    /// [`max_dynbuf_size_is_half_the_address_space`] supplies the independent
-    /// literal for the targets where one exists.
     const LIMITS: [(&str, usize, usize); 19] = [
         ("MAX_DYNBUF_SIZE", MAX_DYNBUF_SIZE, usize::MAX / 2),
         ("DYN_DOH_RESPONSE", DYN_DOH_RESPONSE, 3000),
@@ -1215,12 +947,6 @@ mod tests {
     // ---- The ceiling, and the `+ 1` that defines it ------------------------
 
     /// The single most important behaviour in the module.
-    ///
-    /// The C's `fit` counts the incoming bytes, the bytes held **and** a zero
-    /// byte, so a ceiling of `n` admits at most `n - 1` bytes. Both sides of
-    /// the boundary are pinned, and the second half of the test moves the
-    /// ceiling up by one to show the boundary moves with it -- which is what
-    /// distinguishes a correct `+ 1` from a coincidence.
     #[test]
     fn the_ceiling_reserves_one_byte_for_the_c_terminator() {
         // 7 + 0 + 1 == 8, which is not greater than 8.
@@ -1314,12 +1040,6 @@ mod tests {
     }
 
     /// The doubling branch and the clamp that follows it.
-    ///
-    /// Chosen so that every arm of the growth policy runs: the first append
-    /// takes the `fit < MIN_FIRST_ALLOC` branch, the second doubles 32 to 64
-    /// and is then clamped down to the ceiling, and the third crosses it.
-    /// Capacity is not observable through this interface, so what is asserted
-    /// is the content and the boundary -- which is the whole of the contract.
     #[test]
     fn growth_doubles_and_then_clamps_to_the_ceiling() {
         let mut buf = DynBuf::new(40);

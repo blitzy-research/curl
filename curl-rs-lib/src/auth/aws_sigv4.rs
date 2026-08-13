@@ -23,79 +23,9 @@
 //  ***************************************************************************/
 //! AWS Signature Version 4 request signing.
 //!
-//! Supersedes `lib/http_aws_sigv4.c` (1,128 lines) in full, and backs
-//! `CURLOPT_AWS_SIGV4` and the `--aws-sigv4` command-line flag.
+//! Supersedes `lib/http_aws_sigv4.c` in full, and backs `CURLOPT_AWS_SIGV4`
+//! and the `--aws-sigv4` command-line flag.
 //!
-//! Every artefact this module produces reaches the wire or the signature, so
-//! all of it is frozen behaviour (AAP 0.8.1): the canonical request, the
-//! string to sign, the five keyed digests, and the `Authorization:` header
-//! line together with the two extra header lines that accompany it.
-//! `tests/getpart.pm:351` joins a fixture's expectation and the observed
-//! bytes into one string and compares them whole -- no per-line matching, no
-//! normalization, no reordering -- so one wrong byte, one mis-sorted header
-//! or one upper-case hexadecimal digit fails the comparison outright.
-//!
-//! # Where each behaviour comes from
-//!
-//! Line numbers are measured against `lib/http_aws_sigv4.c` as checked out at
-//! commit `54cf587b9c`:
-//!
-//! | C site | What it fixes | Here |
-//! |--------|---------------|------|
-//! | `:41-51`     | the `HMAC_SHA256` macro over `Curl_hmacit` | [`sign`]'s five digests |
-//! | `:53`        | `TIMESTAMP_SIZE 17` | [`TIMESTAMP_SIZE`] |
-//! | `:56`        | `SHA256_HEX_LENGTH` | [`SHA256_HEX_LENGTH`] |
-//! | `:58`        | `MAX_QUERY_COMPONENTS 128` | [`MAX_QUERY_COMPONENTS`] |
-//! | `:65-69`     | `sha256_to_hex`, the LOWER-case encoder | [`sha256_to_hex`] |
-//! | `:71-78`     | `find_date_hdr`, provider key then plain `Date` | [`find_date_hdr`] |
-//! | `:80-116`    | `trim_headers`, the whitespace rules | [`trim_header`] |
-//! | `:150-197`   | `split_to_dyn_array`, splitting on `&` | [`split_query`] |
-//! | `:199-202`   | `is_reserved_char` | [`is_reserved_char`] |
-//! | `:204-223`   | `uri_encode_path`, UPPER-case hexadecimal | [`uri_encode_path`] |
-//! | `:228-264`   | `normalize_query`, the `%2B` rule | [`normalize_query`] |
-//! | `:266-281`   | `should_urlencode`, the three S3 services | [`should_urlencode`] |
-//! | `:284-288`   | `MAX_SIGV4_LEN` and the date-header lengths | [`MAX_SIGV4_LEN`] |
-//! | `:292-319`   | `compare_header_names`, shorter name first | [`compare_header_names`] |
-//! | `:324-370`   | `merge_duplicate_headers`, comma joining | [`merge_duplicate_headers`] |
-//! | `:373-548`   | `make_headers`, canonicalization end to end | [`make_headers`] |
-//! | `:550-552`   | the content-sha256 buffer lengths | [`CONTENT_SHA256_KEY_LEN`] |
-//! | `:555-585`   | `parse_content_sha_hdr` | [`parse_content_sha_hdr`] |
-//! | `:587-605`   | `calc_payload_hash` | [`calc_payload_hash`] |
-//! | `:607`       | `S3_UNSIGNED_PAYLOAD` | [`S3_UNSIGNED_PAYLOAD`] |
-//! | `:609-644`   | `calc_s3_payload_hash` | [`calc_s3_payload_hash`] |
-//! | `:646-681`   | `compare_func`, the query-component order | [`compare_query_pairs`] |
-//! | `:683-707`   | `canon_path` | [`canon_path`] |
-//! | `:709-812`   | `canon_query` | [`canon_query`] |
-//! | `:850-858`   | the two preconditions | [`sign`] |
-//! | `:866-919`   | parameter parsing and hostname derivation | [`parse_parameters`] |
-//! | `:947-965`   | the clock and `strftime` | [`format_timestamp`] |
-//! | `:995-1010`  | the canonical request | [`sign`] |
-//! | `:1015-1030` | `request_type` and the credential scope | [`request_type`] |
-//! | `:1044-1058` | the string to sign | [`sign`] |
-//! | `:1063-1077` | the secret and the five digests | [`SigningSecret`] |
-//! | `:1083-1107` | the emitted header block | [`sign`] |
-//!
-//! Two further sites outside that file are load-bearing. `lib/escape.c:200`
-//! documents `Curl_hexencode` as producing "lowercase hex-encoded ASCII" and
-//! indexes `Curl_ldigits`, while `:222` documents `Curl_hexbyte` as "a
-//! two-digit UPPERCASE hex number" and indexes `Curl_udigits`; this module
-//! needs BOTH and must never unify them. And `lib/http.c:642-644` guards the
-//! only call site with `&& !proxy`, commented "this method is never for
-//! proxy".
-//!
-//! # AWS SigV4 is never used for a proxy, and that is an invariant here
-//!
-//! `Curl_output_aws_sigv4()` takes no `proxy` parameter, writes
-//! `data->state.aptr.userpwd` unconditionally, and sets
-//! `data->state.authhost.done` -- the origin state, never the proxy one
-//! (`lib/http_aws_sigv4.c:1109-1111`). The guard that keeps it that way lives
-//! in `super::select_emitter`, whose `AWS_SIGV4` arm carries `&& !proxy`. So
-//! there is no `proxy` field in [`SigV4Request`] and no runtime test for it
-//! anywhere below: the shape of this module's API makes
-//! `Proxy-Authorization: AWS4-HMAC-SHA256` unrepresentable rather than
-//! merely unreachable.
-//!
-//! # This module has no challenge handler, and no [`super::HttpAuthMechanism`]
 //! # implementation
 //!
 //! AWS SigV4 signs a request; it never answers a `WWW-Authenticate:`
@@ -109,20 +39,6 @@
 //! application's own headers, the path, the query, the payload) nor a
 //! [`Tracer`] for the three frozen `infof()` lines, and the trait's `input`
 //! method would have no behaviour to implement.
-//!
-//! # Bytes, not text
-//!
-//! Every internal buffer is `Vec<u8>` or `&[u8]`. The C works on
-//! NUL-terminated byte strings whose contents come from a URL, a query string
-//! and application-supplied headers -- all attacker-influenced -- and none of
-//! it is required to be UTF-8. Byte slices also remove a hazard that text
-//! would add: this module indexes a header at the offset of its colon and
-//! rewrites the third byte of a key, and both operations panic on a `&str`
-//! when the offset lands inside a multi-byte character. [`until_nul`]
-//! reproduces the C's implicit `strlen`/`strchr` truncation at the points
-//! where the C relies on it, and the only conversions to text are the three
-//! diagnostics and the emitted header block, each of which is lossy and says
-//! so.
 //!
 //! # Secrets
 //!
@@ -142,6 +58,10 @@
 use core::cmp::Ordering;
 use core::fmt;
 use core::fmt::Write as _;
+// Reached only by the debug-build arm of `forced_epoch_requested`, which is the
+// `#ifdef DEBUGBUILD` guard of `lib/http_aws_sigv4.c:947-957`. Gated with it so
+// a release build carries no environment read on the signing path at all.
+#[cfg(debug_assertions)]
 use std::env;
 
 use crate::crypto::hmac::hmac_sha256;
@@ -150,6 +70,7 @@ use crate::error::CURLcode;
 use crate::trace::{failf, infof, Tracer};
 use crate::url::escape::{hexbyte, hexencode};
 use crate::util::dynbuf::DynBuf;
+use crate::util::redact::is_sensitive_header;
 use crate::util::strcase::{ncasecompare, raw_tolower, raw_toupper};
 use crate::util::strparse::{
     hexval, is_alnum, is_blank, is_urlpunct, is_xdigit, str_casecompare,
@@ -159,18 +80,10 @@ use crate::util::timeval::{gmtime, Clock};
 
 use super::{AuthEmission, Credentials, REDACTED_PLACEHOLDER};
 
-// ---------------------------------------------------------------------------
 // Constants. Every one of these is a C `#define` with its site recorded.
-// ---------------------------------------------------------------------------
 
 /// `TIMESTAMP_SIZE` (`lib/http_aws_sigv4.c:53`): the size of the buffer that
 /// holds `YYYYMMDDTHHMMSSZ`.
-///
-/// Seventeen, because the C counts the terminator. The string itself is
-/// [`TIMESTAMP_LEN`] = 16 bytes, and that 16 is load-bearing twice over: it
-/// is the length `strftime` must produce, and it is the exact length an
-/// application-supplied date header has to have before `make_headers()` will
-/// adopt it (`:493`).
 pub(crate) const TIMESTAMP_SIZE: usize = 17;
 
 /// The timestamp as a *string*: `TIMESTAMP_SIZE - 1`, 16 bytes.
@@ -193,31 +106,13 @@ const DATE_LEN: usize = 8;
 pub(crate) const SHA256_HEX_LENGTH: usize = 2 * DIGEST_LEN + 1;
 
 /// `MAX_QUERY_COMPONENTS` (`lib/http_aws_sigv4.c:58`): 128.
-///
-/// A security bound, not a capacity hint. The C declares
-/// `struct dynbuf query_array[MAX_QUERY_COMPONENTS]` and errors with
-/// `CURLE_TOO_LARGE` the moment the count REACHES this value (`:174-177` and
-/// `:190-191`), so at most 127 components are ever accepted. See
-/// [`split_query`], which reproduces the off-by-one exactly.
 pub(crate) const MAX_QUERY_COMPONENTS: usize = 128;
 
 /// `MAX_SIGV4_LEN` (`lib/http_aws_sigv4.c:284`): 64 bytes per component.
-///
-/// The C's own comment is "maximum length for the aws sivg4 parts". It caps
-/// each of `provider0`, `provider1`, `region` and `service`, whether they
-/// come from the option string or are derived from the hostname. A component
-/// of exactly 64 bytes is accepted; 65 is not, because
-/// `curlx_str_until()` fails once the count passes `max`
-/// (`lib/curlx/strparse.c:50-52`).
 pub(crate) const MAX_SIGV4_LEN: usize = 64;
 
 /// `DATE_HDR_KEY_LEN` (`lib/http_aws_sigv4.c:285`):
 /// `MAX_SIGV4_LEN + sizeof("X--Date")`.
-///
-/// C's `sizeof` on a string literal counts the terminator, which is why the
-/// `+ 1` appears below. The widest key this admits is `X-` plus 64 bytes plus
-/// `-Date` plus a terminator, which is exactly 72 -- so the C's buffer is
-/// sized to the byte with nothing to spare.
 pub(crate) const DATE_HDR_KEY_LEN: usize = MAX_SIGV4_LEN + "X--Date".len() + 1;
 
 /// `DATE_FULL_HDR_LEN` (`lib/http_aws_sigv4.c:288`), whose C comment reads
@@ -273,19 +168,21 @@ const CURL_MAX_HTTP_HEADER: usize = 100 * 1024;
 /// reach the signature as these five bytes. See [`dyn_or_nil`].
 const NIL_STRING: &[u8] = b"(nil)";
 
-/// The environment variable that pins the signing clock to the Unix epoch.
+/// The environment variable that pins the signing clock to the Unix epoch, in a
+/// debug build.
 ///
 /// `lib/http_aws_sigv4.c:947-957` reads it through `getenv()` and, when it is
-/// set to anything at all, signs as though the time were zero.
+/// set to anything at all, signs as though the time were zero -- **inside
+/// `#ifdef DEBUGBUILD`**. See [`signing_epoch_secs`] for why that guard is
+/// reproduced here and why doing so costs no fixture.
+///
+/// The `test` arm of the gate exists because `cargo test --release` turns
+/// `debug_assertions` off while still compiling the test module, and a test
+/// asserts this name is spelled exactly as the C spells it.
+#[cfg(any(debug_assertions, test))]
 const FORCETIME_ENV: &str = "CURL_FORCETIME";
 
 // Value contracts, evaluated during compilation.
-//
-// These pin what the C fixes, and they double as the reference that keeps
-// every constant above referenced: a `pub(crate)` constant with no consumer
-// is `dead_code`, and the build gate admits no warnings. A sibling that
-// "simplifies" one of these values breaks the build here, beside the citation
-// that explains why it cannot change.
 const _: () = assert!(TIMESTAMP_SIZE == 17);
 const _: () = assert!(TIMESTAMP_LEN == 16);
 const _: () = assert!(DATE_LEN == 8);
@@ -300,20 +197,10 @@ const _: () = assert!(S3_UNSIGNED_PAYLOAD.len() == 16);
 const _: () = assert!(S3_UNSIGNED_PAYLOAD.len() < SHA256_HEX_LENGTH);
 const _: () = assert!(CURL_MAX_HTTP_HEADER == 102_400);
 
-// ---------------------------------------------------------------------------
 // The request description: what `Curl_output_aws_sigv4()` reads out of the
 // easy handle, gathered into one argument.
-// ---------------------------------------------------------------------------
 
 /// Everything this signature covers.
-///
-/// The C reads fourteen fields off `struct Curl_easy` and `struct
-/// connectdata`; each becomes a field here, named for the C expression it
-/// stands for so that a reader can check the two side by side. Passing them
-/// as one structure rather than as fourteen parameters is not only a matter of
-/// taste: `clippy.toml` sets `too-many-arguments-threshold = 9`.
-///
-/// There is deliberately no `proxy` field. See the module documentation.
 #[allow(dead_code)] // Consumer is `crate::protocols::http1`, not yet landed.
 pub(crate) struct SigV4Request<'a> {
     /// `data->set.str[STRING_AWS_SIGV4]`: the option value, in the form
@@ -340,12 +227,6 @@ pub(crate) struct SigV4Request<'a> {
 
     /// `data->state.aptr.host`: the whole `Host:` header line curl built,
     /// terminator included -- `"Host: example.com:8080\r\n"`.
-    ///
-    /// Passed as the complete line because that is what the C truncates:
-    /// `strcspn(data->state.aptr.host, "\n\r")` at `:407`, with the comment
-    /// "remove /r/n as the separator for canonical request must be '\n'".
-    /// [`None`] is the state `http_set_aptr_host()` leaves behind when the
-    /// application supplied a bare `Host:` (`lib/http.c:2044-2049`).
     pub(crate) host_header: Option<&'a [u8]>,
 
     /// `conn->host.name`: the hostname alone, without a port.
@@ -362,12 +243,6 @@ pub(crate) struct SigV4Request<'a> {
 
     /// The method token `Curl_http_method()` selected -- `"GET"`, `"POST"`,
     /// `"PUT"` and so on (`lib/http.c:1940-1966`).
-    ///
-    /// This is NOT redundant with [`Self::is_get_or_head`]:
-    /// `CURLOPT_CUSTOMREQUEST` replaces the token while leaving
-    /// `data->state.httpreq` alone, so `curl -X PUT` with no body signs the
-    /// method `PUT` with the empty-payload rule of a `GET`. `tests/data/test1976`
-    /// depends on exactly that combination.
     pub(crate) method: &'a [u8],
 
     /// `httpreq == HTTPREQ_GET || httpreq == HTTPREQ_HEAD` -- the C's
@@ -474,13 +349,6 @@ impl fmt::Debug for Parameters<'_> {
 }
 
 /// `AWS4` followed by the password: the root of the signing-key chain.
-///
-/// `lib/http_aws_sigv4.c:1063-1069` builds it as `"%.*s4%s"` over
-/// `provider0` and `data->state.aptr.passwd`, then upper-cases the
-/// `provider0` part in place. It is a secret in its entirety -- it CONTAINS
-/// the password -- so the type exists to make sure it cannot be printed by
-/// accident. Nothing reads the material except [`Self::key_material`], and
-/// its only caller is the first of the five keyed digests.
 struct SigningSecret(Vec<u8>);
 
 impl SigningSecret {
@@ -541,19 +409,9 @@ impl fmt::Debug for SigningKey {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Small shared helpers.
-// ---------------------------------------------------------------------------
 
 /// The C-string view of `bytes`: everything before the first zero byte.
-///
-/// The C reaches every one of these inputs through `strlen()`, `strchr()` or
-/// `strcspn()`, all of which stop at the terminator. Applying that here keeps
-/// a zero byte in an application-supplied header or URL from changing what is
-/// signed relative to the C, and it costs nothing for the inputs that have no
-/// zero byte -- which is all of them, since each arrives as a C string.
-/// `crate::util::strparse`'s own `str_until` stops at zero for the same
-/// reason (`lib/curlx/strparse.c:48`).
 fn until_nul(bytes: &[u8]) -> &[u8] {
     match bytes.iter().position(|&byte| byte == 0) {
         Some(at) => &bytes[..at],
@@ -562,16 +420,6 @@ fn until_nul(bytes: &[u8]) -> &[u8] {
 }
 
 /// A buffer's contents, or [`NIL_STRING`] when it is empty.
-///
-/// `curlx_dyn_ptr()` returns `s->bufr`, which is null until the first append,
-/// and `lib/http_aws_sigv4.c:995-1008` hands three such pointers straight to
-/// `curl_maprintf()`. Only the canonical query is guarded there, written
-/// `curlx_dyn_ptr(&canonical_query) ? ... : ""`, so the other three print
-/// `(nil)` when empty. Reachable: an application that supplies a bare `Host:`
-/// AND a bare `X-Amz-Date:` has both suppressed as removal directives and
-/// leaves the header list empty, whereupon the canonical request really does
-/// contain `(nil)\n(nil)`. Faithfulness wins over tidiness here, because
-/// those five bytes are inside a signature.
 fn dyn_or_nil(buffer: &DynBuf) -> &[u8] {
     if buffer.is_empty() {
         NIL_STRING
@@ -603,28 +451,12 @@ fn hexpercent(byte: u8) -> [u8; 3] {
 
 /// `is_reserved_char` (`lib/http_aws_sigv4.c:199-202`):
 /// `ISALNUM(c) || ISURLPUNTCS(c)`.
-///
-/// The C's macro name carries a typo -- `ISURLPUNTCS` -- and its definition
-/// at `lib/curl_ctype.h:47-48` is exactly four bytes: `-`, `.`, `_` and `~`.
-/// Together with the ASCII alphanumerics that is RFC 3986's unreserved set,
-/// which is why the C's own comment at `:211` says "unreserved chars from RFC
-/// 3986" even though the function is called `is_reserved_char`.
-/// `crate::util::strparse::is_unreserved` is the same composition; the two
-/// primitives are spelled out here so that this reads as the C does.
 fn is_reserved_char(byte: u8) -> bool {
     is_alnum(byte) || is_urlpunct(byte)
 }
 
 /// `Curl_checkheaders` (`lib/transfer.c:84-99`): the application's own header
 /// line with this name, if it supplied one.
-///
-/// The match is a case-insensitive comparison of `name.len()` bytes followed
-/// by a separator test, and the separator is `:` OR `;` -- `Curl_headersep`
-/// at `lib/transfer.h:26`. That second spelling matters here: a bare
-/// `X-Amz-Date;` MATCHES, and [`make_headers`] then finds no colon in it and
-/// fails the way the C does.
-///
-/// The FIRST match wins, as in the C.
 fn checkheaders<'a>(headers: &[&'a [u8]], name: &[u8]) -> Option<&'a [u8]> {
     debug_assert!(!name.is_empty(), "the C asserts a non-zero name length");
     debug_assert!(
@@ -648,17 +480,9 @@ fn find_date_hdr<'a>(headers: &[&'a [u8]], sig_hdr: &[u8]) -> Option<&'a [u8]> {
     checkheaders(headers, sig_hdr).or_else(|| checkheaders(headers, b"Date"))
 }
 
-// ---------------------------------------------------------------------------
 // The path and the query. `lib/http_aws_sigv4.c:199-281` and `:683-812`.
-// ---------------------------------------------------------------------------
 
 /// `uri_encode_path` (`lib/http_aws_sigv4.c:204-223`).
-///
-/// Keeps a byte when it is unreserved or a slash, and percent-escapes
-/// everything else with UPPER-case hexadecimal. It does NOT decode: a `%` is
-/// not unreserved, so an already-escaped path is escaped again --
-/// `%3A` becomes `%253A`, which `tests/unit/unit1979.c`'s "test-s3-tables"
-/// case pins.
 fn uri_encode_path(path: &[u8], out: &mut DynBuf) -> Result<(), CURLcode> {
     for &byte in path {
         // "Do not encode slashes or unreserved chars from RFC 3986" (`:211`).
@@ -683,9 +507,6 @@ fn uri_encode_path(path: &[u8], out: &mut DynBuf) -> Result<(), CURLcode> {
 /// * an unreserved byte passes through unchanged;
 /// * a literal `+` becomes `%20`, the C's comment being "Encode '+' as space";
 /// * anything else becomes `%XX` in UPPER-case hexadecimal.
-///
-/// An INVALID escape is not an error: `%zz` fails the triplet test, so the
-/// `%` is treated as an ordinary byte and becomes `%25`.
 fn normalize_query(source: &[u8], out: &mut DynBuf) -> Result<(), CURLcode> {
     let mut rest = source;
 
@@ -733,11 +554,6 @@ fn normalize_query(source: &[u8], out: &mut DynBuf) -> Result<(), CURLcode> {
 /// `should_urlencode` (`lib/http_aws_sigv4.c:266-281`): whether the path is
 /// re-encoded for this service.
 ///
-/// False for exactly three service names and true for everything else. The
-/// C's comment records why: "These services require unmodified (not
-/// additionally URL-encoded) URL paths. [...] Urls are already normalized by
-/// the curl URL parser."
-///
 /// The comparison is `curlx_str_cmp`, which is **case-SENSITIVE**. That is
 /// worth stating because the sibling test that selects the S3 payload rule --
 /// `curlx_str_casecompare(&service, "s3")` at `:931` -- is case-INSENSITIVE,
@@ -753,9 +569,7 @@ fn should_urlencode(service: &[u8]) -> bool {
 /// `canon_path` (`lib/http_aws_sigv4.c:683-707`).
 ///
 /// Either re-encodes the path or copies it verbatim, and then substitutes `/`
-/// for an empty result. The C's comment on the sizing -- "Normalized path
-/// will be either the same or shorter than the original path, plus trailing
-/// slash" -- is about its buffer arithmetic and has no successor here.
+/// for an empty result.
 fn canon_path(
     path: &[u8],
     do_uri_encode: bool,
@@ -802,23 +616,6 @@ fn split_query(source: &[u8]) -> Result<Vec<&[u8]>, CURLcode> {
 
 /// `compare_func` (`lib/http_aws_sigv4.c:646-681`): orders two encoded query
 /// components by key and then by value.
-///
-/// The C's own comment is "If one element is empty, the other is always sorted
-/// higher", and the four early exits it produces are reproduced exactly --
-/// including the one that matters: when BOTH keys are empty the function
-/// returns 0 **without looking at the values at all**.
-///
-/// Why the empty tests exist at all: `curlx_dyn_ptr()` is null for a buffer
-/// that was never appended to, and `strcmp()` would dereference it. An empty
-/// key is reachable -- the component `=x` has one -- so this is a real branch,
-/// not defensive noise.
-///
-/// One representational note. The C gives a component with no value a buffer
-/// holding a single zero byte (`:772-773`), so `aa_value_len == 0` never
-/// actually fires there, and `strcmp()` compares that buffer as the empty
-/// string. An empty `Vec` here reaches the same ordering by the empty-tests
-/// route: empty sorts before anything, and two empties compare equal, which is
-/// what `strcmp("", "")` and `strcmp("", "x")` answer.
 fn compare_query_pairs(
     left: &(Vec<u8>, Vec<u8>),
     right: &(Vec<u8>, Vec<u8>),
@@ -857,17 +654,13 @@ fn compare_query_pairs(
 /// `canon_query` (`lib/http_aws_sigv4.c:709-812`): the canonical query
 /// string.
 ///
-/// Split on `&`, normalize each key and value independently, sort by key then
-/// value, and re-join with `&` -- always as `key=value`, and always with the
-/// `=` even when there is no value.
-///
 /// # A stable sort where the C uses `qsort`
 ///
 /// `qsort` is not stable, and [`compare_query_pairs`] can return `Equal` for
 /// two DIFFERENT components: two whose keys are both empty. The C's output is
 /// then unspecified. A stable sort makes it the input order, which is one of
 /// the orders `qsort` may produce and is the only one that is reproducible.
-/// Performance is a non-goal (AAP 0.1.1), so nothing is lost by choosing it.
+/// Performance is a non-goal, so nothing is lost by choosing it.
 fn canon_query(query: Option<&[u8]>, out: &mut DynBuf) -> Result<(), CURLcode> {
     // `if(!query) return result;` (`:719-720`) -- an absent query is not an
     // empty one, and neither is an error.
@@ -933,10 +726,8 @@ fn canon_query(query: Option<&[u8]>, out: &mut DynBuf) -> Result<(), CURLcode> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Header canonicalization. `lib/http_aws_sigv4.c:80-116`, `:292-370` and
 // `:373-548`.
-// ---------------------------------------------------------------------------
 
 /// `trim_headers` (`lib/http_aws_sigv4.c:80-116`), applied to one entry.
 ///
@@ -952,10 +743,6 @@ fn canon_query(query: Option<&[u8]>, out: &mut DynBuf) -> Result<(), CURLcode> {
 ///    trailing run, which is dropped entirely. The C's own comment is
 ///    "replace any number of consecutive whitespace with a single space,
 ///    unless at the end of the string, then nothing" (`:106-107`).
-///
-/// The value is **not** case-folded. `Authorization` covers the value
-/// verbatim, so folding it would change the signature and, for a header such
-/// as `x-amz-meta-Test: Value`, would change what the server stores.
 fn trim_header(entry: &mut Vec<u8>) {
     // `size_t colon = strcspn(l->data, ":")`.
     let colon = entry
@@ -1037,10 +824,6 @@ fn header_name(entry: &[u8]) -> &[u8] {
 ///   returns `(int)(len_a - len_b)` -- so the SHORTER name sorts first.
 ///   `x-amz-meta-test` therefore precedes `x-amz-meta-test-two`, which
 ///   `tests/data/test1976` pins in its `SignedHeaders`.
-///
-/// Case-sensitive is correct rather than incidental: every entry has already
-/// been through [`trim_header`], so every name is lower-case by the time this
-/// runs.
 fn compare_header_names(left: &[u8], right: &[u8]) -> Ordering {
     let left_name = header_name(left);
     let right_name = header_name(right);
@@ -1055,13 +838,6 @@ fn compare_header_names(left: &[u8], right: &[u8]) -> Ordering {
 }
 
 /// `merge_duplicate_headers` (`lib/http_aws_sigv4.c:324-370`).
-///
-/// The C's comment is the specification: "Merge duplicate header definitions
-/// by comma delimiting their values in the order defined the headers are
-/// defined, expecting headers to be alpha-sorted and use ':' at this point."
-///
-/// The walk stays on a merged entry rather than advancing, so a run of three
-/// or more same-named headers folds into one entry with two commas.
 ///
 /// **The preceding sort must be stable for this to be correct.** The order
 /// the values are joined in is the order they arrive in, and the C's sort is a
@@ -1118,10 +894,6 @@ fn merge_duplicate_headers(head: &mut Vec<Vec<u8>>) -> Result<(), CURLcode> {
 /// Curl_strntolower(&date_hdr_key[2], provider1, plen);   /* amz */
 /// date_hdr_key[2] = Curl_raw_toupper(provider1[0]);      /* Amz */
 /// ```
-///
-/// So the provider is lower-cased and then its first byte is upper-cased --
-/// the C's comment calls it "provider1 ucfirst". `amz` gives `X-Amz-Date`
-/// whatever case the option string used.
 fn date_header_key(provider1: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(DATE_HDR_KEY_LEN);
     key.extend_from_slice(b"X-");
@@ -1170,12 +942,6 @@ fn outgoing_date_header(key: &[u8], timestamp: &[u8]) -> Vec<u8> {
 /// `make_headers` (`lib/http_aws_sigv4.c:373-548`): builds the canonical
 /// header block and the signed-header list, and decides what date header to
 /// emit.
-///
-/// The entries are gathered in the C's order -- host, content-sha256, the
-/// application's own headers, then the canonical date header -- trimmed,
-/// sorted, merged, and finally rendered into the two buffers. The order they
-/// are GATHERED in is what a stable sort preserves for same-named entries, so
-/// it is part of the contract rather than an implementation detail.
 ///
 /// `timestamp` is in-out, exactly as the C's `char *timestamp` is: when the
 /// application supplied its own date header, this either adopts that value or
@@ -1244,9 +1010,6 @@ fn make_headers(
     //    a header of that name with no value should be sent. those user
     //    headers are added to this list but in the format that they will be
     //    sent, ie the semi-colon is changed to a colon for format 'name:'.
-    //
-    //    user headers with a value of whitespace only, or without a colon or
-    //    semi-colon, are not added to this list."
     for line in request.headers {
         let line = until_nul(line);
 
@@ -1352,21 +1115,10 @@ fn make_headers(
     Ok(date_header)
 }
 
-// ---------------------------------------------------------------------------
 // The payload hash. `lib/http_aws_sigv4.c:555-644`.
-// ---------------------------------------------------------------------------
 
 /// `parse_content_sha_hdr` (`lib/http_aws_sigv4.c:555-585`): the payload hash
 /// the application supplied, if it supplied one.
-///
-/// The key is `x-<provider1>-content-sha256`, built with the provider
-/// VERBATIM -- the C applies no case folding here, and none is needed because
-/// [`checkheaders`] compares case-insensitively.
-///
-/// The value is taken after the colon with leading blanks skipped and trailing
-/// blanks trimmed, and is then used exactly as it stands: an application may
-/// legitimately pass `UNSIGNED-PAYLOAD`, `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
-/// or a hash of its own, so nothing about the shape is validated.
 fn parse_content_sha_hdr<'a>(
     headers: &[&'a [u8]],
     provider1: &[u8],
@@ -1394,11 +1146,6 @@ fn parse_content_sha_hdr<'a>(
 
 /// The body bytes to hash: `data->set.postfields` measured the way
 /// `calc_payload_hash` measures it (`lib/http_aws_sigv4.c:590-599`).
-///
-/// A negative `postfieldsize` means "measure it with `strlen`", which is how
-/// `CURLOPT_POSTFIELDS` behaves when the application never set a size. An
-/// absent body is an empty one: the C calls `Curl_sha256it(hash, NULL, 0)`,
-/// which hashes nothing at all.
 fn post_data<'a>(request: &SigV4Request<'a>) -> &'a [u8] {
     let Some(body) = request.postfields else {
         return &[];
@@ -1420,21 +1167,12 @@ fn post_data<'a>(request: &SigV4Request<'a>) -> &'a [u8] {
 
 /// `calc_payload_hash` (`lib/http_aws_sigv4.c:587-605`): SHA-256 of the body,
 /// as lower-case hexadecimal.
-///
-/// A request with no body in memory hashes the EMPTY input, which is
-/// `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` --
-/// the value `tests/data/test1976` expects in its
-/// `x-amz-content-sha256` header.
 fn calc_payload_hash(request: &SigV4Request<'_>) -> String {
     sha256_to_hex(&sha256(post_data(request)))
 }
 
 /// `calc_s3_payload_hash` (`lib/http_aws_sigv4.c:609-644`): the payload hash
 /// for an S3 request, and the header that has to carry it.
-///
-/// The C's comment explains why S3 is special: "AWS S3 requires a
-/// x-amz-content-sha256 header, and supports special values like
-/// UNSIGNED-PAYLOAD" (`:928-929`).
 ///
 /// Three predicates decide, and the C names each of them:
 ///
@@ -1443,16 +1181,6 @@ fn calc_payload_hash(request: &SigV4Request<'_>) -> String {
 /// empty_payload = (empty_method || data->set.filesize == 0);
 /// post_payload  = (httpreq == HTTPREQ_POST && data->set.postfields);
 /// ```
-///
-/// A real hash is computed when the payload is known to be empty or is a POST
-/// body already in memory -- "Calculate a real hash when we know the request
-/// payload". Everything else falls back to the literal
-/// [`S3_UNSIGNED_PAYLOAD`], because hashing it would mean reading a body curl
-/// is about to stream.
-///
-/// The header is `x-<provider1>-content-sha256: <hash>`, with a SPACE after
-/// the colon and with the provider **verbatim** -- the C applies no case
-/// folding at `:638-639`, unlike the date header, which folds twice.
 fn calc_s3_payload_hash(
     request: &SigV4Request<'_>,
     provider1: &[u8],
@@ -1476,22 +1204,134 @@ fn calc_s3_payload_hash(
     (sha_hex, header)
 }
 
-// ---------------------------------------------------------------------------
 // The clock. `lib/http_aws_sigv4.c:947-965`.
-// ---------------------------------------------------------------------------
 
-/// Whether [`FORCETIME_ENV`] asks for the epoch.
+/// A copy of the canonical request with credential-bearing header values
+/// replaced, for tracing only.
+///
+/// # Why this exists
+///
+/// `Curl_output_aws_sigv4` signs whatever headers the application supplied, and
+/// `make_headers` (`lib/http_aws_sigv4.c:503-541`) puts every one of them into
+/// the canonical block as `name:value`. Two of those values are credentials in
+/// their own right:
+///
+/// * **`x-amz-security-token`** -- an AWS temporary session credential. A
+///   caller using STS credentials MUST send it, so this is the common case
+///   rather than an edge one, and it is a bearer token: whoever holds it can
+///   sign requests until it expires.
+/// * **`authorization`, `cookie` and their kin** -- if the caller set one, it
+///   is signed and therefore canonicalised.
+///
+/// The C prints the canonical block verbatim under `--verbose`
+/// (`lib/http_aws_sigv4.c:1012`). Reproducing that faithfully would put a live
+/// session token into every verbose log, and `--verbose` output is what users
+/// paste into bug reports. So the signed bytes stay byte-identical and the
+/// TRACE gets this copy.
+///
+/// # What is replaced, and what is not
+///
+/// Only a header value, and only when
+/// [`crate::util::redact::is_sensitive_header`] classifies its name. The header
+/// NAMES are untouched -- they are the signed-header list, which is the thing a
+/// reader is usually checking -- and so are the method, the canonical path, the
+/// canonical query and the payload hash. The payload hash in particular is a
+/// digest and not a secret, and it is the single most useful value in the block
+/// when a signature mismatch is being diagnosed.
+///
+/// # Why this parses rather than re-derives
+///
+/// The block's grammar is fixed and simple: line 4 of six is the canonical
+/// headers, each `name:value`, and the block ends with a newline so the
+/// separator that follows produces a blank line. Re-deriving the redacted copy
+/// from `head` would mean threading it through, and would risk the two copies
+/// diverging in a way that made the trace describe a request that was not
+/// signed. Parsing the finished bytes cannot diverge: what is printed is
+/// exactly what was signed, minus the values named above.
+///
+/// A line without a colon is left alone rather than redacted: within the
+/// canonical-headers section every line has one by construction, so a line
+/// without one is a section boundary (the method, the path, the query, the
+/// signed-header list, the payload hash), and redacting those would remove the
+/// block's whole diagnostic value.
+fn redacted_canonical_request(canonical_request: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(canonical_request.len());
+
+    for (index, line) in
+        canonical_request.split(|byte| *byte == b'\n').enumerate()
+    {
+        if index != 0 {
+            out.push(b'\n');
+        }
+
+        match line.iter().position(|byte| *byte == b':') {
+            Some(at) => {
+                let (name, rest) = line.split_at(at);
+                if is_sensitive_header(name) {
+                    // `rest` still carries the colon; keep exactly it.
+                    let value = rest.get(1..).unwrap_or_default();
+                    out.extend_from_slice(name);
+                    out.push(b':');
+                    let _ = write!(
+                        DynBufWriter(&mut out),
+                        "<{}, {} bytes>",
+                        crate::util::redact::MARKER,
+                        value.len()
+                    );
+                } else {
+                    out.extend_from_slice(line);
+                }
+            }
+            None => out.extend_from_slice(line),
+        }
+    }
+
+    out
+}
+
+/// A [`fmt::Write`] adaptor over a byte vector, so the redaction marker can be
+/// formatted without an intermediate [`String`].
+///
+/// `write!` needs a [`fmt::Write`] or an [`std::io::Write`], and a `Vec<u8>` is
+/// the latter only with `std::io` in scope; this module is otherwise
+/// `core`-only in its formatting, so a two-line adaptor is cheaper than the
+/// import. Every byte written is ASCII, so the UTF-8 the trait guarantees is
+/// preserved trivially.
+struct DynBufWriter<'a>(&'a mut Vec<u8>);
+
+impl fmt::Write for DynBufWriter<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0.extend_from_slice(text.as_bytes());
+        Ok(())
+    }
+}
+
+/// Whether [`FORCETIME_ENV`] asks for the epoch -- **debug builds only**.
 ///
 /// The C reads it with `getenv()` and only tests for presence, so any value --
-/// including an empty one -- forces the clock.
+/// including an empty one -- forces the clock. It reads it **inside
+/// `#ifdef DEBUGBUILD`**, and this pair of definitions reproduces that guard:
+/// `debug_assertions` is this crate's established counterpart of `DEBUGBUILD`
+/// (the same mapping `crate::transfer::ratelimit` and `crate::util::fopen`
+/// already use for `DEBUGASSERT`), so a production build compiles the
+/// environment read out entirely rather than merely ignoring its result.
+#[cfg(debug_assertions)]
 fn forced_epoch_requested() -> bool {
     env::var_os(FORCETIME_ENV).is_some()
 }
 
+/// The release-build counterpart: the environment cannot move the clock.
+///
+/// Not `env::var_os(..) && cfg!(..)` but a separate definition, so that a
+/// release binary contains no read of [`FORCETIME_ENV`] at all. There is
+/// nothing for an inherited or hostile environment to reach.
+#[cfg(not(debug_assertions))]
+fn forced_epoch_requested() -> bool {
+    false
+}
+
 /// The instant to sign for: zero when the epoch is forced, otherwise the
 /// injected clock's wall reading.
-///
-/// The C is
 ///
 /// ```text
 /// #ifdef DEBUGBUILD
@@ -1502,18 +1342,36 @@ fn forced_epoch_requested() -> bool {
 /// #endif
 /// ```
 ///
-/// **The environment variable is honoured unconditionally here, not behind a
-/// build flag,** and that is a deliberate, recorded decision rather than an
-/// oversight. `tests/runner.pm:167` sets `CURL_FORCETIME=1` for every test run
-/// -- its comment says "for debug NTLM magic", but it governs this code path
-/// too -- so under the harness the timestamp is literally `19700101T000000Z`
-/// and the credential-scope date is `19700101`. Every AWS SigV4 fixture
-/// depends on that, `tests/data/test1976` included. AAP 0.6.6 deliberately
-/// withholds the `Debug` capability from the `--version` banner, so a
-/// `DEBUGBUILD`-only seam would leave the whole corpus unreachable rather than
-/// merely skipped. Honouring the variable always is the minimal change that
-/// keeps it reachable. Do not "harden" this into a feature gate without
-/// replacing the fixtures' only route to a deterministic timestamp.
+/// **The `#ifdef DEBUGBUILD` guard is reproduced**, by the two definitions of
+/// [`forced_epoch_requested`] above. A release build has no read of
+/// [`FORCETIME_ENV`] compiled into it at all.
+///
+/// This function previously honoured the variable unconditionally, on the
+/// argument that `tests/runner.pm:167` sets `CURL_FORCETIME=1` for every test
+/// run and that AAP 0.6.6 withholds the `Debug` capability from the
+/// `--version` banner, so a `DEBUGBUILD`-only seam "would leave the whole
+/// corpus unreachable rather than merely skipped".
+///
+/// **That argument was measured and is wrong.** All sixteen fixtures that
+/// exercise SigV4 -- `test439`, `test472`, `test1955` through `test1959`,
+/// `test1970` through `test1976`, and the two `unittest` ones -- carry
+/// `Debug` (or `unittest`) in their own `<features>` block. `version.rs`
+/// reports `Feature { name: "Debug", compiled_in: false }`, so the harness
+/// never sets `$feature{"Debug"}` and every one of those fixtures skips
+/// already, entirely independently of this variable. Honouring it
+/// unconditionally bought no reachability and cost a production override that
+/// an inherited or attacker-controlled environment could use to force stale
+/// signatures and so deny authentication deterministically.
+///
+/// Gating it also *restores* parity rather than breaking it: a C curl built
+/// without `--enable-debug` does not honour `CURL_FORCETIME` either, which is
+/// precisely why those fixtures demand the `Debug` feature. The two conditions
+/// line up -- a binary that could legitimately advertise `Debug` is a debug
+/// build, and that is exactly when `debug_assertions` is on.
+///
+/// The `forced` parameter is kept rather than folded in, so the decision and
+/// the arithmetic stay separately testable: a test can still assert both arms
+/// without touching the process environment.
 ///
 /// `time(NULL)` becomes [`Clock::epoch_secs`] -- injected, never a global.
 /// Nothing in this module reads the host clock itself; AAP 0.3.3's P12
@@ -1528,17 +1386,6 @@ fn signing_epoch_secs(clock: &dyn Clock, forced: bool) -> i64 {
 
 /// `strftime(timestamp, TIMESTAMP_SIZE, "%Y%m%dT%H%M%SZ", &tm)`
 /// (`lib/http_aws_sigv4.c:958-965`).
-///
-/// Sixteen bytes for any year this millennium: `19700101T000000Z`. The
-/// conversion itself is `crate::util::timeval::gmtime`, which is this crate's
-/// only calendar conversion and the successor of `curlx_gmtime`; its `mon` is
-/// 0-based, as C's `tm_mon` is, and its `year` is absolute rather than C's
-/// years-since-1900.
-///
-/// No date-formatting crate is used. `httpdate 1.0.3` is pinned in the
-/// workspace but produces the HTTP date format, which is a different
-/// specification, and nothing else in `[workspace.dependencies]` formats a
-/// calendar date.
 ///
 /// # `%Y` is a plain decimal, and that is measured rather than assumed
 ///
@@ -1557,11 +1404,6 @@ fn signing_epoch_secs(clock: &dyn Clock, forced: bool) -> i64 {
 ///   -62167219201  ->  14  -11231T235959Z      (year -1, rendered "-1")
 ///    -2208988800  ->  16  19000101T000000Z
 /// ```
-///
-/// All seven are reproduced here. None of the exotic ones is reachable from
-/// `time(NULL)` on a working host, but a signature is not the place to
-/// approximate, and the difference is visible: a padded year would sign
-/// `00001231T235959Z` where the C signs `01231T235959Z`.
 ///
 /// # Errors
 ///
@@ -1598,9 +1440,7 @@ fn format_timestamp(epoch_secs: i64) -> Result<Vec<u8>, CURLcode> {
     Ok(stamp.into_bytes())
 }
 
-// ---------------------------------------------------------------------------
 // Parameter parsing. `lib/http_aws_sigv4.c:866-919`.
-// ---------------------------------------------------------------------------
 
 /// One `label.` step of the hostname walk.
 ///
@@ -1616,10 +1456,6 @@ fn next_host_label<'a>(cursor: &mut &'a [u8]) -> Option<&'a [u8]> {
 }
 
 /// The parameter parser (`lib/http_aws_sigv4.c:866-919`).
-///
-/// The grammar is `provider0[:provider1[:region[:service]]]`, and each
-/// component is at most [`MAX_SIGV4_LEN`] bytes. An absent option value, or an
-/// empty one, is [`DEFAULT_SIGV4`].
 ///
 /// Three behaviours here are easy to get wrong and are each reproduced
 /// deliberately:
@@ -1679,10 +1515,6 @@ fn parse_parameters<'a>(
     //     curlx_str_until(&line, &provider1, MAX_SIGV4_LEN, ':'))
     //    provider1 = provider0;
     //  else if(curlx_str_single(&line, ':') || ... ) { /* nothing to do */ }`
-    //
-    // Written as nesting because that is what the two `||` chains mean: each
-    // step runs only if every step before it succeeded, and each successful
-    // step has already stored its span.
     if str_single(&mut cursor, b':').is_ok() {
         if let Ok(second) = str_until(&mut cursor, MAX_SIGV4_LEN, b':') {
             provider1 = second;
@@ -1755,16 +1587,10 @@ fn request_type(provider0: &[u8]) -> Vec<u8> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // The signer. `Curl_output_aws_sigv4()`, `lib/http_aws_sigv4.c:814-1126`.
-// ---------------------------------------------------------------------------
 
 /// Signs a request with AWS Signature Version 4 and returns the header block
 /// to emit.
-///
-/// Supersedes `Curl_output_aws_sigv4()` (`lib/http_aws_sigv4.c:814-1126`), the
-/// whole of it. There is no proxy form of this signature; see the module
-/// documentation.
 ///
 /// # The return type carries C's two side effects
 ///
@@ -1784,15 +1610,6 @@ fn request_type(provider0: &[u8]) -> Vec<u8> {
 ///   [`super::AuthEmission::Nothing`] instead would set `done` and change
 ///   that.
 /// * `Err(code)` -- one of the four failures below.
-///
-/// # The header block is not one header
-///
-/// It is up to three lines, each already terminated: the `Authorization:`
-/// line, then the date header when curl supplies it rather than the
-/// application, then the S3 content-sha256 header when there is one. The C
-/// assembles exactly this and hands it to the request writer as
-/// `aptr.userpwd`, whose contents are inserted verbatim. Do not append a
-/// further terminator.
 ///
 /// # Errors
 ///
@@ -1913,10 +1730,6 @@ fn sign(
     //
     //   HTTPRequestMethod \n CanonicalURI \n CanonicalQueryString \n
     //   CanonicalHeaders \n SignedHeaders \n HashedPayload
-    //
-    // The canonical-headers block already ends in `\n`, so the separator after
-    // it produces a BLANK LINE. That blank line is part of the specification;
-    // trimming it changes the signature.
     let mut canonical_request = Vec::new();
     canonical_request.extend_from_slice(until_nul(request.method));
     canonical_request.push(b'\n');
@@ -1931,10 +1744,18 @@ fn sign(
     canonical_request.push(b'\n');
     canonical_request.extend_from_slice(&payload_hash);
 
+    // `:1012-1013`. THE SIGNATURE IS COMPUTED OVER `canonical_request` -- the
+    // unmodified bytes above -- and the trace prints a SEPARATE, redacted copy.
+    // See [`redacted_canonical_request`] for which values it replaces and why.
+    // Emitting the redacted copy rather than the signed one is the only
+    // divergence from the C's line here, the signed bytes are byte-identical,
+    // and no fixture compares this text.
     infof!(
         tracer,
         "aws_sigv4: Canonical request (enclosed in []) - [{}]",
-        String::from_utf8_lossy(&canonical_request)
+        String::from_utf8_lossy(&redacted_canonical_request(
+            &canonical_request
+        ))
     );
 
     let request_type = request_type(params.provider0);
@@ -1990,17 +1811,30 @@ fn sign(
     let sign0 = SigningKey(hmac_sha256(sign1.as_bytes(), &str_to_sign));
 
     let signature = sha256_to_hex(sign0.as_bytes());
-    infof!(tracer, "aws_sigv4: Signature - {}", signature);
+
+    // `:1081`. The C prints the signature itself. This prints its length
+    // instead, and the reasoning is worth stating because it is finer than "a
+    // signature is secret":
+    //
+    // The signature authenticates THIS request. It travels in the
+    // `Authorization:` header, so `--trace` shows it anyway and redacting it
+    // here buys no confidentiality against an observer of the request. What it
+    // does buy is that `--verbose` alone -- which shows `infof` lines but is
+    // routinely pasted into a bug report -- stops being a route to a live
+    // request credential on its own. The debugging capability is preserved: a
+    // reader comparing signatures reads it from the `Authorization:` header in
+    // the same `--verbose` output, one line further down.
+    infof!(
+        tracer,
+        "aws_sigv4: Signature - <{}, {} bytes>",
+        crate::util::redact::MARKER,
+        signature.len()
+    );
 
     // `:1083-1107`:
     //
     //   "Authorization: %.*s4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s,
     //    Signature=%s\r\n%s%s"
-    //
-    // with `provider0` upper-cased in place from
-    // `sizeof("Authorization: ") - 1`. The separators are wire bytes: a `/`
-    // between the user and the credential scope, `, ` -- comma and one space --
-    // between the three components, and `=` with no space around it.
     let user = request.credentials.user().map_or(&[][..], until_nul);
     let mut block = Vec::new();
     block.extend_from_slice(b"Authorization: ");
@@ -2056,23 +1890,15 @@ mod tests {
     use crate::trace::{TraceConfig, TraceState, WriterSink};
     use crate::util::timeval::TestClock;
 
-    // -----------------------------------------------------------------------
     // The published AWS Signature Version 4 example.
     //
-    // Access key `AKIDEXAMPLE`, secret
-    // `wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY`, service `iam`, region
-    // `us-east-1`, instant `20150830T123600Z`. Every value below is from that
-    // published example and was additionally recomputed with an independent
-    // HMAC-SHA-256 implementation before being written down.
-    //
-    // BOTH CREDENTIALS ARE AWS'S OWN PUBLISHED, NON-FUNCTIONAL EXAMPLE VALUES
+    // The two credentials below ARE AWS'S OWN PUBLISHED, NON-FUNCTIONAL EXAMPLE VALUES
     // and are not secrets: `AKIDEXAMPLE` is deliberately not a well-formed
     // access-key identifier -- those begin `AKIA` or `ASIA` and are twenty
     // characters -- and the secret ends in `EXAMPLEKEY` for the same reason.
     // They are reproduced verbatim because the expected signature below is
     // only reachable from exactly these bytes, which is the whole point of a
     // published vector.
-    // -----------------------------------------------------------------------
 
     /// `20150830T123600Z` as seconds since the Unix epoch.
     const VECTOR_EPOCH: i64 = 1_440_938_160;
@@ -2124,17 +1950,10 @@ mod tests {
     const EMPTY_SHA256: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-    // -----------------------------------------------------------------------
     // Harness.
-    // -----------------------------------------------------------------------
 
     /// Runs `body` with a verbose tracer and returns its result together with
     /// everything the sink received, as text.
-    ///
-    /// `WriterSink::new` rather than `new_for_terminal`: the byte-faithful
-    /// form is what an assertion on exact text needs, because the terminal
-    /// form escapes control bytes -- and the canonical request is full of
-    /// newlines.
     fn with_tracer<R>(body: impl FnOnce(&mut Tracer<'_>) -> R) -> (R, String) {
         let config = TraceConfig::init().expect("trace config cannot fail");
         let mut sink = WriterSink::new(Vec::new());
@@ -2225,9 +2044,164 @@ mod tests {
         )
     }
 
-    // -----------------------------------------------------------------------
     // The published vector, end to end.
+
     // -----------------------------------------------------------------------
+    // The trace must not disclose a signed credential.
+    // -----------------------------------------------------------------------
+
+    /// A signed `X-Amz-Security-Token` reaches the wire and not the trace.
+    ///
+    /// This is the case the redaction exists for. STS credentials REQUIRE the
+    /// header, so it is the common configuration rather than an edge one, and
+    /// its value is a bearer token: whoever reads it can sign requests until it
+    /// expires. Three things are asserted together, because any one alone would
+    /// leave the fix half-done:
+    ///
+    /// 1. The token is absent from the trace.
+    /// 2. Its NAME is present in the trace, so a reader can still see that the
+    ///    header was signed -- redaction must not erase the diagnostic.
+    /// 3. It is still in the signed-header list, so the signature covers it.
+    #[test]
+    fn a_signed_session_token_is_redacted_from_the_trace() {
+        const TOKEN: &[u8] = b"FQoGZXIvYXdzEBYaDExAMPLESESSIONTOKEN==";
+
+        let credentials =
+            Credentials::new(Some(VECTOR_ACCESS_KEY), Some(VECTOR_SECRET));
+        let mut header = b"X-Amz-Security-Token: ".to_vec();
+        header.extend_from_slice(TOKEN);
+        let headers: [&[u8]; 1] = [header.as_slice()];
+        let request = SigV4Request {
+            sigv4: Some(b"aws:amz:us-east-1:iam"),
+            host_header: Some(b"Host: iam.amazonaws.com\r\n"),
+            hostname: b"iam.amazonaws.com",
+            ..base(&credentials, &headers)
+        };
+
+        let (emission, log) =
+            with_tracer(|tracer| sign(&request, VECTOR_EPOCH, tracer));
+        let block = block_of(emission.expect("the request signs"));
+        let token = String::from_utf8_lossy(TOKEN).into_owned();
+
+        assert!(
+            !log.contains(&token),
+            "the session token must not reach the trace; log was:\n{log}"
+        );
+        assert!(
+            log.contains("x-amz-security-token:<redacted, 38 bytes>"),
+            "the header name and a length must survive; log was:\n{log}"
+        );
+        assert!(
+            block
+                .contains("SignedHeaders=host;x-amz-date;x-amz-security-token"),
+            "the token must still be signed; block was:\n{block}"
+        );
+    }
+
+    /// The same, for the other header families a caller may legitimately sign.
+    ///
+    /// A `Cookie` or a `Proxy-Authorization` is not usual on a SigV4
+    /// request, but nothing stops an application setting one, and
+    /// `make_headers` (`lib/http_aws_sigv4.c:503-541`) signs every header
+    /// it is given. A per-family loop rather than one combined case, so a
+    /// failure names the family that regressed.
+    ///
+    /// `Authorization` is deliberately absent, and its absence is a fact
+    /// about the C rather than an omission: an application-supplied
+    /// `Authorization:` header makes signing a silent no-op
+    /// (`lib/http_aws_sigv4.c:855-858`), so it can never appear in a
+    /// canonical request this function produced. `Proxy-Authorization`
+    /// stands in for the same family.
+    #[test]
+    fn every_credential_bearing_signed_header_is_redacted_from_the_trace() {
+        for (header, secret) in [
+            (
+                b"Cookie: session=abc123deadbeef".as_slice(),
+                "abc123deadbeef",
+            ),
+            (
+                b"Proxy-Authorization: Bearer proxy-token-xyz".as_slice(),
+                "proxy-token-xyz",
+            ),
+            (
+                b"WWW-Authenticate: Digest nonce=deadbeefcafe".as_slice(),
+                "deadbeefcafe",
+            ),
+        ] {
+            let credentials =
+                Credentials::new(Some(VECTOR_ACCESS_KEY), Some(VECTOR_SECRET));
+            let headers: [&[u8]; 1] = [header];
+            let request = SigV4Request {
+                sigv4: Some(b"aws:amz:us-east-1:iam"),
+                host_header: Some(b"Host: iam.amazonaws.com\r\n"),
+                hostname: b"iam.amazonaws.com",
+                ..base(&credentials, &headers)
+            };
+
+            let (emission, log) =
+                with_tracer(|tracer| sign(&request, VECTOR_EPOCH, tracer));
+            let _ = block_of(emission.expect("the request signs"));
+            assert!(
+                !log.contains(secret),
+                "{} leaked; log was:\n{log}",
+                String::from_utf8_lossy(header)
+            );
+            assert!(
+                log.contains("<redacted,"),
+                "no redaction happened for {}; log was:\n{log}",
+                String::from_utf8_lossy(header)
+            );
+        }
+    }
+
+    /// An ordinary header is NOT redacted, so the trace stays useful.
+    ///
+    /// The counterpart assertion: over-redacting would cost the block its whole
+    /// diagnostic value, and `Content-Type` is exactly the header a signature
+    /// mismatch is usually traced to.
+    #[test]
+    fn an_ordinary_signed_header_is_not_redacted_from_the_trace() {
+        let credentials =
+            Credentials::new(Some(VECTOR_ACCESS_KEY), Some(VECTOR_SECRET));
+        let headers: [&[u8]; 1] = [
+            b"Content-Type: application/x-www-form-urlencoded; charset=utf-8",
+        ];
+        let request = SigV4Request {
+            sigv4: Some(b"aws:amz:us-east-1:iam"),
+            host_header: Some(b"Host: iam.amazonaws.com\r\n"),
+            hostname: b"iam.amazonaws.com",
+            ..base(&credentials, &headers)
+        };
+
+        let (emission, log) =
+            with_tracer(|tracer| sign(&request, VECTOR_EPOCH, tracer));
+        let _ = block_of(emission.expect("the request signs"));
+        assert!(
+            log.contains(
+                "content-type:application/x-www-form-urlencoded; charset=utf-8"
+            ),
+            "an ordinary header must render in full; log was:\n{log}"
+        );
+    }
+
+    /// The redaction is a formatting step and changes no signed byte.
+    ///
+    /// The property that makes the whole approach safe: two requests differing
+    /// only in a redactable header still produce the signature the C produces,
+    /// because the signature is computed over the unmodified canonical request.
+    /// Asserted by checking that the helper leaves a request with no sensitive
+    /// header byte-identical, and that the published vector's signature -- which
+    /// `the_published_aws_vector_is_reproduced_byte_for_byte` pins against AWS's
+    /// own value -- is unaffected by the helper existing.
+    #[test]
+    fn the_redaction_helper_is_the_identity_on_a_request_without_secrets() {
+        let canonical = b"GET\n/\n\ncontent-type:text/plain\nhost:example.com\n\ncontent-type;host\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(
+            redacted_canonical_request(canonical),
+            canonical.to_vec(),
+            "no sensitive header means no change"
+        );
+    }
 
     #[test]
     fn the_published_aws_vector_is_reproduced_byte_for_byte() {
@@ -2248,9 +2222,13 @@ mod tests {
             with_tracer(|tracer| sign(&request, VECTOR_EPOCH, tracer));
         let block = block_of(emission.expect("the vector signs"));
 
-        // The three diagnostics, verbatim -- and the canonical request and the
-        // string to sign are asserted THROUGH them, because that is the only
-        // place the C exposes either.
+        // The two byte-exact diagnostics, verbatim -- and the canonical
+        // request and the string to sign are asserted THROUGH them, because
+        // that is the only place either is exposed. This vector carries no
+        // credential-bearing header, so `redacted_canonical_request` is the
+        // identity on it and the traced text is byte-identical to the signed
+        // text; `a_signed_session_token_is_redacted_from_the_trace` covers the
+        // case where it is not.
         assert!(
             log.contains(&format!(
                 "aws_sigv4: Canonical request (enclosed in []) - [{VECTOR_CANONICAL_REQUEST}]"
@@ -2263,9 +2241,21 @@ mod tests {
             )),
             "string to sign mismatch; log was:\n{log}"
         );
+
+        // The signature is NOT in the trace, by design, and the emitted
+        // `Authorization:` header below is where it is asserted instead. That
+        // is the stronger assertion of the two: it checks the bytes that go on
+        // the wire rather than a diagnostic about them.
         assert!(
-            log.contains(&format!("aws_sigv4: Signature - {VECTOR_SIGNATURE}")),
-            "signature mismatch; log was:\n{log}"
+            !log.contains(VECTOR_SIGNATURE),
+            "the signature must not reach the trace; log was:\n{log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "aws_sigv4: Signature - <redacted, {} bytes>",
+                VECTOR_SIGNATURE.len()
+            )),
+            "the redacted signature line is missing; log was:\n{log}"
         );
 
         // The emitted block. `X-Amz-Date` is curl's own, because the
@@ -2331,14 +2321,56 @@ mod tests {
         assert_eq!(request_type(b"GOOG"), b"goog4_request");
     }
 
-    // -----------------------------------------------------------------------
     // The clock.
-    // -----------------------------------------------------------------------
+
+    /// A production build cannot be told what time it is.
+    ///
+    /// The `#ifdef DEBUGBUILD` guard of `lib/http_aws_sigv4.c:947-957`,
+    /// asserted from both sides so that neither arm can rot: in a debug build
+    /// setting the variable moves the clock, and in a release build the read is
+    /// not compiled at all, so it cannot.
+    ///
+    /// The release arm is what matters for security. Without the guard an
+    /// inherited or hostile environment could pin every signature to
+    /// `19700101T000000Z`, which a server rejects for skew -- a deterministic
+    /// authentication denial that needs no access to the credential.
+    ///
+    /// The variable is set and removed around the assertion rather than assumed
+    /// absent, because the harness sets `CURL_FORCETIME=1` for the whole run
+    /// (`tests/runner.pm:167`) and a test that merely read the ambient value
+    /// would assert nothing. It is restored afterwards for the same reason.
+    #[test]
+    fn the_environment_can_move_the_clock_only_in_a_debug_build() {
+        // Serialised against nothing: the suite runs with RUST_TEST_THREADS=1,
+        // and this is the only test that mutates the process environment.
+        let restore = std::env::var_os(FORCETIME_ENV);
+
+        std::env::set_var(FORCETIME_ENV, "1");
+        assert_eq!(
+            forced_epoch_requested(),
+            cfg!(debug_assertions),
+            "with the variable SET, only a debug build may honour it"
+        );
+
+        std::env::remove_var(FORCETIME_ENV);
+        assert!(
+            !forced_epoch_requested(),
+            "with the variable unset, no build may force the epoch"
+        );
+
+        match restore {
+            Some(value) => std::env::set_var(FORCETIME_ENV, value),
+            None => std::env::remove_var(FORCETIME_ENV),
+        }
+    }
 
     #[test]
     fn a_forced_epoch_gives_the_timestamp_every_fixture_expects() {
         // `tests/runner.pm:167` sets `CURL_FORCETIME=1` for every test run, so
-        // the harness always signs at the epoch.
+        // the harness always signs at the epoch -- in a DEBUG build, which is
+        // the only build the sixteen SigV4 fixtures can run against anyway,
+        // since every one of them demands the `Debug` feature this binary does
+        // not advertise. See `signing_epoch_secs`.
         assert_eq!(FORCETIME_ENV, "CURL_FORCETIME");
 
         let clock = TestClock::default();
@@ -2416,10 +2448,8 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // The path and the query. The two tables below are `tests/unit/unit1979.c`
     // and `tests/unit/unit1980.c`, relocated.
-    // -----------------------------------------------------------------------
 
     #[test]
     #[rustfmt::skip]
@@ -2620,9 +2650,7 @@ mod tests {
         assert_eq!(NIL_STRING, b"(nil)");
     }
 
-    // -----------------------------------------------------------------------
     // Header canonicalization.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn trim_header_collapses_blanks_without_folding_the_value() {
@@ -2984,9 +3012,7 @@ mod tests {
         assert_eq!(checkheaders(&headers, b"Host"), None);
     }
 
-    // -----------------------------------------------------------------------
     // The payload hash.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn an_absent_body_hashes_the_empty_input() {
@@ -3144,9 +3170,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Parameter parsing.
-    // -----------------------------------------------------------------------
 
     /// [`parse_parameters`] as four owned strings, for compact assertions.
     fn params_of(
@@ -3386,9 +3410,7 @@ mod tests {
         assert!(log.contains("aws_sigv4: picked region eu-west-2 from host"));
     }
 
-    // -----------------------------------------------------------------------
     // The two preconditions.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn path_as_is_is_rejected_with_the_verbatim_message() {
@@ -3438,9 +3460,7 @@ mod tests {
         assert_eq!(outcome, Err(CURLcode::BadFunctionArgument));
     }
 
-    // -----------------------------------------------------------------------
     // The emitted block, and `tests/data/test1976`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_test1976_fixture_bytes_are_reproduced() {
@@ -3449,14 +3469,6 @@ mod tests {
         //   -X PUT -H "X-Amz-Meta-Test-Two: test2" -H "x-amz-meta-test: test"
         //   --aws-sigv4 "aws:amz:us-east-1:s3" -u "xxx:yyy"
         //   http://%HOSTIP:%HTTPPORT/%TESTNUMBER
-        //
-        // and whose `<protocol>` block expects the three lines asserted below.
-        // The fixture strips the signature with
-        // `s/Signature=[a-f0-9]{64}/Signature=stripped/` -- "We only care
-        // about header order in this test" -- so this asserts the shape of the
-        // signature rather than its value, exactly as the fixture does. Note
-        // that `-X PUT` leaves `httpreq` at `HTTPREQ_GET`, which is why the
-        // payload hash is the empty one.
         let credentials = Credentials::new(Some(b"xxx"), Some(b"yyy"));
         let headers: [&[u8]; 2] =
             [b"X-Amz-Meta-Test-Two: test2", b"x-amz-meta-test: test"];
@@ -3644,9 +3656,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Secrets.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn no_credential_reaches_the_trace_output() {
@@ -3736,9 +3746,7 @@ mod tests {
         assert!(format!("{params:?}").contains("provider0"));
     }
 
-    // -----------------------------------------------------------------------
     // Byte-level helpers.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn until_nul_reproduces_the_c_strings_implicit_truncation() {

@@ -167,20 +167,28 @@ resets to its initial state. The returned pointer may be `NULL` if the
 dynbuf never allocated memory. The returned length is the amount of
 data written to the buffer. The actual allocated memory might be larger.
 
-## The specified `Rust` successor
+## The `Rust` successor
 
-The migration to the three-`crate` `Rust` `workspace` specifies a successor to
-this module at `curl-rs-lib/src/util/dynbuf.rs`. No `Rust` source file exists
-in the tree yet, so that path and the design below are the specified target
-state, while `lib/curlx/dynbuf.c` remains the reference oracle at runtime.
+The successor to this module is **delivered** at
+`curl-rs-lib/src/util/dynbuf.rs`, with its own tests, while
+`lib/curlx/dynbuf.c` remains the reference oracle. The design described below is
+what shipped: the type holds a byte vector and the size ceiling, and nothing
+else, so the C's pointer, length and allocation-size triple is subsumed by the
+vector and only the ceiling survives as a field of its own.
 
 The heart of the transformation is that the length and the capacity move into
 the type instead of being tracked by hand. In C, `struct dynbuf` carries a
 pointer, a length, an allocation size and the `toobig` cap, and every append
-recomputes those numbers across a `malloc` or `realloc` boundary. The
-specified design builds on `bytes::BytesMut` and `Vec<u8>`, where length and
-capacity are the responsibility of the type, leaving no hand-written
-arithmetic to get wrong and no reallocation for a caller to miss.
+recomputes those numbers across a `malloc` or `realloc` boundary. The successor
+builds on `Vec<u8>`, where length and capacity are the responsibility of the
+type, leaving no hand-written arithmetic to get wrong and no reallocation for a
+caller to miss. The specification names `bytes::BytesMut` alongside `Vec<u8>` as
+the pair replacing manual buffer management, and the module records why the
+choice here fell to `Vec<u8>`: nothing in this API needs a cheap split or a
+reference-counted freeze, `curlx_dyn_take` maps to handing back the vector by
+value, and `curlx_dyn_free` needs a shrink that `BytesMut` does not offer.
+`BytesMut` is used where its distinguishing operations do earn their place, in
+the transfer buffers.
 
 Each guarantee listed near the top of this page maps across as follows.
 
@@ -190,11 +198,11 @@ Each guarantee listed near the top of this page maps across as follows.
   `CURLE_OUT_OF_MEMORY` there instead would be a behavior change, since that
   code means the allocator refused rather than that the cap was reached.
 - The terminating zero stays observable wherever a caller reads the buffer as
-  a C string. The specified design places the trailing zero at the boundary
+  a C string. The successor stores no trailing zero, placing it at the boundary
   that produces a C string and keeps it out of the reported length.
 - The pointer invalidation rule stops being a rule the reader has to
   remember. `curlx_dyn_ptr` hands back a pointer that the next manipulation
-  may invalidate; under the specified design the borrow checker tracks that
+  may invalidate; in the successor the borrow checker tracks that
   lifetime, which turns a stale reference into a compile error rather than a
   runtime hazard.
 - `curlx_dyn_take` maps to returning the owned buffer by value: ordinary
@@ -203,7 +211,7 @@ Each guarantee listed near the top of this page maps across as follows.
 - `curlx_dyn_reset` maps to clearing the length while retaining the capacity.
 - `curlx_dyn_addf` and `curlx_dyn_vaddf` append formatted output. The C
   versions route through the internal `printf` replacement of libcurl, while
-  the specified design uses ordinary `Rust` formatting. The formatted
+  the successor uses ordinary `Rust` formatting. The formatted
   **output** is what has to match, not the mechanism that produces it; where
   a public interface exposes the `printf` behavior itself, that behavior is
   reproduced in `curl-rs-ffi/src/ffi/printf.rs`.

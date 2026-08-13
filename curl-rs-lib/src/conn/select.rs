@@ -32,111 +32,6 @@
 //! pollsets folded into one internal array) and [`WaitFds`] (the
 //! application-facing array behind `curl_multi_wait`).
 //!
-//! # It is the leaf of `conn/`, and that was measured
-//!
-//! `grep -n "Curl_cfilter\|cfilters\.h\|Curl_conn_" lib/select.h lib/select.c`
-//! returns nothing: `select` names the filter chain nowhere.
-//! `struct easy_pollset` is DEFINED at `lib/select.h:120-130` and only
-//! forward-declared at `lib/cfilters.h:57`, whose four signatures then take it
-//! by pointer (`cfilters.h:84`, `:247`, `:475`, `:482`). `lib/cfilters.c:33`
-//! and `lib/cf-socket.c:64` include `select.h`, not the reverse.
-//!
-//! So the types here are consumed by `conn::filters`, `conn::socket`,
-//! `conn::happy_eyeballs`, `conn::shutdown` and `crate::multi`, and this
-//! module depends on nothing else inside `conn/`. Keep it that way: a cycle
-//! introduced here would be felt by every filter in the chain.
-//!
-//! # The whole C surface, item by item
-//!
-//! Every declaration in the four superseded files is either reproduced below
-//! or recorded as deliberately absent. Nothing is dropped silently.
-//!
-//! | C item | Site | Rust counterpart |
-//! |---|---|---|
-//! | `CURL_POLL_*`, all five | `multi.h:283-287` | [`PollAction`] |
-//! | `CURL_CSELECT_IN/OUT/ERR` | `multi.h:291-293` | [`CURL_CSELECT_IN`] and its two siblings |
-//! | `CURL_CSELECT_IN2` | `select.h:72` | [`CURL_CSELECT_IN2`] |
-//! | `CURL_WAIT_POLLIN/PRI/OUT` | `multi.h:110-112` | [`CURL_WAIT_POLLIN`] and its two siblings |
-//! | `struct curl_waitfd` | `multi.h:114-118` | [`WaitFd`] |
-//! | `POLLIN`..`POLLNVAL` | `select.h:42-47` | [`PollEvents`] |
-//! | the three `POLL*` aliases | `select.h:57-67` | folded into [`PollEvents`] |
-//! | `struct pollfd` | `select.h:49-53` | [`PollFd`] |
-//! | `VALID_SOCK` | `select.h:100` | [`is_valid_sock`] |
-//! | `FDSET_SOCK`, `VERIFY_SOCK` | `select.h:103-111` | absent -- see below |
-//! | `EZ_POLLSET_DEF_COUNT` | `select.h:118` | [`EZ_POLLSET_DEF_COUNT`] |
-//! | `struct easy_pollset` | `select.h:120-130` | [`EasyPollset`] |
-//! | `CURL_EASY_POLLSET_MAGIC`, `init` | `select.h:126,133` | absent, below |
-//! | `Curl_pollset_create`/`_init` | `select.c:500-518` | [`EasyPollset::new`] |
-//! | `Curl_pollset_cleanup` | `select.c:520-535` | `Drop`, so nothing at all |
-//! | `Curl_pollset_reset` | `select.c:487-498` | [`EasyPollset::reset`] |
-//! | `Curl_pollset_move` | `select.c:537-556` | [`EasyPollset::take_from`] |
-//! | `Curl_pollset_change` | `select.c:561-632` | [`EasyPollset::change`] |
-//! | `Curl_pollset_set` | `select.c:634-643` | [`EasyPollset::set`] |
-//! | the seven pollset macros | `select.h:163-179` | [`EasyPollset::add_in`] plus six |
-//! | `Curl_pollset_poll` | `select.c:645-683` | [`EasyPollset::poll`] |
-//! | `Curl_pollset_check` | `select.c:685-701` | [`EasyPollset::check`] |
-//! | `Curl_pollset_want_recv/_send` | `select.c:703-727` | [`EasyPollset::want_recv`] and `_send` |
-//! | `struct curl_pollfds` | `select.h:203-208` | [`PollFds`] |
-//! | `Curl_pollfds_init/_reset/_cleanup` | `select.c:336-360` | [`PollFds::new`], `reset`, `Drop` |
-//! | `Curl_pollfds_add_ps` | `select.c:410-429` | [`PollFds::add_ps`] |
-//! | `Curl_pollfds_add_sock` | `select.c:404-408` | [`PollFds::add_sock`] |
-//! | `struct Curl_waitfds` | `select.h:224-228` | [`WaitFds`] |
-//! | `Curl_waitfds_init` | `select.c:431-440` | [`WaitFds::new`], `counting` |
-//! | `Curl_waitfds_add_ps` | `select.c:467-485` | [`WaitFds::add_ps`] |
-//! | `Curl_poll` | `select.c:203-334` | [`poll_sockets`] |
-//! | `Curl_socket_check` | `select.c:120-188` | [`socket_check`] |
-//! | `SOCKET_READABLE`/`_WRITABLE` | `select.h:78-81` | [`socket_readable`], `_writable` |
-//! | `curlx_wait_ms` | `wait.c:58-94` | [`wait_ms`] |
-//! | `our_select` | `select.c:55-96` | absent: the reactor is the wait |
-//!
-//! # Three meanings of a negative number, and all three are correct
-//!
-//! A count of milliseconds is signed throughout curl, and its sign means
-//! something DIFFERENT in each of three places. Collapsing any two of them
-//! turns a poll into a hang, a wait into a busy spin, or an expired deadline
-//! into an indefinite block, so all three are written out here rather than
-//! left to a reader's inference.
-//!
-//! | Value | RAW POLL TIMEOUT | PURE DELAY | TIME REMAINING |
-//! |---|---|---|---|
-//! | negative | block for ever | REJECTED as invalid | ALREADY EXPIRED |
-//! | zero | poll, do not block | return at once | no limit is configured |
-//! | positive | wait at most that long | sleep that long | that much is left |
-//!
-//! The columns are [`poll_sockets`] with [`socket_check`] (`select.c:242-247`),
-//! [`wait_ms`] (`wait.c:62-67`), and [`timeleft_to_wait`] over what
-//! `Curl_timeleft_ms` reports (`connect.c:120-137`).
-//!
-//! The pure-delay column is the exact opposite of the raw-timeout column, and
-//! the C says so in as many words: "Waiting indefinitely with this function is
-//! not allowed" (`wait.c:48-49`).
-//!
-//! The third column is the one that bites. `Curl_timeleft_ms` cannot use zero
-//! for "expired", because zero already means "no timeout was set" -- so it
-//! reports expiry as `-1`, and the comment at `connect.c:129` spells the
-//! reason out: "0 is 'no limit', fake 1 ms expiry". Every caller therefore
-//! tests for expiry BEFORE handing anything to a wait, and none of them agrees
-//! on what zero should become: `lib/socks.c:129-135` turns it into
-//! `TIMEDIFF_T_MAX`, `lib/ws.c:1707-1716` into 500 ms, and
-//! `lib/cf-socket.c:2040-2049` passes it straight through as "check now".
-//! [`timeleft_to_wait`] therefore rejects expiry and returns zero unchanged,
-//! leaving that policy to the caller that has it.
-//!
-//! # The readiness normalisation is behaviour, not defensive coding
-//!
-//! `select.c:256-263` rewrites what the kernel reported, for every descriptor
-//! it watched:
-//!
-//! - a hang-up also reports READABLE, so the caller performs a zero-length
-//!   read and observes end-of-file;
-//! - an error also reports READABLE AND WRITABLE, so the caller's next
-//!   operation returns the real error number instead of stalling.
-//!
-//! Neither rewrite is filtered by what the caller asked for. Getting this
-//! wrong does not produce a diagnostic -- it produces a hung connection that
-//! looks idle. [`PollEvents::normalise`] is the whole of it, and two tests
-//! pin it.
-//!
 //! # Where the descriptor-set marshalling went
 //!
 //! `FDSET_SOCK` and `VERIFY_SOCK` (`select.h:103-111`) exist only for the
@@ -148,35 +43,6 @@
 //! supplies `(socket, action)` pairs and readiness, and no more -- see
 //! [`EasyPollset::iter`], which is deliberately general enough to build any of
 //! the three representations `lib/cshutdn.c:434-533` needs.
-//!
-//! # What is deliberately absent
-//!
-//! - **The small-vector optimisation.** `def_sockets[2]` and `def_actions[2]`
-//!   beside two heap pointers (`select.h:121-129`) are one hand-rolled
-//!   optimisation; `static_pfds` with `BIT(allocated_pfds)`
-//!   (`select.h:204-207`) is another, fed by two different stack-array sizes
-//!   at its two call sites -- `CF_CONN_NUM_POLLS_ON_STACK` is 5
-//!   (`lib/cfilters.c:501`) and `NUM_POLLS_ON_STACK` is 10
-//!   (`lib/cshutdn.c:205`). Neither number has any observable effect, and
-//!   performance is an explicit non-goal (AAP 0.1.1), so both collapse into a
-//!   plain [`Vec`]. No small-vector crate is introduced; the dependency set is
-//!   closed.
-//! - **The use-after-free canaries.** `CURL_EASY_POLLSET_MAGIC`
-//!   (`0x7a657370`, `select.h:133`) and the `init` field they are written to
-//!   exist so a debug build can catch a pollset used before initialisation or
-//!   after release. Ownership makes both states unrepresentable here, so the
-//!   invariant is enforced by the compiler rather than asserted at run time.
-//! - **The explicit cleanup.** `Curl_pollset_cleanup` and
-//!   `Curl_pollfds_cleanup` have no counterpart because there is nothing to
-//!   call. That closes a real defect rather than reproducing it:
-//!   `cshutdn_wait` releases its aggregation buffer on every path via
-//!   `goto out` (`lib/cshutdn.c:207-226`), while `Curl_conn_connect` returns
-//!   straight out of its flush-error branch with the buffer still live
-//!   (`lib/cfilters.c:518-531`). A leak is not observable behaviour, so it is
-//!   not preserved.
-//! - **`our_select`.** The descriptor-set fallback for platforms without
-//!   `poll` (`select.c:55-96`) has no purpose once the reactor is the single
-//!   wait primitive.
 //!
 //! # The codes this module reports, and the one it does not
 //!
@@ -191,52 +57,8 @@
 //! | [`CURLcode::OperationTimedout`] | `socks.c:130-132` and its siblings | a deadline that had already passed |
 //! | [`CURLcode::UnrecoverablePoll`] | `easy.c:564`, `multi.c:1470` | the wait itself failed, the C's `-1` |
 //!
-//! `CURLE_AGAIN` is deliberately NOT among them, and the omission is measured
-//! rather than assumed: `grep -c CURLE_AGAIN lib/select.c lib/curlx/wait.c`
-//! finds none. It is what a TRANSPORT returns after a readiness report --
-//! `lib/socks.c:136-140` shows the shape, waiting for readability and then
-//! looping on the `CURLE_AGAIN` its receive returns -- so producing it here
-//! would invent an outcome the C does not have at this layer, which AAP 0.8.2
-//! forbids. A caller that wants "not ready yet" reads `Ok(0)`, which is the
-//! answer the C's own `int` return gives it.
-//!
-//! # This directory is a sanctioned `tokio` site
-//!
-//! `crate::util::bufq` and `crate::util::timeval` deliberately keep the
-//! runtime out of the utility layer, on the stated grounds that the
-//! asynchronous layer lives in `conn/` and `transfer/`. This is that layer.
-//! `poll` and `select` become the reactor (AAP 0.4.1), which means:
-//!
-//! - `tokio::io::unix::AsyncFd` replaces the descriptor scan. Wrapping a
-//!   descriptor number does not transfer ownership of it -- the wrapper only
-//!   registers and deregisters interest -- so a caller's socket outlives the
-//!   wait untouched.
-//! - `tokio::time::sleep` replaces the `select(0, NULL, NULL, NULL, tv)` of
-//!   `wait.c:83`, whose comment records why it was not `poll`: "avoid using
-//!   `poll()` for this since it behaves incorrectly with no sockets on Apple
-//!   operating systems". That workaround is obsolete under a reactor, and
-//!   discarding it is a MECHANISM change with identical observable behaviour,
-//!   not a behaviour change.
-//! - `tokio::time::timeout` bounds the wait. Its inner future is polled before
-//!   its deadline is examined, which is what makes a zero-length timeout a
-//!   single non-blocking probe rather than an unconditional expiry.
-//!
-//! No clock is read anywhere in this module, and that is inherited rather than
-//! chosen: `select.c:135-138` and `:230-233` both refuse to take a timestamp,
-//! because "elapsed time in this function does not need to be measured". The
-//! clock seam that `crate::util::timeval` owns (AAP 0.3.3, P12) is therefore
-//! honoured here by having no reading to inject.
-//!
-//! # Where these constraints come from
-//!
-//! `review_rules` reports that NO user-specified rules were provided for this
-//! project, so no file enters scope by rule and there is no rule to cite. The
-//! constraints this module is held to -- the preservation mandate over wire
-//! behaviour and API signatures, the prohibition on the safety escape hatch
-//! outside `crate::ffi`, the minimal-change mandate and the validation gates
-//! -- are AAP REQUIREMENTS originating in the user's request (AAP 0.8), and
-//! are cited as such. Enterprise-standard best practice governs everything the
-//! requirements leave open.
+//! A caller that wants "not ready yet" reads `Ok(0)`, which is the answer the
+//! C's own `int` return gives it.
 
 use core::fmt;
 use core::ops::{BitAnd, BitOr, BitOrAssign, Not};
@@ -258,49 +80,13 @@ use crate::util::timediff::{mstotv, TimeDiff};
 // THE DESCRIPTOR TYPE
 
 /// A socket, as the pollset stores it -- C's `curl_socket_t`.
-///
-/// A bare descriptor number, which is what the C carries in
-/// `ps->sockets[]` (`lib/select.h:121`) and in `struct pollfd.fd`
-/// (`lib/select.h:50`). On all four targets of AAP 0.8.3 -- Linux and macOS
-/// on x86-64 and aarch64 -- `curl_socket_t` is a plain `int`, and
-/// [`RawFd`] is that same signed 32-bit integer under a name the standard
-/// library owns.
-///
-/// # Why a number here, and a borrow at the C boundary
-///
-/// `crate::ffi` takes every descriptor as `BorrowedFd<'_>` precisely because a
-/// number carries no lifetime, so nothing stops a caller passing one whose
-/// file has already been closed. That reasoning does not transfer to a
-/// pollset: the whole point of the structure is to REMEMBER which descriptors
-/// a transfer is interested in, across many calls, without owning any of them,
-/// and a borrow cannot be stored for that. The C makes the same choice for the
-/// same reason. What follows from it is that the pollset is a set of
-/// intentions and never a capability -- nothing here reads, writes or closes a
-/// descriptor.
 pub(crate) type Socket = RawFd;
 
 /// The absent socket -- C's `CURL_SOCKET_BAD`.
-///
-/// `include/curl/curl.h` defines it as `-1` on every non-Winsock platform,
-/// which is every target in scope. It appears in three roles the C keeps
-/// distinct: an empty slot in a pollset, a "not supplied" argument to
-/// [`socket_check`], and, spelled `CURL_SOCKET_TIMEOUT` (`multi.h:289`), the
-/// sentinel that tells `curl_multi_socket_action` a timer expired rather than
-/// a socket became ready.
 #[allow(dead_code)]
 pub(crate) const CURL_SOCKET_BAD: Socket = -1;
 
 /// `VALID_SOCK()`: is this a descriptor at all?
-///
-/// `lib/select.h:100` in its POSIX form, verbatim: `((s) >= 0)`. The Winsock
-/// form at `:90` compares against `INVALID_SOCKET` instead, because a Winsock
-/// socket is unsigned; no target in scope is Winsock.
-///
-/// The companion `FDSET_SOCK` (`select.h:103`) is NOT reproduced. It asks
-/// whether a descriptor number is small enough to be recorded in a
-/// descriptor-set bitmap, which is a question only the descriptor-set flavour
-/// of waiting can ask -- and that flavour lives in `curl-rs-ffi`, as the
-/// module documentation explains.
 #[allow(dead_code)]
 pub(crate) fn is_valid_sock(sock: Socket) -> bool {
     sock >= 0
@@ -309,32 +95,11 @@ pub(crate) fn is_valid_sock(sock: Socket) -> bool {
 // CURL_POLL_*: WHAT A TRANSFER WANTS TO DO WITH A SOCKET
 
 /// The `CURL_POLL_*` bitmap -- what a transfer wants a socket for.
-///
-/// `include/curl/multi.h:283-287` defines five values, and they are
-/// **ABI-visible**: they are the `what` argument every
-/// `CURLMOPT_SOCKETFUNCTION` callback receives, so an application compiled
-/// against curl 8.19.0-DEV holds these integers in its own instruction
-/// stream. They are pinned as associated constants with their values written
-/// out rather than inferred from declaration order, for the reason AAP 0.6.1
-/// gives for `CURLcode`: a renumbering compiles silently and misbehaves
-/// afterwards.
-///
-/// A newtype over [`u8`] rather than an enumeration, because the values
-/// COMBINE -- `INOUT` is `IN | OUT` and nothing else -- and because `u8` is
-/// the width the C array uses (`unsigned char *actions`, `select.h:122`).
-/// An enumeration would make `IN | OUT` unrepresentable without a cast at
-/// every use.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PollAction(u8);
 
 impl PollAction {
     /// `CURL_POLL_NONE` = 0: not interested.
-    ///
-    /// A pollset never STORES this value: an entry whose actions reach zero is
-    /// removed outright (`select.c:583-591`), which is what
-    /// [`EasyPollset::change`] reproduces. It appears as an argument, as the
-    /// identity of the bitwise operators, and as the answer
-    /// [`EasyPollset::action_of`] gives for a socket it does not hold.
     pub(crate) const NONE: Self = Self(0);
 
     /// `CURL_POLL_IN` = 1: wants to read, or to accept.
@@ -352,14 +117,6 @@ impl PollAction {
     pub(crate) const INOUT: Self = Self(3);
 
     /// `CURL_POLL_REMOVE` = 4: stop watching this socket entirely.
-    ///
-    /// A verb of the SOCKET CALLBACK, not a state of a pollset. It is what
-    /// `crate::multi` passes to `CURLMOPT_SOCKETFUNCTION` when a socket leaves
-    /// the interest set, and it NEVER appears in an [`EasyPollset`]'s actions:
-    /// `Curl_pollset_change` asserts `add_flags <= (CURL_POLL_IN |
-    /// CURL_POLL_OUT)` (`select.c:575-576`), which excludes it by
-    /// construction. It is defined here because the constant is part of the
-    /// same public bitmap and `crate::multi` consumes it from one place.
     #[allow(dead_code)]
     pub(crate) const REMOVE: Self = Self(4);
 
@@ -370,12 +127,6 @@ impl PollAction {
     }
 
     /// Reconstructs an action from the raw integer.
-    ///
-    /// Total by construction: every `u8` is a legal bitmap as far as the C is
-    /// concerned, and rejecting unknown bits here would turn a forward-
-    /// compatible callback argument into an error. The assertions that DO
-    /// constrain the value live at the pollset boundary, where the C puts
-    /// them.
     #[allow(dead_code)]
     pub(crate) const fn from_bits(bits: u8) -> Self {
         Self(bits)
@@ -465,31 +216,12 @@ pub(crate) const CURL_CSELECT_OUT: u32 = 0x02;
 pub(crate) const CURL_CSELECT_ERR: u32 = 0x04;
 
 /// `CURL_CSELECT_IN2` = 0x08: the SECOND socket is readable.
-///
-/// Internal, and the C says why in as many words at `lib/select.h:69-71`:
-/// "there are three CSELECT defines that are defined in the public header that
-/// are exposed to users, but this `*IN2` bit is only ever used internally and
-/// therefore defined here". It distinguishes the two read descriptors
-/// [`socket_check`] accepts, which is how FTP watches a control connection and
-/// a data connection at once.
-///
-/// Written as `CURL_CSELECT_ERR << 1` exactly as `select.h:72` derives it,
-/// rather than as `0x08`, so the derivation cannot drift from its base; a test
-/// pins the evaluated value.
 #[allow(dead_code)]
 pub(crate) const CURL_CSELECT_IN2: u32 = CURL_CSELECT_ERR << 1;
 
 // CURL_WAIT_POLL*: WHAT THE APPLICATION SEES
 
 /// `CURL_WAIT_POLLIN` = 0x0001 (`include/curl/multi.h:110`).
-///
-/// The application-facing readiness bitmap, carried in `struct curl_waitfd`
-/// through `curl_multi_wait` and `curl_multi_poll`. The C explains at
-/// `multi.h:107-109` why it is a separate vocabulary rather than `POLL*`
-/// itself: "Based on poll(2) structure and values. We do not use pollfd and
-/// `POLL*` constants explicitly to cover platforms without poll()." The values
-/// are therefore curl's own, and they do NOT coincide with
-/// [`PollEvents::OUT`].
 #[allow(dead_code)]
 pub(crate) const CURL_WAIT_POLLIN: i16 = 0x0001;
 
@@ -500,7 +232,7 @@ pub(crate) const CURL_WAIT_POLLIN: i16 = 0x0001;
 /// (`select.c:477-480`), and no other writer of a `struct curl_waitfd` exists.
 /// It is reproduced because the constant is part of the ABI an application
 /// compiles against, and it is deliberately not produced, because producing it
-/// would be a behaviour change (AAP 0.8.2).
+/// would be a behaviour change.
 #[allow(dead_code)]
 pub(crate) const CURL_WAIT_POLLPRI: i16 = 0x0002;
 
@@ -517,11 +249,6 @@ pub(crate) const CURL_WAIT_POLLOUT: i16 = 0x0004;
 /// that the shim converts to and from. Deliberately NOT `#[repr(C)]`: two
 /// definitions claiming to be the C layout would be one too many, and only the
 /// crate that generates the header can hold that claim.
-///
-/// `events` and `revents` carry [`CURL_WAIT_POLLIN`] and
-/// [`CURL_WAIT_POLLOUT`], never [`PollEvents`]; the two vocabularies have
-/// different integers for the same idea and the conversion is
-/// [`wait_events_of`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WaitFd {
     /// The socket -- C's `curl_socket_t fd`.
@@ -538,12 +265,6 @@ pub(crate) struct WaitFd {
 }
 
 /// Translates one transfer's interest into the application's vocabulary.
-///
-/// `Curl_waitfds_add_ps` (`select.c:475-483`), exactly: `CURL_POLL_IN` becomes
-/// [`CURL_WAIT_POLLIN`], `CURL_POLL_OUT` becomes [`CURL_WAIT_POLLOUT`], and
-/// [`CURL_WAIT_POLLPRI`] is never set. An action of [`PollAction::NONE`] maps
-/// to zero, which is the value the C tests before adding an entry at all
-/// (`select.c:481`).
 fn wait_events_of(action: PollAction) -> i16 {
     let mut events = 0;
     if action.contains_in() {
@@ -558,25 +279,6 @@ fn wait_events_of(action: PollAction) -> i16 {
 // POLL*: THE INTERNAL EVENT BITMAP
 
 /// A `poll(2)`-style event bitmap -- C's `POLLIN`..`POLLNVAL`.
-///
-/// The numbers are curl's own, transcribed from the fallback definitions the C
-/// installs for platforms that have no `poll.h` (`lib/select.h:42-47`):
-/// `POLLIN` 0x01, `POLLPRI` 0x02, `POLLOUT` 0x04, `POLLERR` 0x08, `POLLHUP`
-/// 0x10, `POLLNVAL` 0x20. Using curl's fallback rather than the host's is what
-/// keeps this module free of any C header: no value here is ever handed to a
-/// system call, because the reactor takes `tokio::io::Interest` instead, so the
-/// only requirement on the integers is that they be distinct and that the
-/// mappings below agree with the C's.
-///
-/// Three C aliases collapse into this type rather than being reproduced:
-/// `POLLRDNORM` is `POLLIN`, `POLLWRNORM` is `POLLOUT` and `POLLRDBAND` is
-/// `POLLPRI` (`lib/select.h:57-67`). Every test in `select.c` that reads them
-/// therefore reads a bit this type already has, which is why, for example,
-/// `revents & (POLLRDNORM | POLLIN | POLLERR | POLLHUP)` (`select.c:167`)
-/// appears below as `IN | ERR | HUP`.
-///
-/// `short` in the C, so signed 16-bit here; the bits in use occupy the low
-/// byte.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PollEvents(i16);
 
@@ -605,12 +307,6 @@ impl PollEvents {
     pub(crate) const HUP: Self = Self(0x10);
 
     /// `POLLNVAL` = 0x20: the descriptor is not one that can be watched.
-    ///
-    /// `poll(2)` reports this per descriptor and returns at once rather than
-    /// blocking, and [`poll_sockets`] reproduces that: a descriptor the
-    /// reactor refuses to register is recorded with this bit and the wait is
-    /// skipped. It is never requested -- like `ERR` and `HUP` it is an output
-    /// only.
     pub(crate) const NVAL: Self = Self(0x20);
 
     /// The three bits a wait reports whether or not they were asked for.
@@ -655,19 +351,6 @@ impl PollEvents {
     /// if(ufds[i].revents & POLLERR)
     ///   ufds[i].revents |= POLLIN | POLLOUT;
     /// ```
-    ///
-    /// This is the module's most consequential four lines, and the module
-    /// documentation explains why: a hang-up must present as readable so the
-    /// caller reaches end-of-file through a read, and an error must present as
-    /// both so the caller reaches the real error number through whichever
-    /// operation it attempts next. Without it a failed connection looks idle
-    /// and the transfer stalls until its timeout.
-    ///
-    /// Note what the C does NOT do: it does not mask the added bits against
-    /// what the caller requested. A descriptor watched for writing alone still
-    /// comes back readable when it hangs up. That is reproduced, and
-    /// [`revents_of`] applies the caller's mask BEFORE calling this so that the
-    /// order of the two steps matches the C's.
     pub(crate) fn normalise(self) -> Self {
         let mut events = self;
         if events.intersects(Self::HUP) {
@@ -802,15 +485,6 @@ impl PollFd {
 // THE POLLSET: ONE TRANSFER'S SOCKETS
 
 /// `EZ_POLLSET_DEF_COUNT` = 2 (`lib/select.h:118`).
-///
-/// The capacity a fresh pollset starts with, and the size of the two inline
-/// arrays the C uses to hold it without allocating. Two is enough for the
-/// common case the C is optimising for -- one socket, or two while a second
-/// address is being raced -- and the growth rule below takes over beyond it.
-///
-/// It is retained as a real capacity rather than dropped with the inline
-/// arrays because it is observable: it decides WHEN the growth trace line is
-/// emitted, and that line appears in `--trace` output.
 pub(crate) const EZ_POLLSET_DEF_COUNT: u32 = 2;
 
 /// The floor of the growth rule: `CURLMAX(ps->count * 2, 8)`
@@ -825,39 +499,12 @@ const EZ_POLLSET_MIN_GROWTH: u32 = 8;
 /// the wrapped value into `CURLE_OUT_OF_MEMORY`. Writing `wrapping_mul` states
 /// that intent; a checked multiplication would be a different function whose
 /// overflow arm no test could reach through the C's own path.
-///
-/// [`Vec`] would of course grow itself, so this arithmetic is not what makes
-/// the container work. It is reproduced because the trace line it drives is
-/// observable, and because the sequence 2, 8, 16, 32 is the sequence a reader
-/// of `--trace` output sees.
 fn grown_capacity(capacity: u32) -> u32 {
     capacity.wrapping_mul(2).max(EZ_POLLSET_MIN_GROWTH)
 }
 
 /// The sockets one transfer wants watched -- C's `struct easy_pollset`
 /// (`lib/select.h:120-130`).
-///
-/// The C's own summary, from `select.h:114-117`: "Keep the sockets to poll for
-/// an easy handle. `actions` are bitmaps of `CURL_POLL_IN` and
-/// `CURL_POLL_OUT`. Starts with small capacity, grows on demand."
-///
-/// # Insertion order is a contract, not an accident
-///
-/// `Curl_pollset_change` removes an entry by `memmove`-ing the tail down over
-/// it (`select.c:584-590`), so the surviving entries keep their relative
-/// order. [`Vec::remove`] does exactly that. [`Vec::swap_remove`] would be
-/// cheaper and WRONG: it would reorder the set silently, and the order is what
-/// [`EasyPollset::poll`] hands to the wait (`select.c:665-678`), what
-/// [`PollFds::add_ps`] appends in, and what the C's filter chain relies on when
-/// it walks a connection's sockets. `removal_preserves_insertion_order` pins
-/// it.
-///
-/// # What the two vectors of the C became
-///
-/// One vector of pairs, rather than parallel `sockets` and `actions` arrays
-/// plus their inline two-element twins. The module documentation records why
-/// the small-vector optimisation is dropped; what matters here is that a pair
-/// cannot desynchronise, whereas two arrays with one shared length can.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EasyPollset {
     /// The live entries, in insertion order -- C's `sockets`, `actions` and
@@ -888,21 +535,6 @@ impl Default for EasyPollset {
 impl EasyPollset {
     /// An empty pollset -- `Curl_pollset_create` and `Curl_pollset_init` in
     /// one.
-    ///
-    /// The C needs two functions because it has two states to reach: one
-    /// allocates the structure (`select.c:512-518`) and one brings an already
-    /// allocated structure into a usable state (`:500-510`), which is why
-    /// `struct easy_pollset` can be a stack local at
-    /// `lib/cshutdn.c:441` and a heap object at `lib/multihandle.h`'s pleasure.
-    /// Rust has no uninitialised-then-initialise phase, so the two collapse: a
-    /// value exists only once it is valid, and where a caller wants it on the
-    /// heap it writes `Box::new(EasyPollset::new())` rather than asking for a
-    /// second constructor.
-    ///
-    /// There is no `cleanup` counterpart either. `Curl_pollset_cleanup`
-    /// (`:520-535`) releases the grown arrays; here the vector releases itself
-    /// when the pollset is dropped, which is what closes the leak recorded in
-    /// the module documentation.
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::default()
@@ -930,13 +562,6 @@ impl EasyPollset {
     }
 
     /// Every watched socket with its actions, in insertion order.
-    ///
-    /// The general accessor the three shapes of `lib/cshutdn.c:434-533` are
-    /// built from: `Curl_cshutdn_setfds` walks the pairs into a descriptor
-    /// set, `Curl_cshutdn_add_waitfds` into a [`WaitFds`], and
-    /// `Curl_cshutdn_add_pollfds` into a [`PollFds`]. Two of those three live
-    /// in this module ([`WaitFds::add_ps`] and [`PollFds::add_ps`]); the third
-    /// is `curl-rs-ffi`'s, and this is what it will read.
     #[allow(dead_code)]
     pub(crate) fn iter(
         &self,
@@ -946,16 +571,6 @@ impl EasyPollset {
 
     /// Empties the pollset, keeping the capacity -- `Curl_pollset_reset`
     /// (`select.c:487-498`).
-    ///
-    /// The C additionally writes [`CURL_SOCKET_BAD`] over every slot and zeroes
-    /// every action across `count` -- not across `n` -- which is hygiene with
-    /// no observable effect, since no reader ever looks past `n`. Clearing the
-    /// vector is the whole of the observable behaviour, and the capacity
-    /// survives exactly as the C's `count` does.
-    ///
-    /// This is the method `lib/cshutdn.c:434-533` leans on: all three of its
-    /// loops initialise ONE pollset and reset it between connections rather
-    /// than constructing a fresh one per connection.
     #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         self.entries.clear();
@@ -963,15 +578,6 @@ impl EasyPollset {
 
     /// Takes `other`'s contents, leaving `other` empty --
     /// `Curl_pollset_move(to, from)` (`select.c:537-556`).
-    ///
-    /// The C's contract, quoted from `select.h:145-146`: "Move pollset from to
-    /// pollset to, replacing all in to, leaving from empty." Its
-    /// implementation is three cases -- release whatever `to` held, then either
-    /// steal `from`'s grown arrays or copy out of its inline ones, then
-    /// re-initialise `from` -- and all three are one move here. The capacity
-    /// travels with the contents, and `other` comes back at
-    /// [`EZ_POLLSET_DEF_COUNT`], which is what `Curl_pollset_init(from)` leaves
-    /// behind.
     #[allow(dead_code)]
     pub(crate) fn take_from(&mut self, other: &mut Self) {
         *self = mem::take(other);
@@ -979,11 +585,6 @@ impl EasyPollset {
 
     /// Is the live count at the capacity? -- the `i >= ps->count` of
     /// `select.c:597`.
-    ///
-    /// A length that does not even fit the C's `unsigned int` certainly
-    /// exceeds a capacity that does, which is the honest answer for a case no
-    /// input can reach: an entry is eight bytes, so four thousand million of
-    /// them would need more memory than the descriptor table can address.
     fn at_capacity(&self) -> bool {
         match u32::try_from(self.entries.len()) {
             Ok(live) => live >= self.capacity,
@@ -992,18 +593,6 @@ impl EasyPollset {
     }
 
     /// The actions held for `sock`, or [`PollAction::NONE`] if it is absent.
-    ///
-    /// The scan `Curl_pollset_check`, `_want_recv` and `_want_send` each
-    /// perform (`select.c:693-699`, `:709-712`, `:722-725`), factored out
-    /// once. A socket appears at most once, because [`Self::change`] updates
-    /// the entry it finds rather than appending a second one, so the first
-    /// match is the only match.
-    ///
-    /// `crate::multi` needs this in its own right: to emit a
-    /// `CURLMOPT_SOCKETFUNCTION` callback it has to know what the previous
-    /// action for a socket was, and [`PollAction::NONE`] against a present
-    /// entry is exactly the "no longer interested" case that becomes
-    /// [`PollAction::REMOVE`].
     #[allow(dead_code)]
     pub(crate) fn action_of(&self, sock: Socket) -> PollAction {
         self.entries
@@ -1014,12 +603,6 @@ impl EasyPollset {
 
     /// Adds and removes poll flags for `sock` -- `Curl_pollset_change`
     /// (`lib/select.c:561-632`).
-    ///
-    /// The C's contract, from `select.h:149-153`: "Change the poll flags
-    /// (`CURL_POLL_IN`/`CURL_POLL_OUT`) to the poll set for socket `sock`. If
-    /// the socket is not already part of the poll set, it will be added. If
-    /// the socket is present and all poll flags are cleared, it will be
-    /// removed."
     ///
     /// Three cases, in the C's own order:
     ///
@@ -1033,22 +616,6 @@ impl EasyPollset {
     /// 3. **Absent, with nothing to add.** Nothing happens, and that is not an
     ///    error -- removing a flag from a socket that is not watched is how
     ///    every filter in a chain expresses "not mine".
-    ///
-    /// # The `trc` argument is C's `data`
-    ///
-    /// `Curl_pollset_change` takes a `struct Curl_easy *` and uses it for
-    /// EXACTLY one thing: the growth trace at `select.c:602-603`. The other
-    /// four pollset functions that take `data` cast it to void
-    /// (`select.c:653`, `:691`, `:708`, `:721`). Passing an optional
-    /// [`Tracer`] rather than a handle records that honestly, and it is what
-    /// keeps this module a leaf -- a whole easy handle would drag the transfer
-    /// state into the bottom of `conn/`.
-    ///
-    /// C's line is `CURL_TRC_M`, which additionally prints the transfer's
-    /// multi state. That label is read out of the easy handle
-    /// (`lib/curl_trc.h:129-131`), so it is unavailable here by the same
-    /// argument, and the line is emitted under the same `MULTI` feature with
-    /// the same text instead. The difference is the state label alone.
     ///
     /// # Errors
     ///
@@ -1155,10 +722,6 @@ impl EasyPollset {
     ///                     (!do_out ? CURL_POLL_OUT : 0));
     /// ```
     ///
-    /// Both booleans false therefore REMOVES the socket, which is the
-    /// difference between this and [`Self::add_inout`] and friends: it is
-    /// absolute where they are relative.
-    ///
     /// # Errors
     ///
     /// As [`Self::change`].
@@ -1261,9 +824,6 @@ impl EasyPollset {
     /// `Curl_pollset_set_in_only` (`select.h:174-176`): readability, and
     /// explicitly not writability.
     ///
-    /// One of the three the socket filter calls: `cf_socket_adjust_pollset`
-    /// uses it for a listening socket (`lib/cf-socket.c:1341`).
-    ///
     /// # Errors
     ///
     /// As [`Self::change`].
@@ -1279,9 +839,6 @@ impl EasyPollset {
     /// `Curl_pollset_set_out_only` (`select.h:177-179`): writability, and
     /// explicitly not readability.
     ///
-    /// The socket filter uses it for a connection that has not completed
-    /// (`lib/cf-socket.c:1346`), where writability IS the completion.
-    ///
     /// # Errors
     ///
     /// As [`Self::change`].
@@ -1296,13 +853,6 @@ impl EasyPollset {
 
     /// What this pollset wants for `sock` -- `Curl_pollset_check`
     /// (`lib/select.c:685-701`).
-    ///
-    /// Returns `(want_read, want_write)`. The C writes through two `bool *`
-    /// out-parameters and sets BOTH to false for a socket it does not hold
-    /// (`:700`), which is the same pair a held socket with neither flag would
-    /// produce -- except that no held socket can be in that state, because
-    /// [`Self::change`] removes it instead. So the tuple loses nothing, and
-    /// `check_on_an_absent_socket_wants_neither` pins the absent case.
     #[allow(dead_code)]
     pub(crate) fn check(&self, sock: Socket) -> (bool, bool) {
         debug_assert!(
@@ -1315,12 +865,6 @@ impl EasyPollset {
 
     /// Is `sock` watched for readability? -- `Curl_pollset_want_recv`
     /// (`lib/select.c:703-714`).
-    ///
-    /// Written as the C writes it, as a scan testing both halves of the
-    /// condition at once, rather than as `action_of(sock).contains_in()`. The
-    /// two agree because a socket appears at most once; the scan is kept
-    /// because it is what the C does and because it stays correct without that
-    /// premise.
     #[allow(dead_code)]
     pub(crate) fn want_recv(&self, sock: Socket) -> bool {
         self.entries
@@ -1339,22 +883,6 @@ impl EasyPollset {
 
     /// Waits for any of these sockets -- `Curl_pollset_poll`
     /// (`lib/select.c:645-683`).
-    ///
-    /// The C's contract, from `select.h:181`: "return < = on error, 0 on
-    /// timeout or how many sockets are ready" -- a typo for "< 0 on error",
-    /// which the three-way `int` return then expresses. Here the error arm is
-    /// the [`Err`] arm and the other two are `Ok(0)` and `Ok(n)`.
-    ///
-    /// # The empty-set case is a sleep, not an error
-    ///
-    /// `if(!ps->n) return curlx_wait_ms(timeout_ms);` (`select.c:657-658`).
-    /// A pollset with nothing in it means "this transfer is waiting on time,
-    /// not on a socket", and the answer is to delay. Losing that would turn
-    /// every timer-only wait into a busy loop or a failure. Note the change of
-    /// convention that comes with it: [`wait_ms`] REJECTS a negative timeout,
-    /// so an indefinite wait on an empty pollset is an error rather than an
-    /// eternal block -- exactly as it is in the C, and the module
-    /// documentation tabulates why.
     ///
     /// # Errors
     ///
@@ -1399,18 +927,6 @@ impl EasyPollset {
 /// and reads the results back out of it (`lib/multi.c:1400-1480`). The
 /// application never sees it; what the application sees is [`WaitFds`], and the
 /// asymmetry between the two is deliberate -- see [`Self::add_sock`].
-///
-/// # What the C's four fields became
-///
-/// `pfds`, `n`, `count` and `BIT(allocated_pfds)` become one vector. The bit
-/// exists solely to remember whether the array was the caller's stack space or
-/// the heap's, so that `Curl_pollfds_cleanup` frees only what it allocated
-/// (`select.c:353-360`); with an owned vector the question does not arise, and
-/// neither does the leak on `Curl_conn_connect`'s flush-error path recorded in
-/// the module documentation. The two stack-array sizes -- 5 at
-/// `lib/cfilters.c:501` and 10 at `lib/cshutdn.c:205` -- are allocation hints
-/// with no observable effect, and so is the C's growth step of 100
-/// (`select.c:395`).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PollFds {
     entries: Vec<PollFd>,
@@ -1459,20 +975,15 @@ impl PollFds {
     /// Folds a transfer's pollset into the buffer -- `Curl_pollfds_add_ps`
     /// (`lib/select.c:410-429`).
     ///
-    /// Entries wanting nothing are skipped (`:423`), and every entry that is
-    /// added is added WITH FOLDING: `Curl_pollfds_add_ps` passes `fold = TRUE`
-    /// (`:424`) where [`Self::add_sock`] passes `FALSE` (`:407`). Folding scans
-    /// backwards from the most recent entry and merges into the first match
-    /// (`:385-392`), because a descriptor shared by two transfers must appear
-    /// once with the union of their interests -- twice would ask the reactor to
-    /// watch it twice and would count it twice.
-    ///
     /// # Infallible, where the C returns `CURLcode`
     ///
     /// The C's only failure is `curlx_calloc` returning null (`:367-369`,
-    /// `:395-396`). A Rust vector aborts on allocation failure rather than
-    /// reporting it, so there is no error left to return, and saying so in the
-    /// signature is more honest than a result that can only ever be `Ok`.
+    /// `:395-396`), sizing an array from the number of descriptors the caller
+    /// already holds -- the same order of magnitude as data that is already
+    /// resident, with no amplification, which is why it is not among the
+    /// externally sized allocations `crate::util::fallible` covers. There is
+    /// therefore no error left to return, and saying so in the signature is
+    /// more honest than a result that can only ever be `Ok`.
     /// [`EasyPollset::change`] keeps its result because its failures are real:
     /// a bad descriptor and the capacity overflow guard.
     #[allow(dead_code)]
@@ -1487,19 +998,6 @@ impl PollFds {
 
     /// Appends one descriptor WITHOUT folding -- `Curl_pollfds_add_sock`
     /// (`lib/select.c:404-408`).
-    ///
-    /// # This is the wakeup descriptor's entry point, and it is invisible to
-    /// the application
-    ///
-    /// `lib/multi.c:1436` is its only caller in the C:
-    /// `Curl_pollfds_add_sock(&cpfds, multi->wakeup_pair[0], POLLIN)`. The
-    /// wakeup descriptor is how `curl_multi_wakeup` interrupts a wait, and it
-    /// goes into THIS buffer and never into the [`WaitFds`] that
-    /// `curl_multi_wait` fills for the caller -- so `numfds` never counts it
-    /// and the application never learns it exists. Preserve that: adding it to
-    /// a [`WaitFds`] would leak an internal descriptor into a public array.
-    ///
-    /// Infallible for the reason [`Self::add_ps`] gives.
     #[allow(dead_code)]
     pub(crate) fn add_sock(&mut self, sock: Socket, events: PollEvents) {
         self.entries.push(PollFd::new(sock, events));
@@ -1543,22 +1041,6 @@ impl PollFds {
 /// without ever allocating. That is modelled here as a borrowed mutable slice
 /// rather than an owned vector, because the borrow IS the contract -- and
 /// because the counting mode below is meaningless without a bounded store.
-///
-/// # Counting mode, and why `need` is ABI-visible
-///
-/// `cwfds_add_sock` returns 1 WITHOUT adding when there is no store at all or
-/// when the store is full (`lib/select.c:446-449`, `:459-464`), and
-/// `Curl_waitfds_add_ps` sums those ones into `need` (`:467-485`). That sum is
-/// what `curl_multi_wait` reports through `numfds`, which is how an application
-/// discovers how large an array it should have passed. Double-counting a
-/// descriptor -- or counting one that was folded into another entry -- is
-/// therefore an ABI-visible defect even though no symbol changes, which is why
-/// the folding and the counting are reproduced exactly and pinned by three
-/// tests.
-///
-/// # The wakeup descriptor is not here
-///
-/// See [`PollFds::add_sock`]. There is deliberately no `add_sock` on this type.
 #[derive(Debug, Default)]
 pub(crate) struct WaitFds<'a> {
     /// The caller's array, or [`None`] in counting mode -- C's `wfds`.
@@ -1619,16 +1101,6 @@ impl<'a> WaitFds<'a> {
 
     /// Records a transfer's pollset and returns how many entries it NEEDED --
     /// `Curl_waitfds_add_ps` (`lib/select.c:467-485`).
-    ///
-    /// Entries wanting nothing contribute nothing (`:481`), a repeated
-    /// descriptor folds into its earlier entry and contributes nothing to the
-    /// count, and every other descriptor contributes one whether or not there
-    /// was room for it.
-    ///
-    /// The sum saturates rather than wrapping. The C's `unsigned int` would
-    /// wrap, but reaching four thousand million entries would require that many
-    /// descriptors, so the difference is unobservable and saturation is the
-    /// answer that stays monotonic.
     #[allow(dead_code)]
     pub(crate) fn add_ps(&mut self, ps: &EasyPollset) -> u32 {
         let mut need = 0_u32;
@@ -1686,42 +1158,11 @@ impl<'a> WaitFds<'a> {
 // THE THREE TIMEOUT CONVENTIONS
 
 /// How long a RAW POLL TIMEOUT asks a wait to last.
-///
-/// The clamp is `select.c:238-241` -- "prevent overflow, `timeout_ms` is
-/// typecast to int" -- and it is retained even though a [`Duration`] needs no
-/// clamping, because a caller that asked for longer than about 24 days was
-/// getting the clamped wait from the C too, and matching it costs one
-/// comparison. The clamp is written as a minimum against a positive bound, so
-/// negative and zero values pass through untouched and reach the mapping below
-/// with their meaning intact.
-///
-/// The mapping itself is [`mstotv`]'s, not a second copy of it: negative gives
-/// [`None`] and means block indefinitely (`select.c:244-245`), zero gives
-/// `Some(Duration::ZERO)` and means poll without blocking (`:246-247`), and
-/// positive gives the span. Re-deriving that here is exactly what
-/// `crate::util::timediff` exists to prevent.
 fn wait_span(timeout_ms: TimeDiff) -> Option<Duration> {
     mstotv(timeout_ms.min(TimeDiff::from(i32::MAX)))
 }
 
 /// Turns a COMPUTED TIME REMAINING into a wait, rejecting one that has run out.
-///
-/// This is the third convention of the module documentation's table, and it
-/// exists as a named function because getting it wrong is silent. A negative
-/// count from `Curl_timeleft_ms` means the deadline HAS ALREADY PASSED
-/// (`lib/connect.c:128-129`), and handing that to [`wait_span`] would ask for
-/// an indefinite block -- the exact opposite of what the caller meant. So the
-/// expiry is detected here, BEFORE any mapping, and reported as
-/// [`CURLcode::OperationTimedout`].
-///
-/// Every C call site does this by hand, and they agree about expiry: `-1` is
-/// fatal at `lib/socks.c:130-132`, at `lib/ws.c:1707-1711` and at
-/// `lib/cf-socket.c:2040-2045`. They do NOT agree about zero, which means "no
-/// limit is configured" rather than "no time left": `socks.c:134-135` turns it
-/// into `TIMEDIFF_T_MAX`, `ws.c:1716` into 500 milliseconds, and
-/// `cf-socket.c:2049` passes it through as a non-blocking check. That policy
-/// belongs to the caller that has the context to choose it, so zero is returned
-/// unchanged here rather than being given one of those three meanings.
 ///
 /// # Errors
 ///
@@ -1737,41 +1178,7 @@ pub(crate) fn timeleft_to_wait(time_left_ms: TimeDiff) -> CodeResult<TimeDiff> {
 /// Delays for `timeout_ms` with no socket involved -- `curlx_wait_ms`
 /// (`lib/curlx/wait.c:58-94`).
 ///
-/// The C's contract, from `wait.c:43-57`: an internal delay "used in
-/// `Curl_socket_check()` and `Curl_poll()` when no file descriptor is provided
-/// to wait on, just being used to delay execution", where "Waiting indefinitely
-/// with this function is not allowed".
-///
-/// # Its negative rule is the OPPOSITE of the poll timeout's
-///
-/// Zero returns at once (`wait.c:62-63`) and NEGATIVE IS REJECTED
-/// (`:64-67`), where the same value handed to [`poll_sockets`] means "block
-/// indefinitely". Both conventions are correct in their own place and both are
-/// reproduced; the module documentation tabulates all three, including the
-/// third one that a computed time-remaining carries.
-///
 /// # The mechanism changed and the behaviour did not
-///
-/// The C calls `select(0, NULL, NULL, NULL, tv)` -- deliberately not `poll` --
-/// and says why at `wait.c:79-80`: "avoid using `poll()` for this since it
-/// behaves incorrectly with no sockets on Apple operating systems". Under a
-/// reactor the choice does not arise, because there is no descriptor set to
-/// pass and no platform quirk to route around; `tokio::time::sleep` is the
-/// whole implementation. That is a MECHANISM change with identical observable
-/// behaviour -- the caller still returns after the requested delay, still
-/// returns immediately for zero, and still fails for a negative -- and not a
-/// behaviour change, which AAP 0.8.2 forbids.
-///
-/// The C's other two branches go with it: `delay()` under MS-DOS and `Sleep()`
-/// with its `ULONG_MAX` clamp under Windows (`wait.c:68-77`) serve platforms
-/// outside the four-target matrix of AAP 0.8.3.
-///
-/// # Interruption
-///
-/// `wait.c:86-92` maps `EINTR` to success and every other failure to `-1`. A
-/// timer future has no interruptible system call to translate: the reactor
-/// absorbs signals and the sleep completes. The C's answer for the case it
-/// could observe was success, and success is what this returns.
 ///
 /// # Errors
 ///
@@ -1808,13 +1215,6 @@ pub(crate) async fn wait_ms(timeout_ms: TimeDiff) -> CodeResult<()> {
 ///   /* make EINTR from select or poll not a "lethal" error */
 ///   r = 0;
 /// ```
-///
-/// An interrupted wait is therefore a TIMEOUT, not an error: the caller loops
-/// and waits again, which is what keeps a signal from failing a transfer.
-/// Anything else is the `-1` the C returns, and its callers turn that into
-/// `CURLE_UNRECOVERABLE_POLL` (`lib/easy.c:564`) or
-/// `CURLM_UNRECOVERABLE_POLL` (`lib/multi.c:1470`) -- so this returns the
-/// former directly rather than inventing a code of its own.
 fn wait_failure(error: &io::Error) -> CodeResult<usize> {
     if error.kind() == io::ErrorKind::Interrupted {
         Ok(0)
@@ -1824,19 +1224,6 @@ fn wait_failure(error: &io::Error) -> CodeResult<usize> {
 }
 
 /// The reactor registration that `events` calls for.
-///
-/// `Interest::ERROR` is always included, because `poll(2)` reports `POLLERR`
-/// whether or not it was asked for and the normalisation at
-/// `select.c:261-262` depends on seeing it. Read and write interest follow the
-/// requested events. Requesting nothing but errors is legitimate and is what a
-/// slot with no events gets -- `poll(2)` accepts such an entry too, and can
-/// only report the unsolicited bits for it.
-///
-/// `POLLPRI` is requested where the platform can express it, which matters
-/// because it is not decoration: `Curl_socket_check` asks for it on both read
-/// descriptors (`select.c:143`, `:149`) and turns it into
-/// [`CURL_CSELECT_ERR`] (`:169-170`), so a caller acts on it. See
-/// [`add_priority_interest`] for the platform split.
 fn interest_of(events: PollEvents) -> Interest {
     let mut interest = Interest::ERROR;
     if events.intersects(PollEvents::IN) {
@@ -1863,11 +1250,6 @@ fn add_priority_interest(interest: Interest) -> Interest {
 }
 
 /// Leaves the interest alone on a platform without out-of-band interest.
-///
-/// The two Apple targets of AAP 0.8.3 are here. The consequence is stated on
-/// [`priority_events`]: out-of-band data is under-reported rather than
-/// misreported, so the transfer discovers the condition through its next read
-/// instead of through the readiness.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn add_priority_interest(interest: Interest) -> Interest {
     interest
@@ -1875,10 +1257,8 @@ fn add_priority_interest(interest: Interest) -> Interest {
 
 /// `POLLPRI` from a reactor readiness, where the platform reports it.
 ///
-/// Out-of-band readiness is `EPOLLPRI`, which `tokio` exposes only on Linux and
-/// Android; the two Apple targets of AAP 0.8.3 have no equivalent in its
-/// vocabulary. Platform divergence uses `#[cfg(target_os = ...)]` rather than a
-/// Cargo feature, so that a target cannot be misconfigured into the wrong half.
+/// Platform divergence uses `#[cfg(target_os =...)]` rather than a Cargo
+/// feature, so that a target cannot be misconfigured into the wrong half.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn priority_events(ready: Ready) -> PollEvents {
     if ready.is_priority() {
@@ -1889,12 +1269,6 @@ fn priority_events(ready: Ready) -> PollEvents {
 }
 
 /// `POLLPRI` on a platform whose reactor does not report it.
-///
-/// Under-reporting is the safe direction: `Curl_socket_check` treats `POLLPRI`
-/// as an error condition (`select.c:169-170`), so not reporting one that the
-/// platform never told us about leaves the transfer to discover the condition
-/// through its next read, exactly as it would on a platform where the bit is
-/// absent from `poll(2)` itself.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn priority_events(_ready: Ready) -> PollEvents {
     PollEvents::NONE
@@ -1910,28 +1284,6 @@ fn priority_events(_ready: Ready) -> PollEvents {
 /// | write closed | `POLLHUP` | `poll(2)` calls this a hang-up too |
 /// | error | `POLLERR` | the same idea |
 /// | priority | `POLLPRI` | Linux and Android only -- see [`priority_events`] |
-///
-/// Both "closed" directions become `POLLHUP` because both derive from the same
-/// underlying events -- the reactor separates them, `poll(2)` does not, and
-/// `POLLHUP` is what curl's normalisation and its `CURL_CSELECT_*` mapping both
-/// test.
-///
-/// # One measured subtlety about the reactor's vocabulary
-///
-/// `tokio`'s readable and writable predicates are INCLUSIVE of their closed
-/// counterparts -- its own documentation states it on `Interest::READABLE`
-/// ("Readable interest includes read-closed events"), and measurement confirms
-/// it: a readiness of read-closed alone answers yes to both, so this function
-/// returns `POLLIN | POLLHUP` for it rather than `POLLHUP` alone.
-///
-/// That happens to agree with the first half of
-/// [`PollEvents::normalise`], which is a coincidence and not a substitute for
-/// it. The normalisation is still required, and still applied: the error case
-/// has no such inclusion, `POLLERR` must add BOTH directions, and a mapping
-/// that leaned on the reactor's convenience would break the moment either the
-/// reactor's or `poll(2)`'s definition of readability changed. Deriving the
-/// bits mechanically and then normalising them explicitly keeps the C's rule
-/// visible where a reader can check it against `select.c:256-263`.
 fn events_of_ready(ready: Ready) -> PollEvents {
     let mut events = PollEvents::NONE;
     if ready.is_readable() {
@@ -1968,13 +1320,6 @@ fn revents_of(requested: PollEvents, ready: Ready) -> PollEvents {
 }
 
 /// One descriptor registered with the reactor for the duration of one wait.
-///
-/// `slots` is why this exists: the caller's array may name the same descriptor
-/// more than once -- `Curl_socket_check` does exactly that when a caller passes
-/// one socket as both a read and a write descriptor -- and registering a
-/// descriptor twice with one reactor is refused by the operating system. So the
-/// descriptor is registered once and its readiness is written back to every
-/// slot that named it, which is also what `poll(2)` would report.
 struct Watch {
     /// The reactor registration. Dropping it deregisters interest and does
     /// NOT close the descriptor, because the wrapped value is a number and
@@ -1994,28 +1339,6 @@ const PROBE_TURNS: usize = 3;
 
 /// Reports readiness that is ALREADY present, without blocking.
 ///
-/// This is `poll(2)` with a zero timeout, and it needs more than a
-/// zero-length [`tokio::time::timeout`] to reproduce -- which is a measured
-/// property of the reactor rather than a preference.
-///
-/// # Why a zero-length timeout is not enough
-///
-/// Registering a descriptor queues its readiness in the operating system; the
-/// runtime's driver has to be given a turn before that readiness is recorded
-/// where a future can observe it. A zero-length timeout never yields that
-/// turn: its deadline is already past on the first poll, so it reports
-/// expiry before the driver has run even once, and a socket that WAS ready
-/// would be reported as idle.
-///
-/// That is not a tolerable approximation, because curl asks this exact
-/// question at points where the answer decides control flow rather than
-/// merely how long to wait: `lib/cf-socket.c:1285` uses
-/// `SOCKET_WRITABLE(sock, 0)` to discover that a connection has completed,
-/// `lib/ftp.c:483` uses `SOCKET_READABLE(ctrl_sock, 0)` to discover that a
-/// response has already arrived, and `lib/cf-socket.c:2049` uses it to accept
-/// an incoming data connection. `poll(2)` answers all three immediately and
-/// correctly, so this must too.
-///
 /// # What it does instead
 ///
 /// It polls, and between polls hands the runtime a turn with
@@ -2025,10 +1348,6 @@ const PROBE_TURNS: usize = 3;
 /// [`PROBE_TURNS`] are offered because on a multi-threaded runtime the driver
 /// may be held by another worker, and a spurious "not ready" is the one answer
 /// this must not give cheaply.
-///
-/// It still cannot BLOCK, which is the contract: every turn is a yield and
-/// never a wait, so a probe of an idle descriptor returns as soon as the
-/// scheduler comes back to it.
 async fn probe<F>(all: &mut SelectAll<F>) -> Option<(F::Output, usize, Vec<F>)>
 where
     F: Future + Unpin,
@@ -2061,15 +1380,6 @@ fn record_ready(fds: &mut [PollFd], watch: &Watch, ready: Ready) {
 /// Waits for readiness on a set of descriptors -- `Curl_poll`
 /// (`lib/select.c:203-334`).
 ///
-/// The C's contract, from `select.c:190-202`: "A negative timeout value makes
-/// this function wait indefinitely, unless no valid file descriptor is given,
-/// when this happens the negative timeout is ignored and the function times out
-/// immediately. Return values: -1 = system call error [...] 0 = timeout, N =
-/// number of structures with non zero revent fields."
-///
-/// Here the three outcomes are `Err`, `Ok(0)` and `Ok(n)`, and `revents` is
-/// written into `fds` for every descriptor that reported anything.
-///
 /// # The five behaviours that are load-bearing
 ///
 /// 1. **All descriptors absent means delay.** `select.c:217-228` scans for a
@@ -2083,16 +1393,6 @@ fn record_ready(fds: &mut [PollFd], watch: &Watch, ready: Ready) {
 /// 5. **The count is of SLOTS, not descriptors.** A descriptor named twice
 ///    contributes two, because the C counts `struct pollfd` entries whose
 ///    `revents` is non-zero (`select.c:327-328`).
-///
-/// # A descriptor the reactor will not watch
-///
-/// `poll(2)` reports `POLLNVAL` for such a descriptor and returns AT ONCE
-/// rather than blocking, and that is reproduced: the refusal is recorded as
-/// [`PollEvents::NVAL`] for every slot naming it and the wait is skipped
-/// entirely. [`socket_check`] then turns that bit into
-/// [`CURL_CSELECT_ERR`], which is what the C's `revents & (POLLPRI | POLLNVAL)`
-/// test does with it (`select.c:169-170`). Blocking instead would hide a
-/// closed socket for the whole timeout.
 ///
 /// # Errors
 ///
@@ -2240,15 +1540,6 @@ const CHECK_WRITE_EVENTS: PollEvents =
     PollEvents::from_bits(PollEvents::OUT.bits() | PollEvents::PRI.bits());
 
 /// The `CURL_CSELECT_*` bits a read descriptor's readiness produces.
-///
-/// `select.c:166-179`, where the two read descriptors differ only in which
-/// bit readability sets -- [`CURL_CSELECT_IN`] for the first and
-/// [`CURL_CSELECT_IN2`] for the second.
-///
-/// Note which bits count as readability: `POLLERR` and `POLLHUP` do, because
-/// the read that follows is what surfaces the error or the end of the stream.
-/// `POLLPRI` does NOT -- curl calls out-of-band data an error condition -- and
-/// neither does `POLLNVAL`.
 fn cselect_of_read(revents: PollEvents, second: bool) -> u32 {
     let mut result = 0;
     if revents.intersects(PollEvents::IN | PollEvents::ERR | PollEvents::HUP) {
@@ -2284,16 +1575,6 @@ fn cselect_of_write(revents: PollEvents) -> u32 {
 
 /// Waits on up to two read descriptors and one write descriptor --
 /// `Curl_socket_check` (`lib/select.c:120-188`).
-///
-/// Returns a `CURL_CSELECT_*` bitmap: [`CURL_CSELECT_IN`] for the first read
-/// descriptor, [`CURL_CSELECT_IN2`] for the second, [`CURL_CSELECT_OUT`] for
-/// the write descriptor and [`CURL_CSELECT_ERR`] for an error condition on any
-/// of them. `Ok(0)` is the timeout, exactly as the C's `0` is.
-///
-/// Any argument may be [`CURL_SOCKET_BAD`], which omits it; all three being
-/// absent is a plain delay (`select.c:129-133`). Two read descriptors are what
-/// FTP needs, which watches a control connection and a data connection at once
-/// -- and it is why [`CURL_CSELECT_IN2`] exists at all.
 ///
 /// # Errors
 ///
@@ -2390,29 +1671,6 @@ pub(crate) async fn socket_writable(
 }
 
 // TESTS
-//
-// `tests/unit/*.c` (59 files) and `tests/libtest/*.c` (235) link a debug static
-// build of the C library and call internal `Curl_*` symbols, which a Rust
-// static library does not export. Their coverage therefore relocates into
-// `#[cfg(test)]` modules inside the files under test (AAP 0.8.7), and this is
-// this file's share of that relocation.
-//
-// The division below is deliberate and is what keeps the AAP 0.8.4 Miri gate
-// green:
-//
-//   * Everything that is arithmetic on bitmaps, bookkeeping in a vector, or a
-//     mapping from one vocabulary to another is a plain synchronous test with
-//     no runtime, no descriptor and no clock. Those run everywhere, including
-//     under Miri and under `cargo test --release`.
-//   * Everything that genuinely waits needs the reactor, and the reactor needs
-//     `epoll`, which Miri does not provide. Those tests carry
-//     `#[cfg_attr(miri, ignore = ...)]` and say why. They still run in full
-//     under `cargo test`, which is the gate that owns them.
-//
-// The descriptors they use come from `std::os::unix::net::UnixStream::pair`,
-// which is a socket pair in the same shape as the one `lib/multi.c` builds for
-// its wakeup channel. No test opens a network connection, binds a port, or
-// touches a file.
 
 #[cfg(test)]
 mod tests {
@@ -2608,14 +1866,6 @@ mod tests {
     }
 
     /// A reactor readiness becomes the `poll(2)` bits it corresponds to.
-    ///
-    /// The two "closed" cases pin the measured subtlety recorded on
-    /// [`events_of_ready`]: `tokio`'s readable and writable predicates INCLUDE
-    /// their closed counterparts, so read-closed arrives as `POLLIN | POLLHUP`
-    /// rather than `POLLHUP` alone. Asserting the measured answer rather than
-    /// the expected one is the point -- an implementation written against the
-    /// assumption would look right and report a hung-up socket as unreadable
-    /// on the day the reactor stopped being generous.
     #[test]
     fn readiness_maps_onto_poll_events() {
         assert_eq!(events_of_ready(Ready::EMPTY), PollEvents::NONE);
@@ -3405,12 +2655,6 @@ mod tests {
     }
 
     /// A ZERO timeout reports readiness that is already present.
-    ///
-    /// This is the case a zero-length timeout alone gets wrong, and it is not
-    /// academic: `lib/cf-socket.c:1285` discovers that a connection completed
-    /// with `SOCKET_WRITABLE(sock, 0)`, and `lib/ftp.c:483` discovers that a
-    /// response already arrived with `SOCKET_READABLE(ctrl_sock, 0)`. Both must
-    /// answer YES immediately, exactly as `poll(2)` does. See [`probe`].
     #[tokio::test]
     #[cfg_attr(miri, ignore = "the reactor needs epoll, which Miri lacks")]
     async fn a_zero_timeout_still_sees_what_is_already_ready() {
@@ -3448,12 +2692,6 @@ mod tests {
     }
 
     /// The same probe on a MULTI-THREADED runtime.
-    ///
-    /// AAP 0.8.3 preserves the user's directive that the multi handle runs on a
-    /// multi-thread runtime while the command-line tool runs on a
-    /// current-thread one, so both flavours drive this module and both are
-    /// tested. The extra turns [`PROBE_TURNS`] allows exist for exactly this
-    /// case, where the driver may be parked by a worker other than ours.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg_attr(miri, ignore = "the reactor needs epoll, which Miri lacks")]
     async fn a_zero_timeout_probe_works_on_a_multi_thread_runtime() {
@@ -3599,19 +2837,6 @@ mod tests {
     }
 
     /// Out-of-band data is an ERROR condition, and it reaches a caller.
-    ///
-    /// `Curl_socket_check` asks for `POLLPRI` on both read descriptors
-    /// (`select.c:143`, `:149`) and maps it to [`CURL_CSELECT_ERR`]
-    /// (`:169-170`) rather than to readability -- curl's judgement, preserved.
-    /// This is the end-to-end proof that the mapping is reachable and not
-    /// merely arithmetic: urgent data really does arrive as out-of-band
-    /// readiness and really does come back as an error bit.
-    ///
-    /// Linux and Android only, because those are the platforms whose reactor
-    /// expresses out-of-band interest at all -- see [`add_priority_interest`].
-    /// A loopback TCP pair rather than a socket pair, because urgent data is a
-    /// TCP notion; the listener binds port zero, so nothing collides with
-    /// another test or another build running beside it.
     #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[cfg_attr(miri, ignore = "the reactor needs epoll, which Miri lacks")]

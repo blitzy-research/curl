@@ -24,7 +24,7 @@
 
 // FOUR CONVENTIONS OF THIS DIRECTORY, APPLIED HERE.
 //
-// 1. The 23-line banner above is the one measured at `lib/llist.c:1-23`,
+// 1. The banner above is the one measured at `lib/llist.c:1-23`,
 //    rendered as Rust line comments with the C block-comment decorations
 //    stripped. It is byte-identical to `super`'s and to every other child of
 //    this directory except `inet.rs`, whose C originals carry a different
@@ -32,12 +32,11 @@
 //    the only place in this file where that spelling appears, which is what
 //    `reuse lint` needs (`.github/workflows/checksrc.yml`).
 //
-// 2. `dead_code` allowances are written at the ITEM, never on the module
-//    declaration and never at a file root. The gate that enforces it lives in
-//    `curl-rs-lib/src/lib.rs` (`mod source_policy`), and the reason is in
-//    `super`: an attribute on a module root would silence the NEXT item
-//    somebody adds. Exactly one item here carries one -- `getdate_capped`,
-//    whose consumers (the cookie jar, HSTS and Alt-Svc stores) are later code.
+// 2. The gate that enforces it lives in `curl-rs-lib/src/lib.rs` (`mod
+//    source_policy`), and the reason is in `super`: an attribute on a module
+//    root would silence the NEXT item somebody adds. Exactly one item here
+//    carries one -- `getdate_capped`, whose consumers (the cookie jar, HSTS
+//    and Alt-Svc stores) are later code.
 //
 // 3. No level for the `unsafe_code` lint is set here, at any level. The crate
 //    root carries `#![deny(unsafe_code)]` and grants exactly one exemption, on
@@ -56,8 +55,7 @@
 //    documentation names `parsedate` as one of the four modules it exists to
 //    serve, which is why it precedes this one in the build order.
 
-//! Date parsing -- supersedes `lib/parsedate.c` (585 lines) and
-//! `lib/parsedate.h` (35).
+//! Date parsing -- supersedes `lib/parsedate.c` and `lib/parsedate.h`.
 //!
 //! # Why this module is `pub` when its parent is not
 //!
@@ -93,34 +91,6 @@
 //! * EVERY non-`PARSEDATE_OK` outcome returns `-1` (`:573-574`), overflow
 //!   included, so through this entry point a far-future date is
 //!   indistinguishable from a parse failure.
-//!
-//! `lib/parsedate.c:581-585` defines the internal `Curl_getdate_capped`, which
-//! differs by returning `TIME_T_MAX` for a value too large to represent
-//! instead of failing -- its comment at `:577-579` states it outright. It is
-//! NOT an exported symbol, so [`getdate_capped`] is `pub(crate)`: the same
-//! visibility split the C tree draws. **The two entry points are not
-//! interchangeable.**
-//!
-//! # Which of the four `PARSEDATE_*` results can occur here
-//!
-//! The C names four outcomes -- `PARSEDATE_OK` 0 and `PARSEDATE_FAIL` -1 at
-//! `:95-96`, `PARSEDATE_LATER` 1 at `:100` and `PARSEDATE_SOONER` 2 at `:102`
-//! -- but the fourth and the 32-bit ceilings are conditional
-//! (`lib/parsedate.c:101-103` and `:492-518`). All four mandated targets are
-//! 64-bit with a SIGNED 64-bit `time_t`, so `TIME_T_MAX` is
-//! `0x7FFFFFFFFFFFFFFF` and:
-//!
-//! * `PARSEDATE_SOONER` is not merely unreachable, it is not even DEFINED --
-//!   `#if defined(HAVE_TIME_T_UNSIGNED) || (SIZEOF_TIME_T < 5)` gates the
-//!   `#define` itself. There is no underflow variant in [`Outcome`] for
-//!   exactly that reason, and none of the `yearnum > 2037`, `< 1903` or
-//!   `> 2105` guards is ported. Specification 0.2.2 forfeits 32-bit targets
-//!   deliberately; this is one of the places that shows.
-//! * What DOES apply is `lib/parsedate.c:521-523`: a year before 1583 fails,
-//!   because the Gregorian calendar was introduced in 1582. It is the only
-//!   year guard on these targets.
-//! * `PARSEDATE_LATER` survives, reached only through the timezone-addition
-//!   overflow guard at `:540-543`.
 //!
 //! # Formats accepted
 //!
@@ -178,24 +148,6 @@
 //!   20040912 15:05:58 -0700
 //!   20040911 +0200
 //! ```
-//!
-//! The parser has no grammar. It walks up to six alphanumeric parts,
-//! classifying each as a weekday name, a month name, a timezone name, a time,
-//! a four-digit signed timezone offset, an eight-digit `YYYYMMDD`, a day of
-//! month or a year, and skips ANY run of non-alphanumeric bytes between them.
-//! That is why `1994.Nov.6` and `Sun/Nov/6/94/GMT` both parse, and it is also
-//! why the set of strings it REJECTS is as much part of the contract as the
-//! set it accepts.
-//!
-//! # `httpdate` is not a substitute, and neither is a calendar crate
-//!
-//! `httpdate` parses the three strict forms of RFC 2616 3.3.1 and nothing
-//! else; the long tail enumerated above -- unusual separators, weird orders,
-//! two-digit years, 69 named zones, `YYYYMMDD` -- is exactly the part that
-//! matters, because it is reachable through an exported symbol. [`time2epoch`]
-//! is likewise hand-written rather than delegated: it is `mktime` for GMT
-//! only, and its truncating divisions define which instants curl reports for
-//! pre-1970 dates on the proleptic Gregorian calendar.
 //!
 //! # Byte-oriented, and why
 //!
@@ -286,30 +238,12 @@ struct TzInfo {
 const TDAYZONE: i32 = -60;
 
 /// Days elapsed before the first of each month in a non-leap year.
-///
-/// `lib/parsedate.c:276-278`, where it is `static` INSIDE `time2epoch`. It is
-/// hoisted to module scope for one reason: it is a wire-bearing literal like
-/// the three name tables and [`TZ`], and the test that asserts its twelve
-/// entries cannot see a function-local constant. `#[rustfmt::skip]` for the
-/// same reason it appears on those tables -- twelve numbers on one row are
-/// reviewable against the C, and one number per row is not.
-///
-/// The values are cumulative and 0-based, so index 0 is January with `0` and
-/// index 11 is December with `334`. February's leap day is NOT here; it is
-/// supplied by the `mon <= 1` borrow in [`time2epoch`].
 #[rustfmt::skip]
 const MONTH_DAYS_CUMULATIVE: [i64; 12] = [
     0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334,
 ];
 
 /// Frequently used timezone names, carried over from the old getdate parser.
-///
-/// Transcribed from `lib/parsedate.c:117-194` -- **69 entries**, in the C's
-/// order, with the C's own descriptive comments carried across, so that a
-/// side-by-side diff against that line range is possible. Every name is
-/// distinct and the longest is four characters, which is what lets [`checktz`]
-/// reject anything longer without a search. The count is asserted by test so
-/// that a transcription slip fails at test time rather than in production.
 ///
 /// Two deliberate decisions of the C tree are preserved verbatim, because both
 /// look like defects and neither is:
@@ -320,18 +254,6 @@ const MONTH_DAYS_CUMULATIVE: [i64; 12] = [
 /// * **The military signs diverge from RFC 822.** `:163-166`: *"RFC822 allowed
 ///   these, but (as noted in RFC 1123) had their signs wrong. Here we use the
 ///   correct signs to match actual military usage."*
-///
-/// The three attributes below are scoped to this ONE constant and are not a
-/// module-level blanket, per the policy the crate root sets out.
-/// `#[rustfmt::skip]` is the load-bearing one: this table is behaviour, and a
-/// formatter that reflowed it to one field per line -- which is what it does
-/// when left to itself -- would turn 69 reviewable rows into 276 unreviewable
-/// ones and strip the alignment that makes the diff possible. The two clippy
-/// allowances cover three expressions that are redundant as arithmetic and
-/// load-bearing as PROVENANCE: `0 + TDAYZONE` for `BST`, `1 * 60` for `A` and
-/// `-1 * 60` for `N` are what `lib/parsedate.c:122`, `:167` and `:181`
-/// literally say, and the military ladder from `1 * 60` to `12 * 60` reads as
-/// a ladder only if its first rung keeps the same shape as the rest.
 #[rustfmt::skip]
 #[allow(clippy::identity_op, clippy::neg_multiply)]
 const TZ: [TzInfo; 69] = [
@@ -416,20 +338,9 @@ const TZ: [TzInfo; 69] = [
 ];
 
 /// The largest `time_t` on the four mandated targets.
-///
-/// `lib/curl_setup.h` defines it as `0x7FFFFFFFFFFFFFFF` for a signed 64-bit
-/// `time_t`, which is what all four targets of specification 0.8.3 have.
 const TIME_T_MAX: i64 = i64::MAX;
 
 /// The longest name this parser will consider (`lib/parsedate.c:344-345`).
-///
-/// The C's comment is *"Wednesday is the longest name this parser knows
-/// about"*, and `Wednesday` is nine characters, so twelve is generous. The
-/// value is load-bearing rather than decorative: an alphabetic run that REACHES
-/// this length has ALL THREE table lookups skipped -- `if(len != NAME_LEN)` at
-/// `:376` guards every one of them -- and because `found` then stays false the
-/// parse fails at `:395-396`. That is how the C refuses a pathologically long
-/// word without comparing it against anything.
 const NAME_LEN: usize = 12;
 
 /// The widest value the bare-number branch will accept
@@ -441,10 +352,6 @@ const NAME_LEN: usize = 12;
 const MAX_NUMBER: i64 = 99_999_999;
 
 /// What the next bare number should be taken to mean.
-///
-/// `lib/parsedate.c:263-267`. The parser has no grammar, so it guesses from
-/// position: the first plain number is a day of month, the next a year. That is
-/// what makes both `06 Nov 1994` and `1994 Nov 6` parse.
 ///
 /// **The C declares a third variant, `DATE_TIME`, and never uses it** -- no
 /// assignment, no comparison, anywhere in the file. It is not modelled here,
@@ -489,13 +396,6 @@ pub(crate) enum Outcome {
 }
 
 /// The byte at `idx`, or `0` past the end.
-///
-/// Reproduces the NUL terminator the C parser depends on. Every one of its
-/// `*date` and `p[1]` reads stops at the terminator, so a zero-past-the-end
-/// accessor makes the Rust control flow identical without introducing a bounds
-/// check the C never had. `strparse.rs` and `strcase.rs` each solve the same
-/// problem the same way for the same reason; the three helpers are independent
-/// because no module may widen its surface for another.
 fn at(bytes: &[u8], idx: usize) -> u8 {
     if idx < bytes.len() {
         bytes[idx]
@@ -505,12 +405,6 @@ fn at(bytes: &[u8], idx: usize) -> u8 {
 }
 
 /// The decimal value of the byte at `idx`, or `0` when it is not a digit.
-///
-/// `lib/parsedate.c:292` writes `date[0] - '0'` with no test, because
-/// `:288-289` states that *"the 'date' pointer is known to point to a digit"*.
-/// The guard here costs nothing and makes [`oneortwodigit`] total for every
-/// index a test or a later caller can hand it, which is what keeps a
-/// subtraction on a byte from ever wrapping.
 fn digit_at(bytes: &[u8], idx: usize) -> i64 {
     let byte = at(bytes, idx);
     if is_digit(byte) {
@@ -528,14 +422,6 @@ fn digit_at(bytes: &[u8], idx: usize) -> i64 {
 /// * longer than three characters searches [`WEEKDAY`], the full names;
 /// * exactly three searches [`WKDAY`], the abbreviations;
 /// * shorter than three returns `-1` in the C, *"too short"*, matching nothing.
-///
-/// The comparison additionally requires the candidate's OWN length to equal
-/// `len` -- `strlen(what[0]) == len` at `:212-213` -- so a four-to-eleven byte
-/// token is compared only against the full names and must match one exactly.
-/// `Sund` therefore matches neither table while `Sunday` matches the seventh.
-///
-/// The fold is [`ncasecompare`], curl's `curl_strnequal`, and not the standard
-/// library's: one definition of "same letter, either case" for the whole crate.
 fn checkday(check: &[u8]) -> Option<i32> {
     let len = check.len();
     let table: &[&str] = if len > 3 {
@@ -556,12 +442,6 @@ fn checkday(check: &[u8]) -> Option<i32> {
 }
 
 /// Match a month name: `Some(0..=11)` for January through December.
-///
-/// `lib/parsedate.c:221-234`. The length must be **exactly three**, so
-/// `January` is not a month as far as this parser is concerned. C then compares
-/// a literal `3` bytes rather than `len` (`:229`), which coincides with the
-/// length test immediately above it; both formulations are written out here as
-/// one call because `len` is already known to be 3.
 ///
 /// One note for anyone diffing the C: its `return -1` at `:233` carries the
 /// trailing comment *"return the offset or -1, no real offset is -1"*, which
@@ -587,10 +467,6 @@ fn checkmonth(check: &[u8]) -> Option<i32> {
 /// if the timezone was not found/legal"*. [`TZ`] stores minutes, and `:250`
 /// multiplies by 60 on the way out, so this is the one place the two units
 /// meet.
-///
-/// A token longer than four characters is rejected WITHOUT a search, because
-/// `struct tzinfo`'s `char name[5]` (`:110`) bounds every entry at four bytes.
-/// An exact-length match is then required, as it is in [`checkday`].
 fn checktz(check: &[u8]) -> Option<i32> {
     if check.len() > 4 {
         return None; // longer than any valid timezone
@@ -608,16 +484,6 @@ fn checktz(check: &[u8]) -> Option<i32> {
 }
 
 /// Advance past every byte that is neither a letter nor a digit.
-///
-/// `lib/parsedate.c:256-261`, whose comment is *"skip everything that are not
-/// letters or digits"*. This one function is what makes the separator
-/// irrelevant: `1994.Nov.6`, `Sun/Nov/6/94/GMT` and `06-Nov-94` all reduce to
-/// the same sequence of parts, and a stray byte above ASCII is a separator too.
-///
-/// The predicate is [`is_alnum`], which is `lib/curl_ctype.h:41` -- three ASCII
-/// range tests and nothing else. A Unicode-aware test would treat letters and
-/// digits from other scripts as part of a token and so change the set of
-/// strings this parser accepts, which is observable through an exported symbol.
 fn skip(bytes: &[u8], mut idx: usize) -> usize {
     while idx < bytes.len() && !is_alnum(bytes[idx]) {
         idx += 1;
@@ -627,14 +493,6 @@ fn skip(bytes: &[u8], mut idx: usize) -> usize {
 
 /// Convert a broken-down UTC time to seconds since the Unix epoch.
 ///
-/// `lib/parsedate.c:273-285`, reproduced arithmetic for arithmetic. The C's own
-/// comment is *"time stamp to seconds since epoch in GMT time zone. Similar to
-/// mktime but for GMT only"*, and it must not be replaced by a date library:
-/// the leap-day expression, the `mon <= 1` correction and the truncating
-/// integer divisions together define which instants curl reports, and a library
-/// handling the proleptic Gregorian calendar differently would shift results
-/// for pre-1970 dates.
-///
 /// ```text
 /// int leap_days = year - (mon <= 1);
 /// leap_days = ((leap_days / 4) - (leap_days / 100) + (leap_days / 400)
@@ -643,12 +501,6 @@ fn skip(bytes: &[u8], mut idx: usize) -> usize {
 ///           + leap_days + month_days_cumulative[mon] + mday - 1) * 24
 ///          + hour) * 60 + min) * 60 + sec;
 /// ```
-///
-/// `(mon <= 1)` is a BOOLEAN SUBTRACTED FROM AN INTEGER: January and February
-/// borrow from the previous year, so that a leap day later in the same year is
-/// not counted before it has happened. `1969 / 4`, `1969 / 100` and
-/// `1969 / 400` are compile-time constants -- 492, 19 and 4 -- and are written
-/// in the C's form rather than folded, so the expression stays diffable.
 ///
 /// # Why every parameter is `i64` where the C says `int`
 ///
@@ -748,18 +600,6 @@ fn match_time(bytes: &[u8], idx: usize) -> Option<(i64, i64, i64, usize)> {
 
 /// The parser proper -- `lib/parsedate.c:347-550`.
 ///
-/// Walks at most six alphanumeric parts, classifying each by shape and by what
-/// has already been seen. The structure is preserved rather than reorganised,
-/// because the ORDER of the attempts is what decides ambiguous input: a
-/// three-letter run is tried as a weekday, then a month, then a timezone, and
-/// the first table that claims it wins.
-///
-/// `pub(crate)` rather than private: this is the BYTE-NATIVE entry point, and
-/// the internal callers that parse wire bytes -- the cookie jar's `expires`,
-/// HSTS and Alt-Svc persistence, FTP's `MDTM` -- should reach it without a
-/// detour through `&str`. [`getdate`] and [`getdate_capped`] are the two
-/// contract-shaped facades over it.
-///
 /// # The `-1` sentinels are a correctness requirement, not a C-ism
 ///
 /// C uses `int x = -1` for "not seen yet" on every accumulator. Modelling that
@@ -770,9 +610,8 @@ fn match_time(bytes: &[u8], idx: usize) -> Option<(i64, i64, i64, usize)> {
 /// slot open for a later `Nov` to fill. With `Option`, `Some(-1)` reads as
 /// PRESENT, so `20010001` would parse successfully instead of failing and the
 /// cumulative-days lookup would be handed a negative index. Keeping C's
-/// representation keeps C's semantics, which specification 0.8.1 freezes. The
-/// sentinel is safe for `tzoff` too: offsets are whole minutes, so -1 seconds
-/// is not a representable zone.
+/// representation keeps C's semantics. The sentinel is safe for `tzoff` too:
+/// offsets are whole minutes, so -1 seconds is not a representable zone.
 pub(crate) fn parsedate(date: &[u8]) -> Outcome {
     // A NUL ends the string for the C parser, whose every loop tests `*date`.
     // Truncating here reproduces that without threading the test through each
@@ -1031,11 +870,6 @@ pub(crate) fn parsedate(date: &[u8]) -> Outcome {
 
 /// Parse a date string into seconds since the Unix epoch, UTC.
 ///
-/// This is the engine half of the exported `curl_getdate`
-/// (`lib/parsedate.c:561-575`), and the ONLY date-parsing entry point
-/// `curl-rs-ffi` needs: the adapter converts a `*const c_char` into a `&str`
-/// and an absent value into `-1`, and makes no parsing decision of its own.
-///
 /// Every format listed in the module documentation is accepted, including dates
 /// with no weekday, no timezone or no time at all. What is REJECTED is equally
 /// part of the contract, so the module's own tests assert both directions.
@@ -1045,18 +879,10 @@ pub(crate) fn parsedate(date: &[u8]) -> Outcome {
 /// `curl_getdate(const char *p, const time_t *unused)` declares two arguments
 /// and uses one; `lib/parsedate.c:565` says so outright -- *"legacy argument
 /// from the past that we ignore"*. The declared C signature keeps it because
-/// `include/curl/curl.h` publishes it and specification 0.8.1 freezes published
+/// `include/curl/curl.h` publishes it, and published
 /// signatures, so `curl-rs-ffi/src/ffi/misc.rs` accepts and discards it. It is
 /// absent here because a Rust caller has no reason to pass a value that is
 /// documented to be ignored.
-///
-/// # The `-1` quirk is HERE, not in the caller
-///
-/// `-1` is C's failure sentinel for this function, so a date that genuinely
-/// falls on `-1` -- one second before the epoch -- would be indistinguishable
-/// from an error. C increments it to `0` (`:568-570`) and this does the same.
-/// The quirk is part of the contract rather than of the marshalling, so it
-/// belongs on this side of the boundary.
 ///
 /// # Why `&str` and not `&[u8]`
 ///
@@ -1093,11 +919,6 @@ pub fn getdate(date: &str) -> Option<i64> {
 /// an error. Returns non-zero on error."* Its body is
 /// `return (rc == PARSEDATE_FAIL);`, so `PARSEDATE_LATER` is a SUCCESS here.
 ///
-/// It is not one of the 100 exported symbols -- hence `pub(crate)`, preserving
-/// the visibility split the C tree draws. The FTP, cookie, HSTS and Alt-Svc
-/// paths use it because an expiry far in the future should clamp rather than be
-/// rejected.
-///
 /// Two differences from [`getdate`], both from the C:
 ///
 /// * A value too large to represent yields `Some(TIME_T_MAX)` rather than
@@ -1116,17 +937,6 @@ pub(crate) fn getdate_capped(date: &str) -> Option<i64> {
 
 // ONE C ENTRY POINT IS DELIBERATELY NOT PORTED, and the omission is recorded
 // here rather than left for someone to notice.
-//
-// `lib/parsedate.c:551-559` supplies a second definition of `parsedate` for
-// builds that define `CURL_DISABLE_PARSEDATE`. It ignores its input, writes
-// `*output = 0` and returns `PARSEDATE_OK` -- with the C's own comment on that
-// line reading `/* a lie */`. There is no counterpart because there is no such
-// feature: specification 0.5.2 fixes the workspace feature vocabulary at
-// fifteen names -- http2, http3, ftp, ssh, websockets, cookies, hsts, altsvc,
-// doh, brotli, zstd, gzip, negotiate, hickory-dns and memdebug -- and date
-// parsing is not among them. Adding a sixteenth to reproduce a stub that
-// reports a false success would widen the feature matrix in exchange for a
-// behaviour nothing in this workspace can select.
 
 // THE EXPECTATIONS BELOW ARE A DIFFERENTIAL ORACLE, NOT A RESTATEMENT.
 //

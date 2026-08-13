@@ -22,88 +22,8 @@
 //
 //***************************************************************************
 
-//! The integer-keyed hash map -- supersedes `lib/uint-hash.c` (241 lines)
-//! and `lib/uint-hash.h` (61 lines).
-//!
-//! # What this container actually is
-//!
-//! Read as a data structure it is a hash map keyed on `uint32_t`. Read from
-//! its call sites it is one specific thing: the **transfer-id to
-//! per-stream-state map** for the multiplexed protocols. All three C
-//! consumers construct it identically, with 63 slots, and every one of them
-//! keys on `data->mid`:
-//!
-//! | Call site | Measured at | Destructor passed |
-//! |---|---|---|
-//! | `lib/http2.c` | `:183` | `h2_stream_hash_free` |
-//! | `lib/vquic/curl_ngtcp2.c` | `:163` | `h3_stream_hash_free` |
-//! | `lib/vquic/curl_quiche.c` | `:118` | `h3_stream_hash_free` |
-//!
-//! Two of the three are in scope and become `crate::protocols::http2` and
-//! `crate::protocols::http3`. The third is excluded, because quiche is
-//! dropped in favour of quinn, and it is listed anyway: it contributes two
-//! of the three iteration sites audited below.
-//!
-//! The key is `mid`, declared `uint32_t mid` at `lib/urldata.h:1630` and
-//! documented there as a unique identifier inside one multi instance.
-//!
-//! A `mid` of 0 is a LIVE transfer identifier and must never be read as a
-//! sentinel: the multi layer spells "not in a multi" as `UINT32_MAX`
-//! instead (`lib/multi.c:516`, `:774`, `:876-877`, `:2875`). This container
-//! places no interpretation on any key whatsoever -- 0 and [`u32::MAX`] are
-//! both ordinary storable keys here, and the sentinel meaning belongs to the
-//! multi layer alone.
-//!
-//! # What vanished, and why
-//!
-//! Five constructs in the C have no successor here. They are enumerated
-//! rather than summarized, because each is something a reader may look for
-//! and fail to find.
-//!
-//! 1. **`struct uint_hash_entry` and its `next` chain**
-//!    (`lib/uint-hash.c:38-42`). The C allocates a node per entry carrying
-//!    `next`, `value` and `id`, and threads those nodes through 63 bucket
-//!    chains. [`HashMap`] owns its own storage, so the intrusive chain
-//!    becomes an owned collection, and the pointer-to-pointer unlink surgery
-//!    of `uint32_hash_entry_unlink` (`:93-99`) goes with it.
-//! 2. **`uint32_hash_hash(id, slots)` (`:33-36`)**, whose entire body is
-//!    `id % slots` -- a bare modulo with no mixing step. [`HashMap`]'s
-//!    SipHash replaces it. The substitution is safe because the hash value is
-//!    not externally observable: it only selects a bucket, and no consumer
-//!    ever sees it. Iteration ORDER is a separate question, audited below,
-//!    where the substitution is not quite free.
-//! 3. **`slots`**, which is 63 at every one of the three call sites. Nothing
-//!    corresponds to it, because [`HashMap`] grows on demand. It survives
-//!    only as the argument of [`Uint32Hash::with_capacity`], which forwards
-//!    it as a capacity HINT. No fixed-bucket chained table is built here and
-//!    none should be reintroduced.
-//! 4. **The lazily allocated `table`.** `Curl_uint32_hash_init` leaves it
-//!    NULL and the first `Curl_uint32_hash_set` allocates it (`:120-124`), so
-//!    a map that is never written never allocates. `HashMap::new` is lazy in
-//!    exactly the same way, so the behaviour carries over at no cost. The
-//!    coincidence is recorded because it is the reason no explicit laziness
-//!    appears below.
-//! 5. **`CURL_UINT32_HASHINIT 0x7117e779` (`:29-31`)**, a DEBUGBUILD-only
-//!    magic number stored in `h->init` and re-checked by every entry point to
-//!    catch use of an uninitialized or already destroyed map. Rust's type
-//!    system supersedes it: a [`Uint32Hash`] cannot be observed before it is
-//!    constructed or after it is dropped. The constant is quoted so that a
-//!    search for it lands here.
-//!
-//! ## One measured bug in the C, recorded so that nobody reproduces it
-//!
-//! The lazy allocation at `lib/uint-hash.c:121` reads
-//!
-//! ```text
-//! h->table = curlx_calloc(h->slots, sizeof(*he));
-//! ```
-//!
-//! where `he` is declared as a pointer to `struct uint_hash_entry`, so
-//! `sizeof(*he)` is the size of the STRUCT rather than the size of a
-//! pointer. Measured by compiling that declaration on this host: 24 bytes
-//! against 8, so an array of 63 bucket pointers is allocated at three times
-//! the size it needs. The defect is benign, because it over-allocates rather
-//! than under-allocates, and it disappears entirely with [`HashMap`].
+//! The integer-keyed hash map -- supersedes `lib/uint-hash.c` and
+//! `lib/uint-hash.h`.
 //!
 //! ## Why the C asserted a non-zero slot count
 //!
@@ -113,35 +33,6 @@
 //! because no modulo is taken. [`Uint32Hash::with_capacity`] keeps a
 //! `debug_assert!` on the same condition regardless, so that a caller ported
 //! from a C site which computed its slot count still hears about a zero.
-//!
-//! # The destructor collapses into `Drop`, losslessly
-//!
-//! The C destructor is declared `typedef void Curl_uint32_hash_dtor(uint32_t
-//! id, void *value)` (`lib/uint-hash.h:29`): it receives BOTH the key and
-//! the value. [`Drop`] receives only the value, so the collapse would lose
-//! the key if any consumer used it.
-//!
-//! **Audited, and no consumer uses it.** Every destructor in the tree
-//! discards the key with an explicit `(void)id;` on its first line:
-//!
-//! | Destructor | Measured at |
-//! |---|---|
-//! | `h2_stream_hash_free` | `lib/http2.c:170-175` |
-//! | `h3_stream_hash_free` | `lib/vquic/curl_ngtcp2.c:254-259` |
-//! | `h3_stream_hash_free` | `lib/vquic/curl_quiche.c:187-192` |
-//! | `t1616_mydtor` | `tests/unit/unit1616.c:28-33` |
-//!
-//! Each body then forwards to a plain context-freeing helper that releases
-//! buffers and the struct. [`Drop`] on `V` therefore reproduces all four
-//! exactly, and `crate::protocols::http2` and `crate::protocols::http3` can
-//! rely on that: neither has to drain this map explicitly to recover a key
-//! during teardown. Should some future consumer genuinely need the key while
-//! tearing a value down, the honest remedy is for THAT consumer to drain the
-//! map itself, and not for this type to grow a callback field.
-//!
-//! One conflation disappears in passing. `uint32_hash_entry_clear`
-//! (`:74-84`) runs the destructor only `if(e->value)`, so a stored NULL was
-//! silently skipped. A `V` cannot be absent, so the case cannot arise.
 //!
 //! # The two booleans mean DIFFERENT things
 //!
@@ -166,43 +57,6 @@
 //!     }
 //! ```
 //!
-//! [`Uint32Hash::remove`] reports **that the key was present**. That one
-//! really is `HashMap::remove(..).is_some()`.
-//!
-//! Returning `HashMap::insert(..).is_none()` from `set` would therefore
-//! INVERT the meaning both call sites depend on: it answers "was the key
-//! absent", which is false for an overwrite the C reports as success. The
-//! asymmetry is restated at each of the two methods, because a reader who
-//! meets them in isolation assumes the two booleans match, and they do not.
-//!
-//! # Overwriting a key destroys the old value and leaves the count alone
-//!
-//! `Curl_uint32_hash_set` (`:127-134`) walks the bucket chain and, on a hit,
-//! calls `uint32_hash_entry_clear` -- which runs the destructor on the OLD
-//! value -- then stores the new pointer in the SAME entry and returns TRUE.
-//! No node is linked, so `h->size` does not move.
-//!
-//! [`Uint32Hash::set`] reproduces that shape step for step: it looks the key
-//! up first and, on a hit, assigns through the returned `&mut V`. The
-//! assignment drops the displaced value in place, which IS the destructor
-//! call, and the map length is untouched. Two consequences follow, and both
-//! are deliberate:
-//!
-//! - **The displaced value is never handed back.** The C contract is that
-//!   the old value is destroyed on the caller's behalf. Returning it would
-//!   move a destruction responsibility onto every call site and turn a `set`
-//!   that a C programmer reads as fire-and-forget into a leak wherever the
-//!   result is discarded without thought.
-//! - **An overwrite cannot fail.** Reusing the existing entry allocates
-//!   nothing in the C and nothing here, so the reservation that models the
-//!   C's out-of-memory branch is taken only on the insert path. Reserving
-//!   first would report failure for an operation the C cannot fail.
-//!
-//! New entries are PREPENDED to their bucket in the C
-//! (`uint32_hash_elem_link`, `:101-108`), so within one bucket the C order
-//! is reverse insertion. That detail is observable only through
-//! [`Uint32Hash::visit`], which the audit below covers.
-//!
 //! # `visit` is an early-exit walk, not a plain for-each
 //!
 //! `Curl_uint32_hash_visit` (`:225-240`) walks bucket 0 upwards and, inside
@@ -213,138 +67,11 @@
 //! `&mut V` rather than `&V` because the measured consumers mutate the
 //! stream they are given. [`Uint32Hash::visit_ref`] is the shared-borrow
 //! variant, for a walk that only reads.
-//!
-//! The `void *user_data` third parameter has no successor: a closure
-//! captures whatever it needs with its real type, so the cast that every C
-//! callback performed on entry has nowhere left to happen.
-//!
-//! ## The callback may not structurally modify the map
-//!
-//! The borrow checker forbids inserting or removing during a walk. That is
-//! not a restriction this port adds. `lib/uint-hash.h` offers no such
-//! guarantee either, and the C walk holds an entry pointer across the
-//! callback and then dereferences its `next` field, so a callback that freed
-//! the entry would leave the C reading released memory. The Rust rule and
-//! the real C contract coincide exactly.
-//!
-//! Worth saying plainly, because the neighbouring integer-keyed bitset does
-//! document iteration under modification in its own header, so a reader
-//! arriving from there expects the opposite guarantee here.
-//!
-//! ## Iteration order: audited per call site, and [`HashMap`] is sound
-//!
-//! The C order is deterministic -- bucket `id % 63` ascending, reverse
-//! insertion inside a bucket -- while `HashMap::iter_mut` order is
-//! unspecified and randomized per process. Emitted bytes are a byte-exact
-//! oracle across 1,476 of the test fixtures, so the difference was audited
-//! rather than assumed. Exactly three call sites exist in the whole tree,
-//! and `lib/http2.c` is not one of them: it uses only init, set, get, remove
-//! and destroy.
-//!
-//! | Callback | Defined | Walked | Shape | Sensitive |
-//! |---|---|---|---|---|
-//! | `cf_ngtcp2_sfind` | `:307` | `:325` | search | **No** |
-//! | `cf_quiche_disp_event` | `:577` | `:625` | search | **No** |
-//! | `cf_quiche_stream_do` | `:206` | `:227` | dispatch | **No** |
-//!
-//! The first row is in `lib/vquic/curl_ngtcp2.c` and the other two are in
-//! `lib/vquic/curl_quiche.c`.
-//!
-//! The two searches are order-insensitive because their predicate matches at
-//! most one entry: a QUIC stream identifier designates exactly one stream,
-//! and both callbacks return FALSE the moment they match, so whichever order
-//! the walk takes it finds the same single entry. The first is additionally
-//! behind `#if NGTCP2_VERSION_NUM < 0x011100`; newer ngtcp2 recovers the
-//! stream from `ngtcp2_conn_get_stream_user_data` and never walks at all.
-//!
-//! The dispatch needed the closer look, since a for-each over every stream
-//! CAN be order-sensitive when it produces output. Its only two inner
-//! callbacks are `cf_quiche_do_expire`, which sets `stream->xfer_result` and
-//! marks the transfer dirty, and `cf_quiche_do_resume`, which clears
-//! `stream->quic_flow_blocked` and marks the transfer dirty. Both write
-//! per-stream state idempotently, neither accumulates into anything shared,
-//! and **neither emits a single byte to the network**. The one consequence
-//! of ordering is the sequence of trace lines, which no byte-exact
-//! expectation covers.
-//!
-//! **Conclusion: [`HashMap`] is sound for every consumer that exists.**
-//!
-//! Flagged for whoever writes `crate::protocols::http2` and
-//! `crate::protocols::http3` rather than settled silently on their behalf.
-//! If a new consumer needs a for-each whose ORDER reaches the wire, the
-//! honest fix is to change the one field below to `BTreeMap<u32, V>`. That
-//! yields ascending `mid` order, which is deterministic and is closer to
-//! processing transfers in identifier order than the C's bucket order ever
-//! was, and every method here keeps its signature: the only observable
-//! change is that [`Uint32Hash::visit`] and [`Uint32Hash::visit_ref`] become
-//! ordered. Do not reach for a custom hasher instead. Performance is an
-//! explicit non-goal of this work, a non-default hasher trades away
-//! denial-of-service resistance for no required benefit, and it would not
-//! make the order deterministic in any case.
-//!
-//! # Remaining differences from the C, each one deliberate
-//!
-//! - **`clear` is unconditional here.** `Curl_uint32_hash_clear` exists only
-//!   in unit-test builds: `lib/uint-hash.c:201-206` wraps the file-static
-//!   `uint_hash_clear` in `#ifdef UNITTESTS`, while `uint_hash_clear` itself
-//!   is used year-round by `Curl_uint32_hash_destroy`. Hiding the public form
-//!   behind a build flag would buy nothing and would make the operation
-//!   untestable without one.
-//! - **`clear` keeps the allocation.** The C clear destroys every entry and
-//!   leaves `h->table` allocated; `HashMap::clear` likewise retains capacity.
-//!   Another coincidence rather than a design decision, and recorded so that
-//!   nobody adds a shrink to "finish the job".
-//! - **`destroy` becomes ordinary drop glue, and no [`Drop`] implementation
-//!   is written.** `Curl_uint32_hash_destroy` (`:208-217`) clears, releases
-//!   the table, asserts `h->size == 0` and zeroes `slots` while leaving
-//!   `dtor` set. Dropping a [`Uint32Hash`] drops its map, which drops every
-//!   value: the same effect, with the size assertion made unnecessary by
-//!   construction. An explicit implementation was considered and rejected --
-//!   it would add nothing and would block moving the field out of the struct.
-//! - **`get` is strictly more precise.** `Curl_uint32_hash_get` returns NULL
-//!   both for "absent" and for "present, holding NULL". `Option<&V>` can only
-//!   mean absent, and no consumer stores a null-equivalent value: all three
-//!   store a freshly allocated stream context.
-//! - **`count` saturates rather than wrapping.** The C caches the population
-//!   in a `uint32_t` that `++h->size` would wrap at 2^32. Reporting
-//!   [`u32::MAX`] for a map that large is strictly more honest, and reaching
-//!   the case at all needs 2^32 distinct keys.
-//!
-//! # Layering, safety and dependencies
-//!
-//! One import, [`HashMap`], and nothing else. This module names no sibling
-//! module and no crate dependency, which keeps `crate::util` at the base of
-//! the module graph where every other module can reach it without a cycle.
-//! No error type is in play, because every fallible path in this API answers
-//! with a `bool` exactly as the C does, so there is no `CURLcode` here.
-//!
-//! Nothing below holds a raw pointer, stores a function pointer, or hides a
-//! payload behind a boxed dynamic type. Reintroducing a type-erased payload
-//! to imitate `void *` would rebuild precisely the cast this transformation
-//! exists to remove, so [`Uint32Hash`] is generic over `V` instead. The
-//! `struct uint_hash_entry **he_anchor` double-indirection that the C needs
-//! to unlink from the middle of a bucket chain has no counterpart at all.
-//!
-//! Edition 2021, and the minimum supported Rust version is 1.75.
-//! `HashMap::try_reserve`, the one member here that is not ancient, has been
-//! stable since 1.57 and is comfortably inside that floor.
 
 use std::collections::HashMap;
 
 /// A hash map keyed on [`u32`] -- supersedes `struct uint_hash`
 /// (`lib/uint-hash.h:33-41`).
-///
-/// The C struct carries four fields plus a debug sentinel: `table`, `dtor`,
-/// `slots`, `size` and `init`. Every one of the five is absorbed here. The
-/// bucket array and the population counter are [`HashMap`]'s own business,
-/// the destructor becomes [`Drop`] on `V`, the slot count survives only as
-/// the hint [`Uint32Hash::with_capacity`] forwards, and the sentinel is
-/// replaced by the type system. What is left is one field, which is the
-/// whole point.
-///
-/// Changing that field to a `BTreeMap<u32, V>` is the single-line remedy
-/// documented at the module level, should a consumer ever need a
-/// deterministic walk order.
 pub(crate) struct Uint32Hash<V> {
     map: HashMap<u32, V>,
 }
@@ -366,11 +93,6 @@ impl<V> Uint32Hash<V> {
     /// Creates an empty map, pre-sized from a slot count -- supersedes
     /// `Curl_uint32_hash_init` (`lib/uint-hash.c:44-58`) for the three call
     /// sites that pass one.
-    ///
-    /// All three pass 63. The C treats the argument as a bucket count and
-    /// takes `id % slots` to index; there is no modulo here, so it is a
-    /// capacity hint and nothing more, and passing a different value changes
-    /// no observable behaviour.
     ///
     /// # Panics
     ///
@@ -397,27 +119,6 @@ impl<V> Uint32Hash<V> {
 
     /// Stores `value` under `id`, reporting whether the value was taken --
     /// supersedes `Curl_uint32_hash_set` (`lib/uint-hash.c:113-142`).
-    ///
-    /// # The returned boolean
-    ///
-    /// `true` means **the map has taken ownership of `value`**. `false` means
-    /// the reservation the insert needed could not be made, so nothing was
-    /// stored. It does NOT report whether the key was previously absent, and
-    /// an implementation returning `HashMap::insert(..).is_none()` here would
-    /// invert what both C call sites depend on. See the module documentation
-    /// for the two witnesses.
-    ///
-    /// Because `value` is moved in, a `false` cannot hand it back, whereas
-    /// the C caller still held its pointer. That difference is not a loss:
-    /// the C caller had to release the value itself in that branch, and here
-    /// the value is dropped for it.
-    ///
-    /// # Overwriting
-    ///
-    /// An existing key keeps its slot. The displaced value is dropped in
-    /// place, which is what `uint32_hash_entry_clear` did by invoking the
-    /// destructor, and it is not returned to the caller. The population is
-    /// unchanged, exactly as the C leaves `h->size` alone on that path.
     #[allow(dead_code)]
     pub(crate) fn set(&mut self, id: u32, value: V) -> bool {
         // The C's chain walk, and its consequence: an overwrite reuses the
@@ -451,17 +152,6 @@ impl<V> Uint32Hash<V> {
 
     /// Removes the entry for `id`, reporting whether one was present --
     /// supersedes `Curl_uint32_hash_remove` (`lib/uint-hash.c:144-164`).
-    ///
-    /// # The returned boolean
-    ///
-    /// `true` means **the key was present** and its value has been dropped,
-    /// which is the destructor call the C made through
-    /// `uint32_hash_entry_destroy`. `false` means the key was absent, which
-    /// in the C also covered the case of a map whose table had never been
-    /// allocated.
-    ///
-    /// Note the asymmetry with [`Uint32Hash::set`], whose boolean answers a
-    /// different question entirely.
     #[allow(dead_code)]
     pub(crate) fn remove(&mut self, id: u32) -> bool {
         // The removed value lives in the temporary this expression builds and
@@ -503,12 +193,6 @@ impl<V> Uint32Hash<V> {
     }
 
     /// Reports whether the map holds no entries.
-    ///
-    /// The C has no such entry point, and this is not decoration: two of the
-    /// three `Curl_uint32_hash_count` call sites in `lib/vquic/curl_ngtcp2.c`
-    /// (`:202` and `:374`) exist only to write `if(!count(..))`, which is an
-    /// emptiness test spelled through a population query. This is the direct
-    /// successor of that idiom.
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.map.is_empty()
@@ -517,11 +201,6 @@ impl<V> Uint32Hash<V> {
     /// Drops every stored value, leaving the map empty -- supersedes
     /// `Curl_uint32_hash_clear` (`lib/uint-hash.c:201-206`) and the
     /// file-static `uint_hash_clear` (`:184-199`) it wraps.
-    ///
-    /// Every value is dropped, which is the destructor call the C made per
-    /// entry. The allocation is retained, matching the C, which frees
-    /// `h->table` only in `Curl_uint32_hash_destroy`. Unlike the C wrapper,
-    /// this is available in every build rather than only under `UNITTESTS`.
     #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.map.clear();
@@ -533,19 +212,6 @@ impl<V> Uint32Hash<V> {
     /// `cb` receives each key and a mutable borrow of its value, and
     /// **returning `false` ends the walk immediately**, exactly as the C
     /// returns from its nested loops. Returning `true` continues.
-    ///
-    /// The `void *user_data` the C threaded through has no parameter here: a
-    /// closure captures what it needs, with its own type, so the cast every C
-    /// callback opened with is gone.
-    ///
-    /// `cb` cannot insert into or remove from the map while the walk is in
-    /// progress. The borrow checker enforces that, and the C offers no such
-    /// guarantee either -- it holds an entry pointer across the callback and
-    /// then follows that entry's `next` field.
-    ///
-    /// The visiting ORDER is unspecified. See the module documentation for
-    /// the per-call-site audit that establishes no consumer depends on it,
-    /// and for the remedy if one ever does.
     #[allow(dead_code)]
     pub(crate) fn visit<F>(&mut self, mut cb: F)
     where
@@ -559,12 +225,6 @@ impl<V> Uint32Hash<V> {
     }
 
     /// Walks the entries with shared access, stopping early on request.
-    ///
-    /// The read-only counterpart of [`Uint32Hash::visit`], with the same
-    /// early-exit contract. `visit` is the form the measured consumers need,
-    /// because they mutate the stream they are handed; this one exists for a
-    /// walk that only inspects, so that a caller does not have to take an
-    /// exclusive borrow it has no use for.
     #[allow(dead_code)]
     pub(crate) fn visit_ref<F>(&self, mut cb: F)
     where
@@ -607,12 +267,6 @@ mod tests {
     const VALUE2: i32 = 204;
 
     /// A value whose drops are counted.
-    ///
-    /// The C proved its destructor ran by handing `Curl_uint32_hash_dtor` a
-    /// heap pointer and letting the leak checker complain. `Drop` is the
-    /// successor of that destructor, so the equivalent evidence here is a
-    /// counter: every assertion about destruction below reads this rather
-    /// than assuming the collapse worked.
     struct Counted {
         tag: u32,
         drops: Rc<Cell<usize>>,
@@ -805,9 +459,7 @@ mod tests {
         assert_eq!(calls, 3, "the walk must end on the third callback");
     }
 
-    /// A callback that never stops sees every entry once. Compared as a set,
-    /// because the visiting order is unspecified and the module-level audit
-    /// establishes that no consumer depends on it.
+    /// A callback that never stops sees every entry once.
     #[test]
     fn visit_reaches_every_entry_exactly_once() {
         let expected: HashSet<u32> =

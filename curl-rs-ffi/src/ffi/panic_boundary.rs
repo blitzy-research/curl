@@ -6,11 +6,19 @@
 //!
 //! Every exported entry point routes its body through exactly one of the four
 //! functions here. That is the rule for all 100 names in `lib/libcurl.def`;
-//! measured today, 44 of the 100 are defined and every one of those 44 obeys
-//! it, with the remaining 56 unwritten. The rule is stated as a rule rather
-//! than as an accomplished fact because a future export that skipped this
-//! module would be a defect, and a comment claiming completeness would hide
-//! it. See the crate-level documentation for the fallback each return type
+//! measured today, 59 of the 100 are defined, with the remaining 41 unwritten.
+//! Every one of the 53 that is a Rust function obeys the rule directly. The
+//! other six obey it one call deeper, and none of them escapes it: they are
+//! `global_asm!` labels -- `curl_formadd` and the five plain-variadic
+//! `curl_m*printf` forms -- with no Rust body to wrap, and each spills its
+//! register arguments and then calls a Rust sibling (`formadd_va`, and the five
+//! `curl_mv*printf`) whose body is a `guard` call. So no panic can cross the
+//! boundary by that route either; verified by reading the `callee = sym` of
+//! each trampoline against the `guard` in its target. The count is not
+//! worth trusting from this comment in any case: `build.rs` prints the live
+//! figure on every build. The rule is stated as a rule rather than as an
+//! accomplished fact because a future export that skipped this module would be
+//! a defect, and a comment claiming completeness would hide it. See the crate-level documentation for the fallback each return type
 //! takes and for why containment is a safety net rather than an
 //! error-handling strategy.
 //!

@@ -21,7 +21,7 @@
 // SPDX-License-Identifier: curl
 //
 //**************************************************************************/
-// THE LICENCE BANNER ABOVE -- 23 lines, byte-identical to the banner that
+// THE LICENCE BANNER ABOVE, byte-identical to the banner that
 // heads `lib/cw-out.c:1-23` with the C block comment converted to line
 // comments, and byte-identical to the banners of `transfer/sendf.rs`,
 // `transfer/progress.rs` and `transfer/ratelimit.rs` beside it. The licence
@@ -31,47 +31,23 @@
 // rather than a comment.
 //
 // `dead_code` IS NOT ALLOWED for this file as a whole, and no attribute below
-// grants it at module scope. Items whose consumers have yet to land carry
-// their own `#[allow(dead_code)]`, so the suppressions read as an inventory:
-// each one is load-bearing, deleting any one restores a warning, and an item
-// added later with no consumer is still reported. That is enforced rather
-// than agreed -- `mod source_policy` in `curl-rs-lib/src/lib.rs` walks the
-// workspace at test time and fails on a `dead_code` level set on any crate
-// root or module root.
-//
-// The consumers this module still waits on are named, not implied: the easy
-// handle behind `curl_easy_pause`, which calls `unpause` and reads
-// `is_paused`; the transfer loop, which calls `done` at end of stream; and
-// the engine that implements `ClientOutput` and `HeaderStoreHandle` over the
-// application's registered callbacks. Each allowance is deleted when its
-// consumer lands.
-//
-// No level for the `unsafe_code` lint is set here, at any level, and the
-// keyword itself does not appear in any expression in this file. `src/lib.rs`
-// carries `#![deny(unsafe_code)]` and grants exactly ONE exemption, on
-// `mod ffi`. That matters especially here: the C original hands a `char *`
-// and a `void *` straight to a function pointer the application supplied,
-// which is the single most dangerous call libcurl makes, and the whole point
-// of this transcription is that the pointer pair becomes a byte slice and a
-// typed trait object.
-//
-// No `libc`, no raw pointer, no `extern` function, no `#[repr(C)]` and no
-// `Any` downcast appears below either, and no host clock is read.
+// grants it at module scope. Each unreferenced item carries its own
+// `#[allow(dead_code)]` naming the consumer it belongs to, so the suppressions
+// read as an inventory: every one is load-bearing, deleting any one restores a
+// warning, and an item added later with no consumer is still reported. That is
+// enforced rather than agreed -- `mod source_policy` in
+// `curl-rs-lib/src/lib.rs` walks the workspace at test time and fails on a
+// `dead_code` level set on any crate root or module root.
 
 //! The client-output and pause-handling writer stages -- supersedes
-//! `lib/cw-out.c` (517 lines) with `lib/cw-out.h` (53) and `lib/cw-pause.c`
-//! (226) with `lib/cw-pause.h` (39).
+//! `lib/cw-out.c` with `lib/cw-out.h` and `lib/cw-pause.c` with
+//! `lib/cw-pause.h`.
 //!
 //! Measured against `lib/cw-out.c:36-517` and `lib/cw-pause.c:34-225`, with
 //! the writer contract from `lib/sendf.h:42-140` and `lib/sendf.c:128-513`,
 //! the header collector from `lib/headers.c:292-346`, the buffer policies from
 //! `lib/curlx/dynbuf.c` and `lib/bufq.c`, and the callback vocabulary from
 //! `include/curl/curl.h:258-282` and `:3256-3263`.
-//!
-//! This is the bottom of the writer chain. Every response byte libcurl
-//! delivers leaves through a function in this file, and the two magic return
-//! values an application may answer with -- pause and error -- are interpreted
-//! here and nowhere else.
 //!
 //! # Why two C files become one Rust module
 //!
@@ -93,30 +69,6 @@
 //!   had already sent ([`PauseWriter`]). Reading either alone leaves the
 //!   ordering guarantee unexplained.
 //!
-//! Keeping them together also keeps the two buffer policies side by side,
-//! where the difference between them can be seen: the output buffer is a
-//! [`DynBuf`] ceilinged at [`DYN_PAUSE_BUFFER`] because it holds bytes the
-//! application has already been offered, while the in-flight buffer is a
-//! [`BufQ`] of 16-kibibyte chunks because it holds bytes that are still
-//! travelling and will be handed on whole.
-//!
-//! # The three stages, and where each sits
-//!
-//! | stage | name | phase | supersedes |
-//! |---|---|---|---|
-//! | [`ClientOutWriter`] | `cw-out` | [`Client`] | `lib/cw-out.c` |
-//! | [`PauseWriter`] | `cw-pause` | [`Protocol`] | `lib/cw-pause.c` |
-//! | [`HeaderCollectWriter`] | `hds-collect` | [`Protocol`] | `lib/headers.c` |
-//!
-//! [`ClientOutWriter`] is always last, and [`ClientWriterStack::init_base`]
-//! guarantees it: it is installed FIRST and every later stage is inserted
-//! ahead of it. [`PauseWriter`] is installed second and therefore ends up
-//! BEHIND the download stage, so a length check happens before a byte is ever
-//! buffered for a paused transfer.
-//!
-//! [`Client`]: ClientWriterPhase::Client
-//! [`Protocol`]: ClientWriterPhase::Protocol
-//!
 //! # HEADER and BODY interleave, and the interleaving is observable
 //!
 //! `lib/cw-out.c:58-61` states the model: *"HEADER and BODY data may arrive
@@ -124,12 +76,6 @@
 //! for `cw_out_type` types. The list may be:
 //! \[BODY\]->\[HEADER\]->\[BODY\]->\[HEADER\]....  When unpausing, this list
 //! is 'played back' to the client callbacks."*
-//!
-//! So the buffers are a QUEUE and not a pair of accumulators, and replay must
-//! reproduce the original call sequence -- not merely the original bytes.
-//! Every header write additionally gets a buffer of its own, so that a client
-//! whose header callback counts its invocations counts the same number after
-//! an unpause as it would have without one.
 //!
 //! The C expresses that queue as a singly linked list that grows at the HEAD
 //! and is flushed from the TAIL by a recursive walk (`:302-338`). Here it is a
@@ -146,10 +92,7 @@
 //! implements, which is what keeps the C's `sendf.h` / `cw-out.h` /
 //! `cw-pause.h` include cycle from becoming a module cycle.
 //!
-//! Payloads are bytes throughout. Nothing here converts a payload to `str`,
-//! and nothing normalises a line ending: AAP 0.6.7 measures 1,476 of the 1,914
-//! fixtures by comparing emitted bytes as one string, so any normalisation on
-//! this path is a wire-parity failure.
+//! Payloads are bytes throughout.
 
 use core::fmt;
 use std::collections::VecDeque;
@@ -164,40 +107,15 @@ use crate::transfer::sendf::{
 use crate::util::bufq::{BufQ, BufqOpts};
 use crate::util::dynbuf::{DynBuf, DYN_PAUSE_BUFFER};
 
-// =========================================================================
 // The ABI vocabulary -- `include/curl/curl.h:258-282` and `:3256-3263`
-// =========================================================================
 
 /// The largest chunk a body write callback is ever handed.
-///
-/// `CURL_MAX_WRITE_SIZE` (`include/curl/curl.h:265`), whose own comment
-/// records why it is 16384 rather than a round 20480: *"Tests have proven that
-/// 20K is a bad buffer size for uploads on Windows, while 16K for some odd
-/// reason performed a lot better."*
-///
-/// It is part of the public ABI, so it is not this module's to choose. An
-/// application sizes its own buffer from the macro and is entitled to assume
-/// no single call exceeds it, which is why `cw_get_writefunc` hands it out as
-/// `max_write` for the body stream (`lib/cw-out.c:153`).
-///
-/// The header stream deliberately does NOT use it; see
-/// [`Resolved::max_write`].
 pub(crate) const CURL_MAX_WRITE_SIZE: usize = 16384;
 
 /// The count a write callback returns to pause the transfer.
-///
-/// `CURL_WRITEFUNC_PAUSE` (`include/curl/curl.h:277`).
-///
-/// The value is compared against a `size_t` in the C (`lib/cw-out.c:195`), so
-/// the type here is [`usize`] rather than a 32-bit integer, and the comparison
-/// is exact: a callback on a 64-bit target that returns `0x1_0000_0001` --
-/// one more bit than the sentinel -- is a byte count, not a pause. Widening
-/// the test would change which returns pause a transfer.
 pub(crate) const CURL_WRITEFUNC_PAUSE: usize = 0x1000_0001;
 
 /// The count a write callback returns to fail the transfer.
-///
-/// `CURL_WRITEFUNC_ERROR` (`include/curl/curl.h:281`).
 ///
 /// Note what this is NOT: it is 0xFFFFFFFF, and on a 64-bit target that is
 /// 4,294,967,295 rather than [`usize::MAX`]. A callback that returns
@@ -237,12 +155,6 @@ pub(crate) const CURLPAUSE_CONT: i32 =
 
 /// `curl_easy_pause`'s bitmask, read rather than guessed at.
 ///
-/// The public function takes a bare `int` (`include/curl/easy.h:76`), and the
-/// six macros above are what an application composes it from. This is that
-/// integer with its meaning stated, so that the easy layer can hand the engine
-/// a value whose interpretation lives in one place -- next to the constants,
-/// where a reader can check it against the header.
-///
 /// # Why the "continue" spellings are both zero, and why that is not a bug
 ///
 /// `CURLPAUSE_RECV_CONT` and `CURLPAUSE_SEND_CONT` are both `0`, so they carry
@@ -257,19 +169,19 @@ pub(crate) struct PauseBits(i32);
 
 impl PauseBits {
     /// `CURLPAUSE_RECV`: the receive direction stays paused.
-    #[allow(dead_code)] // consumer not landed: easy/setopt.rs, curl_easy_pause
+    #[allow(dead_code)] // consumer: easy/setopt.rs, curl_easy_pause
     pub(crate) const RECV: Self = Self(CURLPAUSE_RECV);
 
     /// `CURLPAUSE_SEND`: the send direction stays paused.
-    #[allow(dead_code)] // consumer not landed: easy/setopt.rs, curl_easy_pause
+    #[allow(dead_code)] // consumer: easy/setopt.rs, curl_easy_pause
     pub(crate) const SEND: Self = Self(CURLPAUSE_SEND);
 
     /// `CURLPAUSE_ALL`: both directions stay paused.
-    #[allow(dead_code)] // consumer not landed: easy/setopt.rs, curl_easy_pause
+    #[allow(dead_code)] // consumer: easy/setopt.rs, curl_easy_pause
     pub(crate) const ALL: Self = Self(CURLPAUSE_ALL);
 
     /// `CURLPAUSE_CONT`: both directions resume.
-    #[allow(dead_code)] // consumer not landed: easy/setopt.rs, curl_easy_pause
+    #[allow(dead_code)] // consumer: easy/setopt.rs, curl_easy_pause
     pub(crate) const CONT: Self = Self(CURLPAUSE_CONT);
 
     /// The mask an application passed to `curl_easy_pause`.
@@ -278,13 +190,13 @@ impl PauseBits {
     /// validate the mask either -- `lib/easy.c` tests the two bits it knows and
     /// ignores the rest -- and discarding them here would hide a caller's
     /// mistake from [`Self::bits`].
-    #[allow(dead_code)] // consumer not landed: easy/setopt.rs, curl_easy_pause
+    #[allow(dead_code)] // consumer: easy/setopt.rs, curl_easy_pause
     pub(crate) const fn from_bits(bits: i32) -> Self {
         Self(bits)
     }
 
     /// The raw mask, for the ABI shim that received it.
-    #[allow(dead_code)] // consumer not landed: curl-rs-ffi/src/ffi/easy.rs
+    #[allow(dead_code)] // consumer: curl-rs-ffi/src/ffi/easy.rs
     pub(crate) const fn bits(self) -> i32 {
         self.0
     }
@@ -293,7 +205,7 @@ impl PauseBits {
     ///
     /// This is the bit [`ClientOutWriter`] answers to: a mask without it means
     /// [`unpause`] should run.
-    #[allow(dead_code)] // consumer not landed: easy/setopt.rs, curl_easy_pause
+    #[allow(dead_code)] // consumer: easy/setopt.rs, curl_easy_pause
     pub(crate) const fn pauses_recv(self) -> bool {
         (self.0 & CURLPAUSE_RECV) != 0
     }
@@ -303,29 +215,15 @@ impl PauseBits {
     /// Answered by the READER chain rather than by anything here; the method
     /// lives beside its twin so that the vocabulary is not split across two
     /// modules.
-    #[allow(dead_code)] // consumer not landed: easy/setopt.rs, curl_easy_pause
+    #[allow(dead_code)] // consumer: easy/setopt.rs, curl_easy_pause
     pub(crate) const fn pauses_send(self) -> bool {
         (self.0 & CURLPAUSE_SEND) != 0
     }
 }
 
 /// What a write callback answered.
-///
-/// The C reads one `size_t` and overloads two sentinels onto it, then
-/// distinguishes four cases from that single number (`lib/cw-out.c:195-217`).
-/// Those four cases are three variants here plus one comparison, so that no
-/// code below can mistake a byte count for a sentinel or the reverse.
-///
-/// The magic integers themselves stay at the boundary that receives them: an
-/// adapter over `CURLOPT_WRITEFUNCTION` calls
-/// [`Self::from_callback_count`] on whatever the application returned, and
-/// [`Self::to_callback_count`] takes the value back the other way for a
-/// diagnostic. Neither conversion is lossy and both are exact.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-// Constructed by the adapter over `CURLOPT_WRITEFUNCTION`, which has yet to
-// land: `curl-rs-ffi/src/ffi/easy.rs` for a C consumer and
-// `curl-rs/src/callbacks/write.rs` for the command-line tool. Every variant is
-// MATCHED below, so the allowance covers construction only.
+// Every variant is MATCHED below, so the allowance covers construction only.
 #[allow(dead_code)]
 pub(crate) enum ClientWriteOutcome {
     /// The callback claims to have consumed this many bytes.
@@ -350,7 +248,7 @@ impl ClientWriteOutcome {
     /// preserved so a reader diffing the two files finds the branches where
     /// they were.
     #[must_use]
-    #[allow(dead_code)] // consumer not landed: curl-rs-ffi/src/ffi/easy.rs
+    #[allow(dead_code)] // consumer: curl-rs-ffi/src/ffi/easy.rs
     pub(crate) const fn from_callback_count(count: usize) -> Self {
         if count == CURL_WRITEFUNC_PAUSE {
             Self::Pause
@@ -390,25 +288,6 @@ impl ClientWriteOutcome {
 /// | `fwrite_header` | [`Self::has_header_write`], [`Self::write_header`] |
 /// | `writeheader` | [`Self::has_header_target`] |
 /// | `include_header` | [`Self::include_header`] |
-///
-/// # Why the two destinations are not a parameter
-///
-/// The C selects a callback AND a destination independently, and the
-/// interesting case is the one where they cross: with `CURLOPT_HEADERDATA` set
-/// but no `CURLOPT_HEADERFUNCTION`, headers go to the BODY callback with the
-/// HEADER destination (`lib/cw-out.c:160-162`). A single
-/// `write(bytes, destination)` method would need the destination as a value,
-/// which is the `void *` this migration exists to remove. Three methods name
-/// the three pairings the C can form and no others, so the crossing case is
-/// visible in the trait rather than encoded in an argument.
-///
-/// # The answers may change between calls, and are re-asked every time
-///
-/// `lib/cw-out.c:238` is explicit: *"write callbacks may get NULLed by the
-/// client between calls."* An application may replace or remove either
-/// callback from inside the other one, so [`ClientOutWriter`] resolves through
-/// this trait on every flush and never caches the result. An implementation
-/// must therefore answer from live state.
 pub(crate) trait ClientOutput: fmt::Debug {
     /// Whether `CURLOPT_WRITEFUNCTION` is installed.
     ///
@@ -422,12 +301,6 @@ pub(crate) trait ClientOutput: fmt::Debug {
 
     /// Whether `CURLOPT_HEADERDATA` -- the C's `writeheader`, reached through
     /// the `CURLOPT_WRITEHEADER` alias as well -- is set.
-    ///
-    /// Consulted ONLY when [`Self::has_header_write`] is false, and then only
-    /// together with [`Self::has_body_write`]: the C's
-    /// `data->set.writeheader ? data->set.fwrite_func : NULL` yields no
-    /// callback at all when the body callback is absent, however the
-    /// destination is set.
     fn has_header_target(&self) -> bool;
 
     /// `CURLOPT_HEADER`: whether headers are ALSO written to the body stream.
@@ -460,12 +333,6 @@ pub(crate) trait ClientOutput: fmt::Debug {
 
 /// The transfer's header store, and the request it is currently on.
 ///
-/// Supersedes the two pieces of `struct Curl_easy` that `Curl_headers_push`
-/// reaches for (`lib/headers.c:221-281`): `data->state.httphdrs`, the store
-/// itself, and `data->state.requests`, the number stamped into every entry so
-/// that `curl_easy_header` can be asked for a header from an earlier
-/// redirection hop.
-///
 /// A seam and not an owned field, because the store outlives the writer chain:
 /// `curl_easy_header` is answerable after a transfer has finished and its
 /// writers have been torn down, so [`HeaderCollectWriter`] must write THROUGH
@@ -478,9 +345,7 @@ pub(crate) trait HeaderStoreHandle: fmt::Debug {
     fn request(&self) -> i32;
 }
 
-// =========================================================================
 // `cw-out` -- the client-output stage, `lib/cw-out.c:66-517`
-// =========================================================================
 
 /// Which of the client's two streams a buffered run of bytes belongs to.
 ///
@@ -490,30 +355,11 @@ pub(crate) trait HeaderStoreHandle: fmt::Debug {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum OutBufKind {
     /// `CW_OUT_NONE` (`lib/cw-out.c:67`): no stream.
-    ///
-    /// In the C this is the zero a fresh `curlx_calloc` leaves in the `type`
-    /// member before `cw_out_buf_create` assigns the real one, and the value
-    /// `cw_get_writefunc`'s `default:` arm is written for (`:166-171`). It is
-    /// never the type of a buffer that holds bytes.
-    ///
-    /// Here it also serves as the answer to "what kind is the newest buffer"
-    /// when there is no buffer at all -- see
-    /// [`ClientOutWriter::newest_kind`] --
-    /// which is exactly how the C reads the same situation: its
-    /// `!ctx->buf || (ctx->buf->type != otype)` test (`:355`) treats an absent
-    /// buffer and a mismatched one identically.
     None,
     /// `CW_OUT_BODY` (`lib/cw-out.c:68`): the body stream.
     Body,
     /// `CW_OUT_BODY_0LEN` (`lib/cw-out.c:69`): a body write of no bytes that
     /// must still reach the callback.
-    ///
-    /// A separate kind rather than a flag, because it is the one case where an
-    /// EMPTY buffer still has to be flushed: `cw_out_buf_flush`'s guard is
-    /// `curlx_dyn_len(&cwbuf->b) || (cwbuf->type == CW_OUT_BODY_0LEN)`
-    /// (`:275`). A zero-length write is how a protocol signals a body it knows
-    /// to be empty, and an application that counts callback invocations can
-    /// tell the difference.
     BodyZeroLen,
     /// `CW_OUT_HDS` (`lib/cw-out.c:70`): the header stream, which is metadata
     /// rather than content -- headers, and the informational writes FTP and
@@ -527,7 +373,7 @@ impl OutBufKind {
     /// Present so a diagnostic can name a kind the way the C does without a
     /// second table to keep in step.
     #[must_use]
-    #[allow(dead_code)] // consumer not landed: trace/mod.rs pause diagnostics
+    #[allow(dead_code)] // consumer: trace/mod.rs pause diagnostics
     pub(crate) const fn c_name(self) -> &'static str {
         match self {
             Self::None => "CW_OUT_NONE",
@@ -566,16 +412,6 @@ struct OutBuf {
 
 impl OutBuf {
     /// `cw_out_buf_create(otype)` (`lib/cw-out.c:79-87`).
-    ///
-    /// The ceiling is [`DYN_PAUSE_BUFFER`], imported rather than restated: the
-    /// C passes that very macro, and a second constant with the same intent
-    /// would be free to drift from it.
-    ///
-    /// Note that the ceiling is PER BUFFER in the C, while the check in
-    /// [`ClientOutWriter::append`] is over the SUM of every buffer. Both are
-    /// the C's: the per-buffer ceiling is the backstop the aggregate check
-    /// makes unreachable, and keeping it means a defect in the aggregate check
-    /// cannot turn into unbounded growth.
     fn new(kind: OutBufKind) -> Self {
         Self {
             kind,
@@ -585,12 +421,6 @@ impl OutBuf {
 }
 
 /// Which callback pairing a flush resolved to.
-///
-/// The successor of the `curl_write_callback` plus `void *` pair that
-/// `cw_get_writefunc` hands back through two out-parameters
-/// (`lib/cw-out.c:144-147`). The three variants are the three pairings
-/// [`ClientOutput`] can form; a fourth would need a fourth destination, and
-/// there is not one.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum CallbackSlot {
     /// `data->set.fwrite_func` with `data->set.out`.
@@ -611,37 +441,13 @@ struct Resolved {
     /// Which pairing to invoke.
     slot: CallbackSlot,
     /// The largest slice to hand over in one call, or zero for "no limit".
-    ///
-    /// [`CURL_MAX_WRITE_SIZE`] for the body stream (`lib/cw-out.c:153`) and
-    /// ZERO for the header stream (`:163`), whose comment gives the reason:
-    /// *"do not chunk-write headers, write them as they are"*. A header
-    /// callback receives each header exactly as the protocol layer delivered
-    /// it, which is what lets an application parse one header per call.
     max_write: usize,
     /// The smallest slice worth handing over, unless the caller is flushing
     /// everything.
-    ///
-    /// Zero for every stream, and the C explains why at `:154-156`: *"if we
-    /// ever want buffering of BODY output, we can set `min_write` the preferred
-    /// size. The default should always be to pass data to the client as it
-    /// comes without delay."* The field is kept, and the comparison that reads
-    /// it is kept, because removing either would delete the shape of a
-    /// behaviour the C reserves the right to switch on -- and because with a
-    /// zero minimum the comparison is unreachable, so there is nothing to gain
-    /// by removing it.
     min_write: usize,
 }
 
 /// What one attempt at handing bytes to a callback achieved.
-///
-/// The successor of `cw_out_ptr_flush`'s `size_t *pconsumed` out-parameter
-/// (`lib/cw-out.c:221-226`), and the reason it cannot simply be a
-/// `CurlResult<usize>`: the C fills `*pconsumed` even on the paths that return
-/// an error. Specifically, a chunked body flush that pauses partway reports
-/// [`CURLcode::Again`] AND the bytes the earlier chunks consumed
-/// (`:256-262`), and `cw_out_buf_flush` needs both halves -- the code to
-/// decide whether to keep going, the count to decide how much of the buffer
-/// survives.
 #[derive(Debug)]
 struct DirectFlush {
     /// The C's `*pconsumed`: how many bytes the callback took.
@@ -653,34 +459,11 @@ struct DirectFlush {
 
 /// The stage that hands bytes to the application, and holds them back when it
 /// will not take them.
-///
-/// Supersedes `struct cw_out_ctx` (`lib/cw-out.c:97-102`) and the fourteen
-/// functions that operate on it. Always at [`ClientWriterPhase::Client`], and
-/// always the last stage in the chain -- `lib/cw-out.c:39-40` states it as a
-/// requirement: *"The 'cw-out' writer is supposed to be the last writer in a
-/// transfer's stack. It is always added when that stack is initialized."*
-///
-/// # The two flags, and how they differ
-///
-/// [`Self::paused`] is transient: the application raised it by returning
-/// [`ClientWriteOutcome::Pause`] and clears it through `curl_easy_pause`.
-/// [`Self::errored`] is STICKY and has no way back. Its comment in the C names
-/// the defect it fixes (`:410-411`): *"We do not want to invoked client
-/// callbacks a second time after encountering an error. See issue #13337."*
-/// Once it is set, every further flush returns [`CURLcode::WriteError`] without
-/// calling the application again, and the buffers are released so that nothing
-/// is held for a replay that will never happen.
 #[derive(Debug)]
 pub(crate) struct ClientOutWriter<'data> {
     /// The application's callbacks, re-asked on every flush.
     output: Box<dyn ClientOutput + 'data>,
     /// `ctx->buf`, as a queue with the OLDEST run at the front.
-    ///
-    /// The C's list grows at the head and is drained from the tail by a
-    /// recursive walk (`lib/cw-out.c:302-338`); both ends are reversed here and
-    /// the traversal order is therefore identical. Stating it as a queue is
-    /// what makes the replay order -- arrival order -- visible without reading
-    /// the walk.
     bufs: VecDeque<OutBuf>,
     /// `BIT(paused)`: the application asked for delivery to stop.
     paused: bool,
@@ -691,13 +474,7 @@ pub(crate) struct ClientOutWriter<'data> {
 
 impl<'data> ClientOutWriter<'data> {
     /// A stage over the application's callbacks, with nothing buffered.
-    ///
-    /// `cw_out_init` (`lib/cw-out.c:104-111`) sets `ctx->buf = NULL` on a
-    /// structure `curlx_calloc` has already zeroed, so both flags start false
-    /// and the queue starts empty. This is that state, established once at
-    /// construction; [`ClientWriter::init`] re-establishes it, exactly as the
-    /// C's `do_init` does.
-    #[allow(dead_code)] // consumer not landed: the engine's ClientIoFactory
+    #[allow(dead_code)] // consumer: the engine's ClientIoFactory
     pub(crate) fn new(output: Box<dyn ClientOutput + 'data>) -> Self {
         Self {
             output,
@@ -709,26 +486,13 @@ impl<'data> ClientOutWriter<'data> {
 
     /// `cw_out_bufs_len(ctx)` (`lib/cw-out.c:122-131`): how many bytes are
     /// buffered across every run.
-    ///
-    /// Summed rather than tracked incrementally, as the C sums it. A running
-    /// total would be a second representation of the same fact, and
-    /// [`PauseWriter`] shows what that costs: it keeps one, and the C has to
-    /// assert that it has not drifted (`lib/cw-pause.c:122`).
-    #[allow(dead_code)] // consumer not landed: multi/mod.rs pause accounting
+    #[allow(dead_code)] // consumer: multi/mod.rs pause accounting
     pub(crate) fn buffered(&self) -> usize {
         self.bufs.iter().map(|buf| buf.data.len()).sum()
     }
 
     /// The kind of the NEWEST buffered run, or [`OutBufKind::None`] when
     /// nothing is buffered.
-    ///
-    /// The successor of the C's `ctx->buf` dereference, and the reason
-    /// [`OutBufKind::None`] is kept: `!ctx->buf || (ctx->buf->type != otype)`
-    /// (`lib/cw-out.c:355`) asks one question of two situations, and returning
-    /// the sentinel for the absent case lets the comparison ask it once.
-    ///
-    /// The NEWEST run is the C's HEAD, because the C inserts at the head
-    /// (`:359-360`). Here it is the BACK of the queue.
     fn newest_kind(&self) -> OutBufKind {
         self.bufs
             .back()
@@ -738,11 +502,6 @@ impl<'data> ClientOutWriter<'data> {
     /// `cw_get_writefunc` (`lib/cw-out.c:144-172`), asked afresh on every
     /// flush.
     ///
-    /// [`None`] is the C's `wcb == NULL`, and the caller turns it into a
-    /// successful write of everything. The C's `max_write` and `min_write` are
-    /// still assigned on that path (`:167-170`), but nothing reads them once
-    /// the callback is absent, so they are not carried out of here.
-    ///
     /// # The header precedence, which is a chain and not a choice
     ///
     /// `lib/cw-out.c:160-162` is one conditional expression:
@@ -750,18 +509,6 @@ impl<'data> ClientOutWriter<'data> {
     /// 1. `fwrite_header` if it is installed;
     /// 2. otherwise `fwrite_func`, but ONLY if `writeheader` is set;
     /// 3. otherwise no callback at all.
-    ///
-    /// Step 2 is where the two settings cross, and it is easy to get wrong in
-    /// two different ways. `CURLOPT_HEADERDATA` alone with no body callback
-    /// yields NO callback -- the C's inner conditional still evaluates to
-    /// `data->set.fwrite_func`, which is null -- and a body callback alone with
-    /// no `CURLOPT_HEADERDATA` also yields none, because the outer test is on
-    /// `writeheader`. Both are reproduced.
-    ///
-    /// The destination is selected independently of the callback in all three
-    /// steps: `wcb_data` is `data->set.writeheader` unconditionally for this
-    /// stream (`:162`), which is what [`CallbackSlot::BodyToHeaderTarget`]
-    /// records.
     fn resolve(&self, kind: OutBufKind) -> Option<Resolved> {
         match kind {
             // `lib/cw-out.c:149-158`.
@@ -869,11 +616,6 @@ impl<'data> ClientOutWriter<'data> {
                 ctx.trc_write(format_args!("[OUT] PAUSE requested by client"));
                 // `:205-206`: `result ? result : CURLE_AGAIN`. A refusal
                 // propagates unchanged; an acceptance becomes backpressure.
-                //
-                // Spelled through the trait rather than as a method call so
-                // that the seam being crossed is named at the call site: this
-                // is the ONE operation this module asks of the transfer loop,
-                // and `lib/cw-out.c` reaches it by including `transfer.h`.
                 TransferControl::pause_recv(ctx.control(), true)?;
                 Err(Error::new(CURLcode::Again))
             }
@@ -906,9 +648,6 @@ impl<'data> ClientOutWriter<'data> {
 impl ClientOutWriter<'_> {
     /// `cw_out_ptr_flush` (`lib/cw-out.c:221-266`): hand a slice straight to
     /// the application, chunked as the stream requires.
-    ///
-    /// Reports both halves of the C's answer; see [`DirectFlush`] for why one
-    /// of them cannot be folded into the other.
     ///
     /// # The three shapes of the body of this function
     ///
@@ -1008,13 +747,6 @@ impl ClientOutWriter<'_> {
     /// `cw_out_buf_flush` (`lib/cw-out.c:268-300`): flush one buffered run and
     /// keep whatever the application would not take.
     ///
-    /// The run arrives as a borrow rather than being reached through
-    /// [`Self::bufs`], because flushing it needs the callbacks -- and therefore
-    /// `&mut self` -- at the same time as the bytes.
-    /// [`Self::flush_chain`] lifts
-    /// the run out of the queue for the duration of the call, which is what
-    /// makes the two borrows disjoint.
-    ///
     /// # Errors
     ///
     /// Whatever [`Self::ptr_flush`] returned, EXCEPT [`CURLcode::Again`]:
@@ -1068,12 +800,6 @@ impl ClientOutWriter<'_> {
 
     /// `cw_out_flush_chain` (`lib/cw-out.c:302-338`): drain the queue from the
     /// OLDEST run forward, stopping at the first that will not empty.
-    ///
-    /// The C walks a head-inserted list by recursing to its tail, re-finding
-    /// the last node on every turn, and stops when a node survives its flush --
-    /// which its own `DEBUGASSERT(ctx->paused)` says can only happen on a pause
-    /// (`:325`). Both ends are reversed here, so the same walk is a loop over
-    /// the front of a queue and the stopping condition is stated directly.
     ///
     /// # Errors
     ///
@@ -1163,10 +889,6 @@ impl ClientOutWriter<'_> {
         // condition: *"if we do not have a buffer, or it is of another type,
         // make a new one. And for CW_OUT_HDS always make a new one, so we
         // 'replay' headers exactly as they came in"*.
-        //
-        // The header clause is the one that matters for an application: two
-        // consecutive headers must remain two callback invocations after a
-        // replay, so they may never be coalesced into one run.
         if self.newest_kind() != kind || matches!(kind, OutBufKind::Header) {
             self.bufs.push_back(OutBuf::new(kind));
         }
@@ -1331,19 +1053,6 @@ impl ClientWriter for ClientOutWriter<'_> {
     /// | `HEADER`, `CURLOPT_HEADER` on | yes | yes |
     /// | `INFO` | no | yes |
     ///
-    /// The two tests are not exclusive, so a header with `CURLOPT_HEADER`
-    /// enabled reaches BOTH streams -- the body one FIRST, because the C tests
-    /// it first. An application with two callbacks installed sees the same
-    /// header twice, in that order, and that is the documented behaviour of
-    /// `curl -i` rather than a defect.
-    ///
-    /// `STATUS`, `CONNECT`, `1XX` and `TRAILER` are NOT separate streams. They
-    /// qualify `HEADER` and are read by [`HeaderCollectWriter`]; this stage
-    /// never looks at them.
-    ///
-    /// `EOS` sets `flush_all` for both streams (`:424`), which is the only way
-    /// a run below the preferred minimum is ever forced out.
-    ///
     /// # Errors
     ///
     /// Whatever [`Self::do_write`] returned, from the FIRST stream that fails.
@@ -1420,12 +1129,6 @@ impl ClientWriter for ClientOutWriter<'_> {
 
     /// `Curl_cw_out_unpause` (`lib/cw-out.c:487-502`), steps one and three.
     ///
-    /// Step two -- `Curl_cw_pause_flush` -- belongs to [`PauseWriter`], which
-    /// the chain walk reaches FIRST because [`ClientWriterPhase::Protocol`]
-    /// sorts before [`ClientWriterPhase::Client`]. The clearing is repeated
-    /// here rather than left to that stage alone, so that a chain assembled
-    /// without a pause stage still unpauses correctly.
-    ///
     /// # Errors
     ///
     /// Whatever [`Self::flush`] returned.
@@ -1448,10 +1151,6 @@ impl ClientWriter for ClientOutWriter<'_> {
 
     /// `Curl_cw_out_done` (`lib/cw-out.c:504-517`), its second half.
     ///
-    /// The first half -- `Curl_cw_pause_flush` -- belongs to [`PauseWriter`],
-    /// and the chain walk delivers it first for the same reason it does during
-    /// an unpause.
-    ///
     /// # Errors
     ///
     /// Whatever [`Self::flush`] returned, including [`CURLcode::WriteError`]
@@ -1470,44 +1169,16 @@ impl ClientWriter for ClientOutWriter<'_> {
     }
 }
 
-// =========================================================================
 // `cw-pause` -- the in-flight stage, `lib/cw-pause.c:34-225`
-// =========================================================================
 
 /// The chunk size of a buffered BODY run in the in-flight stage.
-///
-/// `CW_PAUSE_BUF_CHUNK` (`lib/cw-pause.c:35`), whose own comment calls it the
-/// *"body dynbuf sizes"* even though the buffer is a [`BufQ`] rather than a
-/// [`DynBuf`].
-///
-/// Sixteen kibibytes, and the queue is built with a nominal ceiling of ONE such
-/// chunk plus [`BufqOpts::SOFT_LIMIT`], which the C's own comment explains
-/// (`:180-181`): the run *"has a soft limit and should take everything up to
-/// OOM"*. The nominal ceiling therefore sets the ALLOCATION GRANULARITY rather
-/// than a limit -- bytes arrive in 16-kibibyte chunks as needed -- and the real
-/// ceiling is the aggregate one [`PauseWriter::write`] enforces.
 pub(crate) const CW_PAUSE_BUF_CHUNK: usize = 16 * 1024;
 
 /// The largest BODY slice handed downstream while a content decoder is
 /// installed.
-///
-/// `CW_PAUSE_DEC_WRITE_CHUNK` (`lib/cw-pause.c:37`), whose comment reads *"when
-/// content decoding, write data in chunks"*, and whose reason is spelled out at
-/// `:160-161`: *"content decoding might blow up size considerably, write
-/// smaller chunks to make pausing need buffer less."*
-///
-/// The economy is worth stating, because it is the whole point of the constant.
-/// A compressed body expands as it passes the decoder, and the bytes that
-/// expand are the ones that end up in [`ClientOutWriter`]'s pause buffer if the
-/// application pauses. Handing the decoder 4096 bytes at a time means at most
-/// one chunk's worth of EXPANSION is in flight when a pause lands, instead of
-/// the whole receive buffer's worth.
 pub(crate) const CW_PAUSE_DEC_WRITE_CHUNK: usize = 4096;
 
 /// One run of bytes that arrived while the application was not taking any.
-///
-/// Supersedes `struct cw_pause_buf` (`lib/cw-pause.c:39-43`) minus its `next`
-/// pointer, which the owning [`VecDeque`] replaces.
 ///
 /// # Two buffer policies, chosen by what the run holds
 ///
@@ -1518,11 +1189,6 @@ pub(crate) const CW_PAUSE_DEC_WRITE_CHUNK: usize = 4096;
 ///   far as
 ///   it must and returns no chunk to a spare list on the way;
 /// * anything else gets a HARD queue of exactly one chunk sized to the write.
-///
-/// The asymmetry is deliberate and observable. A body run may be appended to,
-/// so it must be able to grow. A metadata run may NOT: a header is delivered
-/// whole, so its run is sized to it exactly and the next metadata write starts
-/// a new one, which is what preserves callback boundaries across a replay.
 #[derive(Debug)]
 struct PauseBuf {
     /// `cwbuf->type`: the write flags the run arrived with, replayed unchanged.
@@ -1553,26 +1219,6 @@ impl PauseBuf {
 }
 
 /// The stage that holds bytes already in flight when the application pauses.
-///
-/// Supersedes `struct cw_pause_ctx` (`lib/cw-pause.c:67-71`) and the six
-/// functions that operate on it. Always at [`ClientWriterPhase::Protocol`], and
-/// installed BEFORE the download stage so that it ends up BEHIND it -- so a
-/// response whose length the download stage rejects is rejected before a single
-/// byte is buffered here.
-///
-/// # Why a second buffer is needed at all
-///
-/// [`ClientOutWriter`] buffers what the application refused. This stage buffers
-/// what the SERVER had already sent by the time the refusal happened, and the
-/// distinction matters because those bytes have not yet passed the content
-/// decoder. Holding them here rather than downstream means the pause buffer
-/// stores COMPRESSED bytes, which is both smaller and the only way to keep the
-/// decoder's state consistent: a decoder cannot be asked to un-decode.
-///
-/// `lib/cw-out.c:50-52` states the requirement: *"The `cw-out` writer therefore
-/// manages buffers for bytes that could not be written. Data that was already
-/// in flight from the server also needs buffering on paused transfer when it
-/// arrives."*
 #[derive(Debug, Default)]
 pub(crate) struct PauseWriter {
     /// `ctx->buf`, as a queue with the OLDEST run at the front.
@@ -1581,12 +1227,6 @@ pub(crate) struct PauseWriter {
     /// from the tail (`:112-113`); both ends are reversed here.
     bufs: VecDeque<PauseBuf>,
     /// `ctx->buf_total`: how many bytes are held across every run.
-    ///
-    /// Tracked incrementally because the C tracks it incrementally, and the C
-    /// has to: `Curl_bufq_len` walks a chunk chain, so summing on every write
-    /// would be quadratic in the number of runs. The cost of the second
-    /// representation is that it can drift, which is why the C asserts against
-    /// it (`:122`) and why every update here is checked arithmetic.
     total: usize,
 }
 
@@ -1595,13 +1235,13 @@ impl PauseWriter {
     ///
     /// `cw_pause_init` (`lib/cw-pause.c:73-80`) sets `ctx->buf = NULL` over a
     /// zeroed structure, so the total starts at zero too.
-    #[allow(dead_code)] // consumer not landed: the engine's ClientIoFactory
+    #[allow(dead_code)] // consumer: the engine's ClientIoFactory
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// `ctx->buf_total`: how many bytes are held back.
-    #[allow(dead_code)] // consumer not landed: multi/mod.rs pause accounting
+    #[allow(dead_code)] // consumer: multi/mod.rs pause accounting
     pub(crate) fn buffered(&self) -> usize {
         self.total
     }
@@ -1685,9 +1325,6 @@ impl PauseWriter {
                 // says it: a zero-length write downstream, so the client stage
                 // sees the stream end. The C passes its still-null `buf`
                 // pointer with a length of zero; an empty slice is that.
-                //
-                // The code is RECORDED and not returned -- see this function's
-                // error documentation.
                 result = tail.write(ctx, flags, &[]);
                 let total = self.total;
                 let code = code_of(&result);
@@ -1716,7 +1353,7 @@ impl PauseWriter {
     ///   forwarding loop.
     /// * [`CURLcode::TooLarge`] when holding the remainder would take the total
     ///   past [`DYN_PAUSE_BUFFER`]. This bound is NOT in the C, which lets a
-    ///   soft-limited queue grow until the allocator refuses; AAP 0.6.6 and the
+    ///   soft-limited queue grow until the allocator refuses; the
     ///   64-mebibyte pause-buffer policy require the whole pause path to be
     ///   bounded, and an explicit refusal is what
     ///   [`ClientOutWriter::append`] already gives for the other half of it.
@@ -1755,8 +1392,6 @@ impl PauseWriter {
                 blen
             };
             // `:164-165`. The end of stream belongs to the LAST segment only.
-            // Leaving it on an earlier one would tell the client stage the body
-            // had finished with bytes still to come.
             let wtype = if wlen < blen {
                 flags.difference(ClientWriteFlags::EOS)
             } else {
@@ -1876,13 +1511,6 @@ impl ClientWriter for PauseWriter {
 
     /// `Curl_cw_out_unpause`'s first two steps (`lib/cw-out.c:496-497`).
     ///
-    /// This stage performs the clearing that step one asks for, on the stage
-    /// downstream that owns the flag, and then step two on itself. Doing it
-    /// here rather than in [`ClientOutWriter::unpause`] is what preserves the
-    /// C's ORDER: the chain walk reaches this stage first, and the C drains the
-    /// in-flight buffer before the output buffer.
-    /// [`WriterTail::clear_pause`] sets out the reasoning in full.
-    ///
     /// # Errors
     ///
     /// Whatever [`Self::flush`] returned.
@@ -1898,12 +1526,6 @@ impl ClientWriter for PauseWriter {
     }
 
     /// `Curl_cw_out_done`'s first step (`lib/cw-out.c:512`).
-    ///
-    /// Nothing is unpaused here, and that is the difference from
-    /// [`Self::unpause`]: a transfer that finishes while the application has it
-    /// paused leaves both buffers standing, because [`Self::flush`]'s loop and
-    /// [`ClientOutWriter::flush`] both decline while the client stage is
-    /// paused.
     ///
     /// # Errors
     ///
@@ -1930,30 +1552,11 @@ fn code_of(result: &CurlResult<()>) -> i32 {
     }
 }
 
-// =========================================================================
 // `hds-collect` -- the header collector, `lib/headers.c:292-346`
-// =========================================================================
 
 /// The stage that fills the store `curl_easy_header` reads.
 ///
-/// Supersedes `hds_cw_collect_write` with `struct hds_cw_collect_ctx` and the
-/// `hds_cw_collect` type (`lib/headers.c:292-322`). It lives here rather
-/// than in
-/// [`crate::headers`] because it is a WRITER, and every writer's contract
-/// is the
-/// one [`crate::transfer::sendf`] defines; the store, the classification
-/// and the
-/// origin bits stay where they are and are reached through them.
-///
 /// # A monitoring stage, which is why it is at `Protocol`
-///
-/// It changes nothing and forwards everything. `lib/sendf.h:94-97` reserves
-/// [`ClientWriterPhase::TransferDecode`] and
-/// [`ClientWriterPhase::ContentDecode`] for stages that TRANSFORM data and says
-/// the other three are *"intended for monitoring writers. Which do not modify
-/// the data but gather statistics or update progress reporting."* This one
-/// gathers headers, so [`ClientWriterPhase::Protocol`] is where it belongs --
-/// and the C installs it there explicitly (`lib/headers.c:335`).
 ///
 /// Being at `Protocol` also puts it AHEAD of the client stage, which is the
 /// ordering the store's contract needs: a header is recorded before the
@@ -1973,7 +1576,7 @@ impl<'data> HeaderCollectWriter<'data> {
     /// hds_cw_collect_ctx` that carries nothing but its base
     /// (`lib/headers.c:290-292`); the state this stage needs is the handle,
     /// which the C reaches through `data` instead.
-    #[allow(dead_code)] // consumer not landed: the engine's header init
+    #[allow(dead_code)] // consumer: the engine's header init
     pub(crate) fn new(handle: Box<dyn HeaderStoreHandle + 'data>) -> Self {
         Self { handle }
     }
@@ -1990,13 +1593,6 @@ impl ClientWriter for HeaderCollectWriter<'_> {
 
     /// `hds_cw_collect_write` (`lib/headers.c:296-313`): store a header, then
     /// forward it unchanged.
-    ///
-    /// The classification is [`classify_origin`]'s and is NOT restated here.
-    /// That is the point of it living in [`crate::headers`]: the precedence is
-    /// `CONNECT` before `1XX` before `TRAILER` before plain `HEADER`, it is a
-    /// first-match chain rather than a union, and a `STATUS` write is stored
-    /// under no origin at all. Deriving it a second time is exactly how the two
-    /// would come to disagree.
     ///
     /// # Errors
     ///
@@ -2063,7 +1659,7 @@ impl ClientWriter for HeaderCollectWriter<'_> {
 /// returned. The C frees the stage when `add` fails (`:340-343`); `add` takes
 /// ownership here, so a failure drops it -- which runs the same `do_close` the
 /// C's `Curl_cwriter_free` would, this stage having none.
-#[allow(dead_code)] // consumer not landed: the engine's per-request init
+#[allow(dead_code)] // consumer: the engine's per-request init
 pub(crate) fn install_header_collector<'data>(
     stack: &mut ClientWriterStack<'data>,
     ctx: &mut ClientCtx<'_>,
@@ -2091,23 +1687,11 @@ pub(crate) fn install_header_collector<'data>(
     stack.add(writer, ctx, factory)
 }
 
-// =========================================================================
 // The three entry points -- `lib/cw-out.h:40-50`
-// =========================================================================
 
 /// `Curl_cw_out_is_paused` (`lib/cw-out.c:453-464`): whether the client stage
 /// is holding bytes back.
-///
-/// FALSE when there is no client stage at all, which is the C's
-/// `if(!cw_out) return FALSE`. A chain that has never been built has nothing
-/// buffered, so an application that pauses before the first byte arrives is not
-/// reported as paused -- it has nothing to unpause.
-///
-/// [`ClientWriterStack::is_paused`] asks the same question of every stage and
-/// gives the same answer, because only the client stage can be paused. This
-/// spelling exists because it is the one the C exports and the one
-/// `curl_easy_pause` reads.
-#[allow(dead_code)] // consumer not landed: easy/mod.rs, curl_easy_pause
+#[allow(dead_code)] // consumer: easy/mod.rs, curl_easy_pause
 pub(crate) fn is_paused(stack: &ClientWriterStack<'_>) -> bool {
     stack
         .get_by_kind(ClientWriterKind::ClientOut)
@@ -2125,22 +1709,12 @@ pub(crate) fn is_paused(stack: &ClientWriterStack<'_>) -> bool {
 ///    holds and replays the queue in arrival order;
 /// 3. the client stage is drained, with collation still applying.
 ///
-/// The walk [`ClientWriterStack::unpause`] performs delivers exactly that:
-/// [`PauseWriter`] is at [`ClientWriterPhase::Protocol`] and so is reached
-/// first, where it performs steps one and two, and [`ClientOutWriter`] is at
-/// [`ClientWriterPhase::Client`] and performs step three.
-///
-/// Nothing happens at all when there is no client stage, which is the C's
-/// `if(cw_out)` guarding both flushes. That matters for the in-flight stage: a
-/// chain without a client stage cannot deliver anything, so draining it would
-/// write into an empty tail and fail with [`CURLcode::WriteError`].
-///
 /// # Errors
 ///
 /// Whatever the first failing stage returned -- a client callback's
 /// [`CURLcode::WriteError`], a downstream failure during the replay, or
 /// [`CURLcode::WriteError`] outright when the client stage had already failed.
-#[allow(dead_code)] // consumer not landed: easy/mod.rs, curl_easy_pause
+#[allow(dead_code)] // consumer: easy/mod.rs, curl_easy_pause
 pub(crate) fn unpause(
     stack: &mut ClientWriterStack<'_>,
     ctx: &mut ClientCtx<'_>,
@@ -2172,7 +1746,7 @@ pub(crate) fn unpause(
 /// [`CURLcode::WriteError`]
 /// when the client stage had already failed -- so finishing a transfer whose
 /// callback failed reports the failure again rather than succeeding quietly.
-#[allow(dead_code)] // consumer not landed: transfer/mod.rs, end of stream
+#[allow(dead_code)] // consumer: transfer/mod.rs, end of stream
 pub(crate) fn done(
     stack: &mut ClientWriterStack<'_>,
     ctx: &mut ClientCtx<'_>,
@@ -2226,12 +1800,6 @@ mod tests {
     }
 
     /// One thing that happened, in the order it happened.
-    ///
-    /// Callback invocations and downstream writes share ONE log, because most
-    /// of what this module has to get right is an ORDER across the two: an
-    /// unpause has to drain the in-flight stage before the output stage, and a
-    /// `--include`d header has to reach the body stream before the header
-    /// stream. Two logs could not express either.
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
         /// A call into the application.
@@ -2385,14 +1953,6 @@ mod tests {
     }
 
     /// A monitoring stage that records what passed and forwards it unchanged.
-    ///
-    /// Installed at [`ClientWriterPhase::ContentDecode`] when a test needs to
-    /// see what the pause stage writes downstream. That phase is not an
-    /// arbitrary choice: it is the only one BELOW the pause stage and ABOVE the
-    /// client stage, so it is the only place a relay can observe the traffic
-    /// between them. Its presence therefore also makes
-    /// [`WriterTail::is_content_decoding`] answer true, which is exactly the
-    /// condition the 4096-byte split tests need.
     #[derive(Debug)]
     struct Relay {
         shared: Shared,
@@ -2423,13 +1983,6 @@ mod tests {
     }
 
     /// A stage that stands where the pause stage would and does nothing.
-    ///
-    /// [`ClientWriterStack::init_base`] requires a stage of
-    /// [`ClientWriterKind::Pause`] at [`ClientWriterPhase::Protocol`], so a
-    /// test that wants to drive [`ClientOutWriter`] over SEVERAL writes needs
-    /// one that does not intercept: the real [`PauseWriter`] holds every byte
-    /// that arrives once the client stage is paused, which is its whole job and
-    /// which would leave the second write of such a test upstream.
     #[derive(Debug)]
     struct BypassPause;
 
@@ -2574,13 +2127,6 @@ mod tests {
     }
 
     /// A handle onto a store the TEST owns.
-    ///
-    /// Borrowed rather than shared behind an [`Rc`]: the trait hands out a
-    /// `&mut HeaderStore`, and a [`RefCell`] cannot produce one that outlives
-    /// its guard. The store therefore lives in the test function, the chain
-    /// borrows it for as long as it exists, and the test reads it back once the
-    /// chain has been dropped -- which the lifetime on
-    /// [`ClientWriterStack`] makes the compiler check rather than the reader.
     #[derive(Debug)]
     struct BorrowedStore<'store> {
         store: &'store mut HeaderStore,
@@ -3306,16 +2852,6 @@ mod tests {
 
     /// Alternating streams replay in arrival order, and header boundaries
     /// survive.
-    ///
-    /// The model `lib/cw-out.c:58-61` describes, driven end to end: pause at
-    /// the first callback, write BODY, HEADER, HEADER, BODY behind it, then
-    /// unpause and check what the application sees.
-    ///
-    /// Body runs COALESCE and header runs do not, which is the C's rule at
-    /// `:355`: a new run is started when the kind changes AND for every header
-    /// regardless. So the two consecutive headers stay two invocations while
-    /// the two body writes either side of them stay separate only because a
-    /// header came between them.
     #[test]
     fn alternating_streams_replay_in_arrival_order() {
         let shared = recorder();
@@ -3491,9 +3027,6 @@ mod tests {
 
     /// Arbitrary bytes -- NUL, every high byte, an embedded CRLF -- replay
     /// unchanged.
-    ///
-    /// Nothing on this path may treat a payload as text: AAP 0.6.7 compares
-    /// emitted bytes, so a normalisation here is a wire-parity failure.
     #[test]
     fn arbitrary_bytes_replay_unchanged() {
         let shared = recorder();
@@ -3575,14 +3108,6 @@ mod tests {
     // -- the aggregate ceiling ---------------------------------------------
 
     /// The 64-mebibyte ceiling is exact, and it is a SUM across every run.
-    ///
-    /// Three writes, each buffered because the stage paused on the first
-    /// callback. Header runs are always distinct (`lib/cw-out.c:355`), so this
-    /// accumulates 32 mebibytes twice -- reaching the ceiling exactly, which
-    /// succeeds -- and then one further byte, which does not.
-    ///
-    /// The ceiling is checked BEFORE anything is stored (`:347-350`), so the
-    /// refusal leaves the queue as it was and truncates nothing.
     #[test]
     #[cfg_attr(miri, ignore = "buffers 64 MiB; the arithmetic is the point")]
     fn the_aggregate_ceiling_is_exact() {
@@ -3628,12 +3153,6 @@ mod tests {
     }
 
     /// A single run is bounded by the per-buffer ceiling as well.
-    ///
-    /// `curlx_dyn_addn` reserves one byte for the terminator it writes
-    /// (`lib/curlx/dynbuf.c:72`), so a run of exactly `DYN_PAUSE_BUFFER` bytes
-    /// is refused by the buffer even though the aggregate check admits it. Both
-    /// report [`CURLcode::TooLarge`], which is why the C's two ceilings are
-    /// indistinguishable to a caller -- and why keeping both costs nothing.
     #[test]
     #[cfg_attr(miri, ignore = "buffers 64 MiB; the arithmetic is the point")]
     fn a_single_run_is_bounded_by_the_buffer_ceiling_too() {
@@ -3723,13 +3242,6 @@ mod tests {
 
     /// With a content decoder installed, a body write is split at 4096 bytes
     /// and only the LAST segment carries the end of stream.
-    ///
-    /// `lib/cw-pause.c:160-165`. The split exists so that a decoder's expansion
-    /// cannot fill the client stage's pause buffer, and moving the
-    /// end-of-stream
-    /// flag off the earlier segments is what stops the download stage
-    /// below from
-    /// concluding the body has finished.
     #[test]
     fn with_decoding_a_body_write_splits_and_keeps_the_eos_last() {
         let shared = recorder();
@@ -3784,12 +3296,6 @@ mod tests {
 
     /// While the client stage is paused, the in-flight stage holds what
     /// arrives -- and an unpause drains it BEFORE the client stage's own queue.
-    ///
-    /// This is the order `Curl_cw_out_unpause` fixes (`lib/cw-out.c:496-499`):
-    /// clear the flag, drain the in-flight buffer, drain the output buffer. The
-    /// relay proves the first two happened in that order, because it sees the
-    /// in-flight stage's replay travel past it before the client stage delivers
-    /// anything.
     #[test]
     fn an_unpause_drains_the_in_flight_stage_first() {
         let shared = recorder();
@@ -3860,11 +3366,6 @@ mod tests {
 
     /// An empty run that carries the end of stream still forwards a zero-length
     /// write.
-    ///
-    /// `lib/cw-pause.c:127-132`. The run is created by the `do`/`while` at
-    /// `:177`, which runs once even for an empty slice, and it is the only
-    /// way a
-    /// paused transfer's end of stream survives to be replayed.
     #[test]
     fn an_empty_end_of_stream_run_is_still_forwarded() {
         let shared = recorder();
@@ -3939,10 +3440,6 @@ mod tests {
     }
 
     /// The 64-mebibyte bound applies to the in-flight stage too.
-    ///
-    /// The C bounds only the client stage's queue and lets this one grow until
-    /// the allocator refuses; AAP 0.6.6 requires the whole pause path to be
-    /// bounded, so a refusal is reported instead.
     #[test]
     #[cfg_attr(miri, ignore = "buffers 64 MiB; the arithmetic is the point")]
     fn the_in_flight_stage_is_bounded_as_well() {
@@ -4250,12 +3747,6 @@ mod tests {
     // -- the remaining invariants ------------------------------------------
 
     /// Two IDENTICAL headers buffered behind a pause stay two invocations.
-    ///
-    /// `lib/cw-out.c:352-354`: *"for CW_OUT_HDS always make a new one, so we
-    /// 'replay' headers exactly as they came in"*. Identical bytes are the case
-    /// a coalescing implementation would get away with everywhere else, so
-    /// it is
-    /// the case worth pinning.
     #[test]
     fn identical_headers_keep_their_own_runs() {
         let shared = recorder();
@@ -4445,12 +3936,6 @@ mod tests {
 
     /// The sentinel kind resolves to no callback, which is the C's `default:`
     /// arm.
-    ///
-    /// `cw_get_writefunc` assigns `wcb = NULL` there (`lib/cw-out.c:166-171`),
-    /// and `cw_out_ptr_flush`'s `if(!wcb)` then consumes everything
-    /// successfully. No buffer is ever created with this kind, so the arm is
-    /// reached only through the resolver itself -- which is exactly what is
-    /// driven here.
     #[test]
     fn the_sentinel_kind_resolves_to_no_callback() {
         let shared = recorder();
@@ -4499,13 +3984,6 @@ mod tests {
 
     /// An EMPTY buffered run that is not the zero-length body kind is skipped
     /// and dropped.
-    ///
-    /// `cw_out_buf_flush`'s guard (`lib/cw-out.c:275`) is the only thing
-    /// standing between such a run and a spurious zero-length callback: a
-    /// run of
-    /// no bytes is created whenever the stream changes while paused and the new
-    /// write happens to be empty, and delivering it would invent an invocation
-    /// the application never earned.
     #[test]
     fn an_empty_run_of_the_wrong_kind_is_dropped_silently() {
         let shared = recorder();
@@ -4548,12 +4026,6 @@ mod tests {
 
     /// A BUFFERED run that is only partly taken keeps exactly its unconsumed
     /// tail.
-    ///
-    /// `cw_out_buf_flush`'s `curlx_dyn_tail` call (`lib/cw-out.c:290-296`). The
-    /// distinction from the direct-write path is that the bytes are already
-    /// in a
-    /// buffer, so the wrong arithmetic here would replay bytes the application
-    /// had accepted -- silently, and only for a transfer that paused twice.
     #[test]
     fn a_partly_taken_run_keeps_exactly_its_tail() {
         let shared = recorder();
@@ -4646,13 +4118,6 @@ mod tests {
 
     /// A held run is drained on the NEXT write once the client stage is no
     /// longer paused.
-    ///
-    /// `lib/cw-pause.c:151-155`, the guard at the top of `cw_pause_write`. The
-    /// state it exists for is reachable and this test reaches it: a replay that
-    /// re-pauses partway leaves runs held, and the client stage is then cleared
-    /// by its own `unpause` further down the same chain walk -- so the next
-    /// write arrives with bytes still held and nothing paused. Draining them
-    /// first is what keeps the stream in order.
     #[test]
     fn a_held_run_is_drained_before_the_next_write() {
         let shared = recorder();

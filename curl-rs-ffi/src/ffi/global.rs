@@ -17,11 +17,6 @@
 //! | `curl_global_trace`    | `curl.h:2791`      | `lib/easy.c:292-308` |
 //! | `curl_global_sslset`   | `curl.h:2838`      | `lib/easy.c:312-321` |
 //!
-//! `curl_global_sslset` forwards in C to `Curl_init_sslset_nolock`
-//! (`lib/vtls/vtls.c:1139-1166`) and `curl_global_trace` to `Curl_trc_opt`
-//! (`lib/curl_trc.c:639-651`); both bodies are reproduced below at those
-//! authorities rather than approximated.
-//!
 //! # `curl_global_cleanup` returns `void`, so it has no error channel
 //!
 //! The asymmetry with `curl_global_init` is easy to miss and it decides the
@@ -41,28 +36,6 @@
 //! and `[profile.*]` is root-only, so a member profile would be ignored and
 //! would warn, which the zero-warnings gate turns into a build failure.
 //!
-//! # Null pointers, and the argument error none of the five returns
-//!
-//! The crate-wide rule is that every raw pointer from C is null-checked before
-//! use and a violation returns the family-correct error. Both halves hold here
-//! -- nothing below dereferences an unchecked pointer -- but the
-//! family-correct answer in this family is never
-//! `CURLE_BAD_FUNCTION_ARGUMENT`, because in C no pointer these five take is
-//! required to be non-null:
-//!
-//! * `curl_global_trace(NULL)` is **success**. `Curl_trc_opt` is
-//!   `config ? trc_opt(config) : CURLE_OK` (`lib/curl_trc.c:641`).
-//! * `curl_global_sslset` with a null `avail` simply does not write it
-//!   (`lib/vtls/vtls.c:1144`), and with a null `name` skips the name
-//!   comparison (`:1149`); both are ordinary, documented ways to call it.
-//! * `curl_global_init_mem` takes function pointers, and a null one is refused
-//!   with `CURLE_FAILED_INIT` rather than an argument error, because that is
-//!   the code `lib/easy.c:220-221` returns.
-//! * `curl_global_init` and `curl_global_cleanup` take no pointer at all.
-//!
-//! Inventing a stricter contract than the authority's would be a behaviour
-//! change, which is the one thing this work may not do.
-//!
 //! # The reference-count contract is ABI-visible
 //!
 //! `curl_global_init` and `curl_global_cleanup` are counted, not idempotent:
@@ -81,43 +54,6 @@
 //! synchronised. Advertising it and then racing would be over-reporting, which
 //! is the one direction that is never safe.
 //!
-//! # The allocator hooks: this module consumes the mechanism, it does not pick
-//! it
-//!
-//! `#[global_allocator]` is a crate-root attribute, declarable once per
-//! artifact and selected at compile time, so a submodule cannot own that
-//! decision and nothing can swap an allocator at run time. The decision
-//! therefore belongs to `curl-rs-ffi/src/lib.rs`, which documents it in full,
-//! and this module consumes what that decision leaves it: [`super::memory`],
-//! the Rust counterpart of C's five global function pointers, which
-//! `curl_global_init_mem` writes and `curl_global_init` and
-//! `curl_global_cleanup` reset.
-//!
-//! CORRECTION 11, recorded here because this is the file a reader arrives at:
-//!
-//! * The C hooks are **global function pointers**, one per operation --
-//!   `curl_malloc_callback Curl_cmalloc = (curl_malloc_callback)malloc;` at
-//!   `lib/easy.c:106`, with four siblings through `:110`. `:236-240` installs
-//!   the application's, `:129-135` restores the defaults, and the default
-//!   `Curl_cstrdup` is `CURLX_STRDUP_LOW` rather than the platform `strdup`.
-//! * **Allocation tracking layers on top rather than competing for the slot.**
-//!   `lib/memdebug.c:222` calls `(Curl_cmalloc)(size)`, so the debug wrapper
-//!   and the application's hooks compose. The Rust arrangement mirrors that:
-//!   the optional `memdebug` counting allocator lives in `curl-rs-lib` behind a
-//!   default-off feature and is a `#[global_allocator]`, while these five hooks
-//!   route the buffers that cross the C boundary; neither excludes the other.
-//! * **The install order inside the C function is `m, f, s, r, c`, which is not
-//!   the prototype's `m, f, r, s, c`** (`curl.h:2763-2768`). The signature
-//!   below reproduces the *prototype*; the order in which the five are stored
-//!   is immaterial because they are stored as one group. The discrepancy is
-//!   recorded so that nobody "fixes" the signature to match `lib/easy.c:236`.
-//! * **Silently accepting the hooks and ignoring them is prohibited.** A
-//!   consumer would believe its allocator was in force when it was not, which
-//!   is the class of invisible defect this whole ABI is written to avoid. The
-//!   hooks are installed into `memory`, they are genuinely used by every buffer
-//!   this crate hands to C, and a test below asserts that installing them is
-//!   observable.
-//!
 //! # What "initialization" amounts to here
 //!
 //! C's `global_init` (`lib/easy.c:124-192`) performs eight subsystem
@@ -126,30 +62,14 @@
 //!
 //! | C call | Status |
 //! |--------|--------|
-//! | `Curl_trc_init` | Outside a `DEBUGBUILD` its body is exactly `return CURLE_OK` (`lib/curl_trc.c:653-660`), and this build does not advertise `Debug` (specification 0.6.6). It notably does **not** reset the trace levels, which is why the configuration below survives init and cleanup. |
-//! | `Curl_win32_init` | Windows only; out of scope (specification 0.2.2). |
+//! | `Curl_trc_init` | Outside a `DEBUGBUILD` its body is exactly `return CURLE_OK` (`lib/curl_trc.c:653-660`), and this build does not advertise `Debug`. It notably does **not** reset the trace levels, which is why the configuration below survives init and cleanup. |
+//! | `Curl_win32_init` | Windows only; out of scope. |
 //! | `Curl_amiga_init` | AmigaOS only; out of scope. |
-//! | `Curl_macos_init` | Reads the system trust settings through `lib/macos.c`, which specification 0.2.2 lists as excluded. |
-//! | `Curl_ssl_init` | The TLS backend's process-wide setup. `curl-rs-lib/src/tls/` declares `cipher_suite` and `keylog` at this commit, and no backend, so there is nothing to initialise. |
+//! | `Curl_macos_init` | Reads the system trust settings through `lib/macos.c`, which is excluded from this migration. |
+//! | `Curl_ssl_init` | The TLS backend's process-wide setup. There is none to perform: the cryptographic provider is pinned in the manifests rather than selected at run time, and the engine builds a `CryptoProvider` per client configuration. |
 //! | `Curl_vquic_init` | Likewise for QUIC. |
 //! | `Curl_ssh_init` | Likewise for SSH. |
-//! | `Curl_async_global_init` | The asynchronous resolver's global state. This design uses the system resolver by default (specification 0.8.3), which has none. |
-//!
-//! So the initialization performed here is complete for the global state the
-//! library actually has: the reference count, the five replaceable allocator
-//! hooks, and the remembered flags. Four of the eight are omitted permanently
-//! and the other four have nothing to initialise yet; none is a placeholder
-//! standing in for work this module owes.
-//!
-//! # The flags are remembered and never read
-//!
-//! `easy_init_flags` has exactly one consumer in the whole C tree:
-//! `Curl_win32_cleanup(easy_init_flags)` at `lib/easy.c:273`, inside `#ifdef
-//! _WIN32`. On all four mandated targets the value is stored and never
-//! examined. It is stored here too, because `curl_global_cleanup` must clear it
-//! and because the count-and-flags state machine is observable through the
-//! pairing rules above -- but no behaviour keys off its value, and claiming
-//! otherwise would be untrue.
+//! | `Curl_async_global_init` | The asynchronous resolver's global state. This design uses the system resolver by default, which has none. |
 //!
 //! # The trace configuration lives here, and why
 //!
@@ -164,29 +84,11 @@
 //! allocator hooks -- and [`trace_config`] lends a snapshot to whichever
 //! module creates transfers.
 //!
-//! **A coordination gap was found here and is reported rather than papered
-//! over.** `curl-rs-lib/src/trace.rs` already implements the whole
-//! `--trace-config` grammar, byte for byte, as `TraceConfig::apply` and
-//! `TraceConfig::apply_code` -- the latter documented in that file as provided
-//! "so that the mapping is written once instead of in `curl-rs-ffi`". Both were
-//! nevertheless `pub(crate)` inside a `pub(crate) mod trace`, carrying
-//! `allow(dead_code)` with the note "consumer module not landed", so the ABI
-//! could not reach the code written for it and `curl_global_trace` was absent
-//! from this crate altogether. The fix is the crate root's own named
-//! re-export idiom -- the one `getdate`, `strequal` and `strnequal` already use
-//! and which that file calls load-bearing -- so `curl_rs_lib::TraceConfig` is
-//! now reachable while `TraceFeature`, `TraceFilter`, `TraceLevel`,
-//! `TraceCategory` and the record layouts stay crate-private. This module can
-//! construct, configure and lend a configuration; it can neither read nor forge
-//! a level. What was NOT done: no glob re-export, no private path, and no
-//! second copy of the grammar in this crate, which would have given one
-//! wire-visible parser two owners.
-//!
 //! # `curl_global_sslset` reports the pre-existing `CURLSSLBACKEND_RUSTLS`
 //!
 //! `CURLSSLBACKEND_RUSTLS = 14` is already in the frozen header at
 //! `curl.h:166`, so this build reports a rustls backend **without inventing an
-//! enumerant** -- which is precisely what specification 0.1.1 goal G4 relies
+//! enumerant** -- which is precisely what the rustls-only requirement relies
 //! on. Nothing in this file can weaken certificate validation: it selects or
 //! confirms a backend identity and holds no verification switch. Validation
 //! stays on by default, and `--cacert`, `--capath` and `--insecure` remain the
@@ -210,34 +112,8 @@ use super::types::curl_ssl_backend;
 
 // The flag word shared by curl_global_init and curl_global_init_mem
 //
-// All six bits from `include/curl/curl.h:3014-3019`, typed `c_long` because
-// the parameter is `long`. They are declared here because this module is the
-// only one that receives them, and they are declared in full even where they
-// cannot do anything: specification 0.8.2 forbids removing public surface, so
-// `CURL_GLOBAL_WIN32` stays even though Windows is out of scope, exactly as
-// `CURL_GLOBAL_SSL` stays even though the header itself records that it has
-// had "no purpose since 7.57.0".
-//
-// No bit is rejected. C tests none of them outside `Curl_win32_init`, so a
-// caller passing an unrecognised bit gets `CURLE_OK` there and must get
-// `CURLE_OK` here.
-//
-// WHY FIVE OF THE SIX CARRY A `dead_code` ALLOWANCE, stated once here rather
-// than repeated as a bare attribute five times. Not one of these bits has a
-// run-time consumer in a curl 8.19.0 build for these targets, and that is the
-// authority's own position rather than an omission on this side:
-// `docs/libcurl/curl_global_init.md:107` records that `ACK_EINTR` "has no
-// point since 7.69.0 but its behavior is instead the default", `:74` that
-// `CURL_GLOBAL_SSL`'s "presence or absence serves no meaning since 7.57.0", and
-// `CURL_GLOBAL_WIN32` initialises Winsock on a platform specification 0.2.2
-// excludes. They exist because they are public vocabulary a caller writes at
-// the call site, they are asserted below against
-// `include/curl/curl.h:3014-3019`,
-// and specification 0.8.2 forbids removing public surface. The allowance is
-// per-item deliberately: a module-level or crate-level `dead_code` level would
-// also hide the next genuinely unreferenced item somebody adds.
-//
-// They are `pub(crate)` and not `pub`, which is also deliberate. The six
+// The `CURL_GLOBAL_*` constants below are `pub(crate)` and not `pub`, which is
+// deliberate. The six
 // `#define` directives are carried into the generated header verbatim by
 // `build.rs`, because cbindgen drops the `L` suffix and cannot render
 // `(CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32)`; a `pub` constant here would make
@@ -325,13 +201,6 @@ fn state() -> MutexGuard<'static, GlobalState> {
 
 /// Initialises the library, counting the call.
 ///
-/// Supersedes `curl_global_init` (`lib/easy.c:197-208`). Returns `CURLE_OK`.
-///
-/// Every call must be paired with a [`curl_global_cleanup`]; see the module
-/// documentation for why the pairing is counted rather than idempotent. Every
-/// `flags` value is accepted, including bits this build cannot act on, because
-/// C tests none of them outside `Curl_win32_init`.
-///
 /// The allocator is reset to the C library defaults, exactly as
 /// `global_init(flags, TRUE)` does at `lib/easy.c:129-135`. That matters when
 /// an application called `curl_global_init_mem`, then `curl_global_cleanup`,
@@ -363,8 +232,6 @@ pub extern "C" fn curl_global_init(flags: c_long) -> c_int {
 
 /// Initialises the library with application-supplied allocator hooks.
 ///
-/// Supersedes `curl_global_init_mem` (`lib/easy.c:213-249`).
-///
 /// Returns `CURLE_FAILED_INIT` when any hook is null, before touching the
 /// count -- `lib/easy.c:220-221` tests all five first. Confirmed against the
 /// frozen library, which answers `2` for five nulls.
@@ -376,11 +243,6 @@ pub extern "C" fn curl_global_init(flags: c_long) -> c_int {
 /// same amount of cleanup calls." A caller that wants its hooks installed
 /// must be first, which is why the header requires this be the first libcurl
 /// call a program makes.
-///
-/// The parameter order is the prototype's, `m, f, r, s, c`. The C body stores
-/// them in the order `m, f, s, r, c` (`lib/easy.c:236-240`); see CORRECTION 11
-/// in the module documentation for why that difference is recorded rather than
-/// reconciled.
 ///
 /// # Safety
 ///
@@ -427,21 +289,6 @@ pub unsafe extern "C" fn curl_global_init_mem(
 }
 
 /// Releases one outstanding initialization.
-///
-/// Supersedes `curl_global_cleanup` (`lib/easy.c:255-286`).
-///
-/// Two guards from the C are reproduced: a call with no outstanding
-/// initialization returns immediately (`lib/easy.c:259-262`), and a call that
-/// merely decrements a count above one does nothing else
-/// (`lib/easy.c:264-267`). Only the last one tears down.
-///
-/// Teardown restores the default allocator and clears the flags, which is what
-/// `lib/easy.c:284` does with `easy_init_flags = 0`. The trace configuration
-/// survives, because C's teardown does not touch the levels either.
-///
-/// This is the one entry point in the crate with no error channel, so a panic
-/// here is swallowed silently; the module documentation gives the consequences
-/// in full.
 #[no_mangle]
 pub extern "C" fn curl_global_cleanup() {
     guard_void(|| {
@@ -469,9 +316,6 @@ pub extern "C" fn curl_global_cleanup() {
 /// `TraceConfig::new` is a `const fn`, so this is a genuine static with no lazy
 /// initialization -- which matters because `curl_global_trace` may be the first
 /// libcurl call a program makes.
-///
-/// The configuration deliberately outlives an init/cleanup cycle. See
-/// [`curl_global_init`].
 static TRACE: Mutex<TraceConfig> = Mutex::new(TraceConfig::new());
 
 /// The trace configuration in force, copied out.
@@ -482,13 +326,7 @@ static TRACE: Mutex<TraceConfig> = Mutex::new(TraceConfig::new());
 /// `TraceConfig` so that its own tests stay independent of each other -- and
 /// because handing out a guard would let a transfer hold this lock for as long
 /// as it ran.
-///
-/// This is the seam the transfer layer will use when it lands: whichever module
-/// creates an easy handle through the C API lends it this snapshot, which is
-/// what makes a `curl_global_trace` call visible to transfers exactly as C's
-/// globals are. It is `pub(crate)` and not exported: no symbol in
-/// `lib/libcurl.def` reads the trace configuration back.
-#[allow(dead_code)] // the transfer layer that lends this has not landed
+#[allow(dead_code)] // lent to transfers; no exported entry point reads it
 pub(crate) fn trace_config() -> TraceConfig {
     TRACE
         .lock()
@@ -497,14 +335,6 @@ pub(crate) fn trace_config() -> TraceConfig {
 }
 
 /// Configures which components participate in tracing.
-///
-/// Supersedes `curl_global_trace` (`lib/easy.c:292-308`), whose body is
-/// `Curl_trc_opt(config)` under the global lock. `Curl_trc_opt`
-/// (`lib/curl_trc.c:639-651`) is `config ? trc_opt(config) : CURLE_OK`, so a
-/// null configuration is success and not an error -- which is why this is the
-/// one pointer-taking entry point here that does not answer
-/// `CURLE_BAD_FUNCTION_ARGUMENT` for null. Reproducing the C is the
-/// requirement; inventing a stricter contract would be a behaviour change.
 ///
 /// # The return value
 ///
@@ -575,9 +405,7 @@ const SSLSET_UNKNOWN_BACKEND: c_int =
 
 /// `CURLSSLBACKEND_RUSTLS` = 14 (`include/curl/curl.h:166`).
 ///
-/// The enumerant already existed in the frozen header, so reporting a rustls
-/// backend needs no new value -- specification 0.1.1 goal G4 relies on exactly
-/// that. It is read from [`super::codes`], the crate's single owner of the
+/// It is read from [`super::codes`], the crate's single owner of the
 /// `curl_sslbackend` discriminants, and a test below ties it to
 /// `curl_rs_lib::version::TLS_BACKEND_ID` so that the identity this function
 /// reports and the identity the `--version` banner reports cannot diverge.
@@ -591,15 +419,6 @@ const BACKEND_ID: c_int = curl_sslbackend::CURLSSLBACKEND_RUSTLS.as_c_int();
 const BACKEND_NAME_BYTES: &[u8] = b"rustls\0";
 
 /// [`BACKEND_NAME_BYTES`] as a `CStr`, checked at compile time.
-///
-/// `CStr::from_bytes_with_nul` is a `const fn` from 1.72, so the check runs
-/// during compilation and the `Err` arm is a build failure rather than a
-/// runtime branch that can never be taken. That is why there is no `unsafe`
-/// here: the unchecked constructor would need a justification where this needs
-/// none.
-///
-/// One definition serves both uses -- the pointer the descriptor publishes and
-/// the string the comparison folds -- so the two cannot disagree.
 const fn backend_name() -> &'static CStr {
     match CStr::from_bytes_with_nul(BACKEND_NAME_BYTES) {
         Ok(name) => name,
@@ -620,14 +439,27 @@ const BACKEND_NAME: &CStr = backend_name();
 /// this type exists. C's equivalent is `static const struct Curl_ssl
 /// *available_backends[]` (`lib/vtls/vtls.c`), immutable data with static
 /// storage duration and no synchronisation of any kind.
+///
+/// # The `Sync` promise is made per type, deliberately
+///
+/// There is no `unsafe impl<T> Sync for Immortal<T>` below, and there must
+/// never be one. A blanket implementation promises `Sync` for every `T` a
+/// future author might wrap -- including a `Cell`, an `UnsafeCell`, or any
+/// struct that acquires interior mutability later -- and the promise cannot be
+/// checked, because the property it rests on (written once in a static
+/// initializer, never mutated) is a property of the *static*, not of the type.
+/// A blanket implementation would therefore be sound today and unsound the
+/// moment someone wrapped something else, with no diagnostic at the point of
+/// the mistake.
+///
+/// Instead each wrapped type carries its own implementation, immediately below
+/// the static it exists for. Wrapping a third type is then a compile error at
+/// the point of use -- `Immortal<X> cannot be shared between threads safely` --
+/// which is exactly where the author is in a position to write the
+/// justification. That is a two-line cost paid once per static, against an
+/// unbounded promise; the crate's only other `unsafe impl`,
+/// `Sync for OptionTable` in `super::easy`, is concrete for the same reason.
 struct Immortal<T>(T);
-
-// SAFETY: the wrapped value is written once, in a static initializer, and never
-// mutated afterwards -- there is no interior mutability and no `&mut` path to
-// it. Concurrent readers therefore observe identical immutable bytes, which is
-// what `Sync` requires. The pointers inside address other statics of this same
-// crate, so they stay valid for the life of the process.
-unsafe impl<T> Sync for Immortal<T> {}
 
 /// The one backend descriptor a caller reads through `avail`.
 ///
@@ -642,20 +474,32 @@ static RUSTLS_BACKEND: Immortal<curl_ssl_backend> =
         name: BACKEND_NAME.as_ptr(),
     });
 
+// SAFETY: `curl_ssl_backend` is a two-field `#[repr(C)]` struct -- a `c_int`
+// and a `*const c_char` -- with no interior mutability, and the one value of it
+// this crate creates is `RUSTLS_BACKEND` above: written once in a static
+// initializer, never mutated, with no `&mut` path to it anywhere in the crate.
+// Concurrent readers therefore observe identical immutable bytes, which is what
+// `Sync` requires. The only reason the wrapper is needed at all is the raw
+// pointer, and that pointer is `BACKEND_NAME.as_ptr()` -- the address of a
+// `'static` C string in this crate's own read-only data, so it stays valid and
+// unchanging for the life of the process.
+unsafe impl Sync for Immortal<curl_ssl_backend> {}
+
 /// The NULL-terminated array of pointers to descriptors.
-///
-/// The shape C hands out is `const curl_ssl_backend **`
-/// (`lib/vtls/vtls.c:1144-1145`): an array of pointers, terminated by NULL. One
-/// descriptor and two slots. A genuine `static` rather than a leaked
-/// allocation, so the address is fixed at link time and a caller may cache it
-/// exactly as it may cache C's.
 static AVAILABLE_BACKENDS: Immortal<[*const curl_ssl_backend; 2]> =
     Immortal([&RUSTLS_BACKEND.0 as *const curl_ssl_backend, ptr::null()]);
 
+// SAFETY: a two-element array of raw pointers, with no interior mutability, and
+// the one value of it this crate creates is `AVAILABLE_BACKENDS` above: written
+// once in a static initializer, never mutated, with no `&mut` path to it.
+// Concurrent readers observe identical immutable bytes. Both elements are sound
+// for the life of the process -- the first is the address of `RUSTLS_BACKEND`,
+// another `'static` in this crate, and the second is null, which a caller is
+// required to treat as the terminator and never to dereference
+// (`lib/vtls/vtls.c:1144-1145` hands out the same shape).
+unsafe impl Sync for Immortal<[*const curl_ssl_backend; 2]> {}
+
 /// Selects, or confirms, the TLS backend.
-///
-/// Supersedes `curl_global_sslset` (`lib/easy.c:312-321`, forwarding to
-/// `Curl_init_sslset_nolock` at `lib/vtls/vtls.c:1139-1166`).
 ///
 /// This build has exactly one backend, so it takes the C's single-backend
 /// branch throughout: `Curl_ssl != &Curl_ssl_multi` is true, and with
@@ -682,19 +526,6 @@ static AVAILABLE_BACKENDS: Immortal<[*const curl_ssl_backend; 2]> =
 /// * **`name` is only consulted when non-null.** The C guards it with
 ///   `(name && ...)`, so a null name with a non-matching id fails rather than
 ///   dereferencing.
-///
-/// `CURLSSLSET_NO_BACKENDS` is unreachable here: it is the answer from the
-/// no-TLS arm of the `USE_SSL` conditional at `lib/vtls/vtls.c:1169-1176`, for
-/// a build with no TLS at all, and specification 0.1.1 goal G4 makes rustls
-/// unconditional. There is no `tls` feature to switch it off.
-///
-/// The wording above deliberately spells that conditional out in words rather
-/// than quoting the C directive. A doc comment on an exported function is
-/// transcribed verbatim into the generated C header inside a block comment, so
-/// a literal comment-close sequence anywhere in the prose ends that block
-/// early and turns the remaining lines into stray tokens. `validate_comments`
-/// in `build.rs` fails the build on exactly that, and this sentence records why
-/// the rule exists so it is not undone as mere pedantry.
 ///
 /// # Safety
 ///
@@ -786,17 +617,6 @@ mod tests {
     }
 
     /// Restores a pristine global state so each test starts from zero.
-    ///
-    /// Three pieces of process-wide state live in this module -- the count, the
-    /// allocator hooks and the trace configuration -- and Rust runs tests in
-    /// parallel threads, so every test that touches any of them holds this
-    /// guard for its whole body. Sharing one `Mutex` serialises them, which is
-    /// the only way to assert on process-wide state.
-    ///
-    /// `pub(super)` rather than private because
-    /// [`super::engine_registry_correspondence`] also drives the counter and
-    /// must take the SAME lock: a second guard of its own would serialise that
-    /// module against itself while still racing this one.
     pub(super) fn exclusive() -> MutexGuard<'static, ()> {
         static SERIAL: Mutex<()> = Mutex::new(());
         let guard = SERIAL
@@ -1379,6 +1199,34 @@ mod tests {
         assert_eq!(on_success, on_failure, "the same array either way");
     }
 
+    /// The two `Immortal` instantiations are `Sync`, and nothing else is.
+    ///
+    /// The positive half is what the two statics need in order to exist at all,
+    /// so it would fail to compile rather than fail here -- which is the point:
+    /// it records that these two, and only these two, have an audited
+    /// implementation. The negative half cannot be written as an assertion
+    /// without a nightly feature, so it is enforced structurally instead: there
+    /// is no `unsafe impl<T> Sync for Immortal<T>`, so `Immortal<Cell<u8>>` is
+    /// not `Sync` and a static holding one does not compile.
+    #[test]
+    fn only_the_audited_immortal_types_are_sync() {
+        // The empty body is deliberate: a bound is all this asserts, and a
+        // helper with a body would trip `clippy::extra_unused_type_parameters`
+        // -- the lint exempts exactly this shape. `curl-rs-lib`'s
+        // `share::tests` spells its own version identically.
+        fn requires_sync<T: Sync>() {}
+
+        // Both wrapped types, named rather than inferred, so that removing one
+        // of the two `unsafe impl`s fails to compile here and not only at the
+        // static it serves.
+        requires_sync::<Immortal<curl_ssl_backend>>();
+        requires_sync::<Immortal<[*const curl_ssl_backend; 2]>>();
+
+        // And the wrapper is load-bearing rather than decorative: the inner
+        // types hold raw pointers and are not `Sync` on their own, which is why
+        // `requires_sync::<curl_ssl_backend>()` would not compile.
+    }
+
     /// The descriptor keeps `id` first, which is what lets a consumer walk the
     /// array. `handle.rs` asserts the offsets; this asserts that the entry a
     /// caller actually receives has the identity it should.
@@ -1479,14 +1327,6 @@ mod tests {
 
 /// The engine-registry correspondence for
 /// [`curl_rs_lib::version::ENGINE_GLOBAL_INIT`].
-///
-/// `curl-rs-lib`'s capability registry marks every engine it reports as present
-/// with a compile-time reference to an item the owning module must export, so a
-/// `present: true` cannot outlive the code it claims. `ENGINE_GLOBAL_INIT` is
-/// the single entry that cannot follow that rule where the others do: its owner
-/// is THIS crate, and the registry lives in a crate this one depends on, so a
-/// reference there would invert the dependency direction specification 0.1.1
-/// goal G1 fixes.
 ///
 /// This module is the other half of that arrangement. It is the only place that
 /// can see both the registry's claim and the code the claim is about, so it is

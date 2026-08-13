@@ -26,23 +26,6 @@
 //!
 //! Rust counterpart of three C files read as one:
 //!
-//! * `lib/vtls/vtls_scache.c` (1,222 lines) -- the cache itself: the peer
-//!   key, the peer slab and its LRU, session insertion, retrieval and
-//!   return, and the HMAC-protected import and export paths.
-//! * `lib/vtls/vtls_scache.h` -- the contract. `:39-42` pins the two
-//!   lifetime ceilings this module must reproduce exactly:
-//!
-//!   ```text
-//!   /* RFC 8446 (TLSv1.3) restrict lifetime to one week max, for
-//!    * other, less secure versions, we restrict it to a day */
-//!   #define CURL_SCACHE_MAX_13_LIFETIME_SEC    (60 * 60 * 24 * 7)
-//!   #define CURL_SCACHE_MAX_12_LIFETIME_SEC    (60 * 60 * 24)
-//!   ```
-//!
-//! * `lib/vtls/vtls_spack.c` (330 lines) -- the wire format a session
-//!   packs to. Every constant, every width and every field order below is
-//!   transcribed from it.
-//!
 //! # Why the pack format is frozen, not merely stable
 //!
 //! `Curl_ssl_session_pack` output is not an internal detail. It reaches a
@@ -54,39 +37,6 @@
 //! 8.19.0-DEV ever wrote. So [`TlsSession::pack`] emits the C's bytes and
 //! [`TlsSession::unpack`] accepts the C's bytes, and the byte-golden tests at
 //! the bottom of this file are the mechanism that keeps it that way.
-//!
-//! # What is deliberately absent, and the measurement behind each absence
-//!
-//! **No backend session object.** `struct Curl_ssl_scache_peer` carries `void
-//! *sobj` with a `Curl_ssl_scache_obj_dtor *sobj_free` destructor
-//! (`vtls_scache.h:101-121`, `vtls_scache.c:56-57`), reached through
-//! `Curl_ssl_scache_add_obj` and `Curl_ssl_scache_get_obj`. Those two
-//! functions have exactly **one** consumer in the entire C tree --
-//! `lib/vtls/schannel.c:864` and `:1642`, caching a Windows credential handle
-//! -- and Schannel is an alternate backend that AAP 0.2.2 excludes, on
-//! platforms outside the four-target matrix. With nothing ever setting the
-//! slot, the C's free-peer test `if(!peers[i].sobj &&
-//! !Curl_llist_count(&peers[i].sessions))` (`vtls_scache.c:698-699`)
-//! degenerates to the session count alone, which is what [`SessionCache`]
-//! implements. Reproducing the slot would need either [`std::any::Any`] or a
-//! type parameter threaded through the whole module, for a capability no
-//! in-scope build can reach.
-//!
-//! **No SRP identity.** `:SRP-AUTH` in the peer key
-//! (`vtls_scache.c:269-275`) and the peer's `srp_username` / `srp_password`
-//! pair (`:53-54`) sit behind `#ifdef USE_TLS_SRP`.
-//! [`crate::version`] withholds the `TLS-SRP` token because rustls offers no
-//! SRP key exchange, so this build is the `#ifdef`-off compilation: the
-//! fragment is never emitted and the peer stores no SRP credentials. Modelling
-//! them would advertise a capability that does not exist, and AAP 0.6.5 makes
-//! over-reporting the one failure mode that turns a clean skip into a hard
-//! failure.
-//!
-//! **No `magic` field.** `CURL_SCACHE_MAGIC` and `GOOD_SCACHE`
-//! (`vtls_scache.c:66-68`) guard against a freed or wrongly typed pointer
-//! arriving as a cache. Neither is expressible here: a `&mut SessionCache` is
-//! a `SessionCache`, so the three `CURLE_BAD_FUNCTION_ARGUMENT` returns that
-//! guard produces have no reachable condition.
 //!
 //! # Nothing global: the clock, the generator and the lock are injected
 //!
@@ -110,38 +60,6 @@
 //!                     CURL_LOCK_ACCESS_SINGLE);
 //! }
 //! ```
-//!
-//! A multi handle's own cache is never locked at all. The lock therefore
-//! belongs to the *sharing decision*, not to the cache -- so this module
-//! defines the narrow [`ScacheLock`] seam and nothing more, and the future
-//! share subsystem implements it over the caller's `CURLSHOPT_LOCKFUNC`. This
-//! module imports nothing from `share`, which is what keeps the dependency
-//! acyclic; `share` is also not yet a directory, and inventing a
-//! `share/mod.rs` import would be a dependency on a file that does not exist.
-//!
-//! [`ScacheGuard`] is what the seam buys. The C has to write
-//! `Curl_ssl_scache_unlock(data)` on every exit path, and
-//! `Curl_ssl_session_import` needs a `bool locked` variable plus a
-//! `goto out` to get it right (`:1079`, `:1096`, `:1137-1138`). Here the
-//! guard releases in [`Drop`], so early return, `?` propagation and panic all
-//! unlock, and the critical section is exactly the guard's scope.
-//!
-//! # Secrets stay out of keys, out of logs and out of `Debug`
-//!
-//! A session ticket is resumption material: whoever holds it can resume the
-//! session. A client certificate path and a pinned-key spelling are
-//! configuration, but the private key behind them never enters this module at
-//! all. Three consequences are enforced rather than intended:
-//!
-//! * The peer key carries *paths* and *hashes*, never key bytes and never a
-//!   passphrase. `cf_ssl_peer_key_add_hash` (`:102-125`) hashes a blob to 32
-//!   bytes of lowercase hex precisely so the blob itself does not appear, and
-//!   [`peer_key_make`] does the same.
-//! * [`TlsSession`]'s [`fmt::Debug`] is hand-written and reports the ticket's
-//!   *length*. A derived one would dump the ticket into any failed assertion
-//!   or trace line that formatted a session.
-//! * [`ScachePeer`]'s [`fmt::Debug`] reports whether a salt and code are set,
-//!   not their values.
 //!
 //! # Visibility and safety
 //!
@@ -171,9 +89,7 @@ use crate::tls::{IetfProtoVersion, ReusedSession, SslPeer};
 use crate::util::dynbuf::DynBuf;
 use crate::util::timeval::Clock;
 
-// =========================================================================
 // Lifetimes, ceilings and suffixes -- the pinned constants
-// =========================================================================
 
 /// `CURL_SCACHE_MAX_13_LIFETIME_SEC` (`lib/vtls/vtls_scache.h:41`).
 ///
@@ -193,38 +109,13 @@ pub(crate) const MAX_12_LIFETIME_SEC: i64 = 60 * 60 * 24;
 
 /// `scache->default_lifetime_secs` as `Curl_ssl_scache_create` sets it
 /// (`lib/vtls/vtls_scache.c:548`): `(24 * 60 * 60)`, one day.
-///
-/// Applied when a session arrives with no usable expiry --
-/// `Curl_ssl_session_create` documents `valid_until` of zero as "in case this
-/// is not known" (`vtls_scache.h:142-143`) and the cache reads `<= 0`
-/// (`:797`), so a negative value is treated as unknown too rather than as a
-/// session that expired before the epoch.
-///
-/// Written `24 * 60 * 60` and not `60 * 60 * 24` because that is the order
-/// the C writes it in at that line; the value is identical to
-/// [`MAX_12_LIFETIME_SEC`] and the two are deliberately separate constants,
-/// since one is a default and the other a ceiling.
 pub(crate) const DEFAULT_LIFETIME_SEC: i64 = 24 * 60 * 60;
 
 /// `CURL_SSL_TICKET_MAX` (`lib/vtls/vtls_scache.c:995`): 16 KiB.
-///
-/// The ceiling on one packed session, applied by
-/// `curlx_dyn_init(&sbuf, CURL_SSL_TICKET_MAX)` at `:1163`.
-///
-/// [`DynBuf`] reproduces the C's ceiling arithmetic including its `+ 1` for
-/// the terminator curl stores and this crate does not, so a buffer with this
-/// ceiling admits at most `SSL_TICKET_MAX - 1` bytes -- exactly what curl
-/// admits. Crossing it is [`CURLcode::TooLarge`], the code
-/// `curlx_dyn_addn` returns.
 pub(crate) const SSL_TICKET_MAX: usize = 16 * 1024;
 
 /// The ceiling on a peer key: `curlx_dyn_init(&buf, 10 * 1024)`
 /// (`lib/vtls/vtls_scache.c:150`).
-///
-/// A key is bounded because its inputs are not: `CURLOPT_SSL_CIPHER_LIST`,
-/// `CURLOPT_CAPATH` and `CURLOPT_PINNEDPUBLICKEY` are all
-/// application-supplied strings of arbitrary length, and three of them can
-/// appear in one key.
 #[allow(dead_code)] // Read by peer_key_make; consumers land with the backend.
 pub(crate) const PEER_KEY_MAX: usize = 10 * 1024;
 
@@ -254,16 +145,9 @@ pub(crate) const HMAC_LEN: usize = DIGEST_LEN;
 /// Length of the `shmac` blob an export emits and an import accepts: the
 /// salt followed by the code, `sizeof(peer->key_salt) +
 /// sizeof(peer->key_hmac)` (`lib/vtls/vtls_scache.c:1103`).
-///
-/// Exactly 64. `Curl_ssl_session_import` rejects any other length with
-/// `CURLE_BAD_FUNCTION_ARGUMENT` and explains why in a comment: "Either
-/// salt+hmac was garbled by caller or is from a curl version that does
-/// things differently."
 pub(crate) const SHMAC_LEN: usize = SALT_LEN + HMAC_LEN;
 
-// =========================================================================
 // The session-pack tags -- `lib/vtls/vtls_spack.c:41-47`
-// =========================================================================
 
 /// `CURL_SPACK_VERSION` = `0x01` (`lib/vtls/vtls_spack.c:41`).
 ///
@@ -305,9 +189,7 @@ pub(crate) const SPACK_EARLYDATA: u8 = 0x06;
 /// parameters as a big-endian `u16` length and that many bytes.
 pub(crate) const SPACK_QUICTP: u8 = 0x07;
 
-// =========================================================================
 // The session -- `struct Curl_ssl_session` (`vtls_scache.h:124-134`)
-// =========================================================================
 
 /// One TLS session ticket and everything the cache knows about it.
 ///
@@ -336,20 +218,6 @@ pub(crate) const SPACK_QUICTP: u8 = 0x07;
 /// promises structural: a `Vec<u8>` moved into a constructor that returns
 /// `Err` is dropped by the compiler, on every path, with no code to write and
 /// none to forget.
-///
-/// The same argument retires `Curl_ssl_session_destroy` (`:383-393`) and the
-/// `cf_ssl_scache_session_ldestroy` list callback (`:324-332`) entirely, along
-/// with the `Curl_node_llist(&s->list)` test that exists only to decide which
-/// of the two to run.
-///
-/// # The intrusive list node is gone
-///
-/// `struct Curl_llist_node list` embeds the session in its own container, so a
-/// session knows which list it is in and destroying it means removing it from
-/// that list. Here the container owns the sessions -- a
-/// [`VecDeque<TlsSession>`] on the peer -- so membership is the container's
-/// property, not the element's. That is what makes taking a session out of
-/// the cache a *move* rather than an unlink plus a lifetime question.
 #[derive(Clone, Eq, PartialEq)]
 #[allow(dead_code)] // Consumers land with tls/rustls_backend.rs and share/.
 pub(crate) struct TlsSession {
@@ -385,13 +253,6 @@ pub(crate) struct TlsSession {
 }
 
 /// Reports the session's shape without disclosing the ticket.
-///
-/// Hand-written rather than derived, and the reason is a security property
-/// rather than a formatting preference: a session ticket is resumption
-/// material. `#[derive(Debug)]` would print the whole `Vec<u8>` into any
-/// failed assertion, any `{:?}` in a trace line and any panic message that
-/// happened to include a session. The length is what a reader debugging the
-/// cache needs; the bytes are what an attacker needs.
 impl fmt::Debug for TlsSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsSession")
@@ -442,12 +303,6 @@ impl TlsSession {
 
     /// `Curl_ssl_session_create2` (`lib/vtls/vtls_scache.c:344-381`): the
     /// variation that also carries QUIC transport parameters.
-    ///
-    /// The C keeps two entry points because C has no default arguments and
-    /// the QUIC pair has to be threaded through the general one anyway. Both
-    /// are kept here for the same reason the ALPN parameter is kept -- the
-    /// call sites read differently, and a `None` at every non-QUIC call site
-    /// would be noise.
     ///
     /// # Errors
     ///
@@ -521,23 +376,12 @@ impl TlsSession {
     /// ```text
     /// return (s->valid_until > 0) && (s->valid_until < now);
     /// ```
-    ///
-    /// Both halves matter. A non-positive `valid_until` is "unknown", not
-    /// "expired in 1970", so it never expires -- which is why the cache
-    /// replaces it with a real deadline on the way in. And the comparison is
-    /// strict, so a session expiring exactly *now* is still live.
     pub(crate) const fn expired(&self, now: i64) -> bool {
         self.valid_until > 0 && self.valid_until < now
     }
 
     /// What the reuse decision needs, in the shape [`crate::tls`] already
     /// defined for it.
-    ///
-    /// `Curl_on_session_reuse` (`lib/vtls/vtls.c:2071-2099`) is handed a
-    /// `struct Curl_ssl_session *` and reads exactly two things from it.
-    /// [`ReusedSession`] is those two things, declared in `tls/mod.rs` so that
-    /// the decision could be written before this module existed; this is the
-    /// bridge between them, so neither side has to know the other's layout.
     pub(crate) fn reused(&self) -> ReusedSession {
         ReusedSession {
             alpn: self.alpn.clone(),
@@ -562,9 +406,6 @@ impl TlsSession {
     ///   s->valid_until = now + max_lifetime;
     /// ```
     ///
-    /// Order is load-bearing: defaulting happens first, so a session with no
-    /// stated expiry gets one day rather than being clamped to seven.
-    ///
     /// The additions saturate. The C's `curl_off_t` arithmetic would wrap on
     /// overflow, which for a clock near [`i64::MAX`] turns a far-future
     /// deadline into a past one and silently discards the session;
@@ -587,9 +428,7 @@ impl TlsSession {
     }
 }
 
-// =========================================================================
 // The wire format -- `lib/vtls/vtls_spack.c`
-// =========================================================================
 
 /// Appends one byte: `spack_enc8` (`lib/vtls/vtls_spack.c:49-52`).
 fn enc8(buf: &mut DynBuf, val: u8) -> Result<(), CURLcode> {
@@ -604,10 +443,6 @@ fn enc8(buf: &mut DynBuf, val: u8) -> Result<(), CURLcode> {
 /// nval[0] = (uint8_t)(val >> 8);
 /// nval[1] = (uint8_t)val;
 /// ```
-///
-/// [`u16::to_be_bytes`] is that expression with the shift count supplied by
-/// the type, which is what removes the class of defect where one width's
-/// encoder is edited and another's is not.
 fn enc16(buf: &mut DynBuf, val: u16) -> Result<(), CURLcode> {
     buf.addn(&val.to_be_bytes())
 }
@@ -642,9 +477,6 @@ fn encdata16(buf: &mut DynBuf, data: &[u8]) -> Result<(), CURLcode> {
 /// Appends a `u16` length and that many bytes of text: `spack_encstr16`
 /// (`lib/vtls/vtls_spack.c:130-141`).
 ///
-/// The C measures with `strlen`, so an embedded NUL would truncate; a `&str`
-/// carries its length, so what is written is exactly what was held.
-///
 /// # Errors
 ///
 /// As [`encdata16`]: the C's `if(slen > UINT16_MAX)` check and its code.
@@ -653,18 +485,6 @@ fn encstr16(buf: &mut DynBuf, text: &str) -> Result<(), CURLcode> {
 }
 
 /// A bounds-checked cursor over a packed session.
-///
-/// The C decodes through a `const uint8_t **src` plus a `const uint8_t *end`
-/// and checks `end - *src < n` before every read (`spack_dec8` at
-/// `vtls_spack.c:54-62` and its four siblings). The pair becomes one value
-/// holding the *unread remainder*, so "how much is left" is `self.src.len()`
-/// rather than a pointer difference, and the pointer arithmetic that the C
-/// performs after each successful read cannot run past the end because there
-/// is no pointer to advance.
-///
-/// Every method here is total: each checks the remaining length first and
-/// returns [`CURLcode::ReadError`] when it is short, exactly as the C does,
-/// so no method can panic and none can index outside the input.
 struct SpackReader<'a> {
     /// The bytes not yet consumed.
     src: &'a [u8],
@@ -683,9 +503,6 @@ impl<'a> SpackReader<'a> {
     }
 
     /// Consumes exactly `n` bytes.
-    ///
-    /// The single bounds check every other method routes through, so the
-    /// check exists once rather than five times.
     ///
     /// # Errors
     ///
@@ -710,12 +527,6 @@ impl<'a> SpackReader<'a> {
 
     /// Reads a big-endian `u16`: `spack_dec16`
     /// (`lib/vtls/vtls_spack.c:72-80`).
-    ///
-    /// The C reassembles with `(uint16_t)((*src)[0] << 8 | (*src)[1])`. The
-    /// fold below is the same expression for any width, and it needs no
-    /// fixed-size-array conversion -- which is what keeps this readable at
-    /// the [`u64`] width and free of a fallible `try_into` whose error arm
-    /// could never be reached.
     fn dec16(&mut self) -> Result<u16, CURLcode> {
         let bytes = self.take(2)?;
         Ok(bytes
@@ -789,11 +600,6 @@ impl TlsSession {
     /// `Curl_ssl_session_pack` (`lib/vtls/vtls_spack.c:191-237`), into a
     /// freshly bounded buffer.
     ///
-    /// The buffer's ceiling is [`SSL_TICKET_MAX`], which is the ceiling
-    /// `Curl_ssl_session_export` gives its own `sbuf` at `:1163`, so a
-    /// session too large to export fails here with the same code it fails
-    /// with in C.
-    ///
     /// # Errors
     ///
     /// Whatever [`Self::pack_into`] reports.
@@ -817,26 +623,6 @@ impl TlsSession {
     /// 0x06  u32                             EARLYDATA   (when non-zero)
     /// 0x07  u16 len  <len bytes>            QUICTP      (when non-empty)
     /// ```
-    ///
-    /// Two conditions are exactly the C's and are easy to get subtly wrong.
-    /// `EARLYDATA` is emitted `if(!r && s->earlydata_max)` (`:220`) -- a zero
-    /// maximum is *omitted*, not written as four zero bytes, and a decoder
-    /// that sees no tag reports zero, so the two spellings would round-trip
-    /// to the same value while producing different bytes. `QUICTP` is emitted
-    /// `if(!r && s->quic_tp && s->quic_tp_len)` (`:228`) -- both a null
-    /// pointer and a zero length omit it, which here is `Some(v)` with `v`
-    /// non-empty.
-    ///
-    /// # The C's two `DEBUGASSERT`s are deliberately not reproduced
-    ///
-    /// `:196-197` assert `s->sdata` and `s->sdata_len`. A release build with
-    /// neither writes `TICKET` with a zero length, and this does the same. The
-    /// assertions are not carried across because the only way to hold a
-    /// ticketless session is to have decoded one -- see [`Self::unpack`] --
-    /// and a debug-build panic on a value derived from imported bytes is
-    /// exactly the failure mode that must not exist here. Refusing to pack
-    /// instead would break the round trip and leave an unexportable session
-    /// wedged in the cache.
     ///
     /// # Errors
     ///
@@ -881,26 +667,6 @@ impl TlsSession {
     }
 
     /// `Curl_ssl_session_unpack` (`lib/vtls/vtls_spack.c:239-327`).
-    ///
-    /// The version byte is read and checked *before* anything is built
-    /// (`:256-262`), then tags are read until the input is exhausted. Tag
-    /// order is **not** fixed: the C's `switch` inside `while(buf < end)`
-    /// accepts the six payload tags in any order, and that flexibility is
-    /// preserved here rather than tightened, because a future curl may add a
-    /// field and an older reader must still cope with the ones it knows.
-    ///
-    /// A repeated tag overwrites, as the C's repeated assignment does.
-    ///
-    /// # A missing `TICKET` tag is accepted, and that is the faithful choice
-    ///
-    /// The C's decoder has no post-loop validation, so a payload carrying no
-    /// `TICKET` yields a session whose `sdata` is null. That session is
-    /// useless -- it cannot resume anything -- but it is what curl builds, and
-    /// [`Self::pack_into`] writes a zero-length ticket back for it, so the
-    /// round trip is total in both directions. Rejecting it here instead
-    /// would refuse input curl accepts, and the agent brief scopes the
-    /// empty-ticket rejection to *normal construction*, which is
-    /// [`Self::new`] and [`Self::with_quic_tp`].
     ///
     /// # Errors
     ///
@@ -962,9 +728,7 @@ impl TlsSession {
     }
 }
 
-// =========================================================================
 // The peer key -- `Curl_ssl_peer_key_make` (`vtls_scache.c:138-297`)
-// =========================================================================
 
 /// `TRNSPRT_TCP` (`lib/urldata.h:568`): the transport that adds no fragment.
 #[allow(dead_code)] // Read by peer_key_make.
@@ -984,21 +748,6 @@ const TRNSPRT_UNIX: u8 = 6;
 
 /// The TLS configuration a peer key has to distinguish.
 ///
-/// Every member is one member of `struct ssl_primary_config` that
-/// `Curl_ssl_peer_key_make` reads, or one of the two `cf->conn` bits it reads
-/// alongside them. The struct is declared *here* rather than imported because
-/// this crate has no `ssl_primary_config` successor yet: the option surface
-/// that will own those values belongs to `crate::easy`, and this module's
-/// dependency set is exactly the nine files its schema names. When that
-/// surface lands it constructs one of these; nothing about the key changes.
-///
-/// # Borrowed, not owned
-///
-/// Every string and blob is a borrow, because a key is computed once from
-/// configuration the caller already holds and is then thrown away. Owning
-/// them would copy up to three arbitrary-length application strings per
-/// handshake to build a value whose only use is to be hashed and compared.
-///
 /// # There is no `Default` derive, and that is not an oversight
 ///
 /// `#[derive(Default)]` would make `verifypeer` and `verifyhost` **false**,
@@ -1016,9 +765,6 @@ const TRNSPRT_UNIX: u8 = 6;
 /// data->set.ssl.primary.verifyhost = TRUE;
 /// data->set.ssl.primary.cache_session = TRUE; /* caching by default */
 /// ```
-///
-/// So [`Default`] is written by hand to agree with that line, and validation
-/// is on unless a caller turns it off.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // Populated by crate::easy once the option surface lands.
 pub(crate) struct PeerKeyConfig<'a> {
@@ -1108,35 +854,12 @@ impl Default for PeerKeyConfig<'_> {
 #[allow(dead_code)] // Consumers land with crate::easy's option surface.
 impl<'a> PeerKeyConfig<'a> {
     /// The client-authentication identity this configuration implies.
-    ///
-    /// The C reads `conn_config->clientcert` twice from one place -- once for
-    /// the `:CCERT` fragment (`vtls_scache.c:264`) and once to store on a new
-    /// peer (`:738`) -- and compares it on every lookup
-    /// (`cf_ssl_scache_match_auth`, `:610`). Deriving the identity from the
-    /// same value here is what stops the key and the identity from disagreeing
-    /// about which certificate is in play.
     pub(crate) fn client_auth(&self) -> ClientAuth {
         ClientAuth::new(self.clientcert)
     }
 }
 
 /// Which client credentials a cached session was established with.
-///
-/// The successor of the peer's `char *clientcert` (`vtls_scache.c:52`) and of
-/// `cf_ssl_scache_match_auth` (`:598-618`). A separate type rather than a bare
-/// `Option<String>` because the comparison has a defined shape that must not
-/// drift, and because "no configuration supplied" and "configuration supplied,
-/// naming no certificate" are different questions the C's nullable
-/// `conn_config` pointer answers with the same `NULL`.
-///
-/// # This is where SRP would be, and why it is not
-///
-/// The C peer also carries `srp_username` and `srp_password`, compared with
-/// the constant-time `Curl_timestrcmp` -- both behind `#ifdef USE_TLS_SRP`.
-/// rustls implements no SRP key exchange, [`crate::version`] withholds the
-/// `TLS-SRP` token accordingly, and this build is therefore the `#ifdef`-off
-/// compilation. Adding the fields would either advertise a capability that
-/// does not exist or leave two members that nothing can ever set.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)] // Consumers land with tls/rustls_backend.rs.
 pub(crate) struct ClientAuth {
@@ -1181,10 +904,6 @@ impl ClientAuth {
     /// return TRUE;
     /// ```
     ///
-    /// `expected` of [`None`] is the C's null `conn_config`, which the import
-    /// path passes (`:1099`): a peer that was established with a client
-    /// certificate must not match it.
-    ///
     /// `Curl_safecmp` (`lib/strcase.c:119-124`) is `!strcmp` when both
     /// pointers are non-null and `!a && !b` otherwise -- **case-sensitive**,
     /// with both-absent counting as equal. `Option<String>`'s derived equality
@@ -1207,11 +926,6 @@ impl ClientAuth {
 ///        (peer_key[len - 1] == 'G') &&
 ///        (peer_key[len - 2] == ':');
 /// ```
-///
-/// The `len > 2` is not redundant with the suffix test: it rejects the string
-/// `":G"` itself, which carries no host and no configuration and so identifies
-/// nothing. [`str::ends_with`] compares bytes, exactly as the two indexed
-/// character tests do.
 pub(crate) fn peer_key_is_global(peer_key: &str) -> bool {
     peer_key.len() > 2 && peer_key.ends_with(GLOBAL_SUFFIX)
 }
@@ -1240,22 +954,6 @@ pub(crate) fn peer_key_is_global(peer_key: &str) -> bool {
 /// 3. **Relative and unresolvable.** `*is_local` is set and the path is
 ///    emitted as given. The key is then valid only in this process, and the
 ///    `:L` suffix says so.
-///
-/// [`std::fs::canonicalize`] is `realpath`: it resolves symlinks and requires
-/// the path to exist, and it fails for the same inputs. A resolved path that
-/// is not UTF-8 is treated as case 3 -- unresolvable -- which is the honest
-/// reading, since a key is text and there is nothing else to do with bytes
-/// that cannot appear in one.
-///
-/// # The `_WIN32` branch is not reproduced
-///
-/// `:80-84` uses `_fullpath` for *every* path, absolute ones included. No
-/// mandated target is Windows, and a `#[cfg(windows)]` arm here could not be
-/// built or tested by any of the four. On a Windows build this function
-/// therefore takes case 3 for a drive-letter path -- the key is emitted
-/// unchanged and marked local -- which is the conservative direction: a local
-/// key is never exported, so nothing leaves the process that another process
-/// could misread.
 ///
 /// # Errors
 ///
@@ -1301,15 +999,6 @@ fn peer_key_add_path(
 ///   r = curlx_dyn_addf(buf, "%02x", hash[i]);
 /// ```
 ///
-/// The `%02x` is **lowercase**, which is `{:02x}` here and not `{:02X}`. The
-/// distinction is not cosmetic: the key is compared as a string, so a
-/// different case is a different peer and every session for it would be
-/// missed.
-///
-/// The C's `if(blob && blob->len)` skips an empty blob, so an empty
-/// `CURLOPT_CAINFO_BLOB` produces no fragment rather than the digest of the
-/// empty input.
-///
 /// # Errors
 ///
 /// Whatever the buffer reports. The C's `Curl_sha256it` can return a code
@@ -1334,13 +1023,6 @@ fn peer_key_add_hash(
 /// `Curl_ssl_peer_key_make` (`lib/vtls/vtls_scache.c:138-297`): the key that
 /// decides which sessions may be resumed against which endpoint.
 ///
-/// Two peers share sessions if and only if they produce the same key, so every
-/// fragment below exists because getting it wrong would either leak a session
-/// across a configuration boundary or lose resumption for an identical
-/// configuration. The order is fixed -- the key is compared as one string, so
-/// reordering two fragments produces a different key for the same
-/// configuration and silently disables resumption.
-///
 /// ```text
 /// <host>:<port>                        always
 /// :UDP | :QUIC | :UNIX | :TRNSPRT-<n>  unless TCP, which adds nothing
@@ -1364,40 +1046,6 @@ fn peer_key_add_hash(
 /// :IMPL-<tls_id>                       always
 /// :L | :G                              always, exactly one
 /// ```
-///
-/// # Three details that are easy to read past
-///
-/// **The trust material is conditional on `verifypeer` alone.** `:229` opens
-/// `if(ssl->verifypeer)` and the six CA, CRL, issuer and blob fragments sit
-/// inside it, so with verification off the trust configuration does not
-/// distinguish peers -- correctly, because it is not being used. `:Pinned-` and
-/// `:CCERT` are *outside* that block and always apply.
-///
-/// **`:CHOST-`/`:CPORT-` are conditional the other way.** `:190` opens
-/// `if(!ssl->verifypeer || !ssl->verifyhost)`. With verification on, the
-/// certificate binds the session to the origin name, so a `--connect-to`
-/// override cannot let one endpoint's session be reused for another. With it
-/// off, nothing binds them, and the override has to enter the key.
-///
-/// **`:TLSVER-` prints the maximum shifted down by 16.** `:204-205` is
-/// `":TLSVER-%d-%d", ssl->version, (ssl->version_max >> 16)`, because
-/// `version_max` holds a `CURL_SSLVERSION_*` pre-shifted left by 16. The shift
-/// is arithmetic on a signed value in both languages, so a negative maximum
-/// prints negative in both. The C passes a `long` to a `%d` conversion there,
-/// which reads only an `int`'s worth of it; every assigned
-/// `CURL_SSLVERSION_MAX_*` value shifts down into `0..8`, so the two spellings
-/// agree for every input curl can produce, and this one does not truncate.
-///
-/// # `:IMPL-` is what keeps two rustls versions apart
-///
-/// `tls_id` is documented at `vtls_scache.h:59-61` as the "identifier of TLS
-/// implementation for sessions. Should include full version if session data
-/// from other versions is to be avoided." A ticket is opaque to curl but not
-/// to the library that minted it, so a session from another implementation --
-/// or another version of the same one -- must not be offered back. The caller
-/// supplies the token because it is the caller that knows the truthful one;
-/// this module does not read [`crate::version`], which would be a second
-/// source of truth for one answer.
 ///
 /// # Errors
 ///
@@ -1534,41 +1182,16 @@ fn peer_key_build(
     String::from_utf8(buf.take()).map_err(|_| CURLcode::BadFunctionArgument)
 }
 
-// =========================================================================
 // Constant-time verification, through the wrapper and nowhere else
-// =========================================================================
 
 /// Whether two 32-byte codes are equal, without leaking *where* they differ.
-///
-/// The C compares with `memcmp` in both places it compares a code
-/// (`vtls_scache.c:664` and `:1039-1040`), and `memcmp` returns as soon as it
-/// finds a difference. One of the two operands here always arrives from
-/// outside the process -- it is the `shmac` half of an imported session -- so
-/// the position of the first difference is information an attacker can supply
-/// input to probe.
-///
-/// This is the double-HMAC comparison: both values are keyed with the same key
-/// and the resulting codes are checked through [`HmacContext::verify_slice`],
-/// which is `Mac::verify_slice` and therefore constant-time. Equal inputs
-/// produce equal codes trivially; unequal inputs producing equal codes would
-/// be an HMAC-SHA-256 collision. The key is empty because it has no secret to
-/// hold -- what is being bought is the constant-time *comparison*, not
-/// authentication of a message that is already a code.
-///
-/// Written this way rather than as a hand-rolled XOR-and-fold loop for a
-/// deliberate reason: [`crate::crypto::hmac`] publishes a constant-time
-/// verification and *deliberately does not* publish a non-constant-time
-/// alternative, precisely so that a consumer needing to compare codes reaches
-/// for it instead of writing its own. This module is that consumer.
 fn codes_equal(stored: &[u8; HMAC_LEN], offered: &[u8; HMAC_LEN]) -> bool {
     let mut ctx = HmacContext::<Sha256>::new(&[]);
     ctx.update(stored);
     ctx.verify_slice(&hmac_sha256(&[], offered))
 }
 
-// =========================================================================
 // The peer -- `struct Curl_ssl_scache_peer` (`vtls_scache.c:50-64`)
-// =========================================================================
 
 /// How a peer slot is identified: by its key, or only by its code.
 ///
@@ -1581,11 +1204,6 @@ fn codes_equal(stored: &[u8; HMAC_LEN], offered: &[u8; HMAC_LEN]) -> bool {
 /// else if(salt && hmac)   { memcpy(...); peer->hmac_set = TRUE; }
 /// else                    { result = CURLE_BAD_FUNCTION_ARGUMENT; }
 /// ```
-///
-/// The two valid arms become the two variants, so the error arm has no
-/// reachable input and the function that used to return it cannot fail. That
-/// is a faithful narrowing rather than a dropped check: all four C call sites
-/// pass one or the other, and none passes neither.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PeerIdentity<'a> {
     /// The peer key is known. `hmac_set` is cleared, because a salt and code
@@ -1609,11 +1227,6 @@ enum PeerIdentity<'a> {
 /// the two members the module documentation accounts for -- the `void *sobj`
 /// pair, whose only consumer is out of scope, and the SRP credentials, which
 /// this build cannot have.
-///
-/// Private to this module. The C declares the struct in the implementation
-/// file too, and every function that touches a peer is `static`; the cache is
-/// the only legitimate owner, and publishing the slot would let a caller hold
-/// a peer across the lock release that invalidates it.
 #[derive(Default)]
 struct ScachePeer {
     /// `char *ssl_peer_key`: the key, once known.
@@ -1626,12 +1239,6 @@ struct ScachePeer {
     auth: ClientAuth,
 
     /// `struct Curl_llist sessions`: the cached tickets, oldest at the front.
-    ///
-    /// A [`VecDeque`] rather than a `Vec` because both ends are used: TLS 1.3
-    /// appends at the back and trims from the front (`:773-776`), and a take
-    /// removes from the front (`:891-893`). Front removal on a `Vec` is a
-    /// shift; here it is a pointer move, and more importantly the code reads
-    /// as the queue it is.
     sessions: VecDeque<TlsSession>,
 
     /// `unsigned char key_salt[CURL_SHA256_DIGEST_LENGTH]`: the export salt.
@@ -1665,11 +1272,6 @@ struct ScachePeer {
 
 /// Reports the slot's shape without disclosing its salt, its code or its
 /// tickets.
-///
-/// The salt and code together authenticate a peer key to an importing process,
-/// and the sessions are resumption material. Both are reported as
-/// *presence and counts*, for the same reason [`TlsSession`]'s own
-/// [`fmt::Debug`] reports a length instead of bytes.
 impl fmt::Debug for ScachePeer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScachePeer")
@@ -1698,21 +1300,6 @@ impl ScachePeer {
 
     /// `cf_ssl_scache_clear_peer` (`lib/vtls/vtls_scache.c:395-413`): empties
     /// the slot and makes it free again.
-    ///
-    /// The C frees the sessions, the object, the client certificate, the SRP
-    /// pair and the key, then sets `age = 0` and `hmac_set = FALSE`. It leaves
-    /// `exportable` and the salt-and-code bytes as they were.
-    ///
-    /// This zeroes those too, which is unobservable and strictly safer.
-    /// Unobservable because both readers gate on the identity first:
-    /// `Curl_ssl_session_export` skips a slot with neither key nor code before
-    /// it looks at `exportable` (`:1167-1170`), and
-    /// `cf_ssl_find_peer_by_hmac` requires `hmac_set` before it looks at the
-    /// salt (`:1038`). Safer because a stale code cannot then authenticate a
-    /// slot that has been handed to a different peer.
-    ///
-    /// `max_sessions` survives, as it does in the C: it is a property of the
-    /// slab, configured once.
     fn clear(&mut self) {
         *self = Self::new(self.max_sessions);
     }
@@ -1762,12 +1349,6 @@ impl ScachePeer {
     ///                     (!peer->ssl_peer_key ||
     ///                      cf_ssl_peer_key_is_global(peer->ssl_peer_key)));
     /// ```
-    ///
-    /// The two SRP conjuncts are absent for the reason recorded on
-    /// [`ClientAuth`]; the remaining structure is exact. Note that an unknown
-    /// key makes a peer exportable rather than blocking it: such a slot exists
-    /// only because a previous export produced its code, so re-exporting it
-    /// discloses nothing that was not already disclosed.
     fn update_exportable(&mut self) {
         self.exportable = !self.auth.is_confidential()
             && match self.ssl_peer_key.as_deref() {
@@ -1809,18 +1390,6 @@ impl ScachePeer {
     ///   }
     /// }
     /// ```
-    ///
-    /// Before TLS 1.3 a session identifier is reusable, so exactly one is
-    /// worth keeping and a new one supersedes everything. A TLS 1.3 ticket is
-    /// single-use (RFC 8446 C.4), so several are worth keeping and the queue
-    /// is trimmed from the *front* -- the oldest goes, which is also the one a
-    /// take would have handed out next.
-    ///
-    /// Two asymmetries are the C's and are preserved. The pre-1.3 arm does
-    /// **not** trim, so it stores its one session even where `max_sessions` is
-    /// zero; the 1.3 arm's `while` loop with a maximum of zero discards
-    /// everything including the session just appended. And the pre-1.3 arm
-    /// does not sweep expired entries, because it removes them all anyway.
     fn add_session(&mut self, session: TlsSession, now: i64) {
         if session.is_tls13() {
             self.remove_expired(now);
@@ -1847,15 +1416,6 @@ impl ScachePeer {
     ///                      peer->key_hmac);
     /// if(!result) peer->hmac_set = TRUE;
     /// ```
-    ///
-    /// The salt is what lets a key be *recognised* without being disclosed: an
-    /// importing process that already knows the key can recompute the code,
-    /// and one that does not learns nothing beyond 64 opaque bytes. A fresh
-    /// salt per peer per export is what stops two exports of the same key from
-    /// being correlatable.
-    ///
-    /// The salt and code are assigned only once both are computed, so a peer
-    /// cannot be left holding a salt that does not match its code.
     ///
     /// # Errors
     ///
@@ -1900,18 +1460,6 @@ impl ScachePeer {
     ///    curl_strequal(ssl_peer_key, scache->peers[i].ssl_peer_key) &&
     ///    cf_ssl_scache_match_auth(&scache->peers[i], conn_config))
     /// ```
-    ///
-    /// `curl_strequal` is case-**insensitive** over ASCII only
-    /// (`lib/strequal.c:35-49`, folding through `Curl_raw_toupper`), which
-    /// [`str::eq_ignore_ascii_case`] reproduces exactly. Rust's
-    /// Unicode-aware case folding would not: it would equate keys the C keeps
-    /// apart, merging two configurations into one cache slot.
-    ///
-    /// The authentication test is inseparable from the key test. Two transfers
-    /// to the same endpoint with different client certificates produce the
-    /// *same* key -- the key records only that a certificate is set, as
-    /// `:CCERT` -- so without the second conjunct one transfer could resume a
-    /// session the other established, presenting an identity it does not hold.
     fn matches_key(&self, peer_key: &str, auth: Option<&ClientAuth>) -> bool {
         match self.ssl_peer_key.as_deref() {
             Some(key) => {
@@ -1955,22 +1503,9 @@ impl ScachePeer {
     }
 }
 
-// =========================================================================
 // Whether to cache at all -- `primary.cache_session`
-// =========================================================================
 
 /// Whether a transfer wants its sessions cached.
-///
-/// The successor of `ssl_config->primary.cache_session`, which
-/// `Curl_ssl_scache_use` (`lib/vtls/vtls_scache.c:575-582`) reads and
-/// `Curl_ssl_scache_put` (`:846`) reads again before storing anything.
-///
-/// A named type rather than a bare `bool` for one reason: the default has to
-/// be **on**, and a `bool` parameter has no default.
-/// `Curl_ssl_easy_config_init` (`lib/vtls/vtls.c:189`) sets it with the
-/// comment "caching by default", and
-/// [`Default`] here agrees with that line so a caller that configures nothing
-/// gets curl's behaviour rather than the `bool` zero value.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)] // Consumers land with crate::easy's option surface.
 pub(crate) struct SessionCaching(bool);
@@ -2011,13 +1546,6 @@ impl SessionCaching {
 /// }
 /// return FALSE;
 /// ```
-///
-/// Both conjuncts survive: a cache must exist *and* the transfer must want
-/// caching. The header explains why the first can fail -- "An ssl session
-/// might not be configured or not available for 'connect-only' transfers"
-/// (`vtls_scache.h:69-72`) -- and the missing-cache case is an [`Option`] here
-/// rather than a null pointer, so the C's third `ssl_config ? ... : FALSE`
-/// arm, which guards against a missing configuration, has no analogue.
 #[allow(dead_code)] // Consumer lands with tls/rustls_backend.rs.
 pub(crate) fn scache_use(
     cache: Option<&SessionCache>,
@@ -2026,9 +1554,7 @@ pub(crate) fn scache_use(
     cache.is_some() && caching.is_enabled()
 }
 
-// =========================================================================
 // The cache -- `struct Curl_ssl_scache` (`vtls_scache.c:299-305`)
-// =========================================================================
 
 /// A bounded slab of peers, each holding a bounded queue of sessions.
 ///
@@ -2041,14 +1567,6 @@ pub(crate) fn scache_use(
 /// | `size_t peer_count` | `peers.len()` |
 /// | `int default_lifetime_secs` | [`Self::default_lifetime_secs`] |
 /// | `long age` | [`Self::age`] |
-///
-/// # Bounded in both dimensions, and never reallocated
-///
-/// `Curl_ssl_scache_create` `calloc`s exactly `max_peers` slots and never
-/// grows them; a new peer displaces an existing one. That is the whole point
-/// -- a session cache with no ceiling is a memory leak that a hostile server
-/// can drive by redirecting to unlimited hostnames. The [`Vec`] below is
-/// allocated once at that length and only ever has its elements replaced.
 ///
 /// # No interior locking; read this before adding a `Mutex`
 ///
@@ -2073,10 +1591,6 @@ pub(crate) struct SessionCache {
     /// used (`:894-895`). Comparing two peers' stamps orders them by last use,
     /// which is what makes the eviction in [`Self::free_peer`] an LRU without
     /// storing a timestamp or maintaining a list order.
-    ///
-    /// Starts at 1, not 0 (`:551`), so that a peer that has never been used --
-    /// whose stamp [`ScachePeer::clear`] left at 0 -- always compares older
-    /// than one that has.
     age: i64,
 }
 
@@ -2133,11 +1647,6 @@ impl SessionCache {
 
     /// How many sessions are cached for a peer, or [`None`] when it is not
     /// cached at all.
-    ///
-    /// The C reads `Curl_llist_count(&peer->sessions)` inline for its trace
-    /// lines (`:832`, `:904`, `:1133`). Named here so the count is observable
-    /// without a trace sink, which is what lets the insertion policy be
-    /// asserted.
     pub(crate) fn session_count(
         &self,
         peer_key: &str,
@@ -2160,22 +1669,6 @@ impl SessionCache {
     /// "locale independent". It is deliberately *not* the comparison
     /// [`ClientAuth::matches`] performs, which is case-sensitive; the two
     /// differ in the C and differ here.
-    ///
-    /// **Pass two** looks for a slot that has a code but no key, and offers it
-    /// the key: if the key authenticates against the stored salt, the slot is
-    /// that peer, and the key is *remembered* so pass one finds it next time
-    /// (`:665-673`). This is what makes an import-then-use sequence work when
-    /// the import carried only a `shmac`.
-    ///
-    /// Recording the key changes what the peer is allowed to do, so
-    /// [`ScachePeer::update_exportable`] runs immediately afterwards, exactly
-    /// as `cf_ssl_cache_peer_update(&scache->peers[i])` does at `:673`: a
-    /// recovered key ending in `:L` makes the peer non-exportable, which it
-    /// was not while the key was unknown.
-    ///
-    /// The C's two `CURLcode` returns -- a refused `strdup` and a failing
-    /// `Curl_hmacit` -- have no analogue, so this yields an index rather than
-    /// a result.
     fn find_peer_by_key(
         &mut self,
         peer_key: &str,
@@ -2216,10 +1709,6 @@ impl SessionCache {
     ///    belong together -- and the slot adopts the offered salt and code if
     ///    it had none, which is the C's `if(!peer->hmac_set)` at `:1057-1061`.
     /// 3. Otherwise the slot is not it.
-    ///
-    /// Every slot is first filtered by `cf_ssl_scache_match_auth(peer, NULL)`
-    /// (`:1036`): an import carries no client-certificate configuration, so a
-    /// slot established with one is never a candidate.
     fn find_peer_by_hmac(
         &mut self,
         salt: &[u8; SALT_LEN],
@@ -2270,21 +1759,6 @@ impl SessionCache {
     /// }
     /// if(peer) cf_ssl_scache_clear_peer(peer);
     /// ```
-    ///
-    /// Three tiers, and the order is the policy: an unoccupied slot first,
-    /// then an occupied one holding nothing worth keeping, and only then the
-    /// least recently used. The first two `break` out, so a scan that finds
-    /// either stops without considering age -- which is why a cache with a
-    /// free slot never evicts.
-    ///
-    /// The `!sobj` conjunct of the second test is absent for the reason the
-    /// module documentation records: nothing in an in-scope build ever sets
-    /// the slot, so the test is the session count alone.
-    ///
-    /// The chosen slot is **cleared** before being returned, so the caller
-    /// receives a slot with no residue of its previous occupant -- and a
-    /// caller that abandons it afterwards leaves a free slot rather than a
-    /// half-initialised one.
     fn free_peer(&mut self) -> Option<usize> {
         let mut chosen: Option<usize> = None;
         for index in 0..self.peers.len() {
@@ -2310,14 +1784,6 @@ impl SessionCache {
 
     /// `cf_ssl_add_peer` (`lib/vtls/vtls_scache.c:714-758`): the slot for
     /// `peer_key`, creating one if it is not already cached.
-    ///
-    /// [`None`] means the cache has no room at all, which is the C's
-    /// `!scache->peer_count` early return (`:727-728`) and its
-    /// `if(peer)`-guarded initialisation (`:737`). The C's `ssl_peer_key` is
-    /// nullable at this signature but non-null at all four of its call sites,
-    /// so it is a plain `&str` here and the `CURLE_BAD_FUNCTION_ARGUMENT` that
-    /// `cf_ssl_scache_peer_init` would have returned for a null key with no
-    /// salt is unreachable by construction -- see [`PeerIdentity`].
     fn add_peer(
         &mut self,
         peer_key: &str,
@@ -2345,16 +1811,6 @@ impl SessionCache {
     /// * the cache has no slots -- `:792-795`;
     /// * the session is already expired after clamping -- `:806-810`;
     /// * no slot could be found or made -- `:813-817`.
-    ///
-    /// The C returns `CURLE_OK` for all four, and reports failure only for the
-    /// allocation arms that do not exist here, so this is infallible. The
-    /// return value says whether the session was stored, which is what the C
-    /// expresses through the session count in its trace line at `:827-832`.
-    ///
-    /// Order matters and is the C's: default the expiry, clamp it, *then* test
-    /// for expiry. Testing first would discard a session whose stated expiry
-    /// was unknown, and clamping first would give a session with no stated
-    /// expiry the seven-day ceiling instead of the one-day default.
     pub(crate) fn put(
         &mut self,
         clock: &dyn Clock,
@@ -2388,23 +1844,6 @@ impl SessionCache {
 
     /// `Curl_ssl_scache_take` (`lib/vtls/vtls_scache.c:870-911`): removes and
     /// yields the next session for `peer_key`.
-    ///
-    /// Expired entries are swept **before** the head is taken (`:890`), so a
-    /// stale ticket is never handed out even though nothing sweeps the cache
-    /// in the background. The head is the oldest, which is the right one to
-    /// spend first: a TLS 1.3 ticket is single-use, so the queue is consumed
-    /// in the order it was filled.
-    ///
-    /// A successful take bumps the cache's age and stamps it on the peer
-    /// (`:894-895`), which is what keeps this peer out of the eviction path in
-    /// [`Self::free_peer`]. A miss changes nothing -- neither counter moves --
-    /// so a peer that was never usable does not defend itself against
-    /// eviction by being asked for.
-    ///
-    /// Ownership transfers to the caller. The C hands back a pointer and
-    /// documents that the caller must return it or destroy it; here the caller
-    /// holds the value, so forgetting to return it drops it, which is the safe
-    /// direction.
     pub(crate) fn take(
         &mut self,
         clock: &dyn Clock,
@@ -2434,21 +1873,6 @@ impl SessionCache {
     /// else
     ///   Curl_ssl_session_destroy(s);
     /// ```
-    ///
-    /// So a TLS 1.3 ticket is **dropped** rather than returned: it has been
-    /// spent, and re-caching it would offer the same ticket to a second
-    /// connection, which is what RFC 8446 appendix C.4 tells clients not to
-    /// do. A pre-1.3 session identifier is reusable by design, so it goes
-    /// back.
-    ///
-    /// The C writes the literal `0x304` here where it writes
-    /// `CURL_IETF_PROTO_TLS1_3` elsewhere; both are 0x0304, and the comparison
-    /// is `<`, so any future version above 1.3 is also dropped -- the
-    /// conservative direction for a mechanism whose whole subject is not
-    /// reusing single-use material.
-    ///
-    /// `s` of `NULL` is accepted by the C ("Maybe called with a NULL session",
-    /// `vtls_scache.h:188`); here the caller simply does not call this.
     pub(crate) fn return_session(
         &mut self,
         clock: &dyn Clock,
@@ -2465,11 +1889,6 @@ impl SessionCache {
 
     /// `Curl_ssl_scache_remove_all` (`lib/vtls/vtls_scache.c:972-991`):
     /// forgets everything cached for one peer.
-    ///
-    /// Called when a handshake fails in a way that implicates the cached
-    /// material, so the slot has to be emptied rather than merely skipped. The
-    /// return says whether a slot was found, which the C's `void` return
-    /// discards.
     pub(crate) fn remove_all(
         &mut self,
         peer_key: &str,
@@ -2488,9 +1907,7 @@ impl SessionCache {
     }
 }
 
-// =========================================================================
 // Import and export -- `USE_SSLS_EXPORT` (`vtls_scache.c:993-1219`)
-// =========================================================================
 
 /// One session, as the export callback receives it.
 ///
@@ -2504,16 +1921,6 @@ impl SessionCache {
 ///               s->valid_until, s->ietf_tls_id,
 ///               s->alpn, s->earlydata_max);
 /// ```
-///
-/// The two pointer-and-length pairs become slices, so the callback cannot be
-/// handed a length that disagrees with its buffer. `data` and `userptr` are
-/// absent: the first is the transfer the C needs only to emit a trace line,
-/// and the second is a closure's captured state here.
-///
-/// The metadata beside the packed bytes is not redundant with them. A consumer
-/// writing a session file wants the expiry, the protocol and the ALPN
-/// *indexable* without unpacking every entry -- which is exactly what the
-/// command-line tool's `--ssl-sessions` file does with them.
 #[derive(Debug)]
 #[allow(dead_code)] // Consumers land with curl-rs's --ssl-sessions support.
 pub(crate) struct ExportedSession<'a> {
@@ -2588,19 +1995,6 @@ impl SessionCache {
     /// held (`:766`). A live, usable session is therefore discarded in favour
     /// of a dead one that the next take or export would sweep away anyway
     /// (`:890`, `:1173`).
-    ///
-    /// Testing first is what the agent brief specifies, and it makes the
-    /// observable difference only in that one direction: nothing that could
-    /// have been handed out is lost, because an expired session can never be
-    /// taken or exported in either implementation.
-    ///
-    /// # What is *not* adjusted, and why that matters for round-tripping
-    ///
-    /// The expiry is neither defaulted nor clamped here, because the C does
-    /// neither on this path. That is load-bearing rather than incidental: a
-    /// session imported and then re-exported must carry the *same*
-    /// `valid_until`, or a session file rewritten by a long-running process
-    /// would drift its own deadlines every time it was reloaded.
     ///
     /// # Errors
     ///
@@ -2688,10 +2082,6 @@ impl SessionCache {
     /// 3. Expired sessions are swept, and a slot left with none contributes
     ///    nothing and is not counted (`:1173-1176`).
     ///
-    /// A slot that survives and has no code yet gets one drawn now
-    /// (`:1179-1183`), so the salt is fresh per export rather than per
-    /// process.
-    ///
     /// # Errors
     ///
     /// Whatever [`TlsSession::pack`] reports -- notably
@@ -2762,9 +2152,7 @@ impl SessionCache {
     }
 }
 
-// =========================================================================
 // Selection and locking -- the seam, and nothing beyond it
-// =========================================================================
 
 /// `curl_lock_access` (`include/curl/curl.h`), as the session cache uses it.
 ///
@@ -2775,12 +2163,6 @@ impl SessionCache {
 /// `curl-rs-ffi`; this is the internal vocabulary the seam speaks, and the two
 /// agree by these literals rather than by one importing the other -- which
 /// would make the engine depend on the ABI shim and invert the crate graph.
-///
-/// Only [`Self::Single`] is ever requested here: `Curl_ssl_scache_lock`
-/// (`lib/vtls/vtls_scache.c:588`) asks for exclusive access unconditionally,
-/// because every path that takes the lock goes on to mutate. The other two
-/// values exist so that an implementation of [`ScacheLock`] can carry the whole
-/// vocabulary without inventing part of it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)] // The share subsystem is the consumer, and has no file yet.
 pub(crate) enum LockAccess {
@@ -2806,10 +2188,6 @@ pub(crate) enum LockAccess {
 /// }
 /// ```
 ///
-/// The datum is implicit in the trait: an implementation of [`ScacheLock`]
-/// *is* the SSL-session lock, so nothing here has to name a lock-data
-/// enumeration or dispatch on one.
-///
 /// # Why a trait, and why so narrow
 ///
 /// The mechanics behind these two calls are entirely the share subsystem's:
@@ -2820,12 +2198,8 @@ pub(crate) enum LockAccess {
 /// `crate::share` owns a `SessionCache` -- a cycle. Two methods and no
 /// associated types is the smallest seam that still lets the C's exact locking
 /// discipline be expressed and tested.
-///
-/// The header's own guidance is preserved by [`ScacheGuard`] rather than by
-/// convention: "Caller should unlock this mutex as soon as possible, as it may
-/// block other SSL connection from making progress" (`vtls_scache.h:77-78`).
 #[allow(dead_code)] // The share subsystem is the consumer, and has no file yet.
-pub(crate) trait ScacheLock: fmt::Debug {
+pub(crate) trait ScacheLock: fmt::Debug + Send + Sync {
     /// `Curl_share_lock(data, CURL_LOCK_DATA_SSL_SESSION, access)`.
     fn lock(&self, access: LockAccess);
 
@@ -2891,18 +2265,6 @@ pub(crate) struct SelectedCache<'a> {
 /// else if(data->multi && data->multi->ssl_scache)
 ///   scache = data->multi->ssl_scache;
 /// ```
-///
-/// The precedence is not arbitrary. An application that set
-/// `CURLSHOPT_SHARE` with `CURL_LOCK_DATA_SSL_SESSION` asked for its handles to
-/// resume each other's sessions; honouring the multi handle's private cache
-/// instead would silently ignore that request and confine every session to one
-/// handle.
-///
-/// The C's four-way nullability -- no share, a share with no cache, no multi, a
-/// multi with no cache -- collapses to two [`Option`]s, because "present but
-/// holding nothing" is not expressible when the value *is* the cache. The
-/// `GOOD_SCACHE` validity check that follows in the C (`:315-320`) has no
-/// analogue for the reason the module documentation records.
 #[allow(dead_code)] // Consumers land with multi/ and share/.
 pub(crate) fn select_cache<'a>(
     shared: Option<&'a mut SessionCache>,
@@ -2935,11 +2297,6 @@ impl<'a> SelectedCache<'a> {
     /// scope. The `if(CURL_SHARE_ssl_scache(data))` test is the
     /// [`CacheOrigin`] check below: a local cache is never locked, so `lock`
     /// is not called for one and neither is `unlock`.
-    ///
-    /// Requesting [`LockAccess::Single`] unconditionally is the C's choice at
-    /// `:588`, and it is the right one for every caller here -- `put`, `take`,
-    /// `remove_all`, `import` and `export` all mutate, the last two including
-    /// `export`, which sweeps expired entries and may draw a fresh salt.
     pub(crate) fn acquire(self, lock: &'a dyn ScacheLock) -> ScacheGuard<'a> {
         let held = match self.origin {
             CacheOrigin::Shared => {
@@ -2982,16 +2339,6 @@ impl<'a> SelectedCache<'a> {
 ///   if(locked)
 ///     Curl_ssl_scache_unlock(data);
 /// ```
-///
-/// That is `Curl_ssl_session_import` (`vtls_scache.c:1079`, `:1095-1096`,
-/// `:1136-1138`), and the bookkeeping exists because the function has nine exit
-/// paths. Here the release is [`Drop`], so early return, `?` propagation and
-/// unwinding all release, there is no flag to get wrong, and the critical
-/// section is exactly this value's scope -- which is the header's "as soon as
-/// possible" made structural.
-///
-/// [`Deref`] and [`DerefMut`] to [`SessionCache`] so that a locked cache reads
-/// as the cache it is.
 #[derive(Debug)]
 #[allow(dead_code)] // Consumers land with multi/ and share/.
 pub(crate) struct ScacheGuard<'a> {
@@ -3026,14 +2373,6 @@ impl Drop for ScacheGuard<'_> {
 
 // Tests -- the byte-level contracts, and the cache behaviour around them
 //
-// Two C unit tests cover this code, and both are unreachable here. `tests/unit`
-// programs link a debug static libcurl and call internal `Curl_*` symbols; a
-// Rust static library does not export `pub(crate)` items, so the coverage moves
-// into this module, which AAP 0.8.7 records as a documented deviation rather
-// than a gap. The fixtures that drive the CLI are unaffected:
-// `--ssl-sessions` exercises this file through the binary and needs nothing
-// relocated.
-//
 // What is asserted here, and why each group exists:
 //
 //   * The pack format, byte for byte, per tag and per integer width. A session
@@ -3060,8 +2399,8 @@ impl Drop for ScacheGuard<'_> {
 mod tests {
     use super::*;
     use crate::crypto::rand::TestRng;
+    use crate::util::sync_cell::SyncCell;
     use crate::util::timeval::TestClock;
-    use std::cell::RefCell;
 
     /// A clock reading exactly `secs` seconds past the epoch.
     ///
@@ -3119,11 +2458,6 @@ mod tests {
 
     /// The minimum payload, byte for byte: version, ticket, protocol, expiry
     /// and nothing else.
-    ///
-    /// This is the golden vector the whole format rests on. A widened field, a
-    /// little-endian integer or a reordered tag all fail here, and nowhere
-    /// else would catch them -- a round-trip test passes happily against a
-    /// format that agrees only with itself.
     #[test]
     fn the_minimum_payload_is_byte_exact() {
         let session = TlsSession::new(
@@ -3442,12 +2776,6 @@ mod tests {
     }
 
     /// `u32::MAX` as a `usize`, checked.
-    ///
-    /// `From<u32> for usize` does not exist -- the standard library stops at
-    /// `u16`, because a `usize` is not guaranteed to be 32 bits wide. Every
-    /// mandated target is 64-bit, so this cannot fail there; it is written as a
-    /// checked conversion regardless, because an `as` cast in a test that
-    /// exists to prove a conversion is checked would be a poor advertisement.
     fn u32_max_as_usize() -> usize {
         usize::try_from(u32::MAX).expect("a 64-bit target holds u32::MAX")
     }
@@ -3513,13 +2841,6 @@ mod tests {
 
     /// Truncation is a read error at every offset **except** the ones that fall
     /// exactly on a field boundary, and it never panics anywhere.
-    ///
-    /// The exception is the format's own property rather than a leniency: the
-    /// decoder's loop is `while(buf < end)` (`vtls_spack.c:270`), so a payload
-    /// that stops after a complete field is a shorter but well-formed payload,
-    /// and the C returns `CURLE_OK` for it. Every other offset lands inside a
-    /// tag's fixed-width value or inside a length-prefixed body, and every one
-    /// of those is `CURLE_READ_ERROR`.
     #[test]
     fn truncation_is_a_read_error_everywhere_except_a_field_boundary() {
         let session = TlsSession::with_quic_tp(
@@ -4214,11 +3535,6 @@ mod tests {
     /// The ceiling is enforced at **every** append, not only at the first
     /// oversized one, so an overflow that first bites on a late fragment is
     /// still reported rather than silently truncating the key.
-    ///
-    /// The boundary is computed from the parts rather than written as a
-    /// literal, because the buffer admits `PEER_KEY_MAX - 1` bytes -- it counts
-    /// the terminator curl stores and this crate does not -- and a literal
-    /// would encode that off-by-one invisibly.
     #[test]
     fn the_peer_key_ceiling_is_enforced_on_late_fragments_too() {
         // Fill most of the budget with an early fragment, then vary the
@@ -4323,12 +3639,6 @@ mod tests {
 
     /// [`peer_key_make`] reads the host, port and transport off the peer, and
     /// the result is what [`crate::tls::SslPeer::set_scache_key`] is for.
-    ///
-    /// `crate::conn::filters::Transport` is imported here and nowhere else in
-    /// this file: it is a parameter of `SslPeer::new`, which belongs to the
-    /// declared dependency `tls/mod.rs`, and there is no other way to build a
-    /// peer. Production code reads the transport through the accessor instead,
-    /// so the module itself needs no such import.
     #[test]
     fn peer_key_make_reads_the_peer_and_feeds_set_scache_key() {
         use crate::conn::filters::Transport;
@@ -4363,7 +3673,7 @@ mod tests {
     /// exclusive.
     #[derive(Debug, Default)]
     struct RecordingLock {
-        events: RefCell<Vec<String>>,
+        events: SyncCell<Vec<String>>,
     }
 
     impl RecordingLock {
@@ -5841,11 +5151,6 @@ mod tests {
     /// `cf_ssl_find_peer_by_hmac` (`vtls_scache.c:1036-1037`): a slot
     /// established with client credentials is never a candidate for an import,
     /// because an import carries no client-certificate configuration.
-    ///
-    /// That is a privacy guarantee rather than an optimisation: merging an
-    /// imported session into a client-authenticated slot would let a transfer
-    /// resume a session it never established, presenting an identity the
-    /// exporting process held and this one may not.
     #[test]
     fn an_import_never_lands_in_a_client_authenticated_slot() {
         let clock = clock_at(1_000);

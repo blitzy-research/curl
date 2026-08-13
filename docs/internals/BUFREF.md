@@ -121,17 +121,30 @@ char *Curl_bufref_dup(const struct bufref *br);
 Returns a strdup() version of the buffer. Note that this assumes that the
 bufref is null terminated.
 
-## The specified `Rust` successor
+## The `Rust` successor
 
-The migration to the three-`crate` `Rust` `workspace` specifies a successor to
-this module at `curl-rs-lib/src/util/bufref.rs`. No `Rust` source file exists
-in the tree yet, so that path and the design below are the specified target
-state, while `lib/bufref.c` remains the reference oracle at runtime.
+The successor to this module is **delivered** at
+`curl-rs-lib/src/util/bufref.rs`, with its own tests, while `lib/bufref.c`
+remains the reference oracle.
+
+What shipped is a plain alias over the standard library's clone-on-write
+container rather than a new struct, and the reason is worth recording: once the
+destructor field and the signature field are gone, the C type has no invariant
+left for a wrapper to protect, and a wrapper would have to forward length,
+indexing, iteration, comparison and cloning to earn nothing. The alias keeps a
+dereference to a byte slice, so reading the bytes is the C's pointer accessor
+and asking for the length is its length accessor, with no new API to learn. The
+lifetime parameter is what replaces the destructor field: a reference that owns
+its allocation releases it on drop, exactly as a C reference holding the free
+function does, and a borrowed one cannot outlive the bytes it points at, which
+is a rule the C could only state in a comment. The C's `NULL`-pointer
+"never set" state is not one of the alias's cases; it is an absent optional at
+the field that needs it, because the difference is observable on the wire.
 
 The transformation is that ownership becomes explicit in the type. A `bufref`
 is needed in C because the language has no way to state that a pointer is
 borrowed and to name who cleans it up, so the reference carries a function
-pointer and the cleanup travels alongside the data. In the specified design
+pointer and the cleanup travels alongside the data. In the delivered design
 that distinction belongs to the type, which separates the three cases the C
 API expresses through a single structure.
 
@@ -166,7 +179,7 @@ Each function on this page maps across as follows.
   assumption that the referenced buffer is null terminated remains a contract
   the caller upholds.
 
-The specified design copies wherever the C code copies and borrows wherever
+The successor copies wherever the C code copies and borrows wherever
 the C code borrows. `Curl_bufref_memdup0` allocates and copies, and its
 successor allocates and copies as well. Shapes such as `bytes::Bytes` are
 available in the dependency set, and naming one here states only that the

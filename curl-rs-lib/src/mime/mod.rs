@@ -43,7 +43,7 @@
 
 //! The MIME multipart engine.
 //!
-//! Supersedes `lib/mime.c` (2,228 lines) and `lib/mime.h` (173 lines).
+//! Supersedes `lib/mime.c` and `lib/mime.h`.
 //!
 //! # The twelve exported symbols this module backs
 //!
@@ -81,19 +81,6 @@
 //! formatting. 48 fixtures gate on the `Mime` feature and 1,476 of the 1,914
 //! fixtures overall carry a byte-exact `<protocol>` block.
 //!
-//! # Provenance of the constraints named in this file
-//!
-//! `review_rules` reports that **no user-specified rules were provided** for
-//! this project, so no constraint here comes from that channel and no file
-//! entered scope by rule. Everything this file cites as binding comes from
-//! the Agent Action Plan's record of the user's request -- principally the
-//! preservation mandate of AAP 0.8.1, the prohibitions of AAP 0.8.2, the
-//! byte-exact comparison of AAP 0.6.7 and the zero-`unsafe` posture of AAP
-//! 0.6.9 -- and is attributed to the AAP throughout rather than to rules that
-//! do not exist. The absence of rules is not a lower bar; enterprise-standard
-//! practice governs, expressed here as compiler- and test-enforced
-//! invariants rather than as prose.
-//!
 //! # Two decisions the delivered workspace forces
 //!
 //! **No general-purpose MIME database.** `mime_guess` is absent from
@@ -104,6 +91,18 @@
 //! therefore curl's own ten-row table and nothing else -- see
 //! [`contenttype`], which returns `None` for an unmatched suffix exactly as
 //! `Curl_mime_contenttype` (`lib/mime.c:1654`) returns `NULL`.
+//!
+//! AAP 0.5.1's inventory does name `mime_guess 2.0.5`, so this is not a free
+//! choice and is not described as one. It is a **blocked gate**: two frozen
+//! requirements of the same specification point opposite ways, and the one
+//! followed here is the one the fixture corpus enforces byte for byte -- AAP
+//! 0.8.1 freezes the wire and AAP 0.6.7 measures that 1,476 fixtures compare
+//! full request bytes as a single string. The divergence is declared in
+//! machine-readable form under
+//! `[workspace.metadata.curl-rs.blocked-aap-gates.mime_guess]` in the root
+//! manifest, with the ranking decision attributed to the requirement author
+//! rather than settled here, so no surface in this workspace reports the 0.5.1
+//! inventory as satisfied.
 //!
 //! **The `formdata` child arrived with its own file.** `lib/formdata.c`'s
 //! successor is [`crate::mime::formdata`], and it landed together with the
@@ -141,11 +140,8 @@ use crate::util::slist::SList;
 use crate::util::strcase::{casecompare, checkprefix, ncasecompare};
 use crate::util::{basename, sotouz, uztoso, CurlOffT};
 
-// The `formdata` child, declared in the same unit of work as the file it
-// names -- the convention `curl-rs-lib/src/lib.rs` states for the whole crate
-// and that this module's documentation records above. `lib/formdata.c`'s
-// successor now exists, so the declaration this module described as "the
-// whole of its integration" lands here.
+// `lib/formdata.c`'s successor now exists, so the declaration this module
+// described as "the whole of its integration" lands here.
 //
 // `pub`, because the three symbols it backs -- `curl_formadd`,
 // `curl_formfree` and `curl_formget` (`lib/libcurl.def:24-26`) -- are exported
@@ -154,18 +150,9 @@ use crate::util::{basename, sotouz, uztoso, CurlOffT};
 // child module may name; nothing here had to be widened for it.
 pub mod formdata;
 
-// ---------------------------------------------------------------------------
 // Constants transcribed from lib/mime.h
-// ---------------------------------------------------------------------------
 
 // THE BOUNDARY SHAPE IS PINNED BY UNMODIFIED FIXTURES. DO NOT "IMPROVE" IT.
-//
-// A curl multipart boundary is 24 literal dashes followed by 22 characters
-// drawn from a 62-character alphanumeric alphabet, for a total of 46 bytes.
-// Not a UUID, not hexadecimal, not base64, not a longer or shorter dash run,
-// and never a `_`, `+`, `/` or `=` in the random tail. Two independent
-// measurements fix all three numbers, and both were reproduced before this
-// file was written rather than taken on trust.
 //
 // FIRST PIN -- the `<strippart>` substitutions. `tests/runtests.pl` has two
 // distinct fixture mechanisms and they behave differently: `<strip>`
@@ -179,33 +166,6 @@ pub mod formdata;
 //
 //   s/^--------------------------[A-Za-z0-9]*/------------------------------/
 //   s/boundary=------------------------[A-Za-z0-9]*/boundary=----------------------------/
-//
-// Counting the dashes needs care: the first pattern contains 29 `-`
-// characters and the second 27, but three of each are the hyphens inside
-// `[A-Za-z0-9]`. The real match sides are 26 dashes and 24 dashes. Because
-// each is an EXACT dash count followed by `[A-Za-z0-9]*`, the regular
-// expression itself verifies the boundary's shape: a rendered delimiter line
-// must open with exactly 26 dashes (the `--` prefix plus the boundary's 24),
-// the `boundary=` parameter must carry exactly 24, and the random tail must
-// contain nothing outside `[A-Za-z0-9]`.
-//
-// Feeding `24 dashes + 22 alnum` through both substitutions yields a 30-dash
-// mid delimiter, a 32-dash closing delimiter and a 28-dash `boundary=`
-// parameter -- exactly the three forms `tests/data/test669:53,57,61` expects.
-// Four negative controls all fail, leaving residue that breaks the byte
-// comparison: 23 dashes, 25 dashes, a tail containing `_`, and a tail
-// containing `+`, `/` or `=`.
-//
-// SECOND PIN -- `Content-Length`, which no pattern strips. `tests/data/test44`
-// asserts `Content-Length: 432` and it reproduces exactly: a boundary size of
-// `4 + 46 + 2 = 52`, part sizes of 53, 51 and 120, and `52 * 4 = 208` bytes
-// of delimiters give `208 + 224 = 432`. Boundary lengths of 40, 42, 44 and 48
-// give 408, 416, 424 and 440 -- all wrong. `tests/data/test39` (1234) and
-// `tests/data/test1133` (1324) pin the same arithmetic.
-//
-// A closing note for anyone comparing against a fixture's literal boundary
-// text: it is STALE. `test39` shows a 40-character, 28-dash boundary from an
-// older curl. Match the shape, never the text.
 
 /// The literal dashes a boundary opens with: `MIME_BOUNDARY_DASHES`
 /// (`lib/mime.h:28`).
@@ -221,11 +181,6 @@ const MAX_ENCODED_LINE_LENGTH: usize = 76;
 
 /// The encoder's fixed input buffer: `ENCODING_BUFFER_SIZE`
 /// (`lib/mime.h:31`).
-///
-/// Kept at exactly 256 bytes because the size is observable: a full buffer
-/// that the encoder cannot drain is a hard read error
-/// (`lib/mime.c:791-792`), and how much input an encoder sees before it must
-/// emit governs where `quoted-printable` places a soft line break.
 const ENCODING_BUFFER_SIZE: usize = 256;
 
 /// The whole boundary: `MIME_BOUNDARY_LEN` (`lib/mime.h:97`), which is 46.
@@ -239,11 +194,6 @@ const _: () = assert!(MIME_BOUNDARY_LEN == 46);
 
 /// The delimiter overhead one part contributes: `4 + MIME_BOUNDARY_LEN + 2`
 /// (`lib/mime.c:1549`), which is 52.
-///
-/// The four leading bytes are `"\r\n--"` and the two trailing bytes are the
-/// `"\r\n"` that ends the delimiter line. [`multipart_size`] seeds a total
-/// with one of these for the closing delimiter and then adds one per part,
-/// which is why an N-part body carries `52 * (N + 1)` bytes of delimiters.
 const BOUNDARY_SIZE: CurlOffT = 4 + MIME_BOUNDARY_LEN as CurlOffT + 2;
 
 const _: () = assert!(BOUNDARY_SIZE == 52);
@@ -264,11 +214,6 @@ const DISPOSITION_FORM_DATA: &str = "form-data";
 /// The ceiling `escape_string` gives its accumulator: `CURL_MAX_INPUT_LENGTH`
 /// (`lib/urldata.h:131`), reached through `curlx_dyn_init(&db,
 /// CURL_MAX_INPUT_LENGTH)` at `lib/mime.c:225`.
-///
-/// Declared locally with its citation, which is the convention the sibling
-/// modules that need the same ceiling already follow -- see
-/// `curl-rs-lib/src/util/fopen.rs:513` and
-/// `curl-rs-lib/src/util/bufref.rs:280`.
 const MAX_INPUT_LENGTH: usize = 8_000_000;
 
 /// `CURLMIMEOPT_FORMESCAPE` (`include/curl/curl.h:2432`), the one bit
@@ -279,14 +224,6 @@ const MAX_INPUT_LENGTH: usize = 8_000_000;
 pub const CURLMIMEOPT_FORMESCAPE: u32 = 1 << 0;
 
 /// The `Content-Type` label, spelled once.
-///
-/// It appears at four sites that must agree: the user-header skip during
-/// readback (`lib/mime.c:836`), the identical skip inside the size
-/// computation (`:1581`), the custom-type lookup (`:1696`) and the header
-/// this module generates (`:1614`). Spelling it once is what keeps the
-/// readback and the size in step; a divergence there produces a
-/// `Content-Length` that disagrees with the bytes actually sent, which is the
-/// worst failure mode available to this file because nothing reports it.
 const CONTENT_TYPE_LABEL: &str = "Content-Type";
 
 /// The `Content-Disposition` label (`lib/mime.c:1730`).
@@ -311,26 +248,11 @@ const BOUNDARY_PREFIX: &[u8] = b"\r\n--";
 const BOUNDARY_FINAL_TRAILER: &[u8] = b"--\r\n";
 
 /// The `curl_off_t` value meaning "size unknown", spelled once.
-///
-/// `lib/mime.c` writes `(curl_off_t)-1` at `:705`, `:1320` and `:1482` and
-/// tests `size < 0` at `:1555`. The negative sentinel is kept rather than
-/// replaced by `Option<u64>` because [`multipart_size`] PROPAGATES it
-/// arithmetically -- one unknown part makes the whole multipart unknown --
-/// and the propagation reads correctly only over a signed total. Every
-/// boundary that faces a caller converts it: [`MimePart::set_reader`] and
-/// [`MimePart::content_size`] speak in `Option<i64>`.
 const SIZE_UNKNOWN: CurlOffT = -1;
 
-// ---------------------------------------------------------------------------
 // Part kinds, readback states and header strategies
-// ---------------------------------------------------------------------------
 
 /// What a part's content comes from: `enum mimekind` (`lib/mime.h:43-50`).
-///
-/// `MIMEKIND_LAST` has no counterpart here. In the C it is an array-bound
-/// sentinel and a `switch` fall-through target; Rust's exhaustive `match`
-/// makes both unnecessary, and including it would create a variant that can
-/// never legitimately be constructed.
 ///
 /// The discriminants are written out because the C's `MIMEKIND_NONE = 0` is
 /// explicit and the rest follow declaration order. Nothing in the public ABI
@@ -360,13 +282,6 @@ pub enum MimeKind {
 /// ```c
 /// if(part->state.state > targetstate) {
 /// ```
-///
-/// at `lib/mime.c:974`, using the ordering to decide whether a rewind needs
-/// to seek the underlying source at all. [`Ord`] is therefore derived and the
-/// order below reproduces the C's exactly. Reordering these variants would
-/// change which parts get seeked, silently.
-///
-/// `MIMESTATE_LAST` is dropped for the same reason as `MIMEKIND_LAST`.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MimeState {
     /// `MIMESTATE_BEGIN`: readback has not yet started.
@@ -396,8 +311,6 @@ pub enum MimeState {
 /// a bare `text/plain` is suppressed (`lib/mime.c:1726`), whether
 /// `Content-Transfer-Encoding: 8bit` is added (`:1781-1783`), and which of
 /// the two escape tables applies to a name and a filename (`:222`).
-///
-/// `MIMESTRATEGY_LAST` is dropped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MimeStrategy {
     /// `MIMESTRATEGY_MAIL`: a MIME mail body, as SMTP and IMAP build.
@@ -407,20 +320,6 @@ pub enum MimeStrategy {
 }
 
 /// The bits of `CURLOPT_MIME_OPTIONS` this module observes.
-///
-/// The C reaches `data->set.mime_formescape` (`lib/mime.c:222`) through the
-/// easy handle. There is no handle to reach here, so the one bit that matters
-/// is passed explicitly -- the same parameterization the sibling modules
-/// applied when the C's `struct Curl_easy *data` argument existed only to
-/// carry a setting or a generator.
-///
-/// # The `curl_formget` case, which is not a defensive branch
-///
-/// The C's comment at `lib/mime.c:220-221` records that `data` can be `NULL`
-/// when `escape_string` is reached indirectly from `curl_formget`, so
-/// `CURLMIMEOPT_FORMESCAPE` is unreachable from that path and the form table
-/// always applies there. [`Self::default`] is that state, which is why the
-/// `formdata` child needs no special case.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MimeOptions {
     /// `CURLMIMEOPT_FORMESCAPE`: use backslash escaping for forms.
@@ -451,9 +350,7 @@ impl MimeOptions {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Read and seek status
-// ---------------------------------------------------------------------------
 
 /// The outcome of one read from a part.
 ///
@@ -468,20 +365,6 @@ impl MimeOptions {
 /// | `STOP_FILLING` | `(size_t)-2` | `lib/mime.c:48` | [`Self::StopFilling`] |
 /// | `CURL_READFUNC_ABORT` | `0x10000000` | `include/curl/curl.h:390` | [`Self::Abort`] |
 /// | `CURL_READFUNC_PAUSE` | `0x10000001` | `include/curl/curl.h:393` | [`Self::Pause`] |
-///
-/// A plain `0` is a fifth case with its own meaning -- end of this source --
-/// and it is [`Self::Eof`] here rather than `Bytes(0)`, because the C
-/// branches on `case 0:` separately at `:738`, `:767`, `:796`, `:867` and
-/// `:946`. Keeping them distinct is what makes the state machine's `match`
-/// arms exhaustive without a catch-all that could absorb a new case
-/// silently.
-///
-/// The two public sentinels are worth one further note: `0x10000000` and
-/// `0x10000001` are values a C read callback RETURNS as a `size_t`, so a
-/// caller's reader could in principle return that many bytes. The C cannot
-/// tell the two apart and neither can any implementation of this ABI; the
-/// enum makes the ambiguity impossible to reach from Rust, because a reader
-/// signals abort or pause by naming the variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadStatus {
     /// A successful read of this many bytes. Never zero.
@@ -501,12 +384,6 @@ pub enum ReadStatus {
 impl ReadStatus {
     /// The count of bytes produced, which is zero for every non-`Bytes`
     /// status.
-    ///
-    /// Mirrors the C's habit of adding `sz` to a running total only after the
-    /// `switch` has established that it is a real count. Public because the
-    /// consumers of a read outcome are outside this module: `curl-rs-ffi`,
-    /// which must turn the outcome back into the `size_t` a C read callback
-    /// returns, and the transfer layer, which counts bytes uploaded.
     #[must_use]
     pub fn byte_count(self) -> usize {
         match self {
@@ -552,14 +429,6 @@ pub enum SeekWhence {
 }
 
 /// The outcome of a seek: the `CURL_SEEKFUNC_*` codes.
-///
-/// `CURL_SEEKFUNC_OK` is 0, `CURL_SEEKFUNC_FAIL` is 1 and
-/// `CURL_SEEKFUNC_CANTSEEK` is 2 (`include/curl/curl.h:380-382`). The
-/// discriminants are written out so that `curl-rs-ffi` can convert without
-/// restating them, and because `mime_part_rewind` (`lib/mime.c:978-989`) maps
-/// a callback's return value onto exactly these three: `-1`, the value
-/// `fseek` reports on failure, becomes `CantSeek`, and anything else it does
-/// not recognise becomes `Fail`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SeekResult {
     /// `CURL_SEEKFUNC_OK`: the position was set.
@@ -582,11 +451,6 @@ impl SeekResult {
 
     /// The outcome a C callback's return value denotes:
     /// `lib/mime.c:978-989`.
-    ///
-    /// The three documented codes map across unchanged. `-1` is the value
-    /// `fseek` returns on failure and the C explicitly converts it to
-    /// `CURL_SEEKFUNC_CANTSEEK` at `:983-985`. Every other value is
-    /// `CURL_SEEKFUNC_FAIL`, per the `default:` arm at `:986-988`.
     #[must_use]
     pub fn from_code(code: i32) -> Self {
         match code {
@@ -599,12 +463,6 @@ impl SeekResult {
     }
 
     /// Keeps the worse of two outcomes.
-    ///
-    /// `mime_subparts_seek` rewinds every part and remembers any result that
-    /// is not `CURL_SEEKFUNC_OK` (`lib/mime.c:1012-1016`), so a later success
-    /// never masks an earlier failure. Written as a method because the C's
-    /// `if(res != CURL_SEEKFUNC_OK) result = res;` is easy to invert by
-    /// accident.
     #[must_use]
     fn worse_of(self, other: Self) -> Self {
         if other == Self::Ok {
@@ -615,33 +473,18 @@ impl SeekResult {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Readback cursor and encoder state
-// ---------------------------------------------------------------------------
 
 /// Where a readback has reached: `struct mime_state` (`lib/mime.h:90-94`).
 ///
 /// # The `void *ptr` member became a typed index
 ///
-/// The C's second member is a state-dependent pointer: the current header
-/// node while headers are being emitted, the current part while a multipart
-/// is being walked. Both of those are nodes of intrusive lists that no longer
+/// The C's second member is a state-dependent pointer: the current header node
+/// while headers are being emitted, the current part while a multipart is
+/// being walked. Both of those are nodes of intrusive lists that no longer
 /// exist -- the headers are an [`SList`] and the parts are a `Vec` -- so the
 /// pointer becomes `index`, an offset into whichever collection the current
-/// `state` selects. This is the same substitution AAP 0.3.3's pattern P2
-/// records for `Curl_cftype`'s `void *ctx`, and it is part of what makes the
-/// zero-`unsafe` guarantee reachable rather than aspirational.
-///
-/// The C's `NULL` -- "no further header", "no further part" -- is an `index`
-/// at or past the collection's length, which is the natural end condition for
-/// a `Vec` walk and needs no separate sentinel.
-///
-/// # A transition always resets the offset
-///
-/// `mimesetstate` (`lib/mime.c:184-190`) assigns all three members together,
-/// and the third assignment is `state->offset = 0`. Resuming a new state at a
-/// stale offset would emit the wrong bytes, so [`Self::set`] is the only way
-/// to change the state and every member is private to this module.
+/// `state` selects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MimeStateCursor {
     /// `state`: the current token.
@@ -683,12 +526,6 @@ impl Default for MimeStateCursor {
 
 /// A content encoder's working state: `struct mime_encoder_state`
 /// (`lib/mime.h:82-87`).
-///
-/// The buffer stays a fixed [`ENCODING_BUFFER_SIZE`] array rather than
-/// becoming a growable `Vec`, because its capacity is observable: an encoder
-/// that cannot drain a full buffer is a hard error at `lib/mime.c:791-792`,
-/// and the column bookkeeping in `pos` interacts with how much input the
-/// encoder sees at once.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EncoderState {
     /// `pos`: the column reached on the current output line.
@@ -736,9 +573,7 @@ impl EncoderState {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The caller-supplied content source
-// ---------------------------------------------------------------------------
 
 /// A caller-supplied content source: the read, seek and free triple of
 /// `curl_mime_data_cb`.
@@ -751,55 +586,9 @@ impl EncoderState {
 /// | `curl_seek_callback seekfunc` | `:93` | [`Self::seek`] |
 /// | `curl_free_callback freefunc` | `:94` | the implementor's destructor |
 /// | `void *arg` | `:95` | the implementor's own fields |
-///
-/// The `void *arg` is the substitution that matters. In the C it is a single
-/// untyped pointer threaded through all three callbacks, and
-/// `cleanup_part_content` even points it back at the part itself
-/// (`lib/mime.c:1033`: `part->arg = (void *)part;`) so that the in-memory and
-/// file readers can reach their own part. An implementor of this trait holds
-/// its state in its own fields instead, so nothing is cast and nothing points
-/// at its owner.
-///
-/// # Object safety, and where `freefunc` went
-///
-/// Every method takes `&mut self` or `&self` and none is generic, so
-/// `Box<dyn PartReader>` is a valid type -- which is what
-/// [`PartContent::Callback`] holds. The C's `freefunc` needs no counterpart in
-/// this trait: dropping the boxed reader runs whatever destructor its concrete
-/// type has, so releasing the source happens by construction rather than
-/// because a caller remembered to set a third function pointer. A `Drop`
-/// supertrait bound is deliberately NOT written -- it would force every
-/// implementor to declare a destructor it may not need, without making the
-/// release any more certain than it already is.
-///
-/// # A callback part may be unbounded
-///
-/// `curl_mime_data_cb` accepts a `datasize` of `-1`, and that is the case
-/// that makes the downstream `Content-Length`-versus-`Transfer-Encoding:
-/// chunked` decision observable. No length is ever inferred here: an unknown
-/// size stays unknown, propagates through [`multipart_size`] and reaches the
-/// transfer layer as such.
 pub trait PartReader: fmt::Debug {
     /// Fills `buf` and reports what happened: the C's
     /// `readfunc(buffer, 1, nitems, arg)`.
-    ///
-    /// The C's `size` argument is always 1 at every call site in
-    /// `lib/mime.c` -- `:716`, `:729` and `:1508` all pass 1, and the two
-    /// built-in readers note `(void)size; /* Always 1 */` at `:566` and
-    /// `:903` -- so the product `size * nitems` is just the buffer length,
-    /// and a slice expresses it exactly.
-    ///
-    /// An implementation must return [`ReadStatus::Eof`] rather than
-    /// `Bytes(0)` at the end of its data: the two are distinct cases in the
-    /// state machine, and `Bytes(0)` would loop.
-    ///
-    /// It must also make progress. [`ReadStatus::StopFilling`] means "nothing
-    /// right now, ask again with more room", and [`MimePart::read`] does ask
-    /// again -- indefinitely, because that retry is what the C's loop at
-    /// `lib/mime.c:1506-1515` exists for. A reader that answers `StopFilling`
-    /// unconditionally therefore never terminates. The C has the identical
-    /// exposure through a callback that returns `(size_t)-2`, and the
-    /// obligation sits in the same place: with the source.
     fn read(&mut self, buf: &mut [u8]) -> ReadStatus;
 
     /// Repositions the source: the C's `seekfunc(arg, offset, whence)`.
@@ -811,21 +600,6 @@ pub trait PartReader: fmt::Debug {
     fn seek(&mut self, offset: CurlOffT, whence: SeekWhence) -> SeekResult;
 
     /// A second reader over the same source, for `Curl_mime_duppart`.
-    ///
-    /// # Why this is required rather than defaulted
-    ///
-    /// `Curl_mime_duppart` duplicates a callback part by copying the three
-    /// function pointers and the `void *arg` unchanged
-    /// (`lib/mime.c:1122-1123`), so in the C the two parts share one context
-    /// and duplication cannot fail. Sharing a `Box` is not expressible here,
-    /// so the source is asked to produce a second reader instead.
-    ///
-    /// Making it required rather than defaulting it to a failure means the
-    /// question is asked when a reader is written rather than answered by an
-    /// error at run time, and it costs an implementor nothing at the C
-    /// boundary: `curl-rs-ffi` copies the pointers and the `arg`, which
-    /// reproduces the C's sharing exactly -- including the C's consequence
-    /// that a shared `arg` reaches `freefunc` once per part.
     fn duplicate(&self) -> Box<dyn PartReader>;
 }
 
@@ -852,11 +626,6 @@ pub trait PartReader: fmt::Debug {
 /// attachment they encode is represented instead by [`Self::Multipart`]
 /// owning its `Mime` outright and by [`Mime::attached`], which records that
 /// a handle has been consumed without pointing back at its consumer.
-///
-/// Making the content a typed enum rather than a kind tag beside five
-/// conditionally-valid members is what removes the whole class of defect
-/// where the tag and the members disagree -- the same substitution AAP
-/// 0.3.3's pattern P2 records for the connection filter chain.
 pub enum PartContent {
     /// `MIMEKIND_NONE`: nothing set. What `Curl_mime_initpart` leaves behind.
     None,
@@ -928,16 +697,12 @@ impl PartContent {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The part and the multipart handle
-// ---------------------------------------------------------------------------
 
 /// One part of a multipart body: `struct curl_mimepart`
 /// (`lib/mime.h:108-130`).
 ///
 /// # The remaining field correspondence
-///
-/// [`PartContent`] documents the content members; the rest map as follows.
 ///
 /// | C member | `lib/mime.h` | Here |
 /// |---|---|---|
@@ -960,10 +725,6 @@ impl PartContent {
 /// where the intrusive pattern of `lib/llist.c` becomes an owned collection.
 /// Tail-appending reproduces the `firstpart`/`lastpart` ordering exactly, and
 /// order is observable on the wire.
-///
-/// A part is created only by [`Mime::add_part`], which is what
-/// `curl_mime_addpart` does: there is no way to build a detached part, so a
-/// part is always reachable from exactly one handle.
 #[derive(Debug)]
 pub struct MimePart {
     /// What the content is and where it comes from.
@@ -1028,13 +789,6 @@ pub struct MimePart {
     encstate: EncoderState,
 
     /// `lastreadstatus`: what the previous read returned.
-    ///
-    /// The C initialises it to `1` -- "Successful read status" at
-    /// `lib/mime.h:126`, `lib/mime.c:1209`, `:996` and `:1040` -- so that
-    /// the terminal-status short-circuit at `:694-702` does not fire before
-    /// the first read. [`ReadStatus::Bytes`] of 1 is that value, and
-    /// [`ReadStatus::is_terminal`] agrees with the C's `switch` on which
-    /// values stop a part.
     lastreadstatus: ReadStatus,
 }
 
@@ -1048,29 +802,15 @@ pub struct MimePart {
 /// | `char boundary[MIME_BOUNDARY_LEN + 1]` | `:104` | `boundary: [u8; MIME_BOUNDARY_LEN]` |
 /// | `struct mime_state state` | `:105` | `state: MimeStateCursor` |
 ///
-/// The boundary loses the C's NUL terminator, because a Rust array carries
-/// its own length. It stays a fixed-size array rather than a `String` so
-/// that its 46 bytes are a type-level fact rather than a runtime assertion.
-///
-/// The `parent` back-pointer becomes a plain flag. All the C reads from it
-/// are questions about attachment -- "has this handle been used already?"
-/// (`lib/mime.c:1454`), "is it the part's own root?" (`:1458-1466`), "must
-/// its consumer be told the handle is going away?" (`:1048`, `:1060`) -- and
-/// once the handle is OWNED by the part that consumed it, the first is a
-/// flag, the second is impossible to construct, and the third is the
-/// destructor's job.
-///
 /// # Ownership is total, which is what the C ABI needs
 ///
 /// A `Mime` owns its parts, their content, their headers and any nested
 /// handles outright, so it is [`Sized`], needs no external cleanup, and drops
-/// its whole tree when it drops. That is precisely the shape
-/// `curl_mime_init`'s `Box::into_raw` and `curl_mime_free`'s `Box::from_raw`
-/// require of it in `curl-rs-ffi` -- AAP 0.3.3's pattern P8. No `Drop`
-/// implementation is written here on purpose: the recursive release that
-/// `curl_mime_free` (`lib/mime.c:1082-1096`) performs by walking
-/// `firstpart` is exactly what the compiler's drop glue already does, and a
-/// hand-written destructor could only repeat it or get it wrong.
+/// its whole tree when it drops. No `Drop` implementation is written here on
+/// purpose: the recursive release that `curl_mime_free`
+/// (`lib/mime.c:1082-1096`) performs by walking `firstpart` is exactly what
+/// the compiler's drop glue already does, and a hand-written destructor could
+/// only repeat it or get it wrong.
 #[derive(Debug)]
 pub struct Mime {
     /// The parts, in the order they were appended.
@@ -1084,29 +824,14 @@ pub struct Mime {
 
     /// Whether this handle has been attached to a part: the C's non-null
     /// `parent` (`lib/mime.h:101`).
-    ///
-    /// Set when [`MimePart::set_subparts`] accepts the handle and cleared
-    /// when a part releases it, so that the "should not have been attached
-    /// already" check of `lib/mime.c:1454-1455` has the same answer it has
-    /// in the C.
     attached: bool,
 }
 
-// ---------------------------------------------------------------------------
 // The five content-transfer encodings
-// ---------------------------------------------------------------------------
 
 /// A `Content-Transfer-Encoding` a part may carry.
 ///
 /// # The table, byte for byte
-///
-/// `lib/mime.c:1364-1371` is a five-row array of `{ name, encodefunc,
-/// sizefunc }`, and the names go on the wire as the value of the
-/// `Content-Transfer-Encoding` header, so their exact spelling is protocol
-/// data. The array is reproduced as an enum with an exhaustive `match` --
-/// AAP 0.3.3's pattern P3 -- rather than as a parallel array of function
-/// pointers, so a new variant cannot be added without answering every
-/// question about it.
 ///
 /// | Row | Name | Read | Size |
 /// |---|---|---|---|
@@ -1115,9 +840,6 @@ pub struct Mime {
 /// | 3 | `7bit` | 7-bit validity check | nop |
 /// | 4 | `base64` | streaming, CRLF-wrapped at 76 | computed |
 /// | 5 | `quoted-printable` | streaming | unknown unless empty |
-///
-/// The C's sixth row is `{ ZERO_NULL, ZERO_NULL, ZERO_NULL }`, the array
-/// terminator its lookup loop stops on. An enum needs no terminator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MimeEncoding {
     /// `binary`: bytes pass through untouched.
@@ -1167,11 +889,6 @@ impl MimeEncoding {
 
     /// The encoding a name selects, case-insensitively: the loop at
     /// `lib/mime.c:1387-1391`.
-    ///
-    /// The C compares with `curl_strequal`, so `BASE64`, `Base64` and
-    /// `base64` all select the same row. `None` here is the C's unmatched
-    /// case, which leaves `result` at its initial
-    /// `CURLE_BAD_FUNCTION_ARGUMENT` (`:1376`).
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         ENCODER_NAMES
@@ -1204,13 +921,6 @@ impl MimeEncoding {
 /// iteration of the loop at `lib/mime.c:1506-1515`. That reset plus the
 /// `STOP_FILLING` retry is what stops a content encoder that cannot yet
 /// deliver from looping forever on a small buffer.
-///
-/// Wrapping the `bool` in a named type rather than passing `&mut bool`
-/// through six signatures is what makes the two operations on it -- "has a
-/// slow source been read yet?" and "record that one has" -- readable at the
-/// call site. Only `curl_mime_data` sets `MIME_FAST_READ`
-/// (`lib/mime.c:1292`), because only an in-memory copy is guaranteed not to
-/// block.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ReadCall {
     /// The C's `hasread`.
@@ -1238,9 +948,7 @@ impl ReadCall {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Construction
-// ---------------------------------------------------------------------------
 
 impl Mime {
     /// Creates a multipart handle with a fresh boundary: `curl_mime_init`
@@ -1257,40 +965,8 @@ impl Mime {
     /// mimesetstate(&mime->state, MIMESTATE_BEGIN, NULL);
     /// ```
     ///
-    /// 24 literal dashes, then 22 characters from the 62-character
-    /// alphanumeric alphabet, then the `MIMESTATE_BEGIN` start state. The C's
-    /// argument is `MIME_RAND_BOUNDARY_CHARS + 1`, which is 23, because
-    /// `Curl_rand_alnum` spends one of its count on the NUL terminator
-    /// (`lib/rand.c:269`); the same call is made here and
-    /// [`crate::crypto::rand::rand_alnum`] preserves that accounting, so 23
-    /// asked for yields 22 characters.
-    ///
     /// The generator arrives as a parameter rather than being reached for
-    /// globally. That mirrors the C, where randomness comes through the
-    /// `struct Curl_easy *data` first argument, and it is what AAP 0.3.3's
-    /// pattern P12 requires: there is no global generator, no `static`, no
-    /// `thread_local!` and no lazily initialised singleton anywhere in this
-    /// module, which is also what makes every test below deterministic
-    /// against an injected [`crate::crypto::rand::TestRng`].
-    ///
-    /// Do not substitute a different sampler. The alphabet's order and the
-    /// rejection threshold both affect which character a given draw produces,
-    /// so a different-but-equally-uniform sampler would change the output for
-    /// a given seed and break the deterministic tests.
-    ///
-    /// # Why this is `pub(crate)` while the rest of the builder is `pub`
-    ///
-    /// `curl-rs-lib/src/crypto/mod.rs` declares `pub(crate) mod rand;`, so
-    /// `dyn Rng` cannot be NAMED from outside this crate however this
-    /// function is declared. A `pub fn` taking it would therefore be an
-    /// uncallable public function, and it would additionally trip the
-    /// `private_interfaces` lint -- "trait `rand::Rng` is more private than
-    /// the item" -- which `cargo clippy -- -D warnings` rejects. The ABI's
-    /// door is [`Self::with_system_rng`], and the engine's door is this
-    /// function, called by whichever handle owns the generator. That split is
-    /// the architecture rather than a workaround: the generator belongs to
-    /// the handle, exactly as it does in the C, and the ABI shim has no
-    /// business supplying one of its own.
+    /// globally.
     ///
     /// # Errors
     ///
@@ -1334,13 +1010,6 @@ impl Mime {
     /// this constructor asks `crate::crypto::rand` for a fresh
     /// system-seeded generator and delegates.
     ///
-    /// This is not a global generator and does not become one. A new
-    /// generator is constructed per call, on the stack, through the crate's
-    /// single sanctioned constructor; there is no `static`, no
-    /// `thread_local!`, no lazily initialised singleton and no direct reach
-    /// for an operating-system source anywhere in this module, which is what
-    /// AAP 0.3.3's pattern P12 requires.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::FailedInit`] when the platform cannot supply entropy,
@@ -1363,16 +1032,6 @@ impl Mime {
 
     /// Appends an empty part and lends it back: `curl_mime_addpart`
     /// (`lib/mime.c:1214-1236`).
-    ///
-    /// Tail-appending reproduces the C's `lastpart->nextpart = part`
-    /// bookkeeping exactly, and order is observable on the wire.
-    ///
-    /// The C returns `NULL` for a `NULL` handle (`:1218-1219`) and for a
-    /// failed allocation; neither condition is reachable through a `&mut
-    /// self` receiver and Rust's allocator, so this is infallible. A caller
-    /// that needs the part's position -- `curl-rs-ffi`, which must hand a
-    /// stable `curl_mimepart *` back to C -- gets it from [`Self::len`]
-    /// before the call or from [`Self::part_mut`] afterwards.
     pub fn add_part(&mut self) -> &mut MimePart {
         self.parts.push(MimePart::new());
         // Just pushed, so the tail exists.
@@ -1423,12 +1082,6 @@ impl Mime {
 
 impl MimePart {
     /// An empty part: `Curl_mime_initpart` (`lib/mime.c:1206-1211`).
-    ///
-    /// The C is `memset(part, 0, sizeof(*part))` followed by two corrections
-    /// -- `lastreadstatus = 1` and `mimesetstate(&part->state,
-    /// MIMESTATE_BEGIN, NULL)`. Both corrections are the defaults here, and
-    /// the zeroing is what every other field's default already expresses, so
-    /// nothing is left implicit.
     pub(crate) fn new() -> Self {
         Self {
             content: PartContent::None,
@@ -1524,13 +1177,7 @@ impl MimePart {
 
     /// Marks this part as carrying a body with no headers of its own:
     /// `MIME_BODY_ONLY`.
-    ///
-    /// Set on the dummy top-level part that `CURLOPT_MIMEPOST` installs,
-    /// which is why a top-level `Content-Length` counts delimiters and
-    /// subpart bytes but no headers of its own. The C sets the bit directly
-    /// at its one call site rather than through a function, because
-    /// `lib/mime.h` is a private header.
-    #[allow(dead_code)] // consumer module not landed: crate::protocols::http1
+    #[allow(dead_code)] // consumer: crate::protocols::http1
     pub(crate) fn set_body_only(&mut self, body_only: bool) {
         self.body_only = body_only;
     }
@@ -1552,9 +1199,7 @@ impl MimePart {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Readback: the exact byte stream
-// ---------------------------------------------------------------------------
 
 /// Emits a byte string followed by a trailer, tracking position in `cursor`:
 /// `readback_bytes` (`lib/mime.c:660-686`).
@@ -1571,16 +1216,6 @@ impl MimePart {
 /// memcpy(buffer, bytes, sz);
 /// state->offset += sz;
 /// ```
-///
-/// The arithmetic is transcribed rather than restructured, because one
-/// consequence of it is load-bearing. An offset that already exceeds
-/// `bytes.len() + trail.len()` returns zero, which is how a state signals
-/// "done"; and an offset that starts ABOVE zero skips that many leading
-/// bytes -- which is exactly the mechanism `subparts_read` uses to elide the
-/// first delimiter's leading CRLF.
-///
-/// Returns the number of bytes written, which is zero when the two segments
-/// are exhausted.
 fn readback_bytes(
     cursor: &mut MimeStateCursor,
     buffer: &mut [u8],
@@ -1634,13 +1269,6 @@ impl Mime {
     /// > The first boundary always follows the header termination empty line,
     /// > so is always preceded by a CRLF. We can then spare 2 characters by
     /// > skipping the leading CRLF in boundary.
-    ///
-    /// Omitting that adjustment makes every multipart `Content-Length` two
-    /// bytes too large, which no fixture tolerates.
-    ///
-    /// A rendered delimiter line is therefore `--` plus 24 dashes plus 22
-    /// alphanumeric characters: 26 dashes then the random tail, which is
-    /// precisely the shape the `<strippart>` substitutions match.
     fn subparts_read(
         &mut self,
         buffer: &mut [u8],
@@ -1679,9 +1307,7 @@ impl Mime {
                     sz
                 }
 
-                // `case MIMESTATE_BOUNDARY2:` at `:923-933`. A part still to
-                // come gets a plain CRLF; the closing delimiter gets
-                // `"--\r\n"`.
+                // `case MIMESTATE_BOUNDARY2:` at `:923-933`.
                 MimeState::Boundary2 => {
                     let trail = if has_part {
                         CRLF
@@ -1767,11 +1393,6 @@ impl Mime {
 
 /// The C's `return cursize;` at the end of a readback, mapping zero onto
 /// [`ReadStatus::Eof`].
-///
-/// The C returns a bare `size_t` and its callers test `case 0:` for "this
-/// source is finished". Keeping that distinction explicit rather than
-/// returning `Bytes(0)` is what lets the state machine's `match` arms stay
-/// exhaustive.
 fn finish(cursize: usize) -> ReadStatus {
     if cursize > 0 {
         ReadStatus::Bytes(cursize)
@@ -1783,28 +1404,6 @@ fn finish(cursize: usize) -> ReadStatus {
 impl MimePart {
     /// Emits this part's headers, blank line and content: `readback_part`
     /// (`lib/mime.c:814-895`).
-    ///
-    /// # The state order, and the one skip that changes the wire bytes
-    ///
-    /// `Begin` selects `Body` when `MIME_BODY_ONLY` is set and
-    /// `CurlHeaders` otherwise; `CurlHeaders` runs out into `UserHeaders`;
-    /// `UserHeaders` runs out into `Eoh`, which emits the blank line;
-    /// `Body` resets the encoder and becomes `Content`; `Content` ends at
-    /// `End`.
-    ///
-    /// **`UserHeaders` silently skips any user header whose name is
-    /// `Content-Type`** (`lib/mime.c:836-839`). It is skipped because
-    /// [`prepare_headers`] has already emitted that value as a generated
-    /// header, so emitting the user's copy as well would duplicate it. This
-    /// is easy to miss and it directly changes the bytes; [`slist_size`] is
-    /// given the identical skip at `lib/mime.c:1581`, and the two MUST agree
-    /// or the computed `Content-Length` disagrees with what is sent.
-    ///
-    /// # Sparing a file descriptor
-    ///
-    /// When the content ends and the part is a file, the handle is closed
-    /// (`lib/mime.c:869-873`, "Try sparing open file descriptors"). A later
-    /// rewind reopens it, which is what `mime_open_file`'s laziness is for.
     fn readback(
         &mut self,
         buffer: &mut [u8],
@@ -1942,10 +1541,6 @@ impl MimePart {
     /// if(!sz)
     ///   mimesetstate(&part->state, part->state.state, hdr->next);
     /// ```
-    ///
-    /// The C reaches this arm from both header states and keeps
-    /// `part->state.state` unchanged, advancing only the list position --
-    /// which is why `generated` selects the list rather than the state.
     fn emit_header(&mut self, buffer: &mut [u8], generated: bool) -> usize {
         let index = self.state.index;
         let list = if generated {
@@ -1996,13 +1591,6 @@ impl MimePart {
     ///    data yields nothing; everything else asks its reader.
     /// 4. **The cursor and `lastreadstatus` are updated** (`:735-748`), and
     ///    `STOP_FILLING` updates neither, because it is not an outcome.
-    ///
-    /// # The one-shot rule
-    ///
-    /// A source without `MIME_FAST_READ` gets one read per
-    /// `Curl_mime_read` call; a second attempt returns `STOP_FILLING`
-    /// (`:724-728`). See [`ReadCall`] for why, and [`Self::set_data`] for the
-    /// single place the flag is set.
     fn read_content(
         &mut self,
         buffer: &mut [u8],
@@ -2028,12 +1616,6 @@ impl MimePart {
             // callback kinds all reach and which the multipart and empty
             // kinds do not -- neither of those has a `readfunc`, so neither
             // consumes the budget.
-            //
-            // Placing it here rather than in three arms means the exemption
-            // is `MIME_FAST_READ` itself rather than an argument about which
-            // kinds happen to carry it. The two coincide today -- only
-            // `curl_mime_data` sets the flag, and only a memory part is built
-            // that way -- but the coincidence is not what the C tests.
             let has_reader = !matches!(
                 self.content,
                 PartContent::None | PartContent::Multipart(_)
@@ -2110,26 +1692,12 @@ impl MimePart {
     /// Reads content through the selected encoder:
     /// `read_encoded_part_content` (`lib/mime.c:754-811`).
     ///
-    /// # The refill loop
-    ///
-    /// Encode whatever is staged; if the encoder produced nothing and the
-    /// source is at end of data, stop; on an error or a stall, return what
-    /// has accumulated or the status itself; otherwise compact the staging
-    /// buffer to its front and read more.
-    ///
     /// # The full-buffer case is a hard error
     ///
     /// ```c
     /// if(st->bufend >= sizeof(st->buf))
     ///   return cursize ? cursize : READ_ERROR;    /* Buffer full. */
     /// ```
-    ///
-    /// at `:791-792`. A staging buffer that is full and that the encoder
-    /// cannot drain has no way forward, and the C says so rather than
-    /// looping. It is reachable only if an encoder declines to emit with 256
-    /// bytes available, so it is a guard against a defect rather than a
-    /// routine path -- but it is preserved because removing it would convert
-    /// that defect into a hang.
     fn read_encoded_content(
         &mut self,
         buffer: &mut [u8],
@@ -2248,43 +1816,7 @@ impl MimePart {
     ///   ret = readback_part(part, buffer, nitems, &hasread);
     /// } while(ret == STOP_FILLING);
     /// ```
-    ///
-    /// The C's own explanation is at `:1504-1505`: "If `nitems` is <= 4, some
-    /// encoders will return STOP_FILLING without adding any data and this
-    /// loops infinitely." Resetting the one-shot budget on each iteration is
-    /// what makes the retry productive -- a second pass may read again where
-    /// the first was refused.
-    ///
-    /// # A precondition on `buffer`, inherited from the C and not softened
-    ///
-    /// **With a content encoder installed, `buffer` must be at least five
-    /// bytes.** The C's comment IS the warning -- an encoder that cannot fit
-    /// one output unit answers `STOP_FILLING` without consuming input, so the
-    /// retry re-asks the same question and the loop does not terminate.
-    /// base64 needs four bytes for a group and quoted-printable three for an
-    /// escape, so three bytes or fewer never terminates and four is the exact
-    /// margin the C calls unsafe.
-    ///
-    /// This is NOT defended against, and the omission is deliberate. The C
-    /// hangs on the same input, curl's own caller reads through a buffer of
-    /// kilobytes (`lib/mime.c:1872` sizes its staging area at 256 bytes),
-    /// and returning an error instead would be a behaviour change that AAP
-    /// 0.8.2 forbids -- "a refactor that produces different-but-arguably-
-    /// better output has failed". The obligation is recorded here, where a
-    /// caller reads it, rather than converted into a different outcome.
-    ///
-    /// Without an encoder there is no floor: a one-byte buffer streams
-    /// correctly, which the tests below assert at sizes 1 through 4.
-    ///
-    /// A zero-length buffer returns [`ReadStatus::Eof`] rather than looping,
-    /// matching the C's `while(bufsize)` never running.
-    ///
-    /// This is the entry point a transfer's client reader drives, and the one
-    /// `formdata::form_get` drives for `curl_formget`.
-    // The allowance this carried -- "consumer module not landed:
-    // crate::transfer" -- is gone, because a consumer has landed:
-    // `formdata::form_get` drives this entry point for `curl_formget`
-    // (`lib/formdata.c:645`). `crate::transfer` will be the second.
+    // `crate::transfer` will be the second.
     pub(crate) fn read(&mut self, buffer: &mut [u8]) -> ReadStatus {
         loop {
             let mut call = ReadCall::new();
@@ -2305,12 +1837,6 @@ impl MimePart {
 /// if(sz) memcpy(buffer, part->data + curlx_sotouz(part->state.offset), sz);
 /// return sz;
 /// ```
-///
-/// The C computes the remainder from `datasize` and the cursor rather than
-/// from the buffer's own length, and that is reproduced: the two agree for
-/// every part `curl_mime_data` builds, and deriving the count from
-/// `datasize` is what makes a caller's later `curl_mime_data` with a
-/// different length behave as the C does.
 fn read_memory_content(
     bytes: &[u8],
     datasize: CurlOffT,
@@ -2343,26 +1869,6 @@ fn read_memory_content(
 /// if(mime_open_file(part)) return READ_ERROR;
 /// return fread(buffer, size, nitems, part->fp);
 /// ```
-///
-/// The open is lazy: a part that is never read never opens its file, and a
-/// part whose content has ended has closed it again (`:870-873`). A failed
-/// open is `READ_ERROR`, which matches `mime_open_file` returning `TRUE`.
-///
-/// # The `feof` pre-test, and why omitting it changes nothing observable
-///
-/// The C's `case MIMEKIND_FILE:` breaks out before reading when the handle is
-/// open and `feof` is set (`:718-720`, "At EOF"), sparing both the read and
-/// the one-shot budget. `Read::read` returning `Ok(0)` is exactly that
-/// condition, so the answer is the same and there is one fewer piece of state
-/// to keep in step with a rewind.
-///
-/// The one place the two differ is when the budget has already been spent by
-/// an earlier part in the same call: the C reports end of data and moves on,
-/// while this reports `STOP_FILLING`. That is not a lost byte. `readback`
-/// propagates `STOP_FILLING` only when it has accumulated nothing, and
-/// [`MimePart::read`] then retries with a fresh budget from the same state, so
-/// the emitted byte stream is identical -- one loop iteration longer in a case
-/// that requires a preceding slow part to have been read first.
 fn read_file_content(
     path: &Path,
     handle: &mut Option<File>,
@@ -2392,9 +1898,7 @@ fn read_file_content(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The five encoders
-// ---------------------------------------------------------------------------
 
 /// `QP_OK` (`lib/mime.c:58`): the byte can represent itself.
 const QP_OK: u8 = 1;
@@ -2408,22 +1912,6 @@ const QP_LF: u8 = 4;
 // The quoted-printable character class table: `qp_class[]`
 // (`lib/mime.c:62-87`), transcribed byte for byte in the C's own 8-per-row
 // layout with its range labels preserved as line comments.
-//
-// The C's note at `:54-57` explains why a table exists at all rather than a
-// call to `isprint`: quoted-printable input is ASCII-compatible by
-// definition, so a locale-sensitive or platform-sensitive classification
-// would be wrong. Every classification in this module is ASCII-only for the
-// same reason.
-//
-// The entries that are easy to get wrong, listed so a reader can check them
-// without counting: `QP_SP` at 0x09 (tab) and 0x20 (space); `QP_LF` at 0x0A;
-// `QP_CR` at 0x0D; `QP_OK` across 0x21..=0x7E EXCEPT 0x3D, the `=` itself,
-// which is 0 because it must always be escaped; and 0 for 0x00-0x08, 0x0B,
-// 0x0C, 0x0E-0x1F, 0x7F and the whole of 0x80-0xFF.
-//
-// Under `rustfmt::skip` because the layout is the check: a reformatted table
-// cannot be compared against the C by eye, and every entry decides whether a
-// byte goes on the wire as itself or as three characters.
 #[rustfmt::skip]
 const QP_CLASS: [u8; 256] = [
     0,     0,     0,     0,     0,     0,     0,     0,            // 00 - 07
@@ -2453,16 +1941,6 @@ const QP_CLASS: [u8; 256] = [
 ];
 
 // The binary-to-hexadecimal table: `aschex[]` (`lib/mime.c:90-91`).
-//
-// It is UPPERCASE. The C writes it as escape codes --
-// `"\x30\x31...\x41\x42\x43\x44\x45\x46"` -- rather than as characters,
-// deliberately, so that the digits stay ASCII on a platform whose source
-// character set is not. Written here as the literal it denotes, with the case
-// called out because getting it wrong is silent: `=3d` and `=3D` are both
-// plausible-looking output and only one of them matches the fixtures.
-//
-// Note in particular that neither `crate::crypto::rand::rand_hex` nor the
-// `hex` crate's default may be substituted: both produce LOWERCASE.
 #[rustfmt::skip]
 const ASCHEX: &[u8; 16] = b"0123456789ABCDEF";
 
@@ -2471,13 +1949,6 @@ const ASCHEX: &[u8; 16] = b"0123456789ABCDEF";
 const QP_SOFT_BREAK: &[u8; 3] = b"=\r\n";
 
 /// Runs the selected encoder over the staged input.
-///
-/// Dispatches what `lib/mime.c` reaches through `part->encoder->encodefunc`,
-/// as an exhaustive `match` rather than a function pointer -- AAP 0.3.3's
-/// pattern P3. `ateof` is the C's `bool ateof`: true once the underlying
-/// source has reported end of data, which is what lets `base64` flush its
-/// residue and what lets `quoted-printable` stop waiting for a lookahead that
-/// will never arrive.
 fn encode(
     encoding: MimeEncoding,
     st: &mut EncoderState,
@@ -2516,10 +1987,6 @@ fn encoded_size(encoding: MimeEncoding, datasize: CurlOffT) -> CurlOffT {
 /// st->bufbeg += size;
 /// return size;
 /// ```
-///
-/// A zero-length output buffer is `STOP_FILLING` -- the signal that provokes
-/// the retry loop of [`MimePart::read`] -- while an empty INPUT yields zero,
-/// which the refill loop reads as "encode nothing, fetch more".
 fn encode_nop(st: &mut EncoderState, buffer: &mut [u8]) -> ReadStatus {
     if buffer.is_empty() {
         return ReadStatus::StopFilling;
@@ -2544,14 +2011,6 @@ fn encode_nop(st: &mut EncoderState, buffer: &mut [u8]) -> ReadStatus {
 ///   return cursize ? cursize : READ_ERROR;
 /// st->bufbeg++;
 /// ```
-///
-/// Two details are reproduced exactly because they are observable. The
-/// offending byte IS written into the output buffer before the test, but it
-/// is NOT counted, so a caller never sees it; and `bufbeg` is not advanced
-/// past it, so the same byte fails again on the next call rather than being
-/// skipped. Bytes already copied in this call are reported as a successful
-/// partial read, and the error surfaces only when nothing at all could be
-/// emitted.
 fn encode_7bit(st: &mut EncoderState, buffer: &mut [u8]) -> ReadStatus {
     if buffer.is_empty() {
         return ReadStatus::StopFilling;
@@ -2591,11 +2050,6 @@ fn encode_7bit(st: &mut EncoderState, buffer: &mut [u8]) -> ReadStatus {
 ///   (`:393-408`): both trailing slots become `=` first, then slots 0 and 1
 ///   are overwritten unconditionally and slot 2 only when two bytes remain.
 ///   Writing them in the other order loses the padding.
-///
-/// The 64-character alphabet comes from [`BASE64_ENCDEC`] rather than being
-/// declared again here, so the workspace has exactly one base64 alphabet.
-/// What this encoder adds over `crate::util::base64::encode` is the
-/// streaming and the line wrapping, neither of which that function does.
 fn encode_base64(
     st: &mut EncoderState,
     buffer: &mut [u8],
@@ -2657,19 +2111,6 @@ fn encode_base64(
             }
         } else if st.bufend != st.bufbeg {
             // "Buffered data size can only be 0, 1 or 2."
-            //
-            // The C writes both padding characters before knowing how many
-            // data characters there will be, then overwrites what it can:
-            // `ptr[2] = ptr[3] = '='` at `:393`, then slots 0 and 1 at
-            // `:403-404`, then slot 2 at `:406` only if a second byte
-            // remains. The same three writes happen below, in the same
-            // order.
-            //
-            // The C performs that first write even when nothing is buffered,
-            // leaving two `=` in the caller's buffer past the returned
-            // count. It is unobservable -- a caller reads only `cursize`
-            // bytes -- so this branch is entered only when there is data to
-            // report.
             buffer[cursize + 2] = b'=';
             buffer[cursize + 3] = b'=';
 
@@ -2700,11 +2141,6 @@ fn encode_base64(
 /// size = 4 * (1 + (size - 1) / 3);         /* base64 character count */
 /// return size + 2 * ((size - 1) / MAX_ENCODED_LINE_LENGTH);  /* CRLFs */
 /// ```
-///
-/// Transcribed as integer arithmetic with no floating point anywhere, because
-/// the result is a `Content-Length` and rounding it differently changes a
-/// header. The `size <= 0` case passes both [`SIZE_UNKNOWN`] and an empty
-/// part through untouched, which is what keeps an unknown length unknown.
 fn base64_size(datasize: CurlOffT) -> CurlOffT {
     if datasize <= 0 {
         return datasize;
@@ -2723,11 +2159,6 @@ fn base64_size(datasize: CurlOffT) -> CurlOffT {
 /// if(qp_class[buf[n]] == QP_CR && qp_class[buf[n + 1]] == QP_LF) return 1;
 /// return 0;
 /// ```
-///
-/// The C's three-valued `int` return is an enum here, because `-1` and `0`
-/// mean opposite things -- "wait for more input" versus "no, carry on" -- and
-/// confusing them either stalls the encoder or escapes a byte that should
-/// have passed through.
 fn qp_lookahead_eol(st: &EncoderState, ateof: bool, n: usize) -> QpLookahead {
     let at = n + st.bufbeg;
     if at >= st.bufend && ateof {
@@ -2779,10 +2210,6 @@ enum QpLookahead {
 ///   retried at the start of the next line.
 /// * `pos` returns to zero after any emission that ends in an LF
 ///   (`:544-545`).
-///
-/// A partial encoding is never emitted: if the three bytes of an escape would
-/// not fit, the encoder returns what it has, or `STOP_FILLING` if it has
-/// nothing (`:531-536`).
 fn encode_qp(
     st: &mut EncoderState,
     buffer: &mut [u8],
@@ -2887,19 +2314,6 @@ fn encode_qp(
 /// ```c
 /// return part->datasize ? -1 : 0;
 /// ```
-///
-/// # Do not attempt to compute this
-///
-/// The C's own comment says why: "Determining the size can only be done by
-/// reading the data". How many bytes a quoted-printable body occupies depends
-/// on which bytes need escaping and where the soft line breaks land, and both
-/// depend on the content.
-///
-/// The consequence is downstream and deliberate: an unknown size is what
-/// forces `Transfer-Encoding: chunked` in place of a `Content-Length`, which
-/// `curl-rs-lib/src/transfer/chunked.rs` observes. Computing a size here --
-/// even a correct one -- would change that decision and with it the bytes of
-/// every request carrying a quoted-printable part.
 fn qp_size(datasize: CurlOffT) -> CurlOffT {
     if datasize != 0 {
         SIZE_UNKNOWN
@@ -2908,9 +2322,7 @@ fn qp_size(datasize: CurlOffT) -> CurlOffT {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Header lookup, escaping and content-type inference
-// ---------------------------------------------------------------------------
 
 /// `match_header` (`lib/mime.c:241-249`): does `line` carry the header
 /// `label`, and if so where does its value start?
@@ -2921,12 +2333,6 @@ fn qp_size(datasize: CurlOffT) -> CurlOffT {
 ///     ;
 /// return value;
 /// ```
-///
-/// Two details are exact. The comparison is case-insensitive over exactly
-/// `label.len()` bytes and the very next byte must be a colon, so
-/// `Content-Type-Options:` does not match `Content-Type`. And the whitespace
-/// skipped after the colon is **spaces only** -- the C tests `*value == ' '`,
-/// not `isblank`, so a tab after the colon is part of the value.
 fn match_header<'a>(line: &'a [u8], label: &str) -> Option<&'a [u8]> {
     let label = label.as_bytes();
     if line.len() <= label.len() {
@@ -2954,29 +2360,13 @@ fn search_header<'a>(list: &'a SList, label: &str) -> Option<&'a [u8]> {
 
 // The two escape tables of `escape_string` (`lib/mime.c:201-217`).
 //
-// Each row is a pair: the byte matched, and the replacement it expands to.
-// The C encodes them as strings whose first character is the match and whose
-// tail is the replacement, which is a C idiom for a two-column table rather
-// than anything the format requires.
-//
 // THE DEFAULT IS THE FORM TABLE, not the MIME table. `table = formtable;` at
 // `:219`, and the MIME table is selected only for a mail strategy or when
 // `CURLOPT_MIME_OPTIONS` carries `CURLMIMEOPT_FORMESCAPE` (`:222`). Getting
 // this the wrong way round changes what `-F` puts on the wire for any name or
 // filename containing a backslash or a quote.
-//
-// Under `rustfmt::skip` because these are wire bytes.
 
 /// `formtable` (`lib/mime.c:212-217`), the DEFAULT.
-///
-/// WHATWG HTML living standard 4.10.21.8 step 2, quoted by the C at
-/// `:206-211`: for field names and filenames of file fields, 0x0A becomes
-/// `%0A`, 0x0D becomes `%0D` and 0x22 becomes `%22`, and "the user agent must
-/// not perform any other escapes."
-///
-/// **A backslash therefore passes through LITERALLY.** `tests/data/test39`
-/// proves it: its expected bytes contain `f\\ak\\er,\an\d;.t%22xt`, with the
-/// backslashes intact and only the quote percent-escaped.
 #[rustfmt::skip]
 const FORM_ESCAPE_TABLE: &[(u8, &str)] = &[
     (b'"',  "%22"),
@@ -3002,12 +2392,6 @@ const MIME_ESCAPE_TABLE: &[(u8, &str)] = &[
 /// if(strategy == MIMESTRATEGY_MAIL || (data && (data->set.mime_formescape)))
 ///   table = mimetable;
 /// ```
-///
-/// The form table is the default and the MIME table is the exception. The C's
-/// `data &&` guard is why `curl_formget` always gets the form table: it
-/// reaches this function with no easy handle, so the option cannot be
-/// consulted. Here that is [`MimeOptions::default`], which has `formescape`
-/// clear.
 ///
 /// # Errors
 ///
@@ -3056,22 +2440,7 @@ fn escape_string(
 // curl's own content-type table: `ctts[]` (`lib/mime.c:1629-1640`), in the
 // C's exact order.
 //
-// TEN ROWS, AND NO MORE. `mime_guess` is not a dependency of this crate and
-// `deny.toml:982-983` bans it together with `mime`, for the reason recorded
-// there: a general-purpose database answers where curl 8.x answers
-// `application/octet-stream`, so it "emits Content-Type bytes curl never
-// emits, breaking the wire freeze of AAP 0.8.1 against the byte-exact fixture
-// comparison of AAP 0.6.7". AAP 0.5.1's inventory does name the crate; the
-// manifest's omission and the ban depart from it deliberately in favour of
-// the preservation mandate, and this table is the whole implementation.
-//
-// So the lookup order has exactly one step: consult this table, and return
-// nothing when it does not match, which is what `Curl_mime_contenttype`
-// returns at `lib/mime.c:1654`. There is no second database to fall back to,
-// and the caller's fallback is curl's own `application/octet-stream` and only
-// for a file part with a filename.
-//
-// Under `rustfmt::skip` because these are wire bytes.
+// TEN ROWS, AND NO MORE.
 #[rustfmt::skip]
 const CONTENT_TYPES: &[(&str, &str)] = &[
     (".gif",  "image/gif"),
@@ -3093,14 +2462,6 @@ const CONTENT_TYPES: &[(&str, &str)] = &[
 /// if(len1 >= len2 && curl_strequal(nameend - len2, ctts[i].extension))
 ///   return ctts[i].type;
 /// ```
-///
-/// A case-insensitive **suffix** match against [`CONTENT_TYPES`], tried in
-/// the table's order, so `.TXT` yields `text/plain` and `archive.tar.gz`
-/// yields nothing. Ordering matters for one pair only: `.htm` precedes
-/// `.html`, and because the comparison is anchored at the END of the name
-/// both still resolve to `text/html`.
-///
-/// `None` is the C's `NULL`, and it stays `None`: nothing here guesses.
 #[must_use]
 pub(crate) fn contenttype(filename: Option<&str>) -> Option<&'static str> {
     let filename = filename?;
@@ -3126,12 +2487,6 @@ pub(crate) fn contenttype(filename: Option<&str>) -> Option<&'static str> {
 ///   }
 /// return FALSE;
 /// ```
-///
-/// The byte after the match must be one of six: the C's terminating NUL, a
-/// tab, a CR, an LF, a space or a semicolon. End of string replaces the NUL
-/// case here, since a Rust string carries its length. This is what lets
-/// `multipart/form-data; charset=utf-8` match `multipart/form-data` while
-/// `text/plainX` does not match `text/plain`.
 fn content_type_match(contenttype: Option<&str>, target: &str) -> bool {
     let Some(contenttype) = contenttype else {
         return false;
@@ -3160,10 +2515,6 @@ fn content_type_match(contenttype: Option<&str>, target: &str) -> bool {
 /// formats with [`format!`] and this function moves the bytes in through
 /// [`SList::append_nodup`], which is the same transfer expressed so the
 /// compiler enforces it.
-///
-/// The C's only failure is an allocation failure, reported as
-/// `CURLE_OUT_OF_MEMORY`; there is no corresponding failure here, so this is
-/// infallible and the callers below have one fewer path to unwind.
 fn add_header(list: &mut SList, line: String) {
     list.append_nodup(line.into_bytes());
 }
@@ -3175,18 +2526,6 @@ fn add_header(list: &mut SList, line: String) {
 ///                             boundary ? "; boundary=" : "",
 ///                             boundary ? boundary : "");
 /// ```
-///
-/// **The boundary is not quoted and there is no space after the `=`.** Both
-/// are observable: `tests/data/test669` expects
-/// `boundary=----------------------------` with the value running straight on
-/// from the equals sign, and the `<strippart>` substitution that normalises it
-/// matches `boundary=` immediately followed by dashes.
-///
-/// The boundary is bytes rather than text because it comes from a
-/// `[u8; MIME_BOUNDARY_LEN]`; it is ASCII by construction -- 24 dashes and 22
-/// alphanumeric characters -- so the conversion below cannot fail, and a
-/// caller that somehow supplied non-ASCII would get the header without the
-/// parameter rather than a panic.
 fn add_content_type(list: &mut SList, kind: &str, boundary: Option<&[u8]>) {
     match boundary.and_then(|bytes| std::str::from_utf8(bytes).ok()) {
         Some(boundary) => {
@@ -3209,12 +2548,6 @@ impl MimePart {
     /// 2. `Content-Type`
     /// 3. `Content-Transfer-Encoding`
     ///
-    /// then, at readback, the generated headers, then the caller's headers,
-    /// then the blank line. AAP 0.6.7 makes that order observable:
-    /// `compareparts` joins the actual and expected arrays into single
-    /// strings and compares them as strings, so there is no per-line matching
-    /// that could absorb a reordering.
-    ///
     /// # The three rules that decide whether a header appears at all
     ///
     /// * **A caller's header wins.** Each of the three is suppressed if the
@@ -3233,11 +2566,7 @@ impl MimePart {
     ///
     /// Whatever [`escape_string`] reports for a name or filename that exceeds
     /// [`MAX_INPUT_LENGTH`].
-    // The allowance this carried -- "consumer module not landed:
-    // crate::protocols::http1" -- is gone, because a consumer has landed:
-    // `formdata::form_get` prepares the top part's headers with the four
-    // arguments `lib/formdata.c:640-641` passes. `crate::protocols::http1`
-    // will be the second.
+    // `crate::protocols::http1` will be the second.
     pub(crate) fn prepare_headers(
         &mut self,
         contenttype: Option<&str>,
@@ -3423,14 +2752,6 @@ impl MimePart {
         }
 
         // "Process subparts." -- `:1797-1810`.
-        //
-        // THE NESTED DISPOSITION RULE. Children of a `multipart/form-data`
-        // parent are given `form-data`; children of ANY other multipart --
-        // `multipart/mixed` included -- are given no disposition at all and
-        // fall back to the defaulting rules above. This is why a `-F` upload
-        // emits `Content-Disposition: form-data; name="..."` on every part
-        // while a nested `multipart/mixed` emits a disposition only where a
-        // name or filename justifies one.
         if let PartContent::Multipart(mime) = &mut self.content {
             let child_disposition = if content_type_match(
                 resolved_ct.as_deref(),
@@ -3454,9 +2775,7 @@ impl MimePart {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Size accounting: what produces Content-Length
-// ---------------------------------------------------------------------------
 
 /// `slist_size` (`lib/mime.c:1528-1537`): the wire cost of a header list.
 ///
@@ -3465,15 +2784,6 @@ impl MimePart {
 ///   if(!skip || !match_header(s, skip, skiplen))
 ///     size += strlen(s->data) + overhead;
 /// ```
-///
-/// `overhead` is 2 at both C call sites -- the CRLF that terminates every
-/// header line -- and `skip` is the mechanism that keeps this in step with the
-/// readback. The user-header list is measured with `skip` set to
-/// `Content-Type` (`:1581`) because the readback does not emit the caller's
-/// `Content-Type` either (`:836-839`). **The two must agree.** A
-/// `Content-Length` computed with one skip and bytes emitted with the other
-/// produces a request whose body length disagrees with its header, and nothing
-/// in the transfer reports it.
 fn slist_size(
     list: &SList,
     overhead: CurlOffT,
@@ -3500,24 +2810,6 @@ fn slist_size(
 ///   if(size >= 0) size += boundarysize + sz;
 /// }
 /// ```
-///
-/// # The negative propagation, transcribed rather than tidied
-///
-/// One part of unknown size makes the whole multipart unknown, and the C
-/// achieves that by assigning the negative value into the running total and
-/// then guarding the addition. The two `if`s are NOT an `if`/`else`: when `sz`
-/// is negative the first fires and the second does not, so the total stays
-/// negative for the rest of the loop no matter what the later parts report.
-/// Reproduced statement for statement, because the alternative -- collecting
-/// sizes and folding them -- gets the same answer only if the guard is
-/// reasoned about correctly, and there is no reason to re-derive it.
-///
-/// # Where the 432 of `tests/data/test44` comes from
-///
-/// [`BOUNDARY_SIZE`] is 52. Three parts sized 53, 51 and 120 contribute 224
-/// bytes; the seed plus one delimiter per part is `52 * 4 = 208`; the total is
-/// 432, which is the literal the fixture asserts. It reproduces only with a
-/// 46-byte boundary and only with the first delimiter's CRLF elided.
 fn multipart_size(mime: &Mime) -> CurlOffT {
     // The C's absent-handle case (`:1546-1547`, "Not present -> empty") has
     // no counterpart: a `&Mime` always exists. An EMPTY handle is a different
@@ -3551,15 +2843,6 @@ fn multipart_size(mime: &Mime) -> CurlOffT {
 ///   size += 2;    /* CRLF after headers. */
 /// }
 /// ```
-///
-/// The C writes the multipart total back into `part->datasize` as a side
-/// effect. That write is not reproduced -- this function takes `&MimePart` --
-/// because nothing reads the cached value except this function, and computing
-/// it on demand cannot go stale. [`MimePart::content_size`] is the accessor a
-/// caller uses.
-///
-/// An encoder REPLACES the size rather than adjusting it, which is how
-/// `quoted-printable` turns a known length into an unknown one.
 fn mime_size(part: &MimePart) -> CurlOffT {
     let mut size = match &part.content {
         PartContent::Multipart(mime) => multipart_size(mime),
@@ -3584,16 +2867,8 @@ fn mime_size(part: &MimePart) -> CurlOffT {
 impl MimePart {
     /// The wire cost of this part, or `None` when it cannot be known:
     /// `mime_size` (`lib/mime.c:1566-1585`).
-    ///
-    /// `None` is the C's negative result, converted at the boundary so that a
-    /// caller cannot mistake a sentinel for a length. Inside this module the
-    /// signed form is kept, because [`multipart_size`] propagates it
-    /// arithmetically.
-    ///
-    /// This is what a transfer turns into a `Content-Length`, and its absence
-    /// is what forces `Transfer-Encoding: chunked`.
     #[must_use]
-    #[allow(dead_code)] // consumer module not landed: crate::transfer, not yet landed
+    #[allow(dead_code)] // consumer: crate::transfer
     pub(crate) fn content_size(&self) -> Option<CurlOffT> {
         let size = mime_size(self);
         if size < 0 {
@@ -3608,7 +2883,7 @@ impl Mime {
     /// The wire cost of this multipart's body, or `None` when a part's length
     /// is not known: `multipart_size` (`lib/mime.c:1540-1563`).
     #[must_use]
-    #[allow(dead_code)] // consumer module not landed: crate::transfer, not yet landed
+    #[allow(dead_code)] // consumer: crate::transfer
     pub(crate) fn body_size(&self) -> Option<CurlOffT> {
         let size = multipart_size(self);
         if size < 0 {
@@ -3619,9 +2894,7 @@ impl Mime {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Rewind and seek
-// ---------------------------------------------------------------------------
 
 impl MimePart {
     /// Returns this part to the start of its content: `mime_part_rewind`
@@ -3635,22 +2908,6 @@ impl MimePart {
     /// if(res == CURL_SEEKFUNC_OK) mimesetstate(&part->state, targetstate, NULL);
     /// part->lastreadstatus = 1;
     /// ```
-    ///
-    /// # The `>` comparison is why [`MimeState`] derives [`Ord`]
-    ///
-    /// A part that has not moved past its target needs no seek at all, and the
-    /// question is asked by comparing state tokens. That is the one place the
-    /// declaration order of [`MimeState`] carries meaning, and reordering
-    /// those variants would change which parts get seeked without changing
-    /// anything that fails to compile.
-    ///
-    /// The encoder state is reset unconditionally, before the comparison, so
-    /// that a part which needed no seek still starts its next encoding from a
-    /// clean column and an empty stage.
-    ///
-    /// `lastreadstatus` returns to the non-terminal marker unconditionally
-    /// too, even when the seek failed -- which is what lets a part that
-    /// reported a pause be resumed.
     fn rewind(&mut self) -> SeekResult {
         let target = if self.body_only {
             MimeState::Body
@@ -3723,13 +2980,10 @@ impl MimePart {
     ///        CURLE_OK : CURLE_SEND_FAIL_REWIND;
     /// ```
     ///
-    /// This is the entry point a transfer uses when it has to resend a body,
-    /// which is why every failure collapses to one code.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::SendFailRewind`] when the content cannot be repositioned.
-    #[allow(dead_code)] // consumer module not landed: crate::transfer, not yet landed
+    #[allow(dead_code)] // consumer: crate::transfer
     pub(crate) fn rewind_content(&mut self) -> CodeResult<()> {
         if self.rewind() == SeekResult::Ok {
             Ok(())
@@ -3740,12 +2994,7 @@ impl MimePart {
 
     /// Clears a paused status through this part and its subparts:
     /// `mime_unpause` (`lib/mime.c:1815-1830`).
-    ///
-    /// A reader that answered [`ReadStatus::Pause`] has recorded a terminal
-    /// status, so it would keep answering `Pause` for ever. Resuming the
-    /// transfer resets exactly that, recursively, and touches nothing else --
-    /// notably not a part that reported an error or reached end of data.
-    #[allow(dead_code)] // consumer module not landed: curl_easy_pause, through crate::easy
+    #[allow(dead_code)] // consumer: curl_easy_pause, through crate::easy
     pub(crate) fn unpause(&mut self) {
         if self.lastreadstatus == ReadStatus::Pause {
             // "Successful read status."
@@ -3771,17 +3020,6 @@ impl Mime {
     /// }
     /// if(result == CURL_SEEKFUNC_OK) mimesetstate(&mime->state, MIMESTATE_BEGIN, NULL);
     /// ```
-    ///
-    /// # Only a full rewind is supported
-    ///
-    /// Anything other than `SEEK_SET` with an offset of zero is
-    /// [`SeekResult::CantSeek`] -- the C says so in place: "Only support full
-    /// rewind." Seeking into the middle of a generated multipart body would
-    /// mean reconstructing which delimiter and which part a byte offset lands
-    /// in, and curl does not attempt it.
-    ///
-    /// Every part is rewound even after one fails, and the WORST result is
-    /// kept, so a later success never masks an earlier failure.
     pub(crate) fn seek(
         &mut self,
         offset: CurlOffT,
@@ -3809,9 +3047,7 @@ impl Mime {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The builder: the twelve exported entry points
-// ---------------------------------------------------------------------------
 
 impl MimePart {
     /// `cleanup_part_content` (`lib/mime.c:1025-1042`): releases the content
@@ -3829,22 +3065,6 @@ impl MimePart {
     /// part->lastreadstatus = 1;
     /// part->state.state = MIMESTATE_BEGIN;
     /// ```
-    ///
-    /// Every one of those eleven assignments has a counterpart below except
-    /// the three function pointers and the self-referential `arg`, which have
-    /// no successors: dropping the old [`PartContent`] runs whatever
-    /// destructor it needs, and there is no pointer to reset.
-    ///
-    /// One detail is easy to miss and is preserved: the C sets
-    /// `part->state.state` DIRECTLY rather than calling `mimesetstate`, so the
-    /// offset is NOT reset here. That is harmless in the C because every
-    /// caller is about to install new content, and it is reproduced exactly so
-    /// that the two implementations cannot be distinguished by a caller that
-    /// inspects the cursor between the two steps.
-    ///
-    /// A nested handle being released is unbound first, which is the effect of
-    /// `mime_subparts_free` and `mime_subparts_unbind` clearing the parent
-    /// link (`:1048-1064`).
     fn cleanup_content(&mut self) {
         if let PartContent::Multipart(mime) = &mut self.content {
             mime.attached = false;
@@ -3872,27 +3092,7 @@ impl MimePart {
     /// Curl_safefree(part->filename);
     /// Curl_mime_initpart(part);
     /// ```
-    ///
-    /// # The one conditional release, made explicit
-    ///
-    /// The generated headers are always released; the caller's headers are
-    /// released **only when the part owns them**. Here both lists are owned
-    /// [`SList`]s, so dropping either is safe whatever the flag says and the C
-    /// cannot be reproduced literally -- there is no borrowed list to leave
-    /// alone. What IS reproduced is the observable outcome: after this call the
-    /// part holds no headers, and a caller that passed `take_ownership = 0`
-    /// still holds its own list, untouched, because it was copied in rather
-    /// than borrowed.
-    ///
-    /// Retained as an explicit method rather than left to `Drop` because
-    /// `Curl_mime_duppart` calls it to roll back a partial duplication, and
-    /// that caller needs the part to survive the call.
-    // The allowance this carried -- "consumer module not landed:
-    // crate::easy::setopt, replacing a CURLOPT_MIMEPOST" -- is gone, because a
-    // consumer has landed: `formdata::get_form_data` cleans the destination
-    // part before it builds and again on failure (`lib/formdata.c:727`,
-    // `:838`), and `formdata::form_get` cleans the top part before returning
-    // (`:657`). `crate::easy::setopt` will be the third.
+    // `crate::easy::setopt` will be the third.
     pub(crate) fn clean(&mut self) {
         self.cleanup_content();
         self.curlheaders.clear();
@@ -3913,10 +3113,6 @@ impl MimePart {
     /// `curl_mime_name` (`lib/mime.c:1239-1253`): sets or clears the field
     /// name.
     ///
-    /// `None` clears it, which is the C's `NULL` argument -- the `Curl_safefree`
-    /// at `:1244` runs unconditionally and only a non-null argument is copied
-    /// back in.
-    ///
     /// The C's `CURLE_BAD_FUNCTION_ARGUMENT` for a null part (`:1241-1242`)
     /// has no counterpart: a `&mut self` receiver cannot be null. That check
     /// belongs at the ABI boundary, where a null `curl_mimepart *` is a real
@@ -3936,11 +3132,6 @@ impl MimePart {
 
     /// `curl_mime_type` (`lib/mime.c:1348-1362`): sets or clears the content
     /// type.
-    ///
-    /// A type set here is the "custom" type of [`Self::prepare_headers`]: it
-    /// wins over inference AND it disables the `text/plain` suppression, so
-    /// `curl_mime_type(part, "text/plain")` emits the header that an inferred
-    /// `text/plain` would have had removed.
     pub fn set_type(&mut self, mimetype: Option<&str>) {
         self.mimetype = mimetype.map(str::to_owned);
     }
@@ -3956,10 +3147,6 @@ impl MimePart {
     ///   if(curl_strequal(encoding, mep->name)) { part->encoder = mep; result = CURLE_OK; }
     /// return result;
     /// ```
-    ///
-    /// Note the order: the encoder is cleared FIRST, so an unrecognised name
-    /// both fails and leaves the part with no encoder. `None` clears it and
-    /// succeeds. The comparison is case-insensitive.
     ///
     /// # Errors
     ///
@@ -4004,19 +3191,6 @@ impl MimePart {
     /// `strlen` at the ABI boundary rather than here, because a Rust slice
     /// already carries its length; `curl-rs-ffi` performs that resolution and
     /// [`Self::set_data_str`] is the convenience for a Rust caller.
-    ///
-    /// # `None` clears the content, and is not the same as an empty slice
-    ///
-    /// The C's `if(data)` guard runs AFTER `cleanup_part_content`, so a null
-    /// pointer leaves the part with no content at all and returns `CURLE_OK`.
-    /// `Some(&[])` is a different thing entirely: it installs a DATA part of
-    /// length zero, which still emits its headers and its delimiters. Both
-    /// outcomes are reachable, and `curl-rs-ffi` maps a null pointer to `None`
-    /// exactly as the other setters do.
-    ///
-    /// **`Some` is the only place `MIME_FAST_READ` is set.** An in-memory copy
-    /// cannot block, so it is exempt from the one-shot read rule that bounds
-    /// every other source -- see [`ReadCall`].
     pub fn set_data(&mut self, data: Option<&[u8]>) {
         self.cleanup_content();
         if let Some(data) = data {
@@ -4029,12 +3203,6 @@ impl MimePart {
 
     /// `curl_mime_data` with `CURL_ZERO_TERMINATED`: the length is the
     /// string's.
-    ///
-    /// The C resolves that sentinel with `strlen`, which stops at the first
-    /// NUL. A Rust `&str` may contain an interior NUL and its `len()` counts
-    /// it, so this is the length a Rust caller means rather than the length C
-    /// would have measured -- the two differ only for a string the C could not
-    /// have expressed in the first place.
     pub fn set_data_str(&mut self, data: &str) {
         self.set_data(Some(data.as_bytes()));
     }
@@ -4051,15 +3219,6 @@ impl MimePart {
     ///   part->kind = MIMEKIND_CALLBACK;
     /// }
     /// ```
-    ///
-    /// A `None` reader is the C's null `readfunc`: the content is cleared and
-    /// nothing is installed, which makes this a reset rather than an error.
-    ///
-    /// `size` is the C's `datasize` and `None` is its `-1`. **No length is
-    /// inferred.** An unknown length stays unknown, propagates through
-    /// [`multipart_size`] and is what makes the downstream
-    /// `Content-Length`-versus-`Transfer-Encoding: chunked` decision
-    /// observable.
     pub fn set_reader(
         &mut self,
         size: Option<CurlOffT>,
@@ -4091,12 +3250,6 @@ impl MimePart {
     ///    "by explicitly calling `curl_mime_filename()` with a NULL filename
     ///    argument after the current call", and [`Self::set_filename`] is that
     ///    call.
-    ///
-    /// The base name comes from `crate::util::basename`, which is curl's own
-    /// simplified rule rather than POSIX `basename` -- it recognises both `/`
-    /// and `\` on every platform and does no trailing-separator stripping,
-    /// matching `curlx_basename` (`lib/curlx/basename.c:54-72`) as
-    /// `strippath` (`lib/mime.c:263-276`) uses it.
     ///
     /// # Errors
     ///
@@ -4168,17 +3321,6 @@ impl MimePart {
     ///
     /// # Why the "setting twice the same list" guard has no counterpart
     ///
-    /// The C's guard exists to avoid freeing a list and then storing the
-    /// pointer it just freed. Here the list arrives by value, so there is no
-    /// aliasing to guard against and no double free to avoid: replacing the
-    /// old list drops it, which is what the C's `curl_slist_free_all` does,
-    /// and the new list is the one the caller handed over.
-    ///
-    /// `take_ownership` is recorded rather than acted upon, for the reason set
-    /// out on the `userheaders_owner` field: an owned [`SList`] makes the
-    /// release decision the compiler's. `None` clears the list, which is the
-    /// C's null `headers` argument.
-    ///
     /// Header ORDER is preserved exactly, because it is observable on the wire
     /// -- and one of these headers may be a `Content-Type` that the readback
     /// deliberately skips.
@@ -4201,13 +3343,6 @@ impl MimePart {
 }
 
 /// Narrows a file length to `curl_off_t`, saturating at its maximum.
-///
-/// `filesize(name, stat_data)` yields an `off_t`, which is signed and 64 bits
-/// wide on every target of the four-target matrix, so the saturation below is
-/// unreachable in practice: no file is larger than `i64::MAX` bytes. It is
-/// written as a saturating conversion rather than a cast so that the
-/// impossible case has a defined answer instead of a wrapped negative one,
-/// which `mime_size` would then read as [`SIZE_UNKNOWN`].
 fn clamp_to_off_t(len: u64) -> CurlOffT {
     if len > CurlOffT::MAX as u64 {
         CurlOffT::MAX
@@ -4233,33 +3368,6 @@ impl MimePart {
     /// | it is the part's own root | `:1458-1466` | `CURLE_BAD_FUNCTION_ARGUMENT` | **the caller** |
     /// | it cannot be rewound | `:1472-1474` | `CURLE_SEND_FAIL_REWIND` | **the caller** |
     /// | otherwise | `:1476-1483` | `CURLE_OK` | the part |
-    ///
-    /// On every failure path the subparts are NEITHER attached NOR freed. That
-    /// is why this function returns `Result<(), (Mime, CURLcode)>` rather than
-    /// `Result<(), CURLcode>`: a plain error would have consumed the handle
-    /// and leaked it, and a `&mut Mime` parameter would not express the
-    /// transfer on success. Handing the handle back in the error makes "you
-    /// still own this" impossible to overlook -- the caller cannot drop the
-    /// error without deciding what to do with the `Mime` inside it.
-    ///
-    /// # The cycle guard
-    ///
-    /// The C walks up from the part to the root of its tree and rejects the
-    /// handle if it IS that root, which is what stops a subtree being made a
-    /// subpart of itself. Here a `Mime` is OWNED by the part that consumed it,
-    /// so a cycle is not constructible: to pass this part's own root as an
-    /// argument a caller would have to move it out of the part that owns it,
-    /// and the borrow checker does not permit that while the part exists. The
-    /// `attached` flag catches the reachable half of the same mistake -- a
-    /// handle already consumed by some other part -- and reports the same code
-    /// the C reports for both.
-    ///
-    /// # The rewind
-    ///
-    /// The C's comment at `:1468-1471` explains it: subparts that have already
-    /// served as a top-level body "might not be positioned at start. Rewind
-    /// them now, as a future check while rewinding the parent may cause this
-    /// content to be skipped."
     ///
     /// # Errors
     ///
@@ -4364,27 +3472,12 @@ impl MimePart {
     /// * **A multipart always takes ownership.** `:1126-1129`: "No one knows
     ///   about the cloned subparts, thus always attach ownership to the part."
     ///
-    /// A callback part asks its reader for a second reader --
-    /// [`PartReader::duplicate`] -- because the C's pointer-and-`arg` copy has
-    /// no safe expression. See that method for why it is a required rather
-    /// than a defaulted operation.
-    ///
-    /// The caller's headers are cloned and installed with ownership
-    /// (`:1145-1155`), which is the one place `take_ownership` is set to true
-    /// from inside this module.
-    ///
-    /// # Rollback
-    ///
-    /// "If an error occurred, rollback" -- `:1169-1170` calls
-    /// `Curl_mime_cleanpart(dst)`, leaving the destination empty rather than
-    /// half-built. Reproduced with [`Self::clean`].
-    ///
     /// # Errors
     ///
     /// Whatever the per-kind duplication reports, except a
     /// [`CURLcode::ReadError`] from a file part, which is deliberately
     /// swallowed.
-    #[allow(dead_code)] // consumer module not landed: curl_easy_duphandle, through crate::easy
+    #[allow(dead_code)] // consumer: curl_easy_duphandle, through crate::easy
     pub(crate) fn duplicate_from(&mut self, src: &MimePart) -> CodeResult<()> {
         match self.duplicate_inner(src) {
             Ok(()) => Ok(()),
@@ -4429,10 +3522,6 @@ impl MimePart {
                 // `curl_mime_init(data)` at `:1128` produces: the duplicate
                 // is a different multipart and must not reuse the original's
                 // boundary, or two bodies in one transfer could collide.
-                //
-                // The generator is the crate's system source for the same
-                // reason `Mime::with_system_rng` exists: there is no handle
-                // here to take one from.
                 let mut copy = Mime::with_system_rng()?;
                 for subpart in &mime.parts {
                     let fresh = copy.add_part();
@@ -4460,9 +3549,7 @@ impl MimePart {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -4471,13 +3558,6 @@ mod tests {
 
     /// A deterministic handle, so that every assertion about emitted bytes
     /// can name them literally.
-    ///
-    /// `TestRng` is `pub(crate)` and deliberately NOT `#[cfg(test)]` --
-    /// `crate::crypto::rand` says so in place -- precisely so that this
-    /// module's tests can inject it. With a seed of zero the generator yields
-    /// 0, 1, 2, ... and `rand_alnum` reduces each modulo 62 into an alphabet
-    /// whose first 26 characters are the uppercase letters, so the random tail
-    /// is the first 22 letters of the alphabet.
     fn seeded_mime(seed: u32) -> Mime {
         let mut rng = TestRng::from_seed(seed);
         Mime::new(&mut rng).expect("the test generator never fails")
@@ -4551,12 +3631,6 @@ mod tests {
 
     /// The two `<strippart>` substitutions of the 20 fixtures that use them,
     /// applied to the ACTUAL bytes only.
-    ///
-    /// `tests/runtests.pl:1419-1424` runs `for(@out) { eval $strip; }`, so the
-    /// expectation is never rewritten. Reproduced here as plain byte work
-    /// rather than with a regular-expression crate, because the patterns are
-    /// exact dash counts followed by `[A-Za-z0-9]*` and that is precisely what
-    /// makes them a shape check.
     fn strippart(line: &str) -> String {
         // s/^--------------------------[A-Za-z0-9]*/------------------------------/
         // 26 dashes, anchored at the start, replaced by 30.
@@ -4700,18 +3774,6 @@ mod tests {
     }
 
     /// `tests/data/test44`'s three fields, the third a file part.
-    ///
-    /// The file's bytes are the fixture's own -- `foo-`, `This is a moo-` and
-    /// `bar`, each followed by a newline, 24 bytes in total -- and its remote
-    /// filename is `test44.txt`, which is what gives the part a `text/plain`
-    /// content type under the form strategy.
-    ///
-    /// The content is installed as data rather than from a real file so that
-    /// the arithmetic does not depend on the filesystem; `set_filename` then
-    /// supplies the name `set_file` would have derived as a side effect. The
-    /// wire bytes and every size are identical either way, because a file part
-    /// and a data part of the same length differ only in where the bytes come
-    /// from.
     fn test44_form(seed: u32) -> Mime {
         let mut mime = seeded_mime(seed);
         let first = mime.add_part();
@@ -5024,15 +4086,6 @@ mod tests {
     #[test]
     fn the_content_length_of_test44_is_exactly_432() {
         // ★ THE SECOND INDEPENDENT PIN ON THE BOUNDARY LENGTH ★
-        //
-        // `tests/data/test44:54` asserts `Content-Length: 432` and no strip
-        // pattern touches that line, so the number has to come out right.
-        // The three part sizes are each checked on its own so that a failure
-        // says which part is wrong rather than only that the total is.
-        //
-        // Part 1: `Content-Disposition: form-data; name="name"` is 43 bytes,
-        // plus 2 for its CRLF, plus 2 for the blank line, plus 6 bytes of
-        // data.
         let mut top = body_part(test44_form(0));
         top.prepare_headers(
             Some("multipart/form-data"),
@@ -5066,12 +4119,6 @@ mod tests {
     }
 
     /// Moves a handle out from behind a `&mut`, leaving a fresh one behind.
-    ///
-    /// This is how a handle that has already served as a body is recovered so
-    /// that the ownership contract's rewind-failure path can be reached at
-    /// all: the C gets there when subparts "might not be positioned at start"
-    /// (`lib/mime.c:1468-1471`), and reproducing that requires a handle which
-    /// has been read and then detached.
     fn mime_take(mime: &mut Mime) -> Mime {
         std::mem::replace(mime, seeded_mime(0))
     }
@@ -5641,9 +4688,8 @@ mod tests {
     #[test]
     // Skipped under interpretation rather than made cheaper: the ceiling this
     // asserts IS 8,000,000, so reaching it requires millions of bytes, and
-    // every one of them carries shadow state Miri has to allocate. Lowering
-    // the constant to suit the interpreter would change behaviour the C fixes,
-    // which specification 0.8.2 forbids. The ordinary test run covers it.
+    // every one of them carries shadow state Miri has to allocate. The
+    // ordinary test run covers it.
     #[cfg_attr(miri, ignore = "8 MB of shadow state exhausts the interpreter")]
     fn escaping_refuses_a_name_beyond_the_input_ceiling() {
         // `curlx_dyn_init(&db, CURL_MAX_INPUT_LENGTH)` at `lib/mime.c:225`,
@@ -6032,10 +5078,6 @@ mod tests {
     /// Standard 76-column base64 with CRLF separators and NO trailing
     /// separator: the reference this module's streaming encoder is compared
     /// against.
-    ///
-    /// Built from `crate::util::base64::encode`, which is the workspace's one
-    /// unwrapped encoder, so the comparison tests the wrapping and the
-    /// streaming rather than the alphabet.
     fn wrapped_reference(data: &[u8]) -> String {
         let raw = crate::util::base64::encode(data).expect("encodable");
         let mut out = String::new();

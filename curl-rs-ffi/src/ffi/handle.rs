@@ -25,38 +25,6 @@
 //! 3. The canonical result a null handle produces, one per return-type family,
 //!    so no symbol module invents its own fallback.
 //!
-//! # The seven handle typedefs are not uniform
-//!
-//! Treating them uniformly breaks consumers, so each is reproduced in the
-//! shape its own declaration has:
-//!
-//! | Frozen declaration | Location | Rust form |
-//! |---|---|---|
-//! | `typedef void CURL;` | curl.h:109 | [`CURL`] = `c_void` |
-//! | `typedef void CURLSH;` | curl.h:110 | [`CURLSH`] = `c_void` |
-//! | `typedef void CURLM;` | multi.h:57 | [`CURLM`] = `c_void` |
-//! | `typedef struct Curl_URL CURLU;` | urlapi.h:107 | opaque [`Curl_URL`] |
-//! | `typedef struct CURLMsg CURLMsg;` | multi.h:105 | layout-visible |
-//! | `typedef struct curl_mime curl_mime;` | curl.h:2428 | opaque, self-named |
-//! | `typedef struct curl_mimepart curl_mimepart;` | curl.h:2429 | ditto |
-//!
-//! The first three are `void`, **not** opaque structs. cbindgen's natural
-//! output for an opaque Rust type is `typedef struct X X;`, which diverges
-//! from all three and changes the type of every handle-passing call: a
-//! consumer that assigns a `CURL *` to a `void *` -- a widespread idiom,
-//! present throughout `docs/examples/` -- would begin emitting diagnostics.
-//! `CURLU` diverges differently: its struct tag `Curl_URL` is not its typedef
-//! name, so cbindgen would emit `typedef struct CURLU CURLU;` and declare a
-//! tag no other translation unit knows. `curl_mime` and `curl_mimepart` are
-//! the self-named case, where tag and typedef agree.
-//!
-//! Every name here is listed under `[export] exclude` in `cbindgen.toml`, and
-//! `[export] item_types` deliberately omits `"opaque"` so that no accident of
-//! visibility can produce those lines. The C declarations are spliced verbatim
-//! by `curl-rs-ffi/build.rs` instead. The Rust declarations exist so the rest
-//! of the FFI tree has real types to name and so their layout can be asserted;
-//! they are never the source of the emitted C.
-//!
 //! ## Three names this module deals in are deliberately not on that list
 //!
 //! Measured against `cbindgen.toml`, twenty-eight of the thirty-one names in
@@ -75,55 +43,6 @@
 //! which are excluded and spliced verbatim. `curl_socklen_t` is referenced by
 //! no public prototype at all -- `system.h` is its sole declaration site in
 //! all twelve headers.
-//!
-//! So if header generation resumes and any of the three appears in the output,
-//! that is a regression rather than a cosmetic difference: each would be a
-//! declaration curl 8.19.0-DEV does not have, and `curl_socklen_t` would be a
-//! second typedef of a name `curl.h` already receives by including
-//! `system.h`.
-//!
-//! # Five declarations cbindgen cannot express at all
-//!
-//! For these the header text is authoritative and `build.rs` splices it. The
-//! Rust forms below are layout stand-ins, and each says so at its
-//! declaration:
-//!
-//! * [`curl_httppost`] -- eight `#define`s sit **inside** the struct body
-//!   (curl.h:204-220, between `long flags;` and `char *showfilename;`).
-//!   cbindgen emits no preprocessor directives, let alone interleaved ones.
-//! * [`curl_fileinfo`] -- embeds a nested **anonymous** struct named
-//!   `strings` (curl.h:326-333). cbindgen would hoist it to a named
-//!   top-level type, changing the ABI-visible spelling `finfo->strings.time`.
-//! * `curl_hstsentry` -- carries the ABI's only bit-field. cbindgen cannot
-//!   express a bit-field.
-//! * [`CURLMsg`] -- a C89 named member `data` of an **unnamed union type**,
-//!   not a C11 anonymous union. Rust has no anonymous unions either, so the
-//!   union is named [`CURLMsg_data`] here; naming it changes no offset.
-//! * `curl_pushheaders` -- a forward declaration with no body anywhere
-//!   (multi.h:500). An opaque `typedef` would be wrong: every use site spells
-//!   it `struct curl_pushheaders *`.
-//!
-//! # Where the eighteen declarations live, and why not all of them are here
-//!
-//! The twelve public headers declare nineteen structs: eighteen with bodies
-//! plus one forward declaration. Seventeen bodies and the forward declaration
-//! belong to this module's inventory; the nineteenth, `struct curl_easyoption`
-//! (options.h:51-56), deliberately does not, because it is the row type of the
-//! option-introspection table and belongs with the table.
-//!
-//! Of this module's eighteen, eleven are **declared here** -- the ten below
-//! plus [`CURLMsg`] -- and seven are declared by [`super::types`], which needed
-//! them first because the generated callback prototypes name them. That
-//! division is not cosmetic and it is not negotiable: a second
-//! `#[repr(C)] struct curl_slist` in this module would be a *different Rust
-//! type* with the same name, and `super::slist`, `super::global` and
-//! `super::misc` -- which already name the `types` ones -- would stop
-//! type-checking against it. So there is exactly one definition of each. Three
-//! of the seven are re-exported here, because structs declared below name them
-//! in their own fields; the other four, plus `curl_version_info_data` and the
-//! `curl_pushheaders` forward declaration, are reached at their own path.
-//! The `layout` tests assert all seventeen bodies regardless of which module
-//! declares them, which is where the obligation actually bites.
 //!
 //! # Thirty-two bits are not supported and the limitation is not hidden
 //!
@@ -155,35 +74,24 @@ use super::types::{curlfiletype, CURLMSG};
 // one of them, which is where the obligation actually bites.
 pub(crate) use super::types::{curl_off_t, curl_slist, curl_socket_t};
 
-// ---------------------------------------------------------------------------
 // The seven handle typedefs.
-// ---------------------------------------------------------------------------
 
 /// An easy handle. Frozen as `typedef void CURL;` (curl.h:109), so the alias
 /// resolves to `c_void` and `*mut CURL` is spelled `CURL *` in C.
 #[allow(non_camel_case_types)]
 #[allow(dead_code)]
-// ABI declaration: read by cbindgen, not by Rust callers
-// Frozen C ABI name: `include/curl/curl.h` spells it this way and AAP 0.8.1
-// forbids changing a public typedef, so the style lint yields to the contract.
 #[allow(clippy::upper_case_acronyms)]
 pub type CURL = c_void;
 
 /// A multi handle. Frozen as `typedef void CURLM;` (multi.h:57).
 #[allow(non_camel_case_types)]
 #[allow(dead_code)]
-// ABI declaration: read by cbindgen, not by Rust callers
-// Frozen C ABI name: `include/curl/curl.h` spells it this way and AAP 0.8.1
-// forbids changing a public typedef, so the style lint yields to the contract.
 #[allow(clippy::upper_case_acronyms)]
 pub type CURLM = c_void;
 
 /// A share handle. Frozen as `typedef void CURLSH;` (curl.h:110).
 #[allow(non_camel_case_types)]
 #[allow(dead_code)]
-// ABI declaration: read by cbindgen, not by Rust callers
-// Frozen C ABI name: `include/curl/curl.h` spells it this way and AAP 0.8.1
-// forbids changing a public typedef, so the style lint yields to the contract.
 #[allow(clippy::upper_case_acronyms)]
 pub type CURLSH = c_void;
 
@@ -203,9 +111,6 @@ pub struct Curl_URL {
 /// A URL handle. Frozen as `typedef struct Curl_URL CURLU;` (urlapi.h:107).
 #[allow(non_camel_case_types)]
 #[allow(dead_code)]
-// ABI declaration: read by cbindgen, not by Rust callers
-// Frozen C ABI name: `include/curl/curl.h` spells it this way and AAP 0.8.1
-// forbids changing a public typedef, so the style lint yields to the contract.
 #[allow(clippy::upper_case_acronyms)]
 pub type CURLU = Curl_URL;
 
@@ -218,8 +123,6 @@ pub type CURLU = Curl_URL;
 /// aliases and `CURLU` and `CURLMsg` would suggest -- this type and
 /// [`curl_mimepart`] are the argument and return types of all twelve
 /// `curl_mime_*` symbols, so they are as ABI-visible as `CURLU` is.
-///
-/// Opaque, like `Curl_URL`: the authority never defines a body.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
@@ -279,34 +182,18 @@ pub struct CURLMsg {
     pub data: CURLMsg_data,
 }
 
-// ---------------------------------------------------------------------------
 // The scalar typedefs.
 //
 // `curl_off_t` and `curl_socket_t` are re-exported above from
 // `super::types`; the two declarations below complete the set.
-// ---------------------------------------------------------------------------
 
 /// The invalid-socket sentinel, frozen as `#define CURL_SOCKET_BAD (-1)`
 /// (curl.h:145) on every non-Windows target.
-///
-/// The header's other arm is `INVALID_SOCKET`, reached only under `_WIN32`
-/// (curl.h:140-142). Windows is outside the four mandated targets, all of
-/// which are Unix-like, so no second arm is invented here: writing one would
-/// claim support that nothing in this tree builds or tests.
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
 pub const CURL_SOCKET_BAD: curl_socket_t = -1;
 
 /// The socket-length type, frozen in `system.h` as
 /// `CURL_TYPEOF_CURL_SOCKLEN_T`.
-///
-/// `system.h` is shipped as-is rather than generated, so this alias has to
-/// agree with what that header computes rather than define it. On every
-/// mandated target the macro resolves to the platform's `socklen_t`, which is
-/// what `libc` names per target; measured 4 bytes, alignment 4.
-///
-/// Note that `struct curl_sockaddr` does **not** use this type: curl.h:431-433
-/// records in-source that `socklen_t` "turned really ugly and painful on the
-/// systems that lack this type", so that field is a plain `unsigned int`.
 #[allow(non_camel_case_types)]
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
 pub type curl_socklen_t = libc::socklen_t;
@@ -322,16 +209,10 @@ pub type curl_socklen_t = libc::socklen_t;
 const _: () = assert!(curl_off_t::MIN < 0);
 const _: () = assert!(core::mem::size_of::<curl_off_t>() == 8);
 
-// ---------------------------------------------------------------------------
 // `struct curl_httppost` (curl.h:188-230) and the eight flag bits that the
 // authority interleaves INSIDE its body.
-// ---------------------------------------------------------------------------
 
 /// The legacy form-post node, frozen at curl.h:188-230.
-///
-/// Fourteen fields, in the authority's order. Measured size 112, alignment 8,
-/// with every field at a multiple of eight because `long` and `curl_off_t` are
-/// both 64-bit on the mandated targets.
 ///
 /// # Why the header text is authoritative for this one
 ///
@@ -343,9 +224,6 @@ const _: () = assert!(core::mem::size_of::<curl_off_t>() == 8);
 /// whole declaration verbatim, `#define`s in place, and this Rust form exists
 /// for layout and for `super::form`'s use of the type. The eight constants are
 /// declared below as ordinary Rust items for the same reason.
-///
-/// The type is deprecated in favour of the mime API but still exported through
-/// `curl_formadd`, `curl_formfree` and `curl_formget`, so it stays.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
@@ -416,10 +294,8 @@ pub const CURL_HTTPPOST_CALLBACK: c_long = 1 << 6;
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
 pub const CURL_HTTPPOST_LARGE: c_long = 1 << 7;
 
-// ---------------------------------------------------------------------------
 // `struct curl_fileinfo` (curl.h:316-342), its nested anonymous struct, and
 // the eight `CURLFINFOFLAG_KNOWN_*` bits that say which fields were parsed.
-// ---------------------------------------------------------------------------
 
 /// The nested `strings` sub-struct of [`curl_fileinfo`], frozen at
 /// curl.h:326-333.
@@ -435,10 +311,6 @@ pub const CURL_HTTPPOST_LARGE: c_long = 1 << 7;
 /// anonymous form while Rust gets a nameable one. Naming it changes no offset:
 /// measured, `strings` begins at 56 and its five members follow at 56, 64, 72,
 /// 80 and 88, which is what five pointers laid end to end give.
-///
-/// The authority's own comment applies to every member: "If some of these
-/// fields is not NULL, it is a pointer to `b_data`." They are views into the
-/// private buffer, not separate allocations.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
@@ -457,14 +329,6 @@ pub struct curl_fileinfo_strings {
 
 /// Information about a single file, used when doing FTP wildcard matching
 /// (curl.h:316-342).
-///
-/// Measured size 128, alignment 8. Field offsets: `filename` 0, `filetype` 8,
-/// `time` 16, `perm` 24, `uid` 28, `gid` 32, `size` 40, `hardlinks` 48,
-/// `strings` 56, `flags` 96, `b_data` 104, `b_size` 112, `b_used` 120.
-///
-/// Reached by a `curl_chunk_bgn_callback`, which receives it as
-/// `const void *transfer_info` and casts it, so every offset is observable
-/// from consumer code.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
@@ -532,14 +396,9 @@ pub const CURLFINFOFLAG_KNOWN_SIZE: c_uint = 1 << 6;
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
 pub const CURLFINFOFLAG_KNOWN_HLINKCOUNT: c_uint = 1 << 7;
 
-// ---------------------------------------------------------------------------
 // The remaining layout-visible structs, in header order.
-// ---------------------------------------------------------------------------
 
 /// A host key, handed to a `curl_sshkeycallback` (curl.h:876-881).
-///
-/// Measured size 24, alignment 8, with `key` at 0, `len` at 8 and `keytype`
-/// at 16.
 ///
 /// The third field is spelled with the `enum` **keyword** in the authority --
 /// `enum curl_khtype keytype;` -- because `curl_khtype` is one of the few
@@ -561,9 +420,6 @@ pub struct curl_khkey {
 }
 
 /// One row of a `CURLFORM_ARRAY`, frozen at curl.h:2587-2590.
-///
-/// Measured size 16, alignment 8, with `option` at 0 and `value` at 8. The
-/// four bytes between them are padding the C compiler inserts, not a field.
 ///
 /// `super::opts` owns [`CURLformoption`]; importing it rather than restating it
 /// is what keeps the two from drifting, since a form option's integer is as
@@ -595,14 +451,6 @@ pub struct curl_certinfo {
 
 /// The TLS library and its internal handle, reported by
 /// `CURLINFO_TLS_SSL_PTR` and `CURLINFO_TLS_SESSION` (curl.h:2885-2888).
-///
-/// Measured size 16, alignment 8, with `backend` at 0 and `internals` at 8.
-///
-/// `internals` is null in this implementation and that is the truthful answer,
-/// not an omission: the field's contract is to expose the backend's own session
-/// object, and rustls exposes no C-representable handle to hand over. A
-/// consumer that tests it for null -- which is what the documented use
-/// requires -- sees a correct answer.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
@@ -615,14 +463,6 @@ pub struct curl_tlssessioninfo {
 }
 
 /// A blob argument, frozen at easy.h:34-39.
-///
-/// Measured size 24, alignment 8, with `data` at 0, `len` at 8 and `flags`
-/// at 16.
-///
-/// Consumers construct this **on the stack** and pass `&blob` to every
-/// `CURLOPTTYPE_BLOB` option, so its layout is directly observable rather than
-/// merely referenced. That is why the offsets are asserted rather than
-/// assumed.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
@@ -646,17 +486,6 @@ pub const CURL_BLOB_NOCOPY: c_uint = 0;
 
 /// One header, as returned by `curl_easy_header` and `curl_easy_nextheader`
 /// (header.h:31-38).
-///
-/// Six fields. Measured size 48, alignment 8, with `name` at 0, `value` at 8,
-/// `amount` at 16, `index` at 24, `origin` at 32 and `anchor` at 40.
-///
-/// `anchor` is documented as "handle privately used by libcurl" and is last,
-/// but it is reproduced and occupies its slot: a consumer's `sizeof` sees it,
-/// and libcurl itself allocates the struct, so dropping it would make the two
-/// sides disagree about how much memory a header record needs.
-///
-/// The five `CURLH_*` bits that `origin` carries live in `super::codes`; they
-/// are imported where a symbol module needs them rather than restated here.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
@@ -678,21 +507,6 @@ pub struct curl_header {
 
 /// One entry of a `curl_multi_wait` or `curl_multi_poll` descriptor array
 /// (multi.h:114-118).
-///
-/// Measured size 8, alignment 4, with `fd` at 0, `events` at 4 and `revents`
-/// at 6.
-///
-/// The two event fields are **`short`, not `int`**. Getting that wrong is not a
-/// compile error anywhere; it silently doubles the stride of an array that
-/// `curl_multi_wait`, `curl_multi_poll` and `curl_multi_waitfds` all index, and
-/// the first two declare their parameter with an array declarator
-/// (`struct curl_waitfd extra_fds[]`, multi.h:172-176 and :186-190), so the
-/// caller's array and the callee's view would disagree from the second element
-/// onwards. The authority's comment explains why the type exists at all: it is
-/// "Based on poll(2) structure and values. We do not use pollfd and POLL*
-/// constants explicitly to cover platforms without poll()."
-///
-/// The three `CURL_WAIT_POLL*` bits belong with the multi symbols, not here.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[allow(dead_code)] // ABI declaration: read by cbindgen, not by Rust callers
@@ -706,14 +520,6 @@ pub struct curl_waitfd {
 }
 
 /// Metadata for one received WebSocket frame (websockets.h:31-37).
-///
-/// Five fields. Measured size 32, alignment 8, with `age` at 0, `flags` at 4,
-/// `offset` at 8, `bytesleft` at 16 and `len` at 24.
-///
-/// `age` is the struct-version field and is deliberately first, exactly as
-/// [`super::types::curl_version_info_data`]'s `age` is. Removing or reordering
-/// it would break every consumer's `offsetof`, and its documented value is
-/// zero.
 ///
 /// # A deliberate asymmetry that must not be tidied away
 ///
@@ -740,15 +546,7 @@ pub struct curl_ws_frame {
     pub len: usize,
 }
 
-// ---------------------------------------------------------------------------
 // The canonical result a null handle produces, one per return-type family.
-//
-// The C implementation answers a null handle differently depending on what the
-// function returns, and every one of these was read off the authority rather
-// than chosen. They are constants here so that no symbol module invents its
-// own fallback: sixteen files each picking "the obvious error" is how a family
-// ends up with two different answers for the same mistake.
-// ---------------------------------------------------------------------------
 
 /// What a `CURLcode`-returning entry point answers for a null easy handle:
 /// `CURLE_BAD_FUNCTION_ARGUMENT`, which is 43.
@@ -783,12 +581,6 @@ pub(crate) const BAD_HEADER_ARGUMENT: CURLHcode =
     CURLHcode::CURLHE_BAD_ARGUMENT;
 
 /// What an `int`-returning entry point answers for a null handle.
-///
-/// The `int`-returning members of the export set signal failure with a
-/// negative value rather than with a code from an enumeration, so there is one
-/// sentinel rather than a family of them. A pointer-returning entry point
-/// answers null and a `void`-returning one returns silently; neither needs a
-/// constant, and both are exercised in the `behaviour` tests.
 #[allow(dead_code)] // used as symbol families land; see the module docs
 pub(crate) const BAD_HANDLE_INT: c_int = -1;
 
@@ -797,9 +589,7 @@ pub(crate) const BAD_HANDLE_INT: c_int = -1;
 // the compiler rather than by a test.
 const _: () = assert!(BAD_HANDLE_INT < 0);
 
-// ---------------------------------------------------------------------------
 // RAII at the boundary.
-// ---------------------------------------------------------------------------
 
 /// Hand ownership of an engine object to C, yielding an opaque handle.
 ///
@@ -808,33 +598,12 @@ const _: () = assert!(BAD_HANDLE_INT < 0);
 /// `curl_mime_init` and `curl_easy_duphandle` all end here. The allocation
 /// outlives this call and is owned by the caller of the C function until it is
 /// passed back to [`from_raw`] or [`drop_raw`].
-///
-/// # Why one generic function rather than six family-specific ones
-///
-/// The families differ in exactly one respect -- the pointee type their
-/// pointer names, which is `c_void` for `CURL`, `CURLM` and `CURLSH` and a
-/// distinct opaque type for `CURLU`, `curl_mime` and `curl_mimepart`. The body
-/// is `Box::into_raw` followed by a cast in every case, so six copies would be
-/// six identical bodies differing only in a type that the signature already
-/// parameterises. `H` is that pointee type and `T` is the engine object; a
-/// call site writes `let h: *mut CURLM = handle::into_raw(engine);` and
-/// inference supplies both.
-///
-/// Nothing about the returned pointer is ABI-visible beyond its width: a
-/// generational key or a slab index in the engine's own representation stays
-/// on the engine's side of the boundary, because `CURL *` is `void *` and
-/// cannot carry a second word.
 #[allow(dead_code)] // used as symbol families land; see the module docs
 pub(crate) fn into_raw<H, T>(value: T) -> *mut H {
     Box::into_raw(Box::new(value)).cast::<H>()
 }
 
 /// Take ownership back from C, yielding the engine object.
-///
-/// This is the "in" half, and the only place besides [`drop_raw`] that ever
-/// calls `Box::from_raw`. A null pointer yields `None` rather than a panic,
-/// because a null handle is a caller error that C reports through a return
-/// value.
 ///
 /// # Safety
 ///
@@ -862,13 +631,6 @@ pub(crate) unsafe fn from_raw<H, T>(ptr: *mut H) -> Option<Box<T>> {
 
 /// Release an engine object owned by C.
 ///
-/// This is what a `void`-returning cleanup entry point calls:
-/// `curl_easy_cleanup`, `curl_multi_cleanup`, `curl_share_cleanup`,
-/// `curl_url_cleanup` and `curl_mime_free`. A null pointer returns silently,
-/// which is the documented C behaviour rather than a convenience -- calling
-/// `curl_easy_cleanup(NULL)` is a defined no-op, so answering it with a panic
-/// or an abort would be a behaviour change.
-///
 /// # Safety
 ///
 /// The same contract as [`from_raw`], of which this is the discarding form.
@@ -884,12 +646,6 @@ pub(crate) unsafe fn drop_raw<H, T>(ptr: *mut H) {
 
 /// Borrow an engine object for the duration of one call, without taking
 /// ownership.
-///
-/// This is the path every entry point other than init and cleanup uses, and it
-/// must never be `from_raw`: reconstituting a `Box` here and letting it drop at
-/// the end of the call would free a handle the caller still holds. A null
-/// pointer yields `None` so the caller can answer with the family-correct
-/// constant above.
 ///
 /// # Safety
 ///
@@ -941,33 +697,9 @@ pub(crate) unsafe fn borrow_mut<'a, H, T>(ptr: *mut H) -> Option<&'a mut T> {
     Some(unsafe { &mut *ptr.cast::<T>() })
 }
 
-// ---------------------------------------------------------------------------
 // The one direction of `curl_slist` conversion that belongs here.
-// ---------------------------------------------------------------------------
 
 /// Walk a C string list into owned Rust byte strings.
-///
-/// `curl_slist` keeps its C shape only at the boundary; inside the engine a
-/// list of strings is a `Vec`. This is that conversion, and it is the direction
-/// nothing else in the crate provides: a symbol module that receives a
-/// `struct curl_slist *` through `curl_easy_setopt` needs the contents as
-/// owned data, because the caller may free the chain the moment the setter
-/// returns.
-///
-/// The bytes are copied, NUL exclusive. A node whose `data` is null
-/// contributes an empty entry rather than being skipped, so the returned
-/// length always equals the chain's node count and an index into it matches
-/// the caller's position in the chain.
-///
-/// # Why the opposite direction is not here
-///
-/// Building and freeing a C chain are `super::slist`'s `curl_slist_append` and
-/// `curl_slist_free_all`, and they must stay there because they allocate
-/// through [`super::memory`] -- libcurl's five replaceable allocator hooks. A
-/// `Box`-based builder in this module would hand out nodes that a consumer's
-/// `curl_slist_free_all` would then pass to `free`, mixing two allocators over
-/// one allocation. That is not a style preference; it is the difference between
-/// working and undefined.
 ///
 /// # Safety
 ///
@@ -1002,11 +734,6 @@ pub(crate) unsafe fn slist_to_vec(list: *const curl_slist) -> Vec<Vec<u8>> {
 
 /// How many nodes a C string list holds.
 ///
-/// The companion of [`slist_to_vec`] for the callers that need only the count,
-/// which is what `CURLINFO_CERTINFO` reports through
-/// [`curl_certinfo::num_of_certs`]. Counting without copying keeps that path
-/// allocation-free.
-///
 /// # Safety
 ///
 /// The same contract as [`slist_to_vec`]: `list` must be null or the head of a
@@ -1026,12 +753,6 @@ pub(crate) unsafe fn slist_len(list: *const curl_slist) -> usize {
 
 /// The null pointer, spelled once, for the entry points whose answer to a null
 /// handle is a null return.
-///
-/// A pointer-returning entry point has no error code to give, so it answers
-/// null -- `curl_easy_init` on allocation failure, `curl_url_dup` on a null
-/// input, `curl_slist_append` on either. Naming it alongside the five code
-/// constants keeps the whole family table in one place rather than leaving one
-/// row of it implicit.
 #[allow(dead_code)] // used as symbol families land; see the module docs
 pub(crate) fn bad_handle_ptr<H>() -> *mut H {
     ptr::null_mut()
@@ -1055,14 +776,6 @@ mod layout {
     };
 
     /// Byte offset of a field within a struct.
-    ///
-    /// `core::mem::offset_of!` is stable only from Rust 1.77 and the workspace
-    /// MSRV is 1.75, so the offset is taken through `addr_of!`, stable since
-    /// 1.51. It forms the address without creating a reference, so it is sound
-    /// on uninitialised memory -- which is what lets a struct full of raw
-    /// pointers be measured without inventing values for them. No crate is
-    /// added for this: `memoffset` would be a new dependency, and the
-    /// dependency set is fixed.
     macro_rules! offset {
         ($ty:ty, $($field:tt).+) => {{
             let holder = MaybeUninit::<$ty>::uninit();
@@ -1481,9 +1194,7 @@ mod behaviour {
     ///
     /// The RAII helpers are generic precisely because they know nothing about
     /// the payload, so a local type exercises them exactly as `curl-rs-lib`'s
-    /// easy handle will. `Rc` is the load-bearing part: a clone kept outside
-    /// the boundary lets the test observe whether the allocation was dropped,
-    /// which is the property under test and is otherwise invisible.
+    /// easy handle will.
     struct Engine {
         label: String,
         alive: Rc<()>,

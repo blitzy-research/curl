@@ -1292,25 +1292,22 @@ sort_by = "None"
 # VaArgSafe sealed and NOT implemented for raw pointers (which must be read
 # as usize and cast); it is stable only on nightly 1.99 and so exceeds the
 # mandated MSRV 1.75. Two of the user's own requirements cannot both be met
-# by any implementation. The three options -- raise the MSRV, drop that
+# by any implementation. Of its three options -- raise the MSRV, drop that
 # target, or accept that one target's varargs entry points are unsupported --
-# are all user decisions.
+# the first two are user decisions and the third has been withdrawn.
 #
 # Silent acceptance is the worst of them, so it is impossible rather than
 # merely discouraged. build.rs's check_variadic_abi REFUSES to build for
-# aarch64-apple-darwin unless the decision is on record as
-# CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs, and it refuses on
-# ANY target if src/ffi/printf.rs or src/ffi/form.rs appears while the
-# decision is unrecorded -- those two own the eleven exports (the ten
-# curl_m*printf forms and curl_formadd) that have no ABI-correct expression
-# at MSRV 1.75 on any target at all. A cargo:warning would not have been
-# enough: it is not a refusal, and the build gate requires a warning-free
-# build, so a permanent warning is one that is either suppressed or scrolled
-# past. The one warning the gate does emit fires only where the recorded
-# acceptance actually suppressed a refusal, so the three targets whose
-# variadic ABI is sound stay warning-free and that gate keeps meaning
-# something. This file pins the prototypes; build.rs stops the build. Neither
-# may be changed without the other.
+# aarch64-apple-darwin, UNCONDITIONALLY. It formerly accepted an opt-in through
+# CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs; that was option 3,
+# and it could emit a release artifact whose four option-identifier entry
+# points read a register an Apple arm64 variadic caller never writes, so it has
+# been removed and setting the variable is now itself refused. A cargo:warning
+# would not have been enough either: it is not a refusal, and the build gate
+# requires a warning-free build, so a permanent warning is one that is either
+# suppressed or scrolled past. The refusal is therefore the whole mechanism,
+# and no environment setting reaches it. This file pins the prototypes;
+# build.rs stops the build. Neither may be changed without the other.
 
 # [const] -- #define, never static const
 # Verified by running it: with both allow_* false, a public Rust const emits

@@ -303,6 +303,79 @@ jobs:
           shellcheck --version
           .github/scripts/shellcheck.sh
 
+      # A shell defect that shellcheck does not report and that turns a gate
+      # into decoration, so it is checked by name.
+      #
+      # THE DEFECT. A `run:` body without a `shell:` key runs under `bash -e`
+      # with NO `pipefail`. In `producer 2>&1 | tee log`, `tee` is the last
+      # command of the pipeline, so the PIPELINE's status is `tee`'s - and `tee`
+      # succeeds essentially always. Capture that with `|| status=$?` and the
+      # variable records `tee`, never the producer; `-e` does not fire either,
+      # because the pipeline itself succeeded. The producer can exit non-zero and
+      # every later check in the step passes.
+      #
+      # WHY IT IS WORTH ITS OWN ASSERTION. It was found in production here, in
+      # five places across two workflows, one of them the leg where a C consumer
+      # crosses the FFI ownership boundary under AddressSanitizer - the single
+      # highest-value security check in this repository, and it could have
+      # reported a clean run for a consumer that returned failure. A control that
+      # cannot fail is worse than no control, because it reads as evidence.
+      # shellcheck cannot catch it: every one of those lines is valid, portable,
+      # idiomatic shell. Only intent distinguishes them, so only a named check
+      # finds them.
+      #
+      # THE REMEDY, which is what every `| tee` in this tree now does: let the
+      # pipeline run on its own line and take the producer's status from
+      # `${PIPESTATUS[0]}` on the very next line, before any other command can
+      # overwrite the array. `set -o pipefail` would also work, but it is not
+      # available to choose here - GitHub owns the implicit shell - and adding a
+      # `shell: bash` key to buy it would change every other pipeline in the
+      # file at the same time, which rust-asan.yml documents as an actively
+      # unwanted side effect for its `nm | grep -c` census.
+      #
+      # The pattern is written with bracket expressions rather than backslash
+      # escapes so that this file does not match its own search: `[|]` is one
+      # literal bar, and the needle it forms cannot be spelled by the needle.
+      - name: 'assert: no CI pipeline hides its producer exit status'
+        run: |
+          workflows="$(git ls-files '.github/workflows/*.yml')"
+          if [ -z "${workflows}" ]; then
+            echo 'FAIL: git ls-files matched no workflow under .github/workflows/.'
+            echo 'The set being checked is empty, so a clean result would mean nothing.'
+            exit 1
+          fi
+
+          masked='[|][[:space:]]*tee[[:space:]][^|]*[|][|][[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[$][?]'
+          found="$(printf '%s\n' "${workflows}" | xargs -r grep -n -E -- "${masked}" || true)"
+
+          if [ -n "${found}" ]; then
+            echo 'FAIL: a pipeline into tee captures the pipeline status instead of the producer:'
+            printf '%s\n' "${found}"
+            echo
+            echo 'tee is the last command of the pipeline and it succeeds essentially always, so'
+            echo 'the trailing capture records tee and discards the status that matters. The'
+            echo 'implicit shell for a run: body is bash -e without pipefail, so -e does not fire'
+            echo 'either and the producer fails silently. Replace it with the two-line form used'
+            echo 'everywhere else in this directory: end the line at the pipeline, then take the'
+            echo 'producer status from PIPESTATUS index zero on the next line.'
+            exit 1
+          fi
+
+          # Not vacuous: the correct form must actually be present. If every
+          # `| tee` whose status is consumed were deleted or renamed away, the
+          # search above would pass by having nothing to find, and this check
+          # would quietly stop protecting anything.
+          correct="$(printf '%s\n' "${workflows}" | xargs -r grep -c -F -- 'PIPESTATUS[0]' | awk -F: '{ s += $NF } END { print s + 0 }')"
+          if [ "${correct}" -lt 1 ]; then
+            echo 'FAIL: no workflow recovers a producer status from PIPESTATUS index zero.'
+            echo 'Either the logged pipelines are gone - in which case DELETE this check rather'
+            echo 'than leaving one that guards nothing - or they were rewritten in a form that'
+            echo 'loses the producer status again. Both need action.'
+            exit 1
+          fi
+
+          echo "no masked producer status in any workflow; ${correct} correct PIPESTATUS recovery site(s)"
+
       - name: 'spacecheck'
         run: scripts/spacecheck.pl
 

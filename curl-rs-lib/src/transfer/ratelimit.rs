@@ -21,8 +21,8 @@
 // SPDX-License-Identifier: curl
 //
 //**************************************************************************/
-//! The token bucket behind `--limit-rate` -- supersedes `lib/ratelimit.c`
-//! (289 lines) and `lib/ratelimit.h` (107).
+//! The token bucket behind `--limit-rate` -- supersedes `lib/ratelimit.c` and
+//! `lib/ratelimit.h`.
 //!
 //! Three public options are served by this one primitive, and by nothing
 //! else in the crate:
@@ -31,12 +31,6 @@
 //! * `CURLOPT_MAX_SEND_SPEED_LARGE`, applied to the upload direction;
 //! * `--limit-rate`, which the command-line tool implements by setting both
 //!   of the above to the same value.
-//!
-//! `lib/setopt.c:2793-2813` is where the two options land, and it calls
-//! `Curl_rlimit_init(&data->progress.{ul,dl}.rlimit, offt, offt, ...)` --
-//! burst equal to rate, which per `lib/ratelimit.h:45-47` makes a transfer
-//! "always try to stay *at/below* the rate" so that idle periods do not
-//! bank tokens for a later burst.
 //!
 //! # What a token bucket is, in curl's words
 //!
@@ -56,36 +50,6 @@
 //! average from start to finish is the rate limit; a burst equal to the rate
 //! keeps the transfer at or below the rate at all times.
 //!
-//! A limiter may also be BLOCKED, which makes available tokens always 0
-//! until it is unblocked, and unblocking restarts the limiting with no
-//! history of the past. A limiter whose rate is 0 always has
-//! [`i64::MAX`] tokens available, unless it is blocked.
-//!
-//! # Timing is preserved deliberately, not approximated
-//!
-//! This is a faithful transcription and not a re-derivation.
-//! Specification 0.1.1 makes performance an explicit non-goal and states
-//! that where a choice exists between a faster design and a more
-//! behaviourally faithful one, faithfulness wins; specification 0.8.1 freezes
-//! observable behaviour outright. For this module that has three concrete
-//! consequences:
-//!
-//! 1. **No floating point.** Every quotient below truncates toward zero and
-//!    every millisecond conversion is the `(x + 999) / 1000` ceiling the C
-//!    writes. A floating-point reformulation would move a wait by a
-//!    millisecond here and there, and a millisecond is observable: it is the
-//!    argument to the expiry timer that decides when a transfer next runs.
-//! 2. **No general-purpose rate-limiting crate.** The step-tuning algorithm
-//!    of [`RateLimit::start`] deliberately makes the LAST step of a transfer
-//!    small, which changes completion timing for small transfers. A smoother
-//!    or fairer algorithm is a different algorithm, and different timing is
-//!    a defect here rather than an improvement.
-//! 3. **The integer boundaries are transcribed, including the odd ones.**
-//!    Where the C compares with `>` rather than `>=`, so does this module;
-//!    where the C saturates in a direction that looks counterintuitive --
-//!    [`RateLimit::drain`] has one such branch -- the shipped behaviour is
-//!    reproduced and the oddity is documented at the site.
-//!
 //! # What this module does NOT do
 //!
 //! It computes durations. It does not wait, and it does not know what a
@@ -104,49 +68,16 @@
 //!   `const struct curltime *`. `Instant::now` and `SystemTime::now` appear
 //!   nowhere in this file; `crate::util::timeval` is the crate's only clock
 //!   seam.
-//!
-//! The orchestration those three bullets refer to is spelled out under
-//! [`RateLimit::wait_ms`] and [`RateLimit::next_step_ms`], transcribed from
-//! `lib/multi.c:1880-1921`, so that whoever writes the transfer loop has the
-//! contract in front of them rather than having to rediscover it.
-//!
-//! # Where this sits in the dependency order
-//!
-//! Downwards only. This module imports [`CurlTime`] and [`timediff_us`] from
-//! `crate::util::timeval` and [`TimeDiff`] from `crate::util::timediff`, and
-//! nothing else -- no sibling in `transfer/`, no protocol, no connection, no
-//! TLS.
-//!
-//! The direction of the coupling with progress accounting is fixed by the C
-//! and is worth stating because it is easy to invert: `lib/urldata.h:788-793`
-//! declares `struct pgrs_dir { curl_off_t total_size; curl_off_t cur_size;
-//! curl_off_t speed; struct Curl_rlimit rlimit; }`, so the progress
-//! structure EMBEDS the limiter. Progress accounting will therefore hold a
-//! [`RateLimit`]; this module will never hold a progress structure.
-//! [`RateLimit`] implements [`Default`] for exactly that reason, as the
-//! successor of the calloc-zeroed state a fresh easy handle starts in.
 
 use crate::util::timediff::TimeDiff;
 use crate::util::timeval::{timediff_us, CurlTime};
 
 /// Microseconds in a second -- `CURL_US_PER_SEC` of `lib/ratelimit.c:29`.
-///
-/// The initial step duration, and the base that [`RateLimit::start`]'s
-/// tuning adjusts. `lib/ratelimit.c:118` asserts that a limiter about to be
-/// tuned still has exactly this step, which is why the value appears both as
-/// the initial step in [`RateLimit::new`] and as the assertion in
-/// [`RateLimit::tune_steps`].
 const CURL_US_PER_SEC: TimeDiff = 1_000_000;
 
 /// The largest number of tokens the final step may be given --
 /// `CURL_RLIMIT_MIN_RATE` of `lib/ratelimit.c:30`, whose comment reads
 /// "minimum step rate".
-///
-/// Written `4 * 1024` rather than `4096` because that is how the C spells
-/// it. The name says "minimum rate" while the only use, at
-/// `lib/ratelimit.c:110-111`, is an upper bound on the last step's token
-/// count; the two readings agree, because capping the last step's tokens is
-/// what stops the tuned main rate from falling below this floor.
 const CURL_RLIMIT_MIN_RATE: i64 = 4 * 1024;
 
 /// The shortest step duration tuning will produce, in milliseconds --
@@ -157,13 +88,6 @@ const CURL_RLIMIT_MIN_RATE: i64 = 4 * 1024;
 const CURL_RLIMIT_STEP_MIN_MS: i64 = 2;
 
 /// Milliseconds in a second, and microseconds in a millisecond.
-///
-/// One value, two quantities, and the C spells both as a bare `1000` -- at
-/// `lib/ratelimit.c:120` it scales tokens into millisteps, at `:128` and
-/// `:141` it converts millisteps into microseconds, and at `:253` and `:265`
-/// it reduces microseconds to milliseconds. A single named constant is used
-/// for all of them because they are numerically the same and separating them
-/// would suggest they could diverge.
 const MILLI: i64 = 1_000;
 
 /// Millisteps in one step: the `1000` that `lib/ratelimit.c:125-137` compares
@@ -184,12 +108,6 @@ const PERCENT: i64 = 100;
 
 /// The rounding addend of the microsecond-to-millisecond ceiling: the `999`
 /// of `lib/ratelimit.c:253` and `:265`.
-///
-/// `(x + 999) / 1000` is the ceiling of a NON-NEGATIVE quotient, which is the
-/// only case either site can reach: both divide a strictly positive duration.
-/// One microsecond therefore becomes one millisecond rather than zero, which
-/// matters because a zero return from [`RateLimit::wait_ms`] means "do not
-/// wait at all" and would spin the transfer loop.
 const CEIL_ADDEND: i64 = MILLI - 1;
 
 /// A token bucket for one direction of one transfer -- the successor of
@@ -217,14 +135,6 @@ const CEIL_ADDEND: i64 = MILLI - 1;
 /// multiplication in [`Self::wait_ms`], and mixing them up there produces a
 /// plausible-looking wait that is wrong by a factor of a thousand.
 ///
-/// # The fields are private, unlike the C's
-///
-/// In C every field of `struct Curl_rlimit` is reachable from anywhere that
-/// includes `ratelimit.h`, and only `ratelimit.c` touches them by
-/// convention. Here that convention is enforced: the invariants below are
-/// upheld by the methods, and a caller that could write `tokens` directly
-/// could break all of them.
-///
 /// # Invariants
 ///
 /// * `0 <= spare_us < step_us` whenever `step_us > 0`. Established by
@@ -241,16 +151,6 @@ const CEIL_ADDEND: i64 = MILLI - 1;
 ///   zero would let a transfer that overshot its budget escape the
 ///   corresponding wait, which is precisely the averaging the option
 ///   promises.
-///
-/// # Neither [`Copy`] nor a shared reference
-///
-/// [`Copy`] is deliberately not derived even though every field is a scalar
-/// and the whole structure is about 60 bytes. This is mutable state: three of
-/// the query methods mutate through `&mut self` because the C's do, and an
-/// accidental copy -- `let mut r = dir.rlimit;` -- would drain the copy and
-/// silently leave the original unthrottled. [`Clone`] is derived, because an
-/// explicit clone is exactly what a test needs in order to assert that a call
-/// left the limiter untouched.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct RateLimit {
@@ -286,18 +186,6 @@ pub(crate) struct RateLimit {
 /// `r->rate_per_step * mstep_inc` at `:139`. In C that is undefined
 /// behaviour; in a debug Rust build it is a panic, and this module must
 /// never panic on a value the ABI accepts.
-///
-/// Each of those products is therefore computed in [`i128`], where it is
-/// EXACT for every 64-bit input, and brought back through this function.
-/// Widening rather than pre-clamping is what preserves the C's arithmetic:
-/// the two expressions above multiply before they divide, and clamping the
-/// product first would change the quotient rather than merely bounding it.
-///
-/// Saturation is the right narrowing here because every one of the three
-/// products feeds a duration or a rate that the C already saturates
-/// elsewhere: a wait longer than [`i64::MAX`] microseconds and a wait of
-/// exactly [`i64::MAX`] microseconds are the same instruction to a caller
-/// that is arming a timer.
 fn saturating_i64(value: i128) -> i64 {
     if value > i128::from(i64::MAX) {
         return i64::MAX;
@@ -322,12 +210,6 @@ impl RateLimit {
     /// `lib/setopt.c:2801` and `:2812` mean when they re-initialise a live
     /// limiter as `CURLOPT_MAX_SEND_SPEED_LARGE` or
     /// `CURLOPT_MAX_RECV_SPEED_LARGE` is set.
-    ///
-    /// `burst_per_sec` of 0 means "no cap", not "bank nothing". The two
-    /// interesting settings are recorded at `lib/ratelimit.h:42-47`: a burst
-    /// of [`i64::MAX`] averages the rate across the whole transfer, while a
-    /// burst equal to the rate keeps the transfer at or below the rate
-    /// throughout. curl itself always passes the second form.
     ///
     /// # Panics
     ///
@@ -373,16 +255,6 @@ impl RateLimit {
     /// Restarts limiting at `now`, tuning the step for `total_tokens` --
     /// `Curl_rlimit_start` (`lib/ratelimit.c:169-176`).
     ///
-    /// `total_tokens` is either -1 for "unknown" or the number of tokens the
-    /// transfer expects to consume in total. `lib/sendf.c:202` passes
-    /// `data->req.size` for a download whose length is known and
-    /// `lib/sendf.c:1198` passes -1 for an upload; [`Self::block`] passes -1
-    /// when it lifts a block, so that time spent blocked generates no tokens.
-    ///
-    /// Available tokens are reset to one step's worth and the spare
-    /// microseconds are discarded, which is what "with no history of the
-    /// past" means at `lib/ratelimit.h:50-51`.
-    ///
     /// # Panics
     ///
     /// Panics in a debug build if called with a `total_tokens` above 1 on a
@@ -404,13 +276,6 @@ impl RateLimit {
 
     /// Generates the tokens that have accrued since the last update --
     /// `rlimit_update` (`lib/ratelimit.c:33-75`).
-    ///
-    /// Called by [`Self::available`], [`Self::drain`] and [`Self::wait_ms`],
-    /// which are the three places the C calls it, and by nothing else. It is
-    /// private because it is the one operation that may only run on a limiter
-    /// that is actually limiting: its first line asserts
-    /// `r->rate_per_step`, and each of its three callers has already returned
-    /// for an unlimited or blocked limiter by the time it is reached.
     ///
     /// # The four ways it declines to do anything
     ///
@@ -439,15 +304,6 @@ impl RateLimit {
     ///    reasoning about it is a division by zero -- undefined behaviour in
     ///    C, a panic here -- and a guard that costs one comparison is
     ///    preferable to an argument that a later change could invalidate.
-    ///
-    /// # Why `spare_us` is added before the comparison and not after
-    ///
-    /// `:49-56` adds the pending microseconds to the measured interval,
-    /// compares the SUM against one step, and on a complete update splits the
-    /// sum into whole steps and a new remainder. Comparing the interval alone
-    /// would drop the pending time whenever the interval on its own reached a
-    /// step, and the transfer would then run slightly under its rate
-    /// permanently.
     fn update(&mut self, now: CurlTime) {
         // C: `DEBUGASSERT(r->rate_per_step);`
         debug_assert!(
@@ -531,44 +387,6 @@ impl RateLimit {
 
     /// Shortens the step so that the LAST step of a transfer is small --
     /// `rlimit_tune_steps` (`lib/ratelimit.c:77-150`).
-    ///
-    /// # The problem being solved, in the C's own words
-    ///
-    /// `lib/ratelimit.c:82-100` explains it, and the explanation is the
-    /// specification. Tokens arrive per step, and they may be spent in full
-    /// at the very start of a step; the rest of that step then has none,
-    /// which blocks consumption and holds the average at the rate. That works
-    /// up to the LAST step: when no more tokens are needed there is no wait,
-    /// so the last step finishes too fast, and the effect is most visible
-    /// when only a few steps are needed.
-    ///
-    /// The C's example: downloading 1.5kB at a rate limit of 1k could finish
-    /// in roughly one second -- 1k in the first second and the remaining 0.5k
-    /// at the start of the second one -- rather than in the two seconds the
-    /// rate implies.
-    ///
-    /// The remedy is to give the last step only about one percent of the
-    /// total and to spread the rest over slightly longer, slightly richer
-    /// steps before it.
-    ///
-    /// # Why this is transcribed and not improved
-    ///
-    /// It changes observable completion timing for small transfers, so a
-    /// different distribution is a behaviour change even when it is
-    /// defensible in isolation. Every quotient below truncates toward zero,
-    /// every comparison keeps the C's strictness, and the two `if`s that
-    /// guard against a zero increment are kept even though a zero increment
-    /// would be harmless to apply -- because applying it would still move
-    /// `tokens`, which the C leaves alone.
-    ///
-    /// # The three guards that make the arithmetic safe
-    ///
-    /// `:101-104` returns early for an unlimited limiter, for a total of 1 or
-    /// less (which is how -1, "unknown", is handled), and for a total above
-    /// `INT64_MAX / 1000`. The third is what bounds `tokens_main * 1000`
-    /// below the range of the type, so the C's plain multiplication cannot
-    /// overflow; the saturating form used here is belt and braces rather than
-    /// the mechanism.
     fn tune_steps(&mut self, tokens_total: i64) {
         if self.rate_per_step == 0
             || tokens_total <= 1
@@ -661,13 +479,6 @@ impl RateLimit {
 
     /// The tokens generated per step -- `Curl_rlimit_per_step`
     /// (`lib/ratelimit.c:178-181`).
-    ///
-    /// This is the TUNED rate once [`Self::start`] has run with a known
-    /// total, not the per-second rate the limiter was built with, and the
-    /// step it applies to is not necessarily a second. `lib/http2.c:215` uses
-    /// it to size a stream window, which is why it is exposed at all: a
-    /// window smaller than one step's tokens would throttle below the rate
-    /// limit, and one much larger would defeat it.
     #[allow(dead_code)]
     pub(crate) const fn per_step(&self) -> i64 {
         self.rate_per_step
@@ -675,19 +486,6 @@ impl RateLimit {
 
     /// Whether this limiter has anything to say -- `Curl_rlimit_active`
     /// (`lib/ratelimit.c:183-186`).
-    ///
-    /// True when the rate is positive OR the limiter is blocked. The second
-    /// disjunct is easy to miss and load-bearing: a blocked limiter has no
-    /// rate to enforce but must still report 0 available tokens, so a
-    /// transfer loop that consulted only the rate would run a paused transfer
-    /// at full speed.
-    ///
-    /// Note the asymmetry with the other methods, transcribed rather than
-    /// tidied: this one tests `rate_per_step > 0` while [`Self::available`],
-    /// [`Self::drain`], [`Self::wait_ms`] and [`Self::next_step_ms`] test
-    /// `rate_per_step != 0`. The two agree for every value the constructor's
-    /// assertion admits, and differ only for a negative rate, which is a
-    /// contract violation in the first place.
     #[allow(dead_code)]
     pub(crate) const fn is_active(&self) -> bool {
         self.rate_per_step > 0 || self.blocked
@@ -717,10 +515,6 @@ impl RateLimit {
     ///   and callers treat it as such: `lib/transfer.c:251-256` and
     ///   `lib/sendf.c:1202-1206` use the value to size the next read or write
     ///   and are content to be told a number larger than any buffer.
-    ///
-    /// A NEGATIVE answer is meaningful and is not clamped. `lib/multi.c:953`
-    /// and `:954` read "blocked" as `avail <= 0` rather than `== 0` for
-    /// exactly that reason.
     #[allow(dead_code)]
     pub(crate) fn available(&mut self, now: CurlTime) -> i64 {
         if self.blocked {
@@ -735,20 +529,6 @@ impl RateLimit {
 
     /// Spends `tokens` -- `Curl_rlimit_drain` (`lib/ratelimit.c:206-227`).
     ///
-    /// Called once per delivered chunk from progress accounting
-    /// (`lib/progress.c:342-356`), which is why the count is a [`usize`]: it
-    /// is a byte count that came from a buffer length.
-    ///
-    /// A blocked or unlimited limiter ignores the call entirely, exactly as
-    /// the C does -- so a paused transfer that somehow delivers bytes does
-    /// not accumulate a debt it would have to pay off after unpausing.
-    ///
-    /// Otherwise the limiter is brought up to date first and the balance is
-    /// then reduced, saturating at [`i64::MIN`] instead of wrapping. The
-    /// balance is ALLOWED to go negative: that debt is what
-    /// [`Self::wait_ms`] converts into a wait, and it is how a chunk larger
-    /// than one step's tokens is paid for over the following steps.
-    ///
     /// # One branch that looks wrong and is reproduced anyway
     ///
     /// `lib/ratelimit.c:214-219` reads:
@@ -761,21 +541,6 @@ impl RateLimit {
     ///   else
     /// #endif
     /// ```
-    ///
-    /// A drain too large to express as a signed 64-bit integer sets the
-    /// balance to `INT64_MAX` -- the most credit possible -- where the
-    /// arithmetic direction of the function would suggest `INT64_MIN`. It is
-    /// reproduced rather than corrected, because specification 0.8.1 freezes
-    /// observable behaviour and this is the shipped behaviour. It is also
-    /// unreachable in practice: the argument is a buffer length, and a single
-    /// buffer of more than eight exabytes cannot exist.
-    ///
-    /// `i64::try_from` reproduces both the branch AND its conditional
-    /// compilation, which is the reason it is written that way here. On a
-    /// 64-bit target the conversion fails on exactly the values for which
-    /// `tokens > INT64_MAX` holds; on a 32-bit target every [`usize`] fits
-    /// and the branch is unreachable, which is what the `#if` arranges in C.
-    /// All four mandated targets are 64-bit, so the live path is the first.
     #[allow(dead_code)]
     pub(crate) fn drain(&mut self, tokens: usize, now: CurlTime) {
         if self.blocked || self.rate_per_step == 0 {
@@ -803,11 +568,6 @@ impl RateLimit {
     /// How many milliseconds until tokens are available again --
     /// `Curl_rlimit_wait_ms` (`lib/ratelimit.c:229-254`).
     ///
-    /// Zero means "do not wait". A blocked limiter returns zero because a
-    /// block is not a wait -- it is lifted by a caller, never by the passage
-    /// of time -- and an unlimited limiter returns zero because it never
-    /// runs out. A limiter with a positive balance returns zero too.
-    ///
     /// # The wait is one step, plus the debt, minus what has already elapsed
     ///
     /// Three terms, in the C's order:
@@ -826,10 +586,6 @@ impl RateLimit {
     ///    and deducting it is what stops a caller polling every millisecond
     ///    from being told to wait a full step every time.
     ///
-    /// The result is rounded UP to milliseconds, so a wait of one microsecond
-    /// is reported as one millisecond rather than as zero. Reporting zero
-    /// would tell the caller not to wait at all and spin the transfer loop.
-    ///
     /// # How the transfer loop uses this
     ///
     /// From `lib/multi.c:1880-1921`, and recorded here rather than in the
@@ -845,10 +601,6 @@ impl RateLimit {
     ///   the two would return with the other direction still throttled;
     ///   and traces `[RLIMIT] waiting <n>ms`;
     /// * reports "try again later" for this cycle.
-    ///
-    /// When both waits are zero it consults [`Self::next_step_ms`] instead.
-    /// Neither the state transition nor the timer is this module's business:
-    /// see the module documentation.
     #[allow(dead_code)]
     pub(crate) fn wait_ms(&mut self, now: CurlTime) -> TimeDiff {
         if self.blocked || self.rate_per_step == 0 {
@@ -865,13 +617,6 @@ impl RateLimit {
 
         if self.tokens < 0 {
             // C: `debt_pct = ((-r->tokens) * 100 / r->rate_per_step);`
-            //
-            // Computed in `i128` for two reasons. The negation is exact even
-            // at `i64::MIN`, where C's `-r->tokens` is undefined behaviour
-            // and Rust's would panic; and the product survives a debt near
-            // `i64::MAX`, where multiplying by 100 leaves the range. The
-            // divisor is non-zero because the guard at the top of this
-            // function has already returned for a rate of zero.
             let debt_pct = saturating_i64(
                 -i128::from(self.tokens) * i128::from(PERCENT)
                     / i128::from(self.rate_per_step),
@@ -887,16 +632,6 @@ impl RateLimit {
         }
 
         // C: `elapsed_us = curlx_ptimediff_us(pts, &r->ts);`
-        //
-        // This comparison is defensive in the C and defensive here, and the
-        // reason is worth recording so that a reader does not mistake the
-        // gap in the coverage report for an untested branch. While the step
-        // is positive it cannot fire: a COMPLETE update moved `ts` to `now`,
-        // so the interval is zero, and an update that declined for being
-        // sub-step did so because `elapsed_us + spare_us < step_us`, which is
-        // exactly `elapsed_us < wait_us`. Debt only widens the gap. The one
-        // state that reaches it is the zero-step state, which no sequence of
-        // calls can produce -- see [`Self::update`]'s fourth case.
         let elapsed_us = timediff_us(now, self.ts);
         if elapsed_us >= wait_us {
             return 0;
@@ -910,34 +645,6 @@ impl RateLimit {
 
     /// How many milliseconds until this limiter next generates tokens --
     /// `Curl_rlimit_next_step_ms` (`lib/ratelimit.c:256-269`).
-    ///
-    /// Zero when the limiter is blocked, when it is unlimited, or when a
-    /// step's worth of time has already passed -- in the last case there is
-    /// nothing to wait for, because the tokens arrive on the next update.
-    ///
-    /// # This one does NOT update
-    ///
-    /// It reads `ts` and `spare_us` and mutates nothing, so it is the only
-    /// query here that takes `&self`. The C takes a mutable pointer, as all
-    /// of its accessors do, and never writes through it. That is not a
-    /// detail: the transfer loop calls this method for BOTH directions after
-    /// having called [`Self::wait_ms`] on both, and a hidden update here
-    /// would generate tokens between the two questions.
-    ///
-    /// # Why the loop needs it at all
-    ///
-    /// `lib/multi.c:1902-1915`: when neither direction needs to wait, the
-    /// transfer still has to be woken when tokens next arrive, "or it may
-    /// stall". The loop takes the MINIMUM of the two directions' answers,
-    /// falling back to the maximum when the minimum is zero -- so that a
-    /// direction which is not limited, and answers zero, does not cancel the
-    /// wake-up the other direction needs -- and arms the same `TOOFAST`
-    /// timer, tracing `[RLIMIT] next token update in <n>ms`.
-    ///
-    /// A negative interval is not guarded here, unlike in [`Self::update`],
-    /// and that is the C's behaviour rather than an oversight: a stale
-    /// timestamp makes the reported delay LONGER, which is safe, where
-    /// minting tokens for it would not be.
     #[allow(dead_code)]
     pub(crate) fn next_step_ms(&self, now: CurlTime) -> TimeDiff {
         if !self.blocked && self.rate_per_step != 0 {
@@ -955,31 +662,6 @@ impl RateLimit {
 
     /// Blocks or unblocks limiting -- `Curl_rlimit_block`
     /// (`lib/ratelimit.c:271-288`).
-    ///
-    /// This is how a pause is applied: `lib/transfer.c:896` and `:906` call
-    /// it with the pause state for the upload and download directions, and
-    /// `lib/request.c:162-163` unblocks both as a request begins.
-    ///
-    /// Setting the state it already has does nothing at all -- not even
-    /// moving the timestamp -- which is what makes it safe to call on every
-    /// cycle with the current pause state.
-    ///
-    /// # The two directions are not symmetrical
-    ///
-    /// Blocking sets the balance to zero. Unblocking calls
-    /// [`Self::start`] with an unknown total, so that the balance is reset
-    /// to one step's worth, the pending microseconds are discarded and the
-    /// step is left as it is. `lib/ratelimit.c:281-283` gives the reason:
-    /// "Start rate limiting fresh. The amount of time this was blocked does
-    /// not generate extra tokens."
-    ///
-    /// That asymmetry is the whole point. A blocked limiter whose timestamp
-    /// stayed put would, on unblocking, be asked for the tokens accrued
-    /// across the entire pause -- and a transfer paused for an hour would
-    /// then run unthrottled for as long as that credit lasted. Because
-    /// [`Self::start`] is called with -1, the tuning inside it returns
-    /// immediately, so unblocking never re-tunes a step: see
-    /// [`Self::start`]'s note on why tuning may run only once.
     #[allow(dead_code)]
     pub(crate) fn block(&mut self, activate: bool, now: CurlTime) {
         // C: `if(!activate == !r->blocked) return;` -- for two booleans that
@@ -998,13 +680,6 @@ impl RateLimit {
     }
 }
 
-// The tests below move time by hand. Not one of them sleeps, reads the host
-// clock or touches the network: every instant is a [`CurlTime`] built by
-// [`at_us`], and the scenarios that need a clock use [`TestClock`], which is
-// `pub(crate)` in `crate::util::timeval` precisely so that a consumer's tests
-// can inject it. That is what makes the line-coverage gate of
-// specification 0.8.4 reachable over this directory.
-//
 // `cargo test` builds with `debug_assertions` on, so the contract assertions
 // this module transcribes from the C's `DEBUGASSERT`s do fire during a test
 // run. The tests are split accordingly, following the convention already
@@ -1041,9 +716,9 @@ mod tests {
 
     /// [`i64::MAX`] as a [`usize`], for the drain-saturation tests.
     ///
-    /// All four mandated targets are 64-bit (specification 0.8.3), so the
-    /// conversion succeeds; on a hypothetical 32-bit target it would fail and
-    /// say so rather than silently truncating.
+    /// All four mandated targets are 64-bit, so the conversion succeeds; on a
+    /// hypothetical 32-bit target it would fail and say so rather than
+    /// silently truncating.
     fn i64_max_tokens() -> usize {
         usize::try_from(i64::MAX).expect("a 64-bit target")
     }
@@ -1913,11 +1588,6 @@ mod tests {
 
     /// Runs `total` tokens through `limiter` on a virtual clock, waiting
     /// whenever it asks to, and returns the microseconds the transfer took.
-    ///
-    /// This is the C's transfer loop reduced to its pacing:
-    /// `lib/multi.c:1880-1899` asks for a wait and idles for it,
-    /// `lib/transfer.c:251-256` sizes the next read by the available tokens,
-    /// and `lib/progress.c:342-347` drains what was delivered.
     fn deliver(limiter: &mut RateLimit, total: usize) -> TimeDiff {
         let clock = TestClock::new(at_us(0));
         let mut remaining = total;

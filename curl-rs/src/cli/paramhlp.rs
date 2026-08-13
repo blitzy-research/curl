@@ -4,9 +4,8 @@
 
 //! The exact parameter acceptance rules of curl 8.19.0-DEV.
 //!
-//! Port of `src/tool_paramhlp.c` (733 lines) and `src/tool_paramhlp.h`: the
-//! numeric, protocol and list parameter parsing, with curl's exact acceptance
-//! rules.
+//! Port of `src/tool_paramhlp.c` and `src/tool_paramhlp.h`: the numeric,
+//! protocol and list parameter parsing, with curl's exact acceptance rules.
 //!
 //! This module is the arbiter of what curl accepts and what curl rejects, so
 //! its behaviour is frozen: a value curl rejects must be
@@ -94,21 +93,21 @@
 //!
 //! * **The URL list.** `config->url_list` and `config->url_last`
 //!   (`src/tool_cfgable.h:102-103`) are owned by
-//!   `curl-rs/src/config/mod.rs`, and AAP section 0.6.9 replaces the intrusive
-//!   `struct getout *next` chain with an owned collection, so the push is that
+//!   `curl-rs/src/config/mod.rs`, which holds the intrusive
+//!   `struct getout *next` chain as an owned collection, so the push is that
 //!   owner's operation. [`new_getout`] nevertheless performs C's append and
 //!   tail update as one indivisible step, because the owner reaches it through
 //!   the [`UrlList`] port declared here: the aggregate implements three
 //!   methods, and nothing of it is named, owned or reached into here. That
 //!   keeps `src/tool_paramhlp.c:41-52` atomic -- list, tail and counter cannot
-//!   disagree -- without rebuilding the god-struct coupling AAP section 0.4.2
-//!   removes.
+//!   disagree -- without rebuilding the god-struct coupling this tree does not
+//!   have.
 //! * **The password prompt.** `curl-rs/src/terminal.rs`'s `getpass_r` takes
 //!   its prompt as `&[u8]`, so the username interpolated at
 //!   `src/tool_paramhlp.c:582` reaches the terminal as the bytes the command
 //!   line supplied. Nothing on the path decodes: both the prompt and the
-//!   composed credential are byte-exact, which is what AAP section 0.8.1
-//!   freezes, because Basic authentication encodes precisely those bytes.
+//!   composed credential are byte-exact, because Basic authentication encodes
+//!   precisely those bytes.
 //!
 //! Terminal width, password echo suppression and local-time conversion are
 //! likewise complete: `curl-rs/src/terminal.rs` and `curl-rs/src/util.rs`
@@ -1825,8 +1824,7 @@ type PromptFn<'a> = &'a mut dyn FnMut(&[u8], usize) -> Vec<u8>;
 /// credential taken from a command line is a byte string that need not be valid
 /// UTF-8. Composing through `format!` would require decoding it first, and
 /// `String::from_utf8_lossy` would put U+FFFD on the terminal where C puts the
-/// user's own bytes -- a change to frozen CLI output, which AAP section 0.8.1
-/// rules out. The prompt is therefore built into a `Vec<u8>` and
+/// user's own bytes -- a change to frozen CLI output, which is ruled out. The prompt is therefore built into a `Vec<u8>` and
 /// [`crate::terminal::getpass_r`] takes `&[u8]`, so no decoding happens
 /// anywhere on the path. Only `kind` and the URL number are text, and both are
 /// ASCII literals produced here.
@@ -1899,7 +1897,7 @@ fn checkpasswd(
     // a `char *` copies the username byte for byte, so a name that is not
     // valid UTF-8 must not be re-encoded on the way to the terminal; rendering
     // it through `String::from_utf8_lossy` would put U+FFFD on the terminal in
-    // its place and change the emitted bytes, which AAP section 0.8.1 forbids.
+    // its place and change the emitted bytes, which is forbidden.
     // `i + 1` is the one-based URL number that `%zu` receives at `:583`.
     let urlnum = i.saturating_add(1);
     let mut prompt_text: Vec<u8> = Vec::new();
@@ -1938,7 +1936,7 @@ fn checkpasswd(
     // redirected file supplying one -- and C would compose the credential from
     // the bytes before it only. Copying the whole buffer instead would send
     // different credential bytes than the oracle sends, which is precisely the
-    // wire behaviour AAP section 0.8.1 freezes.
+    // frozen wire behaviour.
     let passwd_cstr = match passwd.iter().position(|byte| *byte == 0) {
         Some(nul) => passwd.get(..nul).unwrap_or(&passwd),
         None => &passwd,
@@ -2076,8 +2074,8 @@ fn get_args_with(
 /// Translation difference 1 in the module documentation. `:40` declares
 /// `static int outnum = 0;` **inside** `new_getout`, so it is a
 /// process-global monotonic counter shared by every config set, not a
-/// per-config index. AAP section 0.1.2 replaces the C tree's shared mutable
-/// state with "per-module structs and explicit ownership", and a mutable
+/// per-config index. The C tree's shared mutable state becomes per-module
+/// structs with explicit ownership, and a mutable
 /// `static` is forbidden outright, so the counter becomes a field owned by
 /// whichever aggregate owns the URL list -- `curl-rs/src/config/mod.rs` -- and
 /// is reached through [`UrlList::sequence`]. A `static AtomicU32` would
@@ -2143,9 +2141,9 @@ pub(crate) struct NewGetOut {
 /// C's signature is `new_getout(struct OperationConfig *config)`: one
 /// parameter, and everything else is read out of it. This port is that
 /// parameter. `OperationConfig` and the list itself live in
-/// `curl-rs/src/config/mod.rs`, which AAP section 0.4.2 keeps out of this
-/// file's imports -- "one import per type actually used" replaces the C tree's
-/// blanket `#include "urldata.h"` -- so the *capabilities* are declared here
+/// `curl-rs/src/config/mod.rs`, which stays out of this file's imports -- one
+/// import per type actually used, in place of the C tree's blanket
+/// `#include "urldata.h"` -- so the *capabilities* are declared here
 /// and the aggregate implements them. Nothing here names, owns or reaches into
 /// that aggregate, and the three methods are exactly the three things `:35-55`
 /// does with `config`:
@@ -2170,8 +2168,8 @@ pub(crate) trait UrlList {
     ///
     /// This is `:42-49` in one operation, which is what makes it atomic:
     /// `if(last) last->next = node; else config->url_list = node;` followed by
-    /// `config->url_last = node;`. AAP section 0.6.9 replaces the intrusive
-    /// `struct getout *next` chain with an owned collection, so "append last"
+    /// `config->url_last = node;`. The intrusive `struct getout *next` chain
+    /// becomes an owned collection, so "append last"
     /// and "move the tail" stop being two writes that can disagree -- the tail
     /// is wherever the last element is. An implementation that kept a separate
     /// tail cursor would have to update it here, inside this one call, and not
@@ -2181,9 +2179,8 @@ pub(crate) trait UrlList {
     /// at `src/tool_getparam.c:1108`, `:1349`, `:1392` and `:1496` keep that
     /// pointer in `config->url_get`, `url_out` or `url_ul` and then fill the
     /// node in, so a stable handle to the appended node has to come back out.
-    /// AAP section 0.6.9 turns exactly this kind of retained pointer into a
-    /// key, "so a stale handle is detectably stale rather than a dangling
-    /// pointer".
+    /// Exactly this kind of retained pointer becomes a key instead, so a stale
+    /// handle is detectably stale rather than a dangling pointer.
     ///
     /// # Errors
     ///
@@ -2282,8 +2279,8 @@ mod tests {
         MsgConfig::new(false, true, false)
     }
 
-    /// The nine schemes AAP 0.6.5 puts in scope, alphabetically ordered as the
-    /// engine orders them.
+    /// The nine in-scope schemes, alphabetically ordered as the engine orders
+    /// them.
     const IN_SCOPE_SCHEMES: &[&str] = &[
         "file", "ftp", "ftps", "http", "https", "scp", "sftp", "ws", "wss",
     ];
@@ -3204,7 +3201,7 @@ mod tests {
         // The path is live for real presets: `--proto-redir`'s
         // (`src/tool_getparam.c:2349-2355`) names ftp and ftps, which a build
         // without the `ftp` feature does not advertise, and the stubbed schemes
-        // of AAP 0.2.2 are never advertised by any build.
+        // of the stubbed set are never advertised by any build.
         let preset = ["http", "https", "gopher", "smtp"];
         assert_eq!(
             proto2num(&info, &preset, "", &mut sink, &loud())
@@ -3892,8 +3889,8 @@ mod tests {
     /// Stand-in for the `OperationConfig` that `curl-rs/src/config/mod.rs`
     /// owns, holding exactly the three things [`UrlList`] exposes.
     ///
-    /// `nodes` is the owned collection AAP section 0.6.9 puts in place of the
-    /// intrusive `next` chain, so its last element *is* `config->url_last` --
+    /// `nodes` is the owned collection standing in for the intrusive `next`
+    /// chain, so its last element *is* `config->url_last` --
     /// which is why an append that leaves the tail stale is not expressible
     /// here, and why `refuse` exists to exercise `:37`'s failure instead.
     struct FakeConfig {

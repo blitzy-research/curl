@@ -21,14 +21,8 @@
 // SPDX-License-Identifier: curl
 //
 //**************************************************************************/
-//! Transfer accounting and timing -- supersedes `lib/progress.c` (685 lines)
-//! and `lib/progress.h` (91).
-//!
-//! The state is the measured `struct Progress` and `struct pgrs_dir` of
-//! `lib/urldata.h:786-831`, transcribed field for field. Everything a
-//! transfer reports about itself lives here: the byte counters, the average
-//! and current speeds, the eight timer accumulators, the five timestamps and
-//! the six-slot speed history.
+//! Transfer accounting and timing -- supersedes `lib/progress.c` and
+//! `lib/progress.h`.
 //!
 //! Four consumers read this state, and every one of them is a frozen
 //! contract:
@@ -62,20 +56,9 @@
 //!    `progress_meter` reads, so relocating the presentation layer cannot
 //!    change what it prints.
 //!
-//! It also arms no timer and reads no clock. `pgrs_speedcheck` (`:132-169`)
-//! ends in `Curl_expire(data, 1000, EXPIRE_SPEEDCHECK)`; here
-//! [`Progress::speedcheck`] returns [`SpeedCheck::Expire`] and the transfer
-//! loop arms it. `Curl_pgrs_now` (`:171-177`) called `curlx_pnow` directly;
-//! here every method either takes a pinned [`CurlTime`] or receives a
-//! [`Clock`] to sample, and `Instant::now` and `SystemTime::now` appear
-//! nowhere in this file.
-//!
 //! # Timing is transcribed, not re-derived
 //!
-//! Specification 0.8.1 freezes observable behaviour and 0.1.1 makes
-//! performance an explicit non-goal, so faithfulness wins wherever it
-//! competes with elegance. For this module that has five concrete
-//! consequences, each pinned by a test:
+//! For this module that has five concrete consequences, each pinned by a test:
 //!
 //! 1. **Microseconds are the unit of every accumulator**, because the
 //!    `CURLINFO_*_TIME_T` values are microseconds. Nothing here converts to
@@ -94,35 +77,6 @@
 //! 5. **The callback return codes keep their exact meanings**, including the
 //!    distinction between `CURL_PROGRESSFUNC_CONTINUE`, zero and everything
 //!    else.
-//!
-//! # Where this sits in the dependency order
-//!
-//! Downwards only, and to four modules: [`CURLcode`] and [`Error`] from
-//! `crate::error`, [`RateLimit`] from `crate::transfer::ratelimit`,
-//! [`TimeDiff`] from `crate::util::timediff`, and [`CurlTime`], [`Clock`],
-//! [`timediff_ms`] and [`timediff_us`] from `crate::util::timeval`.
-//!
-//! The coupling with rate limiting runs one way, fixed by
-//! `lib/urldata.h:786-791`: `struct pgrs_dir` EMBEDS a `struct Curl_rlimit`,
-//! so [`ProgressDirection`] owns a [`RateLimit`] and nothing in
-//! `ratelimit.rs` may ever hold a [`Progress`].
-//!
-//! Three pieces of state the C keeps elsewhere are taken as arguments rather
-//! than reached for, because the god-struct they live in is being
-//! decomposed:
-//!
-//! * `data->set.low_speed_limit` and `data->set.low_speed_time`
-//!   (`lib/urldata.h:1336` and `:1452`) arrive as [`LowSpeedLimit`];
-//! * `Curl_xfer_recv_is_paused` and `Curl_xfer_send_is_paused` arrive as
-//!   [`Paused`];
-//! * `data->req.done` (`lib/urldata.h:1105`) arrives as the `req_done`
-//!   argument.
-//!
-//! One field moves INTO this module: `data->state.keeps_speed`
-//! (`lib/urldata.h:941`), the low-speed timestamp that `pgrs_speedinit`
-//! (`lib/progress.c:124-127`) zeroes. `lib/progress.c` is its only reader and
-//! its only writer, so it belongs with the accounting that uses it rather
-//! than in a shared state block.
 
 use crate::error::{CURLcode, Error};
 use crate::transfer::ratelimit::RateLimit;
@@ -132,12 +86,6 @@ use crate::util::timeval::{timediff_ms, timediff_us, Clock, CurlTime};
 /// Slots in the speed history -- `CURL_SPEED_RECORDS` of
 /// `lib/urldata.h:820`, spelled `(5 + 1)` there and commented "6 entries for
 /// 5 seconds".
-///
-/// The arithmetic behind the comment: a record is added at most once a
-/// second, so six records span five inter-record intervals and the current
-/// speed is measured over approximately five seconds. Widening the ring
-/// would lengthen that window and change every reported current speed, which
-/// `--write-out %{speed_download}` and the meter both print.
 #[allow(dead_code)]
 pub(crate) const CURL_SPEED_RECORDS: usize = 5 + 1;
 
@@ -168,11 +116,6 @@ const US_PER_SEC: i64 = 1_000_000;
 
 /// The largest byte count that can be multiplied by [`US_PER_SEC`] without
 /// leaving [`i64`] -- the C's `CURL_OFF_T_MAX / 1000000`.
-///
-/// Two places compare against it, and they compare DIFFERENTLY: [`trspeed`]
-/// uses `<` (`lib/progress.c:401`) while the current-speed calculation uses
-/// `>` (`:471`). Both spellings are preserved, so the boundary value itself
-/// takes the same branch here as it does in C.
 #[allow(dead_code)]
 const SPEED_OVERFLOW_LIMIT: i64 = i64::MAX / US_PER_SEC;
 
@@ -228,14 +171,11 @@ const CALLBACK_ABORTED: &str = "Callback aborted";
 ///
 /// # Two differences from the C, both deliberate
 ///
-/// 1. **`TIMER_LAST` has no counterpart.** The C's trailing "must be last"
-///    sentinel exists so that a bound can be written for an array or a range
-///    check, and `grep -rn TIMER_LAST lib/ src/` finds exactly one hit: its
-///    own declaration. Nothing converts a `timerid` across a boundary, and
-///    no public header names one, so no ordinal meaning has to be preserved
-///    and a variant that may never be passed would be a variant every
-///    `match` here had to reject. [`Self::VARIANTS`] serves the one real need
-///    the sentinel would have met, which is enumerating the labels in a test.
+/// 1. Nothing converts a `timerid` across a boundary, and no public header
+///    names one, so no ordinal meaning has to be preserved and a variant that
+///    may never be passed would be a variant every `match` here had to reject.
+///    [`Self::VARIANTS`] serves the one real need the sentinel would have met,
+///    which is enumerating the labels in a test.
 /// 2. **`TIMER_POSTRANSFER` is spelled [`Self::PostTransfer`].** The C
 ///    identifier is missing a letter (`lib/progress.h:40`) while the field it
 ///    writes is spelled correctly (`lib/urldata.h:810`,
@@ -330,13 +270,6 @@ impl TimerId {
 }
 
 /// One entry of the speed history.
-///
-/// The C keeps two parallel arrays, `speed_amount[CURL_SPEED_RECORDS]` and
-/// `speed_time[CURL_SPEED_RECORDS]` (`lib/urldata.h:822-823`). They are
-/// merged into one array of pairs here because every one of the four writes
-/// in `progress_calc` sets both members at the same index in the same
-/// statement pair, and two arrays that are always written together are two
-/// chances to write only one of them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 struct SpeedRecord {
@@ -349,18 +282,6 @@ struct SpeedRecord {
 
 /// One direction of a transfer -- `struct pgrs_dir` of
 /// `lib/urldata.h:786-791`.
-///
-/// Both directions carry the same four members, which is why the C factored
-/// them out, and the factoring is kept: `CURLINFO_SIZE_DOWNLOAD_T` and
-/// `CURLINFO_SIZE_UPLOAD_T` read the same field of two different values.
-///
-/// The fields are private with read accessors. The rule the schema sets is
-/// that a field becomes visible when a consumer names it, and the consumers
-/// here -- `easy/getinfo.rs` and the command-line meter -- read rather than
-/// write. Writing goes through [`Progress`], which is where the invariants
-/// live: a total size is meaningless without the matching `*_size_known`
-/// flag, and that flag is a field of [`Progress`] rather than of this
-/// structure, exactly as in the C.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct ProgressDirection {
@@ -425,10 +346,6 @@ impl ProgressDirection {
 /// `low_speed_limit` (`lib/urldata.h:1336`) and `low_speed_time`
 /// (`lib/urldata.h:1452`).
 ///
-/// Passed in rather than stored because they belong to the option block, not
-/// to the accounting: `curl_easy_setopt` may change either between two
-/// checks, and a copy held here would go stale.
-///
 /// # The widths are the C's
 ///
 /// `limit_bps` is a `curl_off_t`, so [`i64`]. `time_secs` is a `uint16_t`,
@@ -478,11 +395,6 @@ impl LowSpeedLimit {
 
     /// The exact text `failf` writes when the window expires --
     /// `lib/progress.c:152-154`.
-    ///
-    /// Reproduced operand for operand, including the two spaces the C's
-    /// string concatenation happens to leave in place and the plural
-    /// "seconds" regardless of the value. This string reaches
-    /// `CURLOPT_ERRORBUFFER`, so specification 0.8.1 freezes it.
     #[allow(dead_code)]
     fn too_slow(self) -> Error {
         Error::with_context(
@@ -498,10 +410,6 @@ impl LowSpeedLimit {
 /// Whether either direction of the transfer is paused -- the results of
 /// `Curl_xfer_recv_is_paused` and `Curl_xfer_send_is_paused` at
 /// `lib/progress.c:136`.
-///
-/// Taken as an argument because pause state belongs to the transfer's
-/// send and receive paths. The C comment at `:137` gives the reason it
-/// matters: "A paused transfer is not qualified for speed checks".
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct Paused {
@@ -534,13 +442,6 @@ impl Paused {
 /// `curl_off_t`, which is what the fields already are; the deprecated
 /// `CURLOPT_PROGRESSFUNCTION` takes them as `double`, which the four
 /// `*_f64` accessors below produce.
-///
-/// # The argument order is part of the ABI
-///
-/// Download first, then upload; total before current within each direction:
-/// `(clientp, dltotal, dlnow, ultotal, ulnow)`. The field order here is the
-/// same so that a reader comparing this structure with the C call cannot
-/// transpose a pair.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct ProgressSnapshot {
@@ -589,17 +490,6 @@ impl ProgressSnapshot {
 }
 
 /// Everything the built-in meter reads, handed over in one value.
-///
-/// The eleven fields are exactly what `progress_meter`
-/// (`lib/progress.c:515-600`) touches, and no more: it reads `p->timespent`,
-/// both directions' three numbers, both `*_size_known` flags,
-/// `p->current_speed` and `p->headers_out`. Enumerating them here is what
-/// makes the relocation of the renderer safe -- if a field it needs were
-/// missing, this structure would not compile against it.
-///
-/// `data->state.resume_from`, which `progress_meter` also reads at `:531`, is
-/// deliberately absent: it is a resume offset owned by the transfer's request
-/// state and never by the accounting, and it reaches the renderer from there.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct MeterSnapshot {
@@ -629,12 +519,6 @@ pub(crate) struct MeterSnapshot {
 }
 
 /// Which of the two progress callbacks a handle has installed.
-///
-/// The C tests the two function pointers in a fixed order --
-/// `if(data->set.fxferinfo) ... else if(data->set.fprogress)`
-/// (`lib/progress.c:612` and `:630`) -- so the modern callback wins when both
-/// are set. That precedence is the implementor's to report through
-/// [`ProgressCallback::flavour`], and this enumeration is how it says which.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum CallbackFlavour {
@@ -645,20 +529,6 @@ pub(crate) enum CallbackFlavour {
 }
 
 /// The progress-callback surface, injected.
-///
-/// The C reaches three globals of the easy handle at once -- the two function
-/// pointers, the opaque `data->set.progress_client`, and the `in_callback`
-/// flag that `Curl_set_in_callback` toggles. All three are behind this trait,
-/// which is what lets the whole update path be exercised with no easy handle
-/// in existence.
-///
-/// # Object safe on purpose
-///
-/// Every method takes `&self` or `&mut self` and none is generic, so
-/// `&mut dyn ProgressCallback` works. The transfer loop holds a boxed
-/// callback whose type is not known to this module, and a test holds a
-/// concrete recorder; both are accepted by the `&mut C` where
-/// `C: ProgressCallback + ?Sized` that every method here takes.
 #[allow(dead_code)]
 pub(crate) trait ProgressCallback {
     /// Which callback is installed, or [`None`] when neither is.
@@ -669,12 +539,6 @@ pub(crate) trait ProgressCallback {
 
     /// Sets or clears the handle's `in_callback` flag --
     /// `Curl_set_in_callback(data, TRUE)` and `(data, FALSE)`.
-    ///
-    /// Never called by an implementor of this trait: it is called by this
-    /// module, immediately before and immediately after the callback, through
-    /// the guard described under [`Progress::report`]. The flag is what makes
-    /// `curl_easy_*` re-entry from inside a callback detectable, so leaving
-    /// it set would misreport every later call on the handle.
     fn set_in_callback(&mut self, active: bool);
 
     /// Invokes `CURLOPT_XFERINFOFUNCTION` and returns its `int`.
@@ -693,17 +557,6 @@ pub(crate) trait ProgressCallback {
 }
 
 /// A handle with no progress callback installed.
-///
-/// The named consumer is the transfer loop before either option has been
-/// set, which is the overwhelmingly common case: the built-in meter, not a
-/// callback, is what curl uses by default. It also keeps the tests that
-/// exercise the meter decision from having to define a callback they do not
-/// use.
-///
-/// [`Self::flavour`] reports [`None`], so the other three methods are
-/// unreachable. They are still implemented rather than left to panic,
-/// because a panic is a worse contract than a defined no-op for a method
-/// nothing calls.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct NoProgressCallback;
@@ -725,11 +578,6 @@ impl ProgressCallback for NoProgressCallback {
 }
 
 /// Brackets one callback invocation with the handle's `in_callback` flag.
-///
-/// This is the "injected callback-state guard": the flag itself belongs to the
-/// handle and is reached through [`ProgressCallback::set_in_callback`], while
-/// the bracketing lives here so that the ordering the C establishes at
-/// `lib/progress.c:615-621` and `:633-639` is written once.
 ///
 /// # Why a guard rather than two calls
 ///
@@ -854,12 +702,6 @@ pub(crate) struct Done {
     /// Whether to draw the built-in meter one last time.
     pub(crate) meter: Meter,
     /// Whether the built-in meter still owes a trailing newline.
-    ///
-    /// `lib/progress.c:199-202` writes `"\n"` to `data->set.err` when the
-    /// progress is neither hidden nor delegated to a callback, because the
-    /// meter has been overwriting one line with a leading `\r` and the cursor
-    /// is still on it. The write belongs to the adapter that owns the stream;
-    /// the DECISION is accounting, so it is made here.
     pub(crate) write_newline: bool,
 }
 
@@ -875,16 +717,6 @@ pub(crate) struct Done {
 /// else                                  return CURL_OFF_T_MAX;
 /// ```
 ///
-/// # Why four branches rather than one division
-///
-/// The obvious formulation, `size * 1000000 / us`, overflows for a size above
-/// about 9.2 terabytes, which is a reachable download. The C's second branch
-/// therefore multiplies first only when it provably can, its third loses
-/// precision in the duration instead of the size, and its fourth gives up and
-/// returns the largest representable rate. Reordering them or collapsing two
-/// would change a reported speed, and `--write-out %{speed_download}` prints
-/// it.
-///
 /// # The two places this saturates and C does not
 ///
 /// Both are undefined behaviour in C and cannot be reproduced literally:
@@ -897,9 +729,6 @@ pub(crate) struct Done {
 ///   `-SPEED_OVERFLOW_LIMIT`. The branch condition is `size <
 ///   SPEED_OVERFLOW_LIMIT`, which every negative size satisfies, so the C's
 ///   guard protects only the positive side.
-///
-/// The third branch's division cannot fault: its guard is `us >= 1000000`, so
-/// `us / 1000000` is at least 1.
 #[allow(dead_code)]
 fn trspeed(size: i64, us: TimeDiff) -> i64 {
     if us < 1 {
@@ -916,43 +745,10 @@ fn trspeed(size: i64, us: TimeDiff) -> i64 {
 
 /// Everything one transfer reports about itself -- `struct Progress` of
 /// `lib/urldata.h:793-831`.
-///
-/// # [`Default`] is the calloc-zeroed state, not the initialised state
-///
-/// A C easy handle is allocated with `calloc`, so its `struct Progress`
-/// begins all-zero, and `Curl_init_userdefined` then sets exactly one field
-/// away from zero: `data->progress.hide = TRUE` (`lib/url.c:495`, repeated at
-/// `lib/easy.c:1109` for `curl_easy_reset`). That is because
-/// `CURLOPT_NOPROGRESS` defaults to 1 -- libcurl draws no meter unless asked.
-///
-/// [`Default`] here reproduces the calloc state, which means a freshly
-/// defaulted value is NOT hidden. The easy-handle initialiser must therefore
-/// call [`Self::set_hide`] with `true`, exactly as the C's initialiser does.
-/// The two-step shape is kept rather than folded into one default because it
-/// is what the C does and because `CURLOPT_NOPROGRESS` is the single option
-/// that decides it; a [`Default`] that silently applied an option's default
-/// would put option policy in the wrong module.
-///
-/// # Ownership
-///
-/// Every field is private. The read surface is the accessors below -- named
-/// after the `CURLINFO` each one answers, so that `easy/getinfo.rs` reads
-/// like `lib/getinfo.c:417-462` -- and the write surface is the operations
-/// named after `lib/progress.h`. Nothing here is `pub`, because no exported
-/// symbol names a transfer's accounting directly.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct Progress {
     /// `now`: the most recently sampled instant.
-    ///
-    /// The C keeps this so that `Curl_pgrs_now` has somewhere to put the
-    /// reading it takes, and so that a transfer driven by a multi handle can
-    /// share one reading across every handle in a cycle -- `Curl_pgrs_now`
-    /// writes `&data->multi->now` when a multi handle is attached and
-    /// `&data->progress.now` otherwise (`lib/progress.c:171-177`). The
-    /// multi-handle half of that choice belongs to the multi handle; what
-    /// remains here is the per-transfer reading, written by
-    /// [`Self::sample`].
     now: CurlTime,
     /// `lastshow`: the whole second in which the meter was last shown, or 0
     /// to force a redraw. A `time_t` in C, compared against
@@ -1044,12 +840,6 @@ impl Progress {
 
     /// Samples `clock`, stores the reading and returns it -- `Curl_pgrs_now`
     /// (`lib/progress.c:171-177`).
-    ///
-    /// The one method here that reads a clock, and it reads an INJECTED one.
-    /// Callers that need several operations to agree on a single instant --
-    /// which is most of them, because a byte count and the timestamp it was
-    /// measured at have to match -- sample once and pass the result along, as
-    /// [`Self::time`], [`Self::check`] and [`Self::done`] show.
     #[allow(dead_code)]
     pub(crate) fn sample(&mut self, clock: &dyn Clock) -> CurlTime {
         let now = clock.now();
@@ -1067,17 +857,6 @@ impl Progress {
 
     /// Clears the counters and forgets both sizes -- `Curl_pgrsReset`
     /// (`lib/progress.c:207-215`).
-    ///
-    /// The C body, in order: upload counter to 0, download counter to 0, both
-    /// sizes to -1 (which stores 0 and marks them unknown), the record
-    /// counter to 0, and the low-speed marker cleared. The order is
-    /// immaterial here because no step reads what an earlier step wrote, but
-    /// it is preserved so the two files read alike.
-    ///
-    /// Note what it does NOT reset: the timer accumulators, the timestamps
-    /// and the speed history's contents all survive. The record COUNTER going
-    /// to zero is what makes the stale contents unreachable, because
-    /// [`Self::calculate`] then takes its first-record branch.
     #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         self.set_upload_counter(0);
@@ -1090,11 +869,6 @@ impl Progress {
 
     /// Forgets both expected sizes and nothing else --
     /// `Curl_pgrsResetTransferSizes` (`lib/progress.c:218-222`).
-    ///
-    /// Called when a transfer is about to be retried or redirected and the
-    /// sizes learnt from the previous response no longer apply. The counters,
-    /// the speed history and every timer survive, which is the whole point of
-    /// having a second, narrower reset.
     #[allow(dead_code)]
     pub(crate) fn reset_transfer_sizes(&mut self) {
         self.set_download_size(-1);
@@ -1103,21 +877,6 @@ impl Progress {
 
     /// Starts the transfer at `now` -- `Curl_pgrsStartNow`
     /// (`lib/progress.c:328-340`).
-    ///
-    /// Six assignments: the record counter to 0, [`Self::start`] to `now`,
-    /// the start-transfer guard cleared, both current counters to 0, and both
-    /// sizes marked unknown.
-    ///
-    /// # One faithful subtlety
-    ///
-    /// The two `total_size` fields are NOT touched, only the two `*_known`
-    /// flags. A total size left over from a previous request therefore
-    /// survives here while being reported as unknown, which is exactly what
-    /// the C does -- and it is why `CURLINFO_CONTENT_LENGTH_DOWNLOAD_T`
-    /// consults the flag rather than the field. Zeroing the fields as well
-    /// would look tidier and would change what a callback sees, because
-    /// `lib/progress.c:617` passes `dl.total_size` to the callback WITHOUT
-    /// consulting the flag.
     #[allow(dead_code)]
     pub(crate) fn start_now(&mut self, now: CurlTime) {
         self.speeder_c = 0;
@@ -1140,12 +899,6 @@ impl Progress {
 
     /// Records the expected download size -- `Curl_pgrsSetDownloadSize`
     /// (`lib/progress.c:366-376`).
-    ///
-    /// A non-negative `size` is stored and marked known; a negative one --
-    /// which is how every caller says "unknown" -- stores 0 and marks it
-    /// unknown. Storing 0 rather than leaving the previous value is
-    /// deliberate in the C and is reproduced: the callback receives the field
-    /// unconditionally, so a stale value would leak to it.
     #[allow(dead_code)]
     pub(crate) fn set_download_size(&mut self, size: i64) {
         if size >= 0 {
@@ -1173,12 +926,6 @@ impl Progress {
 
     /// Sets the uploaded byte count outright --
     /// `Curl_pgrsSetUploadCounter` (`lib/progress.c:361-364`).
-    ///
-    /// Distinct from [`Self::upload_inc`]: this is an assignment, so it does
-    /// NOT drain the rate limiter. The C keeps both because a rewind or a
-    /// resumed upload has to move the counter without pretending bytes were
-    /// just sent, and charging a limiter for bytes that never crossed the
-    /// socket would throttle the transfer that follows.
     #[allow(dead_code)]
     pub(crate) fn set_upload_counter(&mut self, size: i64) {
         self.ul.cur_size = size;
@@ -1186,14 +933,6 @@ impl Progress {
 
     /// Adds `delta` downloaded bytes at `now` --
     /// `Curl_pgrs_download_inc` (`lib/progress.c:342-348`).
-    ///
-    /// A zero `delta` is ignored entirely, counter and limiter alike, which
-    /// the C's `if(delta)` arranges. The same `now` reaches the counter and
-    /// the limiter, because a token bucket brought up to date at a different
-    /// instant from the bytes it is charged for paces the transfer at a rate
-    /// nothing asked for. The C reads the clock inside this function; here
-    /// the reading is the caller's, which is what makes the pairing provable
-    /// in a test.
     #[allow(dead_code)]
     pub(crate) fn download_inc(&mut self, delta: usize, now: CurlTime) {
         if delta == 0 {
@@ -1229,15 +968,6 @@ impl Progress {
 
     /// Informs the accounting that receiving has been paused or resumed --
     /// `Curl_pgrsRecvPause` (`lib/progress.c:224-230`).
-    ///
-    /// Only RESUMING does anything: `if(!enable)` clears the speed history
-    /// and the low-speed marker. The asymmetry is the point. A pause makes
-    /// the measured rate collapse through no fault of the transfer, so the
-    /// history gathered before it would drag the current speed down and the
-    /// low-speed abort would fire on a transfer that is behaving perfectly.
-    /// Discarding the history on resume starts the measurement again;
-    /// discarding it on pause would achieve nothing, because no measurement
-    /// happens while paused.
     #[allow(dead_code)]
     pub(crate) fn recv_pause(&mut self, enable: bool) {
         if !enable {
@@ -1274,13 +1004,6 @@ impl Progress {
     /// Records `timestamp` at `timer` -- `Curl_pgrsTimeWas`
     /// (`lib/progress.c:243-315`).
     ///
-    /// The C header explains why the timestamp is a parameter
-    /// (`lib/progress.h:75-79`): "This allows updating timers later and is
-    /// used by happy eyeballing, where we only want to record the winner's
-    /// times." A dual-stack connection attempt races several sockets, and the
-    /// loser's timings must not be recorded, so the winner's are replayed
-    /// after the fact.
-    ///
     /// # The five kinds of label
     ///
     /// 1. **Origins.** [`TimerId::StartOp`] sets the operation and queue
@@ -1307,9 +1030,6 @@ impl Progress {
     /// 5. **The absolute measurement.** [`TimerId::Redirect`] ASSIGNS the
     ///    microseconds from the overall start -- it does not accumulate --
     ///    and restarts the queue origin at `timestamp`.
-    ///
-    /// [`TimerId::None`] mutates nothing. The C reaches it through `default:`
-    /// as well and calls it a "mistake filter".
     #[allow(dead_code)]
     pub(crate) fn time_was(&mut self, timer: TimerId, timestamp: CurlTime) {
         // The C hoists a `timediff_t *delta` and lets the switch either
@@ -1388,12 +1108,6 @@ impl Progress {
 }
 
 /// Which accumulator [`Progress::time_was`] is about to add to.
-///
-/// The successor of the C's `timediff_t *delta` local
-/// (`lib/progress.c:246`). It exists because a `&mut` into `self` cannot be
-/// held while the rest of `self` is being written, so the decision and the
-/// write are separated by a value rather than by a pointer. It is private and
-/// never crosses a boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 enum Accumulator {
@@ -1412,17 +1126,6 @@ enum Accumulator {
 }
 
 /// A byte count as the signed integer every counter here is.
-///
-/// The C adds a `size_t` straight into a `curl_off_t`, which is a widening
-/// conversion on all four mandated targets and therefore exact. This is that
-/// conversion, written so that it cannot silently do anything else: the
-/// fallback is [`i64::MAX`], which [`i64::saturating_add`] at the call site
-/// then leaves the counter pinned at its ceiling rather than wrapping it into
-/// a negative byte count.
-///
-/// Unreachable in practice -- it needs a single delta above eight exabytes --
-/// and unreachable on a 32-bit target by construction, where every [`usize`]
-/// fits.
 #[allow(dead_code)]
 fn as_i64(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
@@ -1433,11 +1136,6 @@ impl Progress {
 
     /// Recomputes every derived figure and reports whether the meter is due
     /// -- `progress_calc` (`lib/progress.c:410-485`).
-    ///
-    /// Three things happen unconditionally: [`Self::timespent`] becomes the
-    /// microseconds since [`Self::start`], and each direction's average speed
-    /// becomes [`trspeed`] of its byte count over that span. Everything after
-    /// that concerns the six-slot history and the current speed.
     ///
     /// # The history, and the four ways a call can end
     ///
@@ -1466,10 +1164,10 @@ impl Progress {
     /// wraps it to zero, and the next call then finds `!p->speeder_c` true and
     /// takes the first-record branch -- discarding the history and reporting
     /// the whole-transfer average as the current speed for one call. That is
-    /// what curl 8.x does, roughly every 256 seconds of a long transfer, and
-    /// specification 0.8.1 freezes it. [`u8::wrapping_add`] is the wrap
-    /// written explicitly, because a plain `+= 1` would panic in a debug
-    /// build at exactly the moment the C wraps.
+    /// what curl 8.x does, roughly every 256 seconds of a long transfer, and it
+    /// is frozen. [`u8::wrapping_add`] is the wrap written explicitly, because
+    /// a plain `+= 1` would panic in a debug build at exactly the moment the C
+    /// wraps.
     ///
     /// # The once-per-second throttle
     ///
@@ -1571,12 +1269,6 @@ impl Progress {
     }
 
     /// The combined byte count both directions have transferred.
-    ///
-    /// `p->dl.cur_size + p->ul.cur_size`, which appears four times in
-    /// `progress_calc` and once in `progress_meter`. Saturating rather than
-    /// wrapping: two counters that together exceed [`i64::MAX`] cannot arise
-    /// from real byte counts, and a wrapped negative total would make the
-    /// current speed nonsense rather than merely inexact.
     #[allow(dead_code)]
     const fn transferred(&self) -> i64 {
         self.dl.cur_size.saturating_add(self.ul.cur_size)
@@ -1600,10 +1292,6 @@ impl Progress {
     ///    the C returns `CURLE_OK` before reaching `progress_meter`. Only
     ///    `CONTINUE` leaves the built-in behaviour in play. Anything else is
     ///    an abort.
-    ///
-    /// The callback is bracketed by [`CallbackGuard`], which sets the
-    /// handle's `in_callback` flag on entry and clears it on exit -- including
-    /// on an unwinding exit.
     #[allow(dead_code)]
     fn report<C: ProgressCallback + ?Sized>(
         &mut self,
@@ -1653,11 +1341,6 @@ impl Progress {
 
     /// Recalculates without reporting -- `Curl_pgrsUpdate_nometer`
     /// (`lib/progress.c:681-684`).
-    ///
-    /// The C discards `progress_calc`'s answer with an explicit `(void)`
-    /// cast. Used where the accounting must stay current but a callback would
-    /// be wrong -- `lib/multi.c:2361` calls it while a transfer is being torn
-    /// down, where invoking user code again would be a re-entrancy hazard.
     #[allow(dead_code)]
     pub(crate) fn update_nometer(&mut self, now: CurlTime, req_done: bool) {
         let _ = self.calculate(now, req_done);
@@ -1666,20 +1349,14 @@ impl Progress {
     /// Updates, then checks the low speed -- `Curl_pgrsCheck`
     /// (`lib/progress.c:668-676`).
     ///
-    /// The C runs the speed check only `if(!result && !data->req.done)`: an
-    /// update that failed short-circuits it, and a finished request is not
-    /// checked at all, because a transfer that has just delivered its last
-    /// byte would otherwise be aborted for having gone quiet.
-    ///
     /// # One pinned instant, where the C samples twice
     ///
     /// `Curl_pgrsCheck` calls `Curl_pgrs_now(data)` at `:672` and again at
     /// `:674`, so the two halves see readings microseconds apart. Here both
     /// halves use `now`. Nothing observable changes -- the second reading is
     /// never compared with the first, and both are compared only against
-    /// timestamps taken far earlier -- while a single instant is what makes
-    /// the pair reproducible from a pinned clock, which the coverage gate of
-    /// specification 0.8.4 depends on.
+    /// timestamps taken far earlier -- while a single instant is what makes the
+    /// pair reproducible from a pinned clock.
     #[allow(dead_code)]
     pub(crate) fn check<C: ProgressCallback + ?Sized>(
         &mut self,
@@ -1699,16 +1376,6 @@ impl Progress {
     }
 
     /// Forces a final update -- `Curl_pgrsDone` (`lib/progress.c:191-205`).
-    ///
-    /// Zeroing [`Self::lastshow`] first is what makes the update unthrottled:
-    /// the comparison at `:481` can then only match a reading whose whole
-    /// second is itself zero.
-    ///
-    /// The C writes a trailing newline to `data->set.err` when the progress
-    /// is neither hidden nor delegated to a callback. That write belongs to
-    /// the stream's owner, so it is reported as [`Done::write_newline`]
-    /// instead -- and it is reported only on the success path, because the C
-    /// returns before the write when the update failed.
     #[allow(dead_code)]
     pub(crate) fn done<C: ProgressCallback + ?Sized>(
         &mut self,
@@ -1729,38 +1396,6 @@ impl Progress {
     /// Aborts a transfer that has been too slow for too long --
     /// `pgrs_speedcheck` (`lib/progress.c:132-169`), annotated
     /// `@unittest: 1606`.
-    ///
-    /// # The order of the guards matters
-    ///
-    /// An unarmed check and a paused transfer both return
-    /// [`SpeedCheck::Skipped`] WITHOUT arming the timer, because the C
-    /// returns at `:138` before reaching `Curl_expire`. Every other path arms
-    /// it, including the one where the current speed is negative and the
-    /// comparison is skipped entirely.
-    ///
-    /// # Why a negative current speed is not compared
-    ///
-    /// `if(data->progress.current_speed >= 0)` at `:140`.
-    /// [`Self::calculate`] can leave the current speed negative when a
-    /// counter was reset between two records, which makes the amount between
-    /// them negative. Treating that as "slower than the limit" would abort a
-    /// transfer for an artefact of its own bookkeeping, so the C declines to
-    /// judge and waits for the next second.
-    ///
-    /// # The marker, and what "too long" means
-    ///
-    /// [`Self::keeps_speed`] holds the instant the transfer first went under
-    /// the limit, and a zero SECONDS field means "not currently under it" --
-    /// the C tests `if(!data->state.keeps_speed.tv_sec)` at `:142` and clears
-    /// it with `tv_sec = 0` at `:161`, leaving the microseconds untouched.
-    /// That partial clear is reproduced: [`CurlTime::ZERO`] would also make
-    /// the test pass, but writing only the seconds field is what the C does
-    /// and the difference is observable through nothing else, so the narrower
-    /// write is kept.
-    ///
-    /// The comparison is `howlong >= low_speed_time * 1000` in milliseconds,
-    /// so a transfer that has been slow for EXACTLY the configured window
-    /// fails. One millisecond less passes.
     #[allow(dead_code)]
     pub(crate) fn speedcheck(
         &mut self,
@@ -1849,11 +1484,6 @@ impl Progress {
 
     /// Whether a progress callback has been installed --
     /// `lib/setopt.c:2576-2589`.
-    ///
-    /// Read to decide the trailing newline. Kept distinct from
-    /// [`ProgressCallback::flavour`] on purpose: the C's `progress.callback`
-    /// bit records that an option was set to a non-null pointer, and it
-    /// survives into places that hold no callback at all.
     #[allow(dead_code)]
     pub(crate) const fn uses_callback(&self) -> bool {
         self.callback
@@ -2008,12 +1638,6 @@ impl Progress {
     }
 
     /// `CURLINFO_CONTENT_LENGTH_DOWNLOAD_T` -- `lib/getinfo.c:429-432`.
-    ///
-    /// The stored total when it is known, and -1 when it is not. The -1 is
-    /// the whole reason the flag exists: a known length of zero and an
-    /// unknown length are different answers, and both are representable only
-    /// because the flag is consulted rather than the field tested against
-    /// zero.
     #[allow(dead_code)]
     pub(crate) const fn content_length_download(&self) -> i64 {
         if self.dl_size_known {
@@ -2082,14 +1706,6 @@ impl Progress {
     }
 }
 
-// The tests below move time by hand. Not one of them sleeps, reads the host
-// clock, resolves a name or opens a socket: every instant is either a
-// [`CurlTime`] built by [`at_us`] or a reading from a [`TestClock`], which is
-// `pub(crate)` in `crate::util::timeval` precisely so that a consumer's tests
-// can inject it. That is what makes the line-coverage gate of
-// specification 0.8.4 reachable over this directory, and it is why nothing in
-// the module above reads a clock of its own.
-//
 // A `#[cfg(test)]` module is a CHILD of the module it tests, so these tests
 // reach private fields directly. That is used sparingly and only where the
 // public path cannot construct the state under test -- setting
@@ -2133,15 +1749,6 @@ mod tests {
     }
 
     /// A defaulted [`Progress`] whose current speed is pinned.
-    ///
-    /// Every low-speed test needs exactly this one field set and nothing else,
-    /// because [`Progress::speedcheck`] reads only that field of the
-    /// accounting. Arranging it through a whole calculation would test two
-    /// things at once and would fix the byte counts as a side effect.
-    ///
-    /// Struct-update syntax rather than a defaulted value followed by an
-    /// assignment: `clippy::field_reassign_with_default` rejects the latter,
-    /// and the gate is `-D warnings`.
     fn at_speed(current_speed: i64) -> Progress {
         Progress {
             current_speed,
@@ -2164,13 +1771,6 @@ mod tests {
     }
 
     /// A recording [`ProgressCallback`].
-    ///
-    /// Stands in for the three things the C reaches through the easy handle:
-    /// the two function pointers, and the `in_callback` flag that
-    /// `Curl_set_in_callback` toggles. It records enough to assert the
-    /// bracketing as well as the arguments, because "the flag is cleared
-    /// afterwards" and "the flag was set during the call" are different
-    /// claims and both matter.
     #[derive(Debug, Default)]
     struct Recorder {
         /// What [`ProgressCallback::flavour`] reports.
@@ -3593,11 +3193,6 @@ mod tests {
 
     #[test]
     fn the_absent_callback_is_a_defined_no_op_rather_than_a_panic() {
-        // [`NoProgressCallback::flavour`] returns None, so the three methods
-        // below are never reached through [`Progress::update`]. They are still
-        // implemented, and this exercises them directly: a defined answer is a
-        // better contract for a method nothing calls than a panic that would
-        // turn a future caller's mistake into an abort.
         let mut host = NoProgressCallback;
         let snapshot = ProgressSnapshot::default();
         host.set_in_callback(true);

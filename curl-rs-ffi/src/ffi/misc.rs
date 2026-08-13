@@ -23,7 +23,7 @@
 //! | `curl_strequal`           | `curl.h:2424`  | `int`                        | `lib/strequal.c:76-84`    |
 //! | `curl_strnequal`          | `curl.h:2425`  | `int`                        | `lib/strequal.c:87-95`    |
 //! | `curl_version`            | `curl.h:2688`  | `char *`                     | `lib/version.c:145`       |
-//! | `curl_version_info`       | `curl.h:3221`  | `curl_version_info_data *`   | `lib/version.c:396`       |
+//! | `curl_version_info`       | `curl.h:3221`  | `curl_version_info_data *`   | `lib/version.c:596`       |
 //! | `curl_pushheader_bynum`   | `multi.h:502`  | `char *`                     | `lib/http2.c:657-668`     |
 //! | `curl_pushheader_byname`  | `multi.h:504`  | `char *`                     | `lib/http2.c:673-702`     |
 //! | `curl_easy_header`        | `header.h:58`  | `CURLHcode`                  | `lib/headers.c:55-118`    |
@@ -73,7 +73,7 @@
 //! parse, how case folding works, which bytes percent-encode, which header
 //! matches an origin mask -- is answered by `curl-rs-lib`, and this file
 //! marshals. That division is what keeps the ABI shim auditable in isolation
-//! (specification 0.3.3, pattern P10) and is why the module has no tables,
+//! (the facade pattern) and is why the module has no tables,
 //! no parser and no encoding set of its own.
 //!
 //! # Ownership at the boundary, which is not uniform either
@@ -112,45 +112,6 @@
 //!   `&data->state.headerout[0]` and `[1]`. **No returned pointer here ever
 //!   addresses a Rust temporary.**
 //!
-//! [`curl_free`] is the linchpin of that arrangement. It is the counterpart of
-//! every heap pointer libcurl hands out -- from the two escape functions here,
-//! from `curl_easy_escape` and `curl_easy_unescape`, from `curl_url_get`,
-//! `curl_multi_get_handles`, `curl_maprintf` and `curl_mvaprintf` -- and it
-//! must free through exactly the allocator those functions allocate from. Get
-//! it wrong and every heap-returning symbol in the crate corrupts memory.
-//!
-//! # [`curl_version`] is a machine-read contract
-//!
-//! `tests/runtests.pl` runs `curl --version` at start-up and parses two of its
-//! lines (`:640-730`): `Protocols:` feeds `parseprotocols()`, and `Features:`
-//! populates a map over a fixed 52-name vocabulary. **874 of the 1,914 fixtures
-//! gate on `<features>`, and the asymmetry is decisive: under-reporting a
-//! capability makes a fixture skip, whereas over-reporting makes it run and
-//! fail.** Truthful advertisement is therefore the optimal strategy and not
-//! merely the honest one, and two consequences of that were settled deliberately
-//! rather than by accident:
-//!
-//! * **`Debug` and `TrackMemory` are withheld.** `tests/runtests.pl:660` sets
-//!   `$feature{"TrackMemory"}` from a `Debug` token in the banner, and the whole
-//!   memory-checking block is wrapped in `if($feature{"TrackMemory"})` at
-//!   `tests/runtests.pl:1759`, so withholding `Debug` makes the 28 `<limits>`
-//!   fixtures inert.
-//!   The stated cost is that 98 fixtures skip and `make torture-test` does not
-//!   apply (`:847-849`). Nothing here may contradict that by emitting `Debug`.
-//! * **The rustls token is the truthful one, not `rustls-ffi`.**
-//!   `tests/runtests.pl:585-586` keys `$feature{"rustls"}` off a `rustls-ffi`
-//!   token, so a native banner reading `rustls/0.23.42` does not match and the
-//!   rustls-gated fixtures skip. Emitting `rustls-ffi` would unlock them while
-//!   misdescribing an implementation that uses rustls natively rather than
-//!   through its C FFI, so accuracy wins and the skips are accepted.
-//!
-//! The composition itself -- which parts appear, in which order, with which
-//! separators, and which of the 31 `CURL_VERSION_*` bits are set -- belongs to
-//! `curl-rs-lib/src/version.rs` for that reason. This file only marshals, and
-//! the version it reports is `8.19.0-DEV` (`LIBCURL_VERSION_NUM 0x081300`),
-//! which is also the version the harness substitutes for `%VERSION` when it
-//! compares `User-Agent` bytes.
-//!
 //! # Why the immortal storage is built lazily, and why only its ADDRESS is kept
 //!
 //! `curl_version_info_data` holds raw pointers, so it is neither `Send` nor
@@ -163,7 +124,7 @@
 //! That choice is forced, not stylistic. C returns `curl_version_info_data *`
 //! -- a MUTABLE pointer into a mutable `static` -- so a caller has always been
 //! able to write through it and race with libcurl. That hazard belongs to the
-//! frozen signature (specification 0.8.1) and is reproduced rather than fixed:
+//! frozen signature and is reproduced rather than fixed:
 //! narrowing the return type to `const` would break every consumer that assigns
 //! it to a non-const variable. Reproducing it correctly means the returned
 //! pointer must carry WRITE provenance, and a pointer obtained by casting a
@@ -192,15 +153,30 @@
 //!   a test. See [`promised_fields`].
 //!
 //! What follows from that is a genuine answer rather than a placeholder, and
-//! the difference is that it is COMPUTED: an empty [`HeaderStore`] is what every
-//! easy handle in this build has, `lib/headers.c:73-74` answers an empty list
-//! with `CURLHE_NOHEADERS`, and the engine call below reaches the same verdict
-//! by the same route -- after the argument validation `lib/headers.c:69-72`
-//! performs first, so a bad `origin` still yields `CURLHE_BAD_ARGUMENT` rather
-//! than being masked. The projection into `struct curl_header` and the two
-//! output slots that keep its pointers alive are implemented and tested here in
-//! full, because `HeaderView`'s fields are public and a view can be built
-//! directly; only the store they would be filled from is missing.
+//! the difference is that C already wrote the answer down. **Both of these
+//! entry points exist TWICE in the C source**: once for a build that has them,
+//! and once for a build that does not. `lib/headers.c:365-394` and
+//! `lib/http2.c:2993-3011` are the second definitions, reached through
+//! `#else`, and they are terse -- `CURLHE_NOT_BUILT_IN`, NULL, NULL, NULL, with
+//! every parameter cast to void. This build satisfies the conditions those
+//! `#else`s guard, so those are the definitions it reproduces, selected by
+//! [`HEADER_API_IS_BUILT_IN`] and [`PUSH_API_IS_BUILT_IN`], each derived from
+//! the engine's own capability marker rather than hand-set.
+//!
+//! That was read late, and it corrected this module. Until it was, the header
+//! lookup ran the built-in branch's validation against a freshly created empty
+//! store and answered `CURLHE_NOHEADERS` -- a third behaviour matching neither
+//! C branch, and a claim that the API works and this transfer merely carried no
+//! headers. No transfer happened. Specification 0.6.5's asymmetry decides it:
+//! under-reporting a capability is safe, over-reporting is not.
+//!
+//! The built-in branch is written and tested here in full and is not
+//! speculative: the projection into `struct curl_header`, the two output slots
+//! that keep its pointers alive, the folded name match, the origin mask, the
+//! request comparison and the staleness check all run in the tests through
+//! [`HeaderState`] directly, because `HeaderView`'s fields are public and a view
+//! can be built without a store. Only the store's filling is missing, and that
+//! is the one thing that flips the constant.
 
 use core::ffi::{c_char, c_int, c_long, c_uint, c_void};
 use core::ptr;
@@ -220,20 +196,15 @@ use super::types::{curl_pushheaders, curl_version_info_data};
 
 /// `time_t` on all four supported targets.
 ///
-/// Every mandated target is 64-bit Unix with a signed 64-bit `time_t`
-/// (specification 0.8.3 lists them; the reasoning is recorded in
-/// `curl-rs-lib/src/util/parsedate.rs`), so the engine's `i64` and the C
-/// `time_t` are the same type rather than merely the same width. 32-bit targets
-/// are deliberately out of scope, so no narrowing case exists to handle.
+/// Every mandated target is 64-bit Unix with a signed 64-bit `time_t`, so the
+/// engine's `i64` and the C `time_t` are the same type rather than merely the
+/// same width. 32-bit targets are deliberately out of scope, so no narrowing
+/// case exists to handle.
 type TimeT = i64;
 
 // Immortal storage helpers.
 
 /// Leaks a NUL-terminated copy of `text`, returning a pointer C may keep.
-///
-/// Called only from the two version accessors and only once per string per
-/// process, so the leak is the intended lifetime and not an oversight: the C it
-/// supersedes uses `static` buffers for exactly these strings.
 ///
 /// An interior NUL cannot survive the trip -- a C string has no way to carry
 /// one -- so the text is truncated at the first NUL rather than dropped. That
@@ -252,12 +223,6 @@ fn immortal_c_string(text: &str) -> *const c_char {
 }
 
 /// Leaks a NULL-terminated array of NUL-terminated strings.
-///
-/// Both `protocols` and `feature_names` are declared this way, and the
-/// authority's comments say so explicitly: "protocols is terminated by an entry
-/// with a NULL protoname" and "feature_names is terminated by an entry with a
-/// NULL feature name" (`include/curl/curl.h:3119`, `:3169`). A consumer walks
-/// until it sees the NULL, so the terminator is not optional.
 fn immortal_c_array(items: &[&'static str]) -> *const *const c_char {
     let mut pointers: Vec<*const c_char> =
         items.iter().map(|item| immortal_c_string(item)).collect();
@@ -267,12 +232,6 @@ fn immortal_c_array(items: &[&'static str]) -> *const *const c_char {
 }
 
 /// An `Option<&str>` as either a C string or NULL.
-///
-/// Most of `curl_version_info_data`'s string fields are documented as "might be
-/// NULL", and in this build several always are, because the library they name is
-/// not linked. NULL is the contract's way of saying "not available" and is what
-/// a C consumer tests for, so `None` becomes a null pointer rather than an
-/// empty string.
 fn immortal_c_option(text: Option<&'static str>) -> *const c_char {
     match text {
         Some(value) => immortal_c_string(value),
@@ -281,9 +240,6 @@ fn immortal_c_option(text: Option<&'static str>) -> *const c_char {
 }
 
 /// A possibly-null C string as an `Option<&CStr>`.
-///
-/// The one place in this module that turns C's "NULL means absent" convention
-/// into Rust's, so the callers below contain no null tests of their own.
 ///
 /// # Safety
 ///
@@ -314,23 +270,13 @@ unsafe fn borrow<'a>(ptr: *const c_char) -> Option<&'a CStr> {
 /// }
 /// ```
 ///
-/// That forward is reproduced literally rather than duplicated. Duplicating the
-/// marshalling would create two places for the length convention to drift, and
-/// the drift would be invisible because the legacy names have far fewer callers.
-/// The header spells the second parameter `length` (`curl.h:2705`) where the
-/// implementation spells it `inlength`; the header is the declaration the
-/// generated one must match, so `length` it is.
-///
 /// A zero `length` means the string is measured with `strlen`
 /// (`lib/escape.c:59`); any other value is trusted absolutely, so the encode
 /// reads that many bytes whether or not a NUL appears first. The escaped
 /// character set, the case of the hex digits and the unreserved set all belong
 /// to `curl_rs_lib::url::escape`, which pins them against an oracle measured
 /// from the frozen library -- necessarily, because percent-encoding is
-/// wire-visible and 1,476 fixtures compare exact bytes (specification 0.6.7).
-///
-/// Returns a caller-owned, NUL-terminated string that must be released with
-/// [`curl_free`], or null when `string` is null or `length` is negative.
+/// wire-visible and 1,476 fixtures compare exact bytes.
 ///
 /// # Safety
 ///
@@ -351,17 +297,6 @@ pub unsafe extern "C" fn curl_escape(
 /// Percent-decodes a string. The pre-7.15.4 name for `curl_easy_unescape`
 /// (`curl.h:2718-2721`, defined in [`super::escape`]).
 ///
-/// Supersedes `curl_unescape` (`lib/escape.c:42-45`), a single call into
-/// `curl_easy_unescape` with a null handle and no out-parameter. Because the
-/// decoded length is discarded, a decoded NUL truncates the result as far as any
-/// caller can tell -- `curl_easy_unescape` decodes with `REJECT_NADA`
-/// (`lib/escape.c:170-171`), so `"a%00b"` really does decode to three bytes with
-/// a NUL in the middle. That is why the modern name exists and why this one is
-/// not merely a shorter spelling.
-///
-/// Returns a caller-owned buffer that must be released with [`curl_free`], or
-/// null when `string` is null or `length` is negative.
-///
 /// # Safety
 ///
 /// As [`curl_escape`].
@@ -381,15 +316,6 @@ pub unsafe extern "C" fn curl_unescape(
 // curl_free
 
 /// Releases a buffer libcurl allocated for the caller.
-///
-/// Supersedes `curl_free` (`lib/escape.c:189-192`), which is a one-line forward
-/// to the replaceable `free` hook. A null argument is a no-op, as it is in C.
-///
-/// This exists because libcurl may have been built against, or configured with,
-/// a different allocator than the application's; a buffer from [`curl_escape`],
-/// [`curl_getenv`] or `curl_easy_escape` must go back to the allocator that
-/// produced it. Returning `void` means there is no error channel at all, so a
-/// contained panic is swallowed silently rather than reported.
 ///
 /// # Safety
 ///
@@ -412,28 +338,10 @@ pub unsafe extern "C" fn curl_free(p: *mut c_void) {
 
 /// Converts a date string to seconds since the Unix epoch.
 ///
-/// Supersedes `curl_getdate` (`lib/parsedate.c:561-575`). Returns `-1` when the
-/// string cannot be converted.
-///
-/// The second parameter is, in the authority's own words, a "legacy argument
-/// from the past that we ignore" (`lib/parsedate.c:565`), and `curl.h:2870`
-/// names it `unused`. It is still part of the frozen signature, so it keeps both
-/// its place and its name, and it is still ignored -- including when it is
-/// non-null.
-///
 /// Every format curl accepts is accepted, because `curl_getdate` is exported
 /// and applications parse arbitrary server dates through it: RFC 1123, RFC 850,
 /// asctime and the tolerated variants, with the six-part walk, the timezone
 /// table and the two-digit-year pivot all living in `curl-rs-lib`'s parser.
-///
-/// # Why `-1` is unambiguous
-///
-/// `-1` is both the failure sentinel and a representable instant, one second
-/// before the epoch. The engine resolves the collision the way C does: a
-/// successful parse landing on `-1` is incremented to `0`, so no successful
-/// parse ever returns `-1` and the sentinel is unambiguous. That decision lives
-/// in `curl-rs-lib` beside the parser, which is why this function can map
-/// `None` to `-1` with a bare `unwrap_or`.
 ///
 /// # Safety
 ///
@@ -488,9 +396,6 @@ pub unsafe extern "C" fn curl_getdate(
 /// filtering curl does not perform is added, and no check it does perform is
 /// omitted.
 ///
-/// The result is a heap copy, not a pointer into the environment, and must be
-/// released with [`curl_free`].
-///
 /// # Safety
 ///
 /// `variable` must be either null or a pointer to a NUL-terminated string.
@@ -534,9 +439,6 @@ fn os_bytes(value: &std::ffi::OsStr) -> &[u8] {
 // curl_strequal / curl_strnequal
 
 /// Case-insensitive comparison of two whole strings.
-///
-/// Supersedes `curl_strequal` (`lib/strequal.c:76-84`). Returns non-zero when
-/// the strings match, zero otherwise. Two null pointers compare equal.
 ///
 /// The folding is **locale-independent ASCII** and deliberately neither Unicode
 /// nor locale-aware, which matters beyond this function's size: `lib/easygetopt.c:39`
@@ -591,7 +493,7 @@ pub unsafe extern "C" fn curl_strnequal(
 /// into a `static char out[300]`. The composition -- which parts appear, in
 /// which order, with which separators -- is `curl-rs-lib`'s, because the test
 /// harness parses this string to decide which fixtures to run
-/// (specification 0.6.5) and so it is a machine-read contract rather than
+/// and so it is a machine-read contract rather than
 /// display text. The module documentation records the two banner decisions that
 /// follow from that: `Debug` and `TrackMemory` are withheld, and the rustls
 /// token is the truthful one rather than `rustls-ffi`.
@@ -618,16 +520,13 @@ pub extern "C" fn curl_version() -> *mut c_char {
 
 /// Returns the version and capability report.
 ///
-/// Supersedes `curl_version_info` (`lib/version.c:396`). The `CURLversion`
+/// Supersedes `curl_version_info` (`lib/version.c:596`). The `CURLversion`
 /// argument is accepted and ignored, exactly as C ignores it -- `(void)stamp;`
-/// at `lib/version.c:419` -- because the struct only ever grew, so an older
+/// at `lib/version.c:619` -- because the struct only ever grew, so an older
 /// consumer simply reads fewer fields and `age` tells it how many are valid.
 /// `curl.h:3221` leaves the parameter UNNAMED, which `verify-synopsis.pl`
 /// depends on when it rewrites `, parameter);` to `, ...);`, and the return is
 /// non-const; both are preserved.
-///
-/// The returned pointer addresses immortal storage the caller must not free,
-/// and so do the two NULL-terminated arrays it carries.
 ///
 /// # Why the address is leaked and stored as a `usize`
 ///
@@ -675,24 +574,12 @@ pub extern "C" fn curl_version_info(
 
 /// Copies the engine's report into the C layout, once.
 ///
-/// Field for field, in the authority's order, which is historically frozen and
-/// append-only: the struct grew across twelve `CURLVERSION_*` generations with
-/// `CURLversion age` first, so no field may be reordered and none removed.
-/// Every value comes from `curl_rs_lib::version_info()`; nothing is decided
-/// here, and in particular only a `CURL_VERSION_*` bit that is genuinely true
-/// is set, by the same under-report-is-safe asymmetry the banner obeys.
-///
 /// # Where the C widths are put on
 ///
 /// The engine reports fixed-width Rust integers -- `u32`, `i32`, `i64` -- and
 /// this function is where they become `c_uint`, `c_int` and `c_long`. That
-/// split is deliberate: the engine must not carry native-width
-/// assumptions, so `core::ffi` types appear only in the crate that owns the C
-/// ABI. The casts are written out rather than left to inference even though the
-/// types coincide on all four targets of specification 0.8.3, because a silent
-/// coincidence is not a boundary -- naming the conversion is what makes this
-/// the one place a width is asserted, and curl's ABI fixes these widths in the
-/// header regardless of what any compiler would have chosen.
+/// split is deliberate: the engine must not carry native-width assumptions, so
+/// `core::ffi` types appear only in the crate that owns the C ABI.
 fn build_report() -> curl_version_info_data {
     let info = curl_rs_lib::version_info();
 
@@ -727,9 +614,7 @@ fn build_report() -> curl_version_info_data {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The HTTP/2 PUSH_PROMISE field set behind `struct curl_pushheaders *`.
-// ---------------------------------------------------------------------------
 
 /// The promised fields of one `PUSH_PROMISE`, in the form the ABI hands back.
 ///
@@ -741,17 +626,6 @@ fn build_report() -> curl_version_info_data {
 /// NUL-terminated `name:value` string and `curl_pushheader_bynum` can return it
 /// directly. Here the terminated form has to be owned by something with the
 /// lifetime of the push callback, and this is that something.
-///
-/// Every lookup RULE stays in the engine. `PushHeaders::by_num` decides the
-/// bound and `PushHeaders::by_name` decides the whole of the name grammar -- the
-/// empty-name and bare-colon rejections, the middle-colon rejection, the leading
-/// colon that pseudo-fields need, the byte-exact case-SENSITIVE prefix match and
-/// the requirement that the next stored byte be the colon. None of that is
-/// restated here, because restating it is how the two would come to disagree.
-///
-/// `struct curl_pushheaders` is a forward declaration only (`multi.h:500`), so
-/// it is genuinely incomplete and this type owes it no layout. Nothing here
-/// gives it a body.
 struct PushSession {
     /// The engine's field set. Adopted whole, and the authority for both
     /// lookups.
@@ -762,16 +636,7 @@ struct PushSession {
 
 impl PushSession {
     /// Adopt an engine field set, building the NUL-terminated form beside it.
-    ///
-    /// The HTTP/2 layer calls this once per `PUSH_PROMISE`, immediately before
-    /// it invokes the application's `curl_push_callback`, and drops the result
-    /// when the callback returns -- which is exactly the window `multi.h:507-511`
-    /// documents the two accessors as valid in.
-    ///
-    /// An interior NUL is truncated, because a C string cannot carry one and
-    /// `lib/http2.c:1478` built its entries with `%s`, which stops at the first
-    /// NUL for the same reason.
-    #[allow(dead_code)] // caller not landed: protocols/http2.rs
+    #[allow(dead_code)] // no FFI caller: the promise set is always empty here
     fn adopt(fields: PushHeaders) -> Self {
         let terminated = (0..fields.count())
             .map(|at| {
@@ -809,14 +674,6 @@ impl PushSession {
     }
 
     /// The value of the first field with this name, as C returns it.
-    ///
-    /// `lib/http2.c:706` returns `&stream->push_headers[i][len + 1]` -- a
-    /// pointer into the MIDDLE of the matched entry, immediately past the
-    /// colon, with **no blank skipping**, so a promise carrying `x: y` answers
-    /// `" y"` with the space included. That is reproduced by returning the same
-    /// offset into this session's own terminated copy of the same entry, which
-    /// is NUL-terminated from that offset onwards for the same reason the whole
-    /// string is.
     fn byname(&mut self, name: &[u8]) -> *mut c_char {
         // The engine decides both whether there is an answer and where inside
         // its entry the answer starts. Its result is a borrow of ITS storage,
@@ -860,14 +717,6 @@ impl PushSession {
 /// to `usize` and comparing integers is defined -- no arithmetic crosses an
 /// allocation boundary -- and the entries are walked in the engine's own order,
 /// so the first match is the entry the engine chose.
-///
-/// The lower bound is STRICT. `by_name` returns `entry[len + 1..]` where `len`
-/// is the matched name's length and the name is never empty, so the offset is
-/// always at least 2 and an offset of 0 is not a possible answer. Requiring
-/// `target > start` therefore costs nothing and removes the one ambiguity
-/// address comparison would otherwise have: an empty tail sits one past the end
-/// of its entry, which could coincide with the start of an entry the allocator
-/// happened to place next.
 fn locate(entries: &[&[u8]], tail: &[u8]) -> Option<(usize, usize)> {
     let target = tail.as_ptr() as usize;
     entries.iter().enumerate().find_map(|(at, entry)| {
@@ -879,6 +728,62 @@ fn locate(entries: &[&[u8]], tail: &[u8]) -> Option<(usize, usize)> {
         }
     })
 }
+
+// ---------------------------------------------------------------------------
+// Which branch of the C source this build IS.
+// ---------------------------------------------------------------------------
+
+/// Whether the header API is built in, in the sense `lib/headers.c` means it.
+///
+/// This is not a question about Cargo features. `lib/headers.c:31` guards the
+/// whole file with `#if !defined(CURL_DISABLE_HTTP) &&
+/// !defined(CURL_DISABLE_HEADERS_API)`, and the `#else` at `:365-394` supplies
+/// a second, complete definition of both entry points for builds where that
+/// condition is false: `curl_easy_header` returns `CURLHE_NOT_BUILT_IN` after
+/// casting every parameter to void, and `curl_easy_nextheader` returns NULL.
+/// **Two C branches exist, and a build is one or the other.**
+///
+/// This build is the second one, and the reason is the first conjunct rather
+/// than the second: no HTTP protocol is implemented, so
+/// [`curl_rs_lib::version::protocols`] advertises nothing and the collecting
+/// client writer `lib/headers.c:315-346` installs -- which is the only thing
+/// that ever puts a header into a store -- has no module to live in yet. The
+/// engine records exactly that as
+/// [`curl_rs_lib::version::ENGINE_HEADERS`], `Engine::inert`: the store and its
+/// lookup are written and tested, and nothing fills them.
+///
+/// Deriving the branch from that one marker rather than restating it here is
+/// the whole point. When `transfer/writeout.rs` installs the writer, the row
+/// becomes `Engine::working`, this constant becomes `true`, and both entry
+/// points switch to the built-in branch with no edit in this file. A hand-set
+/// `false` would have to be remembered.
+///
+/// Answering `CURLHE_NOHEADERS` instead -- as this module did until the C
+/// `#else` branch was read -- states that the API works and this transfer
+/// merely carried no headers. That is a claim about a transfer that never
+/// happened, and specification 0.6.5's asymmetry applies: under-reporting a
+/// capability is safe, over-reporting is not.
+const HEADER_API_IS_BUILT_IN: bool =
+    curl_rs_lib::version::ENGINE_HEADERS.is_present();
+
+/// Whether the push-header accessors are built in, in `lib/http2.c`'s sense.
+///
+/// The same two-branch shape, one file over. `lib/http2.c:26` guards with
+/// `#if !defined(CURL_DISABLE_HTTP) && defined(USE_NGHTTP2)`, and the `#else`
+/// at `:2993-3011` defines both accessors again -- *"Satisfy external
+/// references even if http2 is not compiled in"* -- as an unconditional
+/// `return NULL`.
+///
+/// This build is that branch too, and [`curl_rs_lib::version::supports_http2`]
+/// is the authority: it conjoins the `http2` feature with `ENGINE_PROTOCOLS`
+/// and `ENGINE_TLS`, and `curl-rs-lib/src/protocols/http2.rs` does not exist.
+/// So the answer is NULL for every input, which is what the accessors below
+/// return -- **the same bytes the built-in branch would return for a pointer it
+/// did not recognise**, since `!h || !GOOD_EASY_HANDLE(h->data)`
+/// (`lib/http2.c:660`, `:693-694`) also answers NULL. The two branches agree
+/// here, which is why this constant changes no behaviour and only records
+/// which one is being executed.
+const PUSH_API_IS_BUILT_IN: bool = curl_rs_lib::version::supports_http2();
 
 /// The push session an application's `struct curl_pushheaders *` names.
 ///
@@ -894,11 +799,13 @@ fn locate(entries: &[&[u8]], tail: &[u8]) -> Option<(usize, usize)> {
 /// was issued here, and a pointer this library did not issue cannot be
 /// interpreted -- which is why `h` is not dereferenced below.
 ///
-/// `None` is the faithful answer and not a shortfall: C guards both accessors
-/// with `!h || !GOOD_EASY_HANDLE(h->data)` (`lib/http2.c:660` and `:693-694`),
-/// a magic-number test whose whole purpose is "detect rubbish input fast(er)",
-/// and answers NULL when it fails. Every pointer this function can be handed
-/// today is in that category.
+/// `None` is the faithful answer and not a shortfall, and it is faithful twice
+/// over: it is what `lib/http2.c`'s not-built-in branch (`:2993-3011`) returns
+/// unconditionally, and it is also what the built-in branch returns for a
+/// pointer failing `!h || !GOOD_EASY_HANDLE(h->data)` (`:660`, `:693-694`), a
+/// magic-number test whose whole purpose is "detect rubbish input fast(er)".
+/// Every pointer this function can be handed today is in that category. See
+/// [`PUSH_API_IS_BUILT_IN`] for which branch this build is.
 ///
 /// When the HTTP/2 layer lands, this becomes a borrow of the [`PushSession`]
 /// that layer built with [`PushSession::adopt`], and neither accessor changes.
@@ -911,6 +818,11 @@ fn locate(entries: &[&[u8]], tail: &[u8]) -> Option<(usize, usize)> {
 unsafe fn promised_fields<'a>(
     h: *mut curl_pushheaders,
 ) -> Option<&'a mut PushSession> {
+    if !PUSH_API_IS_BUILT_IN {
+        // `lib/http2.c:2993-3011`. The pointer is not examined, because a
+        // build without an HTTP/2 layer issued none.
+        return None;
+    }
     let _ = h;
     None
 }
@@ -919,9 +831,6 @@ unsafe fn promised_fields<'a>(
 
 /// A promised header field by position, callable only from a push callback.
 ///
-/// Supersedes `curl_pushheader_bynum` (`lib/http2.c:657-668`). Returns NULL
-/// when `h` is not a live push-promise handle or `num` is past the last field.
-///
 /// **The result is borrowed, not owned.** It points into storage libcurl holds
 /// for the duration of the callback, so the caller must NOT release it with
 /// [`curl_free`] and must not keep it after the callback returns.
@@ -929,10 +838,6 @@ unsafe fn promised_fields<'a>(
 /// **It is the whole `name:value` string, colon and value included**, not the
 /// value alone -- `lib/http2.c:1478` stores each field that way. Trimming it to
 /// a value-only accessor would break every existing push callback.
-///
-/// This function is declared in `include/curl/multi.h` (`:502-503`) and defined
-/// here, and it is declared BEFORE its `byname` sibling. Both facts are
-/// deliberate; see the module documentation.
 ///
 /// # Safety
 ///
@@ -964,16 +869,6 @@ pub unsafe extern "C" fn curl_pushheader_bynum(
 /// value of the first field with this name -- **borrowed**, as
 /// [`curl_pushheader_bynum`] is -- or NULL.
 ///
-/// The name grammar is the engine's and is byte-exact and case-SENSITIVE, the
-/// opposite of [`curl_strequal`]'s rule and of the fold `curl_easy_header` uses,
-/// because `lib/http2.c:701` compares with `strncmp` while `lib/headers.c:83`
-/// compares with `curl_strequal`. Two stores, two rules, both shipped:
-/// unifying them would silently change which fields a push callback can find.
-///
-/// The tests are applied in C's order, so `h` is examined before `name`
-/// (`lib/http2.c:693-695`). Both rejections answer NULL, so the order is not
-/// observable; it is followed because there is no reason to diverge.
-///
 /// # Safety
 ///
 /// `h` must satisfy the contract on [`curl_pushheader_bynum`], and `name` must
@@ -999,26 +894,9 @@ pub unsafe extern "C" fn curl_pushheader_byname(
     })
 }
 
-// ---------------------------------------------------------------------------
 // The two output slots -- `data->state.headerout[0]` and `[1]`.
-// ---------------------------------------------------------------------------
 
 /// One output slot: a `struct curl_header` plus the strings its pointers name.
-///
-/// C keeps two of these per easy handle and returns the address of one of them,
-/// never a fresh allocation: `lib/headers.c:114-116` fills
-/// `data->state.headerout[0]` for `curl_easy_header` and `:176-178` fills
-/// `[1]` for `curl_easy_nextheader`. **They are different slots on purpose** --
-/// interleaving the two functions never clobbers either result -- and that is
-/// reproduced rather than economised on.
-///
-/// The C's `name` and `value` point into the store's own buffer, where the
-/// header line was rewritten in place with NULs over the colon and the trailing
-/// blanks (`lib/headers.c:181-214`). There is no Rust counterpart to that
-/// rewrite -- the engine returns owned copies instead -- so the slot owns the
-/// two NUL-terminated buffers its pointers address. That is what makes the
-/// returned `struct curl_header *` valid after the call returns without
-/// pointing at a Rust temporary, which is the whole obligation here.
 ///
 /// The engine's documentation assigns this type and both slots to this module
 /// (`curl-rs-lib/src/headers/mod.rs`, on `HeaderView`), which is why they are
@@ -1055,24 +933,6 @@ impl HeaderSlot {
     }
 
     /// Project a view into this slot and return the slot's address.
-    ///
-    /// Supersedes `copy_header_external` (`lib/headers.c:35-52`), whose comment
-    /// states the requirement this function keeps by construction: *"This
-    /// function MUST assign all struct fields in the output struct."* A struct
-    /// literal cannot leave one stale, which is why `out` is replaced wholesale
-    /// rather than updated field by field.
-    ///
-    /// `origin` arrives with the reserved bit `1 << 27` already set, because the
-    /// engine ORs it in on the way out for the reason `lib/headers.c:46-49`
-    /// gives: to make `==` comparison impossible so that the reserved bits stay
-    /// reserved. Nothing is added or masked here.
-    ///
-    /// `anchor` is C's resume position. The engine packs its index and store
-    /// generation into one `usize` precisely so the ABI can carry it through
-    /// `void *`, and it is never dereferenced on either side of the boundary --
-    /// which is why an application that overwrites it cannot make this crate
-    /// read wild memory; the generation simply stops matching and iteration
-    /// ends.
     fn fill(&mut self, view: HeaderView<'_>) -> *mut curl_header {
         self.name = c_bytes(view.name);
         self.value = c_bytes(view.value);
@@ -1113,11 +973,6 @@ fn c_bytes(bytes: &[u8]) -> Vec<u8> {
 
 /// The header state of one easy handle: `data->state.httphdrs`,
 /// `data->state.requests` and both `data->state.headerout` slots.
-///
-/// This is the ABI-side aggregate the two header-API functions read and write.
-/// It is a type of its own rather than four loose fields so that the easy-handle
-/// layer can embed it whole, and so that the slot discipline above cannot be
-/// half-adopted.
 struct HeaderState {
     /// The headers collected so far.
     store: HeaderStore,
@@ -1135,7 +990,7 @@ impl HeaderState {
     /// `data->state.requests` starts at 0, so a `request` argument above 0 is
     /// answered with `CURLHE_NOREQUEST` -- after the emptiness test, because
     /// `lib/headers.c` orders them that way.
-    #[allow(dead_code)] // caller not landed: the easy-handle representation
+    #[allow(dead_code)] // no FFI caller: no `CURL *` this library issued exists
     fn new() -> Self {
         Self {
             store: HeaderStore::new(),
@@ -1201,11 +1056,12 @@ impl HeaderState {
 /// awaiting its consumer in `curl-rs-lib/src/transfer/`, and it is
 /// `pub(crate)`, so no store anywhere in this build has ever held a header.
 ///
-/// Both callers therefore fall through to an EMPTY store and answer from it,
-/// which is why `None` here loses nothing: `lib/headers.c:73-74` answers an
-/// empty list with `CURLHE_NOHEADERS`, and `lib/headers.c:154-156` answers an
-/// exhausted walk with NULL. See [`empty_store_verdict`] and
-/// [`empty_store_step`], both of which EVALUATE that rather than asserting it.
+/// `None` therefore means "not a handle this crate issued", which is exactly
+/// the `!data` limb of `lib/headers.c:69-72` -- so the built-in branch below
+/// answers it with `CURLHE_BAD_ARGUMENT`. It is reached only when the header
+/// API is built in at all; [`HEADER_API_IS_BUILT_IN`] is tested first, and
+/// today it is false, so the not-built-in branch of `lib/headers.c:365-394`
+/// answers every call before this function runs.
 ///
 /// When the easy-handle layer lands, this becomes
 /// `handle::borrow_mut::<CURL, _>(easy).map(|handle| &mut handle.headers)` and
@@ -1220,54 +1076,6 @@ unsafe fn header_state<'a>(easy: *mut CURL) -> Option<&'a mut HeaderState> {
     None
 }
 
-/// What `curl_easy_header` answers for a handle whose store is empty.
-///
-/// Computed, not asserted. The engine's own query runs against an empty store,
-/// so the full validation order of `lib/headers.c:69-76` is reproduced exactly:
-/// an `origin` of 0, an `origin` with a bit outside the five-bit mask, or a
-/// `request` below -1 still yields `CURLHE_BAD_ARGUMENT` rather than being
-/// masked by the emptiness, and only a well-formed query reaches
-/// `CURLHE_NOHEADERS`.
-fn empty_store_verdict(
-    name: &[u8],
-    index: usize,
-    origin: c_uint,
-    request: c_int,
-) -> CURLHcode {
-    // `cur_request` is 0 because `data->state.requests` starts at 0 and no
-    // request has been issued through a handle this build can create.
-    match HeaderStore::new().header(name, index, origin, request, 0) {
-        // Unreachable, and unreachable for a reason the engine states: an
-        // empty store yields `CURLHE_NOHEADERS` before it examines anything
-        // that could match. This arm repeats that verdict rather than
-        // projecting into `headerout[0]`, because a projection needs a slot
-        // with an owner and this path has none -- returning a pointer into
-        // storage nothing owns would dangle, and repeating the store's own
-        // answer cannot. `the_empty_store_never_succeeds` asserts it.
-        Ok(_) => CURLHcode::CURLHE_NOHEADERS,
-        Err(code) => CURLHcode::from(code),
-    }
-}
-
-/// What `curl_easy_nextheader` answers for a handle whose store is empty.
-///
-/// Computed the same way, and for the same reason.
-fn empty_store_step(
-    origin: c_uint,
-    request: c_int,
-    prev: Option<HeaderCursor>,
-) -> *mut curl_header {
-    match HeaderStore::new().next_header(origin, request, 0, prev) {
-        // `lib/headers.c:154-156`: the walk is over, so NULL.
-        None => ptr::null_mut(),
-        // Unreachable: an empty store has nothing to step to. NULL for the
-        // same reason `empty_store_verdict` does not project -- there is no
-        // slot to keep a projection alive -- and NULL truthfully ends the
-        // caller's iteration either way.
-        Some(_) => ptr::null_mut(),
-    }
-}
-
 /// The cursor a caller's `prev` resumes from.
 ///
 /// `lib/headers.c:138-142` reads `prev->anchor` and treats a null one as
@@ -1276,11 +1084,6 @@ fn empty_store_step(
 /// decodes to a cursor whose generation matches nothing and ends iteration by
 /// the same staleness check that protects a cursor from a store that has since
 /// been pushed to, reset or cleaned up.
-///
-/// The anchor is never dereferenced. It is an opaque `usize` the engine packed,
-/// carried through `void *` because that is the field the frozen struct
-/// provides, so a caller who overwrites it cannot make this crate follow a wild
-/// pointer.
 ///
 /// # Safety
 ///
@@ -1301,14 +1104,6 @@ unsafe fn resume_from(prev: *mut curl_header) -> Option<HeaderCursor> {
 
 /// Look up one header of a completed or in-flight transfer.
 ///
-/// Supersedes `curl_easy_header` (`lib/headers.c:55-118`). On success `*hout`
-/// receives a pointer to one of the handle's own output slots and
-/// `CURLHE_OK` is returned; on failure `*hout` is untouched.
-///
-/// `index` selects among headers repeating the same name, counting from 0 in
-/// arrival order; `origin` is a mask of the five `CURLH_*` bits; `request` is a
-/// request number, or -1 for the request in progress.
-///
 /// **The returned record is borrowed and must not be freed.** It addresses
 /// `data->state.headerout[0]`, so it stays valid until the next call to this
 /// function on the same handle -- and note that `curl_easy_nextheader` uses the
@@ -1323,10 +1118,14 @@ unsafe fn resume_from(prev: *mut curl_header) -> Option<HeaderCursor> {
 /// produces them. `CURLHcode` (`header.h:47-56`) has eight members, not one of
 /// them explicitly numbered, and **no `_LAST` sentinel** -- none is invented.
 ///
-/// `CURLHE_NOT_BUILT_IN` exists for a build with the API disabled and is the
-/// C-faithful answer in that case; this crate has no feature that removes the
-/// API, so all thirteen exports of this module exist even under
-/// `--no-default-features` and this code is never returned from here.
+/// `CURLHE_NOT_BUILT_IN` is what a build whose header API is not compiled in
+/// answers, unconditionally and before examining anything
+/// (`lib/headers.c:365-381`). **This build is that branch**, because nothing
+/// fills a header store -- see [`HEADER_API_IS_BUILT_IN`] -- so it is the only
+/// code this function returns today. The symbol itself is exported under
+/// `--no-default-features` as all thirteen in this module are; being exported
+/// and being built in are different questions, and it was conflating them that
+/// previously made this paragraph claim the code was unreachable.
 ///
 /// This function is declared in `include/curl/header.h` (`:58-63`) -- one of
 /// only two declarations that header carries -- and defined here rather than in
@@ -1347,6 +1146,14 @@ pub unsafe extern "C" fn curl_easy_header(
     hout: *mut *mut curl_header,
 ) -> CURLHcode {
     guard(BAD_HEADER_ARGUMENT, || {
+        if !HEADER_API_IS_BUILT_IN {
+            // `lib/headers.c:365-381` verbatim: every parameter is cast to
+            // void and `CURLHE_NOT_BUILT_IN` is returned. No argument is
+            // examined and `*hout` is not written, so a null `hout` is safe
+            // here without a test -- which is why C's branch needs none.
+            return CURLHcode::CURLHE_NOT_BUILT_IN;
+        }
+
         // `lib/headers.c:69-72` tests `!name || !hout || !data` as one
         // condition. The origin and request halves of the same condition are
         // the engine's, because they are decisions rather than pointer checks.
@@ -1376,7 +1183,16 @@ pub unsafe extern "C" fn curl_easy_header(
                 }
                 Err(code) => code,
             },
-            None => empty_store_verdict(name, index, origin, request),
+            // The `!data` limb of `lib/headers.c:69-72`, WIDENED, and the
+            // widening is deliberate and measured. That limb tests only for
+            // NULL; a non-null pointer that is not a handle is dereferenced,
+            // and a driver linked against a stock libcurl 8.14.1 and handed
+            // `(CURL *)0x1000` SEGFAULTS here rather than returning a code.
+            // `curl_easy_nextheader` below already answers NULL for the same
+            // input for the same reason. Reproducing a crash is not
+            // reproducing a contract, so an unrecognised pointer gets the code
+            // C reserves for an argument that was not okay.
+            None => BAD_HEADER_ARGUMENT,
         }
     })
 }
@@ -1385,17 +1201,14 @@ pub unsafe extern "C" fn curl_easy_header(
 
 /// Iterate the headers matching an origin mask and request number.
 ///
-/// Supersedes `curl_easy_nextheader` (`lib/headers.c:121-179`). Pass a null
-/// `prev` to start and the previous result to continue; NULL means the walk is
-/// over.
-///
 /// **This function validates almost nothing, deliberately, because C does
 /// not.** There is no origin-mask check and no handle check -- `lib/headers.c:133`
-/// dereferences the handle immediately -- and consequently no error channel at
-/// all: every way of failing is NULL. An `origin` of 0 matches nothing and
-/// simply ends iteration. The one guard this shim adds is the null handle,
-/// answered with NULL, because reproducing a dereference of NULL would be a
-/// crash rather than a contract.
+/// dereferences the handle immediately, which a driver linked against a stock
+/// libcurl 8.14.1 confirms by SEGFAULTING when handed `(CURL *)0x1000` -- and
+/// consequently no error channel at all: every way of failing is NULL. An
+/// `origin` of 0 matches nothing and simply ends iteration. The one guard this
+/// shim adds is a handle it did not issue, answered with NULL, because
+/// reproducing a dereference is not reproducing a contract.
 ///
 /// **The returned record is borrowed and must not be freed.** It addresses
 /// `data->state.headerout[1]`, a different slot from the one
@@ -1404,6 +1217,14 @@ pub unsafe extern "C" fn curl_easy_header(
 ///
 /// A `prev` from a store that has changed since -- pushed to, reset or cleaned
 /// up -- ends iteration rather than reading a shifted element.
+///
+/// A build whose header API is not compiled in returns NULL from here without
+/// examining anything (`lib/headers.c:383-393`). **This build is that branch**
+/// -- see [`HEADER_API_IS_BUILT_IN`] -- and NULL is also what the built-in
+/// branch answers once the walk is over, so the two branches agree on the bytes
+/// and differ only in the reason. Unlike [`curl_easy_header`], which has an
+/// error channel and therefore had a code to get wrong, nothing observable
+/// changed here.
 ///
 /// # Safety
 ///
@@ -1418,6 +1239,10 @@ pub unsafe extern "C" fn curl_easy_nextheader(
     prev: *mut curl_header,
 ) -> *mut curl_header {
     guard_ptr(|| {
+        if !HEADER_API_IS_BUILT_IN {
+            // `lib/headers.c:383-393` verbatim.
+            return ptr::null_mut();
+        }
         if easy.is_null() {
             return ptr::null_mut();
         }
@@ -1429,7 +1254,10 @@ pub unsafe extern "C" fn curl_easy_nextheader(
         // is what `header_state` requires of its caller.
         match unsafe { header_state(easy) } {
             Some(state) => state.next_header(origin, request, resume),
-            None => empty_store_step(origin, request, resume),
+            // A pointer this crate did not issue. `lib/headers.c:133`
+            // dereferences the handle immediately and so has no answer for
+            // this; NULL ends the caller's walk without a read.
+            None => ptr::null_mut(),
         }
     })
 }
@@ -1477,10 +1305,8 @@ mod tests {
         CString::new(text).expect("test literals contain no NUL")
     }
 
-    // -----------------------------------------------------------------------
     // The partition: exactly thirteen exports, spelled as `lib/libcurl.def`
     // spells them.
-    // -----------------------------------------------------------------------
 
     /// This module's own source, so the claim in its documentation is
     /// executable rather than a comment. The needles are matched at column 0,
@@ -1549,9 +1375,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // curl_free, and the producers it must round-trip.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn freeing_null_is_a_no_op() {
@@ -1598,9 +1422,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // curl_escape / curl_unescape -- the two legacy percent-encoding names.
-    // -----------------------------------------------------------------------
 
     /// Calls a legacy escape entry point and returns its bytes, freeing the
     /// buffer through `curl_free` so the allocator round-trip is exercised too.
@@ -1681,9 +1503,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // curl_getdate, curl_strequal, curl_strnequal.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_parsable_date_matches_the_engine_and_a_bad_one_is_minus_one() {
@@ -1826,9 +1646,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // curl_version -- the machine-read banner.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_banner_is_the_engines_and_is_stable_across_calls() {
@@ -1854,9 +1672,7 @@ mod tests {
     ///
     /// Every token below is one `tests/runtests.pl` keys a feature off, and
     /// every one of them would be FALSE of this build. Over-reporting makes a
-    /// fixture run and fail; under-reporting makes it skip. So the negative is
-    /// what is asserted, and no positive claim is made about a capability that
-    /// has not landed.
+    /// fixture run and fail; under-reporting makes it skip.
     #[test]
     fn the_banner_never_over_reports() {
         let banner = text(curl_version());
@@ -1903,9 +1719,6 @@ mod tests {
         }
     }
 
-    /// The 24 schemes specification 0.2.2 leaves unimplemented must not appear
-    /// in `Protocols:`, or the 283 fixtures targeting them fail instead of
-    /// skipping.
     #[test]
     fn no_stubbed_protocol_is_advertised() {
         let report = curl_version_info(0);
@@ -1925,9 +1738,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // curl_version_info -- the 27-field report.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_report_mirrors_the_engine_field_for_field() {
@@ -2026,19 +1837,6 @@ mod tests {
     }
 
     /// The returned pointer must be genuinely WRITABLE, because C's is.
-    ///
-    /// This is the assertion that distinguishes the current implementation from
-    /// the one it replaced. A `*mut` produced by casting a shared reference --
-    /// which is all `OnceLock::get_or_init` can ever yield -- compiles and even
-    /// appears to work, while being undefined behaviour the moment a caller
-    /// writes through it. Leaking the allocation with `Box::into_raw` and
-    /// keeping only its address gives a pointer with write provenance, and this
-    /// test exercises exactly that: it writes a field, reads it back, and
-    /// restores it.
-    ///
-    /// Run under `cargo miri test`, this fails loudly against the old design
-    /// and passes against this one, which is what makes it a regression guard
-    /// rather than a restatement.
     #[test]
     fn the_report_pointer_is_writable_as_the_c_signature_promises() {
         let raw = curl_version_info(0);
@@ -2075,9 +1873,7 @@ mod tests {
         assert_eq!(text(got), "visible");
     }
 
-    // -----------------------------------------------------------------------
     // The push-header pair.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_null_push_handle_answers_null() {
@@ -2155,9 +1951,7 @@ mod tests {
         assert_eq!(locate(&[], tail), None);
     }
 
-    // -----------------------------------------------------------------------
     // The header API pair.
-    // -----------------------------------------------------------------------
 
     /// Every mask the five `CURLH_*` bits can form, plus the invalid ones.
     const ORIGIN_MASK: c_uint =
@@ -2183,23 +1977,82 @@ mod tests {
         (code, out != (0x1_usize as *mut curl_header))
     }
 
+    /// Which C branch this build is, asserted rather than assumed, because
+    /// every expectation below follows from it.
     #[test]
-    fn a_null_argument_is_bad_argument() {
+    fn this_build_is_the_not_built_in_branch_of_both_c_files() {
+        // Asserted through the engine's markers rather than on the constants
+        // themselves. Two reasons, and the second is the important one:
+        // `assert!` on a `const` operand is a constant expression that
+        // `clippy::assertions_on_constants` rejects under `-D warnings`, and
+        // -- more to the point -- asserting the DERIVATION is what makes these
+        // constants flip on their own when the layers land, rather than
+        // needing to be remembered.
+        assert!(
+            !curl_rs_lib::version::ENGINE_HEADERS.is_present(),
+            "nothing fills a header store, so `lib/headers.c:365-394` applies"
+        );
+        assert!(
+            !curl_rs_lib::version::supports_http2(),
+            "there is no HTTP/2 layer, so `lib/http2.c:2993-3011` applies"
+        );
+        assert_eq!(
+            HEADER_API_IS_BUILT_IN,
+            curl_rs_lib::version::ENGINE_HEADERS.is_present()
+        );
+        assert_eq!(
+            PUSH_API_IS_BUILT_IN,
+            curl_rs_lib::version::supports_http2()
+        );
+
+        // The store itself IS written, and the distinction matters: this is an
+        // inert capability, not an unwritten one.
+        assert!(curl_rs_lib::version::ENGINE_HEADERS.is_written());
+    }
+
+    /// `lib/headers.c:365-381` returns `CURLHE_NOT_BUILT_IN` for every input,
+    /// having cast all six parameters to void. Reproduced argument for
+    /// argument, including the ones the built-in branch rejects differently.
+    #[test]
+    fn the_not_built_in_branch_answers_every_input_the_same_way() {
         let name = c_str("content-type");
         let easy = 0x1000_usize as *mut CURL;
+        let want = CURLHcode::CURLHE_NOT_BUILT_IN;
 
-        // `lib/headers.c:69-72` tests `!name || !hout || !data`.
-        assert_eq!(
-            lookup(ptr::null_mut(), Some(&name), 0, CURLH_HEADER, 0).0,
-            CURLHcode::CURLHE_BAD_ARGUMENT,
-            "a null easy handle"
-        );
-        assert_eq!(
-            lookup(easy, None, 0, CURLH_HEADER, 0).0,
-            CURLHcode::CURLHE_BAD_ARGUMENT,
-            "a null name"
-        );
-        // SAFETY: a null `hout` is rejected before it is written.
+        for (label, handle, named, index, origin, request) in [
+            ("a well-formed query", easy, true, 0usize, CURLH_HEADER, -1),
+            (
+                "a null easy handle",
+                ptr::null_mut(),
+                true,
+                0,
+                CURLH_HEADER,
+                0,
+            ),
+            ("a null name", easy, false, 0, CURLH_HEADER, 0),
+            ("origin of zero", easy, true, 0, 0, 0),
+            ("origin above the mask", easy, true, 0, ORIGIN_MASK + 1, 0),
+            ("the reserved bit as an origin", easy, true, 0, 1 << 27, 0),
+            ("request below -1", easy, true, 0, CURLH_HEADER, -2),
+            (
+                "a request above the current one",
+                easy,
+                true,
+                0,
+                CURLH_HEADER,
+                7,
+            ),
+            ("an index past everything", easy, true, 99, ORIGIN_MASK, -1),
+        ] {
+            let owned = if named { Some(&name) } else { None };
+            let (code, touched) = lookup(handle, owned, index, origin, request);
+            assert_eq!(code, want, "{label}");
+            assert!(!touched, "{label}: *hout is never written");
+        }
+
+        // C's branch does not test `hout` either, and does not need to: it
+        // never writes through it.
+        // SAFETY: a null `hout` is never dereferenced on this path.
         let code = unsafe {
             curl_easy_header(
                 easy,
@@ -2210,7 +2063,13 @@ mod tests {
                 ptr::null_mut(),
             )
         };
-        assert_eq!(code, CURLHcode::CURLHE_BAD_ARGUMENT, "a null hout");
+        assert_eq!(code, want, "a null hout");
+
+        // The value is the header family's own, numbered 7 (`header.h:60`),
+        // and is distinct from the null-argument answer the built-in branch
+        // uses -- which is the whole reason this correction was worth making.
+        assert_eq!(want.as_c_int(), 7);
+        assert_ne!(want, BAD_HEADER_ARGUMENT);
         assert_eq!(
             CURLHcode::CURLHE_BAD_ARGUMENT,
             BAD_HEADER_ARGUMENT,
@@ -2218,13 +2077,22 @@ mod tests {
         );
     }
 
-    /// The argument validation `lib/headers.c:69-72` performs runs BEFORE the
+    /// The built-in branch's own validation order, exercised where it is
+    /// reachable: directly on a [`HeaderState`], which is what
+    /// `curl_easy_header` will call once an easy handle can be borrowed.
+    ///
+    /// This is the coverage the entry point can no longer carry, kept rather
+    /// than dropped. `lib/headers.c:69-76` orders the argument tests before the
     /// emptiness test, so a malformed query is never masked by having no
-    /// headers.
+    /// headers, and the emptiness test precedes the request test.
+    ///
+    /// The `CURLHE_NOHEADERS` expectations below are the measured answer of a
+    /// real built-in build, not a reading of the source: a driver linked
+    /// against a stock libcurl 8.14.1, given a genuine `curl_easy_init` handle
+    /// and no transfer, returns 3 for exactly this query.
     #[test]
-    fn a_malformed_query_is_bad_argument_not_noheaders() {
-        let name = c_str("content-type");
-        let easy = 0x1000_usize as *mut CURL;
+    fn the_built_in_branch_validates_before_it_reports_emptiness() {
+        let mut state = HeaderState::new();
 
         for (label, origin, request) in [
             ("origin of zero", 0, 0),
@@ -2233,19 +2101,11 @@ mod tests {
             ("request below -1", CURLH_HEADER, -2),
         ] {
             assert_eq!(
-                lookup(easy, Some(&name), 0, origin, request).0,
-                CURLHcode::CURLHE_BAD_ARGUMENT,
+                state.header(b"content-type", 0, origin, request),
+                Err(CURLHcode::CURLHE_BAD_ARGUMENT),
                 "{label}"
             );
         }
-    }
-
-    /// A well-formed query against a handle that has collected nothing is
-    /// `CURLHE_NOHEADERS`, computed from the empty store rather than asserted.
-    #[test]
-    fn a_well_formed_query_on_an_empty_store_is_noheaders() {
-        let name = c_str("content-type");
-        let easy = 0x1000_usize as *mut CURL;
 
         for origin in [
             CURLH_HEADER,
@@ -2255,23 +2115,23 @@ mod tests {
             CURLH_PSEUDO,
             ORIGIN_MASK,
         ] {
-            let (code, touched) = lookup(easy, Some(&name), 0, origin, -1);
-            assert_eq!(code, CURLHcode::CURLHE_NOHEADERS, "origin {origin:#x}");
-            assert!(!touched, "*hout is untouched unless the call succeeds");
+            assert_eq!(
+                state.header(b"content-type", 0, origin, -1),
+                Err(CURLHcode::CURLHE_NOHEADERS),
+                "origin {origin:#x}"
+            );
         }
 
-        // The emptiness test precedes the request test, exactly as
-        // `lib/headers.c:73-76` orders them, so a request above the current one
-        // still reports NOHEADERS rather than NOREQUEST.
+        // A request above the current one still reports NOHEADERS rather than
+        // NOREQUEST, because emptiness is tested first.
         assert_eq!(
-            lookup(easy, Some(&name), 0, CURLH_HEADER, 7).0,
-            CURLHcode::CURLHE_NOHEADERS
+            state.header(b"content-type", 0, CURLH_HEADER, 7),
+            Err(CURLHcode::CURLHE_NOHEADERS)
         );
     }
 
-    /// The claim that `empty_store_verdict`'s success arm is unreachable, made
-    /// executable. If the engine ever answered `Ok` for an empty store, this
-    /// fails and the comment beside that arm becomes a defect report.
+    /// An empty store cannot match, whatever it is asked -- the property the
+    /// built-in branch's `CURLHE_NOHEADERS` rests on.
     #[test]
     fn the_empty_store_never_succeeds() {
         let store = HeaderStore::new();
@@ -2293,11 +2153,6 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            empty_store_verdict(b"any", 0, CURLH_HEADER, -1),
-            CURLHcode::CURLHE_NOHEADERS
-        );
-        assert!(empty_store_step(CURLH_HEADER, -1, None).is_null());
     }
 
     #[test]
@@ -2310,9 +2165,11 @@ mod tests {
         unsafe {
             assert!(curl_easy_nextheader(null_handle, CURLH_HEADER, 0, start)
                 .is_null());
-            // An origin of 0 is accepted here where `curl_easy_header` rejects
-            // it, because `lib/headers.c:121-179` performs no validation at
-            // all. It simply matches nothing.
+            // An origin of 0 is accepted here where the built-in
+            // `curl_easy_header` rejects it, because `lib/headers.c:121-179`
+            // performs no validation at all. It simply matches nothing. The
+            // not-built-in branch (`:383-393`) answers NULL for the same input
+            // without looking, so both branches agree.
             assert!(curl_easy_nextheader(easy, 0, 0, start).is_null());
             assert!(
                 curl_easy_nextheader(easy, ORIGIN_MASK, -1, start).is_null()
@@ -2356,9 +2213,7 @@ mod tests {
         assert!(unsafe { resume_from(ptr::null_mut()) }.is_none());
     }
 
-    // -----------------------------------------------------------------------
     // The projection into `struct curl_header`, and the two slots.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn the_projection_assigns_every_field() {

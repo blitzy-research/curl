@@ -9,10 +9,15 @@ single section covers every scheme in that family. Transfers are specified for
 exactly nine of the 33: `file`, `ftp`, `ftps`, `http`, `https`, `scp`, `sftp`,
 `ws` and `wss`. Each of the other 24 registered schemes is specified to be
 recognized when curl parses a URL, with a transfer request for one of them
-failing with `CURLE_UNSUPPORTED_PROTOCOL`. The `Protocols:` line in the
---version output names only those nine schemes, so read a section below as a
-description of the protocol family itself rather than as a claim about what a
-given build transfers.
+failing with `CURLE_UNSUPPORTED_PROTOCOL`.
+
+Those nine are the specified target, and the `Protocols:` line in the --version
+output is specified to name exactly them and nothing else. It does not name
+them yet: the transfer engines are still being built, so this build advertises
+an empty protocol list and performs no transfer over any scheme. Read every
+section below as a description of the protocol family itself, never as a claim
+about what a given build transfers, and ask the --version output rather than
+this page for what a build serves.
 ## DICT
 Lets you lookup words using online dictionaries.
 ## FILE

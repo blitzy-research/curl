@@ -173,6 +173,13 @@ pub unsafe extern "C" fn curl_easy_escape(
         let Some(escaped) = escaped else {
             return ptr::null_mut();
         };
+        // The engine reports a refused allocation -- the output is three times
+        // the caller's own length -- and `lib/escape.c:75` and `:82` answer that
+        // with the same null this returns. Two routes to one observable
+        // outcome, which is what the C has too.
+        let Ok(escaped) = escaped else {
+            return ptr::null_mut();
+        };
         memory::copy_to_c_string(&escaped)
     })
 }
@@ -211,6 +218,11 @@ pub unsafe extern "C" fn curl_easy_unescape(
         // SAFETY: forwarded verbatim from this function's own safety contract.
         let decoded = unsafe { with_input(string, length, unescape) };
         let Some(decoded) = decoded else {
+            return ptr::null_mut();
+        };
+        // As in `curl_easy_escape`: a refused output buffer is
+        // `lib/escape.c:117-118`'s null, not an abort.
+        let Ok(decoded) = decoded else {
             return ptr::null_mut();
         };
 

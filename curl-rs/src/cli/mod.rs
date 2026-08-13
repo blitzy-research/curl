@@ -12,47 +12,6 @@
 //! contract that `tests/runtests.pl:640-730` parses to decide which fixtures
 //! may run. Under-reporting a capability there makes a fixture skip, while
 //! over-reporting makes it run and fail.
-//!
-//! Each module stands in for exactly one unit of the C tool. This root declares
-//! those that exist and nothing else. Callers name the owning module directly,
-//! as in `crate::cli::libinfo`, because AAP section 0.4.2 replaces the C tree's
-//! blanket `#include "urldata.h"` with "one import per type actually used". A
-//! convenience re-export here would rebuild exactly the god-header coupling that
-//! this migration removes.
-//!
-//! # Delivered in this checkout
-//!
-//! - `args` -- `src/tool_getparam.c` with `src/tool_helpers.c`: the option
-//!   surface and the parameter-outcome vocabulary.
-//! - `completions` -- `scripts/completion.pl`: the two generated shell
-//!   completion scripts and the names and directories they install under.
-//! - `hugehelp` -- `src/tool_hugehelp.c`, a generated artifact rather than a
-//!   committed source, which is why `src/Makefile.inc` omits it from
-//!   `CURL_CFILES`; includes and emits the manual that `build.rs` produces.
-//! - `libinfo` -- `src/tool_libinfo.c`: the protocol and feature data model
-//!   behind the banner described above.
-//! - `paramhlp` -- `src/tool_paramhlp.c`: the exact numeric, protocol and
-//!   list acceptance rules of curl 8.19.0-DEV.
-//! - `vars` -- `src/var.c` with `src/var.h`: the `--variable` definition
-//!   grammar and the `{{name:func}}` expansion that the `--expand-` option
-//!   prefix drives (`src/tool_getparam.c:2921-2925`, applied at `:2955-2972`).
-//!
-//! # The remaining two -- SPECIFIED TARGET DESIGN, NOT DECLARED
-//!
-//! Their files do not exist in this checkout, and a `mod` line without its file
-//! is `E0583` -- a hard error no `#[allow]` can reach, because module resolution
-//! never gets far enough to produce a lint. Declaring them would stop the crate
-//! compiling rather than merely assert something unverified. Each `mod` line
-//! arrives WITH its file in the unit of work that creates it; every one is
-//! `pub(crate)`, and that visibility is part of the specification.
-//!
-//! - `help` -- `src/tool_help.c` plus `src/tool_listhelp.c`: the help table,
-//!   the 26-bit category mask spanning `CURLHELP_AUTH` through
-//!   `CURLHELP_VERBOSE` (`src/tool_help.h:62-87`), and the `--version`
-//!   printer. The table holds 273 real entries: `src/tool_listhelp.c` carries
-//!   274 initialiser rows, of which `{ NULL, NULL, 0 }` at `:863` is the
-//!   terminator.
-//! - `ipfs` -- `src/tool_ipfs.c`: IPFS gateway URL translation.
 
 /// The option surface and the parameter-outcome vocabulary --
 /// `src/tool_getparam.c` with `src/tool_helpers.c`.

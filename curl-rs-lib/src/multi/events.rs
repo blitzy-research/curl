@@ -23,58 +23,15 @@
 //**************************************************************************/
 //! Socket-callback plumbing, the poll surface and the two-level timer.
 //!
-//! Supersedes `lib/multi_ev.c` (629 lines) and `lib/multi_ev.h` (80 lines)
-//! together with the poll, wait and timer spans of `lib/multi.c`. Eleven of
-//! the twenty-two exported `curl_multi_*` symbols rest on this module:
-//! `curl_multi_socket_action`, `curl_multi_socket` and
-//! `curl_multi_socket_all` (both deprecated at `include/curl/multi.h:317`
-//! and `:325`, both still exported and both still in the hundred-symbol
-//! parity set of `lib/libcurl.def`), `curl_multi_fdset`,
+//! Supersedes `lib/multi_ev.c` and `lib/multi_ev.h` together with the poll,
+//! wait and timer spans of `lib/multi.c`. Eleven of the twenty-two exported
+//! `curl_multi_*` symbols rest on this module: `curl_multi_socket_action`,
+//! `curl_multi_socket` and `curl_multi_socket_all` (both deprecated at
+//! `include/curl/multi.h:317` and `:325`, both still exported and both still
+//! in the hundred-symbol parity set of `lib/libcurl.def`), `curl_multi_fdset`,
 //! `curl_multi_waitfds`, `curl_multi_wait`, `curl_multi_poll`,
 //! `curl_multi_wakeup`, `curl_multi_timeout` and `curl_multi_assign` -- plus
 //! the timer-callback machinery behind `CURLMOPT_TIMERFUNCTION`.
-//!
-//! # The one behavioural rule to read first
-//!
-//! An application that installs `CURLMOPT_SOCKETFUNCTION` is told which
-//! descriptors to watch and for what. [`MultiEvents::assess_xfer`] computes
-//! that from each transfer's interest, and the rule that governs the
-//! resulting callback stream is **deduplication on the socket's aggregate**:
-//! when a transfer's own interest changes but the union of every user's
-//! interest in that socket does not, the application is **not** called
-//! (`lib/multi_ev.c:265-266`). Getting it wrong does not break a transfer;
-//! it floods the application with redundant callbacks, and the
-//! `docs/examples` socket-API programs are the consumers that would notice.
-//!
-//! # Evidence
-//!
-//! Every behavioural claim below carries a locator into the C tree, which is
-//! the executable specification this implementation is measured against
-//! (AAP 0.1.1, bound to curl 8.19.0-DEV at commit `54cf587b9c`). The
-//! principal ones:
-//!
-//! | Subject | Locator |
-//! |---|---|
-//! | The event book-keeping | `lib/multi_ev.c`, `lib/multi_ev.h` |
-//! | `struct curl_waitfd` | `include/curl/multi.h:114-118` |
-//! | `CURL_WAIT_*` | `include/curl/multi.h:110-112` |
-//! | `CURL_POLL_*` | `include/curl/multi.h:283-287` |
-//! | `CURL_CSELECT_*` | `include/curl/multi.h:291-293` |
-//! | `CURL_SOCKET_TIMEOUT` | `include/curl/multi.h:289` |
-//! | `expire_id`, `expires[]` | `lib/urldata.h:886-904`, `:991` |
-//! | The fifteen timer names | `lib/curl_trc.c:281-297` |
-//! | The `"UNKNOWN?"` fallback | `lib/curl_trc.c:299-304` |
-//! | `Curl_multi_pollset` | `lib/multi.c:1097-1210` |
-//! | `curl_multi_fdset` | `lib/multi.c:1213-1263` |
-//! | `curl_multi_waitfds` | `lib/multi.c:1266-1310` |
-//! | `multi_wait` | `lib/multi.c:1332-1572` |
-//! | `curl_multi_wakeup` | `lib/multi.c:1593-1620` |
-//! | `Curl_multi_will_close` | `lib/multi.c:2971-2980` |
-//! | `add_next_timeout` | `lib/multi.c:2982-3033` |
-//! | `multi_socket` | `lib/multi.c:3113-3181` |
-//! | `multi_timeout` | `lib/multi.c:3334-3391` |
-//! | `Curl_update_timer` | `lib/multi.c:3411-3464` |
-//! | The expire entry points | `lib/multi.c:3470-3647` |
 //!
 //! # What this module owns, and what it borrows
 //!
@@ -97,43 +54,6 @@
 //! declares only the one constant that module has no reason to hold:
 //! [`CURL_SOCKET_TIMEOUT`], which belongs to `multi.h`.
 //!
-//! # Four documented departures from the folder brief
-//!
-//! Each is a case where measurement or an already-settled decision in a
-//! sibling module contradicts the brief, and in each the repository wins
-//! (AAP 0.3.2).
-//!
-//! 1. **`ExpireId` is not declared here.** [`crate::trace`] already declares
-//!    it as [`TimerId`], and says so explicitly: *"This type lives here
-//!    rather than in `crate::multi::events` ... The scheduler is to `use`
-//!    this type rather than declare a second one; a parallel enumeration
-//!    there would rebuild precisely the drift this arrangement removes."*
-//!    The brief's expectation that `trace.rs` consume an enumeration
-//!    declared here cannot be met by a module written after it. [`ExpireId`]
-//!    is therefore an alias, and every assertion the brief asks for -- the
-//!    fifteen discriminants, the fifteen frozen names, `LAST == 15` and the
-//!    `"UNKNOWN?"` fallback -- is made below against that alias.
-//! 2. **`curl_waitfd` is not redeclared `#[repr(C)]` here.**
-//!    [`crate::conn::select`]'s `WaitFd` declines the attribute on the
-//!    ground that *"two definitions claiming to be the C layout would be one
-//!    too many, and only the crate that generates the header can hold that
-//!    claim"*, and `curl-rs-ffi` already owns `curl_socket_t`,
-//!    `curl_socket_callback` and `curl_multi_timer_callback`. The brief's own
-//!    Phase 9 agrees that `curl_waitfd` marshalling is `curl-rs-ffi`'s. The
-//!    mandatory layout assertion is kept in full: the test module declares a
-//!    `#[repr(C)]` witness and pins size 8, alignment 4 and the field
-//!    offsets 0, 4 and 6, with a const helper because `offset_of!` stabilised
-//!    in Rust 1.77 and the minimum supported version is 1.75.
-//! 3. **The level-one timer array has fifteen slots, not sixteen.**
-//!    `lib/urldata.h:991` is `struct time_node expires[EXPIRE_LAST]`, and
-//!    `EXPIRE_LAST` is 15. The sixteenth token is the marker, commented "not
-//!    an actual timer", and has no slot. [`ExpireTimers`] is indexed by
-//!    [`ExpireId`], so an out-of-range index is unrepresentable.
-//! 4. **`Uint32SpBset` comes from [`crate::util::uint_bset`].** There is no
-//!    separate module for the sparse form, whatever a dependency list may
-//!    suggest: that one file supersedes both `lib/uint-bset.c` and
-//!    `lib/uint-spbset.c` and exposes both types.
-//!
 //! # Safety, and the absence of `unsafe`
 //!
 //! Nothing here is `unsafe`, no raw pointer appears, and `libc` is not
@@ -144,56 +64,10 @@
 //! integer token that only `curl-rs-ffi` converts to and from a pointer,
 //! inside a documented `// SAFETY:` block on its side of the boundary.
 //!
-//! # Time is injected
-//!
-//! Every reading comes from the [`Clock`] handed to [`MultiEvents::new`]
-//! (pattern P12, AAP 0.3.3). **No standard-library clock is called here, and
-//! none may be**: [`crate::util::timeval`] is the only module in this crate
-//! that reads the host's clocks, and a test drives this one with
-//! [`TestClock`](crate::util::timeval::TestClock) instead. There is no global
-//! default clock either -- no process-wide or thread-local item of any kind
-//! stands in for one -- because a scheduler whose notion of "now" cannot be
-//! replaced cannot be tested without waiting in real time, and the coverage
-//! gate over `transfer/` and `protocols/` (AAP 0.8.4) depends on driving
-//! timeouts deterministically.
-//!
 //! # `long` is 64-bit here
 //!
 //! `curl_multi_timeout` and `curl_multi_timer_callback` traffic in C `long`
-//! (`include/curl/multi.h:312-315`, `:344`). All four targets of AAP 0.8.3
-//! are LP64, so [`TimeDiff`] -- an `i64` -- is that type exactly, and no
-//! `core::ffi` alias is needed to say so.
-//!
-//! # An open hazard on one required target: AAP ambiguity A4
-//!
-//! Both of this module's callbacks are installed through
-//! `curl_multi_setopt`, which is C-variadic
-//! (`include/curl/multi.h:429`): `CURLMOPT_SOCKETFUNCTION` and
-//! `CURLMOPT_SOCKETDATA` carry what [`MultiEvents`] hands to the socket
-//! callback, and `CURLMOPT_TIMERFUNCTION` and `CURLMOPT_TIMERDATA` carry what
-//! [`MultiEvents::update_timer`] calls. That entry point is `super`'s and the
-//! shim is `curl-rs-ffi`'s, but the values arrive here through it, so the
-//! hazard is recorded where the consumer lives.
-//!
-//! AAP 0.6.2 measured the design: a non-variadic `extern "C"` function taking
-//! one trailing pointer, reached through the variadic prototype in the
-//! header, and verified end to end on x86_64 SysV. On `aarch64-apple-darwin`
-//! -- one of the four required targets (AAP 0.8.3) -- **Apple passes variadic
-//! arguments on the stack while the generated aarch64 code reads register
-//! `x2`**, so the callee reads a register the caller never populated. The
-//! failure is SILENT, and it does not reproduce on this Linux host at all.
-//!
-//! This is **escalated ambiguity A4 (AAP 0.8.6)**, not something to resolve
-//! here. Two of the user's own requirements are in direct conflict -- the
-//! MSRV 1.75 floor and the four-target matrix -- because the remedy is
-//! `c_variadic`, which stabilises on a nightly far above 1.75. The three
-//! options are the user's to choose between: raise the MSRV, drop
-//! `aarch64-apple-darwin`, or accept that one target's varargs entry points
-//! are unsupported. Accordingly **nothing here reaches for a nightly-only
-//! feature and nothing here pretends the hazard is absent**; this module
-//! names its callbacks in safe Rust types ([`SocketCallback`],
-//! [`TimerCallback`]) precisely so that whichever way A4 is settled, the
-//! change lands in the shim and not in the engine.
+//! (`include/curl/multi.h:312-315`, `:344`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -217,12 +91,6 @@ use crate::util::uint_bset::Uint32SpBset;
 // THE BORROWED VOCABULARY
 
 /// A socket, as C's `curl_socket_t` (`include/curl/curl.h:144`).
-///
-/// Re-exported from [`crate::conn::select`], which supersedes `lib/select.c`
-/// and holds the engine-side descriptor vocabulary. `int` on every target of
-/// AAP 0.8.3; on Windows it would be `SOCKET`, a pointer-sized unsigned, and
-/// no branch for that appears anywhere in this crate because Windows is out
-/// of scope (AAP 0.2.2).
 pub(crate) use crate::conn::select::Socket;
 
 /// `CURL_SOCKET_BAD` = `-1` (`include/curl/curl.h:145`).
@@ -231,15 +99,6 @@ pub(crate) use crate::conn::select::Socket;
 pub(crate) use crate::conn::select::CURL_SOCKET_BAD;
 
 /// The `CURL_POLL_*` family: what the socket callback is told to watch.
-///
-/// `CURL_POLL_NONE` 0, `CURL_POLL_IN` 1, `CURL_POLL_OUT` 2,
-/// `CURL_POLL_INOUT` 3 and `CURL_POLL_REMOVE` 4
-/// (`include/curl/multi.h:283-287`), as the newtype
-/// [`crate::conn::select`] declares. `INOUT` is exactly `IN | OUT`;
-/// `REMOVE` is **not** a bit combination but a distinct command, which is
-/// why the type is a newtype over the raw bitmap rather than a set of flags.
-///
-/// This family travels **outward**, from libcurl to the application.
 pub(crate) use crate::conn::select::PollAction;
 
 /// `CURL_WAIT_POLLIN` = 0x0001 (`include/curl/multi.h:110`).
@@ -251,28 +110,12 @@ pub(crate) use crate::conn::select::PollAction;
 pub(crate) use crate::conn::select::CURL_WAIT_POLLIN;
 
 /// `CURL_WAIT_POLLPRI` = 0x0002 (`include/curl/multi.h:111`).
-///
-/// **Numerically equal to [`CURL_CSELECT_OUT`], and semantically unrelated
-/// to it.** The two families are never unified here, for the reason the C
-/// gives at `lib/multi.c:1483-1485`: *"the bit values of the actual
-/// underlying `poll()` implementation may not be the same as the ones in the
-/// public libcurl API!"* Conflating them would silently trade urgent data
-/// for writability.
 pub(crate) use crate::conn::select::CURL_WAIT_POLLPRI;
 
 /// `CURL_WAIT_POLLOUT` = 0x0004 (`include/curl/multi.h:112`).
 pub(crate) use crate::conn::select::CURL_WAIT_POLLOUT;
 
 /// `CURL_CSELECT_IN` = 0x01 (`include/curl/multi.h:291`).
-///
-/// The `CURL_CSELECT_*` family is the `ev_bitmask` an application passes
-/// **inward** through [`MultiEvents::socket_action`]. Three families, three
-/// directions, three numerically overlapping bitmaps: see
-/// [`CURL_WAIT_POLLPRI`].
-///
-/// Republished here because this is where the family arrives; its consumer is
-/// `curl-rs-ffi`'s `curl_multi_socket_action`, which is why nothing inside
-/// this crate reads it. libcurl itself never produces these bits.
 #[allow(unused_imports)]
 pub(crate) use crate::conn::select::CURL_CSELECT_IN;
 
@@ -288,11 +131,6 @@ pub(crate) use crate::conn::select::CURL_CSELECT_ERR;
 
 /// One entry of the array `curl_multi_wait` fills -- C's
 /// `struct curl_waitfd` (`include/curl/multi.h:114-118`).
-///
-/// The engine-side form. Its `#[repr(C)]` mirror belongs to `curl-rs-ffi`,
-/// which generates the header; departure 2 in the module documentation
-/// records why there is exactly one such claim in the workspace and why the
-/// layout is nonetheless asserted by test here.
 pub(crate) use crate::conn::select::WaitFd as CurlWaitFd;
 
 /// One expiry timer -- C's `expire_id` (`lib/urldata.h:886-904`).
@@ -302,30 +140,9 @@ pub(crate) use crate::conn::select::WaitFd as CurlWaitFd;
 /// `"UNKNOWN?"` fallback that `trc_timer_name()` answers out of range
 /// (`lib/curl_trc.c:303`). Departure 1 in the module documentation records
 /// why the enumeration is not declared a second time here.
-///
-/// **`"UNKNOWN?"` is the timer fallback and `"?"` is the multi-state
-/// fallback** (`lib/curl_trc.c:358`, [`CurlMstate::name_from_i32`]). Two
-/// arrays, two different strings, both frozen output; unifying them would
-/// change what a trace log says.
-///
-/// The sentinel `EXPIRE_LAST` is published as the integers
-/// `ExpireId::COUNT` and `ExpireId::LAST` rather than as a variant, matching
-/// the choice [`CurlMstate`] made for `MSTATE_LAST`: the header calls it
-/// "not an actual timer", so it must not be constructible.
 pub(crate) use crate::trace::TimerId as ExpireId;
 
 /// `CURL_SOCKET_TIMEOUT` (`include/curl/multi.h:289`).
-///
-/// `#define CURL_SOCKET_TIMEOUT CURL_SOCKET_BAD`, so **the "timeout" socket
-/// and the "bad" socket are the same integer** and
-/// `curl_multi_socket_action` tells them apart by intent alone: this value
-/// in the `s` argument means "a timer expired", not "here is a descriptor".
-/// Both names are kept, because both appear in the public header and a
-/// reader of either deserves to find it.
-///
-/// This is the one member of the poll vocabulary declared here rather than
-/// borrowed from [`crate::conn::select`]: it is `multi.h`'s constant, and
-/// only the multi interface acts on it.
 #[allow(dead_code)] // consumer: `super`'s `curl_multi_socket_action`
 pub(crate) const CURL_SOCKET_TIMEOUT: Socket = CURL_SOCKET_BAD;
 
@@ -339,50 +156,19 @@ pub(crate) const CURL_SOCKET_TIMEOUT: Socket = CURL_SOCKET_BAD;
 pub(crate) type ConnId = i64;
 
 /// The value a callback returns to abort the multi handle.
-///
-/// Both `curl_socket_callback` and `curl_multi_timer_callback` are declared
-/// `int` and both treat `-1` as failure: it sets `multi->dead` and turns the
-/// enclosing call into [`CURLMcode::AbortedByCallback`]
-/// (`lib/multi_ev.c:208-211`, `:276-279`, `lib/multi.c:3458-3461`). The
-/// constant is named so that the failure path stays visible in the safe
-/// signatures below rather than being lost in translation; the header's own
-/// note for the timer callback is "The callback should return zero"
-/// (`include/curl/multi.h:311`).
 pub(crate) const CALLBACK_ABORT: i32 = -1;
 
 /// The application's socket callback, as a safe Rust value.
-///
-/// C's `curl_socket_callback` is
-/// `int (*)(CURL *easy, curl_socket_t s, int what, void *userp, void *socketp)`
-/// (`include/curl/multi.h:295-301`), installed by `CURLMOPT_SOCKETFUNCTION`
-/// with `userp` supplied by `CURLMOPT_SOCKETDATA`. The shape here is what the
-/// engine side of that boundary looks like once the raw pointers are gone:
-/// `easy` becomes the transfer identifier, `what` becomes [`PollAction`], and
-/// the two `void *` become the host's own state plus a [`CallbackData`]
-/// token. The `int` return survives verbatim, because
-/// [`CALLBACK_ABORT`] is the whole failure path.
 ///
 /// `curl-rs-ffi` builds one of these around the C function pointer inside a
 /// documented `// SAFETY:` block; nothing on this side of the boundary needs
 /// `unsafe` to call it. The `Send` bound is what lets a multi handle that
 /// runs on a multi-thread runtime hold one.
-///
-/// [`EventHost::call_socket_cb`] is the seam this module actually invokes, and
-/// its signature is this type's signature: a host that stores a
-/// `SocketCallback` implements that method by delegating to it.
 #[allow(dead_code)] // consumer: `super`'s multi handle, via `curl_multi_setopt`
 pub(crate) type SocketCallback =
     Box<dyn FnMut(u32, Socket, PollAction, CallbackData) -> i32 + Send>;
 
 /// The application's timer callback, as a safe Rust value.
-///
-/// C's `curl_multi_timer_callback` is
-/// `int (*)(CURLM *multi, long timeout_ms, void *userp)`
-/// (`include/curl/multi.h:312-315`), installed by `CURLMOPT_TIMERFUNCTION`
-/// with `userp` from `CURLMOPT_TIMERDATA`. The handle and the user pointer
-/// are the host's to hold, so what remains is the span -- [`TimeDiff`], which
-/// is C's `long` exactly on every target of AAP 0.8.3 -- and the `int` whose
-/// [`CALLBACK_ABORT`] value kills the handle.
 ///
 /// The header's own note is *"The callback should return zero"*
 /// (`include/curl/multi.h:311`). [`MultiEvents::update_timer`] is the only
@@ -392,11 +178,6 @@ pub(crate) type SocketCallback =
 pub(crate) type TimerCallback = Box<dyn FnMut(TimeDiff) -> i32 + Send>;
 
 /// An opaque application pointer, as an integer token.
-///
-/// Stands for two distinct `void *` values that this crate never
-/// dereferences: `CURLMOPT_SOCKETDATA`'s `userp`, and the per-socket value
-/// `curl_multi_assign` stores and the callback receives as `socketp`
-/// (`include/curl/multi.h:295-301`).
 ///
 /// A token rather than a pointer because this crate forbids `unsafe`: only
 /// `curl-rs-ffi` may convert between the two, and it does so inside a
@@ -434,15 +215,6 @@ impl CallbackData {
 }
 
 /// Which book-keeping subject an assessment is about.
-///
-/// `mev_assess(multi, data, conn)` (`lib/multi_ev.c:477`) takes a transfer
-/// and an OPTIONAL connection, and the two cases differ throughout: a
-/// connection's interest is produced by `Curl_conn_adjust_pollset` rather
-/// than by `Curl_multi_pollset`, it is registered in a socket entry's single
-/// `conn` field rather than in its transfer bitset, and its previous pollset
-/// is stashed against the connection rather than against the transfer. An
-/// enumeration makes the two cases exhaustive where a nullable pointer
-/// leaves them implicit.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum EvTarget {
     /// A transfer, by its `mid` -- C's `data` with `conn == NULL`.
@@ -488,16 +260,6 @@ impl EvTarget {
 /// per-state producers -- so the dependency is inverted, exactly as
 /// [`super::notify`]'s `NotifySink` inverts the notification callback. What
 /// stays here is every loop whose ORDER is a public contract.
-///
-/// # Why a trait rather than a concrete handle
-///
-/// [`MultiEvents`] is a separate owned value rather than a set of fields on
-/// the handle precisely so that the two can be borrowed at once: an
-/// implementation calls, for example,
-/// `MultiEvents::assess_xfer(&mut self.events, &mut self.rest, mid, trc)`
-/// with `rest` carrying everything else. C gets the same freedom from having
-/// one struct and no borrow checker, and pays for it with the aliasing this
-/// arrangement removes.
 pub(crate) trait EventHost {
     /// Whether `CURLMOPT_SOCKETFUNCTION` is installed -- `multi->socket_cb`.
     ///
@@ -507,14 +269,6 @@ pub(crate) trait EventHost {
     fn socket_cb_installed(&self) -> bool;
 
     /// Invokes the application's socket callback.
-    ///
-    /// `multi->socket_cb(data, s, what, multi->socket_userp,
-    /// entry->user_data)` (`lib/multi_ev.c:272-273`). `mid` names the
-    /// transfer the C passes as `data`; `socketp` is the value
-    /// [`MultiEvents::assign`] stored for this socket.
-    ///
-    /// Returns the callback's `int`. [`CALLBACK_ABORT`] means failure and the
-    /// caller here reacts to it; every other value is success.
     fn call_socket_cb(
         &mut self,
         mid: u32,
@@ -524,12 +278,6 @@ pub(crate) trait EventHost {
     ) -> i32;
 
     /// Sets or clears `multi->in_callback`.
-    ///
-    /// `mev_in_callback` (`lib/multi_ev.c:38-41`) and `set_in_callback`. The
-    /// flag is what makes a libcurl call from inside a callback return
-    /// [`CURLMcode::RecursiveApiCall`], so the socket callback is covered by
-    /// the same guard as every other. This module only ever sets it through
-    /// [`CallbackGuard`], which cannot leave it set on an early return.
     fn set_in_callback(&mut self, value: bool);
 
     /// Whether a libcurl callback is running -- `multi->in_callback`.
@@ -552,14 +300,6 @@ pub(crate) trait EventHost {
     fn mark_dirty(&mut self, mid: u32);
 
     /// A snapshot of `multi->process`, in ascending `mid` order.
-    ///
-    /// C walks the bitset live with `Curl_uint32_bset_first`/`_next` while
-    /// the body may remove the very entry it is standing on -- the self-heal
-    /// at `lib/multi.c:1291-1295` and `:1378-1382`. A snapshot is how that
-    /// stays expressible without aliasing; it costs one allocation per call,
-    /// and performance is a non-goal (AAP 0.1.1). Ascending order is what
-    /// the bitset walk produces, so the sequence of socket callbacks is
-    /// unchanged.
     fn process_mids(&self) -> Vec<u32>;
 
     /// Removes `mid` from BOTH `multi->process` and `multi->dirty`.
@@ -663,15 +403,6 @@ pub(crate) trait EventHost {
     /// indistinguishable from a lazily created empty one -- `mev_assess`
     /// itself only creates the stash when `ps.n` is non-zero and asserts
     /// that the alternative is an empty pollset (`lib/multi_ev.c:500-514`).
-    ///
-    /// It is TAKEN rather than borrowed because the diff runs the
-    /// application's callback while holding it, and holding a borrow into
-    /// `self` across that call would alias. [`Self::put_prev_pollset`] hands
-    /// it back, which is the whole of `Curl_pollset_move(prev_ps, ps)`
-    /// (`:427`).
-    ///
-    /// [`None`] means the target no longer exists, and the assessment is
-    /// then abandoned rather than invented.
     fn take_prev_pollset(&mut self, target: EvTarget) -> Option<EasyPollset>;
 
     /// Stores the pollset that the next assessment will diff against.
@@ -700,22 +431,11 @@ pub(crate) trait EventHost {
     /// it is **not** `data->mid`. One frozen trace line is gated on it
     /// (`lib/multi.c:3643`), which is why the predicate is asked for
     /// separately rather than inferred.
-    ///
-    /// Its consumer is [`super`], which computes
-    /// [`MultiEvents::expire_clear`]'s `has_xfer_id` argument with it before
-    /// taking the borrow of the timers that method needs; nothing in this
-    /// module calls it, for exactly that reason.
     #[allow(dead_code)]
     fn has_xfer_id(&self, mid: u32) -> bool;
 }
 
 /// What the wait and socket entry points additionally need.
-///
-/// [`EventHost`] covers the book-keeping; this covers the scheduler and the
-/// shutdown pool, which `multi_socket` and `multi_wait` drive but do not
-/// own. Split from [`EventHost`] so that the socket-callback machinery --
-/// the part with the delicate ordering -- can be exercised against the
-/// smaller surface.
 pub(crate) trait SchedulerHost: EventHost {
     /// Whether a notification dispatch is in progress --
     /// `multi->in_ntfy_callback` (`super::notify`'s `in_callback`).
@@ -738,11 +458,6 @@ pub(crate) trait SchedulerHost: EventHost {
 
     /// `multi_perform` -- the `checkall` path of `multi_socket`
     /// (`lib/multi.c:3140`).
-    ///
-    /// C passes `running_handles` through and notes that "*perform() deals
-    /// with running_handles on its own"; the value is then overwritten from
-    /// [`Self::xfers_running`] on the way out (`:3175-3178`), so nothing is
-    /// lost by not threading it.
     fn perform(&mut self) -> CURLMcode;
 
     /// `multi_run_dirty` (`lib/multi.c:3070-3111`), answering its result and
@@ -788,26 +503,10 @@ pub(crate) trait SchedulerHost: EventHost {
     fn timer_cb_installed(&self) -> bool;
 
     /// Invokes the application's timer callback.
-    ///
-    /// `multi->timer_cb(multi, timeout_ms, multi->timer_userp)`
-    /// (`lib/multi.c:3457`). `timeout_ms` is C `long`, which is
-    /// [`TimeDiff`] on every target in scope, and `-1` means "no timeout".
-    ///
-    /// Returns the callback's `int`; the header's note is *"The callback
-    /// should return zero"* and [`CALLBACK_ABORT`] is failure.
     fn call_timer_cb(&mut self, timeout_ms: TimeDiff) -> i32;
 }
 
 /// Holds `multi->in_callback` for the duration of one application callback.
-///
-/// `mev_in_callback(multi, TRUE)` ... `mev_in_callback(multi, FALSE)`
-/// (`lib/multi_ev.c:200-203`, `:271-274`) and the identical
-/// `set_in_callback` pair around the timer callback (`lib/multi.c:3456-3458`).
-///
-/// A guard rather than two calls, so that the flag cannot survive an early
-/// return. The C is safe today only because no `return` sits between its two
-/// calls -- a property that a later edit could quietly break and that this
-/// type makes structural instead.
 struct CallbackGuard<'host, H: EventHost + ?Sized> {
     /// The handle whose flag is held.
     host: &'host mut H,
@@ -839,9 +538,6 @@ impl<H: EventHost + ?Sized> Drop for CallbackGuard<'_, H> {
 /// consequence is that [`PollAction::INOUT`] renders as the CONCATENATION
 /// `"INOUT"` and [`PollAction::NONE`] renders as the EMPTY STRING -- not as
 /// a friendlier name from a lookup table. Both are frozen trace output.
-///
-/// Returned as a pair rather than joined so that the format strings below
-/// keep the C's two `%s` conversions and a reader can line them up.
 const fn action_fragments(action: PollAction) -> (&'static str, &'static str) {
     (
         if action.contains_in() { "IN" } else { "" },
@@ -866,20 +562,9 @@ const fn action_fragments(action: PollAction) -> (&'static str, &'static str) {
 /// BIT(announced);             /* this socket has been passed to the socket
 ///                                callback at least once */
 /// ```
-///
-/// The refcounts are the reason the record exists. Several transfers may want
-/// the same descriptor, so the application must be told the UNION of their
-/// interests, and it must be told again only when that union changes -- see
-/// [`MultiEvents::entry_update`].
 #[derive(Debug, Default)]
 struct ShEntry {
     /// The `mid`s of the transfers using this socket.
-    ///
-    /// A SPARSE bitset, because the `mid`s on one descriptor are a handful
-    /// of arbitrary numbers out of the whole slab's range.
-    /// [`Uint32SpBset`] is that type; it lives in
-    /// [`crate::util::uint_bset`], which supersedes both `lib/uint-bset.c`
-    /// and `lib/uint-spbset.c`.
     xfers: Uint32SpBset,
     /// The connection using this socket, if any -- C's `struct connectdata
     /// *conn`. At most one, which C asserts (`lib/multi_ev.c:156`).
@@ -987,30 +672,6 @@ impl ShEntry {
 /// The socket book-keeping -- C's `struct curl_multi_ev`
 /// (`lib/multi_ev.h:36-38`), whose single field is `struct Curl_hash
 /// sh_entries`.
-///
-/// Kept as a named type, one field wide, so that [`MultiEvents`] mirrors the
-/// C's `struct curl_multi_ev ev` member rather than dissolving it.
-///
-/// # Iteration-order audit
-///
-/// [`crate::util::hash`] requires each of its consumers to state whether the
-/// order in which its container is walked is observable, and names
-/// `lib/multi.c` and `lib/multi_ev.c` among them. **For this container the
-/// answer is that no order is observable at all, because nothing walks it.**
-/// Every access in `lib/multi_ev.c` is by key -- `mev_sh_entry_get`
-/// (`:82-90`), `_add` (`:93-118`) and `_kill` (`:121-124`) -- and the only
-/// traversal is `Curl_hash_destroy` at teardown (`:628`), which frees and
-/// reports nothing. The sequence of socket callbacks within one assessment
-/// is driven by the ORDER OF THE POLLSET (`lib/multi_ev.c:307`, `:367`), not
-/// by this container.
-///
-/// It is a [`BTreeMap`] rather than a hash map even so. The C's own order is
-/// `fd % slots_num` (`lib/multi_ev.c:58-63`), which is neither insertion nor
-/// numeric order and is therefore already not meaningful; an ordered map
-/// costs nothing measurable at these sizes, makes a `Debug` rendering and a
-/// test failure reproducible, and removes the question entirely rather than
-/// answering it. [`crate::util::hash`]'s own `StrHash` is not used because
-/// its key is a byte string while this key is a descriptor number.
 #[derive(Debug, Default)]
 pub(crate) struct MultiEv {
     /// The per-socket records, keyed on the descriptor.
@@ -1052,12 +713,6 @@ impl MultiEv {
 
     /// Ensures a record exists -- `mev_sh_entry_add`
     /// (`lib/multi_ev.c:93-118`), answering whether it had to create one.
-    ///
-    /// The C returns `NULL` on allocation failure and its callers turn that
-    /// into [`CURLMcode::OutOfMemory`] (`:318-319`). A Rust map aborts on
-    /// allocation failure rather than reporting it, so there is no such
-    /// return here and the caller's out-of-memory arm survives only where it
-    /// is still reachable.
     fn add(&mut self, s: Socket) -> bool {
         debug_assert!(
             s != CURL_SOCKET_BAD,
@@ -1090,15 +745,6 @@ impl MultiEv {
 
     /// Forgets every socket -- `Curl_multi_ev_cleanup`
     /// (`lib/multi_ev.c:626-629`).
-    ///
-    /// `Curl_hash_destroy` runs `mev_sh_entry_dtor` over every record, which
-    /// destroys its bitset and frees it (`:74-79`). Dropping the map is that,
-    /// and it cannot leak the bitset the way a hand-written destructor can
-    /// forget to.
-    ///
-    /// **The application is not called.** C does not emit `CURL_POLL_REMOVE`
-    /// for the sockets it forgets here, and neither does this: cleanup runs
-    /// while the multi handle is being destroyed.
     fn clear(&mut self) {
         self.entries.clear();
     }
@@ -1118,14 +764,6 @@ impl MultiEv {
 /// struct time_node expires[EXPIRE_LAST];   /* :991 */
 /// ```
 ///
-/// `expires[]` is a FIXED ARRAY INDEXED BY `expire_id`, so there is at most
-/// one pending timer per (handle, id) pair and `node->eid = eid` "also marks
-/// it as in use" (`lib/multi.c:3505`). `timeoutlist` is an intrusive list
-/// that threads THOSE SAME ARRAY SLOTS, kept sorted so its head is the
-/// nearest. `expiretime` is the instant the handle is registered under in the
-/// level-two tree, and `{0, 0}` doubles as "this handle is NOT in the tree".
-/// `timenode` is the tree node itself.
-///
 /// # What this keeps, and why it is fewer
 ///
 /// The array remains, as [`Self::slots`], indexed by [`ExpireId`] so an
@@ -1144,28 +782,42 @@ impl MultiEv {
 /// token is the marker the header calls "not an actual timer" and it has no
 /// slot; see departure 3 in the module documentation.
 ///
-/// # Ordering: `(instant, arrival)`
+/// # Ordering: millisecond instant, then arrival
 ///
 /// Two timers due at the same instant fire in the order they were set, which
 /// is what C's insertion scan produces: it breaks only when
 /// `curlx_ptimediff_ms(&check->time, &node->time) > 0`, so a new timer is
 /// placed AFTER every entry at or before its own instant
-/// (`lib/multi.c:3513-3520`). The arrival number reproduces that exactly.
+/// (`lib/multi.c:3506-3524`). The arrival number reproduces that.
 ///
-/// **One divergence, stated rather than hidden.** C's insertion scan compares
-/// at MILLISECOND granularity while `add_next_timeout` drains at MICROSECOND
-/// granularity (`lib/multi.c:3005`), so two timers on one handle less than a
-/// millisecond apart and set in the wrong order leave C's list not sorted by
-/// microsecond -- and C then stops draining at the later of the two,
-/// deferring an already-due timer to the next cycle. Ordering by
-/// `(instant, arrival)` removes that asymmetry: the earlier instant is always
-/// nearest. Nothing observes the difference -- both orderings expire the same
-/// timers within the same millisecond, and the sub-millisecond case cannot
-/// change which wire bytes are produced -- and the property the brief pins,
-/// FIFO among equal instants, is preserved exactly.
+/// **The comparison is at MILLISECOND granularity, as the C's is.** That is
+/// the whole of the subtlety: `curlx_ptimediff_ms` truncates, so two instants
+/// less than a millisecond apart compare EQUAL and the tie-break decides. The
+/// consequence is visible: set timer A for now+1500us and then timer B for
+/// now+900us, and C's list keeps A at the head, because inserting B found
+/// `ptimediff_ms(A, B) == 0` and walked past it. `add_next_timeout` then drains
+/// at MICROSECOND granularity (`lib/multi.c:3007`), stops at the head, and
+/// defers B to the next cycle even though B is due first.
+///
+/// An earlier revision compared `(instant, arrival)` at microsecond
+/// granularity, which removes that asymmetry, and argued that nothing observes
+/// the difference. AAP 0.8.2 forbids exactly that trade -- a refactor that
+/// produces different-but-arguably-better output has failed -- and the
+/// difference IS observable: which of two timers is reported as next decides
+/// which handle `curl_multi_timeout` describes, and therefore the order in
+/// which two transfers with near-equal deadlines are serviced. The C's
+/// comparison is reproduced instead, asymmetry included.
+///
+/// Because a truncating difference is not a transitive relation, this is a
+/// linear "keep the best so far" scan rather than a sort key -- which is also
+/// exactly the shape of the C's insertion walk.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExpireTimers {
     /// One optional `(instant, arrival)` per [`ExpireId`] -- C's `expires[]`.
+    ///
+    /// The arrival number is the position information C's list encodes; see the
+    /// type's note on ordering for why it is consulted at millisecond
+    /// granularity.
     slots: [Option<(CurlTime, u64)>; ExpireId::COUNT],
     /// The instant this handle is registered under in the level-two tree, or
     /// [`None`] when it is not registered -- C's `expiretime` and its
@@ -1248,14 +900,31 @@ impl ExpireTimers {
 
     /// The nearest pending timer -- the head of C's sorted `timeoutlist`.
     ///
-    /// Ordered by `(instant, arrival)`; see the type's note on ordering.
+    /// Ordered by millisecond instant and then by arrival; see the type's note
+    /// on ordering for why the granularity is load-bearing.
+    ///
+    /// The scan visits the slots in [`ExpireId`] order, which is irrelevant to
+    /// the answer: the comparison never consults the slot index, so the result
+    /// depends only on the recorded instants and arrival numbers, exactly as
+    /// C's list position does.
     fn nearest(&self) -> Option<(ExpireId, CurlTime)> {
         let mut best: Option<(usize, CurlTime, u64)> = None;
         for (index, slot) in self.slots.iter().enumerate() {
             let Some((at, seq)) = *slot else { continue };
             let better = match best {
                 None => true,
-                Some((_, best_at, best_seq)) => (at, seq) < (best_at, best_seq),
+                // `curlx_ptimediff_ms(&best, &at) > 0` is C's break condition
+                // at `lib/multi.c:3516-3517`: this entry goes BEFORE `best`
+                // only when `best` is more than a whole millisecond later.
+                // Equal to the millisecond falls through to arrival order, so
+                // the earlier-set timer keeps the head -- FIFO, as C's walk
+                // past every `diff <= 0` entry produces.
+                Some((_, best_at, best_seq)) => {
+                    match timediff_ms(best_at, at) {
+                        0 => seq < best_seq,
+                        diff => diff > 0,
+                    }
+                }
             };
             if better {
                 best = Some((index, at, seq));
@@ -1354,20 +1023,7 @@ impl MultiTimers {
 /// cleanup"* (`lib/multi.c:1594-1596`, `:1608-1610`). Nothing else in the
 /// multi interface may be called concurrently with a wait.
 ///
-/// This type is that guarantee made structural. It is [`Clone`], [`Send`] and
-/// [`Sync`], and it holds no borrow of the multi handle, so a second thread
-/// can keep one while the reactor thread holds the `&mut` that every other
-/// entry point takes. C achieves the same by promising not to touch anything
-/// mutable; here the type system holds the promise.
-///
 /// # A notification, not a socket pair
-///
-/// C writes one byte into a self-pipe and reads it back out
-/// (`Curl_wakeup_signal` / `Curl_wakeup_consume`), which costs two
-/// descriptors and a system call and can fail to be created at all. A
-/// [`Notify`] needs no descriptor and cannot fail to be constructed. Any
-/// residual need for a real socket pair belongs to `crate::conn::socket`,
-/// which supersedes `lib/socketpair.c`.
 ///
 /// Consequences that are preserved deliberately:
 ///
@@ -1420,20 +1076,6 @@ impl Wakeup {
 /// Fills `ps` with what transfer `mid` currently wants to watch --
 /// `Curl_multi_pollset` (`lib/multi.c:1097-1210`).
 ///
-/// # The second full-coverage match on the state enumeration
-///
-/// [`super::state`] records that this crate has exactly two matches that
-/// cover every `CURLMstate`: the scheduler's, and this one. **Neither carries
-/// a `_` arm**, so a state added without deciding what it polls for is a
-/// compile error rather than a runtime fall-through (AAP 0.3.3). C's
-/// `default:` arm -- `failf(data, "multi_getsock: unexpected multi state
-/// %d")` followed by `DEBUGASSERT(0)` (`lib/multi.c:1156-1159`) -- is
-/// therefore unreachable here and is deliberately absent; its absence is the
-/// improvement.
-///
-/// The arms keep C's grouping so that its comments stay attached to the cases
-/// they were written about.
-///
 /// # Errors reaching the caller
 ///
 /// Reported as [`CURLMcode`], mapping as C does (`lib/multi.c:1198-1206`):
@@ -1441,9 +1083,6 @@ impl Wakeup {
 /// else is announced with the frozen `failf` text
 /// `"error determining pollset: %d"` and becomes
 /// [`CURLMcode::InternalError`].
-///
-/// A free function rather than a method: it reads no event book-keeping at
-/// all, and saying so keeps [`MultiEvents`] borrowable beside it.
 pub(crate) fn pollset<H: EventHost + ?Sized>(
     host: &mut H,
     mid: u32,
@@ -1558,13 +1197,6 @@ pub(crate) struct MultiEvents {
 impl MultiEvents {
     /// Fresh event state over `clock` -- `Curl_multi_ev_init` together with
     /// the timer and wakeup initialisation of `Curl_multi_handle`.
-    ///
-    /// C's `Curl_multi_ev_init(multi, hashsize)` takes a bucket count that
-    /// has no counterpart here; see [`MultiEv::new`].
-    ///
-    /// The clock is a constructor argument and there is no default: pattern
-    /// P12 (AAP 0.3.3), and the module documentation records why a global
-    /// default would be a defect rather than a convenience.
     #[allow(dead_code)] // consumer: `super`'s `curl_multi_init`
     pub(crate) fn new(clock: Arc<dyn Clock + Send + Sync>) -> Self {
         let now = clock.now();
@@ -1618,12 +1250,6 @@ impl MultiEvents {
     /// Attaches an application pointer to a socket -- `Curl_multi_ev_assign`
     /// (`lib/multi_ev.c:550-559`).
     ///
-    /// The engine half of `curl_multi_assign`. Its documented contract, from
-    /// `lib/multi_ev.h:44-46`: *"Assign a 'user_data' to be passed to the
-    /// socket callback when invoked with the given socket. This will fail if
-    /// this socket is not active, e.g. the application has not been told to
-    /// monitor it."*
-    ///
     /// # Errors
     ///
     /// [`CURLMcode::BadSocket`] when the socket is not one this handle has
@@ -1663,11 +1289,6 @@ impl MultiEvents {
 
     /// Reassesses one connection -- `Curl_multi_ev_assess_conn`
     /// (`lib/multi_ev.c:526-531`).
-    ///
-    /// `lib/multi_ev.h:58`: *"Assess the connection by getting its current
-    /// pollset"*. A connection in the shutdown pool has no transfer driving
-    /// it, so its interest comes from
-    /// [`EventHost::conn_adjust_pollset`] rather than from the state machine.
     #[allow(dead_code)] // consumer: `crate::conn::shutdown`
     pub(crate) fn assess_conn<H: EventHost + ?Sized>(
         &mut self,
@@ -1682,16 +1303,6 @@ impl MultiEvents {
     /// Reassesses a set of transfers -- `Curl_multi_ev_assess_xfer_bset`
     /// (`lib/multi_ev.c:533-548`), whose comment is *"Assess all easy handles
     /// on the list"*.
-    ///
-    /// C takes `struct uint32_bset *set` and walks it with
-    /// `Curl_uint32_bset_first`/`_next`; `mids` is that walk's sequence, so
-    /// the order of the resulting socket callbacks is unchanged. The single
-    /// call site passes `&multi->process` (`lib/multi.c:3147`).
-    ///
-    /// Three behaviours of the C loop are preserved: the whole thing is
-    /// skipped when no socket callback is installed, a `mid` that does not
-    /// resolve is passed over without stopping the walk, and the FIRST
-    /// failure ends it -- `while(!mresult && ...)`.
     #[allow(dead_code)] // consumer: `super`'s scheduler
     pub(crate) fn assess_xfer_set<H: EventHost + ?Sized>(
         &mut self,
@@ -1717,19 +1328,6 @@ impl MultiEvents {
     /// Queues every transfer using `s` to run -- `Curl_multi_ev_dirty_xfers`
     /// (`lib/multi_ev.c:561-594`), *"Mark all transfers tied to the given
     /// socket as dirty"*.
-    ///
-    /// An unknown socket is IGNORED rather than reported, and the C's reason
-    /// is worth keeping verbatim: *"Unmatched socket, we cannot act on it but
-    /// we ignore this fact. In real-world tests it has been proved that
-    /// libevent can in fact give the application actions even though the
-    /// socket was just previously asked to get removed, so thus we better
-    /// survive stray socket actions and just move on."*
-    ///
-    /// A `mid` in the entry that no longer resolves is removed from the entry
-    /// as it is passed over, with the frozen trace
-    /// `"socket transfer %u no longer found"`. A registered connection makes
-    /// the ADMIN transfer dirty instead, since that is the handle the
-    /// shutdown pool runs under.
     #[allow(dead_code)] // consumer: `super`'s socket entry points
     pub(crate) fn dirty_xfers<H: EventHost + ?Sized>(
         &mut self,
@@ -1783,10 +1381,6 @@ impl MultiEvents {
     /// Forgets a socket that is about to be closed --
     /// `Curl_multi_ev_socket_done` (`lib/multi_ev.c:596-600`), *"Socket will
     /// be closed, forget anything we know about it."*
-    ///
-    /// The result of the underlying forget is discarded, exactly as C
-    /// discards it: this is called from a close path that has nowhere to
-    /// report to.
     #[allow(dead_code)] // consumer: `crate::conn`'s close path
     pub(crate) fn socket_done<H: EventHost + ?Sized>(
         &mut self,
@@ -1800,11 +1394,6 @@ impl MultiEvents {
 
     /// A transfer has left the multi handle -- `Curl_multi_ev_xfer_done`
     /// (`lib/multi_ev.c:602-610`), *"Transfer is removed from the multi"*.
-    ///
-    /// One last assessment, which reports every socket the transfer was the
-    /// last user of, and then the stash is discarded. **The admin handle is
-    /// exempt**: `if(data != multi->admin)`, because the admin handle outlives
-    /// every transfer and its connections are the shutdown pool's.
     #[allow(dead_code)] // consumer: `super`'s `curl_multi_remove_handle`
     pub(crate) fn xfer_done<H: EventHost + ?Sized>(
         &mut self,
@@ -1841,17 +1430,6 @@ impl MultiEvents {
 
     /// A socket is about to be closed -- `Curl_multi_will_close`
     /// (`lib/multi.c:2971-2980`).
-    ///
-    /// Its contract, from `lib/multiif.h`: *"The multi will then remove
-    /// anything it knows about the socket, so when the OS is using this
-    /// socket (number) again subsequently, the internal book keeping will not
-    /// get confused."* That is why it belongs to this module rather than to
-    /// [`super::notify`], next to which it merely happens to sit in the C
-    /// file.
-    ///
-    /// C is null-safe at BOTH hops -- `if(data)` and then `if(multi)` -- and
-    /// does nothing when either is absent. A `&mut H` cannot be absent, so
-    /// the remaining guard is that the transfer resolves.
     #[allow(dead_code)] // consumer: `crate::conn`'s close path
     pub(crate) fn will_close<H: EventHost + ?Sized>(
         &mut self,
@@ -1944,13 +1522,6 @@ impl MultiEvents {
     /// transfer might be interested in more than 1 socket. `prev_ps` is the
     /// pollset copy from the previous call here. On the 1st call it will be
     /// empty."*
-    ///
-    /// **The diff is two-sided and both halves must run.** The first loop
-    /// covers the sockets wanted NOW (`:307`) and the second covers those
-    /// wanted BEFORE and no longer (`:367`); each carries the same C comment,
-    /// "track readers/writers changes and report to socket callback". Dropping
-    /// the second would leak a descriptor the application keeps watching for
-    /// ever.
     fn pollset_diff<H: EventHost + ?Sized>(
         &mut self,
         host: &mut H,
@@ -2324,10 +1895,6 @@ impl MultiEvents {
     /// `mev_forget_socket` (`lib/multi_ev.c:185-213`): purge a socket and,
     /// when the application knows about it, emit `CURL_POLL_REMOVE`.
     ///
-    /// `cause` is the caller's reason and appears verbatim in the frozen
-    /// trace line; the two callers pass `"last user gone"`
-    /// (`lib/multi_ev.c:420`) and `"socket done"` (`:599`).
-    ///
     /// Two details are load-bearing:
     ///
     /// * A socket with no entry answers [`CURLMcode::Ok`] -- "we never knew or
@@ -2392,17 +1959,6 @@ impl MultiEvents {
 
 /// What [`MultiEvents::fdset`] answers -- the engine half of
 /// `curl_multi_fdset`.
-///
-/// C writes straight into the caller's three `fd_set`s and its `int *max_fd`
-/// (`lib/multi.c:1213-1263`). A `fd_set` is a C type whose width is a
-/// platform constant, so the marshalling belongs to `curl-rs-ffi`, and this
-/// is what it marshals: the descriptors with what each is wanted for, and the
-/// maximum, already computed.
-///
-/// The shim sets the read bit for [`PollAction::IN`] and the write bit for
-/// [`PollAction::OUT`]. **It sets nothing at all in `exc_fd_set`**: the C
-/// writes `(void)exc_fd_set;` (`lib/multi.c:1226`) and populating it would be
-/// a behaviour change (AAP 0.8.2).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FdSet {
     /// Every descriptor to watch, with what it is wanted for.
@@ -2416,21 +1972,6 @@ pub(crate) struct FdSet {
 impl MultiEvents {
     /// The descriptors to watch -- `curl_multi_fdset`
     /// (`lib/multi.c:1213-1263`).
-    ///
-    /// `fd_setsize` is the caller's `FD_SETSIZE`, which is the C's
-    /// `FDSET_SOCK` test (`lib/select.h:103`): a descriptor at or above it
-    /// cannot be recorded in a `fd_set`, so C skips it -- with the comment
-    /// *"pretend it does not exist"* -- and, because the skip is a `continue`,
-    /// **it does not raise `max_fd` either**. That is why the bound is applied
-    /// here rather than in the shim: the filter has an observable effect on
-    /// the reported maximum. [`crate::conn::select`] deliberately does not
-    /// reproduce `FDSET_SOCK` for the same reason it does not reproduce
-    /// `fd_set`.
-    ///
-    /// This function cannot fail. C returns `CURLM_OK` unconditionally, and
-    /// the shim's only other answers -- [`CURLMcode::BadHandle`] and
-    /// [`CURLMcode::RecursiveApiCall`] -- come from checks it performs before
-    /// arriving here, in that order.
     ///
     /// A `mid` in the process set that does not resolve is SKIPPED and, unlike
     /// [`Self::waitfds`] and the wait, is **not** removed. The asymmetry is
@@ -2499,18 +2040,6 @@ impl MultiEvents {
     /// Whether `curl_multi_waitfds`' arguments are acceptable --
     /// `if(!ufds && (size || !fd_count)) return
     /// CURLM_BAD_FUNCTION_ARGUMENT;` (`lib/multi.c:1276-1277`).
-    ///
-    /// **This check runs BEFORE the handle is validated**, which is unusual
-    /// and observable: a null `ufds` with a non-zero `size` answers
-    /// [`CURLMcode::BadFunctionArgument`] even for a handle that is not a
-    /// multi handle at all. `curl-rs-ffi` must therefore consult this
-    /// predicate before its own `GOOD_MULTI_HANDLE` test, which is why the
-    /// condition is published separately instead of living only inside
-    /// [`Self::waitfds`]. Hoisting the handle check would change the answer.
-    ///
-    /// The permitted shapes, from `include/curl/multi.h:513`: *"Passing zero
-    /// size allows to get just a number of fds."* -- so a null array is fine
-    /// when `size` is zero and a place to report the count exists.
     #[allow(dead_code)] // consumer: `curl-rs-ffi`'s `curl_multi_waitfds`
     pub(crate) const fn waitfds_args_ok(
         has_ufds: bool,
@@ -2529,9 +2058,6 @@ impl MultiEvents {
     /// CURLMcode curl_multi_waitfds(CURLM *multi, struct curl_waitfd *ufds,
     ///                              unsigned int size, unsigned int *fd_count);
     /// ```
-    ///
-    /// `ufds` is [`None`] for a null pointer; `size` is the caller's own
-    /// `size` argument, which a slice cannot carry when there is no slice.
     ///
     /// # Errors
     ///
@@ -2655,26 +2181,6 @@ impl MultiEvents {
     /// 4. the caller's descriptors, translated from `CURL_WAIT_*` into the
     ///    internal `POLL*` bitmap;
     /// 5. the wakeup, last.
-    ///
-    /// # The internal timeout is consulted afterwards, on purpose
-    ///
-    /// C's comment, which is a statement about ORDER rather than about style:
-    /// *"We check the internal timeout \*AFTER\* we collected all sockets to
-    /// poll. Collecting the sockets may install new timers by protocols and
-    /// connection filters. Use the shorter one of the internal and the caller
-    /// requested timeout."*
-    ///
-    /// # The wakeup is an event, not a descriptor
-    ///
-    /// C has two shapes here. Where the wakeup is a socket pair it is added to
-    /// the poll set and counted in `cpfds.n`; where it is an event object --
-    /// the `USE_WINSOCK` build -- it is not, and the two conditions that
-    /// mention it are spelled `if(cpfds.n || use_wakeup)` (`:1450`) and
-    /// `if(extrawait && !cpfds.n && !use_wakeup)` (`:1548`). A [`Wakeup`] is
-    /// an event object, so **those are the two conditions reproduced here**,
-    /// and the wakeup joins the wait as a racing future rather than as a
-    /// descriptor. `NUM_POLLS_ON_STACK` (`:1330`) has no counterpart: a
-    /// growable vector needs no stack reserve, and performance is a non-goal.
     ///
     /// # Errors
     ///
@@ -2833,13 +2339,6 @@ impl MultiEvents {
             //    -1 timeout */
             // else if(sleep_ms < 0) sleep_ms = timeout_ms;
             // ```
-            //
-            // The second arm is only reached when the first is false, so the
-            // two conditions are disjoint and the disjunction is exactly
-            // equivalent -- one span too long and one span meaning "for ever"
-            // both become the caller's own timeout. Note what is NOT here:
-            // `sleep_ms == 0` skips the sleep altogether rather than asking
-            // for one of length zero.
             if sleep_ms != 0 {
                 if sleep_ms > timeout_ms || sleep_ms < 0 {
                     sleep_ms = timeout_ms;
@@ -2889,14 +2388,6 @@ impl MultiEvents {
 // THE TIMERS
 
 /// Forgets one timer -- `Curl_expire_done` (`lib/multi.c:3606-3612`).
-///
-/// *"Removes the expire timer. Marks it as done."* **The level-two tree is
-/// not touched**, exactly as C does not touch it here: the handle stays
-/// registered under whatever instant it had, and the next
-/// [`MultiEvents::add_next_timeout`] recomputes it.
-///
-/// A free function because it needs no multi-side state at all, which is the
-/// same reason C's version reads only `data`.
 #[allow(dead_code)] // consumer: every module that arms a timer
 pub(crate) fn expire_done(
     timers: &mut ExpireTimers,
@@ -2918,12 +2409,6 @@ pub(crate) fn expire_done(
 /// set.tv_usec += (int)(milli % 1000) * 1000;
 /// if(set.tv_usec >= 1000000) { set.tv_sec++; set.tv_usec -= 1000000; }
 /// ```
-///
-/// Field-wise rather than through [`Duration`](std::time::Duration), which
-/// [`crate::util::timeval`] warns about for the matching subtraction: a
-/// millisecond difference there is `secs_delta * 1000 + usec_delta / 1000`,
-/// truncating toward zero, and not `Duration::as_millis`. Mixing the two
-/// kinds of arithmetic is how a timer ends up a millisecond out.
 ///
 /// The carry is euclidean, so it normalises in both directions. C's carry only
 /// handles the positive overflow, which is sound for it because every caller
@@ -2964,11 +2449,6 @@ impl MultiEvents {
     ///    resolution.
     /// 4. **An empty tree answers `-1`** -- "no timeout at all", which is what
     ///    branch one and branch three of [`Self::update_timer`] test for.
-    ///
-    /// The trailing verbose trace names the timer that produced the answer:
-    /// `"gives multi timeout in %ldms"`, attributed to the surfaced handle's
-    /// nearest timer, and emitted only in the tree branch because that is
-    /// where C assigns the handle it traces against.
     fn timeout<H: SchedulerHost + ?Sized>(
         &mut self,
         host: &mut H,
@@ -3019,10 +2499,6 @@ impl MultiEvents {
 
     /// `curl_multi_timeout` (`lib/multi.c:3393-3408`).
     ///
-    /// Measured signature: `CURLMcode curl_multi_timeout(CURLM *multi_handle,
-    /// long *milliseconds)`. The handle check is the shim's; the recursion
-    /// check is C's own and comes second.
-    ///
     /// # Errors
     ///
     /// [`CURLMcode::RecursiveApiCall`] when called from inside a callback.
@@ -3042,15 +2518,6 @@ impl MultiEvents {
     }
 
     /// The nearest expiry as a span, or [`None`] for "no timeout at all".
-    ///
-    /// An addition, not a port: the C's consumers hand a `long` straight to
-    /// `poll()`, while a caller here arms a `tokio` timer and needs a
-    /// [`Duration`](std::time::Duration). The conversion is
-    /// [`mstotv`], whose contract is the reason
-    /// this is not a bare arithmetic helper -- a negative span means "block
-    /// for ever" and becomes [`None`], zero means "do not block" and becomes
-    /// `Some(ZERO)`, and [`crate::util::timediff`] warns that collapsing the
-    /// two "turns a poll into a hang or a wait into a busy spin".
     #[allow(dead_code)] // consumer: `super`'s scheduler
     pub(crate) fn timeout_duration<H: SchedulerHost + ?Sized>(
         &mut self,
@@ -3063,11 +2530,6 @@ impl MultiEvents {
 
     /// Tells the application to restart its timer -- `Curl_update_timer`
     /// (`lib/multi.c:3411-3464`).
-    ///
-    /// `#[must_use]` because `lib/multiif.h:35` declares it
-    /// `WARN_UNUSED_RESULT`: the result carries
-    /// [`CURLMcode::AbortedByCallback`], and dropping it would swallow an
-    /// application's refusal to continue.
     ///
     /// # The five branches, and the two that stay silent
     ///
@@ -3086,8 +2548,6 @@ impl MultiEvents {
     ///    time as previously. Our relative 'timeout_ms' may be different now,
     ///    but the application has the timer running and we do not to tell it to
     ///    start this again."*
-    ///
-    /// All three strings are frozen output.
     #[must_use]
     #[allow(dead_code)] // consumer: `super`'s perform and socket paths
     pub(crate) fn update_timer<H: SchedulerHost + ?Sized>(
@@ -3155,15 +2615,6 @@ impl MultiEvents {
 
     /// Arms a timer -- `Curl_expire_ex` (`lib/multi.c:3526-3586`).
     ///
-    /// `milli` is the delay from now; `id` names the timer, and there is at
-    /// most one pending timer per (handle, id) pair, so arming an id that is
-    /// already armed REPLACES it.
-    ///
-    /// C begins with `if(!multi) return;` -- *"this is only interesting while
-    /// there is still an associated multi struct remaining"*. Reaching this
-    /// method requires a multi handle, so that guard is the caller's: a
-    /// transfer with no multi handle must not call it.
-    ///
     /// # The three steps, in C's order
     ///
     /// 1. `multi_deltimeout(data, id)` FIRST -- *"Remove any timer with the
@@ -3177,12 +2628,6 @@ impl MultiEvents {
     ///    sooner than this new expiry time. We do not need to update our splay
     ///    tree entry."* The test is `diff > 0`, so an EQUAL instant falls
     ///    through and re-inserts.
-    ///
-    /// A failed removal is reported with the observable text `"Internal error
-    /// removing splay node = %d"`. C's `Curl_splayremove` has four codes, of
-    /// which `1` means the tree was empty (`lib/splay.c:214-215`) and `2` that
-    /// the node was not in it (`:249`); those are the two this can report,
-    /// because [`TimerTree`] makes the other two unrepresentable.
     #[allow(dead_code)] // consumer: every module that arms a timer
     pub(crate) fn expire_ex(
         &mut self,
@@ -3242,15 +2687,6 @@ impl MultiEvents {
 
     /// `Curl_expire` (`lib/multi.c:3599-3602`), which is **literally** a call
     /// to [`Self::expire_ex`] and nothing else.
-    ///
-    /// Its own documentation is worth keeping, because it describes both:
-    /// *"given a number of milliseconds from now to use to set the 'act before
-    /// this'-time for the transfer, to be extracted by curl_multi_timeout().
-    /// The timeout will be added to a queue of timeouts if it defines a moment
-    /// in time that is later than the current head of queue. Expire replaces a
-    /// former timeout using the same id if already set."*
-    ///
-    /// One delegation rather than two implementations that could drift.
     #[allow(dead_code)] // consumer: every module that arms a timer
     pub(crate) fn expire(
         &mut self,
@@ -3265,10 +2701,6 @@ impl MultiEvents {
 
     /// Clears every timer for one handle -- `Curl_expire_clear`
     /// (`lib/multi.c:3618-3647`).
-    ///
-    /// Acts only when the handle is registered in the tree, which is C's
-    /// `if(nowp->tv_sec || nowp->tv_usec)` over the sentinel that
-    /// [`ExpireTimers::expiretime`] replaces with [`Option`].
     ///
     /// `has_xfer_id` is `data->id >= 0`, which gates the frozen trace line and
     /// **is not `data->mid`**: `data->id` is the pool-scoped identifier whose
@@ -3318,27 +2750,12 @@ impl MultiEvents {
     /// `multi_addtimeout` (`lib/multi.c:3487-3524`): record a timer and place
     /// it in the handle's order.
     ///
-    /// C copies the instant and the id into the array slot -- `node->eid = eid`
-    /// *"also marks it as in use"* -- and then splices the slot into the sorted
-    /// list. [`ExpireTimers::set`] is both halves; see that type's note on why
-    /// the list is gone and what preserves its order.
-    ///
     /// # The trace label is wrong in the C, and is reproduced wrong
     ///
     /// ```c
     /// CURL_TRC_TIMER(data, eid, "set for %" FMT_TIMEDIFF_T "ns",
     ///                curlx_ptimediff_us(&node->time, Curl_pgrs_now(data)));
     /// ```
-    ///
-    /// **The label says `ns` and the value is MICROSECONDS.** That is an
-    /// upstream defect in a frozen output string: trace formats are preserved
-    /// exactly (AAP 0.8.1), so the `ns` is reproduced verbatim and this comment
-    /// exists so that nobody corrects it into a divergence.
-    ///
-    /// C takes a SECOND reading of the clock for the trace, after the one that
-    /// produced the instant, so the printed span is a little less than the
-    /// delay that was asked for. That is reproduced too: the injected clock is
-    /// read again here.
     fn add_timeout(
         &mut self,
         timers: &mut ExpireTimers,
@@ -3408,19 +2825,6 @@ impl MultiEvents {
 
     /// `multi_mark_expired_as_dirty` (`lib/multi.c:3035-3068`): queue every
     /// handle whose timer is due.
-    ///
-    /// *"The loop following here will go on as long as there are expire-times
-    /// left to process (compared to `ts`) in the splay and 'data' will be
-    /// re-assigned for every expired handle we deal with."*
-    ///
-    /// A handle that no longer resolves is **skipped with `continue`, not
-    /// returned from** -- C's `data = Curl_splayget(t); if(!data) continue;`
-    /// (`:3053-3054`). Its entry has already left the tree, so the loop still
-    /// terminates.
-    ///
-    /// The verbose trace `"has expired"` names the head of that handle's own
-    /// timer list, and is emitted BEFORE the drain, because the drain is what
-    /// removes the entry it names.
     fn mark_expired_as_dirty<H: EventHost + ?Sized>(
         &mut self,
         host: &mut H,
@@ -3479,14 +2883,6 @@ impl MultiEvents {
     /// * The tail runs on every path, error included: pending handles are
     ///   promoted, notifications are dispatched, `running_handles` is written,
     ///   and the timer is updated last.
-    ///
-    /// `ev_bitmask` is accepted and ignored, as in C -- `(void)ev_bitmask;`
-    /// (`lib/multi.c:3123`). The transfer discovers what happened by polling
-    /// its own sockets rather than by being told.
-    ///
-    /// `sigpipe_init`/`sigpipe_restore` have no counterpart: they exist to
-    /// suppress `SIGPIPE` from a C TLS library's writes, and no C TLS library
-    /// is linked (AAP 0.8.2).
     fn multi_socket<H: SchedulerHost + ?Sized>(
         &mut self,
         host: &mut H,
@@ -3556,14 +2952,6 @@ impl MultiEvents {
     }
 
     /// `curl_multi_socket_action` (`lib/multi.c:3292-3302`).
-    ///
-    /// The supported entry point of the three. Its guards are C's own, in
-    /// order: a callback in progress, then a notification dispatch in
-    /// progress, both answering [`CURLMcode::RecursiveApiCall`].
-    ///
-    /// `s` is either a descriptor with activity or [`CURL_SOCKET_TIMEOUT`],
-    /// which is the same integer as [`CURL_SOCKET_BAD`] and is distinguished
-    /// only by intent.
     #[allow(dead_code)] // consumer: `curl-rs-ffi`'s `curl_multi_socket_action`
     pub(crate) fn socket_action<H: SchedulerHost + ?Sized>(
         &mut self,
@@ -3589,29 +2977,13 @@ impl MultiEvents {
     ///
     /// # Why the symbol cannot be dropped
     ///
-    /// AAP 0.8.2 forbids removing a deprecated exported symbol, and this one is
-    /// in `lib/libcurl.def`'s hundred-name parity set. The header additionally
-    /// hides it behind a macro:
+    /// The header additionally hides it behind a macro:
     ///
     /// ```c
     /// #ifndef CURL_ALLOW_OLD_MULTI_SOCKET
     /// #define curl_multi_socket(x,y,z) curl_multi_socket_action(x,y,0,z)
     /// #endif
     /// ```
-    ///
-    /// -- and `.github/scripts/verify-examples.pl:40` compiles every one of the
-    /// 129 example programs with `-DCURL_ALLOW_OLD_MULTI_SOCKET`, which
-    /// SUPPRESSES that macro. The generated header must therefore still declare
-    /// the real prototype and the library must still export it, or the ABI gate
-    /// fails at the compile step rather than at the symbol comparison.
-    ///
-    /// Six examples touch this family -- `multi-event.c`, `hiperfifo.c`,
-    /// `multi-uv.c`, `ephiperfifo.c`, `evhiperfifo.c` and `ghiper.c` -- and,
-    /// measured, **none of them calls `curl_multi_socket` directly**; they all
-    /// call `curl_multi_socket_action`. It is the compile flag that makes the
-    /// prototype load-bearing, not a call site.
-    ///
-    /// Behaviourally it is `curl_multi_socket_action` with a zero bitmask.
     #[allow(dead_code)] // consumer: `curl-rs-ffi`'s `curl_multi_socket`
     pub(crate) fn socket<H: SchedulerHost + ?Sized>(
         &mut self,
@@ -3633,10 +3005,6 @@ impl MultiEvents {
     /// CURL_EXTERN CURLMcode CURL_DEPRECATED(7.19.5, "Use curl_multi_socket_action()")
     /// curl_multi_socket_all(CURLM *multi_handle, int *running_handles);
     /// ```
-    ///
-    /// The one caller of the `checkall` path: it runs every transfer rather
-    /// than the ones attached to one descriptor, and passes
-    /// [`CURL_SOCKET_BAD`] because no descriptor is named.
     #[allow(dead_code)] // consumer: `curl-rs-ffi`'s `curl_multi_socket_all`
     pub(crate) fn socket_all<H: SchedulerHost + ?Sized>(
         &mut self,
@@ -3671,13 +3039,6 @@ mod tests {
     ///   short revents;
     /// };
     /// ```
-    ///
-    /// Declared inside the test module on purpose. The shipped library makes
-    /// exactly one `#[repr(C)]` claim about this struct and it belongs to
-    /// `curl-rs-ffi`, which generates the header; see departure 2 in the
-    /// module documentation. A witness that exists only under `cfg(test)`
-    /// makes no second claim while still pinning the layout on whatever target
-    /// the test suite is built for, which is what the brief requires.
     #[repr(C)]
     struct WaitFdWitness {
         fd: Socket,
@@ -3686,19 +3047,6 @@ mod tests {
     }
 
     /// The `#[repr(C)]` field offsets of a three-field struct.
-    ///
-    /// `core::mem::offset_of!` stabilised in Rust 1.77 and the minimum
-    /// supported version is 1.75, so the offsets are DERIVED rather than
-    /// measured -- and derived without a raw pointer, because this module
-    /// carries none: pointer arithmetic, even the kind that never dereferences,
-    /// belongs to `curl-rs-ffi` and `crate::ffi`.
-    ///
-    /// The rule implemented here is the C's own layout algorithm, which
-    /// `#[repr(C)]` promises to follow: each field starts at the next offset
-    /// that satisfies its alignment, and the whole is padded to the struct's
-    /// alignment. That makes the assertion below genuinely target-sensitive --
-    /// widen `curl_socket_t` and the computed offsets change and the test fails
-    /// -- rather than a restatement of the numbers it checks.
     const fn repr_c_offsets(
         sizes: [usize; 3],
         aligns: [usize; 3],
@@ -3750,7 +3098,7 @@ mod tests {
         // `curl_socket_t` is `int` on all four targets, which is what makes
         // the offsets above what they are. On Windows it would be a
         // pointer-sized unsigned and the struct would be twelve bytes; Windows
-        // is out of scope (AAP 0.2.2) and no branch for it exists here.
+        // is out of scope and no branch for it exists here.
         assert_eq!(std::mem::size_of::<Socket>(), 4);
         assert_eq!(std::mem::size_of::<i16>(), 2);
     }
@@ -5019,17 +4367,6 @@ mod tests {
     /// a pure timer wait, so they interpret cleanly; this one cannot, because
     /// the frozen `fds=1` in the trace line it asserts on is precisely the
     /// count of registered descriptors.
-    ///
-    /// The gate (`.github/workflows/rust-miri.yml`) deliberately passes no
-    /// `-Zmiri-` flag, and no flag would help in any case -- this is an
-    /// unimplemented host facility, not isolation. A single un-ignored
-    /// offender aborts the WHOLE Miri run rather than failing one test, so the
-    /// alternative to this named skip is no interpretation of this module at
-    /// all. The arbitration itself is still covered under Miri by
-    /// `multi_timeout_answers_minus_one_for_an_empty_tree`,
-    /// `multi_timeout_answers_zero_for_a_dead_handle_or_a_dirty_transfer` and
-    /// `multi_timeout_rounds_the_remaining_span_up`, which read
-    /// [`MultiEvents::timeout`] directly and register nothing.
     #[tokio::test(start_paused = true)]
     #[cfg_attr(
         miri,
@@ -5147,12 +4484,6 @@ mod tests {
     async fn extrawait_sleeps_the_callers_timeout_when_there_is_no_timer() {
         // No descriptors and no wakeup: `extrawait` over an empty tree, whose
         // internal timeout is -1, sleeps for the caller's own timeout instead.
-        //
-        // The span is measured by racing a `timeout` against it rather than by
-        // reading a clock, because this module reads no clock but the injected
-        // one and the sleep belongs to the runtime. Under `start_paused` the
-        // runtime advances virtual time to the nearest timer when everything is
-        // idle, so the race is deterministic.
         let (mut events, _clock) = events_at(1);
         let mut host = TestHost::default();
         let slept_at_least = tokio::time::timeout(
@@ -5254,6 +4585,59 @@ mod tests {
             Some((ExpireId::SpeedCheck, due)),
             "and the later arrival is next"
         );
+    }
+
+    /// The millisecond granularity of the insertion comparison, asymmetry and
+    /// all -- `lib/multi.c:3506-3524` against `:3007`.
+    #[test]
+    fn two_timers_inside_one_millisecond_keep_the_order_they_were_set() {
+        let (mut events, _clock) = events_at(10);
+        let mut timers = ExpireTimers::new();
+
+        // `expire` takes whole milliseconds, so the sub-millisecond case is
+        // built by writing the slots directly -- which is what
+        // `multi_addtimeout` does to `data->state.expires[eid]`.
+        let later = CurlTime::new(10, 1_500);
+        let sooner = CurlTime::new(10, 900);
+        timers.set(ExpireId::TooFast, later);
+        timers.set(ExpireId::SpeedCheck, sooner);
+
+        // `curlx_ptimediff_ms(later, sooner)` is 0, so the insertion scan walks
+        // PAST the entry already there and the first-set timer keeps the head,
+        // even though the second is due 600us earlier. C behaves this way and
+        // the asymmetry is deliberate here: comparing at microsecond
+        // granularity would report `SpeedCheck`, which is a different answer
+        // to `curl_multi_timeout` than curl 8.19.0-DEV gives.
+        assert_eq!(
+            timers.nearest(),
+            Some((ExpireId::TooFast, later)),
+            "equal to the millisecond means FIFO, not nearest microsecond"
+        );
+
+        // A whole millisecond apart is a different matter: the comparison then
+        // has something to see and the earlier instant wins regardless of
+        // arrival order.
+        let mut timers = ExpireTimers::new();
+        timers.set(ExpireId::TooFast, CurlTime::new(10, 3_000));
+        timers.set(ExpireId::SpeedCheck, CurlTime::new(10, 1_000));
+        assert_eq!(
+            timers.nearest(),
+            Some((ExpireId::SpeedCheck, CurlTime::new(10, 1_000))),
+            "2ms earlier, so the scan breaks before the first entry"
+        );
+
+        // And the drain still measures in MICROSECONDS (`:3007`), so a timer
+        // 900us into the future is not yet due even though it rounds to 0ms.
+        let mut timers = ExpireTimers::new();
+        timers.set(ExpireId::Timeout, CurlTime::new(10, 900));
+        events.add_next_timeout(&mut timers, 1, CurlTime::new(10, 0));
+        assert_eq!(
+            timers.count(),
+            1,
+            "timediff_us(900us, 0) > 0, so nothing is drained"
+        );
+        events.add_next_timeout(&mut timers, 1, CurlTime::new(10, 900));
+        assert_eq!(timers.count(), 0, "at the instant itself it is due");
     }
 
     #[test]
@@ -5823,7 +5207,7 @@ mod tests {
         assert!(events.assess_xfer(&mut host, 1, None).is_ok());
         host.dirty_marks.clear();
 
-        // Both deprecated symbols stay (AAP 0.8.2), and this one behaves as
+        // Both deprecated symbols stay, and this one behaves as
         // `curl_multi_socket_action(m, s, 0, n)`.
         assert!(events.socket(&mut host, 3, None, None).is_ok());
         assert_eq!(host.dirty_marks, vec![1]);

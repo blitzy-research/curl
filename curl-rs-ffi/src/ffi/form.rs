@@ -15,10 +15,6 @@
 //! | `curl_formget` | curl.h:2657-2660, formdata.c:625-658 | **`int`** | non-zero, a `CURLcode` widened |
 //! | `curl_formfree` | curl.h:2668-2669, formdata.c:664-689 | **`void`** | none: silence |
 //!
-//! These are three of the 100 names in `lib/libcurl.def` (`:24-26`) and the
-//! only three this module may define. A second definition of any of them
-//! anywhere in the crate is a link error rather than a review finding.
-//!
 //! **Three different return types across three functions**, and the
 //! difference is load-bearing rather than cosmetic. `curl_formadd` has the
 //! nine-member `CURLFORMcode` to report with. `curl_formget` returns a plain
@@ -30,34 +26,6 @@
 //! return. That last point matters beyond tidiness, because the fixture
 //! corpus compares output byte for byte and a diagnostic on standard error
 //! would corrupt it.
-//!
-//! All three are deprecated in the headers and all three stay. Specification
-//! 0.8.2 prohibits "removal of deprecated exported symbols", and the `nm`
-//! parity gate compares the whole 100-name set, so dropping one fails it
-//! outright.
-//!
-//! # No wire bytes are produced here
-//!
-//! Boundary generation, part ordering, `Content-Disposition` and
-//! `Content-Type` emission, header casing and CRLF placement belong to
-//! `curl_rs_lib::mime::formdata` and, beneath it, `curl_rs_lib::mime`. This
-//! module marshals: it decodes an argument list, copies bytes across the
-//! boundary, builds the `#[repr(C)]` mirror a C caller walks, and calls one
-//! engine function per entry point. Specification 0.8.1 freezes the wire form
-//! and 0.6.7 measures the consequence -- 1,476 of 1,914 fixtures compare
-//! exact bytes with `compareparts`, which joins both sides into a single
-//! string, so there is no per-line matching, no normalisation and no
-//! reordering, and 48 fixtures gate on the `Mime` feature specifically. The
-//! multipart boundary is randomised in curl 8.x and it stays randomised:
-//! making it deterministic here would be a behaviour change, which 0.8.2
-//! prohibits.
-//!
-//! The C tree layers the legacy API over the modern one -- `Curl_getformdata`
-//! (`lib/formdata.c:717-841`) translates a `curl_httppost` chain into
-//! `curl_mime_*` builder calls and lets `lib/mime.c` emit the bytes -- and
-//! that layering is reproduced rather than a second serialiser written. The
-//! twelve `curl_mime_*` symbols belong to `super::mime`; none of them appears
-//! here.
 //!
 //! # `curl_formadd` is an OPEN-ENDED variadic, and the option-identifier
 //! trick cannot reach it
@@ -71,23 +39,6 @@
 //! enforcement macros for exactly those four functions and for none of the
 //! rest -- `curl_formadd` deliberately among the excluded, "only done to make
 //! sure application authors pass exactly three arguments to these functions".
-//!
-//! `curl_formadd` has no governing identifier. Its arguments are an
-//! open-ended `CURLFORM_*` option/value sequence terminated by
-//! `CURLFORM_END`, optionally routed through a `struct curl_forms` array by
-//! `CURLFORM_ARRAY`, so the callee must walk an unbounded list rather than
-//! read one slot. Structurally it belongs with the printf family.
-//!
-//! What *is* true, and is what makes the walk mechanical rather than
-//! guesswork, is that each option value governs the type of the slot that
-//! follows it -- a per-option encoding instead of an arithmetic one. `lib/
-//! formdata.c:346-347` reads the option itself with `va_arg(params, int)` and
-//! its `switch` then reads `char *`, `long`, `curl_off_t`,
-//! `struct curl_slist *`, `struct curl_forms *` or nothing at all. Every one
-//! of those occupies a single general-purpose slot of at most eight bytes on
-//! the four 64-bit targets specification 0.8.3 requires, and none is a
-//! floating-point type, so one cursor over the general-purpose slots decodes
-//! the whole list.
 //!
 //! **32-bit portability is deliberately forfeited and is not claimed.** A
 //! single register-width slot holds a `curl_off_t` only where a `curl_off_t`
@@ -106,37 +57,7 @@
 //! appear here: there is no `#![feature(...)]`, no `c_variadic` and no
 //! `VaList` in this file.
 //!
-//! Specification 0.8.6's open ambiguity A4 leaves three routes, and none of
-//! the three is taken silently:
-//!
-//! * **(a) Raise the minimum Rust version.** Rejected. Specification 0.8.3
-//!   preserves the directive verbatim -- "Rust edition 2021, MSRV 1.75" -- and
-//!   the workspace is measured to build at that floor.
-//! * **(b) A `cc`-compiled C shim** that performs `va_start` and delegates.
-//!   Rejected as written, because it would add a build dependency this crate's
-//!   manifest does not have -- its build-dependencies are `cbindgen` alone --
-//!   and adding one is above this module's authority. It is **reported** here
-//!   rather than adopted unilaterally.
-//! * **(c) Drop the symbol.** Prohibited outright by specification 0.8.2, and
-//!   the parity gate compares all 100 names as one set.
-//!
-//! **The route actually taken is (b') -- route (b)'s prologue written in
-//! stable `core::arch::global_asm!` instead of in C**, which needs neither a
-//! C compiler nor a newer toolchain. `curl_formadd` is not a Rust function at
-//! all: it is an assembled trampoline that performs precisely what the
-//! target's own C compiler emits for `va_start`, then calls the ordinary Rust
-//! function [`formadd_va`] with the synthesised argument list as its third
-//! parameter. `super::printf` established this route for the five plain
-//! `curl_m*printf` forms and owns the per-ABI cursor the callee walks with, so
-//! the slot arithmetic exists once in this crate rather than twice.
-//!
 //! # ESCALATION A4 remains open, and this is what it costs here
-//!
-//! Specification 0.8.6 records A4 as requiring a **user decision**: AAPCS64
-//! passes variadic arguments in registers while Apple's arm64 ABI passes them
-//! **on the stack**, so any Rust-side reading of an argument list is
-//! target-sensitive and the failure is silent on `aarch64-apple-darwin` -- one
-//! of the four required targets.
 //!
 //! For a trampolined symbol that hazard does not arise, because nothing here
 //! treats a register as a variadic argument: the Apple arm64 prologue is two
@@ -154,39 +75,72 @@
 //! file reports that requirement and emits nothing. A `warning` raised here
 //! would fail validation gate 1, which requires a warning-free build on all
 //! four targets, and a `#[cfg]`-gated `compile_error!` would make
-//! `aarch64-apple-darwin` unbuildable and fail the four-target matrix. Both
-//! would be self-defeating, and specification 0.6.2 calls the remaining
-//! option -- silent acceptance -- the worst of all.
+//! `aarch64-apple-darwin` unbuildable and fail the four-target matrix.
 //!
-//! # A second open item: `curl_formadd` cannot reach the shared library
+//! # A second finding, now closed on ELF: `curl_formadd` and the shared library
 //!
-//! Measured, and recorded in `build.rs` under "Trap 3" for the five printf
-//! trampolines that share the constraint. rustc builds a `cdylib`'s export
-//! list from Rust items carrying `#[no_mangle]` or `#[export_name]` and hands
-//! the linker an anonymous version script shaped
+//! Measured, and recorded in full in `build.rs` under "Trap 3" together with
+//! the five printf trampolines that share the constraint. rustc builds a
+//! `cdylib`'s export list from Rust items carrying `#[no_mangle]` or
+//! `#[export_name]` and hands the linker an anonymous version script shaped
 //! `{ global: <those items>; local: *; };`. An assembled `.globl` label
 //! matches nothing in `global:`, falls to the wildcard, is localised and --
-//! being unreferenced -- is discarded outright. So `curl_formadd` is a `T` in
-//! `libcurl.a` and in every rlib the tests link, and absent from
-//! `libcurl.so`.
+//! being unreferenced -- is discarded outright. So `curl_formadd` was a `T` in
+//! `libcurl.a` and in every rlib the tests link, and absent from `libcurl.so`.
 //!
 //! Eight linker routes were measured against that finding and seven do
-//! nothing; the eighth works on one of the four required targets and fails
-//! the link outright on the other three. Of the three alternatives, an
-//! `asm!(..., options(noreturn))` Rust body emits a prologue that moves the
-//! stack pointer, so the synthesised overflow area would be wrong by a
-//! profile-dependent amount -- `#[naked]`, which would make it exact, is
-//! stable at 1.88 -- declaring the register-resident arguments as ordinary
-//! parameters caps the argument list and mis-renders a legal C call
-//! **silently**, and route (b)'s C shim does not help either, because the
-//! version script governs the whole link and a C object's symbols are
-//! localised exactly as an assembled label is.
+//! nothing, because a symbol rustc's own script has already matched against
+//! `local: *` stays local. The eighth -- a second anonymous version script
+//! naming the assembled labels -- works, and `build.rs`'s
+//! `promote_assembled_exports` now emits it: the label is merged additively
+//! into rustc's list, so `curl_formadd` reaches the shared library too.
 //!
-//! The gap is therefore inherited rather than introduced, it is LOUD -- an
+//! What that route needs is LLD, selected explicitly from the invoking
+//! toolchain's own sysroot rather than left to whatever `cc` defaults to; GNU
+//! ld fails the link with "anonymous version tag cannot be combined with other
+//! version tags". An earlier revision of this comment concluded from that
+//! failure that the route worked on one target only, and the conclusion was
+//! wrong: both pinned toolchains ship LLD, and the route was measured to work
+//! at the 1.75 floor and on the aarch64 cross leg alike, with nothing leaked
+//! and the soname intact.
+//!
+//! What remains is Mach-O, where ld64's export list is REPLACED rather than
+//! extended, so promoting the six there would hide the other fifty-three.
+//! `curl_formadd` is therefore absent from a `.dylib` and present in a `.so`,
+//! and the residual gap is LOUD in the one place it still exists -- an
 //! undefined symbol at link or load time, which the parity gate reports by
-//! design -- and the only complete remedy is the minimum-version rise that A4
-//! already reserves to the user. `curl_formget` and `curl_formfree` are
-//! ordinary Rust items and are exported from both artifacts.
+//! design. `curl_formget` and `curl_formfree` are ordinary Rust items and are
+//! exported from every artifact.
+//!
+//! None of this touches A4: what that escalation reserves to the user is the
+//! four option-identifier setters on Apple arm64, an argument-passing question
+//! that no linker flag addresses.
+//!
+//! `curl_formadd` is one of **six** symbols that were in this position, and the
+//! count belongs here so that this module is not read as an isolated blemish:
+//! the other five are the `curl_m*printf` trampolines, and `ffi/printf.rs`
+//! carries the measurement, the eight rejected linker routes and the enumerated
+//! decision in full. Measured on x86_64-unknown-linux-gnu after the promotion,
+//! in the debug and release profiles alike: `nm -D --defined-only libcurl.so`
+//! and `nm --defined-only libcurl.a` both read the same 59 of the 100 required
+//! symbols, these six among them, so the two artifacts agree. Before the
+//! promotion the shared object read 53 where the archive read 59, and that
+//! earlier pair of numbers now describes Mach-O and the counterfactual the
+//! `build.rs` link-argument gate asserts against, nothing else.
+//!
+//! What is left is Mach-O, and the decision that would close it there is the
+//! requirement owner's: raise the MSRV above 1.75 to a toolchain carrying
+//! `#[naked]` (1.88) or `c_variadic` (1.99) and write the entry points as
+//! ordinary Rust items, which ld64 exports like any other; or narrow the target
+//! matrix. There is no third form, and in particular no environment setting.
+//! `CURL_RS_A4_VARIADIC_DECISION=accept-unsupported-varargs` once released the
+//! related `aarch64-apple-darwin` refusal and has been removed, because a
+//! build-time variable cannot make a known-wrong ABI right -- it can only
+//! produce the artifact that carries it, and specification 0.6.2 calls that
+//! silent acceptance the worst option for this hazard. `build.rs` now refuses a
+//! build that sets the variable at all, so nothing in this crate sets it,
+//! defaults it or infers it, and this module does not become correct because an
+//! environment still carries the string.
 //!
 //! # Where the model lives, and why C is shown a mirror
 //!
@@ -209,31 +163,6 @@
 //! `post->flags`, `post->name` or `post->next` gets what C would have given
 //! it.
 //!
-//! # Two limitations, both LOUD, both consequences of that division
-//!
-//! Stated here rather than discovered later. Neither is reachable from any
-//! documented use of the API.
-//!
-//! 1. A `curl_httppost` chain the application assembled itself is refused,
-//!    because there is no way to build the engine model from it. Every node
-//!    this module hands out carries a tag; an untagged one is not ours.
-//! 2. [`curl_formget`] serialises a whole form and accepts only its head. The
-//!    engine's `FormList` has no public push, so no sub-list can be built for
-//!    a chain starting part-way along.
-//!
-//! # Provenance of the constraints named above
-//!
-//! `review_rules` reports that **no user-specified rules were provided** for
-//! this project, so nothing in this file comes from that channel and no
-//! obligation here is a rule. Every constraint cited as binding is a
-//! requirement recorded in the Agent Action Plan's reading of the user's
-//! request -- the preservation mandate of 0.8.1, the prohibitions of 0.8.2,
-//! the byte-exact comparison of 0.6.7, the ambiguity A4 of 0.8.6 and the
-//! documented deviations of 0.8.7 -- or a measured fact about this
-//! repository, cited with its locator. Their absence from the rules channel is
-//! not a lower bar: the invariants below are compiler- and test-enforced
-//! rather than asserted in prose.
-//!
 //! # Three measurements recorded here because they contradict the folder's
 //! own notes
 //!
@@ -249,23 +178,12 @@
 //! declarations verbatim with the attribute on the preceding line and
 //! `curl_formadd` still spelled with `...`.
 //!
-//! **CORRECTION 12.** Exactly EIGHTEEN of `CURLformoption`'s 22 members carry
-//! `CURL_DEPRECATED(7.56.0, ...)`, not 21. The four that do not are
-//! `CURLFORM_OBSOLETE` (`:2566`), `CURLFORM_END` (`:2576`),
-//! `CURLFORM_OBSOLETE2` (`:2577`) and `CURLFORM_LASTENTRY` (`:2583`).
-//!
 //! **CORRECTION 20.** `CURLFORM_CONTENTLEN` exhibits a fourth attribute
 //! position: the member name and its trailing comment sit on `:2580` and the
 //! attribute on the next line, `:2581`. Across the public headers the four
 //! positions are post-name-pre-`=`, attribute-line-before-name, post-name, and
 //! post-name-post-comment-next-line; cbindgen can express none of them, which
 //! is why all four come from verbatim header text.
-//!
-//! `super::opts` owns `CURLformoption` and `super::codes` owns `CURLFORMcode`
-//! -- two easily confused spellings, the first with a lowercase `f` -- and
-//! `super::handle` owns `struct curl_httppost`, `struct curl_forms` and the
-//! eight `CURL_HTTPPOST_*` bits. This module imports all of them and declares
-//! none.
 
 use core::ffi::{c_char, c_int, c_long, c_void, CStr};
 use core::mem::{align_of, size_of};
@@ -311,9 +229,7 @@ const FORM_MAGIC: u64 = 0x0000_7372_6d72_6f66;
 /// carries fewer than twenty options.
 const MAX_DECODE_STEPS: usize = 4096;
 
-// ---------------------------------------------------------------------------
 // The argument shape of each option: lib/formdata.c:311-316 and :355-566
-// ---------------------------------------------------------------------------
 
 /// What the argument governed by one `CURLFORM_*` option holds.
 ///
@@ -324,10 +240,6 @@ const MAX_DECODE_STEPS: usize = 4096;
 /// #define form_ptr_arg(t) (forms ? (t)(void *)avalue : va_arg(params, t))
 /// #define form_int_arg(t) (forms ? (t)(uintptr_t)avalue : va_arg(params, t))
 /// ```
-///
-/// Both take their value from a `struct curl_forms` row while an array is being
-/// walked and from the argument list otherwise, which is why decoding has to
-/// know the shape either way.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Shape {
     /// `form_ptr_arg(char *)`, and the two other pointer types the switch
@@ -345,17 +257,6 @@ enum Shape {
 
 /// The shape of `option`'s argument, or `None` when the C's `switch` has no
 /// case for it.
-///
-/// `None` covers two groups that behave identically in the C and so are not
-/// distinguished here: an integer outside the enumeration, and the four members
-/// that name no operation -- `CURLFORM_NOTHING`, `CURLFORM_OBSOLETE`,
-/// `CURLFORM_OBSOLETE2` and `CURLFORM_LASTENTRY`. Both reach
-/// `default: retval = CURL_FORMADD_UNKNOWN_OPTION;` (`:563-565`), and the
-/// default arm reads **no argument at all**, which is why the decoder must stop
-/// there rather than guess at the rest of the list.
-///
-/// `CURLFORM_END` also yields `None` and is never asked: the caller tests for it
-/// first, because it terminates the list rather than carrying an argument.
 fn shape_of(option: CURLformoption) -> Option<Shape> {
     match option {
         CURLformoption::CURLFORM_COPYNAME
@@ -418,20 +319,6 @@ impl Item {
     }
 
     /// The integer this item carries, widened, or zero for a pointer shape.
-    ///
-    /// `c_long` and `curl_off_t` are both 64 bits wide on all four required
-    /// targets, so the two integer shapes answer the same question -- "how long
-    /// did the caller say it was?" -- and this returns it once, in one type.
-    ///
-    /// There is no conversion in the `Long` arm, and its absence is the point.
-    /// Every one of the four targets is LP64, so `c_long` *is* `i64` and any
-    /// conversion written here would be dead code that `clippy::useless_
-    /// conversion` and `clippy::unnecessary_cast` both object to, correctly.
-    /// Leaving it out also means a target where `c_long` is narrower fails to
-    /// compile at this line rather than silently widening -- which is the
-    /// outcome to want, because such a target is out of scope by the same
-    /// 64-bit-only decision the module header records, and a loud stop is better
-    /// than a quiet assumption.
     fn integer(self) -> curl_off_t {
         match self.arg {
             Arg::Long(value) => value,
@@ -441,9 +328,7 @@ impl Item {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Stage 1: the argument-list walk, once, in the caller's order
-// ---------------------------------------------------------------------------
 
 /// Walks the argument list into [`Item`]s, flattening any `CURLFORM_ARRAY`.
 ///
@@ -573,29 +458,9 @@ unsafe fn collect(ap: *mut CVaList) -> Result<Vec<Item>, CURLFORMcode> {
     Err(CURLFORMcode::CURL_FORMADD_INCOMPLETE)
 }
 
-// ---------------------------------------------------------------------------
 // Stage 2: resolving the lengths, then building the engine's vocabulary
-// ---------------------------------------------------------------------------
 
 /// Which potential `more`-node group each item belongs to.
-///
-/// The engine's builder wants slices, and a slice carries its own length, so
-/// each pointer has to be paired with the length the caller declared for it
-/// before the slice exists. In the C the two are independent -- the pointer goes
-/// to `curr->name` and the length to `curr->namelength`, and either may arrive
-/// first -- and "the same `curr`" is what makes them belong together.
-///
-/// `curr` advances at exactly two options: `CURLFORM_FILE` when a value is
-/// already present and `CURL_HTTPPOST_FILENAME` is set (`:438-451`), and
-/// `CURLFORM_CONTENTTYPE` under the same two conditions (`:514-527`). No other
-/// option can move it. So splitting the item list at **every** occurrence of
-/// those two options -- whether or not it actually spawns -- yields groups
-/// within which "same group" implies "same node", which is the property the
-/// pairing needs. The split is conservative in the safe direction: it can only
-/// separate things that are together, never join things that are apart.
-///
-/// The item that causes a split belongs to the group it opens, because a spawn
-/// makes the new node current before the option's own value is stored.
 fn groups(items: &[Item]) -> Vec<usize> {
     let mut current = 0usize;
     let mut out = Vec::with_capacity(items.len());
@@ -613,13 +478,6 @@ fn groups(items: &[Item]) -> Vec<usize> {
 }
 
 /// The length the caller declared for the pointer at `at`, if it can be found.
-///
-/// Looks in the item's own group first, which is where a determinable answer
-/// always is. When that group carries none, it falls back to a length option
-/// that is the **only** one of its kind in the whole call -- the ordinary case
-/// for a single-part form, where grouping is irrelevant because there is one
-/// node. When neither holds, the answer is `None` and the pointer is measured
-/// instead.
 ///
 /// `last_wins` distinguishes the two rules the C uses. `CURLFORM_NAMELENGTH`
 /// (`:385-388`) and `CURLFORM_BUFFERLENGTH` (`:487-490`) report
@@ -743,26 +601,6 @@ unsafe fn borrow_bytes<'a>(
 ///
 /// # The one narrow deviation in this module, stated rather than buried
 ///
-/// Five options -- `CURLFORM_FILE`, `CURLFORM_FILECONTENT`, `CURLFORM_BUFFER`,
-/// `CURLFORM_FILENAME` and `CURLFORM_CONTENTTYPE` -- reach the engine through
-/// `&str`, so a byte sequence that is not valid UTF-8 cannot be passed on. The C
-/// accepts any bytes. This is a limitation of the option vocabulary rather than
-/// of the model beneath it: the engine converts straight back to bytes
-/// (`path.as_bytes().to_vec()`), so nothing in the engine needs the string to be
-/// UTF-8, and **the missing capability is a `&[u8]` spelling of those five
-/// variants, which is reported rather than worked around** in keeping with
-/// specification 0.8.7.
-///
-/// Until that exists, such a call is refused with
-/// [`CURLFORMcode::CURL_FORMADD_MEMORY`], whose documented meaning at
-/// `include/curl/curl.h:2604` is "if some allocation for string copying failed"
-/// and which the engine already uses for a conversion it cannot perform. The
-/// refusal is at the point the unrepresentable input was supplied, with no
-/// half-built form and no successful return, which is the loud failure
-/// specification 0.6.2 asks for. A lossy conversion was rejected precisely
-/// because it is the quiet one: it would build a form that uploads a different
-/// file.
-///
 /// # Safety
 ///
 /// `pointer` must be null or address a NUL-terminated string that stays valid
@@ -797,21 +635,6 @@ unsafe fn borrow_str<'a>(
 ///   assembled reader instead, because a function pointer and an untyped context
 ///   cannot be held safely apart, and a reader cannot be asked for the context
 ///   inside it.
-///
-/// # How each is paired with the node it belongs to, without duplicating the
-/// engine's logic
-///
-/// By order, and the pairing is exact on the path that reaches it. Each of the
-/// two options can succeed **at most once per node** -- a second one is
-/// `CURL_FORMADD_OPTION_TWICE` -- and the engine visits nodes in the order the
-/// options arrive. So on the success path the k-th recorded pointer belongs to
-/// the k-th node whose corresponding engine accessor answers `Some`, and nothing
-/// here has to know where a node boundary fell.
-///
-/// A `CURLFORM_CONTENTHEADER` with a null list is stored as "not set" and is not
-/// an error (`:548-551`), so it records nothing and leaves no gap. A
-/// `CURLFORM_STREAM` with a null context is `CURL_FORMADD_NULL`, so on the
-/// success path every recorded stream context is non-null.
 struct Sides {
     /// The `struct curl_slist *` each successful `CURLFORM_CONTENTHEADER`
     /// carried, in order.
@@ -830,19 +653,11 @@ struct Sides {
 /// (`:638`), and `curl_mime_data_cb` with a null read function "clears the
 /// content and installs nothing" (`lib/mime.c:1425-1434`), so a form serialised
 /// by `curl_formget` renders a callback part as its headers with an empty body.
-/// That is curl 8.x's behaviour and specification 0.8.1 freezes it.
+/// That is curl 8.x's behaviour and it is frozen.
 ///
 /// This reader reproduces exactly that, and the context it carries is not lost:
 /// it is written to `post->userp`, which is where the C's own bridge reads it
 /// from.
-///
-/// One capability is genuinely absent and is reported rather than approximated:
-/// `CURLOPT_HTTPPOST` should install the easy handle's read function, and the
-/// engine function that would accept it -- the bridge, together with the
-/// "a read function is available" half of its policy argument -- is crate-private
-/// to `curl-rs-lib`. So a **crate-root re-export is missing**, and that is the
-/// finding, per specification 0.8.7. Reaching for a private path or inventing a
-/// second serialiser here would be the two wrong answers.
 struct StreamSource {
     /// `post->userp`: the caller's context, carried and never dereferenced.
     arg: *mut c_void,
@@ -850,12 +665,6 @@ struct StreamSource {
 
 impl core::fmt::Debug for StreamSource {
     /// Deliberately opaque.
-    ///
-    /// `PartReader` requires `Debug` and the engine derives `Debug` on the part
-    /// that holds one, so this is reachable from a formatting call. It reports
-    /// whether a context is present and never the address itself: an address is
-    /// both a diagnostic hazard and a value that changes between runs, and
-    /// anything this crate writes can end up compared byte for byte.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("StreamSource")
             .field("arg", &!self.arg.is_null())
@@ -907,11 +716,6 @@ impl PartReader for StreamSource {
 ///   `LONG_MAX` in the C's `size_t` field (`:388`, `:490`) and the engine's guard
 ///   answers `CURL_FORMADD_MEMORY` for exactly those inputs. Clamping to zero
 ///   here would silently accept a call the C rejects.
-///
-/// `FormOption::Unknown` is never produced, and that is not an omission: the C's
-/// `default` arm reads no argument, so the shape of everything after an
-/// unrecognised option is unknown and [`collect`] has to stop at it rather than
-/// hand a partial list on.
 ///
 /// # Safety
 ///
@@ -1101,9 +905,7 @@ unsafe fn decode(
     Ok((options, sides))
 }
 
-// ---------------------------------------------------------------------------
 // The mirror: what a `struct curl_httppost *` actually addresses
-// ---------------------------------------------------------------------------
 
 /// One node of the chain a caller walks.
 ///
@@ -1111,15 +913,6 @@ unsafe fn decode(
 /// a `*mut curl_httppost` addressing it are the same address and the first 112
 /// bytes are exactly the frozen struct. The two trailing members are invisible
 /// to C, which cannot know the allocation is larger than the type it was handed.
-///
-/// # Why a node carries its owner
-///
-/// The engine model a node belongs to cannot be reconstructed from the node's
-/// public fields -- `curl_rs_lib::mime::formdata` exposes accessors and no
-/// constructor -- so every entry point that needs the model has to get from a
-/// node back to it. `root` is that link, and it makes the model reachable from
-/// `*httppost` and from `*last_post` alike, which is what `curl_formadd` needs
-/// when it extends an existing chain.
 #[repr(C)]
 struct FormNode {
     /// The ABI-visible prefix, and the only part C may read.
@@ -1131,12 +924,6 @@ struct FormNode {
 }
 
 /// Everything one form owns: the engine's model and the mirror of it.
-///
-/// Allocated as a `Box` rather than through [`super::memory`], and deliberately:
-/// C never sees this record, it holds Rust values with Rust drop glue, and the
-/// allocator hooks exist so that memory a *consumer* might touch comes from the
-/// consumer's allocator. The nodes and the strings inside them, which a consumer
-/// can touch, do come from there.
 struct FormRoot {
     /// The authority. Declared first so that it is dropped first, before the
     /// bookkeeping that describes it.
@@ -1158,13 +945,6 @@ struct FormRoot {
 }
 
 /// The eight `CURL_HTTPPOST_*` bits, from the engine's named booleans.
-///
-/// `AddHttpPost` writes `post->flags = src->flags | CURL_HTTPPOST_LARGE`
-/// (`lib/formdata.c:78`) -- the `LARGE` bit unconditionally, on every node it
-/// creates -- and the engine already reproduces that when it builds an entry, so
-/// this is a transcription of eight booleans and not a place where policy is
-/// decided. A consumer may read `post->flags` directly, which is why every bit
-/// is set rather than only the ones this crate happens to consult.
 fn flag_bits(flags: FormFlags) -> c_long {
     let mut bits: c_long = 0;
     if flags.filename {
@@ -1223,10 +1003,6 @@ fn as_long<T: TryInto<c_long>>(value: T, failed: &mut bool) -> c_long {
 /// caller's: the pointer is stored as it is, the matching `CURL_HTTPPOST_PTR*`
 /// bit keeps `curl_formfree` off it, and the caller may reuse or release it once
 /// the form is gone.
-///
-/// A `None` input is a null field, which is not a failure: `post->name` is
-/// legitimately null for a part the C accepted with "a bad combo" (`:265-266`).
-/// A failed duplicate is, and sets `failed`.
 fn own_or_borrow(
     bytes: Option<&[u8]>,
     ownership: Ownership,
@@ -1259,10 +1035,6 @@ fn own_or_borrow(
 /// free(form->contenttype);
 /// free(form->showfilename);
 /// ```
-///
-/// `buffer` and `contentheader` are absent from that list in the C and are absent
-/// here: both are the caller's memory, stored verbatim by `AddHttpPost` (`:75`,
-/// `:79`) and released by whoever provided them.
 ///
 /// # Safety
 ///
@@ -1326,9 +1098,6 @@ unsafe fn release_node(node: *mut FormNode) {
 ///   `:69` and the accumulator's length goes to `contentlen` at `:74` instead.
 ///   Both members are written anyway, because both are public and a consumer can
 ///   read either.
-///
-/// Returns null when an allocation fails, having released everything it had
-/// already allocated.
 ///
 /// # Safety
 ///
@@ -1437,17 +1206,6 @@ fn take_next<T: Copy>(from: &[T], at: &mut usize, absent: T) -> T {
 }
 
 /// Mirrors one engine entry and its `more` chain into a fresh group of nodes.
-///
-/// The group's shape is `AddHttpPost`'s. Each accumulator after the first is
-/// added with the previous node as its parent, and the parent splice is
-/// `post->more = parent->more; parent->more = post;` (`:85-92`) where
-/// `parent->more` is always null at that moment, so a group built in order is a
-/// plain linear `more` chain from the top node downwards. The engine's `FormList`
-/// documents the same shape from its side: one call appends exactly one
-/// top-level entry, however many files it names.
-///
-/// Returns `None` when an allocation fails, having released every node it had
-/// already built, so that the caller's form is left exactly as it was.
 ///
 /// # Safety
 ///
@@ -1563,11 +1321,6 @@ unsafe fn form_of(post: *mut curl_httppost) -> Option<*mut FormRoot> {
 
 /// The flag's address, read out of a form without borrowing the form.
 ///
-/// `Box<T>` for a sized `T` has the size, alignment and representation of
-/// `*mut T`, so the field is read as a pointer rather than borrowed as a `Box`;
-/// borrowing it would put a second live tag on the allocation the flag lives in.
-/// This is what the boxing on [`FormRoot::poison`] buys.
-///
 /// # Safety
 ///
 /// `root` must address a live [`FormRoot`], and the returned reference must not
@@ -1602,24 +1355,9 @@ fn to_form_code(code: FormCode) -> CURLFORMcode {
     }
 }
 
-// ---------------------------------------------------------------------------
 // 1 of 3: curl_formadd
-// ---------------------------------------------------------------------------
 
 /// Adds one part to a form: the Rust half of `curl_formadd`.
-///
-/// The assembled trampoline below performs the target's own `va_start` and calls
-/// this with the synthesised argument list as its third parameter, which is why
-/// this function is not itself variadic and why it carries no `#[no_mangle]`: the
-/// exported name belongs to the trampoline, and a second definition of it would
-/// be a link error.
-///
-/// The sequence is `FormAdd`'s (`lib/formdata.c:300-601`), with the decode split
-/// out: read the whole option list, hand it to the engine, mirror what the engine
-/// built, and only then touch the caller's two out-parameters. That order is what
-/// makes the C's all-or-nothing contract hold -- "On error, free allocated fields
-/// for all nodes ... the caller's list is left completely unchanged" -- because
-/// nothing is written until everything has succeeded.
 ///
 /// # Safety
 ///
@@ -1712,10 +1450,6 @@ unsafe extern "C" fn formadd_va(
 
 /// The body of one successful-or-not addition, with the form already resolved.
 ///
-/// Split out from [`formadd_va`] so that the transactional guard has a single
-/// closure to protect and so that the failure paths sit beside the state each one
-/// has to leave behind.
-///
 /// # Safety
 ///
 /// `root` must address a live form that nothing else borrows, and `httppost` and
@@ -1792,7 +1526,6 @@ unsafe fn extend(
     CURLFORMcode::CURL_FORMADD_OK
 }
 
-// ---------------------------------------------------------------------------
 // The exported name: an assembled `va_start`, one prologue per ABI
 //
 // ROUTE (b') FROM THE MODULE DOCUMENTATION, and the reason there are four of
@@ -1807,26 +1540,9 @@ unsafe fn extend(
 //                     makes this the simplest of the four rather than the
 //                     hardest
 //
-// Two named parameters, so the first variadic general-purpose argument is the
-// third register and the synthesised list is handed over in that same third
-// register -- after the register file has been saved, so overwriting it cannot
-// lose an argument. `curl_mfprintf` in `super::printf` has the identical
-// arithmetic for the identical reason.
-//
-// The frames and offsets are not read off a specification alone: this shape was
-// measured against the prologue the target's own C compiler emits, and the
-// assembled result was disassembled and compared. It was then executed on
-// x86-64 through a real variadic C-style call carrying eight arguments -- four
-// in registers and four in the overflow area, including a pointer, a value of
-// 2^40 and a negative one -- which round-tripped exactly, on the pinned stable
-// toolchain and on the 1.75 floor, in both profiles. The Apple legs are
-// cross-assembled and disassembled only, no Apple host being available; that
-// gap is stated rather than papered over.
-//
 // The callee is deliberately NOT `#[no_mangle]`. Exactly one symbol named
 // `curl_formadd` may exist, and it is the label below; an exported callee would
 // be a 101st symbol and would fail the parity gate that compares the whole set.
-// ---------------------------------------------------------------------------
 
 // x86-64 System V, ELF flavour.
 //
@@ -1887,12 +1603,6 @@ core::arch::global_asm!(
 );
 
 // x86-64 System V, Mach-O flavour -- `x86_64-apple-darwin`.
-//
-// Identical arithmetic to the ELF form; only the assembler dialect differs.
-// Mach-O decorates symbols with a leading underscore, and its assembler rejects
-// `.type` and `.size` outright -- measured, not assumed: both produce
-// `error: unknown directive` when the ELF form is cross-assembled for this
-// target.
 #[cfg(all(target_arch = "x86_64", target_vendor = "apple"))]
 core::arch::global_asm!(
     concat!(
@@ -1934,15 +1644,6 @@ core::arch::global_asm!(
 );
 
 // AAPCS64, ELF flavour -- `aarch64-unknown-linux-gnu`.
-//
-// Frame of 240 bytes: the frame record at 0, x0 through x7 at 16, q0 through q7
-// at 80, and the 32-byte record at 208. `__stack` is the entry stack pointer,
-// `__gr_top` and `__vr_top` are the ENDS of the two save areas, and the two
-// offsets are negative and count up to zero -- so the general-purpose one starts
-// at -48, eight bytes per unconsumed register with two named parameters already
-// spent, and the vector one always at -128. x9 is a temporary the ABI leaves
-// free. The list pointer is placed after the register saves, so overwriting x2
-// with it cannot lose an argument.
 #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
 core::arch::global_asm!(
     concat!(
@@ -1988,12 +1689,6 @@ core::arch::global_asm!(
 
 // Apple arm64, Mach-O flavour -- `aarch64-apple-darwin`.
 //
-// Two instructions, and that is the whole of it. Apple's arm64 ABI passes every
-// variadic argument on the stack, so the argument list is a bare cursor and
-// `va_start` reduces to "take the entry stack pointer". The two named parameters
-// keep their registers, so nothing needs saving and the callee can be
-// tail-called.
-//
 // **This is the target ESCALATION A4 was raised about, and this is the
 // resolution for this symbol.** The concern was a Rust callee reading a register
 // an Apple caller never populated; nothing here treats a register as a variadic
@@ -2014,9 +1709,7 @@ core::arch::global_asm!(
     callee = sym formadd_va,
 );
 
-// ---------------------------------------------------------------------------
 // 2 of 3: curl_formget
-// ---------------------------------------------------------------------------
 
 /// Serialises a form and hands the bytes to a callback.
 ///
@@ -2024,37 +1717,6 @@ core::arch::global_asm!(
 /// `include/curl/curl.h:2657-2660`. **Returns `int`**, not a `CURLFORMcode` and
 /// not a `CURLcode`: the C casts a `CURLcode` into it at `:658`, so 0 is success
 /// and 43 -- `CURLE_BAD_FUNCTION_ARGUMENT` -- is what an absent callback reports.
-///
-/// # The bytes are the specification
-///
-/// What reaches the callback is the multipart body a `curl_httppost` chain
-/// serialises to, and it must be byte-identical to curl 8.19.0-DEV: the boundary
-/// strings, the part order, `Content-Disposition` and `Content-Type`, the header
-/// casing and every CRLF. Nothing here touches any of it. The engine builds it,
-/// and this function copies whole chunks across the boundary without inspecting
-/// them; there is no normalisation and no reordering, because 1,476 fixtures
-/// compare the result as one string.
-///
-/// Chunk boundaries are not part of that contract -- the callback may be invoked
-/// any number of times with any split, exactly as the C's 8192-byte loop makes it
-/// -- but a callback that returns anything other than the length it was given
-/// aborts the serialisation with `CURLE_READ_ERROR`, which the C's
-/// `append(arg, buffer, nread) != nread` test does at `:650-651`.
-///
-/// # A null form
-///
-/// Reported as success with nothing emitted, because that is what the C does:
-/// `Curl_getformdata`'s "no input => no output!" (`:729-730`) leaves the top part
-/// empty, the read loop ends immediately, and `CURLE_OK` is returned.
-///
-/// # Only the head of a chain
-///
-/// A form is serialised as a whole and `form` must be the `struct curl_httppost *`
-/// [`curl_formadd`] wrote into the caller's variable. A node part-way along the
-/// chain is refused with `CURLE_BAD_FUNCTION_ARGUMENT` rather than serialised
-/// from there: the engine's `FormList` has no public push, so no sub-list can be
-/// built, and answering with the whole form instead would be the quiet wrong
-/// answer. No documented use of this API reaches that case.
 ///
 /// # Safety
 ///
@@ -2125,9 +1787,7 @@ pub unsafe extern "C" fn curl_formget(
     })
 }
 
-// ---------------------------------------------------------------------------
 // 3 of 3: curl_formfree
-// ---------------------------------------------------------------------------
 
 /// Releases a whole form post.
 ///
@@ -2137,26 +1797,6 @@ pub unsafe extern "C" fn curl_formget(
 /// contained panic is a silent return. Whatever it learns about a fault it keeps
 /// to itself, which matters beyond tidiness: the fixture corpus compares output
 /// byte for byte and a diagnostic on standard error would corrupt it.
-///
-/// What is released is exactly what the C releases, and the decision is read out
-/// of `post->flags` exactly as the C reads it: the name unless
-/// `CURL_HTTPPOST_PTRNAME`, the contents unless any of `CURL_HTTPPOST_PTRCONTENTS`,
-/// `CURL_HTTPPOST_BUFFER` or `CURL_HTTPPOST_CALLBACK`, then the content type, the
-/// shown filename and the node. `buffer` and `contentheader` are the caller's and
-/// are left alone in both implementations -- so a `CURLFORM_PTRNAME` name or a
-/// `CURLFORM_PTRCONTENTS` value is still the caller's to reuse or release after
-/// this returns, which is observable and is the whole reason those flags exist.
-///
-/// A form attached to an easy handle with `CURLOPT_HTTPPOST` is **not** owned by
-/// that handle; the caller still calls this, exactly as against C libcurl.
-///
-/// # A node part-way along a chain
-///
-/// Ignored. The C would release the sub-chain from there and leave the preceding
-/// node's `next` dangling, which no documented use does. Releasing the whole form
-/// instead would dangle the head the caller still holds, and releasing nothing is
-/// the only answer that can neither double-free nor dangle. Pass the head, which
-/// is what every documented use passes.
 ///
 /// # Safety
 ///
@@ -2196,9 +1836,7 @@ pub unsafe extern "C" fn curl_formfree(form: *mut curl_httppost) {
     });
 }
 
-// ---------------------------------------------------------------------------
 // The coordination surface `CURLOPT_HTTPPOST` needs
-// ---------------------------------------------------------------------------
 
 /// Runs `body` against the engine model behind a `struct curl_httppost *`.
 ///
@@ -2207,10 +1845,6 @@ pub unsafe extern "C" fn curl_formfree(form: *mut curl_httppost) {
 /// job), and the transfer then needs the model rather than the mirror. This is
 /// the only way to reach it, because the mirror cannot be turned back into a
 /// model: the engine exposes accessors and no constructor.
-///
-/// `None` for a null pointer, for a chain this module did not build, for a node
-/// part-way along one, and for a form whose model and mirror disagree -- the four
-/// cases in which there is no model to hand over.
 ///
 /// # Safety
 ///
@@ -2240,29 +1874,20 @@ pub(crate) unsafe fn with_form_list<R>(
     Some(body(unsafe { &(*root).list }))
 }
 
-// ---------------------------------------------------------------------------
 // Tests
 //
-// COVERAGE RELOCATED HERE, per specification 0.8.7. `curl_formadd` and
-// `curl_formget` are both annotated `@unittest: 1308` (`lib/formdata.c:606`,
-// `:625`), and that annotation points at `tests/libtest/lib1308.c` -- a C program
-// that links a debug static libcurl and calls internal `Curl_*` symbols. Such a
-// program cannot link against a Rust static library at all, because `pub(crate)`
-// items are genuinely absent from its symbol table rather than merely hidden, so
-// the assertions move into the crate that owns the code.
-//
-// Everything below drives the three symbols THROUGH THE C ABI wherever it can:
-// `curl_formadd` is reached by declaring it exactly as C declares it, which
-// exercises the whole chain at once -- the assembly trampoline's `va_start`, the
-// per-target cursor, the decode, the engine and the mirror. Rust may declare a
-// C-variadic function even though it may not define one, so
-// `extern "C" { fn curl_formadd(_: *mut *mut curl_httppost, ...) }` calls the
-// assembled symbol exactly as a C caller would.
-// ---------------------------------------------------------------------------
+// `curl_formadd` and `curl_formget` are both annotated `@unittest: 1308`
+// (`lib/formdata.c:606`, `:625`), and that annotation points at
+// `tests/libtest/lib1308.c` -- a C program that links a debug static libcurl
+// and calls internal `Curl_*` symbols. Such a program cannot link against a
+// Rust static library at all, because `pub(crate)` items are genuinely absent
+// from its symbol table rather than merely hidden, so the assertions move into
+// the crate that owns the code.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::mem::MaybeUninit;
 
     // The exported name, declared as `include/curl/curl.h:2632-2635` declares
     // it. It is variadic here, which is the point: nothing else in this crate
@@ -2391,14 +2016,6 @@ mod tests {
     }
 
     /// [`production_source`] with every comment line removed.
-    ///
-    /// Necessary rather than tidy, and it was necessary in practice: this module
-    /// *discusses* `#![feature(...)]`, `global_asm!` and the rest at length, so
-    /// an unfiltered scan finds the discussion and reports the prose as the very
-    /// violation it is explaining. Dropping whole comment lines is enough here
-    /// because every needle below is code that stands on a line of its own or
-    /// inside an assembler literal, and it keeps the checks living in the file
-    /// they check with no self-exemption and no allow-list.
     fn production_code() -> String {
         production_source()
             .lines()
@@ -2518,15 +2135,38 @@ mod tests {
         );
     }
 
+    /// Byte offset of a field within a struct.
+    ///
+    /// `core::mem::offset_of!` is stable only from Rust 1.77 and the declared
+    /// minimum is 1.75 (AAP 0.8.3, obligation B3), so the offset is taken
+    /// through `addr_of!`, stable since 1.51. It forms the address without
+    /// creating a reference, so it is sound on uninitialised memory -- which is
+    /// what lets a record full of raw pointers be measured without inventing
+    /// values for them. No crate is added for this: `memoffset` would be a new
+    /// dependency and the dependency set is fixed (obligation B4). The same
+    /// helper, for the same reason, is in `super::handle` and `super::types`.
+    macro_rules! offset {
+        ($ty:ty, $field:ident) => {{
+            let holder = MaybeUninit::<$ty>::uninit();
+            let base = holder.as_ptr();
+            // SAFETY: `base` points at a whole, correctly aligned allocation of
+            // `$ty` owned by `holder`. `addr_of!` only computes the field's
+            // address and never reads the uninitialised bytes, so no invalid
+            // value is ever materialised.
+            let field = unsafe { ptr::addr_of!((*base).$field) };
+            (field as usize) - (base as usize)
+        }};
+    }
+
     #[test]
     fn the_node_layout_puts_the_frozen_struct_first() {
         // A `*mut FormNode` handed to C as a `*mut curl_httppost` must address
         // the frozen struct at offset zero, or every field a consumer reads is
         // the wrong one.
         assert_eq!(
-            core::mem::offset_of!(FormNode, post),
+            offset!(FormNode, post),
             0,
-            "the ABI prefix must come first",
+            "the ABI prefix must come first"
         );
         assert!(
             size_of::<FormNode>() > size_of::<curl_httppost>(),
@@ -3154,10 +2794,6 @@ mod tests {
         // One node per flag-setting option, asserted as a whole word rather than
         // bit by bit: a consumer may read `post->flags` and decide from it what
         // it owns, so a spurious bit is as wrong as a missing one.
-        //
-        // `CURL_HTTPPOST_LARGE` is on every row because `AddHttpPost` sets it
-        // unconditionally -- `post->flags = src->flags | CURL_HTTPPOST_LARGE;`
-        // (`:78`) -- which is why it is the expected word for a plain part too.
         let dir = std::env::temp_dir();
         let stamp = std::process::id();
         let path = dir.join(format!("blitzy_form_flags_{stamp}.txt"));

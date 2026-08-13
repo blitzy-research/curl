@@ -26,91 +26,14 @@
 // with the C block comment converted to line comments. `conn/` is curl-licensed
 // throughout; the ISC banner that heads `util/inet.rs` belongs to that file's
 // BSD-derived original and must not be copied here.
-//
-// The licence tag appears exactly once, on line 21, and nowhere else in this
-// file -- not even in prose. `reuse` reads every line carrying the tag's colon
-// form as a licence expression, so a second mention becomes a parse error
-// rather than a comment. `conn/mod.rs:25-61` and `util/mod.rs:25-61` record the
-// full reasoning; it is not repeated here.
-//
-// `dead_code` IS NOT ALLOWED for this file as a whole, and no attribute below
-// grants it at module scope. Items whose consumers have yet to land carry their
-// own `#[allow(dead_code)]`, so the suppressions read as an inventory: each one
-// is load-bearing, deleting any one restores a warning, and an item added later
-// with no consumer is still reported. That is enforced rather than agreed --
-// `mod source_policy` in `curl-rs-lib/src/lib.rs` walks the workspace at test
-// time and fails on a `dead_code` level set on any crate root or module root.
-//
-// The allowances here are expected to be short-lived and their pattern is
-// structural: this module is the COMPOSITION MECHANISM, so its consumers are
-// the filters themselves -- `conn/socket.rs`, `conn/happy_eyeballs.rs`,
-// `tls/`, `proxy/` and `protocols/{http2,http3}` -- together with the transfer
-// loop that drives a chain. None of them exists yet. Each allowance is deleted
-// when its consumer lands.
-//
-// No level for the `unsafe_code` lint is set here, at any level, and the
-// keyword itself does not appear in any expression in this file. `src/lib.rs`
-// carries `#![deny(unsafe_code)]` and grants exactly ONE exemption, on
-// `mod ffi`. That matters more here than almost anywhere else in the crate: the
-// C original is built out of a raw context pointer that every filter casts to
-// its own type, and reproducing the same composition with a typed field is this
-// module's entire reason to exist.
 
-//! The connection filter chain -- supersedes `lib/cfilters.c` (1,104 lines) and
-//! `lib/cfilters.h` (687).
+//! The connection filter chain -- supersedes `lib/cfilters.c` and
+//! `lib/cfilters.h`.
 //!
 //! Measured against `lib/cfilters.h:36-237,239-353,470-491,620-687` and
 //! `lib/cfilters.c:36-136,212-421,446-592,594-1104`, with contract context from
 //! `lib/urldata.h`, `lib/curl_trc.c`, `lib/curl_trc.h`, `lib/vtls/vtls_int.h`,
 //! `lib/vquic/vquic.h`, `lib/cf-haproxy.c` and `lib/select.h`.
-//!
-//! A filter chain is what sits between a protocol and a socket. Bytes leaving a
-//! transfer enter at the top and are handed down link by link -- HTTP/2
-//! framing, then TLS, then a `CONNECT` tunnel, then the socket -- and bytes
-//! arriving travel back up the same way. The chain is the crate's ONLY
-//! composition mechanism for raw sockets, TLS, proxies, HTTP/2 and HTTP/3;
-//! there is deliberately no parallel per-protocol stack, which is what lets
-//! `crate::protocols` name no TLS type at all while TLS is interposed
-//! transparently beneath it.
-//!
-//! # What the C expresses, and how
-//!
-//! Two structures, quoted verbatim so the translation can be checked against
-//! them:
-//!
-//! ```text
-//! struct Curl_cftype {                       /* lib/cfilters.h:210-226 */
-//!   const char *name;
-//!   int flags;
-//!   int log_level;
-//!   Curl_cft_destroy_this *destroy;
-//!   Curl_cft_connect *do_connect;
-//!   Curl_cft_close *do_close;
-//!   Curl_cft_shutdown *do_shutdown;
-//!   Curl_cft_adjust_pollset *adjust_pollset;
-//!   Curl_cft_data_pending *has_data_pending;
-//!   Curl_cft_send *do_send;
-//!   Curl_cft_recv *do_recv;
-//!   Curl_cft_cntrl *cntrl;
-//!   Curl_cft_conn_is_alive *is_alive;
-//!   Curl_cft_conn_keep_alive *keep_alive;
-//!   Curl_cft_query *query;
-//! };
-//!
-//! struct Curl_cfilter {                      /* lib/cfilters.h:229-237 */
-//!   const struct Curl_cftype *cft;
-//!   struct Curl_cfilter *next;
-//!   void *ctx;
-//!   struct connectdata *conn;
-//!   int sockindex;
-//!   BIT(connected);
-//!   BIT(shutdown);
-//! };
-//! ```
-//!
-//! `Curl_cftype` is a hand-rolled vtable: fifteen members, of which twelve are
-//! function pointers. `Curl_cfilter` is one instance of it, and the `void *ctx`
-//! at `lib/cfilters.h:232` is where each implementation keeps its own state.
 //!
 //! # The one thing that had to change
 //!
@@ -130,13 +53,6 @@
 //! point. The specification names the C cast as the largest single source of
 //! unsound patterns in the tree, and removing it is what makes the rest of the
 //! safety guarantee reachable.
-//!
-//! Two C mechanisms vanish with it and have no successor under any name.
-//! `struct cf_call_data` and the `CF_DATA_SAVE`/`CF_DATA_RESTORE` pair
-//! (`lib/cfilters.h:620-685`) exist only so that a re-entrant call can find the
-//! easy handle again after a `void *` has erased it; an explicit typed
-//! [`CallCtx`] parameter carries it instead, so a nested call needs no saved
-//! state and no depth counter.
 //!
 //! # What did NOT change
 //!
@@ -160,30 +76,6 @@
 //!   walks front to back (`lib/cfilters.c:118-136`) -- the opposite of the
 //!   tail-first destruction `crate::util::llist` reproduces for the intrusive
 //!   lists elsewhere in the tree.
-//!
-//! # Trace integration assumes nothing about how either C structure is laid out
-//!
-//! The filter table and the feature table are two SEPARATE typed registries,
-//! never conflated and never reinterpreted as one another.
-//! `lib/curl_trc.c:503-570` defines both -- `trc_feats[]` over
-//! `struct curl_trc_feat` and `trc_cfts[]` over `struct Curl_cftype` -- and the
-//! two do not even agree on field order: the filter table's row carries `flags`
-//! between `name` and `log_level`, and the feature table's row has no such
-//! member at all. A filter here reports a stable
-//! [`ConnFilter::trace_name`] and its [`ConnFilter::trace_filter`] identity,
-//! and the mutable per-name level that `--trace-config` writes lives in
-//! [`crate::trace::TraceConfig`], reached through
-//! [`Tracer::is_filter_verbose`]. A static filter type holds no mutable level.
-//!
-//! # Asynchrony stops at the driver
-//!
-//! The twelve trait methods are SYNCHRONOUS and non-blocking, exactly as their
-//! C originals are: a `connect` reports `done = false` and expects to be called
-//! again. That is not a concession, it is the only shape available -- `async fn`
-//! in a trait is not object-safe on the pinned MSRV, and a chain is
-//! `dyn`-dispatched by construction. The asynchrony lives one level up, in
-//! [`FilterChain::connect`], which awaits readiness through
-//! [`crate::conn::select`] and never touches `poll` or `select` itself.
 
 use core::fmt;
 use core::pin::Pin;
@@ -200,9 +92,7 @@ use crate::util::bufq::BufQ;
 use crate::util::timediff::{tvtoms, TimeDiff};
 use crate::util::timeval::{Clock, CurlTime};
 
-// =========================================================================
 // Socket index -- `FIRSTSOCKET` / `SECONDARYSOCKET`
-// =========================================================================
 
 /// `FIRSTSOCKET` (`lib/urldata.h:421`): the primary socket of a connection.
 pub(crate) const FIRSTSOCKET: i32 = 0;
@@ -213,14 +103,6 @@ pub(crate) const FIRSTSOCKET: i32 = 0;
 pub(crate) const SECONDARYSOCKET: i32 = 1;
 
 /// Which of a connection's two filter chains a filter belongs to.
-///
-/// `int sockindex` (`lib/cfilters.h:234`) becomes a type, because the C value is
-/// an index into `conn->cfilter[2]` (`lib/urldata.h:646`) and every C entry
-/// point guards it with `CONN_SOCK_IDX_VALID(i)` -- `i >= 0 && i < 2`
-/// (`lib/urldata.h:648`) -- returning `CURLE_BAD_FUNCTION_ARGUMENT` when the
-/// guard fails. Making the index a two-variant type moves that guard to the
-/// single place a raw integer enters, [`Self::from_i32`], and removes it from
-/// every entry point after it.
 ///
 /// The conversion is CHECKED and deliberately not lenient: an unrecognised
 /// integer is [`CURLcode::BadFunctionArgument`], never a silent fall back to
@@ -287,20 +169,9 @@ impl SocketIndex {
     }
 }
 
-// =========================================================================
 // Filter type flags -- `CF_TYPE_*`
-// =========================================================================
 
 /// The `flags` member of `struct Curl_cftype` (`lib/cfilters.h:212`).
-///
-/// A set of capabilities, held as a bitmap because the chain queries in
-/// `lib/cfilters.c:615-729` test membership and stop walking at a boundary
-/// expressed as a mask. The C names are kept for the individual bits --
-/// [`CF_TYPE_IP_CONNECT`] and its four siblings -- so that a reader of
-/// `lib/cfilters.h:203-207` finds them unchanged.
-///
-/// No `bitflags` crate: five bits and four operations do not justify a
-/// dependency, and the specification's dependency inventory does not list one.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) struct CfType(u32);
@@ -308,10 +179,6 @@ pub(crate) struct CfType(u32);
 /// `CF_TYPE_IP_CONNECT` (`lib/cfilters.h:203`): provides an IP connection or
 /// something equivalent -- a `CONNECT` tunnel, an `AF_UNIX` socket, a QUIC
 /// connection.
-///
-/// This is the bit that TERMINATES the upward capability searches: nothing
-/// below a filter that provides its own IP connection can contribute to what
-/// the layers above it see.
 #[allow(dead_code)]
 pub(crate) const CF_TYPE_IP_CONNECT: CfType = CfType(1 << 0);
 
@@ -383,13 +250,6 @@ impl CfType {
     }
 
     /// True when EVERY bit of `other` is present.
-    ///
-    /// The C writes this as an equality against the mask, and only once:
-    /// `(cf->cft->flags & (CF_TYPE_IP_CONNECT | CF_TYPE_PROXY)) ==
-    /// (CF_TYPE_IP_CONNECT | CF_TYPE_PROXY)` selects a TUNNELLING proxy in
-    /// `Curl_conn_get_current_host` (`lib/cfilters.c:837-838`). Keeping it
-    /// distinct from [`Self::intersects`] is what stops that one site from
-    /// quietly matching a non-tunnelling proxy.
     #[allow(dead_code)]
     pub(crate) const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
@@ -452,9 +312,7 @@ impl fmt::Debug for CfType {
     }
 }
 
-// =========================================================================
 // The TLS tri-state -- `CURL_CF_SSL_*`
-// =========================================================================
 
 /// `CURL_CF_SSL_DEFAULT` (`lib/cfilters.h:351`): follow the scheme's own rule.
 #[allow(dead_code)]
@@ -469,15 +327,6 @@ pub(crate) const CURL_CF_SSL_DISABLE: i32 = 0;
 pub(crate) const CURL_CF_SSL_ENABLE: i32 = 1;
 
 /// Whether a chain being built should carry TLS.
-///
-/// Three states, and the third is the point: `DEFAULT` is not "off", it is "the
-/// caller has no opinion, so use the scheme's". C spells the distinction with
-/// `-1` and relies on every reader remembering that `-1` is truthy; a
-/// three-variant type makes the collapse to a `bool` impossible to write by
-/// accident.
-///
-/// The chain-building policy that consumes this lives in `conn/mod.rs`, which
-/// owns `cf_setup_insert_after`; this module only defines the vocabulary.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) enum CfSslMode {
@@ -531,9 +380,7 @@ impl CfSslMode {
     }
 }
 
-// =========================================================================
 // Trace levels -- `CURL_LOG_LVL_*`
-// =========================================================================
 
 /// `CURL_LOG_LVL_NONE` (`lib/curl_trc.h:69`): this component logs nothing.
 #[allow(dead_code)]
@@ -541,19 +388,10 @@ pub(crate) const CURL_LOG_LVL_NONE: i32 = 0;
 
 /// `CURL_LOG_LVL_INFO` (`lib/curl_trc.h:70`): this component logs at info
 /// level.
-///
-/// The level is NOT stored on a filter here. In C it is the `log_level` member
-/// of the process-global `struct Curl_cftype` that `--trace-config` writes
-/// through (`lib/curl_trc.c:596-600`); here the mutable per-name registry is
-/// [`crate::trace::TraceConfig`] and a filter contributes only its stable
-/// identity. See this module's documentation for why the two C registries are
-/// separate typed tables rather than one reinterpreted as the other.
 #[allow(dead_code)]
 pub(crate) const CURL_LOG_LVL_INFO: i32 = 1;
 
-// =========================================================================
 // Transport -- `TRNSPRT_*`
-// =========================================================================
 
 /// What a filter chain is carrying, at the bottom.
 ///
@@ -585,12 +423,6 @@ impl Transport {
     }
 
     /// The checked conversion from the C integer.
-    ///
-    /// Returns [`None`] for an unassigned value, including the retired 1 and 2.
-    /// `Curl_conn_cf_get_transport` (`lib/cfilters.c:892-899`) casts whatever
-    /// the query produced straight to `unsigned char`; rejecting an unassigned
-    /// value here is stricter, and it is the strictness the typed query exists
-    /// for.
     #[allow(dead_code)]
     pub(crate) const fn from_u8(raw: u8) -> Option<Self> {
         match raw {
@@ -604,9 +436,7 @@ impl Transport {
     }
 }
 
-// =========================================================================
 // Connection identity
-// =========================================================================
 
 /// Which connection a filter belongs to.
 ///
@@ -626,10 +456,6 @@ impl Transport {
 /// 3. **Connection-level facts** -- `conn->bits.close`, `conn->sock[]`,
 ///    `conn->host.name`, `conn->transport_wanted`. Those arrive through
 ///    [`ConnContext`], injected at the call that needs them.
-///
-/// The identifier remains because the ASSIGNMENT is observable: `insert_after`
-/// must stamp it on every node it links (`:356-361`), and a test can check that
-/// it did.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ConnId(u64);
 
@@ -656,18 +482,9 @@ impl fmt::Display for ConnId {
     }
 }
 
-// =========================================================================
 // Typed answers a query can carry
-// =========================================================================
 
 /// The four addresses and two ports of a connected socket.
-///
-/// `struct ip_quadruple` (`lib/urldata.h:573-579`). The C stores the addresses
-/// as `char[MAX_IPADR_LEN]`, already formatted, because that is what
-/// `CURLINFO_PRIMARY_IP` hands to the application and what the "Established
-/// connection to ..." trace line prints (`lib/cfilters.c:436-440`). Keeping them
-/// as strings preserves the exact text, including an IPv6 scope suffix that
-/// [`std::net::IpAddr`] would drop.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct IpQuadruple {
@@ -755,11 +572,6 @@ pub(crate) enum TlsHandleKind {
 /// application casts to an `SSL *`, and a rustls-native engine has no such
 /// pointer to give. What survives is the part that is engine-neutral and
 /// answerable -- which backend, and which of its two handles.
-///
-/// This is what lets a TLS filter answer the query without any TLS type
-/// appearing in this module and without a cast back through an erased context.
-/// The concrete session state stays on the implementing struct, where it is an
-/// ordinary typed field; `crate::tls` is not imported here, and must not be.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct TlsSessionInfo {
@@ -775,21 +587,6 @@ pub(crate) struct TlsSessionInfo {
 }
 
 /// Whether a connection is still usable, and whether it has data waiting.
-///
-/// `Curl_cft_conn_is_alive` (`lib/cfilters.h:102-104`) returns the first as its
-/// value and writes the second through `bool *input_pending`. Returning both
-/// removes the out-parameter, and the pairing is not arbitrary: a connection
-/// that is alive but has bytes waiting cannot be reused for a new request,
-/// because those bytes belong to the previous one. `lib/url.c:684-687` reads
-/// them together for exactly that reason.
-///
-/// # The one C detail that does not survive, and why it costs nothing
-///
-/// The C's terminal case returns `FALSE` WITHOUT writing `*input_pending`
-/// (`lib/cfilters.c:92-99`), leaving whatever the caller put there. Every C
-/// caller initialises it to `FALSE` first (`lib/url.c:684`), so
-/// [`Self::DEAD`] reporting `input_pending: false` is the same observable
-/// behaviour with the uninitialised read removed.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct Liveness {
@@ -820,9 +617,7 @@ impl Liveness {
     }
 }
 
-// =========================================================================
 // Control events -- `CF_CTRL_*`
-// =========================================================================
 
 /// `CF_CTRL_DATA_SETUP` = 4 (`lib/cfilters.h:119`).
 #[allow(dead_code)]
@@ -830,14 +625,6 @@ pub(crate) const CF_CTRL_DATA_SETUP: i32 = 4;
 
 /// The value 5 is UNUSED and RESERVED (`lib/cfilters.h:120`, whose entire
 /// content is the comment `/* unused now 5 */`).
-///
-/// It is named so that it stays named. A retired identifier in a numbered
-/// protocol is not a free slot: some build somewhere may still send it, and
-/// reusing it would give that build a different event than it asked for. The
-/// same discipline the specification requires of the fifteen retired
-/// `CURLE_OBSOLETE*` placeholders applies here for the same reason, and
-/// [`CfControl::from_event_id`] rejects it explicitly rather than by falling
-/// through.
 #[allow(dead_code)]
 pub(crate) const CF_CTRL_UNUSED_5: i32 = 5;
 
@@ -866,12 +653,6 @@ pub(crate) const CF_CTRL_FORGET_SOCKET: i32 = 256 + 1;
 pub(crate) const CF_CTRL_FLUSH: i32 = 256 + 2;
 
 /// How the driver treats the results of one control event.
-///
-/// `lib/cfilters.h:109-117` names the two policies and every event's row states
-/// which it uses. The C passes the choice as a `bool ignore_result` argument
-/// (`Curl_conn_cf_cntrl`, `lib/cfilters.h:326-329`), which means a caller can
-/// pass the wrong one; here it is a property OF THE EVENT, read from
-/// [`CfControl::policy`], so the pairing cannot come apart.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) enum ControlPolicy {
@@ -883,18 +664,6 @@ pub(crate) enum ControlPolicy {
 }
 
 /// An event or command distributed down a filter chain.
-///
-/// C's `Curl_cft_cntrl(cf, data, int event, int arg1, void *arg2)`
-/// (`lib/cfilters.h:133-135`) is three untyped parameters, of which `arg2` is
-/// never used by any event the tree defines -- every row in
-/// `lib/cfilters.h:118-127` documents it as `NULL`. Two of the seven events use
-/// `arg1`, and both use it as a `bool`. A closed enumeration with the payload on
-/// the variant that has one therefore loses nothing and makes the two payload
-/// events impossible to confuse with the five that carry none.
-///
-/// The discriminants are the C values and are asserted against them, because a
-/// control event identifier is observable: the same numbers appear in the trace
-/// output a `--trace` comparison checks.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum CfControl {
@@ -1016,9 +785,7 @@ impl CfControl {
     }
 }
 
-// =========================================================================
 // Queries -- `CF_QUERY_*`
-// =========================================================================
 
 /// `CF_QUERY_MAX_CONCURRENT` = 1 (`lib/cfilters.h:165`).
 #[allow(dead_code)]
@@ -1081,17 +848,6 @@ pub(crate) const CF_QUERY_TRANSPORT: i32 = 14;
 pub(crate) const CF_QUERY_ALPN_NEGOTIATED: i32 = 15;
 
 /// A property a chain can be asked for.
-///
-/// C's `Curl_cft_query(cf, data, int query, int *pres1, void *pres2)`
-/// (`lib/cfilters.h:187-189`) answers through two out-parameters whose types
-/// depend on the query, and `pres2` is a `void *` that each caller casts: a
-/// `curl_socket_t *` for `CF_QUERY_SOCKET`, a `struct curltime *` for the two
-/// timers, a `const char **` for `CF_QUERY_ALPN_NEGOTIATED`, and so on. Getting
-/// one of those casts wrong is undetectable at the boundary.
-///
-/// Here the question is this enumeration and the answer is [`CfQueryValue`], so
-/// the pairing is checked by the compiler. There is no `Any`, no raw pointer and
-/// no recovery of an erased type anywhere in the protocol.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub(crate) enum CfQuery {
@@ -1206,12 +962,6 @@ impl CfQuery {
 #[allow(dead_code)]
 pub(crate) enum CfQueryValue {
     /// [`CfQuery::MaxConcurrent`]. Negative means "no answer".
-    ///
-    /// ZERO IS LEGITIMATE and does not mean "no answer": a multiplexed
-    /// connection that has received a `GOAWAY` reports zero because it will
-    /// accept no further streams while it drains. `lib/cfilters.c:1031-1034`
-    /// says so in as many words, and
-    /// [`FilterChains::max_concurrent`] preserves it.
     MaxConcurrent(i32),
     /// [`CfQuery::ConnectReplyMs`]. `-1` until determined
     /// (`lib/cfilters.h:147`).
@@ -1263,11 +1013,6 @@ pub(crate) enum CfQueryValue {
 impl CfQueryValue {
     /// The query this value is an answer to, or [`None`] where one variant
     /// serves two queries.
-    ///
-    /// [`Self::Timer`] and [`Self::SslInfo`] are the two ambiguous cases, for
-    /// the reasons their documentation gives, so this reports [`None`] for both
-    /// rather than guessing. [`FilterChain::query_typed`] checks those two
-    /// against the question it asked instead.
     #[allow(dead_code)]
     pub(crate) fn answers(&self) -> Option<CfQuery> {
         match self {
@@ -1302,9 +1047,7 @@ impl CfQueryValue {
     }
 }
 
-// =========================================================================
 // The call context -- what replaces `struct Curl_easy *data`
-// =========================================================================
 
 /// What every filter operation is handed alongside its own state.
 ///
@@ -1313,22 +1056,6 @@ impl CfQueryValue {
 /// clock, and the whole transfer. Only the first two are needed to IMPLEMENT a
 /// filter, so only those two are here. The transfer's own state reaches a filter
 /// through [`CfControl::DataSetup`], which is exactly what that event is for.
-///
-/// The clock is INJECTED rather than read from the host, so that the coverage
-/// gate over the time-driven paths is reachable without waiting in real time:
-/// a test installs [`crate::util::timeval::TestClock`], places a chain at a
-/// chosen instant and steps it forward. Nothing in this module calls the host
-/// clock directly, and the module compiles with no path to one.
-///
-/// # Why this replaces `cf_call_data` outright
-///
-/// `struct cf_call_data` and the `CF_DATA_SAVE`/`CF_DATA_RESTORE` macro pair
-/// (`lib/cfilters.h:620-685`) exist so that a filter which re-enters itself --
-/// TLS calling down into the socket which calls back up, issue #10336 -- can
-/// still find the easy handle after `void *ctx` erased it. Passing the context
-/// as a typed parameter makes it available at every depth by construction, so
-/// there is nothing to save, nothing to restore, and no depth counter to
-/// assert on.
 #[allow(dead_code)]
 pub(crate) struct CallCtx<'ctx, 'trc> {
     /// Where trace lines go, when the transfer is tracing at all.
@@ -1394,16 +1121,6 @@ impl fmt::Debug for CallCtx<'_, '_> {
 }
 
 /// Emits one filter-attributed trace line, the successor of `CURL_TRC_CF`.
-///
-/// Three things have to line up before a line is emitted: the transfer must have
-/// a tracer, the filter must have a registered identity, and that identity's
-/// level must be verbose. The first two are [`Option`]s and the third is
-/// [`Tracer::is_filter_verbose`], which [`trc_cf`] checks. Wrapping the pair of
-/// [`Option`]s here keeps eleven call sites from repeating it.
-///
-/// A filter with no registered identity -- the in-memory transport the tests
-/// build chains over -- traces nothing, which is the honest outcome: there is no
-/// `--trace-config` keyword that could switch it on.
 macro_rules! trc {
     (
         $cx:expr, $filter:expr, $sockindex:expr,
@@ -1419,9 +1136,7 @@ macro_rules! trc {
     }};
 }
 
-// =========================================================================
 // The injected shutdown timer
-// =========================================================================
 
 /// `DEFAULT_SHUTDOWN_TIMEOUT_MS` (`lib/connect.h:45`): two seconds.
 #[allow(dead_code)]
@@ -1437,8 +1152,18 @@ pub(crate) const DEFAULT_SHUTDOWN_TIMEOUT_MS: TimeDiff = 2 * 1000;
 /// what stops the shutdown deadline from existing in two places and disagreeing.
 ///
 /// A method per C helper, with the same names and the same meanings.
+///
+/// # The `Send` supertrait
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`) and the pool holds these as boxed trait objects, so
+/// [`crate::share::Share`] can only be `Send + Sync` -- which it statically
+/// asserts, because one `CURLSH` is usable from two threads
+/// (`tests/libtest/lib506.c`, `lib3207.c`) -- if this is `Send`. `Sync` is
+/// deliberately NOT required: the pool exposes mutation through `&mut self`
+/// alone and is never aliased, so `Mutex<T>: Sync` needs only `T: Send`.
 #[allow(dead_code)]
-pub(crate) trait ShutdownTimer {
+pub(crate) trait ShutdownTimer: Send + Sync {
     /// `Curl_shutdown_started` (`lib/connect.h:64`).
     fn started(&self, sockindex: SocketIndex) -> bool;
 
@@ -1459,27 +1184,16 @@ pub(crate) trait ShutdownTimer {
     fn clear(&mut self, sockindex: SocketIndex);
 }
 
-// =========================================================================
 // The filter contract -- `struct Curl_cftype`
-// =========================================================================
 
 /// One owned link in a chain.
-///
-/// `Pin<Box<...>>` rather than `Box<...>`, and the pinning is not decoration: a
-/// filter's address must not change while it is linked, because the C
-/// mechanisms this chain replaces all key on `cf` pointer identity -- the
-/// unlink walk compares pointers (`lib/cfilters.c:375`), `insert_after` rewires
-/// them (`:354-362`), and an implementation's own asynchronous machinery
-/// registers wakers that outlive the call that created them. Owning the link as
-/// a pinned box states that invariant in the type rather than in a comment.
 pub(crate) type FilterLink = Pin<Box<dyn ConnFilter>>;
 
 /// Boxes and pins a filter into a chain link.
 ///
 /// The successor of `Curl_cf_create` (`lib/cfilters.c:309-327`), minus its two C
-/// concerns: there is no allocation failure to report, because a failure to
-/// allocate aborts rather than returning `CURLE_OUT_OF_MEMORY`, and there is no
-/// `void *ctx` to store, because the state came in with the value.
+/// concerns: there is no allocation failure to report, because the box is a FIXED-SIZE allocation, whose size this module chooses rather than a caller, and which has no stable fallible spelling at the declared minimum Rust version, and there is no `void *ctx` to store, because the state came in
+/// with the value.
 #[allow(dead_code)]
 pub(crate) fn link<F>(filter: F) -> FilterLink
 where
@@ -1524,20 +1238,22 @@ where
 /// `--trace-config` writes through; here [`Self::trace_name`] and
 /// [`Self::trace_filter`] report a stable identity and the level lives in
 /// [`crate::trace::TraceConfig`].
+///
+/// # The `Send` supertrait
+///
+/// `struct Curl_share` holds the connection pool by value
+/// (`lib/curl_share.h:52`) and the pool holds these as boxed trait objects, so
+/// [`crate::share::Share`] can only be `Send + Sync` -- which it statically
+/// asserts, because one `CURLSH` is usable from two threads
+/// (`tests/libtest/lib506.c`, `lib3207.c`) -- if this is `Send`. `Sync` is
+/// deliberately NOT required: the pool exposes mutation through `&mut self`
+/// alone and is never aliased, so `Mutex<T>: Sync` needs only `T: Send`.
 #[allow(dead_code)]
-pub(crate) trait ConnFilter: fmt::Debug + Unpin {
+pub(crate) trait ConnFilter: fmt::Debug + Unpin + Send {
     // -- the `name` and `flags` members ----------------------------------
 
     /// The `name` member (`lib/cfilters.h:211`): the label `--trace-config`
     /// matches and a trace line prints.
-    ///
-    /// Stable and `&'static`, exactly as the C's string literal is. The sixteen
-    /// names the C registers are transcribed in
-    /// [`crate::trace::TraceFilter::name`], and three of them are easy to get
-    /// wrong: the SOCKS filter is `SOCKS`, not `SOCKS-PROXY`; the version
-    /// negotiator is `HTTPS-CONNECT`, not `HTTP-CONNECT`; and
-    /// `HAPPY-EYEBALLS` is hyphenated where the timer of nearly the same name
-    /// is not.
     fn trace_name(&self) -> &'static str;
 
     /// The `flags` member (`lib/cfilters.h:212`).
@@ -1579,12 +1295,6 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
     /// MUST NOT chain (`lib/cfilters.h:37`). The caller has already severed the
     /// link and owns the rest of the chain; reaching `next` from here would
     /// destroy a filter twice.
-    ///
-    /// A no-op by default, which is what the C's own default does -- and note
-    /// that `Curl_cf_def_destroy_this` is DECLARED at `lib/cfilters.h:240` and
-    /// never defined anywhere in the tree, so "no-op" is the whole of it.
-    /// Rust's own [`Drop`] handles the memory; this hook exists for the effects
-    /// a `Drop` cannot have, namely tracing and notifying a peer.
     fn destroy(&mut self, cx: &mut CallCtx<'_, '_>) {
         let _ = cx;
     }
@@ -1593,15 +1303,6 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
 
     /// `Curl_cft_connect` (`lib/cfilters.h:53-55`): make progress towards being
     /// connected.
-    ///
-    /// Returns whether the filter is now connected -- the C's `bool *done`. A
-    /// `false` is not a failure: it means call again when readiness changes, and
-    /// it is how the whole non-blocking design works.
-    ///
-    /// REQUIRED, with no default. There is no universal C default either: every
-    /// registered filter type supplies its own `do_connect`, because "connected"
-    /// means something different at every layer. Inventing one here would let a
-    /// filter compile as permanently unconnected.
     ///
     /// # Errors
     ///
@@ -1621,28 +1322,12 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
     /// discarding it -- with one sanctioned exception: a filter that owns a
     /// PRIVATE SUBCHAIN, as the setup and Happy Eyeballs filters do, may discard
     /// that subchain here because nothing else can reach it.
-    ///
-    /// REQUIRED, with no default, and the C agrees: the only default close in
-    /// the tree is `Curl_cf_def_close` at `lib/cfilters.c:36-44`, which is
-    /// compiled only `#ifdef UNITTESTS` and exists for `unit2600.c`. There is no
-    /// production `Curl_cf_def_close`. [`chain_close`] is the equivalent helper
-    /// here, and it is named so that a filter using it is doing so on purpose.
     fn close(&mut self, cx: &mut CallCtx<'_, '_>);
 
     // -- 4. shutdown -----------------------------------------------------
 
     /// `Curl_cft_shutdown` (`lib/cfilters.h:49-51`): close gracefully,
     /// non-blocking.
-    ///
-    /// MUST NOT chain (`lib/cfilters.h:47`). [`FilterChain::shutdown`] visits
-    /// each filter in turn, so a chaining implementation would shut lower
-    /// filters down before the driver had a chance to record that this one
-    /// finished.
-    ///
-    /// Reports `true` and succeeds by default -- `Curl_cf_def_shutdown` sets
-    /// `*done = TRUE` and returns `CURLE_OK` (`lib/cfilters.c:46-53`) -- which
-    /// is right for every layer with nothing to say goodbye with. `HAPROXY`,
-    /// `SETUP`, `TCP-ACCEPT` and the proxies all take it.
     ///
     /// # Errors
     ///
@@ -1657,24 +1342,6 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
 
     /// `Curl_cft_adjust_pollset` (`lib/cfilters.h:82-84`): say which readiness
     /// this filter is waiting for.
-    ///
-    /// A PURE NO-OP by default. This is the one default whose C prose and C code
-    /// disagree, and the code is what runs: `Curl_cf_def_adjust_pollset`
-    /// (`lib/cfilters.c:55-64`) has the literal body `/* NOP */` and returns
-    /// `CURLE_OK` without touching `cf->next`, while the comment at
-    /// `lib/cfilters.h:64-67` says implementations "need to call filters below".
-    /// The comment is stale. Every concrete implementation adjusts and returns
-    /// -- `cf_haproxy_adjust_pollset` (`lib/cf-haproxy.c:172-182`) is the
-    /// clearest example -- and it is [`FilterChain::adjust_pollset`], the
-    /// driver, that walks the chain.
-    ///
-    /// The only implementation that legitimately invokes a driver from here is
-    /// one owning a private subchain, which it must drive itself because the
-    /// outer walk cannot see it.
-    ///
-    /// A filter with no restriction of its own should leave the pollset alone,
-    /// and so should a filter whose own `next` has not connected
-    /// (`lib/cfilters.h:69-71`).
     ///
     /// # Errors
     ///
@@ -1708,11 +1375,6 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
     // -- 7. send ---------------------------------------------------------
 
     /// `Curl_cft_send` (`lib/cfilters.h:89-94`): hand `buf` down the chain.
-    ///
-    /// Returns how many bytes were accepted, which may be fewer than were
-    /// offered. `eos` marks the last chunk.
-    ///
-    /// Delegates to `next` (`lib/cfilters.c:73-81`).
     ///
     /// # Errors
     ///
@@ -1751,12 +1413,6 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
     /// `Curl_cft_recv` (`lib/cfilters.h:96-100`): read up to `buf.len()` bytes
     /// from the chain.
     ///
-    /// Returns how many bytes were read. Zero is end of stream, not "try
-    /// again"; a filter with nothing available yet reports
-    /// [`CURLcode::Again`].
-    ///
-    /// Delegates to `next` (`lib/cfilters.c:83-90`).
-    ///
     /// # Errors
     ///
     /// At the bottom of the chain, [`CURLcode::SendError`] -- for a RECEIVE. See
@@ -1779,20 +1435,6 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
 
     /// `Curl_cft_cntrl` (`lib/cfilters.h:133-135`): handle one event.
     ///
-    /// MUST NOT chain (`lib/cfilters.h:131`). [`FilterChain::cntrl`] distributes
-    /// the event top-down and applies the event's own
-    /// [`ControlPolicy`]; a chaining implementation would deliver it twice.
-    ///
-    /// A no-op success by default (`lib/cfilters.c:854-864`).
-    ///
-    /// # The C optimisation that is deliberately not reproduced
-    ///
-    /// `Curl_conn_cf_cntrl` skips a filter whose `cntrl` member is literally
-    /// `Curl_cf_def_cntrl`, comparing function pointers (`lib/cfilters.c:874`).
-    /// It is a call-avoidance optimisation with no observable effect -- the
-    /// function it skips does nothing -- and performance is explicitly a
-    /// non-goal here. The driver calls every filter.
-    ///
     /// # Errors
     ///
     /// Whatever the layer's own failure is. Whether it stops the distribution
@@ -1811,12 +1453,6 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
 
     /// `Curl_cft_conn_is_alive` (`lib/cfilters.h:102-104`): is the connection
     /// still usable, and does it already have bytes waiting?
-    ///
-    /// Delegates to `next`; the bottom of the chain is [`Liveness::DEAD`],
-    /// "pessimistic in absence of data" in the C's own words
-    /// (`lib/cfilters.c:92-99`). Pessimism is the safe direction: a connection
-    /// wrongly declared dead is re-established, while one wrongly declared
-    /// alive breaks the next request on it.
     fn is_alive(&mut self, cx: &mut CallCtx<'_, '_>) -> Liveness {
         match self.base_mut().next_mut() {
             Some(next) => next.is_alive(cx),
@@ -1846,9 +1482,6 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
     /// `Curl_cft_query` (`lib/cfilters.h:187-189`): answer a question about the
     /// chain.
     ///
-    /// Delegates to `next`, so a filter need only intercept the questions it
-    /// knows (`lib/cfilters.c:109-116`).
-    ///
     /// # Errors
     ///
     /// [`CURLcode::UnknownOption`] at the bottom of the chain. That is a
@@ -1874,8 +1507,6 @@ pub(crate) trait ConnFilter: fmt::Debug + Unpin {
 /// default for exactly that reason: [`ConnFilter::close`] has no production
 /// default in the C and must not acquire one here, so a filter that wants this
 /// behaviour asks for it by name.
-///
-/// Clears `connected` and passes the close down, in that order.
 #[allow(dead_code)]
 pub(crate) fn chain_close<F>(filter: &mut F, cx: &mut CallCtx<'_, '_>)
 where
@@ -1887,9 +1518,7 @@ where
     }
 }
 
-// =========================================================================
 // The filter instance state -- `struct Curl_cfilter`
-// =========================================================================
 
 pin_project! {
     /// The five members every filter instance carries, whatever it implements.
@@ -1906,30 +1535,6 @@ pin_project! {
     ///     session: TlsSession,   // typed, concrete, no cast anywhere
     /// }
     /// ```
-    ///
-    /// Destructuring `let Self { base, session } = self` then reaches both at
-    /// once, which is what an implementation needs and what a `Pin<&mut Self>`
-    /// receiver would have taken away.
-    ///
-    /// # Both flags belong to the INSTANCE
-    ///
-    /// `connected` and `shutdown` are `BIT()` members of `Curl_cfilter`, not of
-    /// `Curl_cftype`, and every driver in `lib/cfilters.c` depends on that: the
-    /// send and receive entry points skip the leading run of filters whose own
-    /// `connected` is false (`:220`, `:239`), the pollset driver skips the
-    /// leading run whose own `shutdown` is true (`:777-778`), and the shutdown
-    /// driver sets `shutdown` on one filter at a time as each finishes (`:204`).
-    /// A chain-level flag could express none of that.
-    ///
-    /// # Why `#[pin]`
-    ///
-    /// The link is structurally pinned, so a filter cannot be moved out from
-    /// under a chain that is mid-traversal. [`Self::next_pin_mut`] is the only
-    /// way through it and needs no `Pin::new_unchecked`; the pinning projection
-    /// [`pin_project`] generates is what makes that safe. Because every filter
-    /// is [`Unpin`] -- see [`ConnFilter`] for why that bound is the right
-    /// trade -- the pinned reference converts back to `&mut` for free, so the
-    /// guarantee costs nothing at run time.
     #[derive(Debug, Default)]
     pub(crate) struct FilterBase {
         #[pin]
@@ -1943,15 +1548,6 @@ pin_project! {
 
 impl FilterBase {
     /// An unattached base for a chain at `sockindex`.
-    ///
-    /// Unattached is the state `Curl_cf_create` leaves a filter in: `calloc`
-    /// zeroes `conn` and `next`, and both `Curl_conn_cf_add` and
-    /// `Curl_conn_cf_insert_after` assert on it before linking
-    /// (`lib/cfilters.c:335-336`, `:352`).
-    ///
-    /// The index is taken here as well as stamped at insertion, because a filter
-    /// created for a known chain should not have to read as belonging to the
-    /// primary socket until someone links it.
     #[allow(dead_code)]
     pub(crate) fn new(sockindex: SocketIndex) -> Self {
         Self {
@@ -1986,12 +1582,6 @@ impl FilterBase {
     }
 
     /// The next filter down, pinned.
-    ///
-    /// Written through the projection [`pin_project`] generates, which is what
-    /// makes reaching a structurally pinned field safe. Kept private because
-    /// every consumer in this module wants [`Self::next_mut`]; a future
-    /// implementation that genuinely needs the pinned form can widen it without
-    /// changing anything else.
     #[allow(dead_code)]
     fn next_pin_mut(
         self: Pin<&mut Self>,
@@ -2101,9 +1691,7 @@ impl FilterBase {
     }
 }
 
-// =========================================================================
 // The chain -- `conn->cfilter[sockindex]`
-// =========================================================================
 
 /// A walk down one chain, shared.
 ///
@@ -2126,17 +1714,6 @@ impl<'a> Iterator for FilterIter<'a> {
 }
 
 /// What a connect attempt reported back to its connection.
-///
-/// `Curl_conn_connect` writes three values through pointers it was handed --
-/// two progress timers via `conn_report_connect_stats` (`lib/cfilters.c:472-489`)
-/// and `conn->keepalive` (`:537`). The owners of all three are elsewhere:
-/// `crate::transfer::progress` keeps the timers and `conn/mod.rs` keeps the
-/// keepalive reading. Collecting them into one out-parameter hands them back
-/// without this module reaching into either.
-///
-/// Out-parameter rather than a return value deliberately: the C reports the
-/// timers on the ERROR path too (`:543`), and an [`Err`] carries no payload to
-/// put them in.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct ConnectReport {
@@ -2158,24 +1735,6 @@ pub(crate) struct ConnectReport {
 /// C keeps the head as a bare pointer in the connection and passes it around;
 /// here the chain OWNS its filters, which is what makes teardown deterministic
 /// and double-destruction unrepresentable.
-///
-/// # Position, not pointer
-///
-/// The C addresses a particular filter by its pointer: `insert_after(cf_at,
-/// cf_new)` and `discard(&cf)` both take one. A safe chain cannot hand out a
-/// borrow of a node and then be mutated through, so the equivalent operations
-/// here take a POSITION counted from the head -- [`Self::insert_after`] and
-/// [`Self::discard_at`]. That is not a weakening: a caller that has just added
-/// a filter knows where it put it, and the setup filter's own use of
-/// `insert_after` inserts immediately below itself, which is position zero.
-///
-/// One C behaviour disappears entirely as a consequence, and its disappearance
-/// is a guarantee rather than a gap. `Curl_conn_cf_discard` handles the case of
-/// a filter pointer that MAY OR MAY NOT be linked into the chain, and reports
-/// which through its return value (`lib/cfilters.c:365-387`). Here, if a caller
-/// owns a [`FilterLink`] then it is not in a chain, because ownership is
-/// exclusive -- so the ambiguity cannot arise. [`discard_unlinked`] covers the
-/// other half of that C function, for a link the caller still holds.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct FilterChain {
@@ -2301,12 +1860,6 @@ impl FilterChain {
 
     /// `Curl_conn_cf_add` (`lib/cfilters.c:329-343`): install `filter` at the
     /// TOP of the chain.
-    ///
-    /// The new filter takes the old head as its `next` and inherits the chain's
-    /// connection identity and socket index. It must not already be attached,
-    /// which the C asserts in a debug build (`:335-336`) and which is checked
-    /// the same way here -- a release build links it anyway, exactly as the C
-    /// does, because refusing would leak the filter the caller handed over.
     #[allow(dead_code)]
     pub(crate) fn add(
         &mut self,
@@ -2335,13 +1888,6 @@ impl FilterChain {
 
     /// `Curl_conn_cf_insert_after` (`lib/cfilters.c:345-363`): install `filter`
     /// immediately BELOW the filter at `index`.
-    ///
-    /// `filter` may itself be a whole chain, and that is not a corner case --
-    /// the setup filter builds a stack of several and inserts it in one go. The
-    /// C walks the inserted value with a `do {} while(cf_new)` loop stamping
-    /// EVERY node (`:356-361`) and only then reattaches the old successor to its
-    /// tail; both are reproduced, because a node left holding a stale identity
-    /// would report the wrong socket index in every trace line it ever emits.
     ///
     /// # Errors
     ///
@@ -2399,14 +1945,6 @@ impl FilterChain {
 
     /// Unlinks and destroys the filter at `index`, hoisting its successor into
     /// its place.
-    ///
-    /// The linked half of `Curl_conn_cf_discard` (`lib/cfilters.c:365-387`).
-    /// Returns whether a filter was there -- the C's `found`.
-    ///
-    /// Exactly ONE filter is destroyed. The C achieves that by clearing
-    /// `cf->next` before handing the node to `Curl_conn_cf_discard_chain`
-    /// (`:377`); here the successor is moved into the predecessor's place
-    /// first, which has the same effect and cannot be got wrong by omission.
     #[allow(dead_code)]
     pub(crate) fn discard_at(
         &mut self,
@@ -2537,14 +2075,6 @@ pub(crate) fn discard_chain_from(
 
 /// The unlinked half of `Curl_conn_cf_discard` (`lib/cfilters.c:365-387`):
 /// destroys a link the caller still owns.
-///
-/// Always reports `false`, which is the C's `found` for a filter that was not
-/// part of a chain -- and here that is not merely the usual case but the only
-/// one, because owning the link proves it is not installed anywhere.
-///
-/// Destroys the link AND everything below it, which is also the C's behaviour:
-/// only the `found` branch clears `cf->next` (`:377`), so a node that was never
-/// linked reaches `discard_chain` with its subchain still attached.
 #[allow(dead_code)]
 pub(crate) fn discard_unlinked(
     cx: &mut CallCtx<'_, '_>,
@@ -2554,20 +2084,10 @@ pub(crate) fn discard_unlinked(
     false
 }
 
-// =========================================================================
 // Chain drivers -- the `Curl_conn_*` and `Curl_cf_*` entry points
-// =========================================================================
 
 impl FilterChain {
     /// The first filter whose own `connected` is set, if any.
-    ///
-    /// The `while(cf && !cf->connected) cf = cf->next;` that heads
-    /// `Curl_cf_recv` (`lib/cfilters.c:220-221`), `Curl_cf_send` (`:239-240`)
-    /// and `Curl_conn_data_pending` (`:742-744`). Skipping the leading run is
-    /// what lets a partially built chain still carry bytes: during a `CONNECT`
-    /// tunnel negotiation the proxy filter is not connected while the socket
-    /// beneath it is, and the negotiation's own bytes must go through the
-    /// socket.
     #[allow(dead_code)]
     pub(crate) fn first_connected_mut(
         &mut self,
@@ -2586,9 +2106,6 @@ impl FilterChain {
 
     /// `Curl_conn_cf_connect` (`lib/cfilters.c:389-396`): one connect step at
     /// the head.
-    ///
-    /// Returns whether the WHOLE chain is now connected, because the head only
-    /// reports itself connected once everything beneath it is.
     ///
     /// # Errors
     ///
@@ -2663,8 +2180,6 @@ impl FilterChain {
 
     /// `Curl_conn_shutdown` (`lib/cfilters.c:157-210`): shut the chain down
     /// gracefully, without blocking.
-    ///
-    /// Returns whether the shutdown has FINISHED. `Ok(false)` means call again.
     ///
     /// The sequence, step for step:
     ///
@@ -2852,10 +2367,6 @@ impl FilterChain {
     /// `Curl_cf_recv_bufq` (`lib/cfilters.c:263-278`): read from the chain
     /// straight into `bufq`.
     ///
-    /// A convenience over [`BufQ::sipn`] so that a caller does not have to write
-    /// the reader closure, which is exactly what the C says its own wrapper is
-    /// for (`lib/cfilters.h:511-514`).
-    ///
     /// # Errors
     ///
     /// [`CURLcode::BadFunctionArgument`] when no filter is installed. The C
@@ -2888,16 +2399,6 @@ impl FilterChain {
 
     /// `Curl_cf_send_bufq` (`lib/cfilters.c:288-307`): drain `bufq` into the
     /// chain, offering `buf` after it.
-    ///
-    /// With bytes to append this is [`BufQ::write_pass`], which appends then
-    /// drains; with none it is [`BufQ::pass`], which only drains. That is the
-    /// C's `if(buf && blen)` at `:302`.
-    ///
-    /// The writer ALWAYS passes `eos = false`, which is the literal `FALSE` at
-    /// `lib/cfilters.c:285`. It is not an oversight: end of stream is a property
-    /// of the transfer, and a buffer being drained says nothing about whether
-    /// more will follow. A caller that means end of stream sends the last chunk
-    /// through [`Self::send`] directly.
     ///
     /// # Errors
     ///
@@ -2959,10 +2460,6 @@ impl FilterChain {
     ///    filter that cannot write may withdraw a write interest an upper filter
     ///    registered.
     ///
-    /// The walk lives here and not in [`ConnFilter::adjust_pollset`], whose
-    /// default is a pure no-op. See that method for the stale C comment that
-    /// suggests otherwise.
-    ///
     /// # Errors
     ///
     /// Whatever a filter reports while adjusting.
@@ -3010,12 +2507,6 @@ impl FilterChain {
     /// `Curl_conn_cf_cntrl` (`lib/cfilters.c:866-881`): distribute `event` down
     /// the chain, top-down.
     ///
-    /// The event's own [`ControlPolicy`] decides what happens to the results:
-    /// [`ControlPolicy::FirstFail`] stops at the first error and reports it,
-    /// [`ControlPolicy::IgnoreResult`] visits every filter and succeeds. C takes
-    /// that choice as a `bool ignore_result` ARGUMENT, so a caller can pass the
-    /// wrong one; reading it from the event makes the pairing structural.
-    ///
     /// # Errors
     ///
     /// For a first-fail event, whatever the first failing filter reports.
@@ -3054,10 +2545,6 @@ impl FilterChain {
 
     /// Asks the chain `query` and checks that the answer fits the question.
     ///
-    /// The type check is what C's two `void *` out-parameters cannot do. It
-    /// cannot fire for a correctly written filter, and a filter that answers the
-    /// wrong question is a bug this reports rather than mis-reads.
-    ///
     /// # Errors
     ///
     /// [`CURLcode::UnknownOption`] when no filter is installed or none
@@ -3085,11 +2572,6 @@ impl FilterChain {
 
     /// `Curl_conn_is_ip_connected` (`lib/cfilters.c:615-630`): have we reached
     /// the host at IP level?
-    ///
-    /// True before any TLS handshake has started. The walk stops at
-    /// [`CF_TYPE_IP_CONNECT`] because a filter that PROVIDES the IP connection
-    /// and is not itself connected means we have not reached the host, whatever
-    /// lies below it.
     #[allow(dead_code)]
     pub(crate) fn is_ip_connected(&self) -> bool {
         for filter in self.iter() {
@@ -3144,11 +2626,6 @@ impl FilterChain {
 
     /// `Curl_conn_http_version` (`lib/cfilters.c:707-729`): 10, 11, 20, 30 -- or
     /// 0 when unknown.
-    ///
-    /// Finds the first [`CF_TYPE_HTTP`] filter, stopping at the same boundary
-    /// [`Self::is_multiplex`] uses, and asks it. A value outside `0..=255` is a
-    /// failure in the C (`:719-720`) and every failure yields zero (`:728`);
-    /// [`u8::try_from`] folds the range check and the conversion into one.
     #[allow(dead_code)]
     pub(crate) fn http_version(&mut self, cx: &mut CallCtx<'_, '_>) -> u8 {
         let boundary = CF_TYPE_IP_CONNECT.union(CF_TYPE_SSL);
@@ -3310,21 +2787,6 @@ impl FilterChain {
 
     /// `Curl_conn_get_current_host` (`lib/cfilters.c:822-852`): the host and
     /// port being talked to RIGHT NOW.
-    ///
-    /// Once connected, or before connecting starts, that is the connection's own
-    /// destination -- passed in as `conn_host` and `conn_port`. DURING a connect
-    /// through a tunnelling proxy it is the proxy's interim host, because that is
-    /// what authentication and certificate checks apply to.
-    ///
-    /// The interim host comes from the LOWEST not-yet-connected filter that is
-    /// both [`CF_TYPE_IP_CONNECT`] and [`CF_TYPE_PROXY`] -- the conjunction, not
-    /// the union, which is why [`CfType::contains`] exists separately from
-    /// [`CfType::intersects`]. A non-tunnelling proxy filter such as `HAPROXY`
-    /// declares only [`CF_TYPE_PROXY`] and must not match.
-    ///
-    /// The C's third case, `!data->conn` yielding `("", -1)` (`:827-832`), cannot
-    /// occur here: a chain exists only as part of a connection, so there is no
-    /// state in which the fallback has no host to fall back to.
     #[allow(dead_code)]
     pub(crate) fn current_host(
         &mut self,
@@ -3417,12 +2879,6 @@ impl FilterChain {
     }
 
     /// `Curl_conn_is_alive` (`lib/cfilters.c:997-1003`).
-    ///
-    /// `conn_wants_close` is `conn->bits.close`, and the gate is load-bearing:
-    /// the connection pool asks this before reusing a connection, so a
-    /// connection already marked for closing must report dead however healthy
-    /// its socket is. Dropping the gate would put a connection back into the
-    /// pool that the protocol layer has already decided to discard.
     #[allow(dead_code)]
     pub(crate) fn is_alive(
         &mut self,
@@ -3456,9 +2912,7 @@ impl FilterChain {
     }
 }
 
-// =========================================================================
 // Both chains of one connection -- `conn->cfilter[2]`
-// =========================================================================
 
 /// The pair of filter chains a connection owns.
 ///
@@ -3545,11 +2999,6 @@ impl FilterChains {
 
     /// `cf_cntrl_all` (`lib/cfilters.c:446-461`): distribute `event` across BOTH
     /// chains.
-    ///
-    /// Chains are visited in `conn->cfilter[]` order and, for a first-fail
-    /// event, the walk stops at the first error anywhere -- including partway
-    /// through the second chain, which is what the C's `break` out of the array
-    /// loop does.
     ///
     /// # Errors
     ///
@@ -3664,22 +3113,6 @@ impl FilterChains {
 
     /// `Curl_conn_sockindex` (`lib/cfilters.c:1054-1060`): which chain owns
     /// `sockfd`?
-    ///
-    /// # The fallback is deliberately lopsided, and it is C's
-    ///
-    /// [`SocketIndex::Secondary`] is returned ONLY for a descriptor that is
-    /// valid and matches the secondary socket exactly. EVERYTHING else --
-    /// including a descriptor belonging to neither chain -- comes back as
-    /// [`SocketIndex::First`]. That is not a lookup, it is a two-way guess with
-    /// a default, and it is reproduced rather than tightened for two reasons:
-    /// the callers use it to pick which chain to send on, where the primary is
-    /// the right guess; and an unknown descriptor reaching here is already a
-    /// caller bug that a different answer would not fix.
-    ///
-    /// Contrast [`SocketIndex::from_i32`], which REFUSES an unrecognised index.
-    /// The asymmetry is the point: an out-of-range index is a programming error
-    /// and reported as one, while an unmatched descriptor is a question with a
-    /// documented default.
     #[allow(dead_code)]
     pub(crate) fn sockindex_of(
         secondary_socket: Socket,
@@ -3717,10 +3150,6 @@ impl FilterChains {
     }
 
     /// One non-blocking step of `Curl_conn_connect` (`lib/cfilters.c:491-548`).
-    ///
-    /// THE PRIMARY CONNECT API. Returns whether the chain is fully connected;
-    /// `Ok(false)` means readiness has not arrived yet and the caller should
-    /// await it -- through [`Self::connect`], or through its own reactor loop.
     ///
     /// The order of operations is the C's and matters:
     ///
@@ -3805,12 +3234,6 @@ impl FilterChains {
     /// The blocking form of `Curl_conn_connect` (`lib/cfilters.c:491-592`), as
     /// an async loop.
     ///
-    /// A COMPATIBILITY WRAPPER over [`Self::connect_step`], for the callers that
-    /// genuinely want to wait -- FTP's second connection and `CURLOPT_CONNECT_ONLY`
-    /// among them. Where the C calls `Curl_poll` directly, this awaits the
-    /// reactor through [`crate::conn::select`]; nothing here touches `poll` or
-    /// `select`, and `conn/` is where that boundary belongs.
-    ///
     /// Each iteration mirrors `:547-585`:
     ///
     /// * The remaining time is recomputed from the INJECTED CLOCK rather than
@@ -3822,16 +3245,6 @@ impl FilterChains {
     /// * The wait is bounded by `CURLMIN(timeout_ms, cpfds.n ? 1000 : 10)`
     ///   (`:577`), so a filter making progress without any socket readiness --
     ///   one draining an internal buffer -- is still polled promptly.
-    ///
-    /// # `timeout_ms` of zero
-    ///
-    /// Zero means NO LIMIT, which is what `Curl_timeleft_ms` reports when no
-    /// timeout is configured (`lib/connect.c:122`). The C then computes
-    /// `CURLMIN(0, 1000) == 0` and polls without blocking, spinning; that is
-    /// unreachable in practice, because a connect always has
-    /// `DEFAULT_CONNECT_TIMEOUT` in play (`lib/connect.c:113-119`). Here the
-    /// no-limit case waits on the ceiling instead of spinning -- the same
-    /// semantics without the busy loop.
     ///
     /// # Errors
     ///
@@ -3908,18 +3321,16 @@ impl FilterChains {
     }
 }
 
-// =========================================================================
 // Tests
-// =========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::trace::{TraceConfig, TraceLevel, WriterSink};
+    use crate::util::sync_cell::SyncCell;
     use crate::util::timeval::TestClock;
-    use std::cell::RefCell;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     /// An ordered record of what happened, shared by every filter in a test.
     ///
@@ -3928,10 +3339,10 @@ mod tests {
     /// -- deliberately, since recovering the concrete type is exactly what this
     /// module exists to abolish. A shared log is therefore the ONLY way a test
     /// can observe what a linked filter did, and it is fully typed.
-    type EventLog = Rc<RefCell<Vec<String>>>;
+    type EventLog = Arc<SyncCell<Vec<String>>>;
 
     fn new_log() -> EventLog {
-        Rc::new(RefCell::new(Vec::new()))
+        Arc::new(SyncCell::new(Vec::new()))
     }
 
     fn events(log: &EventLog) -> Vec<String> {
@@ -3942,11 +3353,6 @@ mod tests {
 
     /// Everything the in-memory transport can be told to do, and everything it
     /// records having done.
-    ///
-    /// Shared with the test rather than owned outright, for the reason
-    /// [`EventLog`] gives. A production filter owns its state as a plain field;
-    /// the sharing here is what replaces the C tests' habit of reaching into
-    /// `cf->ctx`.
     #[derive(Debug)]
     struct TransportState {
         /// Bytes the transport will hand upward, consumed from the front.
@@ -4014,18 +3420,9 @@ mod tests {
     }
 
     /// A handle on a transport's state that outlives the chain owning it.
-    type TransportHandle = Rc<RefCell<TransportState>>;
+    type TransportHandle = Arc<SyncCell<TransportState>>;
 
     /// A bottom-of-chain transport over two byte buffers.
-    ///
-    /// The most important unit-test seam in the crate: with this at the bottom,
-    /// every layer above -- TLS, the proxies, HTTP/2, HTTP/3, the transfer loop
-    /// -- can be assembled and driven with no socket, no name resolution and no
-    /// TLS library, which is what puts the mandated coverage of the protocol and
-    /// transfer modules within reach.
-    ///
-    /// Note the shape: `state` is a CONCRETE TYPED FIELD beside [`FilterBase`],
-    /// which is precisely the arrangement that replaces C's `void *ctx`.
     #[derive(Debug)]
     struct InMemory {
         base: FilterBase,
@@ -4038,13 +3435,13 @@ mod tests {
     impl InMemory {
         fn new(name: &'static str, log: &EventLog) -> (Self, TransportHandle) {
             let state: TransportHandle =
-                Rc::new(RefCell::new(TransportState::default()));
+                Arc::new(SyncCell::new(TransportState::default()));
             let filter = Self {
                 base: FilterBase::new(SocketIndex::First),
-                state: Rc::clone(&state),
+                state: Arc::clone(&state),
                 name,
                 flags: CF_TYPE_IP_CONNECT,
-                log: Rc::clone(log),
+                log: Arc::clone(log),
             };
             (filter, state)
         }
@@ -4240,7 +3637,7 @@ mod tests {
                 base: FilterBase::new(SocketIndex::First),
                 name,
                 flags: CfType::NONE,
-                log: Rc::clone(log),
+                log: Arc::clone(log),
             }
         }
 
@@ -4657,7 +4054,7 @@ mod tests {
             &mut cx,
             link(Looker {
                 base: FilterBase::new(SocketIndex::First),
-                log: Rc::clone(&log),
+                log: Arc::clone(&log),
             }),
         );
 
@@ -6466,7 +5863,7 @@ mod tests {
             &mut cx,
             link(Reentrant {
                 base: FilterBase::new(SocketIndex::First),
-                log: Rc::clone(&log),
+                log: Arc::clone(&log),
             }),
         );
         let mut index = 0_usize;
@@ -6702,9 +6099,9 @@ mod tests {
         #[derive(Debug)]
         struct Stalling {
             base: FilterBase,
-            clock: Rc<TestClock>,
+            clock: Arc<TestClock>,
             step_ms: u64,
-            attempts: Rc<RefCell<usize>>,
+            attempts: Arc<SyncCell<usize>>,
         }
 
         impl ConnFilter for Stalling {
@@ -6731,17 +6128,17 @@ mod tests {
             }
         }
 
-        let clock = Rc::new(TestClock::new(CurlTime::new(10, 0)));
-        let attempts = Rc::new(RefCell::new(0_usize));
+        let clock = Arc::new(TestClock::new(CurlTime::new(10, 0)));
+        let attempts = Arc::new(SyncCell::new(0_usize));
         let mut cx = CallCtx::new(clock.as_ref());
         let mut chains = FilterChains::new(Some(ConnId::new(33)));
         chains.chain_mut(SocketIndex::First).add(
             &mut cx,
             link(Stalling {
                 base: FilterBase::new(SocketIndex::First),
-                clock: Rc::clone(&clock),
+                clock: Arc::clone(&clock),
                 step_ms: 15,
-                attempts: Rc::clone(&attempts),
+                attempts: Arc::clone(&attempts),
             }),
         );
 

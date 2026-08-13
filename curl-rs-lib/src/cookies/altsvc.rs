@@ -22,8 +22,7 @@
 //
 //***************************************************************************
 
-//! The Alt-Svc cache -- supersedes `lib/altsvc.c` (666 lines) and
-//! `lib/altsvc.h` (74 lines).
+//! The Alt-Svc cache -- supersedes `lib/altsvc.c` and `lib/altsvc.h`.
 //!
 //! Alt-Svc is RFC 7838. A server answers a request with an `Alt-Svc:`
 //! response header naming an alternative service -- a different protocol
@@ -33,55 +32,10 @@
 //! `CURLOPT_ALTSVC_CTRL` (286) for the [`CURLALTSVC_READONLYFILE`],
 //! [`CURLALTSVC_H1`], [`CURLALTSVC_H2`] and [`CURLALTSVC_H3`] bitmask.
 //!
-//! # Two frozen contracts, and the second is easy to underestimate
-//!
-//! **The on-disk format is consumer-visible.** A cache written by curl
-//! 8.19.0-DEV must be readable here and one written here must be readable
-//! there. The nine space-separated fields, the quoted `YYYYMMDD HH:MM:SS`
-//! stamp in GMT, the bracketing of numeric IPv6 destinations and the two
-//! comment lines at the top are all documented in `docs/ALTSVC.md` and are
-//! reproduced byte for byte by [`AltSvcInfo::write_to`].
-//!
-//! **An entry decides which ALPN protocol is offered.** The consumer of
-//! [`AltSvcInfo::lookup`] is `lib/url.c:2944-3053`: it builds an allowed-ALPN
-//! mask from the negotiated HTTP version set, masks it with this cache's
-//! [`AltSvcInfo::flags`], asks for `h3` then `h2` then `h1`, and on a hit
-//! either redirects the connection (`conn_to_host`, `conn_to_port`,
-//! `bits.altused`, which is what emits `Alt-Used:`) or -- when the
-//! alternative names the same destination -- raises the wanted and preferred
-//! HTTP version. Both outcomes change the ALPN list in the TLS ClientHello,
-//! and AAP 0.6.7 establishes that the fixture corpus joins each side of a
-//! `<protocol>` block into ONE string and compares it literally, over 1,476
-//! of 1,914 fixtures. A wrong lookup is a wire-parity failure, not a
-//! cosmetic one, so the lookup is held to the same standard as the file
-//! format.
-//!
-//! # This module owns the ALPN identifier, for now
-//!
-//! [`AlpnId`] supersedes `enum alpnid` (`lib/hostip.h:49-54`), and
-//! [`alpn2alpnid`] supersedes `Curl_alpn2alpnid` and `Curl_str2alpnid`
-//! (`lib/connect.c:73-95`). By the AAP's own mapping those belong to
-//! `crate::dns` and `crate::conn` respectively, and neither provides them at
-//! this commit -- measured: no such type exists anywhere in the crate, and
-//! `src/conn/` holds only its module root and `select.rs`. [`alpnid2str`]
-//! (`lib/altsvc.c:49-61`) is genuinely this module's code in the C too.
-//!
-//! **So this file is first, and the contract is written down here rather
-//! than left to be guessed.** An agent landing `dns` or `conn` should
-//! `use crate::cookies::altsvc::AlpnId;` and MOVE the definition only
-//! together with every reference to it -- never redeclare it. The three
-//! properties that must survive such a move are: the discriminants are the
-//! `CURLALTSVC_*` bits and nothing may infer them from declaration order;
-//! the name mapping is case-sensitive and length-exact; and
-//! [`alpnid2str`]'s default arm is the empty string, which the C marks
-//! `/* bad */`.
-//!
 //! # `share/` owns locking; this module owns none
 //!
-//! `CURLSHOPT_SHARE` can place this cache in a `CURLSH` shared between easy
-//! handles, and the user-supplied lock callbacks belong to `crate::share`,
-//! which does not exist at this commit. What that module needs to know is
-//! which operations mutate, so it is recorded here:
+//! What that module needs to know is which operations mutate, so it is
+//! recorded here:
 //!
 //! | Operation | Access |
 //! |---|---|
@@ -96,14 +50,6 @@
 //! trap: it looks like a query and takes `&mut self` because
 //! `lib/altsvc.c:641-647` deletes expired entries as it scans. A shared
 //! cache must therefore take the WRITE lock for a lookup.
-//!
-//! `curl-rs-lib/src/lib.rs` declares `pub mod share;` but
-//! `pub(crate) mod cookies;`, so naming [`AltSvcInfo`] in a `pub` signature
-//! over there is `error[E0446]: private type in public interface`. The
-//! resolution is `share`'s to make and is either of the two the C already
-//! models -- keep it behind an opaque `pub` wrapper, as C does with
-//! `typedef void CURLSH`, or add a curated `pub use` at the crate root.
-//! Nothing here widens its own visibility to make that choice for it.
 //!
 //! # The clock is injected
 //!
@@ -125,46 +71,9 @@
 //! process-global, and C reached for `getenv` only because it had no better
 //! seam.
 //!
-//! # Preserved warts
-//!
-//! Each of these would be "fixed" by a clean reimplementation, and fixing
-//! any of them changes observable behaviour. Every one carries its
-//! `lib/altsvc.c` line at the site:
-//!
-//! * `:73-76` -- the IPv6 bracket strip subtracts two from the length
-//!   WITHOUT verifying a closing `]`, so `[abc` loses its last byte.
-//! * `:77-80` -- the trailing-dot strip is an `else if`, so it never runs
-//!   when brackets were stripped.
-//! * `:81-85` -- there is NO trailing-dot strip for the destination host.
-//! * `:161` -- `curlx_str_number(&line, &prio, 0)` bounds the priority field
-//!   at zero, so `0` is the only value that parses.
-//! * `:178` -- and the parsed priority is discarded anyway.
-//! * `:169-172` -- `Curl_getdate_capped`'s result is ignored, so an
-//!   unparsable date yields an immediately-expired entry rather than a
-//!   rejected line.
-//! * `:182-183` -- an unknown ALPN name in a file line reports
-//!   `CURLE_OUT_OF_MEMORY`, which is not what happened.
-//! * `:212-215` -- there is no empty-line short-circuit, unlike
-//!   `lib/hsts.c:521`; a blank line is dropped by the grammar instead.
-//! * `:256-274` -- there is no `unlimited` stamp, unlike the HSTS cache, and
-//!   the year is printed with `%d` rather than a padded field.
-//! * `:262`, `:375` -- the return values of `fputs` and `curl_mfprintf` are
-//!   not examined, so a failed WRITE is not detected.
-//! * `:571` -- the flush of a source origin's existing entries fires on the
-//!   first ACCEPTED alternative of a header, not at the start, so a header
-//!   whose every alternative is skipped leaves the cache untouched.
-//! * `:641-647` -- expiry pruning stops at the first match, so expired
-//!   entries after a hit survive into the next save.
-//! * `lib/curl_fopen.c:99` -- the save TRUNCATES the target before the
-//!   temporary file exists, so a failed save can destroy the original.
-//!
 //! # Visibility
 //!
-//! `pub(crate)` throughout. `grep -i altsvc lib/libcurl.def` finds nothing:
-//! no exported symbol resolves a name here, and the cache is reached only
-//! through an easy handle's option surface. Per AAP 0.8.7 no internal is
-//! re-exported to make `tests/unit/unit1654.c` link -- its coverage is
-//! relocated into this file's test module instead.
+//! `pub(crate)` throughout.
 
 use core::fmt;
 use std::fs::File;
@@ -172,8 +81,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{CURLcode, CodeResult};
+// The two open flags for the hardened save, from the one directory in this
+// crate allowed to name `libc`; `crate::util::fopen` cannot import them itself.
+use crate::ffi::{O_CLOEXEC, O_NOFOLLOW};
 use crate::util::dynbuf::DynBuf;
-use crate::util::fopen::open_for_write;
+use crate::util::fopen::{open_for_write, NoFollow, StoreClass};
 use crate::util::get_line::get_line;
 use crate::util::inet::pton6;
 use crate::util::parsedate::{parsedate, Outcome};
@@ -186,17 +98,9 @@ use crate::util::strparse::{
 };
 use crate::util::timeval::{gmtime, Clock};
 
-// ---------------------------------------------------------------------------
 // Constants -- `lib/altsvc.c:41-46` and `include/curl/curl.h:1031-1035`.
-// ---------------------------------------------------------------------------
 
 /// The ceiling on one line of the cache file -- `lib/altsvc.c:41`.
-///
-/// Handed to the [`DynBuf`] that reads the file, exactly as
-/// `curlx_dyn_init(&buf, MAX_ALTSVC_LINE)` does at `:210`. A longer line is
-/// not skipped: the append fails with `CURLcode::TooLarge` and the WHOLE
-/// load fails with it, which `lib/setopt.c:2524` then returns out of
-/// `curl_easy_setopt(CURLOPT_ALTSVC, path)`.
 #[allow(dead_code)]
 const MAX_ALTSVC_LINE: usize = 4095;
 
@@ -230,11 +134,6 @@ const H3VERSION: &str = "h3";
 
 /// The widest numeric address text `str_until` will take for an IPv6
 /// destination -- `MAX_IPADR_LEN`, `lib/urldata.h:124`.
-///
-/// `sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")`, so 46 with the
-/// terminator the C counts and this does not need. It is the C's own bound
-/// at `lib/altsvc.c:509` and is deliberately NOT [`MAX_ALTSVC_HOSTLEN`]: the
-/// bracketed form of an alternative's host is an address, not a name.
 #[allow(dead_code)]
 const MAX_IPADR_LEN: usize = 46;
 
@@ -277,12 +176,6 @@ pub(crate) const CURLALTSVC_H2: i64 = 1 << 4;
 pub(crate) const CURLALTSVC_H3: i64 = 1 << 5;
 
 /// The two comment lines that open the cache file -- `lib/altsvc.c:375`.
-///
-/// The C emits both in ONE `fputs` and writes NOTHING after them: unlike the
-/// Netscape cookie jar there is no trailing blank line, and unlike the HSTS
-/// cache there is no version marker. Split in two here only so that each
-/// literal fits a line; the bytes are identical and a test asserts them
-/// against `tests/data/test1654`'s expected output.
 #[rustfmt::skip]
 #[allow(dead_code)]
 const HEADER_LINE_1: &[u8] =
@@ -294,14 +187,9 @@ const HEADER_LINE_1: &[u8] =
 const HEADER_LINE_2: &[u8] =
     b"# This file was generated by libcurl! Edit at your own risk.\n";
 
-// ---------------------------------------------------------------------------
 // The ALPN identifier -- `enum alpnid`, `lib/hostip.h:49-54`.
-// ---------------------------------------------------------------------------
 
 /// An application-layer protocol identifier.
-///
-/// Supersedes `enum alpnid` (`lib/hostip.h:49-54`). See the module header for
-/// why the type lives here and how to move it.
 ///
 /// # The discriminants ARE the `CURLALTSVC_*` bits
 ///
@@ -315,18 +203,6 @@ const HEADER_LINE_2: &[u8] =
 ///   ALPN_h3 = CURLALTSVC_H3
 /// };
 /// ```
-///
-/// and that identity is LOAD-BEARING rather than decorative.
-/// [`AltSvcInfo::lookup`] receives a bitmask of `CURLALTSVC_H*` bits, built
-/// by `lib/url.c:2964-2973` from the negotiated HTTP version set and masked
-/// with the cache's own flags, and ANDs it directly against a stored
-/// identifier (`lib/altsvc.c:653`). A renumbering would silently make every
-/// alternative unreachable, or reachable when it should not be.
-///
-/// So the discriminants are written out explicitly with `#[repr(i32)]` --
-/// `enum alpnid` is an unadorned C enumeration, which is `int` -- and
-/// [`Self::bits`] is the only way to reach them. Nothing infers a value from
-/// declaration order, and a test asserts each against its public constant.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[repr(i32)]
 #[allow(dead_code)]
@@ -353,13 +229,6 @@ pub(crate) enum AlpnId {
 #[allow(dead_code)]
 impl AlpnId {
     /// The discriminant, for masking against a `CURLALTSVC_*` bitmask.
-    ///
-    /// `i64` rather than the `int` the C's `enum` is, because the cache's
-    /// flags field is a `long` (`lib/altsvc.h:49`) and this is what it is
-    /// compared with. The narrowing in the C's own
-    /// `allowed_alpns &= (int)data->asi->flags` (`lib/url.c:2973`) cannot
-    /// change an outcome: the other operand of every AND is a discriminant of
-    /// this type, so only bits 3 to 5 can ever survive it.
     #[must_use]
     pub(crate) const fn bits(self) -> i64 {
         self as i64
@@ -374,15 +243,6 @@ impl AlpnId {
 
 /// The name of an ALPN identifier -- supersedes `Curl_alpnid2str`
 /// (`lib/altsvc.c:49-61`).
-///
-/// The empty string for [`AlpnId::None`] is the C's `default: return "";`,
-/// which it annotates `/* bad */`. That matters at exactly one place: the
-/// cache writer would emit an empty first field for such an entry, producing
-/// a line that cannot be read back. It never happens, because
-/// [`AltSvc::create`] refuses an unrecognised name on either side and is the
-/// only way an entry is built -- but the empty string is reproduced rather
-/// than replaced by a panic or a placeholder, because a caller that reaches
-/// it must behave as curl does.
 #[must_use]
 #[allow(dead_code)]
 pub(crate) const fn alpnid2str(id: AlpnId) -> &'static str {
@@ -405,19 +265,6 @@ pub(crate) const fn alpnid2str(id: AlpnId) -> &'static str {
 /// else if(len == 8) { "http/1.1" -> ALPN_h1; }
 /// return ALPN_none; /* unknown, probably rubbish input */
 /// ```
-///
-/// so slice equality against the four literals is the same function: each
-/// pattern tests a length and then the bytes, in that order, and no other
-/// length can match anything.
-///
-/// # It is CASE-SENSITIVE, and draft names are not recognised
-///
-/// `memcmp` folds nothing, so `H2` is not `h2`. And every name of any other
-/// length answers [`AlpnId::None`] -- including `h3-22`, which
-/// `docs/ALTSVC.md` still shows in its example cache line. That example is
-/// historical: the line parses as far as its ALPN field and is then dropped,
-/// which is the current behaviour and must not be "fixed" by admitting draft
-/// names.
 #[must_use]
 #[allow(dead_code)]
 pub(crate) fn alpn2alpnid(name: &[u8]) -> AlpnId {
@@ -433,28 +280,9 @@ pub(crate) fn alpn2alpnid(name: &[u8]) -> AlpnId {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The diagnostic sink -- the successor of `infof`.
-// ---------------------------------------------------------------------------
 
 /// Where this module's four diagnostics go.
-///
-/// `lib/altsvc.c` calls `infof(data, ...)` at `:503`, `:511`, `:519` and
-/// `:597`, and `infof` is a macro that tests `Curl_trc_is_verbose(data)`
-/// BEFORE formatting anything (`lib/curl_trc.h:138-142`). The successor of
-/// that macro is `crate::trace`, which is not among this file's declared
-/// dependencies, so the sink is injected -- the same shape
-/// `crate::cookies::psl` uses for its list source and
-/// `crate::cookies::netrc` for its home directory.
-///
-/// The argument is [`fmt::Arguments`] precisely so that the C's ordering
-/// survives: nothing is formatted unless an implementation chooses to look at
-/// it, so a non-verbose transfer pays for no message here either.
-///
-/// No fixture compares these strings -- measured: `Added alt-svc`,
-/// `Bad alt-svc` and `Unknown alt-svc` appear in no file under `tests/data`
-/// -- but they are reproduced verbatim because `--verbose` output is
-/// observable behaviour and AAP 0.8.1 freezes it.
 #[allow(dead_code)]
 pub(crate) trait AltSvcLog {
     /// Emits one diagnostic line, or discards it.
@@ -474,15 +302,6 @@ impl AltSvcLog for NoLog {
 }
 
 /// A host span as text, for a diagnostic only.
-///
-/// The C's `infof(data, "Added alt-svc: %.*s:%d over %s", ...)` prints the
-/// destination host's raw bytes. A host that arrived in a response header is
-/// not required to be UTF-8 and this module never requires it to be, so the
-/// one place a host has to become text substitutes the replacement character
-/// for each invalid sequence, exactly as [`String::from_utf8_lossy`] does.
-///
-/// This affects a diagnostic and nothing else: no stored byte, no byte
-/// written to the cache file and no byte on the wire passes through here.
 #[allow(dead_code)]
 struct HostText<'a>(&'a [u8]);
 
@@ -492,10 +311,8 @@ impl fmt::Display for HostText<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The stored shapes -- `struct althost`, `struct altsvc`, `struct altsvcinfo`
 // (`lib/altsvc.h:31-51`).
-// ---------------------------------------------------------------------------
 
 /// One end of an alternative: a host, a port and a protocol.
 ///
@@ -504,14 +321,6 @@ impl fmt::Display for HostText<'_> {
 /// ```text
 /// struct althost { char *host; unsigned short port; enum alpnid alpnid; };
 /// ```
-///
-/// The host is [`Vec<u8>`] and not [`String`], deliberately. It arrives
-/// either from a response header or from a file on disk, the C validates
-/// neither as text, and requiring UTF-8 here would reject a host curl
-/// accepts. It is stored WITHOUT brackets even when it is a numeric IPv6
-/// address -- [`AltSvc::createid`] strips them on the way in and
-/// [`push_host`] re-adds them on the way out, which is exactly what makes the
-/// file round-trip.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct AltHost {
@@ -535,10 +344,6 @@ pub(crate) struct AltHost {
 ///   unsigned int prio; BIT(persist);
 /// };
 /// ```
-///
-/// `node` is gone: AAP 0.6.9 replaces the intrusive list with an owned
-/// collection, so the entries live in [`AltSvcInfo`]'s [`Vec`] and nothing
-/// embeds a link in its payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct AltSvc {
@@ -567,16 +372,6 @@ pub(crate) struct AltSvc {
 #[allow(dead_code)]
 impl AltSvc {
     /// Builds an entry from already-resolved protocol identifiers.
-    ///
-    /// Supersedes `altsvc_createid` (`lib/altsvc.c:65-110`). THREE
-    /// asymmetries in that function are reproduced exactly; each is marked at
-    /// its site and listed in the module header. A "clean" version of this
-    /// function is a wrong version.
-    ///
-    /// Returns [`None`] for the C's `if(!hlen || !dlen) return NULL` -- a
-    /// host that is empty, or became empty, is bad input. The C's other
-    /// [`None`] is an allocation failure, which has no counterpart because
-    /// this one allocation cannot be observed to fail.
     fn createid(
         srchost: &[u8],
         dsthost: &[u8],
@@ -664,9 +459,6 @@ impl AltSvc {
     /// (as->src.port == srcport) &&
     /// (versions & (int)as->dst.alpnid)
     /// ```
-    ///
-    /// Note the argument order of the host comparison: the ORIGIN's host is
-    /// first, so it is the one whose trailing dot is ignored.
     fn matches_origin(
         &self,
         srcalpn: AlpnId,
@@ -681,9 +473,6 @@ impl AltSvc {
     }
 
     /// Writes this entry as one line of the cache file.
-    ///
-    /// Supersedes `altsvc_out` (`lib/altsvc.c:233-274`), whose format string is
-    /// assembled from five adjacent literals into exactly
     ///
     /// ```text
     /// "%s %s%s%s %u %s %s%s%s %u \"%d%02d%02d %02d:%02d:%02d\" %u %u\n"
@@ -703,10 +492,6 @@ impl AltSvc {
     ///   `curlx_gmtime` is called unconditionally at `:240` and its failure
     ///   aborts the entry.
     /// * The brackets are decided per SIDE, by [`push_host`].
-    ///
-    /// The line is assembled in one buffer and written once because a host is
-    /// bytes rather than text, so the whole line has to be bytes. The bytes
-    /// and their order are identical to the C's single `curl_mfprintf`.
     ///
     /// # Errors
     ///
@@ -771,10 +556,6 @@ impl AltSvc {
 /// entry and copies the host out of it -- `curlx_strdup(as->dst.host)` at
 /// `lib/url.c:3022` -- so this carries those three by value plus the flag,
 /// and the caller is left holding nothing that borrows the cache.
-///
-/// That is not a convenience: the C's out-parameter aliases a list node that
-/// the very next `lookup` may delete as an expired entry, and handing back an
-/// owned copy removes the hazard without changing what the caller can see.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct AltSvcHit {
@@ -787,18 +568,10 @@ pub(crate) struct AltSvcHit {
     /// The alternative's port -- `as->dst.port`.
     pub(crate) port: u16,
     /// True when the alternative names the SAME host and port as the origin.
-    ///
-    /// `*psame_destination`. The caller treats the two cases completely
-    /// differently: same destination means "more HTTPS version options" and
-    /// only the version preference moves, while a different destination
-    /// redirects the connection and sets `bits.altused`, which is what emits
-    /// an `Alt-Used:` request header.
     pub(crate) same_destination: bool,
 }
 
-// ---------------------------------------------------------------------------
 // Shared helpers.
-// ---------------------------------------------------------------------------
 
 /// The bracket strip of `altsvc_createid`, with its wart intact.
 ///
@@ -811,15 +584,6 @@ pub(crate) struct AltSvcHit {
 ///   hlen -= 2;
 /// }
 /// ```
-///
-/// **WART, PRESERVED**: the length loses two bytes on the strength of the
-/// OPENING bracket alone -- no closing `]` is ever verified. So `[abc`
-/// becomes `ab`, silently dropping its last byte. Reproduced because a cache
-/// file written by curl 8.19.0-DEV may contain exactly that, and reading it
-/// differently would diverge.
-///
-/// [`None`] means no strip applied, which is what lets the caller express the
-/// C's `else if` for the trailing dot.
 #[allow(dead_code)]
 fn strip_brackets(host: &[u8]) -> Option<&[u8]> {
     if host.len() > 2 && host.first() == Some(&b'[') {
@@ -864,22 +628,10 @@ fn hostcompare(host: &[u8], check: &[u8]) -> bool {
 
 /// `Curl_getdate_capped` over a byte span.
 ///
-/// `crate::util::parsedate::getdate_capped` is the designated successor of
-/// `Curl_getdate_capped` (`lib/parsedate.c:581-585`) and takes a [`str`],
-/// which this call site cannot supply: the date arrives from
-/// [`str_quotedword`] over a cache file that is not required to be UTF-8, and
-/// refusing to parse a span merely because it is not text would reject a date
-/// curl accepts. So the two-line body is applied to the span directly --
-///
 /// ```text
 /// int rc = parsedate(p, tp);
 /// return (rc == PARSEDATE_FAIL);
 /// ```
-///
-/// -- which is the same function over a wider domain. `PARSEDATE_LATER` is a
-/// SUCCESS here, exactly as it is there, and that is the whole difference from
-/// `curl_getdate`. A test asserts that this agrees with `getdate_capped` for
-/// every span that IS text, so the two cannot drift.
 #[allow(dead_code)]
 fn getdate_capped_bytes(date: &[u8]) -> Option<i64> {
     match parsedate(date) {
@@ -892,17 +644,6 @@ fn getdate_capped_bytes(date: &[u8]) -> Option<i64> {
 }
 
 /// Appends `value` in decimal, zero-padded to at least `width` digits.
-///
-/// The `%u` and `%02d` conversions of the cache line's format string
-/// (`lib/altsvc.c:256-262`), written once. A [`Vec<u8>`] is the sink because
-/// a host is bytes and the line is assembled around it, so the whole line is
-/// bytes.
-///
-/// Total for every [`i64`]: the magnitude is taken with
-/// [`i64::unsigned_abs`], so [`i64::MIN`] converts without overflow, and its
-/// twenty digits are exactly the buffer's capacity. A negative value emits a
-/// leading `-` before the padding, which is what `%d` does; only the year can
-/// ever be negative here, and only for an expiry before the year 0.
 #[allow(dead_code)]
 fn push_int(out: &mut Vec<u8>, value: i64, width: usize) {
     // Twenty digits is `u64::MAX`, so the buffer cannot be outrun. The bound
@@ -937,51 +678,6 @@ fn push_int(out: &mut Vec<u8>, value: i64, width: usize) {
 }
 
 /// Appends a host, bracketed when it is a numeric IPv6 address.
-///
-/// `lib/altsvc.c:245-254` decides this with
-/// `curlx_inet_pton(AF_INET6, host, ipv6_unused) == 1`, applied INDEPENDENTLY
-/// to the source and the destination, and `docs/ALTSVC.md` states the
-/// contract: *"If the hostname is an IPv6 numerical address, it is stored
-/// with brackets such as `[::1]`."*
-///
-/// [`pton6`] and never the standard library's own address parser: curl's
-/// rejects a zone identifier, so the two disagree about which hosts get
-/// brackets -- and the answer is a byte of the cache file.
-///
-/// The C wraps this in `#ifdef USE_IPV6`, which has no counterpart: the
-/// crate's capability vocabulary is closed at fifteen names and none of them
-/// is an IPv6 switch, so address handling is unconditional here.
-///
-/// # Why the decision is not `pton6` alone
-///
-/// `curlx_inet_pton` is not one function. `lib/curlx/inet_pton.h:41-44`
-/// defines it as a MACRO for the platform `inet_pton` whenever
-/// `HAVE_INET_PTON` is defined, and the implementation in
-/// `lib/curlx/inet_pton.c` sits behind `#ifndef HAVE_INET_PTON` -- so on all
-/// four target platforms the in-tree implementation is dead code and this
-/// decision is the C library's. [`pton6`] supersedes the in-tree file and
-/// reproduces it faithfully, including one form the two disagree about: a
-/// trailing colon after a complete group, which the in-tree `inet_pton6`
-/// accepts because the final colon flushes the pending group and the `::`
-/// close-up then pads the address out.
-///
-/// That disagreement was measured rather than reasoned about. A libcurl built
-/// from this tree at `8.19.0-DEV` writes `h1 ::1: 443 ...` -- unbracketed --
-/// for a stored host of `b"::1:"`, so bracketing it here would break the
-/// round trip the format promises. Differentially fuzzing the platform
-/// function against [`pton6`] over 49,688 candidate strings found 215
-/// accepted by the platform, 260 by [`pton6`], no form accepted by the
-/// platform and refused by [`pton6`], and all 45 divergences of one shape:
-/// a final `:` immediately preceded by a hexadecimal digit. [`is_numeric_v6`]
-/// refuses exactly that shape and defers everything else, which reproduces
-/// the platform verdict on every one of the 49,688 forms -- `b"::"` and
-/// `b"1::"` end in a colon and are still accepted, because the byte before it
-/// is not a digit.
-///
-/// The guard belongs here and not in [`pton6`]: that function's accept set is
-/// the in-tree file's, it is pinned by a test of its own, and `dns`, `url` and
-/// `proxy` consume it. This is the one call site where the C's decision is
-/// the platform's.
 #[allow(dead_code)]
 fn push_host(out: &mut Vec<u8>, host: &[u8]) {
     let numeric_v6 = is_numeric_v6(host);
@@ -995,12 +691,6 @@ fn push_host(out: &mut Vec<u8>, host: &[u8]) {
 }
 
 /// `curlx_inet_pton(AF_INET6, host, buf) == 1`, as the platform answers it.
-///
-/// The reasoning, the measurement and the reason the guard lives here rather
-/// than in [`pton6`] are all in [`push_host`]'s documentation. In short: the
-/// C's `curlx_inet_pton` is the platform `inet_pton` on every target platform
-/// (`lib/curlx/inet_pton.h:41-44`), and the only form it and [`pton6`]
-/// disagree about is a trailing colon after a complete group.
 fn is_numeric_v6(host: &[u8]) -> bool {
     // The divergent shape: a final `:` whose predecessor is a hexadecimal
     // digit. `hexval` is the crate's own `ISXDIGIT` -- `strparse`'s tests
@@ -1018,22 +708,14 @@ fn is_numeric_v6(host: &[u8]) -> bool {
     pton6(host).is_some()
 }
 
-// ---------------------------------------------------------------------------
 // The file-line grammar -- the `||` chain of `altsvc_add`
 // (`lib/altsvc.c:145-163`).
-// ---------------------------------------------------------------------------
 
 /// The nine fields of one cache-file line, as spans of that line.
-///
-/// The format is documented in `docs/ALTSVC.md` and its example is
 ///
 /// ```text
 /// h2 quic.tech 8443 h3-22 quic.tech 8443 "20190808 06:18:37" 0 0
 /// ```
-///
-/// which no longer loads, because `h3-22` is not a name [`alpn2alpnid`]
-/// recognises. The documentation is historical on that point; the grammar
-/// below is not.
 #[allow(dead_code)]
 struct FileLine<'a> {
     /// Field 1: the source origin's ALPN name, at most
@@ -1069,11 +751,6 @@ impl<'a> FileLine<'a> {
     ///   ;
     /// else { ...build the entry... }
     /// ```
-    ///
-    /// so ANY failure drops the line in silence, and short-circuiting means a
-    /// later step never runs once an earlier one has failed. `?` on a
-    /// [`Result`] is that chain: the same steps in the same order, stopping at
-    /// the same place, with the cursor left where the failing step left it.
     ///
     /// Three of the bounds are worth reading twice, because each rejects
     /// lines a reader might expect to be accepted:
@@ -1138,10 +815,8 @@ impl<'a> FileLine<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The cache -- `struct altsvcinfo` (`lib/altsvc.h:46-50`) and the
 // library-wide functions of `lib/altsvc.c:280-660`.
-// ---------------------------------------------------------------------------
 
 /// The default flag set of a fresh cache -- `lib/altsvc.c:293-298`.
 ///
@@ -1155,13 +830,6 @@ impl<'a> FileLine<'a> {
 /// #endif
 ///   ;
 /// ```
-///
-/// HTTP/1.1 unconditionally, because this crate has no `http` capability to
-/// gate it on and HTTP/1.1 is always built; the other two follow the `http2`
-/// and `http3` capabilities, which are the successors of `USE_HTTP2` and
-/// `USE_HTTP3`. A constant rather than a mutable local with attributes on its
-/// assignments, so that no configuration leaves a binding unnecessarily
-/// mutable and every configuration folds to one value.
 #[allow(dead_code)]
 const DEFAULT_FLAGS: i64 = CURLALTSVC_H1 | DEFAULT_H2 | DEFAULT_H3;
 
@@ -1206,9 +874,8 @@ const DEFAULT_H3: i64 = 0;
 /// every producer appends at the TAIL, so the file is written in insertion
 /// order. A hash map would reorder it -- and with a randomised hash, it would
 /// reorder it differently on every run -- which would change the bytes of a
-/// file whose bytes are frozen. Lookup is a linear scan for the same reason
-/// it is in the C: the order is the contract, and performance is a non-goal
-/// (AAP 0.1.1).
+/// file whose bytes are frozen. Lookup is a linear scan for the same reason it
+/// is in the C: the order is the contract, and performance is a non-goal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct AltSvcInfo {
@@ -1240,12 +907,6 @@ impl Default for AltSvcInfo {
 #[allow(dead_code)]
 impl AltSvcInfo {
     /// Creates an empty cache with the default flags.
-    ///
-    /// Supersedes `Curl_altsvc_init` (`lib/altsvc.c:288-298`). The C's
-    /// [`None`]-on-allocation-failure has no counterpart, so the successor is
-    /// infallible and its callers -- `lib/setopt.c:2515-2518` and
-    /// `lib/easy.c:1038-1041`, both of which map a null to
-    /// `CURLE_OUT_OF_MEMORY` -- lose a branch they cannot reach.
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
@@ -1267,9 +928,6 @@ impl AltSvcInfo {
     /// Replaces the bitmask -- supersedes `Curl_altsvc_ctrl`
     /// (`lib/altsvc.c:312-325`).
     ///
-    /// The C's lazy creation of `data->asi` has no counterpart: the cache this
-    /// is called on already exists.
-    ///
     /// # Errors
     ///
     /// `CURLcode::BadFunctionArgument` when `ctrl` is zero. The C refuses it
@@ -1286,14 +944,6 @@ impl AltSvcInfo {
 
     /// Empties the cache -- supersedes `Curl_altsvc_cleanup`
     /// (`lib/altsvc.c:331-346`).
-    ///
-    /// The C takes `struct altsvcinfo **asi`, frees every node, frees the
-    /// filename, frees the structure and NULLs the caller's pointer. Dropping
-    /// an [`AltSvcInfo`] does all of that, so this is the successor of the
-    /// FIRST two steps only -- for a caller that holds the cache inside a
-    /// longer-lived structure and wants it emptied without replacing it. The
-    /// same shape `crate::cookies::netrc`'s store and `crate::cookies::psl`'s
-    /// cache use.
     ///
     /// The flags are deliberately NOT reset. They came from
     /// `CURLOPT_ALTSVC_CTRL` and outlive the entries, exactly as they do in
@@ -1337,19 +987,9 @@ impl AltSvcInfo {
     ///
     /// Two behaviours here surprise people, and both are the C's:
     ///
-    /// * **The file name is remembered even when the file cannot be read.**
-    ///   `:201-207` copies it BEFORE the open, which is what lets
-    ///   `--alt-svc <file>` name a cache that does not exist yet and still
-    ///   have it written on the way out.
     /// * **A missing or unopenable file is NOT an error.** `:209` simply does
     ///   nothing when `fopen` returns null, and `CURLE_OK` comes back. Only a
     ///   file that opens and then misbehaves can fail.
-    ///
-    /// The C's `curlx_fopen(file, FOPEN_READTEXT)` is `fopen(file, "r")` on
-    /// the four mandated targets, which is byte-for-byte a binary read, so
-    /// [`File::open`] is the whole of it. The C's own
-    /// `CURLE_OUT_OF_MEMORY` from a failed `strdup` of the name has no
-    /// counterpart.
     ///
     /// # Errors
     ///
@@ -1373,12 +1013,6 @@ impl AltSvcInfo {
     }
 
     /// Loads entries from an already-open reader.
-    ///
-    /// The injected-input form of [`Self::load`], and the one the tests use:
-    /// nothing here opens a file or touches the filesystem, so the whole
-    /// reader is exercisable in memory and therefore under Miri. It is a
-    /// first-class entry point, not a test hook -- a caller holding a cache
-    /// from any source can use it.
     ///
     /// The loop is `:211-222`:
     ///
@@ -1408,8 +1042,6 @@ impl AltSvcInfo {
     /// * `altsvc_add`'s return value is **discarded** at `:220`. A line that
     ///   names an unknown protocol reports `CURLE_OUT_OF_MEMORY` and the load
     ///   still succeeds; see [`Self::add`].
-    ///
-    /// The C's `curlx_dyn_free(&buf)` at `:223` is the buffer's own drop here.
     ///
     /// # Errors
     ///
@@ -1468,9 +1100,6 @@ impl AltSvcInfo {
     ///   harmless because `:219` discards it, and it is reproduced because
     ///   this function is not the only possible caller.
     ///
-    /// The entry is appended at the TAIL -- `Curl_llist_append` at `:180` --
-    /// which is what makes the saved file preserve the loaded order.
-    ///
     /// # Errors
     ///
     /// `CURLcode::OutOfMemory` for the third wart above, and nothing else. A
@@ -1517,32 +1146,6 @@ impl AltSvcInfo {
 
     /// Writes the cache to a file, through a temporary when it is safe to.
     ///
-    /// Supersedes `Curl_altsvc_save` (`lib/altsvc.c:351-390`). `file` is the
-    /// name the option carries; [`None`] falls back to the one
-    /// [`Self::load`] remembered, which is the C's
-    /// `if(!file && asi->filename) file = asi->filename;` at `:363-364`.
-    ///
-    /// Nothing is written, and `Ok(())` comes back, when
-    /// [`CURLALTSVC_READONLYFILE`] is set, when there is no name at all, or
-    /// when the name is empty -- the C's one condition at `:366-368`. The
-    /// C's `if(!asi) return CURLE_OK` has no counterpart: the Option-ness of
-    /// the cache lives in the caller, which is `lib/url.c:271` reaching
-    /// `data->asi`.
-    ///
-    /// `rand_suffix` is the injected randomness `crate::util::fopen` requires
-    /// -- forty characters drawn from its own alphabet, for the temporary
-    /// file's name. It is forwarded rather than produced here: the C reaches
-    /// `Curl_rand_alnum` through `Curl_fopen`'s `struct Curl_easy *data`
-    /// parameter, and that parameter existed for nothing else.
-    ///
-    /// # The target is truncated before the temporary file exists
-    ///
-    /// WART, PRESERVED, and it is not this module's to fix:
-    /// `lib/curl_fopen.c:99` opens the target with `"w"` in order to `fstat`
-    /// it, so **a save that fails afterwards has already destroyed the
-    /// original cache**. The successor reproduces it and says so in its own
-    /// documentation.
-    ///
     /// # Errors
     ///
     /// * Whatever `crate::util::fopen::open_for_write` returns, including
@@ -1577,7 +1180,21 @@ impl AltSvcInfo {
         }
 
         // `:370` -- `result = Curl_fopen(data, file, &out, &tempstore);`
-        let mut opened = open_for_write(target, rand_suffix)?;
+        //
+        // `StoreClass::Public`: an Alt-Svc entry is a hostname and port the
+        // server advertised in the clear, so there is nothing here to keep from
+        // a local reader and the C's mode cloning is kept exactly. Only the
+        // cookie jar is classified `Credential`.
+        //
+        // `NoFollow` carries the platform's `O_NOFOLLOW` from `crate::ffi`,
+        // injected because `crate::util` may not name that module; see the
+        // hardening section of `crate::util::fopen`.
+        let mut opened = open_for_write(
+            target,
+            StoreClass::Public,
+            NoFollow::new(O_NOFOLLOW | O_CLOEXEC),
+            rand_suffix,
+        )?;
 
         // `:371-384` -- the contents, then `:383-390`, the finish sequence.
         match self.write_to(opened.file_mut()) {
@@ -1591,23 +1208,6 @@ impl AltSvcInfo {
 
     /// Writes the whole cache to `out` -- the body of [`Self::save`], over any
     /// sink.
-    ///
-    /// `lib/altsvc.c:373-384`: the two comment lines, then every entry in list
-    /// order. A separate entry point because it is what makes the format
-    /// testable in memory, and because a caller that already holds an open
-    /// destination -- `lib/cookie.c`'s `stdout` path is the C's example of one
-    /// -- has no use for the temporary-file machinery.
-    ///
-    /// # A failed write is NOT reported
-    ///
-    /// WART, PRESERVED. The C checks neither `fputs` (`:375`) nor
-    /// `curl_mfprintf` (`:262`) nor `curlx_fclose` (`:383`), so a full disk
-    /// produces a truncated cache file and `CURLE_OK`. Every write here is
-    /// therefore discarded explicitly, and the ONLY error this function can
-    /// report is the one the C reports: a calendar conversion that fails.
-    /// Propagating I/O errors instead would change what ends up on disk --
-    /// [`Self::save`] would remove the temporary file rather than rename it --
-    /// and AAP 0.8.2 puts behaviour ahead of the improvement.
     ///
     /// # Errors
     ///
@@ -1631,29 +1231,7 @@ impl AltSvcInfo {
 
     /// Stores the alternatives of an incoming `Alt-Svc:` response header.
     ///
-    /// Supersedes `Curl_altsvc_parse` (`lib/altsvc.c:460-622`). `value` is the
-    /// header value -- everything to the right of the name -- and `srcalpn`,
-    /// `srchost` and `srcport` describe the origin that answered:
-    /// `lib/http.c:3218-3223` derives the protocol from the request's own
-    /// version and passes the connection's host and remote port.
-    ///
-    /// The C's contract is stated in its own comment and is honoured
-    /// literally: *"this function rejects invalid data without returning an
-    /// error. Invalid hostname, port number will result in the specific
-    /// alternative being rejected. Unknown protocols are skipped."*
-    ///
     /// # The grammar, and the two places it surprises
-    ///
-    /// `clear` is checked FIRST, against the header's first token up to `;`,
-    /// carriage return or line feed, case-insensitively. A match flushes this
-    /// origin's alternatives and parses nothing else.
-    ///
-    /// Otherwise each alternative is `<alpn>="<host>:<port>"` followed by
-    /// optional `;`-separated parameters, of which two are understood: `ma`
-    /// sets the maximum age, and `persist` sets the flag when its value is
-    /// exactly `1`. An omitted host means the origin's own, which is what
-    /// `h3=":8443"` says. Unknown parameters are parsed and ignored, and a
-    /// comma introduces the next alternative.
     ///
     /// The two surprises:
     ///
@@ -1859,28 +1437,6 @@ impl AltSvcInfo {
     }
 
     /// Reads the `;`-separated parameters of one alternative.
-    ///
-    /// `lib/altsvc.c:538-575`, the `for(;;)` whose every exit is a `break`.
-    /// Split out of [`Self::parse`] only for length; the cursor is threaded
-    /// through so the caller resumes exactly where the C's `p` would be.
-    ///
-    /// # The value is read through a POINTER, not a bounded span
-    ///
-    /// This is the one place a faithful port has to be careful, and getting it
-    /// wrong loses whole alternatives silently. The C takes the value with
-    /// `curlx_str_cspn(&p, &val, ",;")`, trims it, and then reads
-    /// `vp = curlx_str(&val)` -- a pointer INTO the header, not a bounded
-    /// view. `curlx_str_number(&vp, ...)` advances it, and `p = vp` at `:560`
-    /// puts the main cursor wherever the number ended, **with the rest of the
-    /// header still ahead of it**. A Rust port that handed `str_number` the
-    /// trimmed sub-slice would leave `p` truncated at the value's end, and
-    /// `ma=180, h3=":443"` would lose its second alternative -- which
-    /// `tests/unit/unit1654.c` counts. So the leading blanks the trim removed
-    /// are counted and the pointer is reconstructed from the ORIGINAL cursor.
-    ///
-    /// A digit run cannot escape the value in any case: the span stops at `,`
-    /// or `;`, and the byte after a trimmed span is a blank or one of those,
-    /// none of which is a digit.
     fn parse_params(
         &self,
         p: &mut &[u8],
@@ -1957,30 +1513,13 @@ impl AltSvcInfo {
 
     /// Finds a usable alternative for an origin, pruning expired entries.
     ///
-    /// Supersedes `Curl_altsvc_lookup` (`lib/altsvc.c:624-660`). `versions` is
-    /// a mask of [`CURLALTSVC_H1`], [`CURLALTSVC_H2`] and [`CURLALTSVC_H3`]
-    /// bits, which `lib/url.c:2964-2973` builds from the HTTP versions the
-    /// transfer will accept and then narrows with this cache's own
-    /// [`Self::flags`]. It is ANDed straight against a stored [`AlpnId`],
-    /// which is why that type's discriminants ARE those bits.
-    ///
-    /// The first match in list order wins, and the C returns at that point --
-    /// so entries after it are not examined and, critically, not pruned
-    /// either.
-    ///
-    /// # Why this takes `&mut self`
-    ///
-    /// It deletes expired entries as it scans (`:641-647`), so a lookup
-    /// MUTATES the cache. A shared cache must hold the write lock for it; see
-    /// the module header's table.
-    ///
     /// # This is the wire-parity path
     ///
     /// The answer decides which HTTP version the transfer negotiates and
     /// therefore which ALPN identifiers appear in the TLS ClientHello, and it
-    /// decides whether an `Alt-Used:` request header is emitted. AAP 0.6.7
-    /// compares each side of a fixture's `<protocol>` block as ONE joined
-    /// string, so a wrong answer here is a wrong byte on the wire.
+    /// decides whether an `Alt-Used:` request header is emitted. Each side of a
+    /// fixture's `<protocol>` block is compared as ONE joined string, so a wrong
+    /// answer here is a wrong byte on the wire.
     pub(crate) fn lookup(
         &mut self,
         srcalpn: AlpnId,
@@ -2027,14 +1566,6 @@ impl AltSvcInfo {
     }
 
     /// Removes every alternative cached for one source origin.
-    ///
-    /// Supersedes `altsvc_flush` (`lib/altsvc.c:414-429`). Called from
-    /// [`Self::parse`] for a `clear` keyword and before the first accepted
-    /// alternative of a header, because a fresh `Alt-Svc:` header REPLACES
-    /// what the origin said last time rather than adding to it.
-    ///
-    /// [`Vec::retain`] preserves the order of what survives, which is what the
-    /// C's node-by-node removal does and what the file format requires.
     pub(crate) fn flush(
         &mut self,
         srcalpn: AlpnId,
@@ -2059,9 +1590,7 @@ mod tests {
     use crate::util::parsedate::getdate_capped;
     use crate::util::timeval::TestClock;
 
-    // -----------------------------------------------------------------------
     // The oracle: `tests/data/test1654`, transcribed.
-    // -----------------------------------------------------------------------
 
     /// The instant `tests/data/test1654` pins, in seconds since the epoch.
     ///
@@ -2073,13 +1602,6 @@ mod tests {
     const UNIT1654_NOW: i64 = 1_548_369_261;
 
     /// The `<file>` block of `tests/data/test1654`, byte for byte.
-    ///
-    /// The harness writes this before the test runs, substituting a literal
-    /// tab for `%TAB`. Every one of its eight lines is load-bearing: two
-    /// entries load plainly, one is indented with spaces and one with a tab
-    /// (both accepted, because `str_passblanks` runs before the comment test),
-    /// two are comments (one indented), one names an ALPN that no longer
-    /// exists, and one is not a cache line at all.
     #[rustfmt::skip]
     const TEST1654_INPUT: &[u8] = concat!(
         "h2 example.com 443 h3 shiny.example.com 8443",
@@ -2143,10 +1665,8 @@ mod tests {
     )
     .as_bytes();
 
-    // -----------------------------------------------------------------------
     // Helpers. Every one of them works in memory, so the whole suite below
     // runs under Miri except where a test says otherwise.
-    // -----------------------------------------------------------------------
 
     /// A clock whose wall reading is `secs`.
     ///
@@ -2205,13 +1725,6 @@ mod tests {
     }
 
     /// The two stored hosts of a created entry, or [`None`] if it was refused.
-    ///
-    /// Every host assertion below goes through this so that Some-ness and the
-    /// value are one comparison. That is deliberate rather than stylistic: this
-    /// module holds itself to zero uses of the two unwrapping methods and the
-    /// panicking macros in its TESTS as well as in its code, exactly as its two
-    /// siblings in this directory do, so a mechanical scan of the whole file
-    /// comes back empty.
     fn hosts(entry: &Option<AltSvc>) -> Option<(&[u8], &[u8])> {
         entry
             .as_ref()
@@ -2227,9 +1740,7 @@ mod tests {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
-    // -----------------------------------------------------------------------
     // The public integers. Nothing here may drift.
-    // -----------------------------------------------------------------------
 
     /// The four flag bits are the literals of `include/curl/curl.h:1032-1035`.
     ///
@@ -2350,9 +1861,7 @@ mod tests {
         assert_eq!(AltSvcInfo::default().flags(), cache.flags());
     }
 
-    // -----------------------------------------------------------------------
     // Host normalisation -- the three asymmetries of `altsvc_createid`.
-    // -----------------------------------------------------------------------
 
     /// A trailing dot is stripped from the SOURCE host -- `:77-80`.
     ///
@@ -2531,24 +2040,10 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The on-disk format. THE headline contract of this module.
-    // -----------------------------------------------------------------------
 
     /// A cache file written by curl 8.19.0-DEV reads back and writes out
     /// IDENTICALLY.
-    ///
-    /// The input is the `<file>` block of `tests/data/test1654` and the
-    /// expectation is the first four data lines of that fixture's expected
-    /// output, both transcribed byte for byte. Between them they pin: the two
-    /// comment lines and the absence of anything after them; the field order,
-    /// the single spaces, the quoted stamp and the two trailing integers; the
-    /// acceptance of leading blanks and of a tab; the rejection of a comment,
-    /// of an unknown ALPN name and of a line that is not a cache line;
-    /// insertion order; and the date parser agreeing with the date formatter
-    /// well enough to reproduce all four stamps.
-    ///
-    /// If this test fails, a user's cache file has been corrupted.
     #[test]
     fn a_c_produced_cache_file_round_trips_byte_for_byte() {
         let cache = loaded(TEST1654_INPUT);
@@ -2649,23 +2144,6 @@ mod tests {
     }
 
     /// The whole bracketing decision, differentially verified against C.
-    ///
-    /// `curlx_inet_pton(AF_INET6, host, buf) == 1` at `lib/altsvc.c:246-253`
-    /// is the only thing that decides these two bytes, so its accept set is
-    /// part of the file format. Every row below was measured twice: once by
-    /// running the platform `inet_pton` -- which is what `curlx_inet_pton`
-    /// expands to whenever `HAVE_INET_PTON` is defined, and it is defined on
-    /// all four target platforms -- and once through [`push_host`].
-    ///
-    /// The last four rows are the ones worth reading. `b"::"` and `b"1::"` end
-    /// in a colon and ARE numeric; `b"::1:"` and `b"1:2:3:4:5:6:7:8:"` end in
-    /// a colon after a complete group and are NOT. That last shape is the only
-    /// one where the platform function and `crate::util::inet::pton6` disagree
-    /// -- 49,688 candidate strings were compared and all 45 divergences had
-    /// it -- so [`is_numeric_v6`] refuses it before consulting [`pton6`],
-    /// which is what makes this column the platform's answer rather than the
-    /// in-tree fallback's. [`push_host`]'s documentation carries the full
-    /// reasoning and the evidence.
     #[test]
     fn the_bracketing_decision_matches_the_c_address_parser() {
         let cases: [(&[u8], bool); 37] = [
@@ -2866,9 +2344,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The file reader -- what it accepts and, mostly, what it drops.
-    // -----------------------------------------------------------------------
 
     /// The one line every rejection case below is a mutation of.
     const GOOD_LINE: &[u8] =
@@ -2883,11 +2359,6 @@ mod tests {
 
     /// Blanks before a line are skipped, and a comment is still a comment after
     /// them -- `:216-218`.
-    ///
-    /// The two indented entries and the two comments are the third, fifth,
-    /// second and sixth lines of `tests/data/test1654`; the last row is the one
-    /// the fixture does not have -- a comment that would otherwise be a
-    /// perfectly good entry.
     #[test]
     fn leading_blanks_are_skipped_and_comments_are_dropped() {
         let cases: [(&[u8], usize); 6] = [
@@ -2909,12 +2380,6 @@ mod tests {
 
     /// Every one of these is dropped in silence -- the C's empty statement at
     /// `:164`.
-    ///
-    /// The table is the point of the test: each row is a single deviation from
-    /// [`GOOD_LINE`], with the number of entries it must produce, so a row that
-    /// changed answer would name the bound that had moved. Two rows expect ONE
-    /// entry, and both are measured rather than assumed -- see the comments on
-    /// them.
     #[test]
     fn a_malformed_line_is_dropped_without_a_word() {
         let cases: [(&[u8], usize, &str); 19] = [
@@ -3153,9 +2618,7 @@ mod tests {
         assert_eq!(getdate_capped_bytes(&[0xff, 0xfe]), None);
     }
 
-    // -----------------------------------------------------------------------
     // The `Alt-Svc:` header grammar.
-    // -----------------------------------------------------------------------
 
     /// Parses one header into `cache` at the instant `now`.
     fn parse_at(
@@ -3403,13 +2866,6 @@ mod tests {
     }
 
     /// A parameter NAME over twenty bytes ends the list -- `:539`.
-    ///
-    /// The bound counts every byte before the `=`, INCLUDING the blanks the C's
-    /// comment says it allows around the name. So a name of twenty bytes fits
-    /// only when nothing separates it from the semicolon, and one space in
-    /// front of it is enough to refuse it -- measured, which is why the
-    /// accepted row below has no space and why a third row asserts that adding
-    /// one refuses.
     #[test]
     fn a_parameter_name_over_twenty_bytes_ends_the_list() {
         // Twenty bytes exactly: read, unrecognised, ignored, and `ma` after it
@@ -3745,20 +3201,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // The relocated coverage of `tests/unit/unit1654.c` (AAP 0.8.7).
-    // -----------------------------------------------------------------------
-
     /// Every assertion of `tests/unit/unit1654.c`, in order, plus the file
     /// comparison the fixture makes afterwards.
-    ///
-    /// The C program cannot link against a Rust static library -- it calls
-    /// `Curl_altsvc_*`, which are `pub(crate)` here and genuinely absent from
-    /// the symbol table -- so AAP 0.8.7 relocates its coverage rather than
-    /// re-exporting internals to satisfy it. This is that relocation, and it is
-    /// stronger than the original in one respect: the C test only counts
-    /// entries after each step and leaves the file comparison to the harness,
-    /// while this asserts both here.
     ///
     /// The clock stands in for the `CURL_TIME=1548369261` the fixture exports
     /// and the `altsvc_debugtime` shim that reads it (`lib/altsvc.c:431-447`).
@@ -3891,9 +3335,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The bitmask, the accessors and emptying.
-    // -----------------------------------------------------------------------
 
     /// A zero bitmask is refused -- `:314-315`.
     #[test]
@@ -3935,9 +3377,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Lookup -- the wire-parity path.
-    // -----------------------------------------------------------------------
 
     /// Every version bit, for the tests that do not care which.
     const ALL_VERSIONS: i64 = CURLALTSVC_H1 | CURLALTSVC_H2 | CURLALTSVC_H3;
@@ -4180,19 +3620,10 @@ mod tests {
         assert_eq!(cache.len(), 1, "and nothing was pruned");
     }
 
-    // -----------------------------------------------------------------------
     // Saving. The three skip conditions need no filesystem; the rest do, and
     // say so.
-    // -----------------------------------------------------------------------
 
     /// A temporary-name generator that satisfies the injected contract.
-    ///
-    /// `crate::util::fopen::open_for_write` requires exactly
-    /// [`RAND_SUFFIX_LEN`] characters drawn from [`RAND_ALPHABET`]; this
-    /// supplies them deterministically so a test can compute the temporary path
-    /// in advance. The production caller passes `crate::crypto::rand`'s
-    /// generator instead, which is the whole point of the injection: this
-    /// module never reaches for randomness itself.
     fn fixed_suffix() -> CodeResult<String> {
         Ok(RAND_ALPHABET
             .iter()
@@ -4298,8 +3729,6 @@ mod tests {
         assert_eq!(names, vec!["altsvc-cache".to_string()]);
     }
 
-    /// A file that does not exist yet is created -- which is what makes
-    /// `--alt-svc <new file>` work.
     #[cfg(unix)]
     #[test]
     #[cfg_attr(miri, ignore = "Miri's isolation refuses the filesystem")]
@@ -4357,11 +3786,18 @@ mod tests {
             Err(CURLcode::OutOfMemory)
         );
 
-        // WART, PRESERVED: the target was TRUNCATED before the temporary file
-        // was ever named (`lib/curl_fopen.c:99`), so the original contents are
-        // already gone even though the save failed.
+        // The C TRUNCATES the target before the temporary file is ever named
+        // (`lib/curl_fopen.c:99`), so its original contents are gone even
+        // though the save failed. This assertion used to check for that data
+        // loss; `crate::util::fopen` no longer passes `O_TRUNC`, because
+        // truncating the final target is the destructive half of CWE-22, so the
+        // previous cache now survives a failed save.
         let written = std::fs::read(&path);
-        assert_eq!(written.map(|bytes| bytes.len()).ok(), Some(0));
+        assert_eq!(
+            written.ok().as_deref(),
+            Some(&b"replace me\n"[..]),
+            "a failed save leaves the previous cache file untouched"
+        );
     }
 
     /// A save whose CONTENTS fail removes the temporary and reports the code.
@@ -4459,31 +3895,9 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The `tests/data` corpus, replayed.
-    //
-    // Twelve fixtures reference Alt-Svc; ten of them are behavioural and are
-    // reproduced below, each against the expectation the fixture itself
-    // records. `tests/data/test1913` and `tests/data/test1914` are FTP tests
-    // whose only mention is the comment *"require Debug so that alt-svc can
-    // work over plain old HTTP"* -- they exercise nothing here.
-    //
-    // The seven fixtures that compare a saved file apply a `<stripfile>`
-    // substitution to the expiry first, because it is relative to the moment
-    // the test ran. That substitution is reproduced by [`strip_timestamp`]
-    // rather than approximated, so what is compared is what the harness
-    // compares. AAP 0.8.1: a mismatch here is a defect in this file, never a
-    // reason to edit a fixture.
-    // -----------------------------------------------------------------------
 
     /// The harness substitutions these fixtures use.
-    ///
-    /// `%HOSTIP` and the ports come from `tests/servers.pm`; the exact port
-    /// numbers are assigned at run time, so representative values are
-    /// substituted consistently on both sides of every comparison. `%HOST6IP`
-    /// is `"[::1]"` -- WITH brackets -- at `tests/servers.pm:136`, which is
-    /// what makes `tests/data/test438` a round trip through all three
-    /// bracket-handling paths.
     const HOSTIP: &[u8] = b"127.0.0.1";
     const HOST6IP: &[u8] = b"[::1]";
     const HTTPPORT: u16 = 8990;
@@ -4492,16 +3906,6 @@ mod tests {
     const HTTP6PORT: u16 = 8992;
 
     /// Applies a fixture's `<stripfile>` expiry substitution.
-    ///
-    /// `tests/data/test355`, `356`, `437` and `1908` use
-    /// `s/\"([^\"]*)\"/TIMESTAMP/`; `358`, `359` and `438` use
-    /// `s/\"2([^\"]*)\"/TIMESTAMP/`, which additionally requires the year to
-    /// begin with `2` -- an `ma=315360000` ten years out, so it does.
-    /// `year_starts_with_two` asserts that requirement rather than assuming
-    /// it, because a wrong expiry would otherwise be stripped away unnoticed.
-    ///
-    /// Written over bytes with `position`/`rposition` so that nothing here
-    /// indexes or slices.
     fn strip_timestamp(bytes: &[u8], year_starts_with_two: bool) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
         for line in bytes.split_inclusive(|&byte| byte == b'\n') {
@@ -4673,11 +4077,6 @@ mod tests {
 
     /// `tests/data/test412` -- *"alt-svc using hostname with trailing dot in
     /// URL"*.
-    ///
-    /// The URL names `whohoo.` and the cache file names `whohoo`, so the dot
-    /// is on the lookup key -- `hostcompare`'s first argument, the only one it
-    /// strips. The fixture proves the match happened by expecting an
-    /// `Alt-Used:` header naming the alternative.
     #[test]
     fn fixture_412_matches_a_trailing_dot_in_the_url() {
         let clock = clock_at(UNIT1654_NOW);
@@ -4760,11 +4159,6 @@ mod tests {
 
     /// `tests/data/test438` -- *"HTTPS IPv4 GET translated by alt-svc to IPv6
     /// address"*.
-    ///
-    /// The most complete fixture in the set: `%HOST6IP` is bracketed, so the
-    /// brackets are stripped on the FILE READ, stripped again on the HEADER
-    /// PARSE, and re-added on the FILE WRITE. All three paths are asserted
-    /// separately here, and the lookup between them is the redirect itself.
     #[test]
     fn fixture_438_round_trips_an_ipv6_alternative_through_all_three_paths() {
         let clock = clock_at(UNIT1654_NOW);
@@ -4828,11 +4222,6 @@ mod tests {
 
     /// `tests/data/test1908` -- *"alt-svc cache save after resetting the
     /// handle"*.
-    ///
-    /// Two details of the grammar: the parameters follow the quoted value with
-    /// a `;` and no comma, and `persist=1` is the trailing `1` of the saved
-    /// line. The source protocol is `h1` because `lib/http.c:3218` takes it
-    /// from the request's own version while the alternative advertises `h2`.
     ///
     /// The fixture's real subject -- that the file name survives
     /// `curl_easy_reset` -- is the reason [`AltSvcInfo::filename`] is stored

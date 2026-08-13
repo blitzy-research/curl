@@ -4,10 +4,9 @@
 
 //! The single diagnostic channel of the `curl-rs` command-line tool.
 //!
-//! This module supersedes two C translation units, `src/tool_msgs.c`
-//! (138 lines) and `src/tool_stderr.c` (70 lines): warning and error
-//! emission, carrying the mandatory `--insecure` stderr
-//! warning". It owns five things and nothing else:
+//! This module supersedes two C translation units, `src/tool_msgs.c` and
+//! `src/tool_stderr.c`: warning and error emission, carrying the mandatory
+//! `--insecure` stderr warning. It owns five things and nothing else:
 //!
 //! 1. The three message prefixes (`src/tool_msgs.c:30-32`).
 //! 2. The line-wrapping algorithm `voutf` (`src/tool_msgs.c:37-73`).
@@ -15,8 +14,7 @@
 //!    (`src/tool_msgs.c:79-137`, declared at `src/tool_msgs.h:30-33`).
 //! 4. The redirectable diagnostic sink behind `--stderr`
 //!    (`src/tool_stderr.c:29-69`).
-//! 5. The mandatory `--insecure` warning (AAP section 0.1.1 goal G4, section
-//!    0.8.1, and validation gate 10 of section 0.8.4). It is the one emitter
+//! 5. The mandatory `--insecure` warning. It is the one emitter
 //!    here with **no** gate on the message itself -- no flag combination
 //!    suppresses it, and [`warn_insecure`]'s signature, which admits no
 //!    [`MsgConfig`], is what enforces that rather than a convention.
@@ -149,10 +147,12 @@
 //! The doubled `Warning: ` on the first line is not a transcription mistake;
 //! see [`set_stderr_file`].
 
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fmt::{self, Write as FmtWrite};
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
+use std::rc::Rc;
 
 use crate::terminal::get_terminal_columns;
 
@@ -643,8 +643,8 @@ fn voutf_bytes_at_width(
 /// **not one contains a control byte other than the line feeds that separate its
 /// lines**, so escaping would be a no-op across the entire corpus even if a
 /// fixture's sink were a terminal -- which it is not, since the harness
-/// redirects. AAP section 0.6.7's oracle compares the bytes the client *sends*,
-/// and diagnostics are not part of that comparison. Gating on the destination
+/// redirects. The fixture corpus compares the bytes the client *sends*, and
+/// diagnostics are not part of that comparison. Gating on the destination
 /// therefore removes the last way this could have perturbed a comparison, and
 /// keeps the protection where it does something.
 ///
@@ -950,12 +950,11 @@ pub(crate) fn errorf_bytes(
 ///
 /// # Why it takes no [`MsgConfig`]: the warning is ungated
 ///
-/// This is a *protection* warning, not an ordinary one. AAP section 0.1.1 goal
-/// G4 requires that `--insecure` "must emit a stderr warning before
-/// proceeding", and AAP section 0.8.4 makes "TLS validation confirmed on by
-/// default" gate 10; a warning the user can switch off does not satisfy
-/// either, because the whole point is that the transfer must not proceed
-/// silently once verification is gone. Routing it through [`warnf`] would
+/// This is a *protection* warning, not an ordinary one. `--insecure` must emit
+/// a stderr warning before proceeding, and TLS validation being on by default
+/// is a validation gate in its own right; a warning the user can switch off
+/// does not satisfy either, because the whole point is that the transfer must
+/// not proceed silently once verification is gone. Routing it through [`warnf`] would
 /// inherit that entry point's `!silent` gate (`src/tool_msgs.c:95`) and
 /// `--insecure --silent` would emit nothing at all -- and `--show-error` does
 /// not restore [`warnf`], so nothing the user could add would bring it back.
@@ -990,9 +989,9 @@ pub(crate) fn errorf_bytes(
 ///   actually in force. It has no memory of previous calls, exactly as `warnf`
 ///   has none, so a caller that applies the configuration twice would warn
 ///   twice.
-/// * This function only warns. It never changes a default: AAP section 0.8.1
-///   freezes "default option values, including the default-on state of
-///   certificate verification".
+/// * This function only warns. It never changes a default: the default option
+///   values, the default-on state of certificate verification among them, are
+///   frozen.
 ///
 /// # Why it does not route through [`warnf`]
 ///
@@ -1004,11 +1003,11 @@ pub(crate) fn errorf_bytes(
 /// said so" reachable from the command line, which is exactly what the three
 /// AAP clauses above forbid.
 ///
-/// The requirement is unconditional in all three places it is stated. Goal G4
-/// says `--insecure` "must emit a stderr warning before proceeding"; AAP section
-/// 0.8.1 lists it among the frozen defaults; AAP section 0.8.4 makes it
-/// validation gate 10. None of the three is qualified by an output-verbosity
-/// flag, and `--silent` is about progress and body output rather than about
+/// The requirement is unconditional in every form it is stated: `--insecure`
+/// must emit a stderr warning before proceeding, the default-on state of
+/// verification is frozen, and confirming it is a validation gate. None of the
+/// three is qualified by an output-verbosity flag, and `--silent` is about
+/// progress and body output rather than about
 /// consent to a downgraded security posture. Routing through [`warnf`] would
 /// make `curl -s -k` disable certificate verification in complete silence, which
 /// is precisely the outcome the requirement exists to prevent -- and it would do
@@ -1016,8 +1015,8 @@ pub(crate) fn errorf_bytes(
 /// withheld.
 ///
 /// And there is no C behaviour to preserve here, which is what makes the
-/// departure faithful rather than wilful. AAP section 0.8.1's freeze binds
-/// the diagnostics curl 8.19.0-DEV actually emits, and this is not one of
+/// departure faithful rather than wilful. The freeze binds the diagnostics
+/// curl 8.19.0-DEV actually emits, and this is not one of
 /// them: `--insecure` carries no warning upstream at all. [`warnf`]'s
 /// `!silent` gate is faithful to `src/tool_msgs.c:95` for the warnings C
 /// does have; reproducing that gate on a message C does not have would be
@@ -1040,8 +1039,8 @@ pub(crate) fn errorf_bytes(
 /// There is no parameter through which any caller -- present or future -- could
 /// ask for silence, so suppression is not merely unimplemented, it is
 /// unrepresentable. A gate that does not exist cannot be reintroduced by
-/// accident, which is what makes gate 10 of AAP section 0.8.4 hold by
-/// construction instead of by review.
+/// accident, which is what makes the TLS-validation gate hold by construction
+/// instead of by review.
 ///
 /// # The destination is the sink, and only the sink
 ///
@@ -1053,8 +1052,8 @@ pub(crate) fn errorf_bytes(
 /// # No fixture encodes the absence of this warning
 ///
 /// No fixture is affected: `--insecure` has no warning in curl 8.19.0-DEV at
-/// all, so no expectation encodes its absence, and AAP section 0.6.7's oracle
-/// compares the bytes the client *sends* rather than its diagnostics.
+/// all, so no expectation encodes its absence, and the corpus compares the
+/// bytes the client *sends* rather than its diagnostics.
 pub(crate) fn warn_insecure(sink: &mut dyn DiagnosticSink, option: &str) {
     // No gate, by design -- see "Why it does not route through `warnf`" above.
     // The prefix, the wrapping and the `MSG_TEXT_CAPACITY` truncation are
@@ -1102,23 +1101,157 @@ pub(crate) fn warn_insecure(sink: &mut dyn DiagnosticSink, option: &str) {
 /// `my_setopt_long` runs, and verification stays on.
 pub(crate) fn warn_insecure_flags(
     sink: &mut dyn DiagnosticSink,
-    insecure: bool,
-    doh_insecure: bool,
-    proxy_insecure: bool,
+    requested: &dyn InsecureRequest,
 ) {
     // `src/config2setopts.c:379` -- `if(config->insecure_ok)`.
-    if insecure {
+    if requested.insecure() {
         warn_insecure(sink, "insecure");
     }
 
     // `src/config2setopts.c:385` -- `if(config->doh_insecure_ok)`.
-    if doh_insecure {
+    if requested.doh_insecure() {
         warn_insecure(sink, "doh-insecure");
     }
 
     // `src/config2setopts.c:390` -- `if(config->proxy_insecure_ok)`.
-    if proxy_insecure {
+    if requested.proxy_insecure() {
         warn_insecure(sink, "proxy-insecure");
+    }
+}
+
+/// What the user asked for, as the three bits `src/config2setopts.c:378-393`
+/// reads off the configuration.
+///
+/// # Why this is a trait and not three `bool` parameters
+///
+/// [`warn_insecure_flags`] took three `bool`s, and the driver called it
+/// `warn_insecure_flags(sink, false, false, false)`. That compiles forever. It
+/// keeps compiling after an option parser lands, after `--insecure` starts
+/// being honoured, and after certificate verification starts being switched
+/// off -- reporting, in every one of those futures, that nothing insecure was
+/// requested. The literals were not wrong by accident; the signature made them
+/// impossible to get right, because nothing tied the three arguments to the
+/// configuration they were supposed to describe.
+///
+/// A trait fixes that at the type level. The three bits can now only arrive
+/// from something that *has* them, and the thing that has them is
+/// `crate::config::OperationConfig`, which is where
+/// `src/tool_cfgable.h:258-261` puts them. There is no spelling of
+/// [`warn_insecure_flags`] that passes a literal.
+///
+/// The one legitimate exception is a caller that genuinely has no
+/// configuration, and it has to say so by name: see [`NoInsecureRequest`].
+///
+/// # What this trait does NOT do, and where the rest belongs
+///
+/// It carries the three bits to the *warning*. It does not apply them to the
+/// TLS verifier, and it cannot: `src/config2setopts.c:378-393` is the C that
+/// switches verification off, AAP section 0.4.1 maps that file onto
+/// `crate::config::to_setopts`, and **that module is not written**. The engine
+/// side of the same wiring does exist -- `curl_rs_lib`'s `tls::verify` carries a
+/// `VerifyPolicy` whose `with_peer_verification(false)` and
+/// `with_host_verification(false)` are exactly what `CURLOPT_SSL_VERIFYPEER`
+/// and `CURLOPT_SSL_VERIFYHOST` select -- but it is `pub(crate)` to that crate,
+/// so nothing here can name it. The route is
+/// `OperationConfig` -> `to_setopts` -> `curl_easy_setopt` -> `VerifyPolicy`,
+/// and only the first arrow is in place.
+///
+/// This is recorded here rather than left implicit because the warning and the
+/// verifier are two halves of one requirement (AAP section 0.1.1 goal G4): a
+/// build that warns and still verifies is safe, and a build that verifies and
+/// does not warn is not -- so the warning half landing first is the right order,
+/// but somebody has to know the other half is outstanding.
+///
+/// # Why a trait rather than a struct built from the configuration
+///
+/// `crate::config` already imports this module (`config/mod.rs:158`), so a
+/// struct defined here and populated there would be fine, but a struct
+/// defined *there* and named here would be a cycle. The trait keeps the
+/// dependency pointing the way it already points: this module declares the
+/// question, and the module that owns the answer implements it.
+pub(crate) trait InsecureRequest {
+    /// `config->insecure_ok` -- `--insecure`, `CURLOPT_SSL_VERIFYPEER` off.
+    fn insecure(&self) -> bool;
+
+    /// `config->doh_insecure_ok` -- `--doh-insecure`.
+    fn doh_insecure(&self) -> bool;
+
+    /// `config->proxy_insecure_ok` -- `--proxy-insecure`.
+    fn proxy_insecure(&self) -> bool;
+}
+
+/// The three parsed bits, reduced over a whole `--next` chain.
+///
+/// `crate::main`'s driver has no single [`crate::config::OperationConfig`] to
+/// hand over: `src/tool_cfgable.h:258-261` keeps the three bits per operation
+/// and C reads them at each emission site, so a command line carrying
+/// `--insecure --next` has more than one operation to answer for. The driver
+/// therefore reduces the chain and passes the result, named, through this type.
+///
+/// Named rather than passed as three booleans for the reason
+/// [`InsecureRequest`] exists at all: a positional triple compiles whatever
+/// order it is written in, and a mandatory security warning must not be one
+/// transposition away from silence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RequestedInsecurely {
+    /// `config->insecure_ok` for any operation on the command line.
+    pub(crate) insecure: bool,
+    /// `config->doh_insecure_ok` for any operation on the command line.
+    pub(crate) doh_insecure: bool,
+    /// `config->proxy_insecure_ok` for any operation on the command line.
+    pub(crate) proxy_insecure: bool,
+}
+
+impl InsecureRequest for RequestedInsecurely {
+    fn insecure(&self) -> bool {
+        self.insecure
+    }
+
+    fn doh_insecure(&self) -> bool {
+        self.doh_insecure
+    }
+
+    fn proxy_insecure(&self) -> bool {
+        self.proxy_insecure
+    }
+}
+
+/// A caller with no configuration at all: nothing was requested because
+/// nothing could be.
+///
+/// **Legitimate in exactly one circumstance**, and it is not "I do not have a
+/// configuration handy": it is that no configuration *exists* on this path
+/// because no option can have been accepted.
+///
+/// No production caller is in that position any more --
+/// [`RequestedInsecurely`] carries the parsed bits from the driver -- so this
+/// type is retained as the named token the review asks for rather than as a
+/// live admission, and the warning's all-bits-clear behaviour is asserted
+/// through it.
+///
+/// Named, and named awkwardly, on purpose. `grep NoInsecureRequest` finds every
+/// place the warning is being told there is nothing to warn about, which is the
+/// review that three anonymous `false`s could not receive. The moment a
+/// configuration reaches that path, this type is what has to be deleted from
+/// the call, and a reader looking for what to change will find it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)] // retained as the named token; exercised by this module's tests
+pub(crate) struct NoInsecureRequest;
+
+impl InsecureRequest for NoInsecureRequest {
+    /// No option was accepted, so `--insecure` was not.
+    fn insecure(&self) -> bool {
+        false
+    }
+
+    /// Likewise `--doh-insecure`.
+    fn doh_insecure(&self) -> bool {
+        false
+    }
+
+    /// Likewise `--proxy-insecure`.
+    fn proxy_insecure(&self) -> bool {
+        false
     }
 }
 
@@ -1126,7 +1259,6 @@ pub(crate) fn warn_insecure_flags(
 
 /// The argument `--stderr -` uses to mean "standard output"
 /// (`src/tool_stderr.c:44`).
-#[allow(dead_code)]
 const STDERR_STDOUT_ARG: &str = "-";
 
 /// `tool_set_stderr_file` (`src/tool_stderr.c:37-69`): points the diagnostic
@@ -1169,7 +1301,6 @@ const STDERR_STDOUT_ARG: &str = "-";
 /// The filename is appended as raw bytes through [`warnf_bytes`] because C
 /// prints it with `%s` from a `char *`; a lossy conversion would change the
 /// emitted bytes for a path that is not valid UTF-8.
-#[allow(dead_code)]
 pub(crate) fn set_stderr_file(
     sink: &mut MessageSink,
     config: &MsgConfig,
@@ -1201,9 +1332,195 @@ pub(crate) fn set_stderr_file(
     }
 }
 
+/// One [`MessageSink`] reachable from two owners at once.
+///
+/// # The problem this solves, exactly
+///
+/// C keeps the diagnostic channel in a file-scope `FILE *tool_stderr`
+/// (`src/tool_stderr.c:29`), so `tool_set_stderr_file` at `:37` can replace it
+/// from anywhere -- and it is called from *inside* the option parser
+/// (`src/tool_getparam.c:2312`), which means every diagnostic the parser emits
+/// after `--stderr <file>` lands in that file.
+///
+/// This workspace has no such global: the sink is a value that `main` owns and
+/// threads down by reference. `crate::cli::args::parse_args` therefore holds
+/// `&mut dyn DiagnosticSink` for emitting *and* `&mut H` for the injected
+/// capabilities, and `set_stderr_file` above needs the **concrete**
+/// `MessageSink` because it replaces the value rather than writing to it. Two
+/// simultaneous `&mut` to one value is exactly what the borrow checker forbids,
+/// so one of the two references has to be a shared handle. This is that
+/// handle.
+///
+/// Both owners hold a clone of the same [`Rc`]: the sink the parser writes
+/// through, and the parse host that performs the redirection. A redirect is
+/// therefore visible to the next diagnostic, as it is in C, rather than only
+/// after the parser returns.
+///
+/// # Why `Rc` and not `Arc`
+///
+/// AAP section 0.8.3 prescribes a **current-thread** Tokio runtime for the
+/// command-line tool, so nothing in this crate moves the sink across a thread
+/// and the atomic reference count would be paid for nothing. The multi-thread
+/// runtime the same section prescribes is the *engine's*, behind
+/// `curl-rs-lib`'s own `Send + Sync` bounds; it never sees this type.
+///
+/// # Why no method here can panic
+///
+/// [`RefCell`] panics on overlapping borrows, and a panic on the diagnostic
+/// path would replace a message with a Rust backtrace and exit status 101 --
+/// something no fixture expects. Every access below therefore uses the
+/// `try_` form:
+///
+/// * [`Write::write`] and friends map an unavailable borrow to an
+///   [`io::Error`], which every emitter in this module already discards for
+///   the reason `src/tool_msgs.c:62` gives -- a write failure on the
+///   diagnostic channel cannot be reported through the diagnostic channel.
+/// * [`DiagnosticSink::interprets_controls`] falls back to `false`, which is
+///   the safe-for-parity answer this module's trait documentation already
+///   argues for: the cost of wrongly escaping is a corrupted byte-frozen
+///   file, the cost of wrongly not escaping is a control byte reaching
+///   something that was never going to interpret it.
+/// * [`SinkHandle::redirect`] and [`SinkHandle::flush_now`] do nothing at all
+///   when the borrow is unavailable.
+///
+/// An overlapping borrow is in fact unreachable: no [`DiagnosticSink`] method
+/// calls back into a parse host, so the cell is never borrowed at the moment
+/// `redirect` runs. The `try_` forms make that a property of the code rather
+/// than of the argument.
+#[derive(Clone, Debug)]
+pub(crate) struct SinkHandle {
+    inner: Rc<RefCell<MessageSink>>,
+}
+
+impl SinkHandle {
+    /// The initial state, `tool_init_stderr()` (`src/tool_stderr.c:31-35`).
+    ///
+    /// `src/tool_main.c:148` calls that before anything that can fail, so this
+    /// is the first thing `main` builds.
+    pub(crate) fn init() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(MessageSink::init())),
+        }
+    }
+
+    /// A second owner of the same sink.
+    ///
+    /// Named `handle` rather than left to [`Clone`] so that a call site reads
+    /// as "share this channel" instead of as "copy this value": the whole
+    /// point is that there is exactly one `MessageSink` behind every handle.
+    pub(crate) fn handle(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
+
+    /// `tool_set_stderr_file(filename)` (`src/tool_getparam.c:2312`), applied
+    /// through the shared cell.
+    ///
+    /// The four branches, the doubled `Warning: Warning: ` prefix on failure
+    /// and the `-` special case all belong to [`set_stderr_file`]; this only
+    /// supplies it the concrete value it needs.
+    pub(crate) fn redirect(
+        &self,
+        config: &MsgConfig,
+        filename: Option<&OsStr>,
+    ) {
+        if let Ok(mut sink) = self.inner.try_borrow_mut() {
+            set_stderr_file(&mut sink, config, filename);
+        }
+    }
+
+    /// Flushes the underlying sink, reporting whether it was reachable.
+    ///
+    /// `main` calls this before returning its [`std::process::ExitCode`],
+    /// because a buffered diagnostic that is dropped instead of written is a
+    /// silent change to the emitted bytes.
+    pub(crate) fn flush_now(&self) -> io::Result<()> {
+        match self.inner.try_borrow_mut() {
+            Ok(mut sink) => sink.flush(),
+            Err(_) => Err(io::Error::other("diagnostic sink is in use")),
+        }
+    }
+}
+
+impl Write for SinkHandle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner.try_borrow_mut() {
+            Ok(mut sink) => sink.write(buf),
+            Err(_) => Err(io::Error::other("diagnostic sink is in use")),
+        }
+    }
+
+    /// Delegated for the same reason [`MessageSink`] delegates it: so that the
+    /// standard streams keep their own whole-buffer locking, matching the
+    /// single `fwrite` and `fputs` calls in C.
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self.inner.try_borrow_mut() {
+            Ok(mut sink) => sink.write_all(buf),
+            Err(_) => Err(io::Error::other("diagnostic sink is in use")),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_now()
+    }
+}
+
+impl DiagnosticSink for SinkHandle {
+    fn interprets_controls(&self) -> bool {
+        match self.inner.try_borrow() {
+            Ok(sink) => sink.interprets_controls(),
+            // The safe-for-parity default; see this type's documentation.
+            Err(_) => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for a configuration, so these tests can drive
+    /// [`warn_insecure_flags`] over every combination of the three bits.
+    ///
+    /// The production implementor is `crate::config::OperationConfig`, which
+    /// this module cannot name -- `config` imports `msgs`, not the other way
+    /// round -- so the end-to-end assertion that a parsed `--insecure` reaches
+    /// this door lives in `config/mod.rs` instead. What is tested here is the
+    /// door's own behaviour: which names it emits, and in what order.
+    #[derive(Clone, Copy, Debug)]
+    struct Requested {
+        insecure: bool,
+        doh_insecure: bool,
+        proxy_insecure: bool,
+    }
+
+    impl InsecureRequest for Requested {
+        fn insecure(&self) -> bool {
+            self.insecure
+        }
+
+        fn doh_insecure(&self) -> bool {
+            self.doh_insecure
+        }
+
+        fn proxy_insecure(&self) -> bool {
+            self.proxy_insecure
+        }
+    }
+
+    /// The three bits, in `src/config2setopts.c`'s own order.
+    const fn requested(
+        insecure: bool,
+        doh_insecure: bool,
+        proxy_insecure: bool,
+    ) -> Requested {
+        Requested {
+            insecure,
+            doh_insecure,
+            proxy_insecure,
+        }
+    }
 
     /// The width `COLUMNS=40` produces, used for most golden cases:
     /// `40 - 9 == 31` bytes of message per wrapped line.
@@ -1643,8 +1960,8 @@ mod tests {
         );
 
         // And the destination rule: a redirected sink keeps the ESC, because
-        // nothing there will act on it and AAP section 0.8.1 does not permit
-        // altering bytes C wrote through. The protection is where it protects,
+        // nothing there will act on it and altering bytes C wrote through is
+        // not permitted. The protection is where it protects,
         // and absent where it would only corrupt.
         let mut redirected: Vec<u8> = Vec::new();
         let outcome = voutf_bytes_at_width(
@@ -1668,7 +1985,7 @@ mod tests {
         // A path or a header value that is UTF-8, or Latin-1, or arbitrary
         // bytes: none of it is a terminal control, so none of it is touched.
         // Escaping it would change the bytes the oracle emits for a filename
-        // that is merely non-ASCII, which AAP section 0.8.1 does not permit.
+        // that is merely non-ASCII, which the freeze does not permit.
         let mut out: Vec<u8> = Vec::new();
         let message: &[u8] = &[0xc3, 0xa9, 0xff, 0x80, b'x'];
         let outcome =
@@ -1926,8 +2243,8 @@ mod tests {
 
     /// The three flags that switch certificate verification off
     /// (`src/config2setopts.c:379-392`). Every test below iterates all three:
-    /// AAP section 0.1.1 goal G4 does not distinguish between them, so a
-    /// property proven for one of them is not proven for the other two.
+    /// The requirement does not distinguish between them, so a property proven
+    /// for one of them is not proven for the other two.
     const VERIFICATION_FLAGS: [&str; 3] =
         ["insecure", "proxy-insecure", "doh-insecure"];
 
@@ -1989,8 +2306,7 @@ mod tests {
 
     #[test]
     fn the_insecure_warning_is_mandatory_and_takes_no_gate_argument() {
-        // AAP 0.1.1 goal G4, 0.8.1 and validation gate 10 of 0.8.4 all require
-        // the warning to be emitted whenever verification is switched off.
+        // The warning must be emitted whenever verification is switched off.
         // `warn_insecure` therefore accepts no `MsgConfig`: there is no
         // argument through which silence could be requested, so this test
         // asserts an invariant the signature already enforces -- it would not
@@ -2022,9 +2338,9 @@ mod tests {
 
     #[test]
     fn insecure_warning_cannot_be_suppressed_by_any_gate_combination() {
-        // AAP section 0.1.1 goal G4 requires the warning unconditionally, and
-        // AAP section 0.8.4 makes it validation gate 10. This is the assertion
-        // that the requirement is met: all three flags against all four gate
+        // The warning is required unconditionally, and
+        // Confirming it is a validation gate. This is the assertion that the
+        // requirement is met: all three flags against all four gate
         // combinations, twelve cases, every one of which must emit the exact
         // bytes.
         //
@@ -2081,8 +2397,8 @@ mod tests {
     fn the_insecure_warning_survives_every_suppression_flag() {
         // The teeth for F18, and the reason this function takes no MsgConfig:
         // `curl -s -k` must not disable certificate verification silently. The
-        // mandate in goal G4, AAP section 0.8.1 and validation gate 10 is
-        // unconditional, so there is no flag combination that withholds it.
+        // mandate is unconditional, so there is no flag combination that
+        // withholds it.
         //
         // The signature is the enforcement -- there is no config to consult --
         // and this asserts the consequence for every combination of the three
@@ -2123,7 +2439,7 @@ mod tests {
 
     #[test]
     fn insecure_warning_cannot_be_silenced() {
-        // AAP section 0.1.1 goal G4 requires a warning *before proceeding*,
+        // A warning is required *before proceeding*,
         // and section 0.8.4 makes it gate 10. A warning `--silent` removes
         // would satisfy neither, so the emitter accepts no gate set at all:
         // the four states MsgConfig can express are unreachable from here,
@@ -2169,7 +2485,7 @@ mod tests {
         // `proxy_insecure_ok` :390. Two flags together produce two lines whose
         // sequence is program output, so the order is asserted, not assumed.
         let mut all: Vec<u8> = Vec::new();
-        warn_insecure_flags(&mut all, true, true, true);
+        warn_insecure_flags(&mut all, &requested(true, true, true));
         assert_eq!(
             String::from_utf8_lossy(&all),
             "Warning: using --insecure makes the transfer insecure\n\
@@ -2180,7 +2496,7 @@ mod tests {
         // doh precedes proxy -- the pair that would reverse under an
         // alphabetical or declaration-order reading.
         let mut pair: Vec<u8> = Vec::new();
-        warn_insecure_flags(&mut pair, false, true, true);
+        warn_insecure_flags(&mut pair, &requested(false, true, true));
         assert_eq!(
             String::from_utf8_lossy(&pair),
             "Warning: using --doh-insecure makes the transfer insecure\n\
@@ -2193,7 +2509,7 @@ mod tests {
             .enumerate()
         {
             let mut one: Vec<u8> = Vec::new();
-            warn_insecure_flags(&mut one, i == 0, i == 1, i == 2);
+            warn_insecure_flags(&mut one, &requested(i == 0, i == 1, i == 2));
             assert_eq!(
                 String::from_utf8_lossy(&one),
                 format!(
@@ -2205,7 +2521,7 @@ mod tests {
         // All three clear: the three `if` statements are not taken and C emits
         // nothing, so neither does this.
         let mut none: Vec<u8> = Vec::new();
-        warn_insecure_flags(&mut none, false, false, false);
+        warn_insecure_flags(&mut none, &NoInsecureRequest);
         assert!(none.is_empty());
     }
 
@@ -2218,7 +2534,7 @@ mod tests {
         // bytes and asserting the full expected content proves nothing was
         // split off elsewhere, and `warn_insecure` reaches no global stream.
         let mut redirected: Vec<u8> = Vec::new();
-        warn_insecure_flags(&mut redirected, true, false, true);
+        warn_insecure_flags(&mut redirected, &requested(true, false, true));
         assert_eq!(
             String::from_utf8_lossy(&redirected),
             "Warning: using --insecure makes the transfer insecure\n\

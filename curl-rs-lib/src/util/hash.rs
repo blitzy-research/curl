@@ -22,8 +22,7 @@
 //
 //***************************************************************************
 
-//! The string-keyed hash table -- supersedes `lib/hash.c` (388 lines) and
-//! `lib/hash.h` (105 lines).
+//! The string-keyed hash table -- supersedes `lib/hash.c` and `lib/hash.h`.
 //!
 //! The C original is a chained hash table with a fixed bucket count, an
 //! inline flexible-array key and four function pointers. Rust ships
@@ -39,142 +38,8 @@
 //! free functions are kept because the header exports them and a consumer
 //! may want the raw hash value rather than a bucket index.
 //!
-//! Measured consumers of the C API, from
-//! `grep -rl 'Curl_hash_init\|Curl_hash_add\|Curl_hash_pick' lib/`:
-//! `multi.c`, `url.c`, `conncache.c`, `multi_ev.c`, `hostip.c`, `easy.c`,
-//! four TLS backends (`vtls/gtls.c`, `openssl.c`, `schannel.c`,
-//! `wolfssl.c`), and the two god-struct headers `urldata.h` and
-//! `multihandle.h`. It backs the DNS cache, the connection cache, the multi
-//! handle's socket-to-transfer map and the TLS session cache.
-//!
-//! # `Curl_hash_str`, and the two details that make it non-canonical
-//!
-//! The C body, `lib/hash.c:326-339`, is five lines:
-//!
-//! ```text
-//! size_t h = 5381;
-//! while(key_str < end) {
-//!   size_t j = (size_t)*key_str++;
-//!   h += h << 5;
-//!   h ^= j;
-//! }
-//! return (h % slots_num);
-//! ```
-//!
-//! 1. `h += h << 5` is `h * 33` written as an add-and-shift. Canonical djb2
-//!    writes `h * 33 + c`, folding the byte in with the multiply.
-//! 2. `h ^= j` is **XOR, not addition**. Canonical djb2 ADDS the byte; the
-//!    XOR form is usually called djb2a. curl uses the XOR form. This is the
-//!    single likeliest transcription slip, and it is asserted directly by
-//!    `the_byte_is_xored_not_added`.
-//!
-//! Two further properties are not visible in the five lines but change the
-//! result, and both are reproduced deliberately:
-//!
-//! * **The arithmetic wraps.** `h += h << 5` overflows a 64-bit `size_t`
-//!   within a handful of bytes, and C unsigned arithmetic is defined to
-//!   wrap. Rust's `+` PANICS on overflow in a debug build, so the add is
-//!   written [`usize::wrapping_add`]. The shift needs no such treatment:
-//!   Rust only checks the shift AMOUNT, and bits shifted off the top are
-//!   discarded silently exactly as in C.
-//! * **The byte sign-extends.** `key_str` is `const char *`, and `char` is
-//!   SIGNED on all four mandated targets (x86_64 and aarch64, Linux and
-//!   macOS). So `(size_t)*key_str` on a byte >= 0x80 first becomes a
-//!   negative `char`, then sign-extends to a huge `size_t`, and it is that
-//!   huge value which is XORed in. Reading the byte as `u8` would produce a
-//!   different hash for every non-ASCII key. Measured against a compiled
-//!   transcription of the C: a one-byte key `[0x80]` hashes to
-//!   `0xfffffffffffd4a25`, where a `u8` read gives `177445`.
-//!
-//! The hash value is not externally observable -- it only selects a bucket,
-//! and lookup decides membership with the comparator -- so a `u8` read
-//! would have been *functionally* correct. The sign extension is reproduced
-//! anyway so that a future reader diffing this module against `lib/hash.c`
-//! finds no discrepancy to investigate. `sign_extension_is_reproduced`
-//! pins it.
-//!
-//! `% slots_num` folds the hash into a bucket index. Delegating to
-//! `HashMap` removes the modulo, so the primary form [`hash_str`] returns
-//! the UNFOLDED hash and [`hash_str_slot`] applies the fold for a caller
-//! that genuinely wants a bucket index.
-//!
-//! # `curlx_str_key_compare`
-//!
-//! `lib/hash.c:341-348` is `(key1_len == key2_len) && !memcmp(...)`. Two
-//! things about it trip readers, and both are preserved by
-//! [`str_key_compare`]:
-//!
-//! * It returns **1 on MATCH** -- the inverse of the `memcmp` convention a
-//!   reader may assume, and the reason the Rust successor returns a `bool`
-//!   whose `true` means equal.
-//! * It is **case-SENSITIVE**, an exact-length byte comparison. It is NOT
-//!   curl's case-insensitive folding and must not be routed through
-//!   `crate::util::strcase`. Callers wanting case-insensitive keys
-//!   normalise before inserting; the DNS cache lowercases hostnames at the
-//!   call site.
-//!
-//! In Rust the whole function collapses into `PartialEq` on the key type:
-//! `&[u8] == &[u8]` compares length first and then bytes, which is exactly
-//! the C predicate. The thin wrapper is kept only so the C name has a
-//! landing site.
-//!
-//! # What vanishes
-//!
-//! Everything below is in `lib/hash.h:29-76` and has NO successor. It is
-//! listed rather than summarised because each item is an invariant somebody
-//! would otherwise look for.
-//!
-//! * **Four function pointers** -- `hash_function`, `comp_function`,
-//!   `Curl_hash_dtor` and `Curl_hash_elem_dtor`. See the note on the two
-//!   destructor levels below, and on where the other two went.
-//! * **`struct Curl_hash_element::next`** -- the chaining link. `HashMap`
-//!   owns its own collision strategy.
-//! * **`char key[1]`** -- a flexible array member, allocated as
-//!   `curlx_malloc(sizeof(struct Curl_hash_element) + key_len)` and filled
-//!   by `memcpy` (`lib/hash.c:100-118`). `Vec<u8>` as the key type replaces
-//!   it and removes the size arithmetic, and with it the overflow question
-//!   that arithmetic raises.
-//! * **`slots` and `size` bookkeeping** -- `size` becomes `HashMap::len`.
-//!   `slots` is discussed under "The bucket count" below.
-//! * **The `init` sentinel** -- `#define HASHINIT 0x7017e781`
-//!   (`lib/hash.c:30`) is stamped into `h->init` by `Curl_hash_init` and
-//!   re-checked by nine `DEBUGASSERT`s, so that calling any entry point on
-//!   an uninitialised or already-destroyed table is caught in a debug
-//!   build. The sibling `ITERINIT 0x5FEDCBA9` (`lib/hash.c:31`) does the
-//!   same for the iterator. Both are gone because the condition they detect
-//!   cannot arise: a `StrHash` cannot be observed before `new` returns it
-//!   or after `Drop` runs. The values are quoted here so that a search for
-//!   either sentinel lands on this explanation.
-//! * **`struct Curl_hash_iterator`** -- replaced by [`StrHash::iter`], and
-//!   the borrow checker then ENFORCES what the C could only hope for. The
-//!   C's `cpool_foreach` (`lib/conncache.c:512-544`) carries the comment
-//!   "we need to update curr before calling func(), because func() might
-//!   decide to remove the connection"; in Rust an iterator borrows the map
-//!   immutably, so removing during iteration does not compile.
-//! * **`Curl_hash_print`** -- declared at `lib/hash.h:103` but its
-//!   DEFINITION sits inside `#if 0` (`lib/hash.c:34-69`), so it has never
-//!   been compiled, and its only appearance in a consumer is inside a
-//!   comment at `lib/multi.c:538`. It is therefore not ported. The
-//!   `fmt::Debug` implementation on [`StrHash`] stands in for it, rendering
-//!   keys with `String::from_utf8_lossy` to mirror the C's `%.*s`.
-//!
-//! ## Where the hash and comparator function pointers went
-//!
-//! They were not vestigial: the C really did have two implementations of
-//! the pair, and knowing which is which is what makes removing them safe.
-//! Of the seven `Curl_hash_init` call sites, six pass `Curl_hash_str` with
-//! `curlx_str_key_compare` -- `multi.c:250`, `url.c:498`, `url.c:3280`,
-//! `easy.c:970`, `conncache.c:118` and `hostip.c:1270`. The seventh,
-//! `multi_ev.c:622`, passes `mev_sh_entry_hash`, which is
-//! `fd % slots_num` over a `curl_socket_t` (`multi_ev.c:58-63`), with a
-//! matching comparator.
-//!
-//! So the runtime pointer existed to serve exactly one alternative: an
-//! integer-keyed table. In Rust that consumer takes a DIFFERENT map type
-//! keyed by the socket -- `crate::util::uint_hash` is the module the
-//! transformation map assigns it -- rather than handing a function pointer
-//! to a byte-keyed one. This module is byte-keyed and does not need to be
-//! told how to hash.
+//! It backs the DNS cache, the connection cache, the multi handle's
+//! socket-to-transfer map and the TLS session cache.
 //!
 //! ## The bucket count has no successor
 //!
@@ -187,159 +52,6 @@
 //! This is a deliberate CHANGE, and it is safe because the bucket count is
 //! not observable: it affects only which bucket a key lands in, and no C
 //! caller can see that. **No fixed-bucket chained table is rebuilt here.**
-//!
-//! [`StrHash::with_slots`] exists nonetheless, because two of the six
-//! string-keyed call sites pass a count computed at runtime rather than a
-//! literal -- `Curl_cpool_init`'s `size` parameter (`conncache.c:114-118`)
-//! and `Curl_dnscache_init`'s `size` parameter (`hostip.c:1268-1271`). It
-//! forwards to `HashMap::with_capacity`, which is a pre-allocation HINT and
-//! not a cap, so it changes allocation timing and nothing else. The other
-//! four sites pass a literal 23 and can simply call [`StrHash::new`].
-//!
-//! ## Two destructor levels collapse into `Drop`
-//!
-//! The C has a table-wide `Curl_hash_dtor` taking `(void *ptr)` and a
-//! per-element `Curl_hash_elem_dtor` taking `(void *key, size_t key_len,
-//! void *ptr)`, installed by `Curl_hash_add2`. `hash_elem_clear_ptr`
-//! (`lib/hash.c:120-132`) prefers the per-element one when present, which
-//! is what `lib/hash.h:60` means by "General element construct, unless
-//! element itself carries one". Both become `Drop` on the value type, so
-//! there is no `add2` here and no destructor argument anywhere.
-//!
-//! One capability is genuinely lost and must be recorded rather than
-//! glossed: **the per-element destructor also receives the KEY**, and
-//! `Drop for V` does not. A consumer whose teardown needs the key -- to
-//! remove a matching entry from a second index, say -- cannot get it from
-//! `Drop` and must iterate explicitly, reading each key from
-//! [`StrHash::iter`] or [`StrHash::keys`] before removing. The C also
-//! called the destructor only when `he->ptr` was non-NULL; that guard has
-//! no analogue because a `V` is an owned value and cannot be null.
-//!
-//! # Iteration order: the one behavioural difference, and who inherits it
-//!
-//! **`HashMap` iteration order is unspecified and randomised per process**
-//! (SipHash keyed from a random seed), whereas the C's chained table walks
-//! buckets in index order and is therefore DETERMINISTIC for a given key
-//! set and slot count. This is the likeliest source of a subtle behavioural
-//! difference anywhere in this module, so the C call sites were audited
-//! individually rather than assumed harmless.
-//!
-//! `grep -rn 'Curl_hash_start_iterate\|Curl_hash_next_element' lib/*.c
-//! lib/vtls/*.c` finds four sites, **all four in `lib/conncache.c`**, of
-//! which three are live:
-//!
-//! 1. `cpool_get_first` (`conncache.c:129-145`) returns whichever bundle
-//!    the bucket walk reaches first, so it IS order-dependent by
-//!    construction. Its only callers, `conncache.c:242` and `:248`, sit in
-//!    `Curl_cpool_destroy`'s drain loop -- take the first, remove it,
-//!    discard it, take the first again -- so order changes the SEQUENCE of
-//!    closes and not the outcome: every connection is closed either way.
-//! 2. `cpool_get_oldest_idle` (`conncache.c:336-368`) is a max-reduction
-//!    over every connection with `highscore` starting at -1. The
-//!    comparison is a STRICT `score > highscore`, so the result is
-//!    order-independent EXCEPT on a tie, where the first connection
-//!    encountered wins. Two connections whose `lastused` timestamps are
-//!    equal to the millisecond may therefore be evicted in either order.
-//! 3. `cpool_foreach` (`conncache.c:512-544`) visits every connection and
-//!    ABORTS on the first callback returning 1. Which connection is
-//!    reached first therefore decides the outcome whenever the callback can
-//!    abort early. This is the one genuinely order-sensitive site.
-//! 4. `Curl_cpool_print` (`conncache.c:877-909`) is inside `#if 0` and has
-//!    never been compiled.
-//!
-//! **Conclusion, addressed to whoever writes
-//! `curl-rs-lib/src/conn/pool.rs`:** the connection pool is the ONLY
-//! consumer that inherits order sensitivity, it inherits it at those three
-//! sites, and site 3 is the one that can change an observable outcome. If
-//! deterministic behaviour is wanted there, sort explicitly on a field that
-//! is already part of the value -- `lastused` for eviction -- or hold the
-//! pool in a `BTreeMap`. Do NOT reach for a stable hasher: the bucket
-//! order the C happened to produce was never a specified behaviour, and
-//! reproducing it would freeze an accident.
-//!
-//! **And, equally importantly, addressed to whoever writes
-//! `curl-rs-lib/src/dns/`:** the DNS cache does NOT inherit this. It never
-//! iterates. `lib/hostip.c` prunes through `Curl_hash_clean_with_criterium`
-//! (`hostip.c:291`) with the callback `dnscache_entry_is_stale`
-//! (`hostip.c:258-274`), which decides each entry on its own timestamp and
-//! accumulates the surviving maximum age -- a per-entry test plus a
-//! max-reduction, order-independent in both halves.
-//!
-//! # The criterium polarity trap
-//!
-//! `Curl_hash_clean_with_criterium` and `HashMap::retain` have OPPOSITE
-//! polarity, and getting it backwards would silently empty a cache or
-//! silently never prune one. The C, at `lib/hash.c:311-323`, is
-//!
-//! ```text
-//! if(!comp || comp(user, (*he_anchor)->ptr)) { unlink; destroy; }
-//! else he_anchor = &(*he_anchor)->next;
-//! ```
-//!
-//! so the callback returning TRUE means **REMOVE**, and a NULL callback
-//! removes EVERYTHING. The live consumer says the same thing in words at
-//! `hostip.c:255-257`: "Returning non-zero means remove the entry, return 0
-//! to keep it in the cache." `HashMap::retain`'s closure returning `true`
-//! means KEEP.
-//!
-//! [`StrHash::clean_with_criterium`] keeps **curl's** polarity, so a
-//! transliterated consumer is correct without thinking about it, and
-//! performs the single inversion internally. The inversion therefore exists
-//! in exactly one place in this workspace, and
-//! `the_criterium_removes_what_it_selects` and
-//! `an_always_true_criterium_empties_the_table` assert both directions.
-//! The C's `void *user` context becomes a closure capture, which is the
-//! typed-context requirement applied to this module.
-//!
-//! # The 14 C entry points and their fate
-//!
-//! `lib/hash.h:78-103` declares fourteen functions. Every one is mapped.
-//!
-//! | C entry point                    | Rust successor                        |
-//! |----------------------------------|---------------------------------------|
-//! | `Curl_hash_init`                 | `StrHash::new` / `with_slots`         |
-//! | `Curl_hash_add`                  | `StrHash::insert`                     |
-//! | `Curl_hash_add2`                 | `insert`; the dtor becomes `Drop`     |
-//! | `Curl_hash_delete`               | `StrHash::remove`                     |
-//! | `Curl_hash_pick`                 | `StrHash::get` / `get_mut`            |
-//! | `Curl_hash_destroy`              | `Drop`, run automatically             |
-//! | `Curl_hash_count`                | `StrHash::len` / `is_empty`           |
-//! | `Curl_hash_clean`                | `StrHash::clear`                      |
-//! | `Curl_hash_clean_with_criterium` | `StrHash::clean_with_criterium`       |
-//! | `Curl_hash_str`                  | `hash_str` / `hash_str_slot`          |
-//! | `curlx_str_key_compare`          | `str_key_compare`                     |
-//! | `Curl_hash_start_iterate`        | `StrHash::iter` / `iter_mut`          |
-//! | `Curl_hash_next_element`         | the same iterators                    |
-//! | `Curl_hash_print`                | `fmt::Debug`; never compiled in C     |
-//!
-//! The C return values are not documented in the header and callers branch
-//! on them, so they were read from the bodies:
-//!
-//! * `Curl_hash_add` and `Curl_hash_add2` return the stored pointer, or
-//!   NULL on allocation failure (`lib/hash.c:161-192`). Neither half
-//!   survives. Rust has no allocation-failure return -- the allocator
-//!   aborts -- and what [`StrHash::insert`] returns instead is the
-//!   DISPLACED value, which the C destroyed through the destructor at
-//!   `lib/hash.c:179`. Dropping the returned `Option` reproduces the C
-//!   exactly; keeping it is strictly more capable.
-//! * `Curl_hash_delete` returns `int`: **0 on success**
-//!   (`lib/hash.c:226`) and **1 when the key was absent**
-//!   (`lib/hash.c:231`). [`StrHash::remove`] carries the same distinction
-//!   in the shape of its return -- `Some` is the C's 0 and `None` is the
-//!   C's 1 -- and hands back the removed value as well.
-//! * `Curl_hash_init` returns `void`. Its own doc comment at
-//!   `lib/hash.c:71-72` claims "Return 1 on error, 0 is fine", which is
-//!   stale and describes no version of the function in this tree. Noted so
-//!   that nobody ports a non-existent error path.
-//!
-//! # Layering
-//!
-//! `util` is the base of this crate's module graph and depends on nothing.
-//! This module imports from `std` only, adds no dependency to any manifest
-//! and reaches no sibling module. It contains no `unsafe` block: the C's
-//! flexible-array-member allocation and its `he_anchor` pointer-to-pointer
-//! unlink surgery (`lib/hash.c:141-147`) are both expressed as safe
-//! collection operations.
 //!
 //! # A note on performance, since a hash table invites the question
 //!
@@ -362,16 +74,6 @@ const HASH_SEED: usize = 5381;
 /// Hashes a byte key exactly as `Curl_hash_str` does, without folding the
 /// result into a bucket index.
 ///
-/// Supersedes `Curl_hash_str` (`lib/hash.c:326-339`). The algorithm and the
-/// two ways it deviates from canonical djb2 are set out in the module
-/// documentation; the short version is `h = h * 33` written as an
-/// add-and-shift, then `h ^= byte` -- XOR, where canonical djb2 adds.
-///
-/// The C signature takes `slots_num` and returns `h % slots_num`. That fold
-/// is separated out into [`hash_str_slot`] because delegating storage to
-/// `HashMap` removes the need for it, while the unfolded value remains
-/// useful to a caller that wants the hash itself.
-///
 /// Two deliberate reproductions of C behaviour, both load-bearing:
 ///
 /// * the running value WRAPS, hence [`usize::wrapping_add`], where Rust's
@@ -384,13 +86,6 @@ const HASH_SEED: usize = 5381;
 /// ```text
 /// hash_str(b"") == 5381
 /// ```
-///
-/// That block is deliberately `text` rather than a runnable example. Every
-/// item in this module is `pub(crate)`, and rustdoc compiles a doctest as a
-/// separate crate that can only reach the public surface, so a runnable
-/// example here would fail to compile rather than document anything. The
-/// executable form of the same claim is
-/// `the_empty_key_returns_the_seed_unmodified` in the test module below.
 #[allow(dead_code)]
 pub(crate) fn hash_str(key: &[u8]) -> usize {
     let mut h = HASH_SEED;
@@ -412,11 +107,6 @@ pub(crate) fn hash_str(key: &[u8]) -> usize {
 }
 
 /// Hashes a byte key and folds the result into `slots` buckets.
-///
-/// This is `Curl_hash_str` in full, including the `% slots_num` the C
-/// applies before returning (`lib/hash.c:338`). Nothing in this crate needs
-/// it to store anything -- [`StrHash`] delegates bucketing to `HashMap` --
-/// but the C header exports the folded form, so the folded form exists.
 ///
 /// # Panics
 ///
@@ -440,9 +130,6 @@ pub(crate) fn hash_str_slot(key: &[u8], slots: usize) -> usize {
 
 /// Compares two byte keys for exact equality.
 ///
-/// Supersedes `curlx_str_key_compare` (`lib/hash.c:341-348`), whose body is
-/// `(key1_len == key2_len) && !memcmp(k1, k2, key1_len)`.
-///
 /// Two properties of the C are easy to misread and are preserved here:
 ///
 /// * the C returns **1 on MATCH**, which is the inverse of `memcmp`'s own
@@ -451,12 +138,6 @@ pub(crate) fn hash_str_slot(key: &[u8], slots: usize) -> usize {
 ///   folding and must not be routed through `crate::util::strcase`; a
 ///   caller wanting case-insensitive keys normalises before inserting, as
 ///   the DNS cache does by lowercasing hostnames at the call site.
-///
-/// In Rust the function collapses entirely into `PartialEq` on the slices:
-/// `&[u8] == &[u8]` tests length and then bytes, which is the C predicate
-/// term for term. [`StrHash`] therefore does not call this at all -- its
-/// key type provides `Eq` -- and the function is kept so the C name has a
-/// landing site and a direct caller has one too.
 #[allow(dead_code)]
 pub(crate) fn str_key_compare(k1: &[u8], k2: &[u8]) -> bool {
     k1 == k2
@@ -479,26 +160,6 @@ pub(crate) fn str_key_compare(k1: &[u8], k2: &[u8]) -> bool {
 /// 3. a key type fixed at `Vec<u8>`, which is what removes the
 ///    `hash_function` and `comp_function` pointers -- see the module
 ///    documentation for why the C needed them and why this does not.
-///
-/// # Naming
-///
-/// The C type is `struct Curl_hash`. Stripping the `Curl_` prefix, as this
-/// crate does throughout, would give `Hash`, which collides with the name
-/// of the ubiquitous `std::hash::Hash` trait and would force every future
-/// consumer importing both to disambiguate. `StrHash` is used instead, and
-/// it is not an invention: `curl-rs-lib/src/util/mod.rs` already introduces
-/// this module as "the string-keyed hash table", and the C's own comparator
-/// is spelled `curlx_str_key_compare`.
-///
-/// # Keys
-///
-/// Keys are arbitrary byte strings, NOT C strings, and their length is
-/// carried explicitly exactly as the C's `key_len` parameter carries it.
-/// Interior NUL bytes are ordinary key bytes and a trailing NUL is part of
-/// the key when the caller includes it -- which matters, because
-/// `cpool_find_bundle` keys the connection pool on
-/// `strlen(conn->destination) + 1` (`lib/conncache.c:147-152`) and so its
-/// keys really do end in a NUL byte.
 pub(crate) struct StrHash<V> {
     /// The entries, owning both key and value.
     ///
@@ -512,17 +173,6 @@ pub(crate) struct StrHash<V> {
 
 impl<V> StrHash<V> {
     /// Creates an empty table.
-    ///
-    /// Supersedes `Curl_hash_init` (`lib/hash.c:77-98`) for the four call
-    /// sites that pass a literal bucket count of 23 -- `multi.c:250`,
-    /// `url.c:498`, `url.c:3280` and `easy.c:970`. The `slots`, `hfunc`,
-    /// `comparator` and `dtor` arguments all have no successor; the module
-    /// documentation records where each of them went.
-    ///
-    /// Like the C, this allocates nothing. `Curl_hash_init` set
-    /// `h->table = NULL` and left `Curl_hash_add2` to `curlx_calloc` the
-    /// bucket array on first insert (`lib/hash.c:169-173`); `HashMap::new`
-    /// likewise defers its first allocation until an entry is added.
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
@@ -531,24 +181,6 @@ impl<V> StrHash<V> {
     }
 
     /// Creates an empty table sized for at least `slots` entries.
-    ///
-    /// Supersedes `Curl_hash_init` for the two string-keyed call sites that
-    /// compute a count at runtime rather than writing a literal:
-    /// `Curl_cpool_init`'s `size` parameter (`conncache.c:114-118`) and
-    /// `Curl_dnscache_init`'s `size` parameter (`hostip.c:1268-1271`).
-    ///
-    /// The meaning differs from the C's and the difference is the point.
-    /// `slots` there was a FIXED bucket count that was never grown, so
-    /// exceeding it degraded the table into that many linked lists. Here it
-    /// is a capacity hint passed to `HashMap::with_capacity`: the table
-    /// still grows without limit, and the hint only moves allocation
-    /// earlier. Nothing observable changes, which
-    /// `a_capacity_hint_changes_nothing_observable` asserts.
-    ///
-    /// A zero hint is accepted and is equivalent to [`Self::new`]. The C
-    /// would have failed a `DEBUGASSERT(slots)` (`lib/hash.c:84`) and then
-    /// divided by zero; there is no division here, so there is nothing to
-    /// reject.
     #[allow(dead_code)]
     pub(crate) fn with_slots(slots: usize) -> Self {
         Self {
@@ -558,41 +190,25 @@ impl<V> StrHash<V> {
 
     /// Inserts `value` under `key`, returning the value it displaced.
     ///
-    /// Supersedes `Curl_hash_add` (`lib/hash.c:202-205`) and, together with
-    /// `Drop`, `Curl_hash_add2` (`lib/hash.c:161-192`). An existing entry is
-    /// REPLACED, matching the C, which cleared the old pointer through its
-    /// destructor and overwrote in place (`lib/hash.c:176-183`).
-    ///
     /// Neither half of the C return value survives, and both replacements
     /// are deliberate:
     ///
-    /// * the C returned `p` on success and NULL on allocation failure. Rust
-    ///   has no allocation-failure return -- the allocator aborts -- so
-    ///   there is no failure to report;
+    /// * the C returned `p` on success and NULL on allocation failure. What it
+    ///   allocated is one fixed-size element plus a copy of the caller's key --
+    ///   bytes already resident -- so there is nothing here that
+    ///   `crate::util::fallible` would cover and no failure to report. The
+    ///   externally sized allocation in this module is the bucket vector, whose
+    ///   growth `Self::resize` already reserves fallibly;
     /// * what is returned instead is the DISPLACED value, which the C
     ///   destroyed at `lib/hash.c:179`. Ignoring the result drops it
     ///   immediately and reproduces the C exactly; binding it is strictly
     ///   more capable.
-    ///
-    /// `key` is copied into an owned `Vec<u8>`, which is what the C did with
-    /// `memcpy` into its flexible array member. The copy is therefore
-    /// faithful rather than incidental.
     #[allow(dead_code)]
     pub(crate) fn insert(&mut self, key: &[u8], value: V) -> Option<V> {
         self.entries.insert(key.to_vec(), value)
     }
 
     /// Removes the entry under `key`, returning its value.
-    ///
-    /// Supersedes `Curl_hash_delete` (`lib/hash.c:212-232`), which returns
-    /// `int`: 0 when the entry was found and removed (`lib/hash.c:226`) and
-    /// 1 when the key was absent (`lib/hash.c:231`). That distinction is
-    /// preserved in the shape of the return -- `Some` is the C's 0, `None`
-    /// is the C's 1 -- and the removed value comes back with it instead of
-    /// being destroyed on the spot.
-    ///
-    /// Removing an absent key is not an error in either language; it simply
-    /// reports absence.
     #[allow(dead_code)]
     pub(crate) fn remove(&mut self, key: &[u8]) -> Option<V> {
         self.entries.remove(key)
@@ -621,12 +237,6 @@ impl<V> StrHash<V> {
     }
 
     /// Returns the number of entries.
-    ///
-    /// Supersedes `Curl_hash_count` (`lib/hash.c:295-299`), which returned
-    /// the hand-maintained `h->size` counter that `hash_elem_link` and
-    /// `hash_elem_unlink` incremented and decremented (`lib/hash.c:141-156`).
-    /// `HashMap` maintains its own, so the counter and both helpers are
-    /// gone.
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -642,57 +252,12 @@ impl<V> StrHash<V> {
     }
 
     /// Removes every entry, keeping the table usable.
-    ///
-    /// Supersedes `Curl_hash_clean` (`lib/hash.c:278-293`), which walked all
-    /// `slots` buckets unlinking and destroying each element. Each value's
-    /// `Drop` runs here, which is what the C's two destructor levels
-    /// existed to arrange.
-    ///
-    /// `Curl_hash_destroy` (`lib/hash.c:263-272`) has no separate successor:
-    /// it was `Curl_hash_clean` followed by freeing the bucket array, and
-    /// both halves are the compiler's job now.
     #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
     }
 
     /// Removes every entry whose value the criterium SELECTS.
-    ///
-    /// Supersedes `Curl_hash_clean_with_criterium` (`lib/hash.c:302-324`).
-    ///
-    /// # Polarity
-    ///
-    /// `select` returning `true` means **REMOVE**, which is curl's polarity
-    /// and the OPPOSITE of `HashMap::retain`, whose closure returning `true`
-    /// means keep. The C is explicit -- at `lib/hash.c:315`,
-    /// `if(!comp || comp(user, ptr))` unlinks and destroys -- and the live
-    /// consumer states it in words at `hostip.c:255-257`: "Returning
-    /// non-zero means remove the entry, return 0 to keep it in the cache."
-    ///
-    /// curl's polarity is kept so that a consumer transliterated from the C
-    /// is correct without having to notice the difference, and the single
-    /// inversion is performed below. It exists in exactly one place in this
-    /// workspace and is asserted in both directions by
-    /// `the_criterium_removes_what_it_selects` and
-    /// `an_always_true_criterium_empties_the_table`.
-    ///
-    /// # The two arguments that are not here
-    ///
-    /// The C signature is `(h, void *user, int (*comp)(void *, void *))`.
-    /// The `user` context becomes whatever the closure captures, which is
-    /// the typed-context substitution this migration applies to every C
-    /// callback pair. A NULL `comp` removed EVERYTHING; that case is
-    /// [`Self::clear`], and it is not expressible here because `select` is
-    /// not optional -- which is a deliberate narrowing, since "pass NULL to
-    /// mean clear" is a trap rather than a feature.
-    ///
-    /// The criterium receives `&V` and NOT the key, because the C's
-    /// `comp(user, ptr)` receives only the value. Widening it would be a
-    /// change with no call site asking for one: the sole live consumer,
-    /// `dnscache_entry_is_stale` (`hostip.c:258-274`), reads only the entry.
-    /// A consumer that genuinely needs keys should collect them from
-    /// [`Self::keys`] and then call [`Self::remove`], which is what the C
-    /// would also have required.
     #[allow(dead_code)]
     pub(crate) fn clean_with_criterium<F>(&mut self, mut select: F)
     where
@@ -706,20 +271,6 @@ impl<V> StrHash<V> {
     }
 
     /// Iterates over every entry as a key/value pair.
-    ///
-    /// Supersedes the `Curl_hash_start_iterate` / `Curl_hash_next_element`
-    /// pair (`lib/hash.c:350-388`) and the whole of
-    /// `struct Curl_hash_iterator`. Keys are yielded as slices because the
-    /// C's `struct Curl_hash_element` exposed `he->key` and `he->key_len`
-    /// together and `Curl_cpool_print` read them.
-    ///
-    /// # Order
-    ///
-    /// **Unspecified, and randomised per process.** The C walked buckets in
-    /// index order, which was deterministic for a given key set and slot
-    /// count. The module documentation audits all three live C call sites
-    /// and records which one can change an observable outcome; read it
-    /// before relying on order here.
     #[allow(dead_code)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&[u8], &V)> + '_ {
         self.entries
@@ -736,8 +287,6 @@ impl<V> StrHash<V> {
     /// callback removes the element it was handed. Here the map is borrowed
     /// mutably for the life of the iterator, so that hazard is a compile
     /// error rather than a comment.
-    ///
-    /// Order is unspecified, exactly as for [`Self::iter`].
     #[allow(dead_code)]
     pub(crate) fn iter_mut(
         &mut self,
@@ -748,14 +297,6 @@ impl<V> StrHash<V> {
     }
 
     /// Iterates over every key.
-    ///
-    /// The C had no key-only walk; a caller ran the iterator and read
-    /// `he->key`. This is the accessor the module documentation points at
-    /// for the one capability the destructor collapse loses -- teardown
-    /// logic that needs the key must collect it here first, because
-    /// `Drop for V` never sees it.
-    ///
-    /// Order is unspecified, exactly as for [`Self::iter`].
     #[allow(dead_code)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &[u8]> + '_ {
         self.entries.keys().map(Vec::as_slice)
@@ -772,12 +313,6 @@ impl<V> StrHash<V> {
 
 impl<V> Default for StrHash<V> {
     /// Equivalent to [`StrHash::new`].
-    ///
-    /// Provided because a Rust type with an argument-free `new` is expected
-    /// to have one, and because `clippy::new_without_default` is
-    /// warn-by-default under a `-D warnings` gate. It has no C counterpart:
-    /// `struct Curl_hash` was embedded by value in its owners and zeroed by
-    /// `Curl_hash_init`.
     fn default() -> Self {
         Self::new()
     }
@@ -785,19 +320,6 @@ impl<V> Default for StrHash<V> {
 
 impl<V: fmt::Debug> fmt::Debug for StrHash<V> {
     /// Renders the table as a map, standing in for `Curl_hash_print`.
-    ///
-    /// `Curl_hash_print` (`lib/hash.h:103`, defined at `lib/hash.c:34-69`)
-    /// is a diagnostic dumper that has never been compiled: its definition
-    /// sits inside `#if 0`, and its only appearance in a consumer is a
-    /// commented-out line at `lib/multi.c:538`. It is therefore not ported,
-    /// and this is the substitution.
-    ///
-    /// Keys are rendered with `String::from_utf8_lossy` because the C
-    /// printed them with `%.*s`, treating the key bytes as text without
-    /// checking that they are. Two details of the C output are deliberately
-    /// NOT reproduced: the bucket index it grouped by, which no longer
-    /// exists, and the raw element and value addresses it printed, which
-    /// would be neither stable nor useful.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
             .entries(
@@ -832,17 +354,6 @@ mod tests {
     // compared rather than a bucket index. A divergence therefore means this
     // module disagrees with the shipped C, not that a hand calculation was
     // wrong.
-    //
-    // The same program reported `sizeof(size_t) == 8` and `char` signed,
-    // which are the two platform facts the transcription depends on.
-    //
-    // The corpus is chosen for the places a mistranscription would show up:
-    // the empty key (the loop bound), one and three ASCII bytes (the XOR),
-    // two keys differing only in case, the three bytes either side of the
-    // sign boundary (0x7F, 0x80, 0xFF), a key mixing signed and unsigned
-    // ranges, a NUL-terminated connection-pool destination of the exact
-    // shape `cpool_find_bundle` builds, a 32-byte run (the wrap), bare NUL
-    // bytes, and a run of eight 0xFF.
     const C_ORACLE: [(&[u8], usize); 15] = [
         (b"", 5381),
         (b"a", 177_604),
@@ -885,12 +396,6 @@ mod tests {
     const SLOT_COUNTS: [usize; 4] = [7, 23, 91, 256];
 
     /// A value that counts its own drops.
-    ///
-    /// This is the instrument for the one property the C's two destructor
-    /// levels existed to arrange: that every stored value is destroyed
-    /// exactly once, whether the table is cleared, overwritten, pruned or
-    /// dropped. `Rc<Cell<usize>>` rather than an atomic because the counter
-    /// never leaves the thread that made it.
     struct Tracked {
         drops: Rc<Cell<usize>>,
     }
@@ -969,13 +474,6 @@ mod tests {
         // Not a one-key accident -- but the separation is not universal
         // either, and the exception is worth stating because it is the sort
         // of thing an over-strong assertion hides.
-        //
-        // `h ^ 0` and `h + 0` are both `h`, so a key made entirely of ZERO
-        // bytes drives the two forms through identical states and they
-        // return the same value. That includes the empty key, which runs the
-        // loop no times at all. For every other corpus entry -- measured,
-        // not assumed -- the forms diverge, which is what makes those
-        // entries able to detect the slip and the all-zero ones unable to.
         for (key, _) in C_ORACLE {
             let every_byte_is_zero = key.iter().all(|&byte| byte == 0);
             if every_byte_is_zero {
