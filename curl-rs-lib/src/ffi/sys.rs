@@ -62,7 +62,17 @@
 //! | `lib/if2ip.c:92-174` | 262 | [`interface_addrs`], [`interface_names`] |
 //! | `lib/if2ip.h:29-45` | -- | referenced only; the verdict logic lives elsewhere |
 //! | `lib/url.c:1615` | -- | [`if_nametoindex`] |
+//! | `src/tool_getparam.c:625-637` | 13 | [`scrub_argument`] |
 //! | `lib/memdebug.c:184-368` | 577 | `memdebug`, behind a default-off feature |
+//!
+//! The `cleanarg` row is the one entry that comes from the command-line tool
+//! rather than the library, and it is here because the capability it needs --
+//! writing to the process's own argument vector -- is unreachable from safe
+//! Rust and `curl-rs` carries `#![forbid(unsafe_code)]`. It is also the one
+//! entry whose C guard, `HAVE_WRITABLE_ARGV`, is defined on all four mandated
+//! targets (`configure.ac:1809`, `CMakeLists.txt:619`), so implementing the
+//! no-op arm instead would have left a credential visible in every process
+//! listing for the life of a transfer.
 //!
 //! # The `socket2`-first obligation
 //!
@@ -1913,6 +1923,379 @@ pub(crate) fn seek_fd_with(
     sys.seek_fd(fd, offset)
 }
 
+// The argument vector -- supersedes cleanarg() (src/tool_getparam.c:625-637)
+
+/// The process's argument vector, as the scrubber needs to see it.
+///
+/// A seam of its own, for the reason every other seam in this file is one:
+/// Miri cannot be handed a real argument vector, and a clean Miri run over this
+/// crate is a required gate. Every byte of the *decision* -- which element
+/// matches, at which offset, and how many bytes are overwritten -- therefore
+/// runs above this trait and is covered against a pure-Rust fake, while the
+/// implementation that touches the loader's memory is three lines long.
+///
+/// Both methods are **total**. C's `cleanarg` returns `void` and ignores every
+/// failure it could observe, so inventing a failure channel here would invite a
+/// caller to act on one the C does not have.
+pub(crate) trait ArgvCalls {
+    /// How many elements the vector has, `argv[0]` included.
+    ///
+    /// Zero means "there is no writable argument vector in this process",
+    /// which is the state Miri and any platform without the capture mechanism
+    /// are in. It is the runtime answer to the question C answers at configure
+    /// time with `HAVE_WRITABLE_ARGV`.
+    fn count(&self) -> usize;
+
+    /// The bytes of element `index`, up to but excluding its terminator.
+    ///
+    /// Copied out rather than borrowed. A borrow would have to name the
+    /// lifetime of memory this process does not own, and would alias the very
+    /// bytes [`ArgvCalls::wipe`] then writes; an owned copy makes the scanning
+    /// loop an ordinary safe function.
+    fn read(&self, index: usize) -> Option<Vec<u8>>;
+
+    /// Overwrites `len` bytes of element `index`, starting at `at`, with `*`.
+    ///
+    /// `at + len` never exceeds the length [`ArgvCalls::read`] reported for
+    /// the same index, so the terminator is never touched: C's
+    /// `memset(str, '*', strlen(str))` leaves the NUL in place and so does
+    /// this, which is what keeps the element a valid C string for `/proc` and
+    /// for `ps`.
+    fn wipe(&self, index: usize, at: usize, len: usize);
+}
+
+/// Where the loader's `argv` was recorded, and how many elements it had.
+///
+/// `-1` and null are the "never captured" state, which is what
+/// [`RealArgv::count`] reports as zero. Two statics rather than one struct
+/// because they are written by a function that runs before anything in this
+/// crate can have initialised a lock, and an [`AtomicIsize`] plus an
+/// [`AtomicPtr`] need no initialisation at all.
+///
+/// Both carry the same `#[cfg]` as [`capture_argv`], the only writer, because
+/// macOS reads the vector from `_NSGetArgv` instead and Miri has none: leaving
+/// them compiled on a target that never writes them would be two dead statics,
+/// and the mandated four-target build allows no warning on any of them.
+///
+/// [`AtomicIsize`]: core::sync::atomic::AtomicIsize
+/// [`AtomicPtr`]: core::sync::atomic::AtomicPtr
+#[cfg(all(not(miri), target_os = "linux"))]
+static ARGV_COUNT: core::sync::atomic::AtomicIsize =
+    core::sync::atomic::AtomicIsize::new(-1);
+
+/// The captured `argv` base pointer. See [`ARGV_COUNT`].
+#[cfg(all(not(miri), target_os = "linux"))]
+static ARGV_BASE: core::sync::atomic::AtomicPtr<*mut libc::c_char> =
+    core::sync::atomic::AtomicPtr::new(ptr::null_mut());
+
+/// Records `argc` and `argv` as the dynamic loader passes them.
+///
+/// # Why a constructor is the only way in
+///
+/// `std::env::args_os` copies; it cannot hand back the loader's memory, and
+/// nothing else in the standard library can either. On an ELF platform the
+/// loader calls every function pointer in `.init_array` with the same
+/// `(argc, argv, envp)` triple it gives `main`, which is the one moment those
+/// values are observable. Recording them here and nowhere else is what lets
+/// [`scrub_argument`] be an ordinary safe function later.
+///
+/// # Why it is absent under Miri
+///
+/// Miri does execute `.init_array` entries, but it calls them with **no
+/// arguments**; a three-parameter callee then reads parameters that were never
+/// passed, which Miri correctly reports as undefined behaviour ("calling a
+/// function with fewer arguments than it requires"). Measured, not assumed.
+/// Miri also models no process argument vector for `ps` to show, so the
+/// capability has nothing to do there. The constructor is therefore compiled
+/// out under Miri and [`RealArgv::count`] answers zero, which
+/// [`scrub_argument_with`] turns into the documented no-op.
+#[cfg(all(not(miri), target_os = "linux"))]
+extern "C" fn capture_argv(
+    argc: libc::c_int,
+    argv: *mut *mut libc::c_char,
+    _envp: *mut *mut libc::c_char,
+) {
+    use core::sync::atomic::Ordering;
+
+    // A negative or zero `argc`, or a null vector, stays the "never captured"
+    // state rather than being stored and defended against at every use.
+    if argc > 0 && !argv.is_null() {
+        // `Release` pairs with the `Acquire` load in `RealArgv`, so a reader
+        // that sees the pointer also sees the count.
+        ARGV_COUNT.store(argc as isize, Ordering::Relaxed);
+        ARGV_BASE.store(argv, Ordering::Release);
+    }
+}
+
+/// The `.init_array` slot holding [`capture_argv`].
+///
+/// `#[used]` is what keeps it: the symbol has no caller, so without it the
+/// compiler is free to discard the static and the linker's `--gc-sections`
+/// certainly would. Verified in this workspace at both optimisation levels and
+/// inside a `cargo test` harness binary, which is why the test below can assert
+/// that the capture happened.
+#[cfg(all(not(miri), target_os = "linux"))]
+#[used]
+#[link_section = ".init_array"]
+static CAPTURE_ARGV: extern "C" fn(
+    libc::c_int,
+    *mut *mut libc::c_char,
+    *mut *mut libc::c_char,
+) = capture_argv;
+
+/// The loader's argument vector, or nothing.
+///
+/// On Linux the answer comes from [`CAPTURE_ARGV`]. On macOS it comes from
+/// `_NSGetArgv`/`_NSGetArgc`, which libSystem exports for exactly this purpose
+/// and which may be called at any time -- so no constructor is needed there,
+/// and none is declared, because `.init_array` is not how Mach-O spells
+/// initialisers and a `#[link_section]` naming it would be silently inert.
+pub(crate) struct RealArgv;
+
+impl RealArgv {
+    /// The base pointer and element count, once, so that a scan cannot see the
+    /// two disagree.
+    #[cfg(all(not(miri), target_os = "macos"))]
+    fn vector(&self) -> Option<(*mut *mut libc::c_char, usize)> {
+        extern "C" {
+            fn _NSGetArgv() -> *mut *mut *mut libc::c_char;
+            fn _NSGetArgc() -> *mut libc::c_int;
+        }
+
+        // SAFETY: both functions are libSystem exports that return the address
+        // of a process-global variable and take no arguments, so there is no
+        // precondition to uphold at the call. Each result is checked for null
+        // before it is read, and each read is a single aligned load of a value
+        // the dynamic loader initialised before any user code ran.
+        let (argv, argc) = unsafe {
+            let argv_slot = _NSGetArgv();
+            let argc_slot = _NSGetArgc();
+            if argv_slot.is_null() || argc_slot.is_null() {
+                return None;
+            }
+            (*argv_slot, *argc_slot)
+        };
+
+        if argv.is_null() || argc <= 0 {
+            return None;
+        }
+        Some((argv, argc as usize))
+    }
+
+    /// The base pointer and element count recorded by [`capture_argv`].
+    #[cfg(all(not(miri), target_os = "linux"))]
+    fn vector(&self) -> Option<(*mut *mut libc::c_char, usize)> {
+        use core::sync::atomic::Ordering;
+
+        let base = ARGV_BASE.load(Ordering::Acquire);
+        let count = ARGV_COUNT.load(Ordering::Relaxed);
+        if base.is_null() || count <= 0 {
+            return None;
+        }
+        Some((base, count as usize))
+    }
+
+    /// No vector: neither capture mechanism is compiled in.
+    ///
+    /// Reached under Miri, and on any target that is neither Linux nor macOS.
+    /// The four mandated targets are all one or the other, so this arm exists
+    /// to keep the module compiling rather than to serve a platform.
+    #[cfg(any(miri, not(any(target_os = "linux", target_os = "macos"))))]
+    fn vector(&self) -> Option<(*mut *mut libc::c_char, usize)> {
+        None
+    }
+
+    /// Element `index`, as a raw pointer, bounds-checked against the count.
+    fn slot(&self, index: usize) -> Option<*mut libc::c_char> {
+        let (base, count) = self.vector()?;
+        if index >= count {
+            return None;
+        }
+        // SAFETY: `index < count`, and the loader guarantees `count`
+        // consecutive readable pointers at `base` -- that is what `argc` means.
+        // The offset therefore stays inside one allocated object, and the load
+        // is of a `*mut c_char` the loader wrote before `main` was entered.
+        let slot = unsafe { *base.add(index) };
+        if slot.is_null() {
+            None
+        } else {
+            Some(slot)
+        }
+    }
+}
+
+impl ArgvCalls for RealArgv {
+    fn count(&self) -> usize {
+        self.vector().map_or(0, |(_, count)| count)
+    }
+
+    fn read(&self, index: usize) -> Option<Vec<u8>> {
+        let slot = self.slot(index)?;
+        // SAFETY: `slot` is a non-null element of the loader's argument
+        // vector, so it points at a NUL-terminated string that lives for the
+        // whole process. `to_bytes` measures to that terminator and the result
+        // is copied immediately, so no borrow of foreign memory escapes.
+        let bytes = unsafe { CStr::from_ptr(slot) }.to_bytes();
+        Some(bytes.to_vec())
+    }
+
+    fn wipe(&self, index: usize, at: usize, len: usize) {
+        let Some(slot) = self.slot(index) else {
+            return;
+        };
+        // Re-measure rather than trusting the caller's arithmetic: this is the
+        // one operation in the module that writes to memory the process does
+        // not own, so the bound is established here, immediately above the
+        // write, from the string as it is right now.
+        // SAFETY: as in `read` -- `slot` is a live NUL-terminated string from
+        // the argument vector.
+        let length = unsafe { CStr::from_ptr(slot) }.to_bytes().len();
+        let Some(end) = at.checked_add(len) else {
+            return;
+        };
+        if end > length {
+            return;
+        }
+        // SAFETY: `at + len <= length`, and `length` is the number of bytes
+        // before this element's terminator, so the written range lies wholly
+        // inside the element and never reaches the NUL. The pointer is
+        // `*mut c_char` from the vector the loader made writable -- which is
+        // the whole premise of `HAVE_WRITABLE_ARGV` -- and `u8` and `c_char`
+        // have the same size and alignment on every mandated target. The
+        // caller's exclusive access for the duration of the scan is the
+        // documented precondition of `scrub_argument`.
+        unsafe {
+            ptr::write_bytes(slot.cast::<u8>().add(at), b'*', len);
+        }
+    }
+}
+
+/// Where `needle` sits at the end of `element`, when C would have wiped it.
+///
+/// C hands `cleanarg` the very pointer the parser was reading, so it wipes
+/// from that offset to the end of that string and nothing else. This function
+/// recovers the same offset from the bytes alone, which is what lets the
+/// capability be reached without threading a vector index and a byte offset
+/// through every layer of the parser.
+///
+/// Two conditions, and the second is what makes the rule precise rather than
+/// merely plausible:
+///
+/// * `element` must **end** with `needle`. A separate argument (`--user
+///   bob:pw`) matches wholly; a glued one (`-ubob:pw`, `--user=bob:pw`)
+///   matches at the offset the parser's own pointer had, so the wipe reproduces
+///   `-u******` and `--user=******` exactly.
+/// * a match that is not the whole element is accepted only when the element
+///   begins with `-`. Without it, `curl https://h/bob:pw -u bob:pw` would wipe
+///   the tail of the URL, and every argument that merely happens to end with a
+///   credential's bytes would be at risk. With it, the only elements that can
+///   match partially are the option-bearing ones -- which are the only ones a
+///   parser pointer can point into.
+///
+/// Returns [`None`] when the element must be left alone, including for an empty
+/// `needle`: `strlen("")` is zero, so C's `memset` writes nothing.
+fn wipe_offset(element: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || element.len() < needle.len() {
+        return None;
+    }
+    let at = element.len() - needle.len();
+    if element.get(at..)? != needle {
+        return None;
+    }
+    if at != 0 && element.first() != Some(&b'-') {
+        return None;
+    }
+    Some(at)
+}
+
+/// Overwrites `argument` with `*` wherever it appears in this process's
+/// argument vector, reproducing `cleanarg` (`src/tool_getparam.c:625-637`).
+///
+/// Returns how many elements were overwritten. C's `cleanarg` returns `void`
+/// and its caller discards the outcome; the count exists so that the behaviour
+/// can be asserted, and discarding it is correct.
+///
+/// # What this is for
+///
+/// The C comment at `:628-630` states the purpose exactly: "now that getstr has
+/// copied the contents of nextarg, wipe the next argument out so that the
+/// username:password is not displayed in the system process list". Eleven rows
+/// of the option table carry `ARG_CLEAR`, all of them credential-bearing, and
+/// every one of them is a value that `ps`, `/proc/<pid>/cmdline` and any
+/// process listing would otherwise show to every other user on the host for as
+/// long as the transfer runs.
+///
+/// # Why `HAVE_WRITABLE_ARGV` is not optional here
+///
+/// `src/tool_getparam.c:637` does define the no-op arm, and it is a supported
+/// configuration -- but it is not the configuration the mandated targets build.
+/// `configure.ac:1809` defines `HAVE_WRITABLE_ARGV` when its runtime probe
+/// succeeds and forces it on when cross-compiling for Apple, and
+/// `CMakeLists.txt:619` sets it unconditionally for `APPLE`. On all four
+/// mandated targets the C build really does wipe the argument, so implementing
+/// the no-op arm would have been a silent security regression dressed as a
+/// configuration choice.
+///
+/// # Concurrency, stated because it is a real precondition
+///
+/// The argument vector is process-global memory that this process does not own,
+/// and `std::env::args_os` reads the same bytes. This function must therefore
+/// be called only while nothing else is reading or writing that vector -- which
+/// is exactly the position C's `cleanarg` is in, called from inside argument
+/// parsing. The sole caller satisfies it by construction:
+/// `curl-rs/src/main.rs` collects the command line into owned `OsString`s once,
+/// before parsing begins, and no other code in the workspace reads the argument
+/// vector at all (measured: one `args_os` call in the whole workspace).
+/// Concurrent calls to *this* function are serialised below, so a caller cannot
+/// create a race by scrubbing two values at once.
+///
+/// # When it does nothing
+///
+/// Under Miri, and on a target where no capture mechanism is compiled in, there
+/// is no vector to write and the return value is `0`. That is a genuine no-op
+/// and is reported as one rather than being presented as a wipe.
+pub fn scrub_argument(argument: &[u8]) -> usize {
+    // `Mutex::new` is a `const fn`, so this needs no lazy initialisation. A
+    // poisoned lock is recovered rather than propagated: the guarded region
+    // performs byte stores of a single constant and holds no invariant that a
+    // panic elsewhere could have broken.
+    static SERIALISE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = SERIALISE.lock().unwrap_or_else(|error| error.into_inner());
+
+    scrub_argument_with(&RealArgv, argument)
+}
+
+/// [`scrub_argument`] over an injected [`ArgvCalls`].
+///
+/// Scans **every** element rather than stopping at the first match, and the
+/// difference matters. C wipes one location because it holds the pointer; this
+/// holds only the bytes, and a credential can appear more than once on a
+/// command line -- `-u bob:pw --proxy-user bob:pw` is the ordinary case.
+/// Stopping early would leave the second occurrence legible in `ps`, which is
+/// the one outcome this capability exists to prevent, so the scan continues.
+/// `argv[0]` is skipped: it is the program name, it is not an option value, and
+/// C's parser never points into it.
+pub(crate) fn scrub_argument_with(
+    argv: &dyn ArgvCalls,
+    argument: &[u8],
+) -> usize {
+    if argument.is_empty() {
+        return 0;
+    }
+
+    let mut wiped = 0;
+    for index in 1..argv.count() {
+        let Some(element) = argv.read(index) else {
+            continue;
+        };
+        if let Some(at) = wipe_offset(&element, argument) {
+            argv.wipe(index, at, argument.len());
+            wiped += 1;
+        }
+    }
+    wiped
+}
+
 // The counting allocator -- feature `memdebug`, DEFAULT OFF
 
 /// An allocation log in the format `tests/memanalyzer.pm` parses.
@@ -2631,8 +3014,17 @@ pub(crate) mod memdebug {
             return false;
         }
 
+        // Through `set_memlimit`, not `arm_cap` directly, so that the Rust
+        // call graph is the C's: `memory_tracking_init()`
+        // (`src/tool_main.c:117-125`) parses the variable and then calls
+        // `curl_dbg_memlimit()`, which is what `set_memlimit` supersedes. The
+        // two are behaviourally identical -- `set_memlimit(n)` IS
+        // `arm_cap(&LIMIT, n)` -- so this changes no outcome; what it changes is
+        // that the cap has exactly one production entry point instead of a
+        // second private path around it, which is also what stops
+        // `set_memlimit` from being an unreferenced item.
         match memlimit_from_env(std::env::var_os("CURL_MEMLIMIT")) {
-            Some(limit) => arm_cap(&LIMIT, limit),
+            Some(limit) => set_memlimit(limit),
             None => false,
         }
     }
@@ -4618,6 +5010,272 @@ mod tests {
 
         assert!(set_locale_from_environment_with(&accepted));
         assert!(!set_locale_from_environment_with(&refused));
+    }
+
+    // -- the argument vector, src/tool_getparam.c:625-637 -------------------
+
+    /// A pure-Rust [`ArgvCalls`] that records every wipe it is asked for.
+    ///
+    /// The seam that makes `cleanarg` testable at all: Miri has no process
+    /// argument vector, so the whole of the matching rule and the scan are
+    /// driven from here instead and are covered without touching the loader's
+    /// memory.
+    struct FakeArgv {
+        /// The vector, `argv[0]` included, mutated in place by [`Self::wipe`].
+        elements: RefCell<Vec<Vec<u8>>>,
+        /// Every `(index, at, len)` the scan asked for, in order.
+        wipes: RefCell<Vec<(usize, usize, usize)>>,
+    }
+
+    impl FakeArgv {
+        fn new(elements: &[&[u8]]) -> Self {
+            Self {
+                elements: RefCell::new(
+                    elements.iter().map(|item| item.to_vec()).collect(),
+                ),
+                wipes: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn element(&self, index: usize) -> Vec<u8> {
+            self.elements.borrow()[index].clone()
+        }
+    }
+
+    impl ArgvCalls for FakeArgv {
+        fn count(&self) -> usize {
+            self.elements.borrow().len()
+        }
+
+        fn read(&self, index: usize) -> Option<Vec<u8>> {
+            self.elements.borrow().get(index).cloned()
+        }
+
+        fn wipe(&self, index: usize, at: usize, len: usize) {
+            self.wipes.borrow_mut().push((index, at, len));
+            let mut elements = self.elements.borrow_mut();
+            let element = &mut elements[index];
+            assert!(
+                at + len <= element.len(),
+                "a wipe must stay inside the element it was measured against"
+            );
+            for byte in &mut element[at..at + len] {
+                *byte = b'*';
+            }
+        }
+    }
+
+    /// The three spellings C's parser can point into, and the offset each one
+    /// leaves `nextarg` at.
+    #[test]
+    fn every_argument_spelling_wipes_exactly_what_the_c_pointer_covered() {
+        // `--user bob:pw` -- a separate element, wiped whole.
+        assert_eq!(wipe_offset(b"bob:pw", b"bob:pw"), Some(0));
+        // `-ubob:pw` -- C's `nextarg` is `argv[i] + 2`, so `-u` survives.
+        assert_eq!(wipe_offset(b"-ubob:pw", b"bob:pw"), Some(2));
+        // `--user=bob:pw` -- `nextarg` is just past the `=`.
+        assert_eq!(wipe_offset(b"--user=bob:pw", b"bob:pw"), Some(7));
+    }
+
+    /// The rule that keeps the wipe off arguments the parser never pointed
+    /// into.
+    #[test]
+    fn a_value_that_merely_ends_an_unrelated_argument_is_left_alone() {
+        // The regression this guards: `curl https://h/bob:pw -u bob:pw` must
+        // wipe the credential, not the tail of the URL.
+        assert_eq!(wipe_offset(b"https://h/bob:pw", b"bob:pw"), None);
+        // Not a suffix at all.
+        assert_eq!(wipe_offset(b"bob:pw-and-more", b"bob:pw"), None);
+        // Shorter than the value.
+        assert_eq!(wipe_offset(b"pw", b"bob:pw"), None);
+        // `strlen("")` is zero, so C's `memset` writes nothing.
+        assert_eq!(wipe_offset(b"-u", b""), None);
+        assert_eq!(wipe_offset(b"", b""), None);
+    }
+
+    /// Every occurrence is wiped, not just the first.
+    ///
+    /// C holds the parser's pointer and so wipes one location per call. This
+    /// holds only the bytes, and `-u bob:pw --proxy-user bob:pw` is an ordinary
+    /// command line: stopping at the first match would leave the second
+    /// credential legible in `ps`, which is the whole exposure being closed.
+    #[test]
+    fn a_credential_repeated_on_the_command_line_is_wiped_everywhere() {
+        let argv = FakeArgv::new(&[
+            b"curl",
+            b"-u",
+            b"bob:pw",
+            b"--proxy-user",
+            b"bob:pw",
+            b"https://example.com/",
+        ]);
+
+        assert_eq!(scrub_argument_with(&argv, b"bob:pw"), 2);
+        assert_eq!(argv.element(2), b"******".to_vec());
+        assert_eq!(argv.element(4), b"******".to_vec());
+        assert_eq!(argv.element(5), b"https://example.com/".to_vec());
+        assert_eq!(
+            *argv.wipes.borrow(),
+            vec![(2, 0, 6), (4, 0, 6)],
+            "each wipe covers exactly the value's bytes"
+        );
+    }
+
+    /// `argv[0]` is the program name and C's parser never points into it.
+    #[test]
+    fn the_program_name_is_never_wiped() {
+        let argv = FakeArgv::new(&[b"-ubob:pw", b"--url", b"https://h/"]);
+
+        assert_eq!(scrub_argument_with(&argv, b"bob:pw"), 0);
+        assert_eq!(argv.element(0), b"-ubob:pw".to_vec());
+        assert!(argv.wipes.borrow().is_empty());
+    }
+
+    /// The glued forms keep their option text, byte for byte as C leaves it.
+    #[test]
+    fn a_glued_option_keeps_its_flag_and_loses_only_the_value() {
+        let argv =
+            FakeArgv::new(&[b"curl", b"-ubob:pw", b"--proxy-user=bob:pw"]);
+
+        assert_eq!(scrub_argument_with(&argv, b"bob:pw"), 2);
+        assert_eq!(argv.element(1), b"-u******".to_vec());
+        assert_eq!(argv.element(2), b"--proxy-user=******".to_vec());
+    }
+
+    /// An empty vector -- the state Miri and any uncaptured platform are in --
+    /// is a no-op that reports itself as one.
+    #[test]
+    fn an_absent_vector_is_a_no_op_that_reports_zero() {
+        let argv = FakeArgv::new(&[]);
+        assert_eq!(scrub_argument_with(&argv, b"bob:pw"), 0);
+
+        // And an empty value writes nothing even when the vector is there,
+        // matching `memset(str, '*', strlen(""))`.
+        let present = FakeArgv::new(&[b"curl", b"-u", b""]);
+        assert_eq!(scrub_argument_with(&present, b""), 0);
+        assert!(present.wipes.borrow().is_empty());
+    }
+
+    /// A value that is not valid UTF-8 is wiped like any other.
+    ///
+    /// `--user` takes arbitrary bytes on all four mandated targets, so a
+    /// credential that Unicode cannot spell must not be the one that stays
+    /// visible in `ps`.
+    #[test]
+    fn an_undecodable_credential_is_wiped_too() {
+        let argv = FakeArgv::new(&[b"curl", b"-u", b"bob:\xff\xfe"]);
+
+        assert_eq!(scrub_argument_with(&argv, b"bob:\xff\xfe"), 1);
+        assert_eq!(argv.element(2), b"******".to_vec());
+    }
+
+    /// The capture really ran in this process.
+    ///
+    /// The mechanism is a `.init_array` entry in an rlib, which survives only
+    /// because of `#[used]`; this is the assertion that would fail if a future
+    /// toolchain or linker flag discarded it. Reading element `0` also proves
+    /// the pointer is dereferenceable, not merely non-null.
+    ///
+    /// Ignored under Miri, which does not model a process argument vector and
+    /// for which the constructor is deliberately not compiled.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri models no process argument vector")]
+    fn the_real_argument_vector_was_captured() {
+        assert!(
+            RealArgv.count() > 0,
+            "the .init_array capture did not run -- see CAPTURE_ARGV"
+        );
+
+        let program = RealArgv
+            .read(0)
+            .expect("argv[0] is always present in a real process");
+        assert!(!program.is_empty());
+
+        // Past the end reports absence rather than reading out of bounds.
+        assert_eq!(RealArgv.read(RealArgv.count()), None);
+
+        // A value no command line can contain changes nothing, which exercises
+        // the real read path without mutating this process.
+        assert_eq!(scrub_argument(b"\x01curl-rs-no-such-argument\x01"), 0);
+    }
+
+    /// The environment variable that puts the round-trip test below into its
+    /// child role.
+    const ARGV_PROBE_ROLE: &str = "CURL_RS_ARGV_SCRUB_PROBE";
+
+    /// The argument the child is given, and then wipes out of its own vector.
+    const ARGV_PROBE_VALUE: &str = "curl-rs-argv-scrub-probe-value";
+
+    /// Printed by the child once it has observed the wipe.
+    const ARGV_PROBE_DONE: &str = "argv-scrub-probe-ok";
+
+    /// The end-to-end assertion: a real argument, in a real process, really
+    /// overwritten.
+    ///
+    /// Every other test above drives the seam. This one drives the platform,
+    /// and it is the only way to prove the write lands, because the memory it
+    /// writes belongs to the process that owns it. The test re-executes this
+    /// same test binary with [`ARGV_PROBE_VALUE`] as an extra filter -- so the
+    /// value becomes a genuine element of the child's `argv` -- and the child
+    /// then scrubs it and reads the element back through [`RealArgv`].
+    ///
+    /// `--exact` with the test's own name is what keeps the child running one
+    /// test rather than the whole suite, and the printed marker is what
+    /// distinguishes "the child ran and observed the wipe" from "the child
+    /// filtered everything out and exited successfully".
+    ///
+    /// Ignored under Miri: it spawns a process and mutates the loader's memory,
+    /// neither of which Miri models.
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns a process and writes to argv")]
+    fn a_real_argument_is_overwritten_in_this_process() {
+        if std::env::var_os(ARGV_PROBE_ROLE).is_some() {
+            // The child. Its own `argv` carries the probe value as one element.
+            let at = (1..RealArgv.count())
+                .find(|index| {
+                    RealArgv.read(*index).as_deref()
+                        == Some(ARGV_PROBE_VALUE.as_bytes())
+                })
+                .expect("the parent passed the probe value as an argument");
+
+            assert_eq!(scrub_argument(ARGV_PROBE_VALUE.as_bytes()), 1);
+
+            let after = RealArgv
+                .read(at)
+                .expect("the element is still a valid C string");
+            assert_eq!(
+                after,
+                vec![b'*'; ARGV_PROBE_VALUE.len()],
+                "the value must be asterisks of its own length, terminator \
+                 untouched"
+            );
+            println!("{ARGV_PROBE_DONE}");
+            return;
+        }
+
+        // The parent.
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "ffi::sys::tests::a_real_argument_is_overwritten_in_this_process",
+                "--nocapture",
+                ARGV_PROBE_VALUE,
+            ])
+            .env(ARGV_PROBE_ROLE, "1")
+            .output()
+            .expect("the test binary is executable");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(ARGV_PROBE_DONE),
+            "the child never reached the assertion: {stdout}"
+        );
     }
 
     // -- the real implementations -------------------------------------------

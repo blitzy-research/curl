@@ -2196,37 +2196,115 @@ impl VerifyPolicy {
 
 // The one dangerous path: supersedes `cr_verify_none`, rustls.c:377-385
 
-/// The certificate verifier that verifies no certificate.
+/// Whether a rustls error is the name check, and only the name check.
 ///
-/// The exact Rust equivalent of C `cr_verify_none`
-/// (`lib/vtls/rustls.c:377-385`):
+/// `CURLOPT_SSL_VERIFYHOST` turns the subject-name check off while leaving the
+/// chain check on, and rustls has no builder for that combination: its
+/// `WebPkiServerVerifier` does both in one call. The combination is therefore
+/// assembled by running that verifier and discarding exactly this one class of
+/// failure -- which is safe only if the class is recognised precisely, so the
+/// test is written against the two variants rustls defines and nothing wider.
 ///
-/// ```c
-/// static uint32_t cr_verify_none(void *userdata,
-///                               const rustls_verify_server_cert_params *p)
-/// {
-///   (void)userdata;
-///   (void)p;
-///   return RUSTLS_RESULT_OK;
-/// }
-/// ```
-#[derive(Debug)]
-struct NoVerification {
-    provider: Arc<CryptoProvider>,
+/// [`rustls::CertificateError::NotValidForNameContext`] is documented as
+/// *"semantically the same as `NotValidForName`, but includes extra
+/// context"* (`rustls-0.23.42/src/error.rs:464-466`), so both are the name
+/// check and both are discarded. `Other`, `Expired`, `Revoked`,
+/// `UnknownIssuer`, `BadSignature` and every remaining variant are chain or
+/// validity failures and are propagated: with `VERIFYPEER` on, an untrusted
+/// issuer must still fail.
+fn is_name_mismatch(error: &rustls::Error) -> bool {
+    matches!(
+        error,
+        rustls::Error::InvalidCertificate(
+            rustls::CertificateError::NotValidForName
+                | rustls::CertificateError::NotValidForNameContext { .. }
+        )
+    )
 }
 
-impl ServerCertVerifier for NoVerification {
-    /// Returns the assertion without looking at anything.
+/// The certificate verifier for the two states web-PKI cannot express.
+///
+/// `CURLOPT_SSL_VERIFYPEER` and `CURLOPT_SSL_VERIFYHOST` are independent in
+/// the C -- `lib/setopt.c:723` writes `verifyhost` without consulting
+/// `verifypeer`, and `lib/vtls/openssl.c`'s `Curl_ossl_check_peer_cert` runs
+/// `ossl_verifyhost` under `if(conn_config->verifyhost)` alone -- so there are
+/// four states, not two. Two of them are `WebPkiServerVerifier`'s business
+/// (`verify_host` decides only whether the caller also runs
+/// [`verify_hostname`] afterwards); the other two land here:
+///
+/// * `chain_only: None` -- verify nothing about the certificate. This is the
+///   exact Rust equivalent of C `cr_verify_none`
+///   (`lib/vtls/rustls.c:377-385`):
+///
+///   ```c
+///   static uint32_t cr_verify_none(void *userdata,
+///                                 const rustls_verify_server_cert_params *p)
+///   {
+///     (void)userdata;
+///     (void)p;
+///     return RUSTLS_RESULT_OK;
+///   }
+///   ```
+///
+/// * `chain_only: Some(verifier)` -- verify the chain and **not** the name.
+///   The inner verifier is the very one the fully-verifying state uses, built
+///   from the same trust anchors and the same revocation list, so the chain
+///   verdict is identical in both states and `--crlfile` keeps working.
+///   Only [`is_name_mismatch`] failures are discarded.
+///
+/// The handshake signature is verified in both modes, because neither option
+/// disables it -- see [`Self::verify_tls12_signature`]. Those two methods and
+/// [`Self::supported_verify_schemes`] read the injected provider directly,
+/// which is what `WebPkiServerVerifier` does with the same provider, so the
+/// chain-only mode agrees with the fully-verifying state there as well.
+#[derive(Debug)]
+struct RelaxedVerifier {
+    provider: Arc<CryptoProvider>,
+    /// `Some` for `VERIFYPEER=1, VERIFYHOST=0`; `None` for `VERIFYPEER=0`.
+    chain_only: Option<Arc<WebPkiServerVerifier>>,
+}
+
+impl ServerCertVerifier for RelaxedVerifier {
+    /// Verifies as much as the two options ask for, and no more.
     ///
-    /// `return RUSTLS_RESULT_OK;` (`lib/vtls/rustls.c:384`).
+    /// With `chain_only` unset: `return RUSTLS_RESULT_OK;`
+    /// (`lib/vtls/rustls.c:384`), without looking at anything.
+    ///
+    /// With `chain_only` set: the inner web-PKI verifier's verdict, except
+    /// that a name mismatch is not a failure -- which is what
+    /// `CURLOPT_SSL_VERIFYHOST 0` means while `CURLOPT_SSL_VERIFYPEER` is 1.
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        if let Some(verifier) = self.chain_only.as_deref() {
+            match verifier.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ) {
+                // The chain is trusted and the name matched as well. The
+                // assertion the inner verifier returned is discarded rather
+                // than forwarded so that this function has exactly one place
+                // that produces one, which is what
+                // `exactly_one_type_asserts_a_certificate_without_checking_it`
+                // reads.
+                Ok(_verified) => {}
+                // The chain is trusted and the name did not match. That is
+                // precisely the state `VERIFYHOST 0` describes, so it is not
+                // an error here.
+                Err(error) if is_name_mismatch(&error) => {}
+                // Every other failure is a chain or validity failure and
+                // `VERIFYPEER` is on, so it stands.
+                Err(error) => return Err(error),
+            }
+        }
         Ok(ServerCertVerified::assertion())
     }
 
@@ -2271,18 +2349,27 @@ impl ServerCertVerifier for NoVerification {
 
 /// Which verifier a [`ServerVerification`] holds.
 ///
-/// Two variants, because there are exactly two outcomes, and making them a
-/// closed enumeration is what lets [`ServerVerification::install`] hold the
-/// only production `dangerous()` call: the choice is a `match` over a type
+/// Two variants, because rustls offers exactly two installation routes -- its
+/// own web-PKI verifier, or a custom one behind `dangerous()` -- and making
+/// them a closed enumeration is what lets [`ServerVerification::install`] hold
+/// the only production `dangerous()` call: the choice is a `match` over a type
 /// only this module can construct, not a boolean somebody could flip. Test
 /// fixtures in `tls/rustls_backend.rs` call `dangerous()` too, so the claim
 /// is about production paths, not about the whole crate.
+///
+/// Two variants, four states. The `VERIFYPEER`/`VERIFYHOST` pair has four
+/// settings and [`RelaxedVerifier`] covers three of them between its two
+/// modes; which state a `Relaxed` value represents is read from that
+/// verifier's own `chain_only` field and from
+/// [`ServerVerification::host_verification_enabled`], never inferred from the
+/// variant.
 #[derive(Debug)]
 enum ServerVerifierKind {
     /// Full web-PKI verification, with revocation checking when configured.
     WebPki(Arc<WebPkiServerVerifier>),
-    /// [`NoVerification`]: `--insecure`, and nothing else.
-    NoVerification(Arc<NoVerification>),
+    /// [`RelaxedVerifier`]: `VERIFYPEER 0`, or `VERIFYPEER 1` with
+    /// `VERIFYHOST 0`.
+    Relaxed(Arc<RelaxedVerifier>),
 }
 
 /// A built server-certificate verifier, plus what the caller must report.
@@ -2302,8 +2389,30 @@ pub(crate) struct ServerVerification {
 impl ServerVerification {
     /// Builds the verifier a policy calls for.
     ///
-    /// The single branch that decides everything, and the successor of
-    /// `lib/vtls/rustls.c:1032-1053`:
+    /// # Four states, not two
+    ///
+    /// `CURLOPT_SSL_VERIFYPEER` and `CURLOPT_SSL_VERIFYHOST` are independent
+    /// options and the C keeps them independent. `lib/setopt.c:723` writes
+    /// `verifyhost` without reading `verifypeer`, and `Curl_ossl_check_peer_cert`
+    /// (`lib/vtls/openssl.c`) runs the chain verdict under `verifypeer` and
+    /// `ossl_verifyhost` under `if(conn_config->verifyhost)`, each on its own.
+    /// `lib/vtls/schannel.c:1469` goes further and spells the mixed case out as
+    /// `if(!verifypeer && verifyhost)`. So all four combinations are reachable
+    /// through the public API and each is answered here:
+    ///
+    /// | `VERIFYPEER` | `VERIFYHOST` | chain | name |
+    /// |---|---|---|---|
+    /// | 1 | 1 | web-PKI | web-PKI during the handshake, and [`verify_hostname`] after it |
+    /// | 1 | 0 | web-PKI | not checked |
+    /// | 0 | 1 | not checked | [`verify_hostname`] after the handshake |
+    /// | 0 | 0 | not checked | not checked |
+    ///
+    /// The third row is the one that has no rustls builder at all and the one a
+    /// two-state reading loses: switching the chain off must not switch the
+    /// name check off with it, because `--insecure` and
+    /// `--no-check-certificate`-style host relaxation are separate requests.
+    ///
+    /// `lib/vtls/rustls.c:1032-1053` is the C this supersedes:
     ///
     /// ```c
     /// if(!conn_config->verifypeer) {
@@ -2312,6 +2421,13 @@ impl ServerVerification {
     /// }
     /// else if(...) { /* trust sources */ }
     /// ```
+    ///
+    /// That branch reads `verifypeer` only because the rustls-ffi backend has
+    /// no way to express row two, and `lib/vtls/rustls.c` therefore leaves the
+    /// name check to `Curl_ossl_check_peer_cert`'s equivalent in the shared
+    /// layer. The shape here is the same: the chain decision is made at
+    /// configuration time and the name decision is carried in
+    /// [`Self::host_verification_enabled`] for the caller to act on.
     ///
     /// # Errors
     ///
@@ -2322,18 +2438,28 @@ impl ServerVerification {
         policy: &VerifyPolicy,
         provider: &Arc<CryptoProvider>,
     ) -> CurlResult<Self> {
-        if policy.verify_peer {
-            Self::web_pki(policy, provider)
-        } else {
-            Ok(Self::insecure_disable_peer_verification(policy, provider))
+        match (policy.verify_peer, policy.verify_host) {
+            (true, true) => Self::web_pki(policy, provider),
+            (true, false) => Self::chain_without_name(policy, provider),
+            // The name decision is carried through unchanged: with the chain
+            // switched off, `verify_host` still decides whether the caller
+            // runs `verify_hostname`.
+            (false, verify_host) => Ok(
+                Self::insecure_disable_peer_verification(provider, verify_host),
+            ),
         }
     }
 
-    /// The verifying path: web-PKI against the policy's trust anchors.
-    fn web_pki(
+    /// The web-PKI verifier both verifying states share.
+    ///
+    /// Extracted so that `VERIFYPEER=1, VERIFYHOST=1` and
+    /// `VERIFYPEER=1, VERIFYHOST=0` cannot diverge on trust anchors, on
+    /// revocation, or on the codes a failed build reports: the chain verdict is
+    /// the same object in both, and only the name check differs.
+    fn web_pki_verifier(
         policy: &VerifyPolicy,
         provider: &Arc<CryptoProvider>,
-    ) -> CurlResult<Self> {
+    ) -> CurlResult<Arc<WebPkiServerVerifier>> {
         let roots = Arc::new(build_root_store(policy)?);
         let mut builder = WebPkiServerVerifier::builder_with_provider(
             roots,
@@ -2343,7 +2469,7 @@ impl ServerVerification {
             builder = builder.with_crls(load_crls(path)?);
         }
 
-        let verifier = builder.build().map_err(|error| match error {
+        builder.build().map_err(|error| match error {
             VerifierBuilderError::InvalidCrl(_) => Error::with_context(
                 CURLcode::SslCrlBadfile,
                 "rustls: failed to parse revocation list",
@@ -2355,29 +2481,64 @@ impl ServerVerification {
                 CURLcode::SslCacertBadfile,
                 "rustls: failed to build certificate verifier",
             ),
-        })?;
+        })
+    }
 
+    /// The fully verifying path: web-PKI against the policy's trust anchors,
+    /// with the name checked as well. `VERIFYPEER=1, VERIFYHOST=1`.
+    fn web_pki(
+        policy: &VerifyPolicy,
+        provider: &Arc<CryptoProvider>,
+    ) -> CurlResult<Self> {
         Ok(Self {
-            kind: ServerVerifierKind::WebPki(verifier),
+            kind: ServerVerifierKind::WebPki(Self::web_pki_verifier(
+                policy, provider,
+            )?),
             peer_verification_disabled: false,
             verify_host: policy.verify_host,
         })
     }
 
-    /// Builds the UNVERIFIED configuration. `--insecure`, and nothing else.
-    fn insecure_disable_peer_verification(
+    /// The chain-only path: the same web-PKI verdict, with the subject name
+    /// deliberately not checked. `VERIFYPEER=1, VERIFYHOST=0`.
+    ///
+    /// The inner verifier is built exactly as [`Self::web_pki`] builds it --
+    /// same anchors, same `--crlfile` -- and wrapped so that a name mismatch,
+    /// and only a name mismatch, is not a failure. An untrusted issuer, an
+    /// expired certificate or a revoked one still fails, which is what keeps
+    /// `VERIFYHOST 0` from quietly becoming `VERIFYPEER 0`.
+    fn chain_without_name(
         policy: &VerifyPolicy,
         provider: &Arc<CryptoProvider>,
-    ) -> Self {
-        let _ = policy;
-        Self {
-            kind: ServerVerifierKind::NoVerification(Arc::new(
-                NoVerification {
-                    provider: Arc::clone(provider),
-                },
-            )),
-            peer_verification_disabled: true,
+    ) -> CurlResult<Self> {
+        let inner = Self::web_pki_verifier(policy, provider)?;
+        Ok(Self {
+            kind: ServerVerifierKind::Relaxed(Arc::new(RelaxedVerifier {
+                provider: Arc::clone(provider),
+                chain_only: Some(inner),
+            })),
+            peer_verification_disabled: false,
             verify_host: false,
+        })
+    }
+
+    /// Builds the configuration whose chain is UNVERIFIED. `VERIFYPEER=0`.
+    ///
+    /// `verify_host` is the policy's own value, not `false`: `--insecure` in
+    /// the tool sets both options together, but the library API can set either
+    /// alone, and a caller that asked for the name to be checked gets the name
+    /// checked. See [`Self::build`]'s table, row three.
+    fn insecure_disable_peer_verification(
+        provider: &Arc<CryptoProvider>,
+        verify_host: bool,
+    ) -> Self {
+        Self {
+            kind: ServerVerifierKind::Relaxed(Arc::new(RelaxedVerifier {
+                provider: Arc::clone(provider),
+                chain_only: None,
+            })),
+            peer_verification_disabled: true,
+            verify_host,
         }
     }
 
@@ -2390,7 +2551,10 @@ impl ServerVerification {
     /// Whether the caller is to run [`verify_hostname`] on the peer
     /// certificate.
     ///
-    /// Always `false` when [`Self::peer_verification_disabled`] is `true`.
+    /// This is `CURLOPT_SSL_VERIFYHOST` and nothing else. It is **independent**
+    /// of [`Self::peer_verification_disabled`]: `VERIFYPEER 0` with
+    /// `VERIFYHOST 1` reports `true` here, and that state is the whole reason
+    /// the two are stored separately.
     pub(crate) const fn host_verification_enabled(&self) -> bool {
         self.verify_host
     }
@@ -2403,7 +2567,7 @@ impl ServerVerification {
             // object by the match's own type. `Arc::clone` cannot infer
             // that target, which is why this is a method call.
             ServerVerifierKind::WebPki(verifier) => verifier.clone(),
-            ServerVerifierKind::NoVerification(verifier) => verifier.clone(),
+            ServerVerifierKind::Relaxed(verifier) => verifier.clone(),
         }
     }
 
@@ -2417,7 +2581,7 @@ impl ServerVerification {
             ServerVerifierKind::WebPki(verifier) => {
                 builder.with_webpki_verifier(Arc::clone(verifier))
             }
-            ServerVerifierKind::NoVerification(verifier) => builder
+            ServerVerifierKind::Relaxed(verifier) => builder
                 .dangerous()
                 .with_custom_certificate_verifier(verifier.clone()),
         }
@@ -2881,17 +3045,108 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
-    fn the_insecure_policy_drops_the_hostname_check_with_the_chain() {
+    fn peer_verification_off_keeps_the_hostname_check_the_caller_asked_for() {
+        // `CURLOPT_SSL_VERIFYPEER 0` with `CURLOPT_SSL_VERIFYHOST 1` (or 2).
+        // `lib/setopt.c:723` writes `verifyhost` without consulting
+        // `verifypeer`, and `lib/vtls/schannel.c:1469` spells this exact pair
+        // out as `if(!verifypeer && verifyhost)`, so the state is reachable
+        // through the public API and the name check must survive.
         let policy = VerifyPolicy::new()
             .with_peer_verification(false)
             .with_host_verification(true);
         let built = ServerVerification::build(&policy, &provider())
             .expect("the insecure path cannot fail");
         assert!(
-            !built.host_verification_enabled(),
-            "comparing names against an unverified issuer establishes \
-             nothing, and curl clears verifyhost with verifypeer"
+            built.peer_verification_disabled(),
+            "the chain is not verified in this state"
         );
+        assert!(
+            built.host_verification_enabled(),
+            "VERIFYHOST is a separate option from VERIFYPEER: clearing it \
+             with VERIFYPEER would silently ignore what the caller asked \
+             for, and curl's own backends do not"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
+    fn both_options_off_checks_neither_the_chain_nor_the_name() {
+        let policy = VerifyPolicy::new()
+            .with_peer_verification(false)
+            .with_host_verification(false);
+        let built = ServerVerification::build(&policy, &provider())
+            .expect("the insecure path cannot fail");
+        assert!(built.peer_verification_disabled());
+        assert!(!built.host_verification_enabled());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
+    fn peer_verification_on_with_the_name_check_off_still_verifies_the_chain() {
+        // `CURLOPT_SSL_VERIFYPEER 1` with `CURLOPT_SSL_VERIFYHOST 0`: the
+        // fourth state, and the one rustls has no builder for. The chain must
+        // still be verified, so this must NOT report peer verification
+        // disabled -- reporting it would print the `--insecure` warning for a
+        // connection that does verify its issuer.
+        let policy = VerifyPolicy::new()
+            .with_peer_verification(true)
+            .with_host_verification(false);
+        let built = ServerVerification::build(&policy, &provider())
+            .expect("the bundled roots build a verifier");
+        assert!(
+            !built.peer_verification_disabled(),
+            "the chain IS verified in this state, so no --insecure warning \
+             is due"
+        );
+        assert!(
+            !built.host_verification_enabled(),
+            "the name is the one thing this state does not check"
+        );
+    }
+
+    #[test]
+    fn a_name_mismatch_is_recognised_and_nothing_wider_is() {
+        use rustls::CertificateError;
+
+        // The two variants that ARE the name check. `NotValidForNameContext`
+        // is documented as semantically the same as `NotValidForName` with
+        // extra context, so both must be recognised.
+        for error in [
+            rustls::Error::InvalidCertificate(
+                CertificateError::NotValidForName,
+            ),
+            rustls::Error::InvalidCertificate(
+                CertificateError::NotValidForNameContext {
+                    expected: ServerName::try_from("example.com")
+                        .expect("a literal name parses")
+                        .to_owned(),
+                    presented: vec!["other.example".to_owned()],
+                },
+            ),
+        ] {
+            assert!(
+                is_name_mismatch(&error),
+                "VERIFYHOST 0 must discard this: {error:?}"
+            );
+        }
+
+        // Everything else is a chain or validity failure and must stand,
+        // because VERIFYPEER is on whenever `is_name_mismatch` is consulted.
+        for error in [
+            rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer),
+            rustls::Error::InvalidCertificate(CertificateError::Expired),
+            rustls::Error::InvalidCertificate(CertificateError::Revoked),
+            rustls::Error::InvalidCertificate(CertificateError::BadSignature),
+            rustls::Error::InvalidCertificate(CertificateError::BadEncoding),
+            rustls::Error::InvalidCertificate(CertificateError::NotValidYet),
+            rustls::Error::NoCertificatesPresented,
+            rustls::Error::DecryptError,
+        ] {
+            assert!(
+                !is_name_mismatch(&error),
+                "VERIFYHOST 0 must NOT discard this: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -2954,7 +3209,7 @@ mod tests {
         assert_eq!(
             assertions.len(),
             1,
-            "only NoVerification may assert a certificate. Sites: \
+            "only RelaxedVerifier may assert a certificate. Sites: \
              {assertions:?}"
         );
 

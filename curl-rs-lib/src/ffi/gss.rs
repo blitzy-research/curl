@@ -93,18 +93,55 @@ use core::ffi::{c_int, c_void};
 use std::sync::OnceLock;
 
 // Protection levels
+//
+// # The RFC 4752 bitmask, and why all three carry an allowance
+//
+// `lib/curl_gssapi.h:65-67` declares these three, and the whole C tree reads
+// them in exactly one place: `lib/vauth/krb5_gssapi.c:234` and `:239`, inside
+// `Curl_auth_create_gssapi_security_message`. That is the SASL GSSAPI path, and
+// its only callers are SMTP, IMAP and POP3 -- which AAP section 0.2.2 excludes
+// from implementation outright (5,151 lines across the three). There is
+// therefore no in-scope production consumer, and there cannot be one under this
+// plan; the constants are the protocol's vocabulary rather than this crate's
+// code.
+//
+// Two of the three are not even read by the C. Measured:
+// `grep -rn GSSAUTH_P_ lib/ src/` finds `GSSAUTH_P_NONE` twice and
+// `GSSAUTH_P_INTEGRITY` and `GSSAUTH_P_PRIVACY` nowhere outside their own
+// `#define`s. They exist in the header to make the bitmask complete, and they
+// exist here for the same reason.
+//
+// The allowance is PER ITEM, never on the module: a module-level attribute
+// would silence the next unreferenced item somebody adds, and
+// `curl-rs-lib/src/lib.rs` (`mod source_policy`) enforces that distinction as a
+// test. `protection_level_constants_match_the_c_header` pins all three values
+// against the header, so an allowance here suppresses a lint, not a check.
+//
+// Note also what these are NOT: they are not the SOCKS5 protection levels.
+// Those are the separate RFC 1961 encoding declared further down as
+// `SOCKS5_PROTECTION_*`, whose values are 0, 1 and 2 rather than 1, 2 and 4,
+// and which `socks5_protection_level` really does compute.
 
 /// No per-message protection. `GSSAUTH_P_NONE` -- `lib/curl_gssapi.h:65`.
+///
+/// The one constant of the three that the C reads, at
+/// `lib/vauth/krb5_gssapi.c:234`: the server's offered bitmask must include it,
+/// because curl supports no security layer. Out of scope with SASL; see above.
+#[allow(dead_code)]
 pub(crate) const GSSAUTH_P_NONE: u8 = 1;
 
 /// Integrity protection. `GSSAUTH_P_INTEGRITY` -- `lib/curl_gssapi.h:66`.
 ///
 /// Declared by the C header and carried here for completeness of the RFC 4752
 /// bitmask; curl never requests a security layer, so it only ever appears as a
-/// bit a server offered.
+/// bit a server offered. Read nowhere in the C tree; see above.
+#[allow(dead_code)]
 pub(crate) const GSSAUTH_P_INTEGRITY: u8 = 2;
 
 /// Confidentiality protection. `GSSAUTH_P_PRIVACY` -- `lib/curl_gssapi.h:67`.
+///
+/// Read nowhere in the C tree either; see above.
+#[allow(dead_code)]
 pub(crate) const GSSAUTH_P_PRIVACY: u8 = 4;
 
 /// The warning C emits when the platform GSS-API lacks

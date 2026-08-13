@@ -71,6 +71,8 @@
 
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use curl_rs_lib::mime::{
@@ -839,28 +841,35 @@ pub unsafe extern "C" fn curl_mime_addpart(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Undecodable;
 
-/// A caller's NUL-terminated string as UTF-8, or the reason it is not usable.
+/// A caller's NUL-terminated string as the bytes it is.
 ///
-/// `Err(Undecodable)` is a non-null string that is not valid UTF-8. **This is
-/// the one place this module is narrower than the C**, which stores arbitrary
-/// bytes.
-/// The engine's setters take `&str`, and its own `MimePart::set_file`
-/// establishes the precedent by answering `CURLcode::BadFunctionArgument` for a
-/// path it cannot decode. The alternative -- a lossy conversion -- would put
-/// replacement characters on the wire, and the wire form is frozen. Every
-/// affected field is ASCII in practice: a mime field name, a remote filename
-/// and a content type all are, and `curl_mime_data` is unaffected because it
-/// takes bytes rather than a string.
+/// # Why this is not a `&str`, and what changed
+///
+/// Three of the four string setters -- `curl_mime_name`, `curl_mime_filename`
+/// and `curl_mime_type` -- put their argument on the wire verbatim, inside a
+/// `Content-Disposition` or a `Content-Type`. The C stores each with `strdup`
+/// and emits it back byte for byte, so a field name or a filename that is not
+/// valid UTF-8 still reaches the peer unchanged.
+///
+/// This function used to decode instead, and answered
+/// `CURLE_BAD_FUNCTION_ARGUMENT` for anything it could not read as text. That
+/// rejected a call the C accepts, on a surface whose signature is frozen: a
+/// program built against curl 8.x and relinked against this library would see a
+/// working `curl_mime_name` begin to fail. The engine's setters now take bytes,
+/// so no conversion exists here at all and there is nothing to reject.
+///
+/// The fourth setter, `curl_mime_encoder`, still decodes -- through
+/// [`borrowed_str`] -- because its argument is not carried anywhere: it selects
+/// one of five ASCII names, and a byte string that is not UTF-8 matches none of
+/// them, which is exactly the answer the C gives.
 ///
 /// # Safety
 ///
 /// `text` must be either null or a pointer to a NUL-terminated string that
 /// stays valid and unmodified for the duration of the call.
-unsafe fn borrowed_str(
-    text: *const c_char,
-) -> Result<Option<&'static str>, Undecodable> {
+unsafe fn borrowed_bytes(text: *const c_char) -> Option<&'static [u8]> {
     if text.is_null() {
-        return Ok(None);
+        return None;
     }
     // SAFETY: non-null by the check above and, by contract, a NUL-terminated
     // string that stays valid for the call -- which is `CStr::from_ptr`'s
@@ -868,7 +877,31 @@ unsafe fn borrowed_str(
     // borrow checker; every caller consumes the result inside its own body,
     // before returning to C, and none stores it.
     let cstr = unsafe { CStr::from_ptr(text) };
-    cstr.to_str().map(Some).map_err(|_| Undecodable)
+    // `to_bytes` excludes the terminator, which is `strlen`'s extent and the
+    // extent the C's `strdup` copies.
+    Some(cstr.to_bytes())
+}
+
+/// A caller's NUL-terminated string as UTF-8, or the reason it is not usable.
+///
+/// The sole consumer is [`curl_mime_encoder`], whose argument is matched
+/// against a fixed vocabulary of five ASCII names rather than stored: see
+/// [`borrowed_bytes`] for why every other setter takes bytes.
+///
+/// # Safety
+///
+/// As [`borrowed_bytes`].
+unsafe fn borrowed_str(
+    text: *const c_char,
+) -> Result<Option<&'static str>, Undecodable> {
+    // SAFETY: `text` is this function's own contract, forwarded unchanged.
+    let bytes = unsafe { borrowed_bytes(text) };
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    std::str::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| Undecodable)
 }
 
 /// Sets a mime part's field name.
@@ -893,21 +926,17 @@ pub unsafe extern "C" fn curl_mime_name(
 ) -> CURLcode {
     guard(CURLcode::CURLE_FAILED_INIT, || {
         // SAFETY: both pointers reach their documented consumers unchanged;
-        // this function's contract is `with_part`'s and `borrowed_str`'s
+        // this function's contract is `with_part`'s and `borrowed_bytes`'s
         // together.
         unsafe {
             with_part(part, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT, |target| {
-                match borrowed_str(name) {
-                    Ok(text) => {
-                        target.set_name(text);
-                        CURLcode::CURLE_OK
-                    }
-                    Err(Undecodable) => {
-                        // The C clears the field before it looks at the
-                        // argument, so the clearing happens on this path too.
-                        target.set_name(None);
-                        CURLcode::CURLE_BAD_FUNCTION_ARGUMENT
-                    }
+                match target.set_name(borrowed_bytes(name)) {
+                    Ok(()) => CURLcode::CURLE_OK,
+                    // The engine's own `CURLE_OUT_OF_MEMORY`, which is the C's
+                    // answer when its `curlx_strdup` returns null. The field is
+                    // left CLEARED on that path, exactly as the C leaves it,
+                    // because the clearing precedes the copy.
+                    Err(code) => CURLcode::from(code),
                 }
             })
         }
@@ -931,18 +960,16 @@ pub unsafe extern "C" fn curl_mime_filename(
 ) -> CURLcode {
     guard(CURLcode::CURLE_FAILED_INIT, || {
         // SAFETY: as `curl_mime_name`; the two pointers reach `with_part` and
-        // `borrowed_str` unchanged.
+        // `borrowed_bytes` unchanged.
         unsafe {
             with_part(part, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT, |target| {
-                match borrowed_str(filename) {
-                    Ok(text) => {
-                        target.set_filename(text);
-                        CURLcode::CURLE_OK
-                    }
-                    Err(Undecodable) => {
-                        target.set_filename(None);
-                        CURLcode::CURLE_BAD_FUNCTION_ARGUMENT
-                    }
+                match target.set_filename(borrowed_bytes(filename)) {
+                    Ok(()) => CURLcode::CURLE_OK,
+                    // The engine's own `CURLE_OUT_OF_MEMORY`, which is the C's
+                    // answer when its `curlx_strdup` returns null. The field is
+                    // left CLEARED on that path, exactly as the C leaves it,
+                    // because the clearing precedes the copy.
+                    Err(code) => CURLcode::from(code),
                 }
             })
         }
@@ -964,18 +991,16 @@ pub unsafe extern "C" fn curl_mime_type(
 ) -> CURLcode {
     guard(CURLcode::CURLE_FAILED_INIT, || {
         // SAFETY: as `curl_mime_name`; the two pointers reach `with_part` and
-        // `borrowed_str` unchanged.
+        // `borrowed_bytes` unchanged.
         unsafe {
             with_part(part, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT, |target| {
-                match borrowed_str(mimetype) {
-                    Ok(text) => {
-                        target.set_type(text);
-                        CURLcode::CURLE_OK
-                    }
-                    Err(Undecodable) => {
-                        target.set_type(None);
-                        CURLcode::CURLE_BAD_FUNCTION_ARGUMENT
-                    }
+                match target.set_type(borrowed_bytes(mimetype)) {
+                    Ok(()) => CURLcode::CURLE_OK,
+                    // The engine's own `CURLE_OUT_OF_MEMORY`, which is the C's
+                    // answer when its `curlx_strdup` returns null. The field is
+                    // left CLEARED on that path, exactly as the C leaves it,
+                    // because the clearing precedes the copy.
+                    Err(code) => CURLcode::from(code),
                 }
             })
         }
@@ -1106,16 +1131,17 @@ pub unsafe extern "C" fn curl_mime_filedata(
 ) -> CURLcode {
     guard(CURLcode::CURLE_FAILED_INIT, || {
         // SAFETY: as `curl_mime_name`; the two pointers reach `with_part` and
-        // `borrowed_str` unchanged.
+        // `borrowed_bytes` unchanged.
         unsafe {
             with_part(part, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT, |target| {
-                let Ok(text) = borrowed_str(filename) else {
-                    // The C clears the content before it looks at the path, so
-                    // the clearing happens on this path too.
-                    target.set_data(None);
-                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
-                };
-                match target.set_file(text.map(Path::new)) {
+                // The path is viewed, not decoded: `OsStr::from_bytes` is a
+                // lossless view of a platform string on the mandated targets.
+                // A `Path::new(str)` conversion stood here behind
+                // `borrowed_str` and refused every path the local filesystem
+                // accepts and Unicode cannot spell -- a file the C uploads.
+                let path = borrowed_bytes(filename)
+                    .map(|bytes| Path::new(OsStr::from_bytes(bytes)));
+                match target.set_file(path) {
                     Ok(()) => CURLcode::CURLE_OK,
                     Err(code) => CURLcode::from(code),
                 }
@@ -2403,10 +2429,12 @@ mod tests {
     }
 
     #[test]
-    fn a_non_utf8_string_argument_is_rejected_after_the_c_s_clearing() {
-        // The one documented narrowing: the engine's setters take `&str`. The
-        // clearing the C performs first still happens, so the part is left in
-        // the state the C leaves it in.
+    fn a_non_utf8_string_argument_is_stored_rather_than_refused() {
+        // The C stores each of these with `strdup` and emits it back byte for
+        // byte, so a field name, a remote filename or a media type that is not
+        // valid UTF-8 is accepted and carried. These three answered
+        // `CURLE_BAD_FUNCTION_ARGUMENT` while the engine's setters took `&str`,
+        // which refused a call curl 8.x accepts on a frozen surface.
         let mime = init();
         let part = addpart(mime);
         let invalid: [c_char; 3] = [-1_i8 as c_char, -2_i8 as c_char, 0];
@@ -2415,28 +2443,74 @@ mod tests {
         unsafe {
             assert_eq!(
                 curl_mime_name(part, invalid.as_ptr()),
-                CURLcode::CURLE_BAD_FUNCTION_ARGUMENT
+                CURLcode::CURLE_OK
             );
             assert_eq!(
                 curl_mime_filename(part, invalid.as_ptr()),
-                CURLcode::CURLE_BAD_FUNCTION_ARGUMENT
+                CURLcode::CURLE_OK
             );
             assert_eq!(
                 curl_mime_type(part, invalid.as_ptr()),
-                CURLcode::CURLE_BAD_FUNCTION_ARGUMENT
+                CURLcode::CURLE_OK
             );
+        }
+
+        // And the bytes reached the part unaltered -- not replaced, not
+        // dropped. Read back through `with_part`, which is how this module
+        // resolves an opaque handle: `curl_mimepart *` is a record in the
+        // root's table and NOT a `MimePart` address, so casting it would be
+        // reading the wrong object. Its fallback must be `Copy`, so the three
+        // answers land in a fixed buffer rather than in allocations.
+        let mut stored = [[0_u8; 2]; 3];
+        // SAFETY: `part` was returned by `addpart` for a live tree, which is
+        // `with_part`'s contract.
+        let read = unsafe {
+            with_part(part, false, |target| {
+                for (slot, field) in stored.iter_mut().zip([
+                    target.name(),
+                    target.filename(),
+                    target.mime_type(),
+                ]) {
+                    match field {
+                        Some(bytes) if bytes.len() == 2 => {
+                            slot.copy_from_slice(bytes);
+                        }
+                        _ => return false,
+                    }
+                }
+                true
+            })
+        };
+        assert!(read, "every field must hold exactly the two bytes supplied");
+        for (field, value) in ["name", "filename", "type"].iter().zip(&stored) {
+            assert_eq!(
+                value, b"\xff\xfe",
+                "{field} must carry the caller's bytes unaltered"
+            );
+        }
+
+        // SAFETY: as above.
+        unsafe {
+            // The encoder is the one argument that is MATCHED rather than
+            // stored, against five ASCII names. A byte string that is not
+            // UTF-8 matches none of them, which is the C's own unmatched
+            // answer, so this one is unchanged.
             assert_eq!(
                 curl_mime_encoder(part, invalid.as_ptr()),
                 CURLcode::CURLE_BAD_FUNCTION_ARGUMENT
             );
+            // And the path is now attempted rather than pre-refused, so the
+            // answer is the one a non-existent file gets: `CURLE_READ_ERROR`,
+            // which is what `curl_mime_filedata` reports for a path it cannot
+            // stat (`lib/mime.c:1313-1315`). It is emphatically NOT
+            // `CURLE_BAD_FUNCTION_ARGUMENT`, which was the old pre-refusal.
             assert_eq!(
                 curl_mime_filedata(part, invalid.as_ptr()),
-                CURLcode::CURLE_BAD_FUNCTION_ARGUMENT
+                CURLcode::CURLE_READ_ERROR
             );
         }
 
-        // The part is still usable afterwards, which the C's unconditional
-        // clearing also leaves true.
+        // The part is still usable afterwards.
         let valid = cstring("recovered");
         // SAFETY: `part` is live and `valid` is live for the call.
         assert_eq!(

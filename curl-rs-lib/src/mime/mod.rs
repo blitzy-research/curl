@@ -138,7 +138,9 @@ use crate::util::base64::BASE64_ENCDEC;
 use crate::util::dynbuf::DynBuf;
 use crate::util::slist::SList;
 use crate::util::strcase::{casecompare, checkprefix, ncasecompare};
-use crate::util::{basename, sotouz, uztoso, CurlOffT};
+use crate::util::{
+    basename_bytes, fallible, path_bytes, sotouz, uztoso, CurlOffT,
+};
 
 // `lib/formdata.c`'s successor now exists, so the declaration this module
 // described as "the whole of its integration" lands here.
@@ -711,9 +713,19 @@ impl PartContent {
 /// | `unsigned int flags` | `:112` | the three `bool` fields below |
 /// | `struct curl_slist *curlheaders` | `:117` | `curlheaders: SList` |
 /// | `struct curl_slist *userheaders` | `:118` | `userheaders: SList` |
-/// | `char *mimetype` | `:119` | `mimetype: Option<String>` |
-/// | `char *filename` | `:120` | `filename: Option<String>` |
-/// | `char *name` | `:121` | `name: Option<String>` |
+/// | `char *mimetype` | `:119` | `mimetype: Option<Vec<u8>>` |
+/// | `char *filename` | `:120` | `filename: Option<Vec<u8>>` |
+/// | `char *name` | `:121` | `name: Option<Vec<u8>>` |
+///
+/// # Why those three are bytes and not `String`
+///
+/// All three go on the wire, and the wire form is frozen. The C copies the
+/// caller's `char *` with `strdup` and emits it back byte for byte, so a field
+/// name, a remote filename or a media type containing a byte sequence Unicode
+/// cannot spell still reaches the peer unchanged. `String` cannot hold such a
+/// value, which leaves only two ways to accept one -- reject it, or convert it
+/// lossily -- and both change what goes on the wire. `Vec<u8>` is what the C
+/// field is.
 /// | `curl_off_t datasize` | `:122` | `datasize: CurlOffT` |
 /// | `struct mime_state state` | `:123` | `state: MimeStateCursor` |
 /// | `const struct mime_encoder *encoder` | `:124` | `encoder: Option<MimeEncoding>` |
@@ -767,14 +779,17 @@ pub struct MimePart {
     /// `userheaders`: the caller's headers, in the order supplied.
     userheaders: SList,
 
-    /// `mimetype`: the type `curl_mime_type` set, if any.
-    mimetype: Option<String>,
+    /// `mimetype`: the type `curl_mime_type` set, if any, as the caller's
+    /// bytes.
+    mimetype: Option<Vec<u8>>,
 
-    /// `filename`: the remote filename `curl_mime_filename` set, if any.
-    filename: Option<String>,
+    /// `filename`: the remote filename `curl_mime_filename` set, if any, as
+    /// the caller's bytes.
+    filename: Option<Vec<u8>>,
 
-    /// `name`: the field name `curl_mime_name` set, if any.
-    name: Option<String>,
+    /// `name`: the field name `curl_mime_name` set, if any, as the caller's
+    /// bytes.
+    name: Option<Vec<u8>>,
 
     /// `datasize`: the content length, or [`SIZE_UNKNOWN`].
     datasize: CurlOffT,
@@ -1116,21 +1131,22 @@ impl MimePart {
         &self.content
     }
 
-    /// The field name `curl_mime_name` set, if any.
+    /// The field name `curl_mime_name` set, if any, as the caller's bytes.
     #[must_use]
-    pub fn name(&self) -> Option<&str> {
+    pub fn name(&self) -> Option<&[u8]> {
         self.name.as_deref()
     }
 
-    /// The remote filename `curl_mime_filename` set, if any.
+    /// The remote filename `curl_mime_filename` set, if any, as the caller's
+    /// bytes.
     #[must_use]
-    pub fn filename(&self) -> Option<&str> {
+    pub fn filename(&self) -> Option<&[u8]> {
         self.filename.as_deref()
     }
 
-    /// The type `curl_mime_type` set, if any.
+    /// The type `curl_mime_type` set, if any, as the caller's bytes.
     #[must_use]
-    pub fn mime_type(&self) -> Option<&str> {
+    pub fn mime_type(&self) -> Option<&[u8]> {
         self.mimetype.as_deref()
     }
 
@@ -2399,10 +2415,10 @@ const MIME_ESCAPE_TABLE: &[(u8, &str)] = &[
 /// [`MAX_INPUT_LENGTH`], which is the ceiling `curlx_dyn_init(&db,
 /// CURL_MAX_INPUT_LENGTH)` gives the C's accumulator at `:225`.
 fn escape_string(
-    src: &str,
+    src: &[u8],
     strategy: MimeStrategy,
     options: MimeOptions,
-) -> CodeResult<String> {
+) -> CodeResult<Vec<u8>> {
     let table = if strategy == MimeStrategy::Mail || options.formescape {
         MIME_ESCAPE_TABLE
     } else {
@@ -2416,7 +2432,7 @@ fn escape_string(
     // having succeeded, and because an empty name is a real input.
     out.addn(b"")?;
 
-    for byte in src.bytes() {
+    for &byte in src {
         match table.iter().find(|(matched, _)| *matched == byte) {
             Some((_, replacement)) => out.add(replacement)?,
             // The C appends the single source byte with `curlx_dyn_addn(&db,
@@ -2424,17 +2440,15 @@ fn escape_string(
             // multi-byte UTF-8 sequence is therefore reassembled unchanged,
             // since none of its bytes can match a table entry: every
             // continuation byte is at or above 0x80 and every table key is
-            // ASCII.
+            // ASCII. So is a byte sequence that is not UTF-8 at all, which is
+            // why the source and the result are bytes: the C escapes and
+            // emits arbitrary bytes, and a decode step here would either
+            // reject or corrupt them.
             None => out.addn(&[byte])?,
         }
     }
 
-    let escaped = out.take();
-    // Every byte written above came from `src`, which is `&str`, or from a
-    // table replacement, which is ASCII, so the result is valid UTF-8 by
-    // construction. Answered rather than asserted so that no input can turn
-    // this into a panic across the C ABI.
-    String::from_utf8(escaped).map_err(|_| CURLcode::BadFunctionArgument)
+    Ok(out.take())
 }
 
 // curl's own content-type table: `ctts[]` (`lib/mime.c:1629-1640`), in the
@@ -2462,10 +2476,14 @@ const CONTENT_TYPES: &[(&str, &str)] = &[
 /// if(len1 >= len2 && curl_strequal(nameend - len2, ctts[i].extension))
 ///   return ctts[i].type;
 /// ```
+/// The parameter is bytes because the C's is a `char *` that it only ever
+/// compares against the ten ASCII suffixes of `ctts[]`. A name that is not
+/// UTF-8 cannot match any of them, and passing it through as bytes gives that
+/// answer directly -- where decoding first would have had to choose between
+/// rejecting the name and inventing a lossy spelling of it.
 #[must_use]
-pub(crate) fn contenttype(filename: Option<&str>) -> Option<&'static str> {
-    let filename = filename?;
-    let name = filename.as_bytes();
+pub(crate) fn contenttype(filename: Option<&[u8]>) -> Option<&'static str> {
+    let name = filename?;
     CONTENT_TYPES
         .iter()
         .find(|(extension, _)| {
@@ -2487,11 +2505,10 @@ pub(crate) fn contenttype(filename: Option<&str>) -> Option<&'static str> {
 ///   }
 /// return FALSE;
 /// ```
-fn content_type_match(contenttype: Option<&str>, target: &str) -> bool {
-    let Some(contenttype) = contenttype else {
+fn content_type_match(contenttype: Option<&[u8]>, target: &str) -> bool {
+    let Some(subject) = contenttype else {
         return false;
     };
-    let subject = contenttype.as_bytes();
     let label = target.as_bytes();
     if subject.len() < label.len() {
         return false;
@@ -2512,11 +2529,15 @@ fn content_type_match(contenttype: Option<&str>, target: &str) -> bool {
 /// The C is variadic and builds the line with `curl_mvaprintf`, then hands
 /// the allocation to `Curl_slist_append_nodup` (`:1600`) so that the list
 /// takes ownership without copying. Rust needs no `va_list`: the caller
-/// formats with [`format!`] and this function moves the bytes in through
+/// assembles the line and this function moves the bytes in through
 /// [`SList::append_nodup`], which is the same transfer expressed so the
 /// compiler enforces it.
-fn add_header(list: &mut SList, line: String) {
-    list.append_nodup(line.into_bytes());
+///
+/// The line is a `Vec<u8>` and not a `String` because two of the values that
+/// go into one -- a field name and a remote filename -- are the caller's
+/// arbitrary bytes, and the header they compose goes on the wire as it stands.
+fn add_header(list: &mut SList, line: Vec<u8>) {
+    list.append_nodup(line);
 }
 
 /// `add_content_type` (`lib/mime.c:1611-1617`).
@@ -2526,16 +2547,14 @@ fn add_header(list: &mut SList, line: String) {
 ///                             boundary ? "; boundary=" : "",
 ///                             boundary ? boundary : "");
 /// ```
-fn add_content_type(list: &mut SList, kind: &str, boundary: Option<&[u8]>) {
-    match boundary.and_then(|bytes| std::str::from_utf8(bytes).ok()) {
-        Some(boundary) => {
-            add_header(
-                list,
-                format!("Content-Type: {kind}; boundary={boundary}"),
-            );
-        }
-        None => add_header(list, format!("Content-Type: {kind}")),
+fn add_content_type(list: &mut SList, kind: &[u8], boundary: Option<&[u8]>) {
+    let mut line = Vec::from(&b"Content-Type: "[..]);
+    line.extend_from_slice(kind);
+    if let Some(boundary) = boundary {
+        line.extend_from_slice(b"; boundary=");
+        line.extend_from_slice(boundary);
     }
+    add_header(list, line);
 }
 
 impl MimePart {
@@ -2589,17 +2608,22 @@ impl MimePart {
         // among the caller's headers is the next authority. `customct` being
         // set also disables the `text/plain` suppression below, which is why
         // the two are tracked separately.
-        let user_ct = search_header(&self.userheaders, CONTENT_TYPE_LABEL)
-            .and_then(|value| std::str::from_utf8(value).ok())
-            .map(str::to_owned);
-        let custom_ct: Option<String> = self.mimetype.clone().or(user_ct);
+        // The C reads the caller's header value as the `char *` it is and
+        // carries it straight into the emitted `Content-Type`. No decode step
+        // stands between the two here either: a value this crate cannot read
+        // as text is still the value the caller supplied, and dropping it
+        // would silently emit a DIFFERENT header from the one the C emits.
+        let user_ct: Option<Vec<u8>> =
+            search_header(&self.userheaders, CONTENT_TYPE_LABEL)
+                .map(<[u8]>::to_vec);
+        let custom_ct: Option<Vec<u8>> = self.mimetype.clone().or(user_ct);
         // The local is named `resolved_ct` rather than `contenttype` so
         // that the free function `contenttype` -- the successor of
         // `Curl_mime_contenttype` -- stays callable below. The C has no
         // such clash because its function carries a `Curl_` prefix.
-        let mut resolved_ct: Option<String> = match &custom_ct {
+        let mut resolved_ct: Option<Vec<u8>> = match &custom_ct {
             Some(custom) => Some(custom.clone()),
-            None => contenttype.map(str::to_owned),
+            None => contenttype.map(|kind| kind.as_bytes().to_vec()),
         };
 
         // "If content type is not specified, try to determine it." --
@@ -2607,7 +2631,7 @@ impl MimePart {
         if resolved_ct.is_none() {
             resolved_ct = match &self.content {
                 PartContent::Multipart(_) => {
-                    Some(MULTIPART_CONTENTTYPE_DEFAULT.to_owned())
+                    Some(MULTIPART_CONTENTTYPE_DEFAULT.as_bytes().to_vec())
                 }
                 // `case MIMEKIND_FILE:` -- the remote filename first, then
                 // the local path, then the octet-stream default but ONLY when
@@ -2616,13 +2640,21 @@ impl MimePart {
                 // method's `contenttype` parameter, which carries the C's own
                 // name for it (`lib/mime.c:1675`).
                 PartContent::File { path, .. } => {
+                    // The local path reaches the suffix table as the bytes it
+                    // is. `Path::to_str` stood here and answered `None` for
+                    // any path Unicode cannot spell, so `-F 'f=@caf\xe9.txt'`
+                    // lost its inferred `text/plain` on a Latin-1 filesystem;
+                    // the ten suffixes are ASCII, so bytes match exactly the
+                    // names the C matches.
                     self::contenttype(self.filename.as_deref())
-                        .or_else(|| self::contenttype(path.to_str()))
-                        .map(str::to_owned)
                         .or_else(|| {
-                            self.filename
-                                .as_ref()
-                                .map(|_| FILE_CONTENTTYPE_DEFAULT.to_owned())
+                            self::contenttype(Some(path_bytes(path.as_path())))
+                        })
+                        .map(|kind| kind.as_bytes().to_vec())
+                        .or_else(|| {
+                            self.filename.as_ref().map(|_| {
+                                FILE_CONTENTTYPE_DEFAULT.as_bytes().to_vec()
+                            })
                         })
                 }
                 // `default:` -- every other kind infers from the remote
@@ -2631,7 +2663,7 @@ impl MimePart {
                 | PartContent::Data(_)
                 | PartContent::Callback(_) => {
                     self::contenttype(self.filename.as_deref())
-                        .map(str::to_owned)
+                        .map(|kind| kind.as_bytes().to_vec())
                 }
             };
         }
@@ -2664,7 +2696,7 @@ impl MimePart {
                         // backwards relative to its name and is worth stating
                         // once: the prefix is the first argument and the
                         // subject is the second.
-                        !checkprefix("multipart/", kind.as_bytes())
+                        !checkprefix("multipart/", kind)
                     }))
             {
                 disposition = Some(DISPOSITION_DEFAULT);
@@ -2694,17 +2726,17 @@ impl MimePart {
                     None => None,
                 };
 
-                let mut line = String::from("Content-Disposition: ");
-                line.push_str(disposition);
+                let mut line = Vec::from(&b"Content-Disposition: "[..]);
+                line.extend_from_slice(disposition.as_bytes());
                 if let Some(name) = &name {
-                    line.push_str("; name=\"");
-                    line.push_str(name);
-                    line.push('"');
+                    line.extend_from_slice(b"; name=\"");
+                    line.extend_from_slice(name);
+                    line.push(b'"');
                 }
                 if let Some(filename) = &filename {
-                    line.push_str("; filename=\"");
-                    line.push_str(filename);
-                    line.push('"');
+                    line.extend_from_slice(b"; filename=\"");
+                    line.extend_from_slice(filename);
+                    line.push(b'"');
                 }
                 add_header(&mut self.curlheaders, line);
             }
@@ -2737,10 +2769,12 @@ impl MimePart {
                 None
             };
             if let Some(cte) = cte {
-                add_header(
-                    &mut self.curlheaders,
-                    format!("Content-Transfer-Encoding: {cte}"),
-                );
+                add_header(&mut self.curlheaders, {
+                    let mut line =
+                        Vec::from(&b"Content-Transfer-Encoding: "[..]);
+                    line.extend_from_slice(cte.as_bytes());
+                    line
+                });
             }
         }
 
@@ -3110,6 +3144,26 @@ impl MimePart {
         self.state = MimeStateCursor::default();
     }
 
+    /// One of the three string fields, copied or cleared.
+    ///
+    /// The shared body of [`Self::set_name`], [`Self::set_filename`] and
+    /// [`Self::set_type`], whose C originals are three copies of one function.
+    /// The clearing happens FIRST and unconditionally -- `Curl_safefree(...)`
+    /// before the `if(name)` at `lib/mime.c:1244` -- so a refused allocation
+    /// leaves the field cleared rather than holding its previous value, which is
+    /// exactly what the C leaves behind when its `curlx_strdup` returns null.
+    fn set_field(
+        field: &mut Option<Vec<u8>>,
+        value: Option<&[u8]>,
+    ) -> CodeResult<()> {
+        *field = None;
+        if let Some(value) = value {
+            *field =
+                Some(fallible::vec_from_slice(value).map_err(fallible::oom)?);
+        }
+        Ok(())
+    }
+
     /// `curl_mime_name` (`lib/mime.c:1239-1253`): sets or clears the field
     /// name.
     ///
@@ -3117,8 +3171,15 @@ impl MimePart {
     /// has no counterpart: a `&mut self` receiver cannot be null. That check
     /// belongs at the ABI boundary, where a null `curl_mimepart *` is a real
     /// possibility, and `curl-rs-ffi` performs it there.
-    pub fn set_name(&mut self, name: Option<&str>) {
-        self.name = name.map(str::to_owned);
+    ///
+    /// # Errors
+    ///
+    /// [`CURLcode::OutOfMemory`], which is the C's own answer when its
+    /// `curlx_strdup` at `:1247` returns null. The name is a caller-supplied
+    /// extent, so the allocation is externally sized; see
+    /// [`crate::util::fallible`].
+    pub fn set_name(&mut self, name: Option<&[u8]>) -> CodeResult<()> {
+        Self::set_field(&mut self.name, name)
     }
 
     /// `curl_mime_filename` (`lib/mime.c:1256-1270`): sets or clears the
@@ -3126,14 +3187,22 @@ impl MimePart {
     ///
     /// `None` clears it. This is also how a caller undoes the side effect of
     /// [`Self::set_file`], which the C documents at `:1330-1333`.
-    pub fn set_filename(&mut self, filename: Option<&str>) {
-        self.filename = filename.map(str::to_owned);
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_name`]; the C's arm is at `:1265`.
+    pub fn set_filename(&mut self, filename: Option<&[u8]>) -> CodeResult<()> {
+        Self::set_field(&mut self.filename, filename)
     }
 
     /// `curl_mime_type` (`lib/mime.c:1348-1362`): sets or clears the content
     /// type.
-    pub fn set_type(&mut self, mimetype: Option<&str>) {
-        self.mimetype = mimetype.map(str::to_owned);
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_name`]; the C's arm is at `:1357`.
+    pub fn set_type(&mut self, mimetype: Option<&[u8]>) -> CodeResult<()> {
+        Self::set_field(&mut self.mimetype, mimetype)
     }
 
     /// `curl_mime_encoder` (`lib/mime.c:1374-1394`): selects a
@@ -3290,10 +3359,22 @@ impl MimePart {
 
         // `strippath(filename)`, which is
         // `curlx_strdup(curlx_basename(filename))`. Derived before the
-        // content is installed so that a path this crate cannot decode fails
-        // before the part is half-built, as the C's allocation failure does.
-        let text = filename.to_str().ok_or(CURLcode::BadFunctionArgument)?;
-        let base = basename(text).to_owned();
+        // content is installed, matching the order in which the C's
+        // allocation failure would abandon the part.
+        //
+        // The path reaches `basename_bytes` as the bytes the platform holds.
+        // `Path::to_str` stood here and answered `CURLE_BAD_FUNCTION_ARGUMENT`
+        // for any path Unicode cannot spell, so `curl_mime_filedata` refused a
+        // file the C uploads without complaint -- and the C never decodes it,
+        // it walks it with `strrchr` and copies the tail.
+        // `curlx_strdup(curlx_basename(filename))` at `lib/mime.c:1336`,
+        // whose null return the C answers with `CURLE_OUT_OF_MEMORY`
+        // (`:1337-1338`). The extent is the caller's path, so it is externally
+        // sized. Taken BEFORE the content is installed, which is the order in
+        // which the C's own failure abandons the part.
+        let base =
+            fallible::vec_from_slice(basename_bytes(path_bytes(filename)))
+                .map_err(fallible::oom)?;
 
         self.content = PartContent::File {
             path: filename.to_path_buf(),
@@ -3301,9 +3382,10 @@ impl MimePart {
             size,
         };
 
-        // The side effect, last, exactly as the C orders it.
-        self.set_filename(Some(&base));
-        Ok(())
+        // The side effect, last, exactly as the C orders it. The copy is
+        // already made, so this cannot fail; `set_filename` is still the one
+        // path that writes the field.
+        self.set_filename(Some(&base))
     }
 
     /// `curl_mime_headers` (`lib/mime.c:1397-1412`): installs the caller's
@@ -3539,11 +3621,13 @@ impl MimePart {
             self.set_headers(Some(src.userheaders.duplicate()), true);
         }
 
-        // "Duplicate other fields." -- `:1158-1166`, in the C's order.
+        // "Duplicate other fields." -- `:1158-1166`, in the C's order, and
+        // each guarded by `if(!res)` so the first refusal stops the rest and
+        // reaches the rollback in `duplicate_from`.
         self.encoder = src.encoder;
-        self.set_type(src.mimetype.as_deref());
-        self.set_name(src.name.as_deref());
-        self.set_filename(src.filename.as_deref());
+        self.set_type(src.mimetype.as_deref())?;
+        self.set_name(src.name.as_deref())?;
+        self.set_filename(src.filename.as_deref())?;
 
         Ok(())
     }
@@ -3617,14 +3701,27 @@ mod tests {
     #[test]
     fn add_part_appends_at_the_tail_in_order() {
         let mut mime = seeded_mime(0);
-        mime.add_part().set_name(Some("first"));
-        mime.add_part().set_name(Some("second"));
-        mime.add_part().set_name(Some("third"));
+        mime.add_part()
+            .set_name(Some(b"first"))
+            .expect("a servable copy");
+        mime.add_part()
+            .set_name(Some(b"second"))
+            .expect("a servable copy");
+        mime.add_part()
+            .set_name(Some(b"third"))
+            .expect("a servable copy");
 
         assert_eq!(mime.len(), 3);
-        let names: Vec<Option<&str>> =
+        let names: Vec<Option<&[u8]>> =
             mime.parts().map(MimePart::name).collect();
-        assert_eq!(names, vec![Some("first"), Some("second"), Some("third")]);
+        assert_eq!(
+            names,
+            vec![
+                Some(&b"first"[..]),
+                Some(&b"second"[..]),
+                Some(&b"third"[..])
+            ]
+        );
     }
 
     // --- the <strippart> round trip, and the four negative controls --------
@@ -3765,10 +3862,10 @@ mod tests {
     fn two_field_form(seed: u32) -> Mime {
         let mut mime = seeded_mime(seed);
         let first = mime.add_part();
-        first.set_name(Some("name"));
+        first.set_name(Some(b"name")).expect("a servable copy");
         first.set_data_str("daniel");
         let second = mime.add_part();
-        second.set_name(Some("tool"));
+        second.set_name(Some(b"tool")).expect("a servable copy");
         second.set_data_str("curl");
         mime
     }
@@ -3777,14 +3874,16 @@ mod tests {
     fn test44_form(seed: u32) -> Mime {
         let mut mime = seeded_mime(seed);
         let first = mime.add_part();
-        first.set_name(Some("name"));
+        first.set_name(Some(b"name")).expect("a servable copy");
         first.set_data_str("daniel");
         let second = mime.add_part();
-        second.set_name(Some("tool"));
+        second.set_name(Some(b"tool")).expect("a servable copy");
         second.set_data_str("curl");
         let third = mime.add_part();
-        third.set_name(Some("file"));
-        third.set_filename(Some("test44.txt"));
+        third.set_name(Some(b"file")).expect("a servable copy");
+        third
+            .set_filename(Some(b"test44.txt"))
+            .expect("a servable copy");
         third.set_data(Some(b"foo-\nThis is a moo-\nbar\n"));
         mime
     }
@@ -3825,6 +3924,65 @@ mod tests {
             String::from_utf8_lossy(&body),
             expected,
             "the multipart body must match byte for byte"
+        );
+    }
+
+    /// A field name, a remote filename and a media type that are not valid
+    /// UTF-8 reach the wire byte for byte.
+    ///
+    /// The C stores each of the three with `strdup` and writes it back into the
+    /// part headers unchanged, so a `-F` argument in a locale encoding, or a
+    /// `curl_mime_filename` call from a program that never used Unicode, posts
+    /// exactly those bytes. This is the assertion that the whole byte path --
+    /// setter, escaper, header assembly and readback -- carries them, and it is
+    /// deliberately made against the emitted BODY rather than against the
+    /// accessors, because the body is the frozen artifact.
+    #[test]
+    fn undecodable_names_reach_the_wire_unaltered() {
+        // Lone continuation bytes, which no UTF-8 sequence can contain, and
+        // none of which appears in either escape table -- every table key is
+        // ASCII, so all four pass through untouched.
+        const RAW: &[u8] = b"na\xffme";
+        const RAW_FILE: &[u8] = b"fi\xfele.txt";
+        const RAW_TYPE: &[u8] = b"x/\xfdtype";
+
+        let mut mime = seeded_mime(0);
+        let boundary = mime.boundary().to_vec();
+        let part = mime.add_part();
+        part.set_name(Some(RAW)).expect("a servable copy");
+        part.set_filename(Some(RAW_FILE)).expect("a servable copy");
+        part.set_type(Some(RAW_TYPE)).expect("a servable copy");
+        part.set_data(Some(b"payload"));
+
+        let mut body_part = body_part(mime);
+        body_part
+            .prepare_headers(
+                Some("multipart/form-data"),
+                None,
+                MimeStrategy::Form,
+                MimeOptions::default(),
+            )
+            .expect("headers prepare");
+        let body = drain(&mut body_part);
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"--");
+        expected.extend_from_slice(&boundary);
+        expected
+            .extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"");
+        expected.extend_from_slice(RAW);
+        expected.extend_from_slice(b"\"; filename=\"");
+        expected.extend_from_slice(RAW_FILE);
+        expected.extend_from_slice(b"\"\r\nContent-Type: ");
+        expected.extend_from_slice(RAW_TYPE);
+        expected.extend_from_slice(b"\r\n\r\npayload\r\n--");
+        expected.extend_from_slice(&boundary);
+        expected.extend_from_slice(b"--\r\n");
+
+        assert_eq!(
+            body, expected,
+            "every one of the three fields must reach the wire as the bytes \
+             the caller supplied"
         );
     }
 
@@ -3945,7 +4103,7 @@ mod tests {
     fn a_user_content_type_header_is_not_emitted_twice() {
         let mut mime = seeded_mime(0);
         let part = mime.add_part();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         let mut headers = SList::new();
         headers.push_str("Content-Type: text/plain");
@@ -3985,7 +4143,7 @@ mod tests {
         // computed with one skip and bytes emitted with the other.
         let mut mime = seeded_mime(0);
         let part = mime.add_part();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         let mut headers = SList::new();
         headers.push_str("Content-Type: text/plain");
@@ -4179,7 +4337,7 @@ mod tests {
     fn body_only_suppresses_the_header_contribution() {
         // `if(size >= 0 && !(part->flags & MIME_BODY_ONLY))` at `:1578`.
         let mut part = MimePart::new();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         part.prepare_headers(
             None,
@@ -4212,7 +4370,9 @@ mod tests {
         assert!(mime.body_size().is_some());
 
         let streaming = mime.add_part();
-        streaming.set_name(Some("stream"));
+        streaming
+            .set_name(Some(b"stream"))
+            .expect("a servable copy");
         streaming.set_reader(None, Some(Box::new(CountingReader::new(8))));
         assert_eq!(
             mime.body_size(),
@@ -4334,7 +4494,7 @@ mod tests {
         // The order is observable because `compareparts` compares one joined
         // string.
         let mut part = MimePart::new();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         part.set_encoder(Some("base64")).expect("known");
         let headers = generated_headers(
@@ -4352,7 +4512,8 @@ mod tests {
             "with no content type the middle header is simply absent"
         );
 
-        part.set_type(Some("application/json"));
+        part.set_type(Some(b"application/json"))
+            .expect("a servable copy");
         let headers = generated_headers(
             &mut part,
             None,
@@ -4376,8 +4537,9 @@ mod tests {
         // quotes around both values, `; ` between parameters, and NO space
         // after either `=`.
         let mut part = MimePart::new();
-        part.set_name(Some("file"));
-        part.set_filename(Some("test44.txt"));
+        part.set_name(Some(b"file")).expect("a servable copy");
+        part.set_filename(Some(b"test44.txt"))
+            .expect("a servable copy");
         part.set_data_str("x");
         let headers = generated_headers(
             &mut part,
@@ -4394,7 +4556,8 @@ mod tests {
 
         // A filename with no name, and a name with no filename.
         let mut part = MimePart::new();
-        part.set_filename(Some("only.txt"));
+        part.set_filename(Some(b"only.txt"))
+            .expect("a servable copy");
         part.set_data_str("x");
         let headers = generated_headers(
             &mut part,
@@ -4408,7 +4571,7 @@ mod tests {
         );
 
         let mut part = MimePart::new();
-        part.set_name(Some("only"));
+        part.set_name(Some(b"only")).expect("a servable copy");
         part.set_data_str("x");
         let headers = generated_headers(
             &mut part,
@@ -4455,7 +4618,7 @@ mod tests {
         // A name is enough to justify the default -- `:1731-1734` -- and the
         // drop rule at `:1735-1737` does not fire because a name exists.
         let mut part = MimePart::new();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         let headers =
             generated_headers(&mut part, None, None, MimeStrategy::Form);
@@ -4469,7 +4632,7 @@ mod tests {
         // because an `attachment` carrying no information says nothing.
         let mut part = MimePart::new();
         part.set_data_str("value");
-        part.set_type(Some("text/plain"));
+        part.set_type(Some(b"text/plain")).expect("a servable copy");
         let headers =
             generated_headers(&mut part, None, None, MimeStrategy::Form);
         assert_eq!(headers, vec!["Content-Type: text/plain".to_owned()]);
@@ -4479,7 +4642,8 @@ mod tests {
         // guard.
         let mut part = MimePart::new();
         part.set_data_str("value");
-        part.set_type(Some("multipart/mixed"));
+        part.set_type(Some(b"multipart/mixed"))
+            .expect("a servable copy");
         let headers =
             generated_headers(&mut part, None, None, MimeStrategy::Form);
         assert_eq!(headers, vec!["Content-Type: multipart/mixed".to_owned()]);
@@ -4500,7 +4664,7 @@ mod tests {
     #[test]
     fn a_caller_supplied_disposition_header_suppresses_the_generated_one() {
         let mut part = MimePart::new();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         let mut headers = SList::new();
         headers.push_str("Content-Disposition: inline");
@@ -4532,7 +4696,7 @@ mod tests {
         ] {
             let mut inner = seeded_mime(0);
             let child = inner.add_part();
-            child.set_name(Some("child"));
+            child.set_name(Some(b"child")).expect("a servable copy");
             child.set_data_str("value");
 
             let mut top = MimePart::new();
@@ -4630,9 +4794,17 @@ mod tests {
         // `lib/mime.c:212-219`. WHATWG HTML living standard 4.10.21.8 step 2:
         // only 0x0A, 0x0D and 0x22 are escaped, and "the user agent must not
         // perform any other escapes."
+        // The escaper takes and returns bytes; the closure keeps the
+        // assertions below readable, and every expectation is ASCII so the
+        // round trip through `from_utf8` cannot fail.
         let escape = |src: &str| {
-            escape_string(src, MimeStrategy::Form, MimeOptions::default())
-                .expect("within the length ceiling")
+            let escaped = escape_string(
+                src.as_bytes(),
+                MimeStrategy::Form,
+                MimeOptions::default(),
+            )
+            .expect("within the length ceiling");
+            String::from_utf8(escaped).expect("ASCII in, ASCII out")
         };
         assert_eq!(escape("plain"), "plain");
         assert_eq!(escape("\""), "%22");
@@ -4661,8 +4833,13 @@ mod tests {
     fn the_mime_table_applies_to_mail_and_to_formescape() {
         // `lib/mime.c:201-205` and the selection at `:222`.
         let mail = |src: &str| {
-            escape_string(src, MimeStrategy::Mail, MimeOptions::default())
-                .expect("within the ceiling")
+            let escaped = escape_string(
+                src.as_bytes(),
+                MimeStrategy::Mail,
+                MimeOptions::default(),
+            )
+            .expect("within the ceiling");
+            String::from_utf8(escaped).expect("ASCII in, ASCII out")
         };
         assert_eq!(mail("\\"), "\\\\");
         assert_eq!(mail("\""), "\\\"");
@@ -4674,9 +4851,9 @@ mod tests {
         let options = MimeOptions::from_bits(CURLMIMEOPT_FORMESCAPE);
         assert!(options.formescape);
         assert_eq!(
-            escape_string("a\\b\"c", MimeStrategy::Form, options)
+            escape_string(b"a\\b\"c", MimeStrategy::Form, options)
                 .expect("within the ceiling"),
-            "a\\\\b\\\"c"
+            b"a\\\\b\\\"c"
         );
         // And the bits round-trip, which is what `curl-rs-ffi` needs.
         assert_eq!(options.to_bits(), CURLMIMEOPT_FORMESCAPE);
@@ -4699,7 +4876,7 @@ mod tests {
         let oversized = "\"".repeat(MAX_INPUT_LENGTH / 3 + 16);
         assert_eq!(
             escape_string(
-                &oversized,
+                oversized.as_bytes(),
                 MimeStrategy::Form,
                 MimeOptions::default()
             ),
@@ -4709,11 +4886,11 @@ mod tests {
         let acceptable = "a".repeat(1024);
         assert_eq!(
             escape_string(
-                &acceptable,
+                acceptable.as_bytes(),
                 MimeStrategy::Form,
                 MimeOptions::default()
             ),
-            Ok(acceptable)
+            Ok(acceptable.into_bytes())
         );
     }
 
@@ -4735,55 +4912,59 @@ mod tests {
             ("a.pdf", "application/pdf"),
             ("a.xml", "application/xml"),
         ] {
-            assert_eq!(contenttype(Some(name)), Some(expected), "{name}");
+            assert_eq!(
+                contenttype(Some(name.as_bytes())),
+                Some(expected),
+                "{name}"
+            );
         }
 
         // Case-insensitive, because the comparison is `curl_strequal`.
-        assert_eq!(contenttype(Some("A.TXT")), Some("text/plain"));
-        assert_eq!(contenttype(Some("photo.JPeG")), Some("image/jpeg"));
+        assert_eq!(contenttype(Some(b"A.TXT")), Some("text/plain"));
+        assert_eq!(contenttype(Some(b"photo.JPeG")), Some("image/jpeg"));
 
         // A SUFFIX match, so a compound extension the table does not carry
         // yields nothing rather than a guess. THIS is where a general-purpose
         // MIME database would diverge and emit bytes curl never emits;
         // `deny.toml:982-983` bans `mime_guess` for exactly this reason.
-        assert_eq!(contenttype(Some("archive.tar.gz")), None);
-        assert_eq!(contenttype(Some("program.rs")), None);
-        assert_eq!(contenttype(Some("noextension")), None);
-        assert_eq!(contenttype(Some("")), None);
+        assert_eq!(contenttype(Some(b"archive.tar.gz")), None);
+        assert_eq!(contenttype(Some(b"program.rs")), None);
+        assert_eq!(contenttype(Some(b"noextension")), None);
+        assert_eq!(contenttype(Some(b"")), None);
         assert_eq!(contenttype(None), None);
 
         // The extension is enough on its own -- the C compares from the end
         // of the name, so a bare `.txt` matches.
-        assert_eq!(contenttype(Some(".txt")), Some("text/plain"));
+        assert_eq!(contenttype(Some(b".txt")), Some("text/plain"));
         // And a name SHORTER than the extension cannot match.
-        assert_eq!(contenttype(Some("xt")), None);
+        assert_eq!(contenttype(Some(b"xt")), None);
     }
 
     #[test]
     fn content_type_match_accepts_exactly_six_following_bytes() {
         // `lib/mime.c:1657-1671`: the byte after the match must be the C's
         // terminating NUL, a tab, a CR, an LF, a space or a semicolon.
-        assert!(content_type_match(Some("text/plain"), "text/plain"));
+        assert!(content_type_match(Some(b"text/plain"), "text/plain"));
         for follower in ["\t", "\r", "\n", " ", ";"] {
             let subject = format!("text/plain{follower}rest");
             assert!(
-                content_type_match(Some(&subject), "text/plain"),
+                content_type_match(Some(subject.as_bytes()), "text/plain"),
                 "{follower:?} must be accepted"
             );
         }
         assert!(content_type_match(
-            Some("multipart/form-data; charset=utf-8"),
+            Some(b"multipart/form-data; charset=utf-8"),
             "multipart/form-data"
         ));
 
         // Anything else is not a match.
-        assert!(!content_type_match(Some("text/plainX"), "text/plain"));
-        assert!(!content_type_match(Some("text/plain2"), "text/plain"));
-        assert!(!content_type_match(Some("text/plai"), "text/plain"));
-        assert!(!content_type_match(Some("application/json"), "text/plain"));
+        assert!(!content_type_match(Some(b"text/plainX"), "text/plain"));
+        assert!(!content_type_match(Some(b"text/plain2"), "text/plain"));
+        assert!(!content_type_match(Some(b"text/plai"), "text/plain"));
+        assert!(!content_type_match(Some(b"application/json"), "text/plain"));
         assert!(!content_type_match(None, "text/plain"));
         // Case-insensitive over the label itself.
-        assert!(content_type_match(Some("TEXT/PLAIN; x=1"), "text/plain"));
+        assert!(content_type_match(Some(b"TEXT/PLAIN; x=1"), "text/plain"));
     }
 
     #[test]
@@ -4793,8 +4974,9 @@ mod tests {
         // `Content-Type: text/plain` because the strategy is form and a
         // filename is set.
         let mut part = MimePart::new();
-        part.set_name(Some("file"));
-        part.set_filename(Some("test44.txt"));
+        part.set_name(Some(b"file")).expect("a servable copy");
+        part.set_filename(Some(b"test44.txt"))
+            .expect("a servable copy");
         part.set_data(Some(b"foo-\nThis is a moo-\nbar\n"));
         let headers = generated_headers(
             &mut part,
@@ -4824,7 +5006,7 @@ mod tests {
         // And a part with no filename has it suppressed even under a form
         // strategy, because there is nothing for the type to describe.
         let mut part = MimePart::new();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         let headers = generated_headers(
             &mut part,
@@ -4838,8 +5020,8 @@ mod tests {
         // rule, which is why `curl_mime_type(part, "text/plain")` emits what
         // inference would have removed.
         let mut part = MimePart::new();
-        part.set_name(Some("field"));
-        part.set_type(Some("text/plain"));
+        part.set_name(Some(b"field")).expect("a servable copy");
+        part.set_type(Some(b"text/plain")).expect("a servable copy");
         part.set_data_str("value");
         let headers = generated_headers(
             &mut part,
@@ -4862,7 +5044,8 @@ mod tests {
             size: Some(3),
         };
         part.datasize = 3;
-        part.set_filename(Some("blob.unknown"));
+        part.set_filename(Some(b"blob.unknown"))
+            .expect("a servable copy");
         let headers = generated_headers(
             &mut part,
             None,
@@ -4876,7 +5059,7 @@ mod tests {
         );
 
         // With the filename withdrawn there is no fallback at all.
-        part.set_filename(None);
+        part.set_filename(None).expect("a servable copy");
         let headers = generated_headers(
             &mut part,
             None,
@@ -4894,7 +5077,8 @@ mod tests {
             size: Some(3),
         };
         part.datasize = 3;
-        part.set_filename(Some("renamed.unknown"));
+        part.set_filename(Some(b"renamed.unknown"))
+            .expect("a servable copy");
         let headers = generated_headers(
             &mut part,
             None,
@@ -4927,7 +5111,7 @@ mod tests {
         // `:1779-1783`. An encoder names itself.
         let mut part = MimePart::new();
         part.set_data_str("value");
-        part.set_type(Some("text/plain"));
+        part.set_type(Some(b"text/plain")).expect("a servable copy");
         part.set_encoder(Some("quoted-printable")).expect("known");
         let headers =
             generated_headers(&mut part, None, None, MimeStrategy::Mail);
@@ -4965,7 +5149,7 @@ mod tests {
     fn a_caller_supplied_transfer_encoding_suppresses_the_generated_one() {
         let mut part = MimePart::new();
         part.set_data_str("value");
-        part.set_type(Some("text/plain"));
+        part.set_type(Some(b"text/plain")).expect("a servable copy");
         part.set_encoder(Some("base64")).expect("known");
         let mut headers = SList::new();
         headers.push_str("Content-Transfer-Encoding: 7bit");
@@ -4984,7 +5168,7 @@ mod tests {
     fn preparing_headers_twice_replaces_rather_than_appends() {
         // "Get rid of previously prepared headers." -- `:1686-1687`.
         let mut part = MimePart::new();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         let first = generated_headers(
             &mut part,
@@ -5008,7 +5192,7 @@ mod tests {
         // custom type, so it wins over inference AND disables the
         // `text/plain` suppression.
         let mut part = MimePart::new();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         let mut headers = SList::new();
         headers.push_str("Content-Type: text/plain");
@@ -5026,7 +5210,8 @@ mod tests {
         );
 
         // And `curl_mime_type` outranks the header.
-        part.set_type(Some("application/json"));
+        part.set_type(Some(b"application/json"))
+            .expect("a servable copy");
         let generated = generated_headers(
             &mut part,
             None,
@@ -5460,7 +5645,7 @@ mod tests {
     fn a_rewind_targets_begin_without_body_only() {
         let mut mime = seeded_mime(0);
         let part = mime.add_part();
-        part.set_name(Some("field"));
+        part.set_name(Some(b"field")).expect("a servable copy");
         part.set_data_str("value");
         part.prepare_headers(
             None,
@@ -5766,23 +5951,24 @@ mod tests {
         // instead of failing: `:1239-1253`, `:1256-1270`, `:1348-1362`,
         // `:1374-1394`, `:1397-1412`.
         let mut part = MimePart::new();
-        part.set_name(Some("field"));
-        part.set_filename(Some("file.txt"));
-        part.set_type(Some("text/plain"));
+        part.set_name(Some(b"field")).expect("a servable copy");
+        part.set_filename(Some(b"file.txt"))
+            .expect("a servable copy");
+        part.set_type(Some(b"text/plain")).expect("a servable copy");
         part.set_encoder(Some("base64")).expect("a known encoder");
         let mut headers = SList::new();
         headers.push_str("X-Custom: 1");
         part.set_headers(Some(headers), true);
 
-        assert_eq!(part.name(), Some("field"));
-        assert_eq!(part.filename(), Some("file.txt"));
-        assert_eq!(part.mime_type(), Some("text/plain"));
+        assert_eq!(part.name(), Some(&b"field"[..]));
+        assert_eq!(part.filename(), Some(&b"file.txt"[..]));
+        assert_eq!(part.mime_type(), Some(&b"text/plain"[..]));
         assert_eq!(part.encoder(), Some(MimeEncoding::Base64));
         assert_eq!(part.user_headers().len(), 1);
 
-        part.set_name(None);
-        part.set_filename(None);
-        part.set_type(None);
+        part.set_name(None).expect("a servable copy");
+        part.set_filename(None).expect("a servable copy");
+        part.set_type(None).expect("a servable copy");
         // "Discard the encoder" -- a null name is success, not an error.
         part.set_encoder(None).expect("clearing is not an error");
         part.set_headers(None, false);
@@ -5862,14 +6048,14 @@ mod tests {
 
         assert_eq!(part.kind(), MimeKind::File);
         assert_eq!(part.datasize, 10, "a regular file has a known size");
-        let base = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("a base name");
-        assert_eq!(part.filename(), Some(base));
+        let base = path.file_name().expect("a base name");
+        assert_eq!(
+            part.filename(),
+            Some(crate::util::path_bytes(std::path::Path::new(base)))
+        );
 
         // Withdrawing it, exactly as the C documents.
-        part.set_filename(None);
+        part.set_filename(None).expect("a servable copy");
         assert_eq!(part.filename(), None);
 
         std::fs::remove_file(&path).expect("cleanup");
@@ -5925,9 +6111,10 @@ mod tests {
     fn duplicating_a_part_copies_its_content_and_metadata() {
         // `Curl_mime_duppart` (`:1098-1173`), field by field in the C's order.
         let mut src = MimePart::new();
-        src.set_name(Some("field"));
-        src.set_filename(Some("remote.txt"));
-        src.set_type(Some("text/plain"));
+        src.set_name(Some(b"field")).expect("a servable copy");
+        src.set_filename(Some(b"remote.txt"))
+            .expect("a servable copy");
+        src.set_type(Some(b"text/plain")).expect("a servable copy");
         src.set_encoder(Some("base64")).expect("a known encoder");
         src.set_data(Some(b"duplicate me"));
         let mut headers = SList::new();
@@ -5938,9 +6125,9 @@ mod tests {
         dst.duplicate_from(&src).expect("duplication succeeds");
 
         assert_eq!(dst.kind(), MimeKind::Data);
-        assert_eq!(dst.name(), Some("field"));
-        assert_eq!(dst.filename(), Some("remote.txt"));
-        assert_eq!(dst.mime_type(), Some("text/plain"));
+        assert_eq!(dst.name(), Some(&b"field"[..]));
+        assert_eq!(dst.filename(), Some(&b"remote.txt"[..]));
+        assert_eq!(dst.mime_type(), Some(&b"text/plain"[..]));
         assert_eq!(dst.encoder(), Some(MimeEncoding::Base64));
         assert_eq!(dst.user_headers().len(), 1);
         assert!(
@@ -5960,7 +6147,7 @@ mod tests {
 
         let mut src = MimePart::new();
         src.set_file(Some(&path)).expect("readable at first");
-        src.set_name(Some("upload"));
+        src.set_name(Some(b"upload")).expect("a servable copy");
 
         std::fs::remove_file(&path).expect("remove it again");
 
@@ -5973,7 +6160,7 @@ mod tests {
         assert_eq!(dst.kind(), MimeKind::None);
         assert_eq!(
             dst.name(),
-            Some("upload"),
+            Some(&b"upload"[..]),
             "the other fields are still copied"
         );
     }

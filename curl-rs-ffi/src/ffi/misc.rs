@@ -396,6 +396,18 @@ pub unsafe extern "C" fn curl_getdate(
 /// filtering curl does not perform is added, and no check it does perform is
 /// omitted.
 ///
+/// # The NAME is bytes too
+///
+/// `getenv` takes a `char *` and compares it against the bytes of `environ`,
+/// so a variable whose name is not valid UTF-8 is findable in the C. This
+/// function decoded the name with `CStr::to_str` and answered NULL for
+/// anything it could not read, which reported such a variable as unset even
+/// when it was set -- a filter curl does not perform, on the very surface
+/// whose value path is already careful to stay byte-exact.
+/// [`OsStr::from_bytes`](std::os::unix::ffi::OsStrExt::from_bytes) is a
+/// lossless view rather than a conversion, and `std::env::var_os` accepts an
+/// `OsStr`, so the lookup now uses exactly the bytes the caller passed.
+///
 /// # Safety
 ///
 /// `variable` must be either null or a pointer to a NUL-terminated string.
@@ -408,12 +420,9 @@ pub unsafe extern "C" fn curl_getenv(variable: *const c_char) -> *mut c_char {
         let Some(name) = name else {
             return ptr::null_mut();
         };
-        let Ok(name) = name.to_str() else {
-            // A non-UTF-8 name cannot be looked up through `std::env`, and no
-            // such variable name is portable, so absent is the honest answer.
-            return ptr::null_mut();
-        };
-        let Some(value) = std::env::var_os(name) else {
+        // The name reaches `var_os` as the bytes the caller supplied. See the
+        // "The NAME is bytes too" section above for what decoding it cost.
+        let Some(value) = std::env::var_os(os_str(name.to_bytes())) else {
             return ptr::null_mut();
         };
         let bytes = os_bytes(&value);
@@ -434,6 +443,16 @@ pub unsafe extern "C" fn curl_getenv(variable: *const c_char) -> *mut c_char {
 fn os_bytes(value: &std::ffi::OsStr) -> &[u8] {
     use std::os::unix::ffi::OsStrExt;
     value.as_bytes()
+}
+
+/// The inverse view: bytes as an `OsStr`, without a conversion.
+///
+/// The mirror of [`os_bytes`] and exact for the same reason. It is what lets an
+/// environment variable be looked up by the name the caller actually gave,
+/// rather than by a decoded approximation of it.
+fn os_str(bytes: &[u8]) -> &std::ffi::OsStr {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::OsStr::from_bytes(bytes)
 }
 
 // curl_strequal / curl_strnequal
@@ -1420,6 +1439,40 @@ mod tests {
             got.is_null(),
             "an empty value is indistinguishable from unset"
         );
+    }
+
+    /// A variable whose NAME is not valid UTF-8 is found, not reported absent.
+    ///
+    /// `getenv` compares its `char *` against the bytes of `environ`, so such a
+    /// variable is findable in the C. This function decoded the name with
+    /// `CStr::to_str` and answered NULL for anything it could not read, which
+    /// reported a variable that IS set as unset -- a filter curl does not
+    /// perform, on the very surface whose value path was already careful to
+    /// stay byte-exact.
+    #[test]
+    #[cfg(unix)]
+    fn an_undecodable_variable_name_is_still_looked_up() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // A lone continuation byte in the middle of an otherwise ASCII name.
+        const NAME: &[u8] = b"CURL_RS_MISC_\xffPROBE";
+        let name = std::ffi::OsStr::from_bytes(NAME);
+        std::env::set_var(name, "found");
+
+        // The same bytes, NUL-terminated, as a C caller would pass them.
+        let mut terminated = NAME.to_vec();
+        terminated.push(0);
+        // SAFETY: `terminated` is a live NUL-terminated buffer for the call.
+        let got = unsafe { curl_getenv(terminated.as_ptr().cast::<c_char>()) };
+        std::env::remove_var(name);
+
+        assert!(
+            !got.is_null(),
+            "the variable is set, so reporting it absent is wrong"
+        );
+        assert_eq!(text(got), "found");
+        // SAFETY: `got` came from `curl_getenv`, which documents `curl_free`.
+        unsafe { curl_free(got.cast::<c_void>()) };
     }
 
     // curl_escape / curl_unescape -- the two legacy percent-encoding names.

@@ -51,6 +51,7 @@
 //! where `off_t` fits a register. Thirty-two-bit portability is deliberately
 //! forfeited and is not claimed anywhere.
 
+use core::alloc::Layout;
 use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_void};
 use core::ptr;
 
@@ -598,9 +599,60 @@ const _: () = assert!(BAD_HANDLE_INT < 0);
 /// `curl_mime_init` and `curl_easy_duphandle` all end here. The allocation
 /// outlives this call and is owned by the caller of the C function until it is
 /// passed back to [`from_raw`] or [`drop_raw`].
+///
+/// # A refused allocation answers NULL, it does not abort
+///
+/// Every C function that reaches this returns a pointer and documents NULL as
+/// its failure answer -- `curl_easy_init` "returns a CURL easy handle ... If
+/// this function returns NULL, something went wrong", and the same for
+/// `curl_multi_init`, `curl_share_init`, `curl_url` and `curl_mime_init`. An
+/// embedding application therefore already has a code path for it.
+///
+/// `Box::new` cannot give that answer: on refusal it calls
+/// `alloc::alloc::handle_alloc_error`, which **aborts the process**. That is
+/// strictly worse than the contract being replaced, and the panic boundary
+/// cannot rescue it, because an allocator abort is not an unwind and
+/// `catch_unwind` never sees it. `Box::try_new` is the natural fix and is
+/// unstable at the declared minimum Rust version, so the allocation is done
+/// through [`std::alloc`] directly -- which is exactly what `Box::try_new`
+/// would do -- inside this crate's sanctioned `unsafe` island.
+///
+/// A zero-sized `T` needs no allocation at all and `std::alloc::alloc` would be
+/// undefined behaviour for it, so that case is served by `Box::new`, which for a
+/// zero-sized type cannot fail either.
 #[allow(dead_code)] // used as symbol families land; see the module docs
 pub(crate) fn into_raw<H, T>(value: T) -> *mut H {
-    Box::into_raw(Box::new(value)).cast::<H>()
+    let layout = Layout::new::<T>();
+    if layout.size() == 0 {
+        // No allocation occurs for a zero-sized type, so there is nothing to
+        // refuse; `Box::new` is infallible here in fact and not merely in
+        // signature.
+        return Box::into_raw(Box::new(value)).cast::<H>();
+    }
+
+    // SAFETY: `layout` has a non-zero size, which is `alloc`'s one
+    // precondition. The returned pointer is either null -- handled immediately
+    // below -- or a fresh, uninitialised, suitably aligned block of exactly
+    // `size_of::<T>()` bytes that this call owns.
+    let raw = unsafe { std::alloc::alloc(layout) }.cast::<T>();
+    if raw.is_null() {
+        // The C's documented NULL, reported instead of aborting.
+        return ptr::null_mut();
+    }
+
+    // SAFETY: `raw` is non-null by the check above, is aligned for `T` because
+    // `alloc` honoured `layout`, and points at `size_of::<T>()` writable bytes
+    // that hold no live value -- so writing `value` there initialises the block
+    // without dropping anything, which is `ptr::write`'s contract.
+    unsafe { ptr::write(raw, value) };
+
+    // SAFETY: `raw` now addresses a live, initialised `T` in a block allocated
+    // by the global allocator with `Layout::new::<T>()`. That is precisely the
+    // invariant `Box::from_raw` requires, and it is the same invariant
+    // `Box::into_raw` would have established, so the pointer is reclaimable by
+    // `from_raw` and `drop_raw` exactly as before.
+    let owned = unsafe { Box::from_raw(raw) };
+    Box::into_raw(owned).cast::<H>()
 }
 
 /// Take ownership back from C, yielding the engine object.
@@ -1242,6 +1294,48 @@ mod behaviour {
 
         drop(owned);
         assert_eq!(Rc::strong_count(&witness), 1, "and then be released");
+    }
+
+    /// `into_raw` allocates through [`std::alloc`] rather than `Box::new`, so
+    /// that a refused allocation can answer the NULL every one of these C
+    /// functions documents instead of aborting the process. The refusal itself
+    /// cannot be provoked from a test -- the allocator decides -- so what is
+    /// asserted here is that the hand-rolled path is correct on the served side:
+    /// alignment, initialisation, and reclaimability by the same `from_raw`.
+    #[test]
+    fn into_raw_allocates_correctly_on_the_served_path() {
+        // A payload with a real alignment requirement, so that a mistake in the
+        // `Layout` would be visible rather than accidentally harmless.
+        #[repr(align(64))]
+        struct Aligned {
+            value: u64,
+        }
+
+        let handle: *mut CURLM = into_raw(Aligned { value: 0xfeed });
+        assert!(!handle.is_null(), "a servable allocation is not NULL");
+        assert_eq!(
+            handle as usize % 64,
+            0,
+            "the block must honour the payload's alignment"
+        );
+
+        // SAFETY: `handle` came from `into_raw` with this payload type and has
+        // not been reclaimed.
+        let owned = unsafe { from_raw::<CURLM, Aligned>(handle) }
+            .expect("a non-null handle reclaims");
+        assert_eq!(
+            owned.value, 0xfeed,
+            "the value must have been written into the block"
+        );
+        drop(owned);
+
+        // A zero-sized payload takes the `Box::new` branch, because
+        // `std::alloc::alloc` is undefined behaviour for a zero-sized layout.
+        struct Empty;
+        let empty: *mut CURLU = into_raw(Empty);
+        assert!(!empty.is_null(), "a zero-sized handle is still a handle");
+        // SAFETY: as above, with the zero-sized payload type.
+        unsafe { drop_raw::<CURLU, Empty>(empty) };
     }
 
     #[test]

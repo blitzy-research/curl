@@ -597,27 +597,41 @@ unsafe fn borrow_bytes<'a>(
     }
 }
 
-/// Borrows a NUL-terminated string the engine's vocabulary spells as `&str`.
+/// Borrows a NUL-terminated pathname or media type, as the bytes it is.
 ///
-/// # The one narrow deviation in this module, stated rather than buried
+/// # The narrow deviation that used to live here, and why it is gone
+///
+/// A `borrow_str` stood in this place. It decoded the pointer as UTF-8 and, for
+/// anything it could not read, returned `CURL_FORMADD_MEMORY` -- because the
+/// engine's `FormOption` vocabulary spelled these five options `&str` and there
+/// was no other code to give. Two things were wrong with that, beyond the
+/// narrowing itself:
+///
+/// * `CURL_FORMADD_MEMORY` means an allocation failed. Reporting it for a
+///   perfectly valid byte string told the caller something untrue about its own
+///   process, and `curl_formadd`'s five codes have no member that means "your
+///   filename is not Unicode" precisely because the C never needs one.
+/// * The affected options are `CURLFORM_FILE`, `CURLFORM_FILECONTENT`,
+///   `CURLFORM_BUFFER`, `CURLFORM_FILENAME` and `CURLFORM_CONTENTTYPE`. The
+///   first three name files on the local filesystem and the last two go on the
+///   wire inside a `Content-Disposition` or a `Content-Type`. The C stores each
+///   as the `char *` it received. So a form that curl 8.x posts was refused,
+///   and the refusal was reachable from any program passing a filename in a
+///   locale encoding.
+///
+/// The engine now carries all five as bytes, so this is a plain borrow with no
+/// failure mode -- which is why it returns `Option` rather than `Result`.
 ///
 /// # Safety
 ///
 /// `pointer` must be null or address a NUL-terminated string that stays valid
 /// and unmodified for as long as the returned reference is used.
-unsafe fn borrow_str<'a>(
-    pointer: *const c_char,
-) -> Result<Option<&'a str>, CURLFORMcode> {
-    if pointer.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: by contract `pointer` addresses a NUL-terminated string that
-    // outlives this borrow, which is `CStr::from_ptr`'s precondition.
-    let text = unsafe { CStr::from_ptr(pointer) };
-    match text.to_str() {
-        Ok(text) => Ok(Some(text)),
-        Err(_) => Err(CURLFORMcode::CURL_FORMADD_MEMORY),
-    }
+unsafe fn borrow_cstr_bytes<'a>(pointer: *const c_char) -> Option<&'a [u8]> {
+    // The NUL-terminated form of `borrow_bytes`, reached by declaring no
+    // length: one implementation answers for both, so the two cannot drift.
+    // SAFETY: this function's contract is `borrow_bytes`'s contract for a
+    // `declared` of `None`, forwarded unchanged.
+    unsafe { borrow_bytes(pointer, None) }
 }
 
 /// The caller's own pointers, which the engine's model does not carry back.
@@ -720,7 +734,7 @@ impl PartReader for StreamSource {
 /// # Safety
 ///
 /// Every pointer in `items` must satisfy the promise the option that carried it
-/// makes -- see [`borrow_bytes`] and [`borrow_str`] -- and a
+/// makes -- see [`borrow_bytes`] and [`borrow_cstr_bytes`] -- and a
 /// `CURLFORM_CONTENTHEADER` list must be null or a well-formed, terminating
 /// chain of NUL-terminated strings that nothing mutates during the call.
 unsafe fn decode(
@@ -797,14 +811,16 @@ unsafe fn decode(
                 // SAFETY: this function's contract; the option names a
                 // NUL-terminated filename.
                 FormOption::FileContent(unsafe {
-                    borrow_str(item.pointer().cast())
-                }?)
+                    borrow_cstr_bytes(item.pointer().cast())
+                })
             }
 
             // `case CURLFORM_FILE:` (`:435-468`).
             CURLformoption::CURLFORM_FILE => {
                 // SAFETY: as `CURLFORM_FILECONTENT`.
-                FormOption::File(unsafe { borrow_str(item.pointer().cast()) }?)
+                FormOption::File(unsafe {
+                    borrow_cstr_bytes(item.pointer().cast())
+                })
             }
 
             // `case CURLFORM_BUFFERPTR:` (`:470-484`).
@@ -847,8 +863,8 @@ unsafe fn decode(
                 // SAFETY: as `CURLFORM_FILECONTENT`; a media type is a
                 // NUL-terminated string.
                 FormOption::ContentType(unsafe {
-                    borrow_str(item.pointer().cast())
-                }?)
+                    borrow_cstr_bytes(item.pointer().cast())
+                })
             }
 
             // `case CURLFORM_CONTENTHEADER:` (`:542-553`). The chain is copied
@@ -878,7 +894,7 @@ unsafe fn decode(
             CURLformoption::CURLFORM_FILENAME
             | CURLformoption::CURLFORM_BUFFER => {
                 // SAFETY: as `CURLFORM_FILECONTENT`.
-                let shown = unsafe { borrow_str(item.pointer().cast()) }?;
+                let shown = unsafe { borrow_cstr_bytes(item.pointer().cast()) };
                 if item.option == CURLformoption::CURLFORM_FILENAME {
                     FormOption::FileName(shown)
                 } else {
@@ -1121,16 +1137,12 @@ unsafe fn stage(
     } else {
         own_or_borrow(entry.contents(), plan.contents, &mut failed)
     };
-    let contenttype = own_or_borrow(
-        entry.contenttype().map(str::as_bytes),
-        plan.contenttype,
-        &mut failed,
-    );
-    let showfilename = own_or_borrow(
-        entry.showfilename().map(str::as_bytes),
-        plan.showfilename,
-        &mut failed,
-    );
+    // Both already are the bytes the C's `char *` holds, so nothing is
+    // converted here any more.
+    let contenttype =
+        own_or_borrow(entry.contenttype(), plan.contenttype, &mut failed);
+    let showfilename =
+        own_or_borrow(entry.showfilename(), plan.showfilename, &mut failed);
 
     let post = curl_httppost {
         next: ptr::null_mut(),
@@ -1364,7 +1376,7 @@ fn to_form_code(code: FormCode) -> CURLFORMcode {
 /// `httppost` and `last_post` must each be null or address a writable
 /// `struct curl_httppost *`, and `ap` must be the argument list the trampoline
 /// synthesised. Every pointer in that list must satisfy the promise its option
-/// makes -- see [`borrow_bytes`] and [`borrow_str`] -- and a `CURLFORM_PTR*`
+/// makes -- see [`borrow_bytes`] and [`borrow_cstr_bytes`] -- and a `CURLFORM_PTR*`
 /// buffer must outlive the form. Any existing chain reached through `*last_post`
 /// must be one this module produced.
 unsafe extern "C" fn formadd_va(
@@ -2532,6 +2544,62 @@ mod tests {
         assert_eq!(code, CURLFORMcode::CURL_FORMADD_MEMORY);
         assert!(post.is_null(), "nothing is written on failure");
         assert!(last.is_null(), "nothing is written on failure");
+    }
+
+    /// A filename that is not valid UTF-8 is accepted and reaches the wire.
+    ///
+    /// This used to answer `CURL_FORMADD_MEMORY`, because the five path and
+    /// media-type options were decoded as UTF-8 first and the five-member code
+    /// set has no member meaning "not Unicode". Two things were wrong with
+    /// that: it refused a form curl 8.x posts, and it told the caller an
+    /// allocation had failed when none had. Both halves are asserted -- the
+    /// code, and the bytes in the emitted body.
+    #[test]
+    fn an_undecodable_shown_filename_is_accepted_and_emitted_verbatim() {
+        let mut post: *mut curl_httppost = ptr::null_mut();
+        let mut last: *mut curl_httppost = ptr::null_mut();
+
+        // `fi\xffle.txt`, NUL-terminated, as a C caller would hold it.
+        const SHOWN: &[u8] = b"fi\xffle.txt\0";
+
+        // SAFETY: every pointer addresses a NUL-terminated buffer that outlives
+        // the call, and the option sequence is well formed.
+        let code = unsafe {
+            curl_formadd(
+                &mut post,
+                &mut last,
+                opt(CURLformoption::CURLFORM_COPYNAME),
+                cstr!("upload"),
+                opt(CURLformoption::CURLFORM_BUFFER),
+                SHOWN.as_ptr().cast::<c_char>(),
+                opt(CURLformoption::CURLFORM_BUFFERPTR),
+                cstr!("payload"),
+                opt(CURLformoption::CURLFORM_BUFFERLENGTH),
+                7 as c_long,
+                opt(CURLformoption::CURLFORM_END),
+            )
+        };
+        assert_eq!(
+            code,
+            CURLFORMcode::CURL_FORMADD_OK,
+            "a filename the local filesystem accepts is not an allocation \
+             failure"
+        );
+        assert!(!post.is_null());
+
+        // SAFETY: `post` is the chain `curl_formadd` just built.
+        let (status, bytes) = unsafe { serialise(post) };
+        assert_eq!(status, 0);
+        assert!(
+            bytes
+                .windows(SHOWN.len() - 1)
+                .any(|window| window == &SHOWN[..SHOWN.len() - 1]),
+            "the filename must appear in the body as the bytes supplied, \
+             neither replaced nor dropped"
+        );
+
+        // SAFETY: `post` is a chain this test owns and has not yet freed.
+        unsafe { curl_formfree(post) };
     }
 
     // -- the error codes ---------------------------------------------------

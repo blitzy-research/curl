@@ -358,14 +358,21 @@ pub(crate) use sys::memdebug::{
 // The re-export surface -- group E: the platform facade the command-line
 // tool consumes
 //
-// These six functions and one guard type are the only items in this directory
+// These seven functions and one guard type are the only items in this directory
 // re-exported at `pub` rather than `pub(crate)`, and the reason is structural
 // rather than a relaxation. `curl-rs` carries `#![forbid(unsafe_code)]` and
 // has no `mod ffi` of its own, and AAP 0.8.5 conflict C3 reserves
-// `curl-rs-lib/src/ffi/` for genuine operating-system residue -- so the four
+// `curl-rs-lib/src/ffi/` for genuine operating-system residue -- so the five
 // capabilities the tool needs (suppressing terminal echo while a password is
-// typed, reading the terminal width, writing an extended attribute, and
-// rendering local and locale-dependent time) can only reach it from here.
+// typed, reading the terminal width, writing an extended attribute, rendering
+// local and locale-dependent time, and wiping a credential out of the process
+// argument vector) can only reach it from here.
+//
+// `scrub_argument` is the newest of them and the one whose absence was a
+// security defect rather than a missing convenience: `cleanarg`
+// (`src/tool_getparam.c:625-637`) is what keeps a `-u bob:pw` out of `ps` for
+// the life of the transfer, `HAVE_WRITABLE_ARGV` is defined on all four
+// mandated targets, and no safe crate can reach the loader's argument vector.
 // `crate::lib` re-exports exactly this list at the crate root, and nothing
 // else from this directory crosses the crate boundary.
 //
@@ -379,7 +386,7 @@ pub(crate) use sys::memdebug::{
 // duration of a single call.
 
 pub use sys::{
-    disable_echo, local_utc_offset_secs, set_file_xattr,
+    disable_echo, local_utc_offset_secs, scrub_argument, set_file_xattr,
     set_locale_from_environment, strftime_gmt, terminal_columns, EchoGuard,
 };
 
@@ -391,9 +398,10 @@ pub use sys::{
 // wrappers need these for their own tests, and nothing outside the crate does.
 
 pub(crate) use sys::{
-    disable_echo_with, local_utc_offset_secs_with, set_file_xattr_with,
-    set_locale_from_environment_with, strftime_gmt_with, terminal_columns_with,
-    SavedTerminal, TerminalCalls, TimeCalls, XattrCalls,
+    disable_echo_with, local_utc_offset_secs_with, scrub_argument_with,
+    set_file_xattr_with, set_locale_from_environment_with, strftime_gmt_with,
+    terminal_columns_with, ArgvCalls, RealArgv, SavedTerminal, TerminalCalls,
+    TimeCalls, XattrCalls,
 };
 
 // The re-export surface -- group D: the GSS-API vocabulary, feature
@@ -406,23 +414,36 @@ pub(crate) use sys::{
 // the status integers and the `GSS_C_*` bit constants all stay inside
 // `gss.rs`.
 //
-// The three `GSSAUTH_P_*` constants come from `lib/curl_gssapi.h:65-67` and
-// are the SOCKS5 protection levels curl negotiates; the three
-// `SOCKS5_PROTECTION_*` constants are the wire values that correspond to
-// them.
+// The three `SOCKS5_PROTECTION_*` constants are the RFC 1961 wire values a
+// SOCKS5 GSS-API negotiation carries, computed by
+// `ContextFlags::socks5_protection_level` from `lib/socks_gssapi.c:330-335`.
 //
-// DELIBERATELY NOT re-exported: `gss::available`. Its total counterpart
-// `gss_available` below answers the same question in every feature state, and
-// having one blessed entry point is what stops a caller from reaching for a
-// predicate that does not exist in the default build.
+// DELIBERATELY NOT re-exported, and each absence is a decision:
+//
+//   * `gss::available`. Its total counterpart `gss_available` below answers the
+//     same question in every feature state, and having one blessed entry point
+//     is what stops a caller from reaching for a predicate that does not exist
+//     in the default build.
+//   * `GSSAUTH_P_NONE`, `GSSAUTH_P_INTEGRITY` and `GSSAUTH_P_PRIVACY`. These
+//     were re-exported and anchored here, and a comment above this list
+//     described them as "the SOCKS5 protection levels curl negotiates" -- which
+//     they are not. They are the RFC 4752 SASL security-layer bitmask from
+//     `lib/curl_gssapi.h:65-67`, a different encoding for a different protocol
+//     (1/2/4, not 0/1/2), and the whole C tree reads them only in
+//     `lib/vauth/krb5_gssapi.c`, on the SASL path that serves SMTP, IMAP and
+//     POP3 -- protocols AAP section 0.2.2 excludes. No module outside `gss.rs`
+//     has any use for them, so re-exporting them widened the audit list without
+//     adding a capability, and the anchor below created the appearance of a
+//     consumer where there was none. They stay in `gss.rs`, with a per-item
+//     allowance and the reason written beside each one, and their values stay
+//     pinned by `protection_level_constants_match_the_c_header` there.
 
 #[cfg(feature = "negotiate")]
 pub(crate) use gss::{
     request_flags, ContextFlags, Delegation, Diagnostics, DiscardDiagnostics,
     GssStatus, HandshakeOutcome, HandshakeState, Mechanism, NameType,
     RequestedFlags, SealedMessage, SecurityContext, StepOptions, TargetName,
-    DELEGATION_POLICY_UNSUPPORTED_WARNING, GSSAUTH_P_INTEGRITY, GSSAUTH_P_NONE,
-    GSSAUTH_P_PRIVACY, SOCKS5_PROTECTION_CONFIDENTIALITY,
+    DELEGATION_POLICY_UNSUPPORTED_WARNING, SOCKS5_PROTECTION_CONFIDENTIALITY,
     SOCKS5_PROTECTION_INTEGRITY, SOCKS5_PROTECTION_NONE,
 };
 
@@ -583,6 +604,13 @@ const _: fn(BorrowedFd<'_>, &[u8], &[u8]) -> io::Result<()> = set_file_xattr;
 const _: fn(i64) -> Option<i32> = local_utc_offset_secs;
 const _: fn(&[u8], i64, &mut [u8]) -> Option<usize> = strftime_gmt;
 const _: fn() -> bool = set_locale_from_environment;
+// The scrubber takes BYTES and returns a count, and both halves are pinned
+// here. A credential is arbitrary bytes on the four mandated targets, so a
+// `&str` parameter would make an argument this must wipe unrepresentable; the
+// `usize` is how many elements were overwritten, which is what makes "the
+// vector was not writable" reportable as `0` rather than indistinguishable
+// from success.
+const _: fn(&[u8]) -> usize = scrub_argument;
 
 // Group F: their injection seams.
 const _: for<'a> fn(&'a dyn TerminalCalls, BorrowedFd<'a>) -> EchoGuard<'a> =
@@ -594,7 +622,9 @@ const _: fn(&dyn TimeCalls, i64) -> Option<i32> = local_utc_offset_secs_with;
 const _: fn(&dyn TimeCalls, &[u8], i64, &mut [u8]) -> Option<usize> =
     strftime_gmt_with;
 const _: fn(&dyn TimeCalls) -> bool = set_locale_from_environment_with;
+const _: fn(&dyn ArgvCalls, &[u8]) -> usize = scrub_argument_with;
 const _: Option<SavedTerminal> = None;
+const _: Option<RealArgv> = None;
 
 // Group C: the counting allocator. `TrackingAllocator` is named so that
 // `lib.rs` can install it; `set_memlimit` reproduces `curl_dbg_memlimit()`.
@@ -605,16 +635,24 @@ const _: fn() -> bool = init_from_env;
 #[cfg(feature = "memdebug")]
 const _: Option<TrackingAllocator> = None;
 
-// Group D: the GSS-API vocabulary. The six protection-level constants are
+// Group D: the GSS-API vocabulary. The three protection-level constants are
 // `u8` and the delegation diagnostic is a `&'static str`, so both are pinned
 // by value rather than merely by name.
+//
+// WHAT AN ANCHOR IS AND IS NOT. Naming a constant in an anonymous `const` pins
+// its type and its value at compile time, which is this block's whole purpose,
+// and it is genuinely useful for an item that has a consumer elsewhere: it makes
+// a change of type break the build HERE, beside the documentation, rather than
+// at a distant call site. What it is NOT is a "use" for the `dead_code` lint --
+// measured, the three `GSSAUTH_P_*` constants warned as unreferenced while
+// anchored here. An anchor is therefore never the answer to an unreferenced
+// item; either the item has a consumer, or it carries a justified per-item
+// allowance where it is declared. Every constant named below has a real
+// consumer inside `gss.rs`.
 #[cfg(feature = "negotiate")]
 const _: &str = DELEGATION_POLICY_UNSUPPORTED_WARNING;
 #[cfg(feature = "negotiate")]
-const _: [u8; 6] = [
-    GSSAUTH_P_NONE,
-    GSSAUTH_P_INTEGRITY,
-    GSSAUTH_P_PRIVACY,
+const _: [u8; 3] = [
     SOCKS5_PROTECTION_NONE,
     SOCKS5_PROTECTION_INTEGRITY,
     SOCKS5_PROTECTION_CONFIDENTIALITY,

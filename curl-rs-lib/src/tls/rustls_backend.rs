@@ -548,11 +548,23 @@ impl TlsOptions {
     /// cached session on the client certificate as well as the peer, so a
     /// transfer presenting different credentials must not resume another's
     /// session. The spelling is the option's own, which is what the C
-    /// compares.
+    /// compares -- byte for byte, through `Curl_safecmp`.
+    ///
+    /// # The path is passed on whole
+    ///
+    /// `Path::as_os_str` cannot fail, and that is the point. Decoding the path
+    /// first -- `Path::to_str`, which answers `None` for anything that is not
+    /// UTF-8 -- would turn a configured client certificate into *no* client
+    /// certificate for every path the platform accepts and Unicode does not.
+    /// The identity would then report itself non-confidential, the cache slot
+    /// would be marked exportable, and `curl_easy_ssls_export` would offer a
+    /// session established with a private key to whoever asked; a second
+    /// connection with a different undecodable certificate path would also
+    /// match it and resume it. `ScacheClientAuth` takes an
+    /// [`OsStr`](std::ffi::OsStr) so that no such conversion exists to get
+    /// wrong.
     fn scache_auth(&self) -> ScacheClientAuth {
-        ScacheClientAuth::new(
-            self.client_cert.as_deref().and_then(Path::to_str),
-        )
+        ScacheClientAuth::new(self.client_cert.as_deref().map(Path::as_os_str))
     }
 }
 
@@ -1149,6 +1161,11 @@ pub(crate) struct RustlsSession {
     peer_verification_disabled: bool,
     /// Whether [`crate::tls::verify::verify_hostname`] is still owed on the
     /// peer certificate.
+    ///
+    /// This is `CURLOPT_SSL_VERIFYHOST` and not a derivative of
+    /// `CURLOPT_SSL_VERIFYPEER`: with the chain check off and the name check
+    /// on, it is `true`, and the after-handshake check is then the only one
+    /// there is.
     verify_host_pending: bool,
 }
 
@@ -2397,9 +2414,18 @@ fn capture_certinfo(
 /// `CURLOPT_ERRORBUFFER` consumers read; and the check is `verify.rs`'s to own,
 /// so skipping it would leave the module's contract half-honoured.
 ///
-/// Reached only when peer verification is on, because
-/// `host_verification_enabled` is always `false` when it is off -- comparing a
-/// name on a self-signed certificate establishes nothing.
+/// # It is gated on `CURLOPT_SSL_VERIFYHOST` alone
+///
+/// `state.verify_host_pending` carries
+/// [`verify::ServerVerification::host_verification_enabled`], which is that
+/// option and nothing else. In particular it is **independent of
+/// `CURLOPT_SSL_VERIFYPEER`**: with the chain check off and the name check on --
+/// `lib/vtls/schannel.c:1469`'s `if(!verifypeer && verifyhost)` -- this is the
+/// only place the name is checked at all, because the verifier rustls holds in
+/// that state examines nothing. Skipping it there would silently discard a
+/// check the caller asked for. In the mirror state, chain on and name off, the
+/// flag is `false` and rustls has already been told not to reject a name
+/// mismatch, so the two agree.
 ///
 /// # Errors
 ///
@@ -2893,6 +2919,7 @@ mod tests {
     use crate::util::sync_cell::SyncCell;
     use crate::util::timeval::{CurlTime, TestClock};
     use rustls::CertificateError;
+    use std::ffi::OsStr;
     use std::sync::Arc;
 
     // Test doubles. Nothing here touches a socket, a file or the network:
@@ -3983,7 +4010,71 @@ mod tests {
         let _progress = coded(backend.do_connect(&mut state, &mut io))
             .expect("the first step writes the ClientHello");
         assert!(state.peer_verification_disabled());
-        assert!(!state.verify_host_pending, "no name check without a chain");
+        assert!(
+            !state.verify_host_pending,
+            "`--insecure` clears BOTH options, so no name check is owed \
+             either -- and it is the pair that decides this, not the chain \
+             alone: see `a_chainless_session_still_owes_a_requested_name_check`"
+        );
+    }
+
+    /// `VERIFYPEER 0` with `VERIFYHOST 1`: the chain is not verified and the
+    /// name check is still owed. Reachable only through the library API, since
+    /// the tool's `--insecure` clears both, and the state
+    /// `lib/vtls/schannel.c:1469` spells out as `if(!verifypeer &&
+    /// verifyhost)`.
+    #[test]
+    #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
+    fn a_chainless_session_still_owes_a_requested_name_check() {
+        let mut options = TlsOptions::new();
+        options.verify_peer = false;
+        options.verify_host = true;
+        let backend = RustlsBackend::new(provider(), options);
+        let mut state = backend
+            .new_state(&peer("example.com"), None)
+            .expect("a fresh state builds without I/O");
+        let (mut base, shared) = stack();
+        shared.borrow_mut().read_script = vec![Step::Again];
+        let clock = TestClock::new(CurlTime::new(1, 0));
+        let mut cx = CallCtx::new(&clock);
+        let mut io = TlsTransport::new(&mut base, &mut cx);
+        let _progress = coded(backend.do_connect(&mut state, &mut io))
+            .expect("the chainless path cannot fail to build");
+        assert!(
+            state.peer_verification_disabled(),
+            "the chain is not verified, so the --insecure warning is due"
+        );
+        assert!(
+            state.verify_host_pending,
+            "the caller asked for the name to be checked and this is the \
+             only place it can be"
+        );
+    }
+
+    /// `VERIFYPEER 1` with `VERIFYHOST 0`: the chain is verified and the name
+    /// is not, so no `--insecure` warning is due and no name check is owed.
+    #[test]
+    #[cfg_attr(miri, ignore = "ring's assembly is outside Miri's reach")]
+    fn a_verifying_session_with_the_name_check_off_owes_no_name_check() {
+        let mut options = TlsOptions::new();
+        options.verify_peer = true;
+        options.verify_host = false;
+        let backend = RustlsBackend::new(provider(), options);
+        let mut state = backend
+            .new_state(&peer("example.com"), None)
+            .expect("a fresh state builds without I/O");
+        let (mut base, shared) = stack();
+        shared.borrow_mut().read_script = vec![Step::Again];
+        let clock = TestClock::new(CurlTime::new(1, 0));
+        let mut cx = CallCtx::new(&clock);
+        let mut io = TlsTransport::new(&mut base, &mut cx);
+        let _progress = coded(backend.do_connect(&mut state, &mut io))
+            .expect("the bundled roots build a verifier");
+        assert!(
+            !state.peer_verification_disabled(),
+            "the chain IS verified here, so warning would be false"
+        );
+        assert!(!state.verify_host_pending);
     }
 
     /// A verifying configuration owes the hostname check, and does not claim
@@ -5015,7 +5106,8 @@ mod tests {
         assert!(scope.admits("host:443:G", &auth));
         assert!(!scope.admits("other:443:G", &auth));
         // Case-sensitive, exactly as `Curl_safecmp` is.
-        let with_cert = ScacheClientAuth::new(Some("/tmp/client.pem"));
+        let with_cert =
+            ScacheClientAuth::new(Some(OsStr::new("/tmp/client.pem")));
         assert!(!scope.admits("host:443:G", &with_cert));
         let scoped_to_cert =
             SessionScope::new(String::from("host:443:G"), with_cert.clone());
@@ -5253,10 +5345,53 @@ mod tests {
         with_cert.client_cert = Some(PathBuf::from("/tmp/client.pem"));
         assert_eq!(
             with_cert.scache_auth().clientcert(),
-            Some("/tmp/client.pem")
+            Some(OsStr::new("/tmp/client.pem"))
         );
         assert!(with_cert.scache_auth().is_confidential());
         assert!(!TlsOptions::new().scache_auth().is_confidential());
+    }
+
+    /// A client-certificate path that is not valid UTF-8 still produces a
+    /// confidential, distinguishable cache identity.
+    ///
+    /// `scache_auth` used to decode the path with `Path::to_str` first, which
+    /// answers `None` for any path Unicode cannot spell. The identity then
+    /// reported itself non-confidential -- so the cache slot became exportable
+    /// and `curl_easy_ssls_export` would offer a session established with a
+    /// private key -- and it compared equal to every other undecodable path, so
+    /// a connection presenting a *different* certificate could resume it. Both
+    /// halves are asserted, on the option surface where the conversion was.
+    #[test]
+    #[cfg(unix)]
+    fn an_undecodable_client_certificate_path_survives_into_the_identity() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = OsStr::from_bytes(b"/certs/\xff\xfeclient.pem");
+        let mut options = TlsOptions::new();
+        options.client_cert = Some(PathBuf::from(path));
+
+        let auth = options.scache_auth();
+        assert_eq!(
+            auth.clientcert(),
+            Some(path),
+            "the path reaches the identity byte for byte"
+        );
+        assert!(
+            auth.is_confidential(),
+            "a configured client certificate is confidential whatever its \
+             path spells"
+        );
+
+        let mut other = TlsOptions::new();
+        other.client_cert = Some(PathBuf::from(OsStr::from_bytes(
+            b"/certs/\xff\xfeother.pem",
+        )));
+        assert!(
+            !auth.matches(Some(&other.scache_auth())),
+            "two different undecodable paths must not resume each other's \
+             sessions"
+        );
+        assert!(!auth.matches(Some(&TlsOptions::new().scache_auth())));
     }
 
     /// The `adjust_pollset` slot is the *generic* helper, and the need this

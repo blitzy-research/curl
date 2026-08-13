@@ -78,6 +78,7 @@
 //! the crate root's `#![deny(unsafe_code)]`.
 
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
@@ -817,7 +818,13 @@ pub(crate) struct PeerKeyConfig<'a> {
     /// withheld -- and so, necessarily, is the private key it implies -- while
     /// the *value* is still compared, through [`ClientAuth`], before a session
     /// may be reused.
-    pub(crate) clientcert: Option<&'a str>,
+    ///
+    /// An [`OsStr`] rather than a `str`, because the C's `char *` is a path and
+    /// a path is not text. A cache identity that cannot represent every path
+    /// the option accepts would map some paths onto "no client certificate",
+    /// which is the one answer that must never be reached by accident: see
+    /// [`ClientAuth::is_confidential`].
+    pub(crate) clientcert: Option<&'a OsStr>,
 }
 
 impl Default for PeerKeyConfig<'_> {
@@ -860,24 +867,50 @@ impl<'a> PeerKeyConfig<'a> {
 }
 
 /// Which client credentials a cached session was established with.
+///
+/// # Why the identity is bytes and not text
+///
+/// The C field is `char *clientcert`, a path, and `Curl_safecmp` compares it
+/// with `strcmp`. Storing it as a `String` would make the type unable to hold
+/// a path that is not valid UTF-8, and the only way to construct such a value
+/// would be to drop it -- turning a credential-bound identity into the
+/// no-credential identity. That single substitution has two consequences, and
+/// both are security failures rather than fidelity failures:
+///
+/// * [`Self::is_confidential`] would answer `false`, so
+///   [`ScachePeer::update_exportable`] would mark the slot **exportable** and
+///   `curl_easy_ssls_export` would hand a session established with a private
+///   key to any process that asks for it.
+/// * [`Self::matches`] would answer `true` against every other undecodable
+///   path, so a session established with one client certificate could be
+///   resumed by a connection presenting a different one.
+///
+/// An [`OsString`] holds every byte string the platform accepts as a path, and
+/// its equality is a plain byte comparison -- which is `strcmp`, exactly. A
+/// [`PathBuf`](std::path::PathBuf) would be the more obvious type and is
+/// deliberately not used: its `PartialEq` compares normalised
+/// [`Components`](std::path::Components), so `./cert.pem` and `cert.pem` would
+/// compare equal where `strcmp` says they differ.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)] // Consumers land with tls/rustls_backend.rs.
 pub(crate) struct ClientAuth {
     /// `peer->clientcert`: the `CURLOPT_SSLCERT` spelling, or [`None`].
-    clientcert: Option<String>,
+    clientcert: Option<OsString>,
 }
 
-#[allow(dead_code)] // Consumers land with tls/rustls_backend.rs.
 impl ClientAuth {
     /// An identity naming `clientcert`, or naming no certificate.
-    pub(crate) fn new(clientcert: Option<&str>) -> Self {
+    ///
+    /// `None` means, and may only mean, that no client certificate is
+    /// configured. There is no input for which this returns `None` from a
+    /// `Some` argument: the parameter type holds every path there is.
+    pub(crate) fn new(clientcert: Option<&OsStr>) -> Self {
         Self {
-            clientcert: clientcert.map(String::from),
+            clientcert: clientcert.map(OsString::from),
         }
     }
 
     /// The certificate spelling, if there is one.
-    pub(crate) fn clientcert(&self) -> Option<&str> {
+    pub(crate) fn clientcert(&self) -> Option<&OsStr> {
         self.clientcert.as_deref()
     }
 
@@ -887,6 +920,10 @@ impl ClientAuth {
     /// (`vtls_scache.c:434-436`): a peer whose sessions were established with
     /// client credentials must never be exported, because the importing
     /// process may hold different ones.
+    ///
+    /// This is the presence of a configured certificate and nothing else --
+    /// never whether that certificate's path could be decoded, which is the
+    /// distinction the type's own documentation exists to protect.
     pub(crate) fn is_confidential(&self) -> bool {
         self.clientcert.is_some()
     }
@@ -906,10 +943,11 @@ impl ClientAuth {
     ///
     /// `Curl_safecmp` (`lib/strcase.c:119-124`) is `!strcmp` when both
     /// pointers are non-null and `!a && !b` otherwise -- **case-sensitive**,
-    /// with both-absent counting as equal. `Option<String>`'s derived equality
-    /// is exactly that. It is deliberately *not* `curl_strequal`, which is
-    /// case-insensitive and which the peer-key comparison does use; the two
-    /// comparisons differ in the C and differ here.
+    /// with both-absent counting as equal. `Option<OsString>`'s derived
+    /// equality is exactly that: byte-for-byte, with both-absent equal. It is
+    /// deliberately *not* `curl_strequal`, which is case-insensitive and which
+    /// the peer-key comparison does use; the two comparisons differ in the C
+    /// and differ here.
     pub(crate) fn matches(&self, expected: Option<&Self>) -> bool {
         match expected {
             None => self.clientcert.is_none(),
@@ -1164,6 +1202,9 @@ fn peer_key_build(
     if let Some(pinned) = config.pinned_key.filter(|key| !key.is_empty()) {
         buf.addf(format_args!(":Pinned-{pinned}"))?;
     }
+    // `if(config->clientcert && config->clientcert[0])`. `is_empty` on the
+    // path's bytes is that second test; the path's CONTENT never reaches the
+    // key, only the fact that one was configured.
     if config.clientcert.is_some_and(|cert| !cert.is_empty()) {
         buf.add(":CCERT")?;
     }
@@ -3437,7 +3478,7 @@ mod tests {
             verifypeer: false,
             verifyhost: false,
             pinned_key: Some("sha256//abc="),
-            clientcert: Some("/client.pem"),
+            clientcert: Some(OsStr::new("/client.pem")),
             ..PeerKeyConfig::default()
         };
         let key = peer_key_build("h", 1, TRNSPRT_TCP, &config, "i")
@@ -3451,7 +3492,7 @@ mod tests {
         // Empty strings add nothing, which is the C's `if(x && x[0])`.
         let empty = PeerKeyConfig {
             pinned_key: Some(""),
-            clientcert: Some(""),
+            clientcert: Some(OsStr::new("")),
             ..PeerKeyConfig::default()
         };
         assert_eq!(
@@ -3466,7 +3507,7 @@ mod tests {
     #[test]
     fn the_client_certificate_path_is_withheld_from_the_key() {
         let config = PeerKeyConfig {
-            clientcert: Some("/home/user/secret-identity.pem"),
+            clientcert: Some(OsStr::new("/home/user/secret-identity.pem")),
             ..PeerKeyConfig::default()
         };
         let key = peer_key_build("h", 1, TRNSPRT_TCP, &config, "i")
@@ -3480,7 +3521,7 @@ mod tests {
     #[test]
     fn no_srp_fragment_is_ever_emitted() {
         let config = PeerKeyConfig {
-            clientcert: Some("/client.pem"),
+            clientcert: Some(OsStr::new("/client.pem")),
             pinned_key: Some("p"),
             ..PeerKeyConfig::default()
         };
@@ -3605,7 +3646,7 @@ mod tests {
             ca_file: Some("/ca"),
             cert_blob: Some(b"blob"),
             pinned_key: Some("PK"),
-            clientcert: Some("CC"),
+            clientcert: Some(OsStr::new("CC")),
             ..PeerKeyConfig::default()
         };
         let key =
@@ -4503,8 +4544,8 @@ mod tests {
     #[test]
     fn the_client_auth_comparison_matches_curl_safecmp() {
         let none = ClientAuth::new(None);
-        let one = ClientAuth::new(Some("/a.pem"));
-        let other = ClientAuth::new(Some("/b.pem"));
+        let one = ClientAuth::new(Some(OsStr::new("/a.pem")));
+        let other = ClientAuth::new(Some(OsStr::new("/b.pem")));
 
         // conn_config == NULL: only a peer with no certificate matches.
         assert!(none.matches(None));
@@ -4518,13 +4559,64 @@ mod tests {
         assert!(!none.matches(Some(&one)));
 
         // Case-sensitive, unlike the peer-key comparison.
-        let upper = ClientAuth::new(Some("/A.PEM"));
+        let upper = ClientAuth::new(Some(OsStr::new("/A.PEM")));
         assert!(!one.matches(Some(&upper)));
 
         // A supplied configuration naming no certificate behaves exactly like
         // no configuration at all.
         assert!(none.matches(Some(&ClientAuth::default())));
         assert!(!one.matches(Some(&ClientAuth::default())));
+    }
+
+    /// A certificate path that is not valid UTF-8 is still a certificate.
+    ///
+    /// The failure this guards against is a substitution, not a rejection: if
+    /// the identity cannot hold such a path it holds `None` instead, and `None`
+    /// means "no client certificate". Two consequences follow immediately, and
+    /// both are asserted here -- the slot becomes exportable, and every other
+    /// undecodable path matches it.
+    #[test]
+    #[cfg(unix)]
+    fn an_undecodable_certificate_path_is_neither_absent_nor_interchangeable() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // Lone continuation bytes: a valid POSIX filename, not valid UTF-8.
+        let mine = ClientAuth::new(Some(OsStr::from_bytes(
+            b"/certs/\xff\xfemine.pem",
+        )));
+        let yours = ClientAuth::new(Some(OsStr::from_bytes(
+            b"/certs/\xff\xfeyours.pem",
+        )));
+        let absent = ClientAuth::new(None);
+
+        assert!(
+            mine.is_confidential(),
+            "a configured client certificate is confidential whatever its \
+             path spells; answering otherwise would let \
+             `curl_easy_ssls_export` publish a session established with a \
+             private key"
+        );
+        assert_eq!(
+            mine.clientcert(),
+            Some(OsStr::from_bytes(b"/certs/\xff\xfemine.pem")),
+            "the identity is carried through byte for byte"
+        );
+
+        assert!(mine.matches(Some(&mine)));
+        assert!(
+            !mine.matches(Some(&yours)),
+            "two different undecodable paths are two different identities"
+        );
+        assert!(!mine.matches(Some(&absent)));
+        assert!(!mine.matches(None));
+
+        // And the slot built from it is not exportable.
+        let mut peer = ScachePeer::new(4);
+        peer.init(PeerIdentity::Key("h:443:CCERT:IMPL-i:G"), Some(&mine));
+        assert!(
+            !peer.exportable,
+            "a slot holding credential-bound sessions must never be exported"
+        );
     }
 
     /// The key records only *that* a certificate is set, as `:CCERT`, so two
@@ -4534,8 +4626,8 @@ mod tests {
     fn a_session_is_not_reused_across_different_client_certificates() {
         let clock = clock_at(1_000);
         let mut cache = SessionCache::new(2, 4);
-        let mine = ClientAuth::new(Some("/mine.pem"));
-        let yours = ClientAuth::new(Some("/yours.pem"));
+        let mine = ClientAuth::new(Some(OsStr::new("/mine.pem")));
+        let yours = ClientAuth::new(Some(OsStr::new("/yours.pem")));
 
         cache.put(
             &clock,
@@ -4563,10 +4655,13 @@ mod tests {
     #[test]
     fn the_client_auth_is_derived_from_the_same_configuration_as_the_key() {
         let config = PeerKeyConfig {
-            clientcert: Some("/client.pem"),
+            clientcert: Some(OsStr::new("/client.pem")),
             ..PeerKeyConfig::default()
         };
-        assert_eq!(config.client_auth().clientcert(), Some("/client.pem"));
+        assert_eq!(
+            config.client_auth().clientcert(),
+            Some(OsStr::new("/client.pem"))
+        );
         assert!(config.client_auth().is_confidential());
 
         let plain = PeerKeyConfig::default();
@@ -4645,7 +4740,7 @@ mod tests {
         peer.clear();
         peer.init(
             PeerIdentity::Key("h:1:CCERT:IMPL-i:G"),
-            Some(&ClientAuth::new(Some("/c.pem"))),
+            Some(&ClientAuth::new(Some(OsStr::new("/c.pem")))),
         );
         assert!(!peer.exportable);
 
@@ -4697,7 +4792,7 @@ mod tests {
                 salt: [1; SALT_LEN],
                 hmac: [2; HMAC_LEN],
             },
-            Some(&ClientAuth::new(Some("/c.pem"))),
+            Some(&ClientAuth::new(Some(OsStr::new("/c.pem")))),
         );
         peer.age = 42;
         peer.sessions.push_back(session13(b"t", 9_000));
@@ -4925,7 +5020,7 @@ mod tests {
             &clock,
             SessionCaching::ENABLED,
             "cert:G",
-            Some(&ClientAuth::new(Some("/c.pem"))),
+            Some(&ClientAuth::new(Some(OsStr::new("/c.pem")))),
             session13(b"c", 9_000),
         );
         // Everything expires before the export runs.
@@ -5160,7 +5255,7 @@ mod tests {
             &clock,
             SessionCaching::ENABLED,
             key,
-            Some(&ClientAuth::new(Some("/mine.pem"))),
+            Some(&ClientAuth::new(Some(OsStr::new("/mine.pem")))),
             session13(b"authenticated", 9_000),
         );
 
@@ -5181,7 +5276,10 @@ mod tests {
         // so the authenticated session is gone and the import stands alone
         // under the code -- never under the credentialed identity.
         assert_eq!(
-            cache.session_count(key, Some(&ClientAuth::new(Some("/mine.pem")))),
+            cache.session_count(
+                key,
+                Some(&ClientAuth::new(Some(OsStr::new("/mine.pem"))))
+            ),
             None
         );
         let peer = cache.peers.first().expect("a slot");
@@ -5531,7 +5629,7 @@ mod tests {
     fn the_session_count_respects_the_client_identity() {
         let clock = clock_at(1_000);
         let mut cache = SessionCache::new(2, 4);
-        let mine = ClientAuth::new(Some("/mine.pem"));
+        let mine = ClientAuth::new(Some(OsStr::new("/mine.pem")));
         cache.put(
             &clock,
             SessionCaching::ENABLED,
@@ -5542,7 +5640,10 @@ mod tests {
         assert_eq!(cache.session_count("k:G", Some(&mine)), Some(1));
         assert_eq!(cache.session_count("k:G", None), None);
         assert_eq!(
-            cache.session_count("k:G", Some(&ClientAuth::new(Some("/x.pem")))),
+            cache.session_count(
+                "k:G",
+                Some(&ClientAuth::new(Some(OsStr::new("/x.pem"))))
+            ),
             None
         );
     }

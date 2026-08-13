@@ -23,12 +23,17 @@
 //! # GAPs
 //!
 //! Five capabilities this port needs have no module among this file's declared
-//! dependencies (GAPs #1 to #5, one per [`ParseHost`] method), one cannot exist
-//! in safe Rust at all (GAP #0, `cleanarg`), and three rows of the frozen table
-//! configure fields that `curl-rs/src/config/mod.rs` does not declare (GAP #6).
-//! None is worked around silently: each is a `GAP #n` note on the method, the
-//! function or the rows that stand in for it, and every one is reachable by the
-//! caller that owns the missing half.
+//! dependencies (GAPs #1 to #5, one per [`ParseHost`] method), and three rows of
+//! the frozen table configure fields that `curl-rs/src/config/mod.rs` does not
+//! declare (GAP #6). None is worked around silently: each is a `GAP #n` note on
+//! the method or the rows that stand in for it, and every one is reachable by
+//! the caller that owns the missing half.
+//!
+//! What was once GAP #0 -- `cleanarg`, which no safe Rust in this crate can
+//! perform because the process's argument vector is not reachable through
+//! `std` -- is no longer a gap. It is a capability, obtained from
+//! `curl_rs_lib::scrub_argument` in the library's sanctioned operating-system
+//! island, and [`cleanarg`] below is the two-line call.
 
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
@@ -2176,15 +2181,39 @@ pub(crate) trait ParseHost: VarHost + StdinAccess {
 
 /// `cleanarg` -- `src/tool_getparam.c:626-637`.
 ///
-/// GAP #0: under `HAVE_WRITABLE_ARGV` C overwrites the argument in place with
-/// `memset(str, '*', strlen(str))` (`:633`), with the comment "wipe the next
-/// argument out so that the username:password is not displayed in the system
-/// process list". The `!HAVE_WRITABLE_ARGV` arm (`:637`) is `#define
-/// cleanarg(x) tool_nop_stmt`, a supported upstream configuration, so that arm
-/// is the one implemented. Reported rather than worked around: no
-/// `/proc/self/cmdline` write, no re-`exec`, no subprocess.
-fn cleanarg(_argument: &[u8]) {
-    // The `!HAVE_WRITABLE_ARGV` arm, `src/tool_getparam.c:637`.
+/// Overwrites the argument with `*` inside the process's own argument vector,
+/// which is what C's `memset(str, '*', strlen(str))` (`:633`) does, for the
+/// reason its comment gives: "wipe the next argument out so that the
+/// username:password is not displayed in the system process list".
+///
+/// # Why the no-op arm was the wrong one to implement
+///
+/// `:637` does define `#define cleanarg(x) tool_nop_stmt` for
+/// `!HAVE_WRITABLE_ARGV`, and this function was once that arm. It should not
+/// have been: `configure.ac:1809` defines `HAVE_WRITABLE_ARGV` whenever its
+/// runtime probe succeeds and forces it on when cross-compiling for Apple, and
+/// `CMakeLists.txt:619` sets it unconditionally for `APPLE`, so on all four
+/// mandated targets the C build wipes the argument. Choosing the other arm left
+/// every one of the eleven `ARG_CLEAR` credentials -- `-u`, `--proxy-user`,
+/// `--pass`, `--tlspassword` and the rest -- legible in `ps` and in
+/// `/proc/<pid>/cmdline` to every other user on the host for as long as the
+/// transfer ran, which is precisely the exposure the C exists to close.
+///
+/// # Where the capability comes from
+///
+/// `curl-rs` carries `#![forbid(unsafe_code)]` and the loader's argument vector
+/// is unreachable through `std` -- `std::env::args_os` copies -- so this is not
+/// a defect that could be repaired in this file. It is repaired in
+/// `curl-rs-lib/src/ffi/sys.rs`, the library's one sanctioned
+/// operating-system island, and reached here through the single public name
+/// `curl_rs_lib::scrub_argument`. That function documents the matching rule, the
+/// concurrency precondition this call site satisfies, and the platforms on which
+/// it is a genuine no-op.
+///
+/// The count of elements overwritten is discarded, because C's `cleanarg`
+/// returns `void` and `:3027-3028` acts on nothing.
+fn cleanarg(argument: &[u8]) {
+    curl_rs_lib::scrub_argument(argument);
 }
 
 // Parser state and shared accessors
@@ -2241,13 +2270,32 @@ fn getstr(value: &[u8], allowblank: bool) -> Result<Vec<u8>, ParameterError> {
     Ok(value.to_vec())
 }
 
-/// `getstr` for a field typed `Option<String>`.
+/// `getstr` for a field the C types `char *`, which is most of them.
+///
+/// # Why this is not a `String`, and what it used to be
+///
+/// This function existed only to bridge `getstr`'s bytes into an
+/// `Option<String>` field, and it bridged them with
+/// `String::from_utf8_lossy` -- which replaces every byte it cannot decode with
+/// U+FFFD. That is a silent, irreversible rewrite of a value the caller
+/// supplied, and it lands on values that are anything but decorative: a
+/// `--user` credential, a `--header` line, a `--cipher-list`, a
+/// `--pinnedpubkey` digest. `curl` copies each with `strdup` and hands the same
+/// bytes to `curl_easy_setopt`, so on the four mandated targets -- where an
+/// argument vector is bytes, not text -- a lossy conversion changes what goes
+/// on the wire and what a server is asked to authenticate against.
+///
+/// The receiving fields are therefore `Option<Vec<u8>>`, and this function
+/// simply forwards `getstr`. It is kept as a distinct name because the
+/// alias-count assertions and the C cross-references throughout this file
+/// distinguish `getstr` (`:44-59`) from its typed callers, and because a
+/// future field that genuinely is text should decode at ITS OWN consumer rather
+/// than here.
 fn getstr_text(
     value: &[u8],
     allowblank: bool,
-) -> Result<String, ParameterError> {
-    let bytes = getstr(value, allowblank)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+) -> Result<Vec<u8>, ParameterError> {
+    getstr(value, allowblank)
 }
 
 /// `getstr` for a field typed `Option<PathBuf>`.
@@ -2271,14 +2319,17 @@ fn getstrn(
     value: &[u8],
     len: usize,
     allowblank: bool,
-) -> Result<String, ParameterError> {
+) -> Result<Vec<u8>, ParameterError> {
     // `:69-70` inspects `val[0]`, the *unbounded* first byte, exactly as
     // `getstr` does -- the length bound applies to the copy, not to the check.
     if !allowblank && value.is_empty() {
         return Err(ParameterError::BlankString);
     }
+    // The C's `memcpy(*str, val, len)` over a `char *`: bytes, bounded, with no
+    // decode step. See `getstr_text` for why a lossy conversion stood here and
+    // why it must not.
     let taken = value.get(..len).unwrap_or(value);
-    Ok(String::from_utf8_lossy(taken).into_owned())
+    Ok(taken.to_vec())
 }
 
 // `-E` / `--cert` splitting -- `src/tool_getparam.c:376-533`
@@ -2412,16 +2463,21 @@ pub(crate) fn parse_cert_parameter(
 fn get_file_and_password(
     nextarg: &[u8],
     file: &mut Option<std::path::PathBuf>,
-    password: &mut Option<String>,
+    password: &mut Option<Vec<u8>>,
 ) -> Result<(), ParameterError> {
     let parsed = parse_cert_parameter(nextarg)?;
     // `:525-526`
     *file = Some(std::path::PathBuf::from(OsString::from_vec(
         parsed.certname,
     )));
-    // `:527-530`
+    // `:527-530`. The passphrase keeps its bytes: the C moves the `char *`
+    // `parse_cert_parameter` produced straight into the configuration and hands
+    // it to `CURLOPT_KEYPASSWD`, where it is used to decrypt a private key. A
+    // lossy conversion stood here, so a passphrase containing a byte Unicode
+    // cannot spell was silently replaced with U+FFFD and the key then failed to
+    // decrypt -- with no diagnostic naming the cause.
     if let Some(passphrase) = parsed.passphrase {
-        *password = Some(String::from_utf8_lossy(&passphrase).into_owned());
+        *password = Some(passphrase);
     }
     Ok(())
 }
@@ -3177,12 +3233,15 @@ fn url_query<H: ParseHost>(
     } else {
         data_urlencode(nextarg, host, sink, msgs)?
     };
-    let query = String::from_utf8_lossy(&query).into_owned();
-
-    // `:913-926`
+    // `:913-926`. The C joins with `curl_maprintf("%s&%s", ...)` over two
+    // `char *`, so the join is a byte concatenation: `--url-query` carries
+    // whatever the caller wrote, and a percent-encoded or locale-encoded value
+    // must reach the query string unaltered.
     match config.query.take() {
         Some(existing) => {
-            let joined = format!("{existing}&{query}");
+            let mut joined = existing;
+            joined.push(b'&');
+            joined.extend_from_slice(&query);
             // `:902` bounds the buffer at `MAX_QUERY_LEN`.
             if joined.len() > MAX_QUERY_LEN {
                 return Err(ParameterError::NoMem);
@@ -3701,9 +3760,11 @@ fn parse_ech<H: ParseHost>(
             inner: &mut *source,
         };
         let contents = file2string(Some(&mut reader))?;
-        // `:1266` -- `curl_maprintf("ecl:%s", tmpcfg)`.
-        let text = String::from_utf8_lossy(&contents);
-        config.ech_config = Some(format!("ecl:{text}"));
+        // `:1266` -- `curl_maprintf("ecl:%s", tmpcfg)`, a byte concatenation
+        // of an ASCII literal and the file's contents.
+        let mut value = Vec::from(&b"ecl:"[..]);
+        value.extend_from_slice(&contents);
+        config.ech_config = Some(value);
         return Ok(());
     }
 
@@ -3734,13 +3795,16 @@ fn parse_header<H: ParseHost>(
         // `:1297` -- `curlx_dyn_init(&line, 1024 * 100)`.
         let lines = read_lines(&mut *source, 1024 * 100)?;
         for line in lines {
-            let text = String::from_utf8_lossy(&line).into_owned();
+            // The line reaches the list as the bytes the file held. `-H` values
+            // are emitted on the wire verbatim, and the fixture corpus compares
+            // request bytes including header content, so a decode step here
+            // would put U+FFFD where a server expects the caller's byte.
             let list = if proxy {
                 &mut config.proxyheaders
             } else {
                 &mut config.headers
             };
-            add2list(list, &text)?;
+            add2list(list, &line)?;
         }
         return Ok(());
     }
@@ -3758,14 +3822,14 @@ fn parse_header<H: ParseHost>(
         );
     }
 
-    // `:1318-1321`
-    let text = String::from_utf8_lossy(nextarg).into_owned();
+    // `:1318-1321`. `add2list` is `curl_slist_append` over a `char *`, so the
+    // header reaches the list as the caller's bytes.
     let list = if proxy {
         &mut config.proxyheaders
     } else {
         &mut config.headers
     };
-    add2list(list, &text)
+    add2list(list, nextarg)
 }
 
 /// Advances an output cursor past every node that already has an output set.
@@ -3859,24 +3923,17 @@ fn parse_quote(
 ) -> Result<(), ParameterError> {
     match nextarg.first() {
         // `:1412-1416` -- "prefixed with a dash makes it a POST TRANSFER one".
-        Some(b'-') => {
-            let text =
-                String::from_utf8_lossy(nextarg.get(1..).unwrap_or_default())
-                    .into_owned();
-            add2list(&mut config.postquote, &text)
-        }
+        Some(b'-') => add2list(
+            &mut config.postquote,
+            nextarg.get(1..).unwrap_or_default(),
+        ),
         // `:1417-1421` -- "a just-before-transfer one".
         Some(b'+') => {
-            let text =
-                String::from_utf8_lossy(nextarg.get(1..).unwrap_or_default())
-                    .into_owned();
-            add2list(&mut config.prequote, &text)
+            add2list(&mut config.prequote, nextarg.get(1..).unwrap_or_default())
         }
         // `:1422-1424`
-        _ => {
-            let text = String::from_utf8_lossy(nextarg).into_owned();
-            add2list(&mut config.quote, &text)
-        }
+        // An FTP command is sent verbatim, so it keeps its bytes.
+        _ => add2list(&mut config.quote, nextarg),
     }
 }
 
@@ -3917,7 +3974,7 @@ fn parse_range(
                     "A specified range MUST include at least one dash (-). Appending one for you"
                 ),
             );
-            config.range = Some(format!("{value}-"));
+            config.range = Some(format!("{value}-").into_bytes());
             return Ok(());
         }
     }
@@ -4105,7 +4162,10 @@ fn parse_writeout<H: ParseHost>(
         warnf(sink, msgs, format_args!("Failed to read {shown}"));
         return Ok(());
     }
-    config.writeout = Some(String::from_utf8_lossy(&contents).into_owned());
+    // The C stores the file's bytes with no decode step (`:1602`), and
+    // `--write-out` output is emitted byte for byte, so a format string
+    // containing a non-UTF-8 literal reaches the output unaltered.
+    config.writeout = Some(contents);
     Ok(())
 }
 
@@ -5196,7 +5256,7 @@ fn opt_string<H: ParseHost>(
         // `:2532-2535`
         CmdKey::MailRcpt => {
             let config = config_of(global)?;
-            add2list(&mut config.mail_rcpt, &text)?;
+            add2list(&mut config.mail_rcpt, nextarg)?;
         }
         // `:2536-2539`
         CmdKey::Proto => {
@@ -5205,7 +5265,10 @@ fn opt_string<H: ParseHost>(
                 proto2num(&global.libinfo, &preset, &text, sink, &msgs);
             let config = config_of(global)?;
             config.proto_present = true;
-            config.proto_str = Some(resolved?);
+            // `proto2num` composes its answer from the scheme names the library
+            // advertises, every one of which is ASCII, so this is a synthesised
+            // value rather than a caller's bytes.
+            config.proto_str = Some(resolved?.into_bytes());
         }
         // `:2540-2544` -- any failure becomes `PARAM_BAD_USE` here, unlike
         // `--proto`, which propagates the reason.
@@ -5215,14 +5278,17 @@ fn opt_string<H: ParseHost>(
             let config = config_of(global)?;
             config.proto_redir_present = true;
             match resolved {
-                Ok(value) => config.proto_redir_str = Some(value),
+                // As `--proto` above: a synthesised ASCII list.
+                Ok(value) => {
+                    config.proto_redir_str = Some(value.into_bytes());
+                }
                 Err(_) => return Err(ParameterError::BadUse),
             }
         }
         // `:2545-2547`
         CmdKey::Resolve => {
             let config = config_of(global)?;
-            add2list(&mut config.resolve, &text)?;
+            add2list(&mut config.resolve, nextarg)?;
         }
         // `:2548-2550`
         CmdKey::Delegation => {
@@ -5252,7 +5318,18 @@ fn opt_string<H: ParseHost>(
         // `:2563-2567`
         CmdKey::ProtoDefault => {
             let value = getstr_text(nextarg, DENY_BLANK)?;
-            check_protocol(&global.libinfo, Some(&value))?;
+            // `check_protocol` matches against the fixed vocabulary of scheme
+            // names the library advertises, all ASCII, so this is one of the
+            // genuinely textual consumers and the decode belongs here. A value
+            // that is not UTF-8 matches no scheme, which is the same answer
+            // `Curl_proto_token` gives for an unknown one -- so it reports
+            // `CURLE_UNSUPPORTED_PROTOCOL` rather than being silently rewritten.
+            match std::str::from_utf8(&value) {
+                Ok(text) => check_protocol(&global.libinfo, Some(text))?,
+                Err(_) => {
+                    return Err(ParameterError::LibcurlUnsupportedProtocol)
+                }
+            }
             config_of(global)?.proto_default = Some(value);
         }
         // `:2568-2570`
@@ -5262,7 +5339,7 @@ fn opt_string<H: ParseHost>(
         // `:2571-2573`
         CmdKey::ConnectTo => {
             let config = config_of(global)?;
-            add2list(&mut config.connect_to, &text)?;
+            add2list(&mut config.connect_to, nextarg)?;
         }
         // `:2574-2580`
         CmdKey::TlsMax => {
@@ -5334,9 +5411,9 @@ fn opt_string<H: ParseHost>(
         CmdKey::Cookie => {
             let config = config_of(global)?;
             if nextarg.contains(&b'=') {
-                add2list(&mut config.cookies, &text)?;
+                add2list(&mut config.cookies, nextarg)?;
             } else {
-                add2list(&mut config.cookiefiles, &text)?;
+                add2list(&mut config.cookiefiles, nextarg)?;
             }
         }
         // `:2625-2627`
@@ -5406,7 +5483,9 @@ fn opt_string<H: ParseHost>(
         // selecting one.
         CmdKey::Engine => {
             let value = getstr_text(nextarg, DENY_BLANK)?;
-            let listing = value == "list";
+            // `!strcmp(nextarg, "list")` at `:2671`: an exact byte comparison,
+            // so no decode is needed and none is done.
+            let listing = value == b"list";
             config_of(global)?.engine = Some(value);
             if listing {
                 return Err(ParameterError::EnginesRequested);
@@ -5463,7 +5542,9 @@ fn opt_string<H: ParseHost>(
                 return Err(ParameterError::LibcurlDoesntSupport);
             }
             let value = getstr_text(nextarg, DENY_BLANK)?;
-            let srp = value == "SRP";
+            // `strcmp(nextarg, "SRP")` at `:2711`, an exact byte
+            // comparison, so no decode is needed and none is done.
+            let srp = value == b"SRP";
             config_of(global)?.tls_authtype = Some(value);
             if !srp {
                 return Err(ParameterError::LibcurlDoesntSupport);
@@ -5501,7 +5582,9 @@ fn opt_string<H: ParseHost>(
                 return Err(ParameterError::LibcurlDoesntSupport);
             }
             let value = getstr_text(nextarg, DENY_BLANK)?;
-            let srp = value == "SRP";
+            // `strcmp(nextarg, "SRP")` at `:2711`, an exact byte
+            // comparison, so no decode is needed and none is done.
+            let srp = value == b"SRP";
             config_of(global)?.proxy_tls_authtype = Some(value);
             if !srp {
                 return Err(ParameterError::LibcurlDoesntSupport);
@@ -5609,7 +5692,7 @@ fn opt_string<H: ParseHost>(
         // `:2807-2810`
         CmdKey::TelnetOption => {
             let config = config_of(global)?;
-            add2list(&mut config.telnet_options, &text)?;
+            add2list(&mut config.telnet_options, nextarg)?;
         }
         // `:2811-2814`
         CmdKey::User => {
@@ -6886,8 +6969,8 @@ mod tests {
     #[test]
     fn the_eleven_credential_rows_carry_arg_clear() {
         // The `ARG_CLEAR` set is exactly the credential-bearing options, which
-        // is what makes `cleanarg` (GAP #0) about passwords rather than about
-        // arguments in general.
+        // is what makes `cleanarg` about passwords rather than about arguments
+        // in general.
         assert_eq!(
             names_with_flag(ARG_CLEAR),
             vec![
@@ -7103,7 +7186,7 @@ mod tests {
         assert_eq!(split.result, Ok(()));
         assert_eq!(
             config(&split.global).and_then(|c| c.useragent.clone()),
-            Some("Agent/1".to_owned())
+            Some(b"Agent/1".to_vec())
         );
 
         // The longest real name is 26 bytes, `proxy-ssl-auto-client-cert`, and
@@ -7154,7 +7237,7 @@ mod tests {
         assert_eq!(accepted.result, Ok(()));
         assert_eq!(
             config(&accepted.global).and_then(|c| c.useragent.clone()),
-            Some("Plain".to_owned())
+            Some(b"Plain".to_vec())
         );
     }
 
@@ -8003,6 +8086,112 @@ mod tests {
             .contains("Max config file recursion level reached (5)"));
     }
 
+    /// The environment variable that puts the argv-wipe test into its child
+    /// role.
+    const CLEANARG_PROBE_ROLE: &str = "CURL_RS_CLEANARG_PROBE";
+
+    /// The credential the child is given on its own command line.
+    const CLEANARG_PROBE_VALUE: &str = "probeuser:probesecret";
+
+    /// Printed by the child once it has observed the wipe.
+    const CLEANARG_PROBE_DONE: &str = "cleanarg-probe-ok";
+
+    /// `:3027-3028` end to end: an `ARG_CLEAR` value really leaves the process
+    /// argument vector.
+    ///
+    /// The seam-level assertions live beside the capability in
+    /// `curl-rs-lib/src/ffi/sys.rs`; what this adds is the half that only this
+    /// crate can assert -- that `getparameter` reaches it, for a real `-u` on a
+    /// real command line. The test re-executes this test binary with the
+    /// credential as an extra filter, so it becomes a genuine element of the
+    /// child's `argv`, and the child observes the result through
+    /// `std::env::args_os`, which reads that same memory on every call.
+    ///
+    /// Ignored under Miri: it spawns a process, and the capture the wipe needs
+    /// is deliberately not compiled under Miri.
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns a process and writes to argv")]
+    fn an_arg_clear_credential_leaves_the_process_argument_vector() {
+        if std::env::var_os(CLEANARG_PROBE_ROLE).is_some() {
+            // The child. Before parsing, the credential is on its command line.
+            let before: Vec<OsString> = std::env::args_os().collect();
+            assert!(
+                before.iter().any(
+                    |arg| arg.as_bytes() == CLEANARG_PROBE_VALUE.as_bytes()
+                ),
+                "the parent passed the credential as an argument"
+            );
+
+            let Some((mut global, mut sink)) = fixture() else {
+                return;
+            };
+            let mut host = FakeHost::default();
+            let mut used = false;
+            let result = getparameter(
+                b"-u",
+                Some(CLEANARG_PROBE_VALUE.as_bytes()),
+                &mut used,
+                0,
+                &mut global,
+                &mut host,
+                &mut sink,
+            );
+            assert_eq!(result, Ok(()));
+
+            // The value was copied into the configuration first, exactly as the
+            // C comment at `:628-630` says -- "now that getstr has copied the
+            // contents of nextarg".
+            assert_eq!(
+                global
+                    .chain
+                    .current_mut()
+                    .and_then(|config| config.userpwd.clone()),
+                Some(CLEANARG_PROBE_VALUE.as_bytes().to_vec())
+            );
+
+            // And it is gone from the command line every other process can see.
+            let after: Vec<OsString> = std::env::args_os().collect();
+            assert!(
+                !after.iter().any(
+                    |arg| arg.as_bytes() == CLEANARG_PROBE_VALUE.as_bytes()
+                ),
+                "the credential is still visible in argv: {after:?}"
+            );
+            assert!(
+                after.iter().any(|arg| arg.as_bytes()
+                    == vec![b'*'; CLEANARG_PROBE_VALUE.len()].as_slice()),
+                "the element must be asterisks of the value's own length: \
+                 {after:?}"
+            );
+            println!("{CLEANARG_PROBE_DONE}");
+            return;
+        }
+
+        // The parent.
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "cli::args::tests::an_arg_clear_credential_leaves_the_process_argument_vector",
+                "--nocapture",
+                CLEANARG_PROBE_VALUE,
+            ])
+            .env(CLEANARG_PROBE_ROLE, "1")
+            .output()
+            .expect("the test binary is executable");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(CLEANARG_PROBE_DONE),
+            "the child never reached the assertion: {stdout}"
+        );
+    }
+
     #[test]
     fn an_arg_tls_row_is_refused_when_tls_is_absent() {
         // `:2991-2994`.
@@ -8311,19 +8500,19 @@ mod tests {
         // `:527-530` -- the password is overwritten only when a passphrase was
         // present, which is why `--pass` before `--cert` survives.
         let mut file = None;
-        let mut password = Some("kept".to_owned());
+        let mut password = Some(b"kept".to_vec());
         assert_eq!(
             get_file_and_password(b"cert.pem", &mut file, &mut password),
             Ok(())
         );
         assert_eq!(file, Some(std::path::PathBuf::from("cert.pem")));
-        assert_eq!(password, Some("kept".to_owned()));
+        assert_eq!(password, Some(b"kept".to_vec()));
 
         assert_eq!(
             get_file_and_password(b"cert.pem:new", &mut file, &mut password),
             Ok(())
         );
-        assert_eq!(password, Some("new".to_owned()));
+        assert_eq!(password, Some(b"new".to_vec()));
     }
 
     #[test]
@@ -8453,7 +8642,7 @@ mod tests {
         };
         assert_eq!(
             config(&auto.global).and_then(|c| c.referer.clone()),
-            Some("https://from".to_owned())
+            Some(b"https://from".to_vec())
         );
         assert_eq!(config(&auto.global).map(|c| c.autoreferer), Some(true));
 
@@ -8652,7 +8841,7 @@ mod tests {
         };
         assert_eq!(
             config(&query.global).and_then(|c| c.query.clone()),
-            Some("n=x+y&raw".to_owned())
+            Some(b"n=x+y&raw".to_vec())
         );
     }
 

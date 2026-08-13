@@ -1726,10 +1726,10 @@ pub(crate) fn delegation(
 /// shape would ripple into every one of them.
 #[allow(dead_code)]
 pub(crate) fn add2list(
-    list: &mut Vec<String>,
-    ptr: &str,
+    list: &mut Vec<Vec<u8>>,
+    ptr: &[u8],
 ) -> Result<(), ParameterError> {
-    list.push(ptr.to_owned());
+    list.push(ptr.to_vec());
     Ok(())
 }
 
@@ -1760,15 +1760,23 @@ const fn is_header_sep(byte: u8) -> bool {
 ///
 /// The two `DEBUGASSERT`s at `:661-662` are preserved as `debug_assert!`:
 /// `checkfor` must be non-empty and must not already carry the `':'`.
+///
+/// `head` carries the `-H` values as bytes because a header line is emitted on
+/// the wire verbatim and need not be valid UTF-8; `checkfor` stays `&str`
+/// because the only two needles are the ASCII literals the C passes at
+/// `:679` and `:684`. An entry with an interior NUL cannot arise -- every
+/// entry came from a NUL-terminated argv element or a `-H @file` line -- so
+/// prefix comparison over bytes is exactly `curl_strnequal` over the C
+/// string.
 #[allow(dead_code)]
-fn inlist(head: &[String], checkfor: &str) -> bool {
+fn inlist(head: &[Vec<u8>], checkfor: &str) -> bool {
     let needle = checkfor.as_bytes();
     // `:661-662`
     debug_assert!(!needle.is_empty());
     debug_assert!(needle.last() != Some(&b':'));
 
     for entry in head {
-        let bytes = entry.as_bytes();
+        let bytes = entry.as_slice();
         // `:665` -- curl_strnequal over strlen(checkfor) bytes.
         let prefix_matches = match bytes.get(..needle.len()) {
             Some(prefix) => prefix.eq_ignore_ascii_case(needle),
@@ -1976,7 +1984,8 @@ pub(crate) struct OperationArgs<'a> {
     /// `config->jsoned` -- set by `--json`.
     pub(crate) jsoned: bool,
     /// `config->headers` -- the `-H` list, which `--json` must not duplicate.
-    pub(crate) headers: &'a mut Vec<String>,
+    /// Bytes, because a header line reaches the wire verbatim.
+    pub(crate) headers: &'a mut Vec<Vec<u8>>,
     /// `config->userpwd` -- `-u`, as bytes so the credential stays exact.
     pub(crate) userpwd: &'a mut Option<Vec<u8>>,
     /// `config->proxyuserpwd` -- `-U`.
@@ -2042,10 +2051,10 @@ fn get_args_with(
     if jsoned {
         let mut err = Ok(());
         if !inlist(headers, "Content-Type") {
-            err = add2list(headers, "Content-Type: application/json");
+            err = add2list(headers, b"Content-Type: application/json");
         }
         if err.is_ok() && !inlist(headers, "Accept") {
-            err = add2list(headers, "Accept: application/json");
+            err = add2list(headers, b"Accept: application/json");
         }
         if err.is_err() {
             // `:686`
@@ -3263,18 +3272,23 @@ mod tests {
 
     #[test]
     fn add2list_appends_in_order() {
-        let mut list: Vec<String> = Vec::new();
-        assert!(add2list(&mut list, "first").is_ok());
-        assert!(add2list(&mut list, "second").is_ok());
-        assert_eq!(list, vec!["first".to_owned(), "second".to_owned()]);
+        let mut list: Vec<Vec<u8>> = Vec::new();
+        assert!(add2list(&mut list, b"first").is_ok());
+        assert!(add2list(&mut list, b"second").is_ok());
+        assert_eq!(list, vec![b"first".to_vec(), b"second".to_vec()]);
+
+        // An entry that is not valid UTF-8 is stored as given, because
+        // `curl_slist_append` copies bytes.
+        assert!(add2list(&mut list, b"X-Raw: \xff\xfe").is_ok());
+        assert_eq!(list[2], b"X-Raw: \xff\xfe".to_vec());
     }
 
     #[test]
     fn inlist_needs_a_header_separator_after_the_name() {
         let list = vec![
-            "content-type: text/plain".to_owned(),
-            "X-Thing;".to_owned(),
-            "Acceptable: no".to_owned(),
+            b"content-type: text/plain".to_vec(),
+            b"X-Thing;".to_vec(),
+            b"Acceptable: no".to_vec(),
         ];
 
         // Case-insensitive over exactly the name's length, then `:` or `;`.
@@ -3288,9 +3302,13 @@ mod tests {
 
         // An entry shorter than the name cannot match, and one exactly as long
         // has no separator after it.
-        assert!(!inlist(&["Con".to_owned()], "Content-Type"));
-        assert!(!inlist(&["Accept".to_owned()], "Accept"));
+        assert!(!inlist(&[b"Con".to_vec()], "Content-Type"));
+        assert!(!inlist(&[b"Accept".to_vec()], "Accept"));
         assert!(!inlist(&[], "Accept"));
+
+        // A name whose value is not valid UTF-8 is still found: the match is
+        // over the name's bytes, and the value is never decoded.
+        assert!(inlist(&[b"Content-Type: \xff".to_vec()], "Content-Type"));
     }
 
     #[test]
@@ -3711,7 +3729,7 @@ mod tests {
     /// [`get_args_with`] over freshly owned state, returning what it produced.
     fn run_get_args(
         jsoned: bool,
-        headers: Vec<String>,
+        headers: Vec<Vec<u8>>,
         userpwd: Option<Vec<u8>>,
         proxyuserpwd: Option<Vec<u8>>,
         oauth_bearer: Option<&str>,
@@ -3719,7 +3737,7 @@ mod tests {
         last: bool,
     ) -> (
         CURLcode,
-        Vec<String>,
+        Vec<Vec<u8>>,
         Vec<Vec<u8>>,
         Option<Vec<u8>>,
         Option<Vec<u8>>,
@@ -3754,8 +3772,8 @@ mod tests {
         assert_eq!(
             headers,
             vec![
-                "Content-Type: application/json".to_owned(),
-                "Accept: application/json".to_owned(),
+                b"Content-Type: application/json".to_vec(),
+                b"Accept: application/json".to_vec(),
             ]
         );
         assert!(asked.is_empty());
@@ -3766,7 +3784,7 @@ mod tests {
         // An explicit Content-Type wins, case-insensitively.
         let (_, headers, _, _, _) = run_get_args(
             true,
-            vec!["content-type: text/plain".to_owned()],
+            vec![b"content-type: text/plain".to_vec()],
             None,
             None,
             None,
@@ -3776,15 +3794,15 @@ mod tests {
         assert_eq!(
             headers,
             vec![
-                "content-type: text/plain".to_owned(),
-                "Accept: application/json".to_owned(),
+                b"content-type: text/plain".to_vec(),
+                b"Accept: application/json".to_vec(),
             ]
         );
 
         // The `-H 'Name;'` form counts as supplied too.
         let (_, semi, _, _, _) = run_get_args(
             true,
-            vec!["Accept;".to_owned()],
+            vec![b"Accept;".to_vec()],
             None,
             None,
             None,
@@ -3794,15 +3812,15 @@ mod tests {
         assert_eq!(
             semi,
             vec![
-                "Accept;".to_owned(),
-                "Content-Type: application/json".to_owned(),
+                b"Accept;".to_vec(),
+                b"Content-Type: application/json".to_vec(),
             ]
         );
 
         // Both supplied: nothing is added.
         let (_, both, _, _, _) = run_get_args(
             true,
-            vec!["Content-Type: a".to_owned(), "Accept: b".to_owned()],
+            vec![b"Content-Type: a".to_vec(), b"Accept: b".to_vec()],
             None,
             None,
             None,
@@ -3814,7 +3832,7 @@ mod tests {
         // A name that merely starts the same is not a match.
         let (_, prefixed, _, _, _) = run_get_args(
             true,
-            vec!["Acceptable: no".to_owned()],
+            vec![b"Acceptable: no".to_vec()],
             None,
             None,
             None,
@@ -3828,7 +3846,7 @@ mod tests {
     fn get_args_leaves_headers_alone_without_json() {
         let (code, headers, _, _, _) = run_get_args(
             false,
-            vec!["X: y".to_owned()],
+            vec![b"X: y".to_vec()],
             None,
             None,
             None,
@@ -3836,7 +3854,7 @@ mod tests {
             true,
         );
         assert_eq!(code, CURLcode::Ok);
-        assert_eq!(headers, vec!["X: y".to_owned()]);
+        assert_eq!(headers, vec![b"X: y".to_vec()]);
     }
 
     #[test]

@@ -433,33 +433,77 @@ const fn backend_name() -> &'static CStr {
 /// the string the version banner reports.
 const BACKEND_NAME: &CStr = backend_name();
 
-/// A wrapper that makes an immutable static holding raw pointers `Sync`.
-///
-/// A `static` must be `Sync` and a raw pointer is not, which is the only reason
-/// this type exists. C's equivalent is `static const struct Curl_ssl
-/// *available_backends[]` (`lib/vtls/vtls.c`), immutable data with static
-/// storage duration and no synchronisation of any kind.
-///
-/// # The `Sync` promise is made per type, deliberately
-///
-/// There is no `unsafe impl<T> Sync for Immortal<T>` below, and there must
-/// never be one. A blanket implementation promises `Sync` for every `T` a
-/// future author might wrap -- including a `Cell`, an `UnsafeCell`, or any
-/// struct that acquires interior mutability later -- and the promise cannot be
-/// checked, because the property it rests on (written once in a static
-/// initializer, never mutated) is a property of the *static*, not of the type.
-/// A blanket implementation would therefore be sound today and unsound the
-/// moment someone wrapped something else, with no diagnostic at the point of
-/// the mistake.
-///
-/// Instead each wrapped type carries its own implementation, immediately below
-/// the static it exists for. Wrapping a third type is then a compile error at
-/// the point of use -- `Immortal<X> cannot be shared between threads safely` --
-/// which is exactly where the author is in a position to write the
-/// justification. That is a two-line cost paid once per static, against an
-/// unbounded promise; the crate's only other `unsafe impl`,
-/// `Sync for OptionTable` in `super::easy`, is concrete for the same reason.
-struct Immortal<T>(T);
+// THE TWO IMMORTAL WRAPPERS
+//
+// A `static` must be `Sync` and a raw pointer is not, which is the only reason
+// either type exists. C's equivalent is `static const struct Curl_ssl
+// *available_backends[]` (`lib/vtls/vtls.c`), immutable data with static
+// storage duration and no synchronisation of any kind.
+//
+// # Why there are two concrete types and not one generic wrapper
+//
+// These were one type, `struct Immortal<T>(T)`, with two implementations
+// written against instantiations of it -- `unsafe impl Sync for
+// Immortal<curl_ssl_backend>` and `unsafe impl Sync for Immortal<[*const
+// curl_ssl_backend; 2]>`. That shape is a SPECIALIZATION of a cross-crate
+// auto trait, and rustc says so:
+//
+//   warning: cross-crate traits with a default impl, like `Sync`, should not be
+//            specialized
+//     = warning: this will change its meaning in a future release!
+//     = note: `curl_ssl_backend` is not a generic parameter
+//     = note: `#[warn(suspicious_auto_trait_impls)]` on by default
+//
+// Two of them, at the MSRV the workspace declares, in a build that denies
+// warnings. Measured on 1.75.0, and the tracking issue the note points at is
+// rust-lang/rust#93367. The compiler's own summary is the important part: the
+// meaning of those two lines is not settled, so what they promise today is not
+// necessarily what they will promise later. A promise about `unsafe` code whose
+// meaning may change is not a promise worth keeping.
+//
+// A blanket `unsafe impl<T> Sync for Immortal<T>` would have silenced the
+// warning and been far worse: it promises `Sync` for every `T` a future author
+// might wrap -- a `Cell`, an `UnsafeCell`, or any struct that acquires interior
+// mutability later -- and the promise cannot be checked, because the property it
+// rests on (written once in a static initializer, never mutated) is a property
+// of the STATIC, not of the type. It would have been sound today and unsound the
+// moment someone wrapped something else, with no diagnostic at the point of the
+// mistake.
+//
+// Two concrete newtypes keep the original intent -- one audited promise per
+// static, written immediately beside it -- and reach it with no specialization
+// at all, so the warning has nothing to fire on and the meaning cannot drift.
+// A third immortal static then needs a third named type and a third
+// justification, which is exactly where the author is in a position to write
+// one. The crate's only other `unsafe impl`, `Sync for OptionTable` in
+// `super::easy`, is concrete for the same reason, and now by the same shape.
+
+/// The wrapper for the single backend descriptor. See the note above.
+struct ImmortalBackend(curl_ssl_backend);
+
+// SAFETY: `curl_ssl_backend` is a two-field `#[repr(C)]` struct -- a `c_int`
+// and a `*const c_char` -- with no interior mutability, and the one value of it
+// this crate creates is `RUSTLS_BACKEND` below: written once in a static
+// initializer, never mutated, with no `&mut` path to it anywhere in the crate.
+// Concurrent readers therefore observe identical immutable bytes, which is what
+// `Sync` requires. The only reason the wrapper is needed at all is the raw
+// pointer, and that pointer is `BACKEND_NAME.as_ptr()` -- the address of a
+// `'static` C string in this crate's own read-only data, so it stays valid and
+// unchanging for the life of the process.
+unsafe impl Sync for ImmortalBackend {}
+
+/// The wrapper for the NULL-terminated descriptor array. See the note above.
+struct ImmortalBackendList([*const curl_ssl_backend; 2]);
+
+// SAFETY: a two-element array of raw pointers, with no interior mutability, and
+// the one value of it this crate creates is `AVAILABLE_BACKENDS` below: written
+// once in a static initializer, never mutated, with no `&mut` path to it.
+// Concurrent readers observe identical immutable bytes. Both elements are sound
+// for the life of the process -- the first is the address of `RUSTLS_BACKEND`,
+// another `'static` in this crate, and the second is null, which a caller is
+// required to treat as the terminator and never to dereference
+// (`lib/vtls/vtls.c:1144-1145` hands out the same shape).
+unsafe impl Sync for ImmortalBackendList {}
 
 /// The one backend descriptor a caller reads through `avail`.
 ///
@@ -468,36 +512,16 @@ struct Immortal<T>(T);
 /// `lib/vtls/vtls_int.h:141-145`: the descriptor "must be the first entry to
 /// allow returning the list of available backends in curl_global_sslset()".
 /// `handle.rs` asserts the offsets independently.
-static RUSTLS_BACKEND: Immortal<curl_ssl_backend> =
-    Immortal(curl_ssl_backend {
-        id: BACKEND_ID,
-        name: BACKEND_NAME.as_ptr(),
-    });
-
-// SAFETY: `curl_ssl_backend` is a two-field `#[repr(C)]` struct -- a `c_int`
-// and a `*const c_char` -- with no interior mutability, and the one value of it
-// this crate creates is `RUSTLS_BACKEND` above: written once in a static
-// initializer, never mutated, with no `&mut` path to it anywhere in the crate.
-// Concurrent readers therefore observe identical immutable bytes, which is what
-// `Sync` requires. The only reason the wrapper is needed at all is the raw
-// pointer, and that pointer is `BACKEND_NAME.as_ptr()` -- the address of a
-// `'static` C string in this crate's own read-only data, so it stays valid and
-// unchanging for the life of the process.
-unsafe impl Sync for Immortal<curl_ssl_backend> {}
+static RUSTLS_BACKEND: ImmortalBackend = ImmortalBackend(curl_ssl_backend {
+    id: BACKEND_ID,
+    name: BACKEND_NAME.as_ptr(),
+});
 
 /// The NULL-terminated array of pointers to descriptors.
-static AVAILABLE_BACKENDS: Immortal<[*const curl_ssl_backend; 2]> =
-    Immortal([&RUSTLS_BACKEND.0 as *const curl_ssl_backend, ptr::null()]);
-
-// SAFETY: a two-element array of raw pointers, with no interior mutability, and
-// the one value of it this crate creates is `AVAILABLE_BACKENDS` above: written
-// once in a static initializer, never mutated, with no `&mut` path to it.
-// Concurrent readers observe identical immutable bytes. Both elements are sound
-// for the life of the process -- the first is the address of `RUSTLS_BACKEND`,
-// another `'static` in this crate, and the second is null, which a caller is
-// required to treat as the terminator and never to dereference
-// (`lib/vtls/vtls.c:1144-1145` hands out the same shape).
-unsafe impl Sync for Immortal<[*const curl_ssl_backend; 2]> {}
+static AVAILABLE_BACKENDS: ImmortalBackendList = ImmortalBackendList([
+    &RUSTLS_BACKEND.0 as *const curl_ssl_backend,
+    ptr::null(),
+]);
 
 /// Selects, or confirms, the TLS backend.
 ///
@@ -1199,15 +1223,17 @@ mod tests {
         assert_eq!(on_success, on_failure, "the same array either way");
     }
 
-    /// The two `Immortal` instantiations are `Sync`, and nothing else is.
+    /// The two immortal wrappers are `Sync`, and nothing else is.
     ///
     /// The positive half is what the two statics need in order to exist at all,
     /// so it would fail to compile rather than fail here -- which is the point:
     /// it records that these two, and only these two, have an audited
     /// implementation. The negative half cannot be written as an assertion
-    /// without a nightly feature, so it is enforced structurally instead: there
-    /// is no `unsafe impl<T> Sync for Immortal<T>`, so `Immortal<Cell<u8>>` is
-    /// not `Sync` and a static holding one does not compile.
+    /// without a nightly feature, so it is enforced structurally instead, and
+    /// the structure is now stronger than it was: there is no generic wrapper to
+    /// instantiate at all, so there is no `Immortal<Cell<u8>>` to be `Sync` or
+    /// not. Making a third immortal static requires declaring a third named type
+    /// and writing a third `unsafe impl` beside it.
     #[test]
     fn only_the_audited_immortal_types_are_sync() {
         // The empty body is deliberate: a bound is all this asserts, and a
@@ -1219,8 +1245,8 @@ mod tests {
         // Both wrapped types, named rather than inferred, so that removing one
         // of the two `unsafe impl`s fails to compile here and not only at the
         // static it serves.
-        requires_sync::<Immortal<curl_ssl_backend>>();
-        requires_sync::<Immortal<[*const curl_ssl_backend; 2]>>();
+        requires_sync::<ImmortalBackend>();
+        requires_sync::<ImmortalBackendList>();
 
         // And the wrapper is load-bearing rather than decorative: the inner
         // types hold raw pointers and are not `Sync` on their own, which is why

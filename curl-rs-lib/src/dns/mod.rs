@@ -4412,11 +4412,32 @@ mod tests {
         assert!(!doh_transport_registered());
         assert!(!crate::version::supports_doh());
 
-        // The feature is default-on, so the conjunct that withholds the label
-        // is one of the other two rather than the feature. Asserted in an
-        // anonymous constant because `assert!` on a `cfg!` is a constant
-        // expression and `clippy::assertions_on_constants` rejects it under
-        // `-D warnings` -- the form the lint's own help text suggests.
+        // The feature is default-on, so in the default configuration the
+        // conjunct that withholds the label is one of the other two rather than
+        // the feature. Asserted in an anonymous constant because `assert!` on a
+        // `cfg!` is a constant expression and `clippy::assertions_on_constants`
+        // rejects it under `-D warnings` -- the form the lint's own help text
+        // suggests.
+        //
+        // GATED ON THE FEATURE IT DESCRIBES, and that is the repair of a real
+        // defect rather than a tidy-up. Unconditional, this constant is
+        // `assert!(false)` whenever the feature is off, and a failing constant
+        // is a compile error rather than a failing test: measured,
+        // `cargo clippy --locked --workspace --no-default-features --all-targets`
+        // stopped at
+        // `error[E0080]: evaluation panicked: assertion failed: cfg!(feature = "doh")`
+        // and the whole crate did not build in that configuration -- production
+        // code included, because a `#[cfg(test)]` module still has to compile
+        // for `--all-targets`.
+        //
+        // The three assertions above and the two below are deliberately NOT
+        // gated. The registry is empty, no transport is registered and
+        // `supports_doh()` answers `false` in EVERY feature configuration; that
+        // invariance is the guarantee this test exists for, and gating it would
+        // have thrown away the check to silence the error. Only the sentence
+        // about which conjunct does the withholding is configuration-specific,
+        // so only that sentence is configuration-gated.
+        #[cfg(feature = "doh")]
         const _: () = assert!(cfg!(feature = "doh"));
 
         // The two remaining conjuncts, so a future change to either is visible

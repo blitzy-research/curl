@@ -104,6 +104,7 @@ use crate::crypto::{
 use crate::error::CURLcode;
 use crate::util::base64;
 use crate::util::dynbuf::DynBuf;
+use crate::util::fallible;
 use crate::util::strcase::{casecompare, checkprefix};
 use crate::util::strparse::{
     is_blank, str_casecompare, str_passblanks, str_single, str_until,
@@ -746,13 +747,19 @@ fn select_qop(content: &[u8]) -> Option<&'static [u8]> {
 ///
 /// `CURLcode::BadContentEncoding` for an unknown `algorithm` value and for
 /// each of the three validations above -- the same code the C returns in all
-/// four places. The C's `CURLE_OUT_OF_MEMORY` arms guarded `curlx_strdup` of a
-/// challenge field, which is a copy of bytes already in memory -- the same
-/// order of magnitude as the input, with no amplification -- so it is not among
-/// the externally sized allocations `crate::util::fallible` covers, and
-/// `Box`/`String` duplication has no stable fallible spelling at the declared
-/// minimum Rust version. A failure there aborts, and that is stated rather than
-/// papered over.
+/// four places -- and `CURLcode::OutOfMemory` for a refused allocation, which
+/// is the code the C's own `curlx_strdup` arms return.
+///
+/// Those arms are reproduced rather than dismissed. The extents copied here are
+/// the fields of a `WWW-Authenticate` header a **server** sent: a nonce, a
+/// realm, an opaque token and a raw algorithm spelling, each as long as the
+/// peer chose to make it, bounded only by the response-header ceiling. That is
+/// externally sized by the definition `crate::util::fallible` uses, so a
+/// hostile or merely verbose challenge must not be able to abort an embedding
+/// process that is prepared to handle `CURLE_OUT_OF_MEMORY`. An earlier reading
+/// of this function called the copies "the same order of magnitude as the
+/// input, with no amplification" and concluded they were exempt; the size being
+/// unamplified is not the test -- the test is who chooses it.
 ///
 /// The two `CURLE_NOT_BUILT_IN` arms at `:606` and `:613` are also absent, and
 /// deliberately: they sit under `#else /* !CURL_HAVE_SHA512_256 */`, and
@@ -764,6 +771,17 @@ pub(crate) fn decode_digest_http_message(
     challenge: &[u8],
     digest: &mut DigestData,
 ) -> Result<(), CURLcode> {
+    /// One challenge field, copied, reporting a refused allocation.
+    ///
+    /// The successor of the C's `curlx_strdup` at `:531`, `:544`, `:549`,
+    /// `:558` and `:590`, each of which is followed by
+    /// `if(!...) return CURLE_OUT_OF_MEMORY;`. Named once so that the five
+    /// sites read as the five the C has, and so that none of them can quietly
+    /// pick a different code.
+    fn dup(field: &[u8]) -> Result<Vec<u8>, CURLcode> {
+        fallible::vec_from_slice(field).map_err(fallible::oom)
+    }
+
     // `bool before = FALSE; if(digest->nonce) before = TRUE;` -- FIRST.
     let before = digest.nonce.is_some();
 
@@ -788,7 +806,7 @@ pub(crate) fn decode_digest_http_message(
         let content = pair.content.as_slice();
 
         if casecompare(key, b"nonce") {
-            digest.nonce = Some(content.to_vec());
+            digest.nonce = Some(dup(content)?);
         } else if casecompare(key, b"stale") {
             if casecompare(content, DIGEST_TRUE) {
                 digest.stale = true;
@@ -798,17 +816,17 @@ pub(crate) fn decode_digest_http_message(
                 digest.nc = 1;
             }
         } else if casecompare(key, b"realm") {
-            digest.realm = Some(content.to_vec());
+            digest.realm = Some(dup(content)?);
         } else if casecompare(key, b"opaque") {
-            digest.opaque = Some(content.to_vec());
+            digest.opaque = Some(dup(content)?);
         } else if casecompare(key, b"qop") {
             if let Some(selected) = select_qop(content) {
-                digest.qop = Some(selected.to_vec());
+                digest.qop = Some(dup(selected)?);
             }
         } else if casecompare(key, b"algorithm") {
             // The RAW spelling is stored first, because it is echoed back
             // verbatim in the emitted header (`:589-592`, then `:936`).
-            digest.algorithm = Some(content.to_vec());
+            digest.algorithm = Some(dup(content)?);
 
             // ... and then mapped to a value, in the C's own order.
             let mapped = ALGORITHM_TABLE

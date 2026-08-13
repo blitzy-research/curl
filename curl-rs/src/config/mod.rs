@@ -374,10 +374,10 @@ pub(crate) struct OperationConfig {
     /// `struct dynbuf postdata` -- `:61`, the `--data` accumulator.
     pub(crate) postdata: Vec<u8>,
     /// `char *useragent` -- `:62`.
-    pub(crate) useragent: Option<String>,
+    pub(crate) useragent: Option<Vec<u8>>,
     /// `struct curl_slist *cookies` -- `:63`, cookies to serialize into a
     /// single line.
-    pub(crate) cookies: Vec<String>,
+    pub(crate) cookies: Vec<Vec<u8>>,
     /// `char *cookiejar` -- `:64`, write to this file.
     pub(crate) cookiejar: Option<PathBuf>,
     /// `struct curl_slist *cookiefiles` -- `:65`, file(s) to load cookies
@@ -386,17 +386,17 @@ pub(crate) struct OperationConfig {
     /// A `Vec<String>` and not of paths: the option accepts the literal `-`
     /// for standard input as well as filenames, so the values are not all
     /// paths and the distinction is made where they are opened.
-    pub(crate) cookiefiles: Vec<String>,
+    pub(crate) cookiefiles: Vec<Vec<u8>>,
     /// `char *altsvc` -- `:66`, the alt-svc cache filename.
     pub(crate) altsvc: Option<PathBuf>,
     /// `char *hsts` -- `:67`, the HSTS cache filename.
     pub(crate) hsts: Option<PathBuf>,
     /// `char *proto_str` -- `:68`, the `--proto` argument.
-    pub(crate) proto_str: Option<String>,
+    pub(crate) proto_str: Option<Vec<u8>>,
     /// `char *proto_redir_str` -- `:69`, the `--proto-redir` argument.
-    pub(crate) proto_redir_str: Option<String>,
+    pub(crate) proto_redir_str: Option<Vec<u8>>,
     /// `char *proto_default` -- `:70`, the `--proto-default` argument.
-    pub(crate) proto_default: Option<String>,
+    pub(crate) proto_default: Option<Vec<u8>>,
     /// `curl_off_t resume_from` -- `:71`.
     pub(crate) resume_from: i64,
     /// `char *postfields` -- `:72`, reduced to the flag it functionally is.
@@ -410,9 +410,9 @@ pub(crate) struct OperationConfig {
     /// `postdata` owns the storage.
     pub(crate) postfields: bool,
     /// `char *referer` -- `:73`.
-    pub(crate) referer: Option<String>,
+    pub(crate) referer: Option<Vec<u8>>,
     /// `char *query` -- `:74`, the `--url-query` accumulator.
-    pub(crate) query: Option<String>,
+    pub(crate) query: Option<Vec<u8>>,
     /// `curl_off_t max_filesize` -- `:75`.
     pub(crate) max_filesize: i64,
     /// `char *output_dir` -- `:76`, the `--output-dir` argument.
@@ -420,52 +420,52 @@ pub(crate) struct OperationConfig {
     /// `char *headerfile` -- `:77`, the `-D`/`--dump-header` argument.
     pub(crate) headerfile: Option<PathBuf>,
     /// `char *ftpport` -- `:78`, the `-P`/`--ftp-port` argument.
-    pub(crate) ftpport: Option<String>,
+    pub(crate) ftpport: Option<Vec<u8>>,
     /// `char *iface` -- `:79`, the `--interface` argument.
-    pub(crate) iface: Option<String>,
+    pub(crate) iface: Option<Vec<u8>>,
     /// `char *range` -- `:80`, the `-r`/`--range` argument.
-    pub(crate) range: Option<String>,
+    pub(crate) range: Option<Vec<u8>>,
     /// `char *dns_servers` -- `:81`, dot notation: `1.1.1.1;2.2.2.2`.
-    pub(crate) dns_servers: Option<String>,
+    pub(crate) dns_servers: Option<Vec<u8>>,
     /// `char *dns_interface` -- `:82`, an interface name.
-    pub(crate) dns_interface: Option<String>,
+    pub(crate) dns_interface: Option<Vec<u8>>,
     /// `char *dns_ipv4_addr` -- `:83`, dot notation.
-    pub(crate) dns_ipv4_addr: Option<String>,
+    pub(crate) dns_ipv4_addr: Option<Vec<u8>>,
     /// `char *dns_ipv6_addr` -- `:84`, dot notation.
-    pub(crate) dns_ipv6_addr: Option<String>,
+    pub(crate) dns_ipv6_addr: Option<Vec<u8>>,
     /// `char *userpwd` -- `:85`.
-    pub(crate) userpwd: Option<String>,
+    pub(crate) userpwd: Option<Vec<u8>>,
     /// `char *login_options` -- `:86`.
-    pub(crate) login_options: Option<String>,
+    pub(crate) login_options: Option<Vec<u8>>,
     /// `char *tls_username` -- `:87`.
-    pub(crate) tls_username: Option<String>,
+    pub(crate) tls_username: Option<Vec<u8>>,
     /// `char *tls_password` -- `:88`.
-    pub(crate) tls_password: Option<String>,
+    pub(crate) tls_password: Option<Vec<u8>>,
     /// `char *tls_authtype` -- `:89`.
-    pub(crate) tls_authtype: Option<String>,
+    pub(crate) tls_authtype: Option<Vec<u8>>,
     /// `char *proxy_tls_username` -- `:90`.
-    pub(crate) proxy_tls_username: Option<String>,
+    pub(crate) proxy_tls_username: Option<Vec<u8>>,
     /// `char *proxy_tls_password` -- `:91`.
-    pub(crate) proxy_tls_password: Option<String>,
+    pub(crate) proxy_tls_password: Option<Vec<u8>>,
     /// `char *proxy_tls_authtype` -- `:92`.
-    pub(crate) proxy_tls_authtype: Option<String>,
+    pub(crate) proxy_tls_authtype: Option<Vec<u8>>,
     /// `char *proxyuserpwd` -- `:93`.
-    pub(crate) proxyuserpwd: Option<String>,
+    pub(crate) proxyuserpwd: Option<Vec<u8>>,
     /// `char *proxy` -- `:94`.
-    pub(crate) proxy: Option<String>,
+    pub(crate) proxy: Option<Vec<u8>>,
     /// `char *noproxy` -- `:95`.
-    pub(crate) noproxy: Option<String>,
+    pub(crate) noproxy: Option<Vec<u8>>,
     /// `char *knownhosts` -- `:96`, resolved in place by the option applier;
     /// see the struct documentation.
     pub(crate) knownhosts: Option<PathBuf>,
     /// `char *mail_from` -- `:97`.
-    pub(crate) mail_from: Option<String>,
+    pub(crate) mail_from: Option<Vec<u8>>,
     /// `struct curl_slist *mail_rcpt` -- `:98`.
-    pub(crate) mail_rcpt: Vec<String>,
+    pub(crate) mail_rcpt: Vec<Vec<u8>>,
     /// `char *mail_auth` -- `:99`.
-    pub(crate) mail_auth: Option<String>,
+    pub(crate) mail_auth: Option<Vec<u8>>,
     /// `char *sasl_authzid` -- `:100`, the authorization identity to use.
-    pub(crate) sasl_authzid: Option<String>,
+    pub(crate) sasl_authzid: Option<Vec<u8>>,
     /// `char *netrc_file` -- `:101`.
     pub(crate) netrc_file: Option<PathBuf>,
     /// `struct getout *url_list` -- `:102`, C's "point to the first node".
@@ -490,25 +490,25 @@ pub(crate) struct OperationConfig {
     /// Unconditional here. C guards it with `#ifndef CURL_DISABLE_IPFS`
     /// (`:108-110`), which is not a Cargo feature, and the module that
     /// translates an IPFS URL exists unconditionally.
-    pub(crate) ipfs_gateway: Option<String>,
+    pub(crate) ipfs_gateway: Option<Vec<u8>>,
     /// `char *doh_url` -- `:111`.
-    pub(crate) doh_url: Option<String>,
+    pub(crate) doh_url: Option<Vec<u8>>,
     /// `char *cipher_list` -- `:112`.
-    pub(crate) cipher_list: Option<String>,
+    pub(crate) cipher_list: Option<Vec<u8>>,
     /// `char *proxy_cipher_list` -- `:113`.
-    pub(crate) proxy_cipher_list: Option<String>,
+    pub(crate) proxy_cipher_list: Option<Vec<u8>>,
     /// `char *cipher13_list` -- `:114`.
-    pub(crate) cipher13_list: Option<String>,
+    pub(crate) cipher13_list: Option<Vec<u8>>,
     /// `char *proxy_cipher13_list` -- `:115`.
-    pub(crate) proxy_cipher13_list: Option<String>,
+    pub(crate) proxy_cipher13_list: Option<Vec<u8>>,
     /// `char *cert` -- `:116`.
     pub(crate) cert: Option<PathBuf>,
     /// `char *proxy_cert` -- `:117`.
     pub(crate) proxy_cert: Option<PathBuf>,
     /// `char *cert_type` -- `:118`.
-    pub(crate) cert_type: Option<String>,
+    pub(crate) cert_type: Option<Vec<u8>>,
     /// `char *proxy_cert_type` -- `:119`.
-    pub(crate) proxy_cert_type: Option<String>,
+    pub(crate) proxy_cert_type: Option<Vec<u8>>,
     /// `char *cacert` -- `:120`.
     pub(crate) cacert: Option<PathBuf>,
     /// `char *proxy_cacert` -- `:121`.
@@ -526,55 +526,55 @@ pub(crate) struct OperationConfig {
     /// Text, not a path: the option accepts either a filename or a
     /// `sha256//<base64>` digest list, and only the option applier can tell
     /// them apart.
-    pub(crate) pinnedpubkey: Option<String>,
+    pub(crate) pinnedpubkey: Option<Vec<u8>>,
     /// `char *proxy_pinnedpubkey` -- `:127`.
-    pub(crate) proxy_pinnedpubkey: Option<String>,
+    pub(crate) proxy_pinnedpubkey: Option<Vec<u8>>,
     /// `char *key` -- `:128`.
     pub(crate) key: Option<PathBuf>,
     /// `char *proxy_key` -- `:129`.
     pub(crate) proxy_key: Option<PathBuf>,
     /// `char *key_type` -- `:130`.
-    pub(crate) key_type: Option<String>,
+    pub(crate) key_type: Option<Vec<u8>>,
     /// `char *proxy_key_type` -- `:131`.
-    pub(crate) proxy_key_type: Option<String>,
+    pub(crate) proxy_key_type: Option<Vec<u8>>,
     /// `char *key_passwd` -- `:132`.
-    pub(crate) key_passwd: Option<String>,
+    pub(crate) key_passwd: Option<Vec<u8>>,
     /// `char *proxy_key_passwd` -- `:133`.
-    pub(crate) proxy_key_passwd: Option<String>,
+    pub(crate) proxy_key_passwd: Option<Vec<u8>>,
     /// `char *pubkey` -- `:134`.
     pub(crate) pubkey: Option<PathBuf>,
     /// `char *hostpubmd5` -- `:135`, a hex digest rather than a path.
-    pub(crate) hostpubmd5: Option<String>,
+    pub(crate) hostpubmd5: Option<Vec<u8>>,
     /// `char *hostpubsha256` -- `:136`, a base64 digest rather than a path.
-    pub(crate) hostpubsha256: Option<String>,
+    pub(crate) hostpubsha256: Option<Vec<u8>>,
     /// `char *engine` -- `:137`.
-    pub(crate) engine: Option<String>,
+    pub(crate) engine: Option<Vec<u8>>,
     /// `char *etag_save_file` -- `:138`.
     pub(crate) etag_save_file: Option<PathBuf>,
     /// `char *etag_compare_file` -- `:139`.
     pub(crate) etag_compare_file: Option<PathBuf>,
     /// `char *customrequest` -- `:140`, the `-X` argument.
-    pub(crate) customrequest: Option<String>,
+    pub(crate) customrequest: Option<Vec<u8>>,
     /// `char *ssl_ec_curves` -- `:141`.
-    pub(crate) ssl_ec_curves: Option<String>,
+    pub(crate) ssl_ec_curves: Option<Vec<u8>>,
     /// `char *ssl_signature_algorithms` -- `:142`.
-    pub(crate) ssl_signature_algorithms: Option<String>,
+    pub(crate) ssl_signature_algorithms: Option<Vec<u8>>,
     /// `char *krblevel` -- `:143`.
-    pub(crate) krblevel: Option<String>,
+    pub(crate) krblevel: Option<Vec<u8>>,
     /// `char *request_target` -- `:144`.
-    pub(crate) request_target: Option<String>,
+    pub(crate) request_target: Option<Vec<u8>>,
     /// `char *writeout` -- `:145`, the `%`-styled format string to output.
-    pub(crate) writeout: Option<String>,
+    pub(crate) writeout: Option<Vec<u8>>,
     /// `struct curl_slist *quote` -- `:146`.
-    pub(crate) quote: Vec<String>,
+    pub(crate) quote: Vec<Vec<u8>>,
     /// `struct curl_slist *postquote` -- `:147`.
-    pub(crate) postquote: Vec<String>,
+    pub(crate) postquote: Vec<Vec<u8>>,
     /// `struct curl_slist *prequote` -- `:148`.
-    pub(crate) prequote: Vec<String>,
+    pub(crate) prequote: Vec<Vec<u8>>,
     /// `struct curl_slist *headers` -- `:149`.
-    pub(crate) headers: Vec<String>,
+    pub(crate) headers: Vec<Vec<u8>>,
     /// `struct curl_slist *proxyheaders` -- `:150`.
-    pub(crate) proxyheaders: Vec<String>,
+    pub(crate) proxyheaders: Vec<Vec<u8>>,
     /// `struct tool_mime *mimeroot` and `*mimecurrent` -- `:151-152`.
     ///
     /// `curl_mime *mimepost` (`:153`) has no field here. Its only purpose in C
@@ -586,39 +586,39 @@ pub(crate) struct OperationConfig {
     /// builder's choice.
     pub(crate) mime: Option<MimeTree>,
     /// `struct curl_slist *telnet_options` -- `:154`.
-    pub(crate) telnet_options: Vec<String>,
+    pub(crate) telnet_options: Vec<Vec<u8>>,
     /// `struct curl_slist *resolve` -- `:155`.
-    pub(crate) resolve: Vec<String>,
+    pub(crate) resolve: Vec<Vec<u8>>,
     /// `struct curl_slist *connect_to` -- `:156`.
-    pub(crate) connect_to: Vec<String>,
+    pub(crate) connect_to: Vec<Vec<u8>>,
     /// `char *preproxy` -- `:157`.
-    pub(crate) preproxy: Option<String>,
+    pub(crate) preproxy: Option<Vec<u8>>,
     /// `char *proxy_service_name` -- `:158-159`, the authentication service
     /// name for HTTP and SOCKS5 proxies.
-    pub(crate) proxy_service_name: Option<String>,
+    pub(crate) proxy_service_name: Option<Vec<u8>>,
     /// `char *service_name` -- `:160-161`, the authentication service name for
     /// DIGEST-MD5, Kerberos 5 and SPNEGO.
-    pub(crate) service_name: Option<String>,
+    pub(crate) service_name: Option<Vec<u8>>,
     /// `char *ftp_account` -- `:162`, for `ACCT`.
-    pub(crate) ftp_account: Option<String>,
+    pub(crate) ftp_account: Option<Vec<u8>>,
     /// `char *ftp_alternative_to_user` -- `:163`, the command to send if
     /// `USER`/`PASS` fails.
-    pub(crate) ftp_alternative_to_user: Option<String>,
+    pub(crate) ftp_alternative_to_user: Option<Vec<u8>>,
     /// `char *oauth_bearer` -- `:164`, the OAuth 2.0 bearer token.
-    pub(crate) oauth_bearer: Option<String>,
+    pub(crate) oauth_bearer: Option<Vec<u8>>,
     /// `char *unix_socket_path` -- `:165`, the path to a Unix domain socket.
     pub(crate) unix_socket_path: Option<PathBuf>,
     /// `char *haproxy_clientip` -- `:166`, the client IP for the HAProxy
     /// protocol.
-    pub(crate) haproxy_clientip: Option<String>,
+    pub(crate) haproxy_clientip: Option<Vec<u8>>,
     /// `char *aws_sigv4` -- `:167`.
-    pub(crate) aws_sigv4: Option<String>,
+    pub(crate) aws_sigv4: Option<Vec<u8>>,
     /// `char *ech` -- `:168`, set by `--ech` keywords.
-    pub(crate) ech: Option<String>,
+    pub(crate) ech: Option<Vec<u8>>,
     /// `char *ech_config` -- `:169`, set by the `--ech esl:` option.
-    pub(crate) ech_config: Option<String>,
+    pub(crate) ech_config: Option<Vec<u8>>,
     /// `char *ech_public` -- `:170`, set by the `--ech pn:` option.
-    pub(crate) ech_public: Option<String>,
+    pub(crate) ech_public: Option<Vec<u8>>,
     /// `curl_off_t condtime` -- `:173`.
     ///
     /// `prev` and `next` (`:171-172`, "Always last in the struct") have no
@@ -933,7 +933,7 @@ impl fmt::Debug for OperationConfig {
         f.debug_struct("OperationConfig")
             // What the request is.
             .field("httpreq", &self.httpreq)
-            .field("customrequest", &hidden_str(self.customrequest.as_ref()))
+            .field("customrequest", &hidden_bytes(self.customrequest.as_ref()))
             .field("num_urls", &self.num_urls)
             .field("url_list", &self.url_list.len())
             .field("postdata", &Hidden(self.postdata.len()))
@@ -2487,25 +2487,23 @@ mod tests {
         // trip `clippy::field_reassign_with_default`, and it also states
         // plainly that every field not named here is its default.
         let config = OperationConfig {
-            userpwd: Some(String::from("alice:hunter2")),
-            proxyuserpwd: Some(String::from("proxyuser:proxypass")),
-            tls_password: Some(String::from("tlssecret")),
-            proxy_tls_password: Some(String::from("proxytlssecret")),
-            key_passwd: Some(String::from("keysecret")),
-            proxy_key_passwd: Some(String::from("proxykeysecret")),
-            oauth_bearer: Some(String::from("bearer-token-value")),
-            aws_sigv4: Some(String::from("aws:amz:us-east-1:s3")),
+            userpwd: Some(b"alice:hunter2".to_vec()),
+            proxyuserpwd: Some(b"proxyuser:proxypass".to_vec()),
+            tls_password: Some(b"tlssecret".to_vec()),
+            proxy_tls_password: Some(b"proxytlssecret".to_vec()),
+            key_passwd: Some(b"keysecret".to_vec()),
+            proxy_key_passwd: Some(b"proxykeysecret".to_vec()),
+            oauth_bearer: Some(b"bearer-token-value".to_vec()),
+            aws_sigv4: Some(b"aws:amz:us-east-1:s3".to_vec()),
             postdata: b"password=hunter2&card=4111111111111111".to_vec(),
-            headers: vec![String::from("Authorization: Basic c2VjcmV0")],
-            proxyheaders: vec![String::from(
-                "Proxy-Authorization: Bearer ptok",
-            )],
-            quote: vec![String::from("USER alice")],
-            cookies: vec![String::from("session=cafebabe")],
+            headers: vec![b"Authorization: Basic c2VjcmV0".to_vec()],
+            proxyheaders: vec![b"Proxy-Authorization: Bearer ptok".to_vec()],
+            quote: vec![b"USER alice".to_vec()],
+            cookies: vec![b"session=cafebabe".to_vec()],
             cookiejar: Some(PathBuf::from("/home/alice/.cookies")),
-            doh_url: Some(String::from("https://tok@doh.example/q")),
-            proxy: Some(String::from("http://proxyuser:pw@proxy.example")),
-            customrequest: Some(String::from("PROPFIND")),
+            doh_url: Some(b"https://tok@doh.example/q".to_vec()),
+            proxy: Some(b"http://proxyuser:pw@proxy.example".to_vec()),
+            customrequest: Some(b"PROPFIND".to_vec()),
             ..Default::default()
         };
 

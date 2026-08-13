@@ -75,6 +75,7 @@ use tokio::io::{Interest, Ready};
 
 use crate::error::{CURLcode, CodeResult};
 use crate::trace::{trc_feat, TraceFeature, Tracer};
+use crate::util::fallible;
 use crate::util::timediff::{mstotv, TimeDiff};
 
 // THE DESCRIPTOR TYPE
@@ -621,9 +622,13 @@ impl EasyPollset {
     ///
     /// [`CURLcode::BadFunctionArgument`] for a socket that is not a
     /// descriptor, which is what the C returns at `select.c:573`.
-    /// [`CURLcode::OutOfMemory`] if the capacity cannot grow, matching
-    /// `:605`; the allocation itself cannot fail recoverably in Rust, so this
-    /// is reachable only through the overflow guard.
+    /// [`CURLcode::OutOfMemory`] if the capacity cannot grow, matching `:605`,
+    /// or if the allocator declines the room for the new entry -- which is the
+    /// same code C's `curlx_realloc` failure at `:607-620` reports. The second
+    /// route is routed through [`crate::util::fallible`] rather than allowed to
+    /// abort, because the pollset grows once per watched socket and a multi
+    /// handle driving many thousands of transfers is the caller choosing that
+    /// number.
     #[allow(dead_code)]
     pub(crate) fn change(
         &mut self,
@@ -705,8 +710,13 @@ impl EasyPollset {
             self.capacity = grown;
         }
 
-        self.entries.push((sock, add));
-        Ok(())
+        // The C's own `curlx_realloc` failure answer (`:607-620`), reported
+        // rather than aborted. The capacity bookkeeping above has already been
+        // updated; that is deliberate and matches the C, which advances
+        // `ps->size` before the copy and leaves it advanced -- the field records
+        // the growth DECISION, and the next call re-checks `at_capacity`
+        // against the real length either way.
+        fallible::push(&mut self.entries, (sock, add)).map_err(fallible::oom)
     }
 
     /// Sets exactly what is wanted for `sock` -- `Curl_pollset_set`

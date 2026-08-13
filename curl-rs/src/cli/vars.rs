@@ -550,35 +550,63 @@ fn match_func(f: &[u8]) -> Option<(VarFunc, usize)> {
 }
 
 /// What a base64 call produced.
-#[allow(dead_code)]
+///
+/// Two outcomes, because the C distinguishes exactly two: `curlx_base64_encode`
+/// and `curlx_base64_decode` return a `CURLcode`, and each caller tests it with
+/// `if(result)`. There is no third state -- the codec is always available, in
+/// the C and now here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CodecOutcome {
     /// The call succeeded and produced these bytes.
     Produced(Vec<u8>),
 
     /// The call ran and refused the input -- a `CURLcode` about the data.
+    ///
+    /// Which `CURLcode` it was is deliberately not carried: both call sites
+    /// collapse every non-zero code to one action, and the two arms differ in
+    /// what that action IS, not in which code produced it. See [`apply_b64`]
+    /// and [`apply_64dec`].
     Rejected,
-
-    /// The call could not be made at all. See GAP #1 on [`encode_base64`].
-    Unavailable,
 }
 
 /// `curlx_base64_encode(c, clen, &enc, &elen)` -- `src/var.c:147`.
-fn encode_base64(_input: &[u8]) -> CodecOutcome {
-    // GAP #1: curl-rs-lib exposes no public base64; src/var.c:148,:167 needs
-    // curlx_base64_encode/decode for the {{name:b64}} and {{name:64dec}}
-    // functions.
-    CodecOutcome::Unavailable
+///
+/// The engine owns the codec; this is the two-line adapter to it.
+/// `curl_rs_lib::base64_encode` supersedes `lib/curlx/base64.c:241-246` and is
+/// the same function `auth/basic.rs` builds a `Authorization: Basic` header
+/// with, so the tool and the library cannot disagree about the alphabet, the
+/// padding or the input ceiling.
+///
+/// Its only failure is `CURLcode::TooLarge`, above
+/// `CURL_MAX_BASE64_INPUT`. C reaches the same refusal at
+/// `lib/curlx/base64.c:230-236` and, like every other non-zero code here,
+/// collapses it to `PARAM_NO_MEM` at `src/var.c:148-151`.
+fn encode_base64(input: &[u8]) -> CodecOutcome {
+    match curl_rs_lib::base64_encode(input) {
+        Ok(text) => CodecOutcome::Produced(text.into_bytes()),
+        Err(_) => CodecOutcome::Rejected,
+    }
 }
 
 /// `curlx_base64_decode(c, &enc, &elen)` -- `src/var.c:167`.
 ///
-/// Blocked by GAP #1 on [`encode_base64`]. Reports
-/// [`CodecOutcome::Unavailable`] rather than [`CodecOutcome::Rejected`]
-/// precisely so that `[64dec-fail]`, which asserts the input was bad base64,
-/// is never emitted for an input nobody looked at.
-fn decode_base64(_input: &[u8]) -> CodecOutcome {
-    CodecOutcome::Unavailable
+/// `curl_rs_lib::base64_decode` supersedes `lib/curlx/base64.c:61-163`
+/// branch for branch, which is what makes the `[64dec-fail]` sentinel truthful:
+/// it is emitted exactly when curl's own decoder would have refused the input.
+/// Two of that decoder's properties decide real cases and neither is RFC 4648's
+/// reading, so they are recorded here as well as there -- canonical padding is
+/// MANDATORY, so `{{v:64dec}}` over `QQ` fails where `QQ==` succeeds; and
+/// non-canonical trailing bits are ACCEPTED, so `AB==` decodes rather than
+/// failing.
+///
+/// The decoded bytes need not be valid UTF-8 and are not decoded: the result is
+/// a `Vec<u8>` that goes straight into the output buffer, as C's
+/// `dyn_addn(out, enc, elen)` puts it there.
+fn decode_base64(input: &[u8]) -> CodecOutcome {
+    match curl_rs_lib::base64_decode(input) {
+        Ok(bytes) => CodecOutcome::Produced(bytes),
+        Err(_) => CodecOutcome::Rejected,
+    }
 }
 
 /// The `b64` tail of `src/var.c:141-160`.
@@ -592,10 +620,8 @@ fn apply_b64(
     match outcome {
         // `:154`
         CodecOutcome::Produced(bytes) => dyn_addn(out, &bytes),
-        // `:148-151`, and GAP #1's reported outcome.
-        CodecOutcome::Rejected | CodecOutcome::Unavailable => {
-            Err(ParameterError::NoMem)
-        }
+        // `:148-151`
+        CodecOutcome::Rejected => Err(ParameterError::NoMem),
     }
 }
 
@@ -614,9 +640,6 @@ fn apply_64dec(
         CodecOutcome::Produced(bytes) => dyn_addn(out, &bytes),
         // `:170` -- frozen, byte for byte, and not an error.
         CodecOutcome::Rejected => dyn_addn(out, B64DEC_FAIL.as_bytes()),
-        // GAP #1: nothing looked at the input, so `[64dec-fail]` would be a
-        // false claim about it.
-        CodecOutcome::Unavailable => Err(ParameterError::NoMem),
     }
 }
 
@@ -1740,13 +1763,12 @@ mod tests {
         assert_eq!(apply_64dec(&mut out, produced), Ok(()));
         assert_eq!(out, b"hi".to_vec());
 
-        // An unavailable codec never claims the input was bad.
+        // Decoded bytes need not be text, and are not decoded on the way
+        // through: `dyn_addn(out, enc, elen)` copies `elen` bytes.
         let mut out: Vec<u8> = Vec::new();
-        assert_eq!(
-            apply_64dec(&mut out, CodecOutcome::Unavailable),
-            Err(ParameterError::NoMem)
-        );
-        assert!(out.is_empty());
+        let raw = CodecOutcome::Produced(vec![0xff, 0x00, 0xfe]);
+        assert_eq!(apply_64dec(&mut out, raw), Ok(()));
+        assert_eq!(out, vec![0xff, 0x00, 0xfe]);
     }
 
     /// The encode side has no sentinel: a failure aborts the chain
@@ -1761,27 +1783,93 @@ mod tests {
         assert!(out.is_empty());
 
         let mut out: Vec<u8> = Vec::new();
-        assert_eq!(
-            apply_b64(&mut out, CodecOutcome::Unavailable),
-            Err(ParameterError::NoMem)
-        );
-        assert!(out.is_empty());
-
-        let mut out: Vec<u8> = Vec::new();
         let produced = CodecOutcome::Produced(b"aGk=".to_vec());
         assert_eq!(apply_b64(&mut out, produced), Ok(()));
         assert_eq!(out, b"aGk=".to_vec());
     }
 
-    /// GAP #1, asserted so that its resolution is visible as a test change.
+    /// Both adapters reach the engine codec and round-trip through it.
     ///
-    /// When a public base64 becomes reachable from `curl-rs-lib`, these two
-    /// calls start reporting `Produced`, this test fails, and the failure is
-    /// the reminder to point [`encode_base64`] and [`decode_base64`] at it.
+    /// This test replaced one that asserted the two calls were UNAVAILABLE,
+    /// which is what they reported while `curl-rs-lib` kept its base64 crate-
+    /// private. The old test existed to fail the moment a public codec appeared;
+    /// it did its job, and this is the assertion that takes its place.
     #[test]
-    fn base64_is_unavailable_per_gap_one() {
-        assert_eq!(encode_base64(b"hi"), CodecOutcome::Unavailable);
-        assert_eq!(decode_base64(b"aGk="), CodecOutcome::Unavailable);
+    fn both_codecs_reach_the_engine_and_round_trip() {
+        assert_eq!(
+            encode_base64(b"hi"),
+            CodecOutcome::Produced(b"aGk=".to_vec())
+        );
+        assert_eq!(
+            decode_base64(b"aGk="),
+            CodecOutcome::Produced(b"hi".to_vec())
+        );
+
+        // The RFC 4648 section 10 vectors, through the tool's own adapter.
+        for (plain, encoded) in [
+            (&b""[..], &b""[..]),
+            (b"f", b"Zg=="),
+            (b"fo", b"Zm8="),
+            (b"foo", b"Zm9v"),
+            (b"foob", b"Zm9vYg=="),
+            (b"fooba", b"Zm9vYmE="),
+            (b"foobar", b"Zm9vYmFy"),
+        ] {
+            assert_eq!(
+                encode_base64(plain),
+                CodecOutcome::Produced(encoded.to_vec()),
+                "encoding {}",
+                String::from_utf8_lossy(plain)
+            );
+            if !encoded.is_empty() {
+                assert_eq!(
+                    decode_base64(encoded),
+                    CodecOutcome::Produced(plain.to_vec()),
+                    "decoding {}",
+                    String::from_utf8_lossy(encoded)
+                );
+            }
+        }
+
+        // Bytes that are not text survive the round trip.
+        assert_eq!(
+            encode_base64(&[0xff, 0xfe]),
+            CodecOutcome::Produced(b"//4=".to_vec())
+        );
+        assert_eq!(
+            decode_base64(b"//4="),
+            CodecOutcome::Produced(vec![0xff, 0xfe])
+        );
+    }
+
+    /// The refusals `[64dec-fail]` is a truthful claim about.
+    ///
+    /// Curl's decoder is not RFC 4648's: canonical padding is mandatory and
+    /// non-canonical trailing bits are accepted. Both are asserted here through
+    /// the tool's adapter, because both decide whether a real `{{v:64dec}}`
+    /// produces bytes or the sentinel.
+    #[test]
+    fn the_decoder_refuses_exactly_what_curls_does() {
+        // Not a multiple of four -- `lib/curlx/base64.c:79-80`.
+        assert_eq!(decode_base64(b"QQ"), CodecOutcome::Rejected);
+        assert_eq!(
+            decode_base64(b"QQ=="),
+            CodecOutcome::Produced(b"A".to_vec())
+        );
+
+        // Padding inside the input -- `:83-89` walks from the end only.
+        assert_eq!(decode_base64(b"A=B="), CodecOutcome::Rejected);
+
+        // An alphabet violation.
+        assert_eq!(decode_base64(b"a*b="), CodecOutcome::Rejected);
+
+        // Non-canonical trailing bits are ACCEPTED, which the `base64` crate
+        // refuses and curl does not.
+        assert_eq!(decode_base64(b"AB=="), CodecOutcome::Produced(vec![0x00]));
+        assert_eq!(
+            decode_base64(b"AAB="),
+            CodecOutcome::Produced(vec![0x00, 0x00])
+        );
     }
 
     // The store
@@ -2055,20 +2143,29 @@ mod tests {
         assert_eq!(outcome, Ok(Some(b"aGk%3D".to_vec())));
         assert!(sink.is_empty());
 
-        for line in [&b"{{v:b64}}"[..], &b"{{v:64dec}}"[..]] {
-            let (outcome, sink) = expand(&vars, line);
-            assert_eq!(
-                outcome,
-                Err(ParameterError::NoMem),
-                "{} is blocked by GAP #1",
-                String::from_utf8_lossy(line)
-            );
-            assert!(
-                sink.is_empty(),
-                "{} must not report an unknown function",
-                String::from_utf8_lossy(line)
-            );
-        }
+        // Both codecs now run. `aGk=` encodes to `YUdrPQ==` and decodes to
+        // `hi`, so the two are visibly different functions rather than two
+        // spellings of one.
+        let (outcome, sink) = expand(&vars, b"{{v:b64}}");
+        assert_eq!(outcome, Ok(Some(b"YUdrPQ==".to_vec())));
+        assert!(sink.is_empty());
+
+        let (outcome, sink) = expand(&vars, b"{{v:64dec}}");
+        assert_eq!(outcome, Ok(Some(b"hi".to_vec())));
+        assert!(sink.is_empty());
+
+        // A chain composes them, which is the property `varfunc` exists for:
+        // the second function sees the first's output as its input.
+        let (outcome, sink) = expand(&vars, b"{{v:b64:64dec}}");
+        assert_eq!(outcome, Ok(Some(b"aGk=".to_vec())));
+        assert!(sink.is_empty());
+
+        // And an input that is not base64 produces the frozen sentinel rather
+        // than an error -- `src/var.c:169-172`.
+        let bad = one("v", b"not base64!");
+        let (outcome, sink) = expand(&bad, b"{{v:64dec}}");
+        assert_eq!(outcome, Ok(Some(B64DEC_FAIL.as_bytes().to_vec())));
+        assert!(sink.is_empty());
 
         // With empty content neither codec is called at all, so both succeed.
         let empty = one("v", b"");

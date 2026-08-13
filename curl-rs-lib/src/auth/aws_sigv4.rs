@@ -70,7 +70,7 @@ use crate::error::CURLcode;
 use crate::trace::{failf, infof, Tracer};
 use crate::url::escape::{hexbyte, hexencode};
 use crate::util::dynbuf::DynBuf;
-use crate::util::redact::is_sensitive_header;
+use crate::util::redact::{is_sensitive_header, Redacted};
 use crate::util::strcase::{ncasecompare, raw_tolower, raw_toupper};
 use crate::util::strparse::{
     hexval, is_alnum, is_blank, is_urlpunct, is_xdigit, str_casecompare,
@@ -282,19 +282,125 @@ pub(crate) struct SigV4Request<'a> {
 
 impl fmt::Debug for SigV4Request<'_> {
     /// Hand-written so that the byte fields read as text instead of as lists
-    /// of integers.
+    /// of integers, and so that the two fields which can carry a credential
+    /// are rendered through a redaction adaptor rather than verbatim.
     ///
-    /// Nothing printed here is a secret. The option string, the headers, the
-    /// host, the path and the query all go on the wire, and
-    /// [`Credentials`]'s own formatter prints
-    /// [`REDACTED_PLACEHOLDER`] in place of the password -- which is why this
-    /// delegates to it rather than reaching for its fields.
+    /// # What is withheld, and why the previous claim was wrong
+    ///
+    /// This formatter used to state that "nothing printed here is a secret",
+    /// on the grounds that every field goes on the wire. Going on the wire is
+    /// not the test. A `--trace` log, a panic message and a bug report all
+    /// outlive the request and travel further than it does, and two of these
+    /// fields carry material that authenticates one:
+    ///
+    /// * `headers` is `CURLOPT_HTTPHEADER` as the application supplied it, so
+    ///   it can contain any header at all -- including `Authorization`,
+    ///   `Cookie` and `X-Amz-Security-Token`, every one of which this crate's
+    ///   own [`crate::util::redact::is_sensitive_header`] classifies as a
+    ///   credential. Each line is now classified by that same
+    ///   [`crate::util::redact::is_sensitive_header`], and a named value is
+    ///   replaced by [`crate::util::redact::Redacted`].
+    /// * `query` can be a presigned URL's query string, whose
+    ///   `X-Amz-Signature` is an HMAC over the signing key. Each parameter's
+    ///   value is now classified by the same predicate, extended with
+    ///   `X-Amz-Signature`.
+    ///
+    /// Everything else is printed as before. `hostname`, `path`, `method` and
+    /// the three size fields disclose nothing, and [`Credentials`]'s own
+    /// formatter already prints [`REDACTED_PLACEHOLDER`] in place of the
+    /// password -- which is why this delegates to it rather than reaching for
+    /// its fields.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Whether a name -- of a header field or of a query parameter --
+        // introduces a value that authenticates the request. The shared
+        // classifier makes the judgement for everything it knows, so
+        // `Authorization`, `Cookie` and `X-Amz-Security-Token` are covered by
+        // the same list `crate::headers` and `redacted_canonical_request` use.
+        //
+        // `X-Amz-Signature` is the one addition, and it earns its place: it is
+        // the HMAC over the signing key, so possession of it is possession of an
+        // authenticated request for as long as the presigned URL carrying it is
+        // valid. It is a query parameter and never a header field, which is why
+        // it is not in the shared header list. Spelled here, inside the only
+        // code that uses it, rather than as a module constant -- a `const` whose
+        // sole reference is inside this impl reads as unreferenced to rustc,
+        // measured, and an allowance to silence that would be an allowance
+        // hiding nothing.
+        //
+        // `X-Amz-Credential` is deliberately NOT sensitive. Its leading
+        // component is the access key ID, which is the username: this crate
+        // already treats it as public, `Credentials`'s own formatter prints it in
+        // the clear, and it is emitted on the wire in `Credential=`. Redacting it
+        // here while printing it three fields further down would mislead a
+        // reader into thinking one of the two disclosed a secret.
+        let sensitive = |name: &[u8]| {
+            is_sensitive_header(name)
+                || name.eq_ignore_ascii_case(b"x-amz-signature")
+        };
+
+        // One header line -- `b"Name: value"` -- with the name recovered so the
+        // shared classifier can judge the value. The split is the first `:`,
+        // which is what `redacted_canonical_request` does over the same data and
+        // what `Curl_checkheaders` does on the wire side. A line with no `:` is
+        // the `-H "Name;"` form, which carries no value to disclose, so it is
+        // rendered whole.
+        //
+        // The redaction is `redact::Redacted`, the shared adaptor, rather than
+        // `redact::HeaderValue`. Both make the same decision from the same list;
+        // the difference is the shape, and here the shape matters. `HeaderValue`
+        // renders a NON-sensitive value as `Debug` of a string, which is correct
+        // for a field of its own -- it is used that way by `crate::headers` --
+        // but inside a reconstructed line it would quote the value and move the
+        // separator's space inside the quotes, turning `X-Amz-Meta: value` into
+        // `X-Amz-Meta:" value"`. A line that discloses nothing is therefore left
+        // exactly as the application wrote it, and only a value the classifier
+        // names is replaced.
         let headers: Vec<String> = self
             .headers
             .iter()
-            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .map(|line| match line.iter().position(|byte| *byte == b':') {
+                Some(at) if is_sensitive_header(&line[..at]) => {
+                    let (name, rest) = line.split_at(at);
+                    let value = rest.get(1..).unwrap_or_default();
+                    format!(
+                        "{}:{:?}",
+                        String::from_utf8_lossy(name),
+                        Redacted(value)
+                    )
+                }
+                _ => String::from_utf8_lossy(line).into_owned(),
+            })
             .collect();
+
+        // The query string, `&`-separated and then split on the first `=`. That
+        // is the shape AWS query signing composes and the shape a presigned URL
+        // arrives in. A parameter with no `=` has no value to disclose, and one
+        // whose name matches nothing is kept, because a query string is most of
+        // what makes a signing trace useful.
+        let query = self.query.map(|query| {
+            let mut out = String::new();
+            for (index, pair) in query.split(|byte| *byte == b'&').enumerate() {
+                if index != 0 {
+                    out.push('&');
+                }
+                match pair.iter().position(|byte| *byte == b'=') {
+                    Some(at) => {
+                        let (name, rest) = pair.split_at(at);
+                        let value = rest.get(1..).unwrap_or_default();
+                        out.push_str(&String::from_utf8_lossy(name));
+                        out.push('=');
+                        if sensitive(name) {
+                            out.push_str(&format!("{:?}", Redacted(value)));
+                        } else {
+                            out.push_str(&String::from_utf8_lossy(value));
+                        }
+                    }
+                    None => out.push_str(&String::from_utf8_lossy(pair)),
+                }
+            }
+            out
+        });
+
         f.debug_struct("SigV4Request")
             .field("sigv4", &self.sigv4.map(String::from_utf8_lossy))
             .field("path_as_is", &self.path_as_is)
@@ -305,7 +411,7 @@ impl fmt::Debug for SigV4Request<'_> {
             )
             .field("hostname", &String::from_utf8_lossy(self.hostname))
             .field("path", &String::from_utf8_lossy(self.path))
-            .field("query", &self.query.map(String::from_utf8_lossy))
+            .field("query", &query)
             .field("method", &String::from_utf8_lossy(self.method))
             .field("is_get_or_head", &self.is_get_or_head)
             .field("is_post", &self.is_post)
@@ -3744,6 +3850,111 @@ mod tests {
             service: b"s3",
         };
         assert!(format!("{params:?}").contains("provider0"));
+    }
+
+    /// A credential-bearing header supplied through `CURLOPT_HTTPHEADER` must
+    /// not reach the formatted request.
+    ///
+    /// `headers` is whatever the application handed curl, so it can hold any
+    /// field at all. The three asserted here are the ones this crate's own
+    /// classifier names, and each is a real leak if printed: `Authorization` is
+    /// the credential, `Cookie` is a session identifier, and
+    /// `X-Amz-Security-Token` is a live AWS session credential.
+    #[test]
+    fn a_credential_bearing_header_is_not_printed() {
+        let credentials =
+            Credentials::new(Some(b"AKIDEXAMPLE"), Some(b"wJalr"));
+        let headers: [&[u8]; 4] = [
+            b"Authorization: AWS4-HMAC-SHA256 Credential=leaked-signature",
+            b"Cookie: session=deadbeefcafe",
+            b"X-Amz-Security-Token: FQoDYXdzEO-live-token",
+            b"Content-Type: application/json",
+        ];
+        let request = base(&credentials, &headers);
+        let rendered = format!("{request:?}");
+
+        // None of the three values appears.
+        assert!(!rendered.contains("leaked-signature"), "{rendered}");
+        assert!(!rendered.contains("deadbeefcafe"), "{rendered}");
+        assert!(!rendered.contains("FQoDYXdzEO-live-token"), "{rendered}");
+
+        // The NAMES stay, because a reader needs to know the field was there,
+        // and the marker says why the value is missing.
+        assert!(rendered.contains("Authorization:"), "{rendered}");
+        assert!(rendered.contains("Cookie:"), "{rendered}");
+        assert!(rendered.contains("X-Amz-Security-Token:"), "{rendered}");
+        assert!(rendered.contains(crate::util::redact::MARKER), "{rendered}");
+
+        // An ordinary header is still legible: over-redacting would trade a
+        // real debugging capability for no additional confidentiality.
+        assert!(rendered.contains("application/json"), "{rendered}");
+    }
+
+    /// A presigned URL's `X-Amz-Signature` must not reach the formatted
+    /// request, and the rest of the query must.
+    #[test]
+    fn a_presigned_query_does_not_disclose_its_signature() {
+        let credentials =
+            Credentials::new(Some(b"AKIDEXAMPLE"), Some(b"wJalr"));
+        let headers: [&[u8]; 0] = [];
+        let mut request = base(&credentials, &headers);
+        request.query = Some(
+            b"X-Amz-Algorithm=AWS4-HMAC-SHA256\
+              &X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request\
+              &X-Amz-Date=20130524T000000Z\
+              &X-Amz-Expires=86400\
+              &X-Amz-SignedHeaders=host\
+              &X-Amz-Security-Token=live-session-token\
+              &X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404",
+        );
+        let rendered = format!("{request:?}");
+
+        // The two authenticating values are gone.
+        assert!(
+            !rendered.contains(
+                "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("live-session-token"), "{rendered}");
+        assert!(rendered.contains("X-Amz-Signature="), "{rendered}");
+        assert!(rendered.contains("X-Amz-Security-Token="), "{rendered}");
+
+        // Everything a reader needs in order to diagnose a signature mismatch
+        // stays: the algorithm, the scope, the timestamp, the expiry and the
+        // signed-header list. The access key ID stays too -- it is the username,
+        // which this crate prints in the clear elsewhere.
+        assert!(rendered.contains("AWS4-HMAC-SHA256"), "{rendered}");
+        assert!(rendered.contains("AKIDEXAMPLE%2F20130524"), "{rendered}");
+        assert!(rendered.contains("20130524T000000Z"), "{rendered}");
+        assert!(rendered.contains("X-Amz-Expires=86400"), "{rendered}");
+        assert!(rendered.contains("X-Amz-SignedHeaders=host"), "{rendered}");
+    }
+
+    /// The shapes that have no value to disclose are rendered whole rather than
+    /// mangled.
+    #[test]
+    fn valueless_header_and_query_shapes_survive_redaction() {
+        let credentials = Credentials::new(None, None);
+        // `-H "Name;"` -- the send-an-empty-header form, which has no colon.
+        let headers: [&[u8]; 1] = [b"X-Amz-Meta"];
+        let mut request = base(&credentials, &headers);
+        // A bare query parameter with no `=`, and one with an empty value.
+        request.query = Some(b"acl&versionId=");
+        let rendered = format!("{request:?}");
+
+        assert!(rendered.contains("X-Amz-Meta"), "{rendered}");
+        assert!(rendered.contains("acl&versionId="), "{rendered}");
+        assert!(
+            !rendered.contains(crate::util::redact::MARKER),
+            "nothing here is sensitive: {rendered}"
+        );
+
+        // A header value that is not valid UTF-8 still renders rather than
+        // making the formatter the thing that fails.
+        let raw: [&[u8]; 1] = [b"X-Amz-Meta: \xff\xfe"];
+        let request = base(&credentials, &raw);
+        assert!(format!("{request:?}").contains("X-Amz-Meta:"));
     }
 
     // Byte-level helpers.

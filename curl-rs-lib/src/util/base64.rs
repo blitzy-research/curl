@@ -50,9 +50,27 @@
 //!
 //! # Visibility
 //!
-//! Everything is `pub(crate)`. That fixture's coverage is relocated into
-//! [`tests`] below instead, which is where the `@unittest: 1302` annotation on
-//! all three C functions now leads.
+//! [`encode`] and [`decode`] are `pub`; everything else -- the two alphabets,
+//! the input ceiling, [`encode_with`] and [`url_encode`] -- is `pub(crate)`.
+//!
+//! `mod util` is itself `pub(crate)`, so `pub` here confers nothing on its own:
+//! the two functions leave the crate only through the root's
+//! `pub use crate::util::base64::{decode as base64_decode, encode as
+//! base64_encode}`, which is the same arrangement `getdate`, `strequal`,
+//! `strnequal` and `os_error_message` use. The consumer outside this crate is
+//! `curl-rs/src/cli/vars.rs`, whose `{{name:b64}}` and `{{name:64dec}}`
+//! variable functions (`src/var.c:141-181`) call `curlx_base64_encode` and
+//! `curlx_base64_decode` directly in the C. Its `:64dec` arm emits the literal
+//! `[64dec-fail]` for input the decoder REFUSES, so the tool needs this
+//! decoder's exact refusals -- mandatory canonical padding, accepted
+//! non-canonical trailing bits -- for that sentinel to be a truthful claim
+//! about the input.
+//!
+//! [`url_encode`] stays `pub(crate)` because its only consumer is
+//! `protocols/ws`, inside this crate.
+//!
+//! That fixture's coverage is relocated into [`tests`] below, which is where
+//! the `@unittest: 1302` annotation on all three C functions now leads.
 
 use crate::error::CURLcode;
 use crate::util::fallible;
@@ -253,12 +271,16 @@ fn encode_with(
 ///
 /// # Errors
 ///
-/// [`CURLcode::TooLarge`] when `input` exceeds [`CURL_MAX_BASE64_INPUT`].
+/// [`CURLcode::TooLarge`], and nothing else, when `input` is longer than
+/// `CURL_MAX_BASE64_INPUT` -- 16,000,000 bytes, the ceiling
+/// `lib/curlx/base64.c:230-236` applies. The name is crate-private and so is
+/// spelled rather than linked, with its value beside it, because a reader of
+/// this crate's public surface cannot navigate to it.
 ///
 /// # Examples
 ///
-/// The RFC 4648 section 10 vectors, which are also
-/// [`tests::the_rfc_4648_test_vectors_encode_and_decode`]:
+/// The RFC 4648 section 10 vectors, which `tests` asserts in
+/// `the_rfc_4648_test_vectors_encode_and_decode`:
 ///
 /// ```text
 /// encode(b"")       == Ok(String::new())
@@ -269,11 +291,14 @@ fn encode_with(
 /// encode(b"fooba")  == Ok("Zm9vYmE=".to_owned())
 /// encode(b"foobar") == Ok("Zm9vYmFy".to_owned())
 /// ```
-// A module- or crate-level attribute would instead silence the next
-// unreferenced item somebody adds; `src/lib.rs` (`mod source_policy`) enforces
-// that distinction as a test.
-#[allow(dead_code)]
-pub(crate) fn encode(input: &[u8]) -> Result<String, CURLcode> {
+// `pub`, not `pub(crate)`, and re-exported from the crate root as
+// `base64_encode`. `mod util` is itself `pub(crate)`, so this is unreachable by
+// path from outside the crate; the root's `pub use` is the only way in, which is
+// the same arrangement `getdate`, `strequal`, `strnequal` and `os_error_message`
+// use and for the same reason. No `#[allow(dead_code)]` is needed on a `pub`
+// item, and it is deliberately absent: the consumers are `auth/basic.rs`,
+// `auth/digest.rs` and `curl-rs/src/cli/vars.rs`.
+pub fn encode(input: &[u8]) -> Result<String, CURLcode> {
     encode_with(BASE64_ENCDEC, Some(b'='), input)
 }
 
@@ -331,8 +356,11 @@ pub(crate) fn url_encode(input: &[u8]) -> Result<String, CURLcode> {
 /// decode(b"A=B=")     == Err(CURLcode::BadContentEncoding)
 /// decode(b"QQ")       == Err(CURLcode::BadContentEncoding)
 /// ```
-#[allow(dead_code)]
-pub(crate) fn decode(input: &[u8]) -> Result<Vec<u8>, CURLcode> {
+///
+/// `pub` for the reason recorded on [`encode`]: the crate root re-exports it as
+/// `base64_decode`, which is how `curl-rs/src/cli/vars.rs` reaches the
+/// `{{name:64dec}}` codec. Consumed inside the crate by `auth/negotiate.rs`.
+pub fn decode(input: &[u8]) -> Result<Vec<u8>, CURLcode> {
     // Rejection (a), `if(!srclen || srclen % 4)` (:79-80). The C reaches
     // this length through `strlen`; here it is the slice's own, which is
     // the one divergence the module documentation records.

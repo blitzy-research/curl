@@ -1093,33 +1093,49 @@ cross = "0.2.5"                         # aarch64-unknown-linux-gnu leg
 
 # BLOCKED AAP GATES - the requirements this build does NOT satisfy
 #
-# WHY THIS TABLE EXISTS. The specification's dependency inventory is FROZEN, and
-# four of its entries cannot be implemented as written without failing a
-# DIFFERENT requirement of the same specification. Documenting that in prose
-# beside each pin was not enough: prose reads as an explanation, and an
-# explanation reads as compliance. Every one of these four is a gate that is
-# BLOCKED, and nothing in this workspace may report the inventory as satisfied
-# while any row stands here.
+# WHY THIS TABLE EXISTS. Six requirements of the FROZEN specification cannot be
+# implemented as written without failing a DIFFERENT requirement of the same
+# specification. Documenting that in prose beside each one was not enough: prose
+# reads as an explanation, and an explanation reads as compliance. Every row
+# below is a gate that is BLOCKED, and nothing in this workspace may report the
+# requirement a row names as satisfied while that row stands.
+#
+# WHAT THE SIX ARE, because they are not all the same kind of thing. Four are
+# entries of the 0.5.1 dependency inventory - russh, rustls-pemfile, mime_guess,
+# hickory-dns - where the named package cannot be used at the version, the MSRV
+# or the wire behaviour another clause freezes. The other two are not inventory
+# rows at all, and were added after a review found them recorded ONLY in prose:
+# `advisory-remediation` is the 0.8.4 gate-9 conflict, escalated until then just
+# in a comment in deny.toml, and `aarch64-apple-darwin` is the 0.1.1 goal-G8
+# target matrix, escalated until then just in a build-script message.
 #
 # WHY IT IS DATA AND NOT A COMMENT. A comment goes stale silently - that is
 # measured, not feared: the engine registry in curl-rs-lib/src/version.rs
 # carried "the file does not exist" about two modules that had already landed,
-# and only a review caught it. So each row names the pin it is a statement
-# ABOUT, and curl-rs-ffi/build.rs asserts on every build that the manifest above
-# really does pin what `delivered` claims. Bump one of these versions and the
-# build fails until this table is brought with it.
+# and only a review caught it. So each row that is a statement about a PIN names
+# that pin, and curl-rs-ffi/build.rs asserts on every build that the manifest
+# above really does pin what `delivered` claims. Bump one of those versions and
+# the build fails until this table is brought with it. The rows whose `delivered`
+# is prose rather than a pin - because what is delivered there is code, a feature
+# name, a triage decision or a refusal - are each held current by a mechanism of
+# their own, named in the row's `evidence`.
 #
-# WHY IT IS NOT A BUILD REFUSAL. The A4 variadic gate refuses to build, because
-# it would otherwise ship an artifact whose ABI is known-wrong. These four are
-# different: the delivered code is correct and shippable, and it is the CLAIM of
-# inventory compliance that is unavailable. Refusing to build would make the
-# tree unusable to withhold a claim nobody has to make.
+# WHETHER THE BUILD REFUSES DIFFERS BY ROW, and reading one rule onto all six
+# would be wrong. Five ship: the delivered code is correct and usable, and it is
+# only the CLAIM of compliance that is unavailable, so refusing to build would
+# make the tree unusable in order to withhold a claim nobody has to make.
+# `aarch64-apple-darwin` is the exception and DOES refuse - unconditionally, on
+# that one triple, with no environment opt-in - because there the artifact's
+# variadic entry points would read a register the caller never writes. That is a
+# memory-safety fault rather than a missing claim, and it is silent at run time.
 #
-# WHAT A HUMAN MUST DO. Each row names the decision and its owner. Three of the
-# four need an upstream change nobody here controls; `mime_guess` needs the
-# requirement author to say which of two frozen requirements outranks the other,
-# and until they do, the preservation mandate is followed because it is the one
-# the fixture corpus enforces byte for byte.
+# WHAT A HUMAN MUST DO. Each row names the decision and its owner, and not one of
+# those decisions may be taken here. Three need an upstream release nobody here
+# controls. `mime_guess` needs the requirement author to say which of two frozen
+# requirements outranks the other, and until they do the preservation mandate is
+# followed because it is the one the fixture corpus enforces byte for byte.
+# `advisory-remediation` and `aarch64-apple-darwin` both need whoever set the
+# requirements to move the 1.75 floor or to strike the clause it collides with.
 [workspace.metadata.curl-rs.blocked-aap-gates]
 
 [workspace.metadata.curl-rs.blocked-aap-gates.russh]
@@ -1193,6 +1209,79 @@ name one this binary does not contain.
 evidence = "hickory-resolver =0.25.2 wired in: resolves, clears cargo +1.75.0 metadata, and cargo deny check advisories reports 2 errors against hickory-proto 0.25.2"
 blocks = "specification 0.5.2; the capability is vocabulary, not an implementation"
 decision-owner = "whoever may raise the MSRV floor or accept two DoS advisories"
+
+[workspace.metadata.curl-rs.blocked-aap-gates.advisory-remediation]
+aap-section = "0.8.4 gate 9, colliding with 0.8.3 and 0.5.2"
+requirement = "gate 9 read as remediation rather than triage - no advisory outstanding against the default dependency graph"
+delivered = "four advisories triaged and CARRIED - RUSTSEC-2026-0185, RUSTSEC-2026-0153 and RUSTSEC-2026-0154 at 7.5 HIGH, RUSTSEC-2023-0071 at 5.9 MEDIUM - as a closed, self-expiring ignore set in deny.toml"
+reason = """
+READ CAREFULLY WHAT IS AND IS NOT BLOCKED HERE, because the two readings of \
+gate 9 give opposite verdicts. Gate 9 exactly as 0.8.4 words it - "cargo audit \
+with zero critical advisories" - PASSES: the set is 3 x HIGH + 1 x MEDIUM and \
+nothing critical. What is blocked is REMEDIATION, the stricter reading a reader \
+would reasonably expect of a supply-chain gate, and it is blocked by a conflict \
+among mandatory clauses rather than by anything left undone here. Fixing \
+RUSTSEC-2026-0185 needs quinn-proto >= 0.11.15, which declares rust-version \
+1.85; fixing RUSTSEC-2026-0153 and -0154 needs russh >= 0.60.3, which declares \
+1.85 and additionally carries 17 pre-release requirements. Both violate the \
+MSRV 1.75 that 0.8.3 freezes and that `cargo +1.75.0 build --workspace` \
+exercises green on this tree today, so raising the floor would discard a \
+property that currently holds. RUSTSEC-2023-0071 against rsa 0.9.10 has \
+patched = [] - no fixed release exists at ANY floor, so no choice of MSRV \
+retires it. Dropping `http3` and `ssh` retires all four and violates 0.5.2, \
+which makes both default-on. The three-way conflict, its measurements and its \
+full option space are written out in deny.toml above the ignore list; this row \
+exists because that text is a comment inside a policy file, and a review found \
+the escalation was nowhere a build or a workflow could report it.
+
+WHAT IS DONE INSTEAD OF REMEDIATION, because it is not nothing. The vulnerable \
+code is WITHHELD FROM THE ARTIFACT rather than merely accepted on paper: none of \
+the four advisories is reachable in anything this workspace ships today, because \
+the executors that would drive quinn and russh have not landed and the linker \
+drops what nothing calls. That is measured on the release artifacts, not \
+inferred, and rust-audit.yml asserts it on every run with a non-vacuity control \
+so the scan cannot pass by finding nothing at all. The withholding is therefore \
+the finding's own second option - hold affected executor activation until \
+patched - and it is mechanical. What it is NOT is remediation: the advisories \
+remain in the graph, and the day an executor lands, this row's `blocks` becomes \
+a live exposure rather than a latent one. Backporting fixes into local forks was \
+considered as the finding's first option and rejected on evidence: rsa has no \
+patched release to backport FROM, and hand-authoring security patches to QUIC \
+reassembly and SSH allocation paths would put unreviewed cryptographic changes \
+in the graph that cargo audit cannot verify - strictly worse than a documented, \
+unreachable advisory behind an optional feature.
+"""
+evidence = "cargo audit --file Cargo.lock reports exactly 4 vulnerabilities, severities 7.5/7.5/7.5 high and 5.9 medium, zero critical - which is why gate 9 as worded passes. Fix versions read from the crates.io index: quinn-proto 0.11.15 -> rust-version 1.85, russh 0.60.3 -> 1.85, russh-cryptovec 0.60.3 -> 1.85; rsa 0.9.10 -> `No fixed upgrade is available!`. Withholding measured on the release artifacts: `strings -a` over libcurl.so, curl and curlinfo matching /(quinn|quinn-proto|h3|h3-quinn|rsa|russh|russh-cryptovec)-[0-9] returns 0, 0 and 0, against a control of 36 /rustls-[0-9] references in libcurl.so that proves the scan is not vacuous. Staleness is asserted mechanically rather than by this row: rust-audit.yml re-runs cargo audit with the ignores DISABLED and fails unless the reported set is exactly these four, so a newly published advisory, or one of these becoming fixable within the floor, breaks the gate instead of disappearing."
+blocks = "0.8.4 gate 9 read as remediation; the gate as literally worded passes"
+decision-owner = "whoever may raise the 1.75 floor, or move `http3` and `ssh` out of the default feature set"
+
+[workspace.metadata.curl-rs.blocked-aap-gates.aarch64-apple-darwin]
+aap-section = "0.1.1 goal G8 and 0.8.4 gate 1, resolving 0.8.6 ambiguity A4"
+requirement = "clean compilation on all four mandated targets: x86_64 and aarch64 unknown-linux-gnu, x86_64 and aarch64 apple-darwin"
+delivered = "three of the four, measured green with RUSTFLAGS=-D warnings. aarch64-apple-darwin is REFUSED at build time by variadic_abi_verdict in curl-rs-ffi/build.rs - unconditionally, with no environment opt-in"
+reason = """
+A4 is escalated by the specification itself rather than resolved, and this row \
+is that escalation in a form a build can report. Apple's arm64 ABI passes \
+variadic arguments ON THE STACK. The four variadic exports are non-variadic Rust \
+callees reached through a variadic C prototype - the only shape 1.75 admits, \
+c_variadic being unstable there - and on aarch64 they read register x2 (measured \
+codegen: "mov x0, x2; ret"), which such a caller never populates. Reading an \
+uninitialised register as a user-supplied option value is memory-unsafe, not \
+merely wrong, and it is SILENT: no Linux and no x86-64 macOS run can surface it. \
+That is why this one row refuses the build rather than shipping with a caveat, \
+and why A4's option 3 - an environment variable recording acceptance - has been \
+REMOVED rather than kept as an escape hatch: a build-time variable cannot make a \
+memory-safety fault safe, it can only produce the artifact that carries it. The \
+same ambiguity independently blocks eleven of the 100 exported symbols on EVERY \
+target - five plain `...` printf forms needing va_start, five va_list forms whose \
+representation differs across the four triples, and curl_formadd's open-ended \
+CURLFORM_* sequence - none of which the single-trailing-pointer design reaches, \
+because that design works only where the option identifier already encodes its \
+argument's type class.
+"""
+evidence = "variadic_abi_verdict condition 1 refuses os == macos && arch == aarch64 with no variable consulted; condition 2 refuses the retired opt-in if it is set; condition 3 refuses any module claiming the eleven. Measured: cargo check --locked --workspace --target aarch64-apple-darwin fails ONLY in the curl-rs-ffi build script, emitting that refusal, while curl-rs-lib alone on the same triple exits 0 with no warnings - so the refusal is the sole blocker and not a symptom. The other three triples pass cargo check --locked --workspace under RUSTFLAGS=-D warnings."
+blocks = "0.1.1 goal G8 and the 0.8.4 four-target build gate, for one triple of the four"
+decision-owner = "whoever set the requirements: raise the MSRV above 1.75 and implement the four with c_variadic / VaList::next_arg, or strike aarch64-apple-darwin from goal G8"
 
 # Build profiles - deliberately conservative.
 #

@@ -21,22 +21,59 @@
 //! that a consumer linking against them gets a link error naming the symbol
 //! instead of a runtime answer that is silently wrong.
 //!
-//! # One table, projected
+//! # One table, projected twice, searched once
 //!
 //! [`super::opts::EASY_OPTIONS`] is the authority. It is a pure-Rust table with
-//! no raw pointers, which is what lets `opts.rs` stay free of `unsafe`. The C
-//! ABI needs the same data as an array of [`curl_easyoption`] with a
-//! `*const c_char` name and a NULL-named terminating row, so this module holds
-//! a *projection* of that table, built by [`project`] during const evaluation.
+//! no raw pointers, which is what lets `opts.rs` stay free of `unsafe`. Two
+//! consumers need it in a shape it is not already in, so this module holds two
+//! `const fn`-derived projections of that single authority and no table of its
+//! own:
 //!
-//! The projection is deliberately not a second table:
+//! - [`TABLE`] -- the C form. An array of [`curl_easyoption`] with a
+//!   `*const c_char` name and a NULL-named terminating row, built by
+//!   [`project`]. This is the memory whose addresses the three exports hand
+//!   out, so it must exist in exactly the layout a C caller reads.
+//! - [`ENGINE_VIEW`] -- the engine form. An array of
+//!   [`curl_rs_lib::easy::options::EasyOption`], built by [`project_engine`].
+//!   This is what the *search* runs over.
 //!
-//! - It is `const fn`-derived from `EASY_OPTIONS`, so a row cannot be added,
+//! Neither is a second table:
+//!
+//! - Both are `const fn`-derived from `EASY_OPTIONS`, so a row cannot be added,
 //!   removed, reordered or edited on one side only. Verified at MSRV 1.75.
-//! - The names are the same `&'static [u8]` literals `opts.rs` declares,
-//!   NUL included; [`project`] takes their address rather than copying them.
-//! - `ROWS_MATCH_THE_AUTHORITY` asserts the two lengths agree, and the tests
-//!   walk both in lockstep.
+//! - The names in both are the same `&'static [u8]` literals `opts.rs`
+//!   declares, NUL included; each projection takes their address rather than
+//!   copying them.
+//! - The two `const` assertions below pin both lengths to the authority's, and
+//!   the tests walk all three in lockstep.
+//!
+//! # Where the lookup algorithm lives, and why it is not here
+//!
+//! `lib/easygetopt.c` is a library file, not a tool file, so its algorithm
+//! belongs to the engine: `curl_rs_lib::easy::options` owns
+//! [`by_name`](curl_rs_lib::easy::options::by_name),
+//! [`by_id`](curl_rs_lib::easy::options::by_id),
+//! [`next`](curl_rs_lib::easy::options::next) and the
+//! [`lookup`](curl_rs_lib::easy::options::lookup) they share. Each of the three
+//! exports below therefore does exactly three things -- validate the pointer or
+//! integer a C caller supplied, call the engine over [`ENGINE_VIEW`], and turn
+//! the row the engine chose back into an address in [`TABLE`]. No comparison,
+//! no `break` on the sentinel, and no index arithmetic that decides *which* row
+//! is the answer appears in this file any more.
+//!
+//! That direction is required rather than tidy. This crate is a leaf adapter
+//! (AAP section 0.1.1 G1); a search written here would be a second
+//! implementation of a library algorithm, free to disagree with the engine's
+//! about case folding, about whether an alias row is a candidate, and about
+//! where a walk stops -- and nothing would have caught the disagreement,
+//! because the engine's version had no consumer to disagree with.
+//!
+//! The engine also owns the check that its own three entry points agree about
+//! every row of a table it is handed,
+//! [`first_inconsistent_row`](curl_rs_lib::easy::options::first_inconsistent_row).
+//! Its documentation says the crate that owns the table is the one that must
+//! run it, because the acyclicity rule keeps the table out of reach from the
+//! engine's own tests. This crate owns the table, so this module runs it.
 //!
 //! # Row order is part of the contract
 //!
@@ -59,6 +96,10 @@
 //! this side's spelling differs, and it differs in the direction that is sound.
 
 use core::ffi::{c_char, c_int, CStr};
+
+use curl_rs_lib::easy::options::{
+    self as options, EasyOption, EasyType, OptionFlags, OptionId,
+};
 
 use super::opts::{EasyOptionRow, EASY_OPTIONS, EASY_OPTION_ROWS};
 use super::panic_boundary::guard_const_ptr;
@@ -150,6 +191,139 @@ fn base() -> *const curl_easyoption {
     TABLE.0.as_ptr()
 }
 
+/// Projects one authority row into the engine's normalized row.
+///
+/// The three conversions are each a narrowing that would otherwise have to be
+/// trusted, and each is checked here during const evaluation, so a malformed
+/// row is a compile error rather than a wrong answer at run time:
+///
+/// * The name becomes a `&'static CStr` through
+///   [`CStr::from_bytes_with_nul`], which is `const` from Rust 1.72 and so is
+///   available at MSRV 1.75. It rejects a name with no terminator or with an
+///   interior NUL. The previous hand-written search reached the same value with
+///   `.ok()` and silently treated a malformed name as the table's terminator,
+///   which would have truncated the walk.
+/// * The type integer becomes an [`EasyType`] through its own total
+///   constructor. A value outside the nine `CURLOT_*` members cannot be
+///   projected at all.
+/// * `id` and `flags` are the same integers, in the engine's newtypes.
+///
+/// The `&'static [u8]` the name points into is `opts.rs`'s own literal, so this
+/// borrows rather than copies and the two projections name the same bytes.
+const fn project_engine_row(row: &EasyOptionRow) -> EasyOption {
+    let name = match row.name {
+        Some(bytes) => match CStr::from_bytes_with_nul(bytes) {
+            Ok(text) => Some(text),
+            Err(_) => panic!(
+                "an option name must end in exactly one NUL and contain no \
+                 other"
+            ),
+        },
+        None => None,
+    };
+    let value_type = match EasyType::from_i32(row.value_type as i32) {
+        Some(kind) => kind,
+        None => panic!("an option row carries a type outside CURLOT_*"),
+    };
+
+    EasyOption {
+        name,
+        id: OptionId(row.id as i32),
+        value_type,
+        flags: OptionFlags(row.flags),
+    }
+}
+
+/// Builds the engine projection during const evaluation.
+const fn project_engine() -> [EasyOption; ROWS] {
+    // The seed is the sentinel's own shape for the same reason [`UNWRITTEN`] is
+    // all-zero: a projection bug that skipped a slot leaves a name-less row,
+    // which the engine's walk treats as the end of the table and the
+    // consistency check below then reports.
+    let mut out = [EasyOption {
+        name: None,
+        id: OptionId(0),
+        value_type: EasyType::Long,
+        flags: OptionFlags::NONE,
+    }; ROWS];
+    let mut index = 0;
+    while index < ROWS {
+        out[index] = project_engine_row(&EASY_OPTIONS[index]);
+        index += 1;
+    }
+    out
+}
+
+/// The engine-layout option table. Derived, never hand-maintained.
+///
+/// Needs no `Sync` wrapper: every field of [`EasyOption`] is a shared reference
+/// to immortal data or a plain integer, so the array is `Sync` on its own terms
+/// and this `static` asserts nothing. That is the difference the two
+/// projections make plain -- only the C form has to carry a raw pointer, and
+/// only the C form has to opt out of the auto trait.
+static ENGINE_VIEW: [EasyOption; ROWS] = project_engine();
+
+// NO `const` LENGTH ASSERTION ON `ENGINE_VIEW`, and the absence is reasoned
+// rather than an omission -- the guarantee exists twice over without one, and
+// the assertion could not be written portably anyway.
+//
+// It cannot be written: `const _: () = assert!(ENGINE_VIEW.len() == ROWS);`
+// compiles on the pinned 1.97.1 and is `error[E0013]: constants cannot refer to
+// statics` on the 1.75.0 floor. Measured -- it took `cargo +1.75.0 build
+// --workspace` down on its own, which is precisely what the MSRV gate is for.
+//
+// It is not needed:
+//
+//   * the `static`'s own type annotation is `[EasyOption; ROWS]`, so a
+//     projection of any other length does not type-check at all; and
+//   * `project_engine` indexes `EASY_OPTIONS[index]` for every `index < ROWS`,
+//     so an authority shorter than `ROWS` is an out-of-bounds index during
+//     const evaluation -- a compile error, not a short table.
+//
+// `EASY_OPTIONS.len() == ROWS` is asserted above, over a `const`, which is
+// legal on both toolchains; and `the_engine_projection_mirrors_the_authority_row_for_row`
+// asserts the two lengths agree at run time as well.
+
+/// The identifier C's `by_name` searches for when it is handed a NULL name.
+///
+/// `lib/easygetopt.c:55` spells this `CURLOPT_LASTENTRY`, and reaching it is
+/// not an accident of the C: `curl_easy_option_by_name` is
+/// `lookup(name, CURLOPT_LASTENTRY)`, so a NULL name falls into the id branch
+/// with that identifier. Only the never-examined sentinel carries it, so the
+/// search finds nothing. Named here so the NULL case can take that route
+/// literally rather than short-circuiting past it.
+const LASTENTRY: OptionId =
+    OptionId(super::opts::CURLoption::CURLOPT_LASTENTRY as i32);
+
+/// The index in [`ENGINE_VIEW`] of a row the engine returned.
+///
+/// Found by identity rather than by arithmetic. Every row the engine hands back
+/// is an element of the slice it was given, so a subtraction of addresses would
+/// also be correct -- but a scan comparing addresses *proves* that, where the
+/// subtraction would assume it, and an option-introspection lookup is not a hot
+/// path (AAP section 0.1.1 makes performance an explicit non-goal). The row is
+/// never dereferenced through a raw pointer, so no `unsafe` is involved.
+///
+/// [`ENGINE_VIEW`] and [`TABLE`] are projections of one authority in one order,
+/// so the index is equally an index into the C form.
+fn engine_index(row: &EasyOption) -> Option<usize> {
+    ENGINE_VIEW
+        .iter()
+        .position(|candidate| core::ptr::eq(candidate, row))
+}
+
+/// The address in [`TABLE`] of the row the engine chose, or NULL.
+fn c_row(chosen: Option<&EasyOption>) -> *const curl_easyoption {
+    let Some(index) = chosen.and_then(engine_index) else {
+        return core::ptr::null();
+    };
+    // SAFETY: `index` came from `ENGINE_VIEW.iter().position`, so it is below
+    // `ENGINE_VIEW.len()`, which the `const` assertion above pins to `ROWS` --
+    // the length of `TABLE.0`. The offset therefore lands on an element of
+    // `TABLE`, and nothing is dereferenced here.
+    unsafe { base().add(index) }
+}
+
 /// Resolves a caller-supplied row pointer back to its index in [`TABLE`].
 ///
 /// The C reaches the next row with `prev++`, which is defined only when `prev`
@@ -174,15 +348,6 @@ fn index_of(row: *const curl_easyoption) -> Option<usize> {
     }
 }
 
-/// The row's name as a `&CStr`, or `None` for the sentinel.
-///
-/// Reads the authority rather than the projection, so no raw pointer is
-/// dereferenced to answer a question the safe table can already answer.
-fn row_name(index: usize) -> Option<&'static CStr> {
-    let bytes = EASY_OPTIONS[index].name?;
-    CStr::from_bytes_with_nul(bytes).ok()
-}
-
 /// Looks up an option by name, case-insensitively.
 ///
 /// Reproduces `lookup(name, CURLOPT_LASTENTRY)` from `lib/easygetopt.c:31`.
@@ -190,8 +355,10 @@ fn row_name(index: usize) -> Option<&'static CStr> {
 /// three are measured against `libcurl.so.4.8.0` in this module's tests:
 ///
 /// - The comparison is `curl_strequal`, so it is case-insensitive over ASCII.
-///   This delegates to the same function the exported `curl_strequal` uses, so
-///   there is one case-folding authority rather than two.
+///   It reaches that authority through the engine's own search, which folds with
+///   `crate::util::strcase::casecompare` -- the function the exported
+///   `curl_strequal` is itself a thin wrapper over -- so there is one
+///   case-folding authority rather than two.
 /// - Alias rows are **included**. `by_name("ENCODING")` returns the retired
 ///   spelling's own row -- id `CURLOPT_ACCEPT_ENCODING`, flags
 ///   `CURLOT_FLAG_ALIAS` -- and not the preferred row.
@@ -212,22 +379,17 @@ pub unsafe extern "C" fn curl_easy_option_by_name(
 ) -> *const curl_easyoption {
     guard_const_ptr(|| {
         if name.is_null() {
-            return core::ptr::null();
+            // C's own route, not a short-circuit: `lookup` with no name and
+            // `CURLOPT_LASTENTRY` searches the id branch for an identifier only
+            // the never-examined sentinel carries, and so answers NULL.
+            return c_row(options::lookup(&ENGINE_VIEW, None, LASTENTRY));
         }
         // SAFETY: the caller guarantees a valid NUL-terminated string, and the
-        // NULL case returned above. The borrow does not outlive this call.
+        // NULL case returned above. The borrow does not outlive this call, and
+        // the engine's search compares its bytes without retaining it.
         let wanted = unsafe { CStr::from_ptr(name) };
-        for index in 0..ROWS {
-            let Some(candidate) = row_name(index) else {
-                // The sentinel. The C loop stops here too, having never
-                // compared against it.
-                break;
-            };
-            if curl_rs_lib::strequal(Some(candidate), Some(wanted)) {
-                return unsafe { base().add(index) };
-            }
-        }
-        core::ptr::null()
+
+        c_row(options::by_name(&ENGINE_VIEW, wanted))
     })
 }
 
@@ -242,27 +404,14 @@ pub unsafe extern "C" fn curl_easy_option_by_name(
 /// - `id == 0` yields NULL without a search, because the C guards the whole
 ///   lookup with `if(name || id)` and a NULL name with a zero id fails it. No
 ///   row carries id 0 -- option numbering starts at 1 -- so the guard and the
-///   search agree, but it is reproduced explicitly rather than left implicit.
+///   search agree. The engine reproduces it explicitly, in
+///   [`by_id`](curl_rs_lib::easy::options::by_id), rather than leaving it to
+///   coincide; this side does not restate it.
 ///
 /// Any id with no matching non-alias row yields NULL.
 #[no_mangle]
 pub extern "C" fn curl_easy_option_by_id(id: c_int) -> *const curl_easyoption {
-    guard_const_ptr(|| {
-        if id == 0 {
-            return core::ptr::null();
-        }
-        for (index, row) in EASY_OPTIONS.iter().enumerate() {
-            if row.name.is_none() {
-                break;
-            }
-            if row.id as c_int == id && !row.is_alias() {
-                // SAFETY: `index` is a valid index of `EASY_OPTIONS`, whose
-                // length equals `ROWS`, so this is inside `TABLE`.
-                return unsafe { base().add(index) };
-            }
-        }
-        core::ptr::null()
-    })
+    guard_const_ptr(|| c_row(options::by_id(&ENGINE_VIEW, OptionId(id))))
 }
 
 /// Walks the option table.
@@ -284,22 +433,20 @@ pub extern "C" fn curl_easy_option_next(
     prev: *const curl_easyoption,
 ) -> *const curl_easyoption {
     guard_const_ptr(|| {
-        if prev.is_null() {
-            return base();
-        }
-        let Some(index) = index_of(prev) else {
-            return core::ptr::null();
+        // The one decision that is genuinely this side's: turning the foreign
+        // pointer into a row of the table, or refusing it. Everything after it
+        // -- the sentinel test, where the walk stops, which row comes next --
+        // is the engine's.
+        let here = if prev.is_null() {
+            None
+        } else {
+            let Some(index) = index_of(prev) else {
+                return core::ptr::null();
+            };
+            Some(&ENGINE_VIEW[index])
         };
-        if EASY_OPTIONS[index].name.is_none() {
-            // `prev` is the sentinel; the C's `prev->name` test fails.
-            return core::ptr::null();
-        }
-        let next = index + 1;
-        if next >= ROWS || EASY_OPTIONS[next].name.is_none() {
-            return core::ptr::null();
-        }
-        // SAFETY: `next` is below `ROWS`, so this is inside `TABLE`.
-        unsafe { base().add(next) }
+
+        c_row(options::next(&ENGINE_VIEW, here))
     })
 }
 
@@ -575,6 +722,119 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The engine projection must mirror the authority row for row too.
+    ///
+    /// The C projection has the same assertion above. Both are needed and for
+    /// the same reason: the exports look a row up in `ENGINE_VIEW` and hand back
+    /// the address of the row at that index in `TABLE`, so the two projections
+    /// agreeing with the authority is what makes that index mean the same thing
+    /// on both sides. A single reordered row would make every answer point at
+    /// its neighbour.
+    #[test]
+    fn the_engine_projection_mirrors_the_authority_row_for_row() {
+        assert_eq!(ENGINE_VIEW.len(), EASY_OPTIONS.len());
+        for (index, authority) in EASY_OPTIONS.iter().enumerate() {
+            let projected = &ENGINE_VIEW[index];
+            assert_eq!(
+                projected.id,
+                OptionId(authority.id as c_int),
+                "row {index} id"
+            );
+            assert_eq!(
+                projected.value_type.as_i32(),
+                authority.value_type as c_int,
+                "row {index} type"
+            );
+            assert_eq!(
+                projected.flags,
+                OptionFlags(authority.flags),
+                "row {index} flags"
+            );
+            match authority.name {
+                None => assert!(
+                    projected.is_sentinel(),
+                    "row {index} should be the sentinel"
+                ),
+                Some(bytes) => assert_eq!(
+                    projected.name.map(CStr::to_bytes_with_nul),
+                    Some(bytes),
+                    "row {index} name must be the authority's own literal"
+                ),
+            }
+        }
+    }
+
+    /// The two projections agree about every row, index for index.
+    ///
+    /// Stated directly rather than left to follow from the two assertions above,
+    /// because it is the property [`c_row`] relies on: an index found in one
+    /// array is used to address the other.
+    #[test]
+    fn the_two_projections_agree_index_for_index() {
+        assert_eq!(TABLE.0.len(), ENGINE_VIEW.len());
+        for (index, engine) in ENGINE_VIEW.iter().enumerate() {
+            let c = &TABLE.0[index];
+            assert_eq!(c.id, engine.id.0, "row {index} id");
+            assert_eq!(
+                c.r#type,
+                engine.value_type.as_i32(),
+                "row {index} type"
+            );
+            assert_eq!(c.flags, engine.flags.0, "row {index} flags");
+            assert_eq!(
+                c.name.is_null(),
+                engine.is_sentinel(),
+                "row {index} sentinel-ness"
+            );
+        }
+    }
+
+    /// The engine's three entry points agree about every row of this table.
+    ///
+    /// `first_inconsistent_row`'s own documentation says the crate that owns the
+    /// table has to be the one to run it, because the acyclicity rule keeps the
+    /// table out of reach from the engine's tests. This is that call, and it is
+    /// the anti-duplication check in the literal sense: it holds only if
+    /// `by_name`, `by_id` and `next` are consistent over these exact rows, which
+    /// is a property a second, drifting table would lose.
+    ///
+    /// The check is stronger than "each row is findable". For a preferred row it
+    /// requires `by_id` to return *that very row*, compared by address, which
+    /// holds only when no two preferred rows share an identifier -- and it
+    /// requires every alias row's identifier to resolve to a non-alias row.
+    #[test]
+    fn the_engine_finds_every_row_of_this_table_consistently() {
+        let inconsistent = options::first_inconsistent_row(&ENGINE_VIEW);
+
+        assert!(
+            inconsistent.is_none(),
+            "the engine's entry points disagree about {:?}",
+            inconsistent.and_then(|row| row.name_str())
+        );
+    }
+
+    /// The metadata table and the option enumeration are in step.
+    ///
+    /// `lib/easyoptions.c`'s `Curl_easyopts_check()` is
+    /// `(CURLOPT_LASTENTRY % 10000) != (328 + 1)`; the engine owns that
+    /// arithmetic as `easyopts_in_sync`, and this crate owns the identifier it
+    /// is asked about. C evaluates it per lookup in a debug build; running it
+    /// once, here, over the identifier this table's sentinel carries is the same
+    /// guarantee without the per-call cost.
+    #[test]
+    fn the_table_is_in_step_with_the_option_enumeration() {
+        assert!(options::easyopts_in_sync(LASTENTRY));
+
+        // Discriminating rather than vacuous: a different identifier fails.
+        assert!(!options::easyopts_in_sync(OptionId(LASTENTRY.0 + 1)));
+
+        // And the sentinel really is the row that carries it.
+        let sentinel =
+            ENGINE_VIEW.last().expect("the table has a terminating row");
+        assert!(sentinel.is_sentinel());
+        assert_eq!(sentinel.id, LASTENTRY);
     }
 
     /// No slot may keep its seed value. A skipped slot would look like a

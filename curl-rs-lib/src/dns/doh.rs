@@ -135,6 +135,7 @@ use crate::dns::{
 use crate::error::{CURLcode, CodeResult};
 use crate::trace::{failf, infof, trc_feat, TraceFeature, Tracer};
 use crate::util::dynbuf::{DynBuf, DYN_DOH_CNAME, DYN_DOH_RESPONSE};
+use crate::util::fallible;
 use crate::util::redact::Redacted;
 use crate::util::timediff::{mstotv, TimeDiff};
 use crate::util::timeval::Clock;
@@ -942,19 +943,33 @@ impl DohEntry {
     /// *"silently ignore RRs over the limit"* and which returns `DOH_OK` in
     /// that case -- an over-limit record is success, not an error.
     ///
-    /// C's remaining failure mode, `if(!h->val) return DOH_OUT_OF_MEM;` after a
-    /// `curlx_memdup` of bytes already resident, has **no counterpart**: a
-    /// duplication has no stable fallible spelling and Rust aborts on allocation
-    /// failure rather than reporting it. The return type is therefore `()`
-    /// rather than a `Result` that could only ever be `Ok`.
-    fn store_https(&mut self, rdata: &[u8]) {
+    /// # Errors
+    ///
+    /// [`DohCode::OutOfMem`], which is C's `if(!h->val) return DOH_OUT_OF_MEM;`
+    /// after its `curlx_memdup` (`lib/doh.c:596-598`).
+    ///
+    /// The duplicated extent is an RDATA field from a **DNS response**, so its
+    /// length is chosen by whatever answered the query -- up to 65,535 bytes per
+    /// record, and up to [`DOH_MAX_HTTPS`] records. That is an externally sized
+    /// allocation by any reading, which is why it is routed through
+    /// [`crate::util::fallible`] rather than allowed to abort: a resolver
+    /// answering a hostile or merely large HTTPS record must not be able to kill
+    /// an embedding process that is prepared to handle an out-of-memory return.
+    ///
+    /// The over-limit case is still success, and still silent, exactly as the
+    /// C's comment says: *"silently ignore RRs over the limit"*.
+    fn store_https(&mut self, rdata: &[u8]) -> Result<(), DohCode> {
         // `if(d->numhttps_rrs < DOH_MAX_HTTPS)`
         if self.https_rrs.len() >= DOH_MAX_HTTPS {
-            return;
+            return Ok(());
         }
-        self.https_rrs.push(DohHttpsRr {
-            val: rdata.to_vec(),
-        });
+        // The copy first, then the push: nothing is stored unless both
+        // allocations succeeded, which is the shape the C gets from checking
+        // `h->val` before incrementing `numhttps_rrs`.
+        let val =
+            fallible::vec_from_slice(rdata).map_err(|_| DohCode::OutOfMem)?;
+        fallible::push(&mut self.https_rrs, DohHttpsRr { val })
+            .map_err(|_| DohCode::OutOfMem)
     }
 
     /// Decodes a `CNAME` record's name, **following compression pointers**.
@@ -1041,7 +1056,7 @@ impl DohEntry {
     /// # Errors
     ///
     /// [`DohCode::DnsRdataLen`] for a mis-sized address, or whatever
-    /// [`Self::store_cname`] reports.
+    /// [`Self::store_https`] or [`Self::store_cname`] reports.
     fn rdata(
         &mut self,
         doh: &[u8],
@@ -1062,7 +1077,7 @@ impl DohEntry {
                 }
                 self.store_aaaa(rdata);
             }
-            DnsType::Https => self.store_https(rdata),
+            DnsType::Https => self.store_https(rdata)?,
             DnsType::Cname => self.store_cname(doh, rdata_at)?,
             // `case CURL_DNS_TYPE_DNAME: /* just skip */ break;` and
             // `default: /* unsupported type, just skip it */ break;`
@@ -1793,7 +1808,12 @@ pub(crate) fn resp_decode_httpsrr(
     }
 
     // `lhrr = curlx_calloc(1, sizeof(struct Curl_https_rrinfo));` and the
-    // `if(!lhrr) return CURLE_OUT_OF_MEMORY;` that has no counterpart.
+    // `if(!lhrr) return CURLE_OUT_OF_MEMORY;` that guards it. The guard has no
+    // counterpart because the ALLOCATION has none: the record is built as a
+    // value on the stack and returned by move, so there is nothing for an
+    // allocator to refuse. This is a genuinely absent failure mode, not an
+    // unhandled one -- contrast `Self::store_https`, whose copy IS externally
+    // sized and does report a refusal.
     let mut record = HttpsRrInfo {
         priority,
         target: Some(target),

@@ -125,6 +125,7 @@ use memchr::memchr;
 
 use crate::error::{CURLHcode, CURLcode, CodeResult, HeaderResult};
 use crate::util::dynbuf::{DynBuf, DYN_HTTP_REQUEST};
+use crate::util::fallible;
 use crate::util::redact::{HeaderValue, Lossy};
 use crate::util::strcase::{casecompare, ncasecompare, raw_tolower};
 use crate::util::strparse::is_blank;
@@ -660,22 +661,37 @@ impl HeaderSet {
         // NAME is folded if and only if `DYNHDS_OPT_LOWERCASE` is set. The
         // fold is `Curl_strntolower`, which is ASCII-only -- every byte from
         // 0x80 upwards maps to itself -- and the value is never folded.
-        let mut stored_name = name.to_vec();
+        //
+        // Both copies are externally sized: a header name and value from the
+        // network, bounded only by `max_strs_size` above, which the caller
+        // chooses. `entry_new`'s own answer to a failed `curlx_malloc` is
+        // `CURLE_OUT_OF_MEMORY` (`lib/dynhds.c:38-40`), and the same code is
+        // reported here rather than aborting the process. Ordered so that
+        // nothing is stored until every allocation has succeeded, which is what
+        // makes a refusal leave this set exactly as it was.
+        let mut stored_name =
+            fallible::vec_from_slice(name).map_err(fallible::oom)?;
         if self.lowercase {
             for byte in &mut stored_name {
                 *byte = raw_tolower(*byte);
             }
         }
+        let stored_value =
+            fallible::vec_from_slice(value).map_err(fallible::oom)?;
 
         // The C grows its pointer array 16 at a time, clamped to
-        // `max_entries` (`lib/dynhds.c:148-165`). `Vec::push` owns growth
-        // here; the policy is recorded only so that a reader comparing the
-        // two files does not go looking for it. Growth is not observable.
+        // `max_entries` (`lib/dynhds.c:148-165`). Growth is `fallible::push`'s
+        // business here; the policy is recorded only so that a reader comparing
+        // the two files does not go looking for it. Growth is not observable.
         // Order is, so nothing that could reorder is introduced.
-        self.entries.push(HeaderEntry {
-            name: stored_name,
-            value: value.to_vec(),
-        });
+        fallible::push(
+            &mut self.entries,
+            HeaderEntry {
+                name: stored_name,
+                value: stored_value,
+            },
+        )
+        .map_err(fallible::oom)?;
         self.strs_len = total;
         Ok(())
     }
@@ -1118,15 +1134,20 @@ impl HeaderStore {
         }
 
         // `lib/headers.c:265-275`. On failure the C frees the half-built
-        // entry and stores nothing; returning early is that, without the
-        // allocation to undo.
+        // entry and stores nothing; returning early is that, and the generation
+        // counter is deliberately NOT bumped on a failed push, because nothing
+        // was added for an iterator to have been invalidated by.
         let (name, value) = namevalue(span, origin)?;
-        self.headers.push(StoredHeader {
-            name,
-            value,
-            request,
-            origin,
-        });
+        fallible::push(
+            &mut self.headers,
+            StoredHeader {
+                name,
+                value,
+                request,
+                origin,
+            },
+        )
+        .map_err(fallible::oom)?;
         self.bump_generation();
         Ok(())
     }
@@ -1350,7 +1371,16 @@ fn namevalue(header: &[u8], origin: u32) -> CodeResult<(Vec<u8>, Vec<u8>)> {
         end -= 1;
     }
 
-    Ok((header[..separator].to_vec(), header[start..end].to_vec()))
+    // Both copies are the size of a header a server sent, so both are routed
+    // through `crate::util::fallible`. The C reaches them through
+    // `Curl_dyn_addn` into a `dynbuf` whose refusal is
+    // `CURLE_OUT_OF_MEMORY`; `CURLcode::OutOfMemory` is the same answer, and
+    // the `?` ordering means a refusal on the second leaves nothing stored.
+    let name = fallible::vec_from_slice(&header[..separator])
+        .map_err(fallible::oom)?;
+    let value =
+        fallible::vec_from_slice(&header[start..end]).map_err(fallible::oom)?;
+    Ok((name, value))
 }
 
 // The HTTP/2 PUSH_PROMISE field set -- `lib/http2.c`.
@@ -1480,11 +1510,23 @@ impl PushHeaders {
             return Err(CURLcode::TooLarge);
         }
 
-        let mut entry = Vec::new();
+        // `name`, a colon and `value`, in one allocation sized from the two
+        // network-supplied extents. The C's `curlx_maprintf` of the same three
+        // pieces answers `NGHTTP2_ERR_CALLBACK_FAILURE` when it cannot
+        // allocate; `CURLcode::OutOfMemory` is the honest `CURLcode` for it,
+        // and it is a DIFFERENT condition from the count ceiling above, which
+        // is why the two do not share a code.
+        let needed = name
+            .len()
+            .checked_add(value.len())
+            .and_then(|sum| sum.checked_add(1))
+            .ok_or(CURLcode::OutOfMemory)?;
+        let mut entry =
+            fallible::vec_with_capacity(needed).map_err(fallible::oom)?;
         entry.extend_from_slice(name);
         entry.extend_from_slice(b":");
         entry.extend_from_slice(value);
-        self.entries.push(entry);
+        fallible::push(&mut self.entries, entry).map_err(fallible::oom)?;
         Ok(())
     }
 

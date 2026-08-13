@@ -628,9 +628,63 @@ pub(crate) mod fallible {
         vec.try_reserve(additional)
     }
 
+    /// `slice.to_vec()`, reporting failure.
+    ///
+    /// The successor of the C's `curlx_memdup`, `Curl_bufref_memdup0` and bare
+    /// `strdup` of a caller- or server-supplied buffer: the length is the
+    /// input's, so the allocation is externally sized however small the
+    /// particular input happens to be.
+    ///
+    /// Reserve-then-copy rather than `to_vec`, and the order is the whole point:
+    /// the reservation is the only step that can fail, and it happens before
+    /// anything is written, so a refusal leaves no half-built value behind. That
+    /// is the same transactional shape the C gets for free by checking a null
+    /// return before assigning it.
+    pub(crate) fn vec_from_slice<T: Clone>(
+        source: &[T],
+    ) -> Result<Vec<T>, TryReserveError> {
+        let mut vec = vec_with_capacity(source.len())?;
+        vec.extend_from_slice(source);
+        Ok(vec)
+    }
+
+    /// `Vec::extend_from_slice`, reporting failure.
+    ///
+    /// The growth-doubling `try_reserve` rather than the exact form, because an
+    /// append into a buffer that is being built up in pieces -- a header line, a
+    /// percent-encoded URL -- would otherwise reallocate on every piece.
+    ///
+    /// On refusal the destination is unchanged: `try_reserve` is checked first
+    /// and `extend_from_slice` cannot fail once the room exists.
+    pub(crate) fn extend_from_slice<T: Clone>(
+        vec: &mut Vec<T>,
+        source: &[T],
+    ) -> Result<(), TryReserveError> {
+        vec.try_reserve(source.len())?;
+        vec.extend_from_slice(source);
+        Ok(())
+    }
+
+    /// `str::to_owned`, reporting failure.
+    ///
+    /// The same shape as [`vec_from_slice`], for the sites whose C original
+    /// duplicates a `char *` that is genuinely text on this side of the
+    /// boundary.
+    #[allow(dead_code)] // used by some duplication sites and not others
+    pub(crate) fn string_from_str(
+        source: &str,
+    ) -> Result<String, TryReserveError> {
+        let mut string = string_with_capacity(source.len())?;
+        string.push_str(source);
+        Ok(string)
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::{oom, push, string_with_capacity, vec_with_capacity};
+        use super::{
+            extend_from_slice, oom, push, string_from_str,
+            string_with_capacity, vec_from_slice, vec_with_capacity,
+        };
         use crate::error::CURLcode;
 
         /// One past the largest expressible allocation, for `u8`.
@@ -711,6 +765,39 @@ pub(crate) mod fallible {
                 string_with_capacity(4).expect("four bytes are servable");
             text.push_str("ok");
             assert_eq!(text, "ok", "within the reservation, so no growth");
+        }
+
+        /// The three copy helpers duplicate exactly, and refuse without
+        /// disturbing their destination.
+        #[test]
+        fn the_copy_helpers_are_exact_and_transactional() {
+            assert_eq!(
+                vec_from_slice(b"abc").expect("three bytes are servable"),
+                b"abc"
+            );
+            assert_eq!(
+                vec_from_slice::<u8>(&[]).expect("an empty copy is servable"),
+                Vec::<u8>::new(),
+                "an empty source is a legal input, not a special case"
+            );
+            assert_eq!(
+                string_from_str("text").expect("servable"),
+                String::from("text")
+            );
+
+            // Appended, not replaced.
+            let mut buffer = Vec::from(&b"head"[..]);
+            extend_from_slice(&mut buffer, b"tail").expect("servable");
+            assert_eq!(buffer, b"headtail" as &[u8]);
+            extend_from_slice(&mut buffer, b"").expect("empty is servable");
+            assert_eq!(buffer, b"headtail" as &[u8], "and adds nothing");
+
+            // A refusal leaves the destination byte for byte as it was, which
+            // is the property the C gets by checking a null return before
+            // assigning it.
+            let mut vec: Vec<u64> = Vec::from(&[1_u64, 2][..]);
+            assert!(super::reserve(&mut vec, usize::MAX / 4).is_err());
+            assert_eq!(vec, vec![1_u64, 2], "the contents survive a refusal");
         }
     }
 }
@@ -904,13 +991,28 @@ pub(crate) fn read16_be(buf: &[u8]) -> u16 {
 /// ```
 #[allow(dead_code)]
 pub(crate) fn basename(path: &str) -> &str {
-    // `rfind` over a `char` pattern is `strrchr`. Both needles are
-    // single-byte ASCII, so the byte offset it returns is a character
-    // boundary and `offset + 1` is the boundary just past it -- which is why
-    // the slice below can never split a multi-byte code point, whatever the
-    // encoding of the surrounding text.
-    let last_slash = path.rfind('/');
-    let last_backslash = path.rfind('\\');
+    // Delegated so that one implementation answers for both spellings and no
+    // divergence is possible. `basename_bytes` cuts on a single-byte ASCII
+    // separator, so its offset is always a character boundary in a `&str` --
+    // which is why re-viewing its answer as text below cannot split a
+    // multi-byte code point and cannot fail.
+    let base = basename_bytes(path.as_bytes());
+    // The returned slice is a suffix of `path`, so its length locates it.
+    &path[path.len() - base.len()..]
+}
+
+/// Returns the final component of `path`, after the rightmost `/` or `\`.
+///
+/// The same rule as [`basename`] on the bytes the C actually holds. The C's
+/// `curlx_basename` takes a `char *` and walks it with `strrchr`, so it has
+/// never required its input to be text; a MIME part's filename or a
+/// `CURLFORM_FILE` path may be any byte sequence the platform accepts, and
+/// this is the form that can express one.
+#[allow(dead_code)]
+pub(crate) fn basename_bytes(path: &[u8]) -> &[u8] {
+    // `iter().rposition` over a single byte is `strrchr`.
+    let last_slash = path.iter().rposition(|&byte| byte == b'/');
+    let last_backslash = path.iter().rposition(|&byte| byte == b'\\');
 
     // The C's four-branch chain, branch for branch.
     let cut = match (last_slash, last_backslash) {
@@ -926,6 +1028,23 @@ pub(crate) fn basename(path: &str) -> &str {
         // this. It is what makes `basename("")` yield `""` rather than `"."`.
         None => path,
     }
+}
+
+/// A path as the bytes the operating system holds, losslessly.
+///
+/// `Path::to_str` answers `None` for any path Unicode cannot spell, and
+/// `to_string_lossy` changes its bytes; both are wrong for a value that is
+/// going to be compared against an ASCII table, put on the wire, or handed
+/// back to a system call. On the four mandated targets a platform string *is*
+/// a byte string, and [`std::os::unix::ffi::OsStrExt`] is the lossless view of
+/// it -- not a conversion. `OsStr::as_encoded_bytes` would say the same thing
+/// portably but is not available at the declared minimum Rust version, which
+/// is why the Unix extension is named here and why this crate is Unix-only in
+/// the same way `crate::util::fopen` already is.
+#[allow(dead_code)]
+pub(crate) fn path_bytes(path: &std::path::Path) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes()
 }
 
 // ABSORBED SHIM 3 of 6 -- bounded string copy.  `lib/curlx/strcopy.c:24-50`

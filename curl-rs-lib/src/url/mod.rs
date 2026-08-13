@@ -94,6 +94,7 @@ use core::fmt;
 use core::ops::{BitOr, BitOrAssign};
 
 use crate::error::{CURLUcode, CURLcode, UrlResult};
+use crate::util::fallible;
 use crate::util::inet;
 use crate::util::memrchr::memrchr;
 use crate::util::redact::RedactedOpt;
@@ -289,19 +290,32 @@ impl Buf {
     ///
     /// # Errors
     ///
-    /// [`CURLcode::TooLarge`] when the append would cross the ceiling. The
-    /// C's other failure, a refused allocation, has no expression here:
-    /// `Vec` aborts rather than reporting it.
+    /// [`CURLcode::TooLarge`] when the append would cross the ceiling, and
+    /// [`CURLcode::OutOfMemory`] when the allocator declines the room.
+    ///
+    /// The second is the C's own second failure -- `curlx_dyn_addn` returns
+    /// `CURLE_OUT_OF_MEMORY` when its `realloc` fails (`lib/curlx/dynbuf.c:99`)
+    /// -- and it is reachable here for the same reason it is reachable there:
+    /// every extent this buffer accumulates comes from a URL the caller
+    /// supplied, and `curl_url_set` sizes its ceiling at `nalloc * 3 + 1`, so a
+    /// large-but-legal input asks for three times its own length. Routing it
+    /// through [`crate::util::fallible`] is what keeps an embedding application
+    /// that handles `CURLUE_OUT_OF_MEMORY` from being killed by an allocator
+    /// abort instead of being told.
+    ///
+    /// The buffer is left as it was on either failure path, save that crossing
+    /// the ceiling frees it -- which is the C's own behaviour, described above.
     fn addn(&mut self, mem: &[u8]) -> Result<(), CURLcode> {
         let fit = mem.len().saturating_add(self.len()).saturating_add(1);
         if fit > self.toobig {
             self.bytes = None;
             return Err(CURLcode::TooLarge);
         }
-        self.bytes
-            .get_or_insert_with(Vec::new)
-            .extend_from_slice(mem);
-        Ok(())
+        fallible::extend_from_slice(
+            self.bytes.get_or_insert_with(Vec::new),
+            mem,
+        )
+        .map_err(fallible::oom)
     }
 
     /// The accumulated bytes, empty when there are none.

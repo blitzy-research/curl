@@ -572,6 +572,16 @@ pub use crate::protocols::scheme_registry;
 //     that makes the second of those locale-dependent at all. Consumed by
 //     `curl-rs/src/util.rs`, `curl-rs/src/output/writeout.rs` and
 //     `curl-rs/src/operate/mod.rs` respectively.
+//   * `scrub_argument` -- `cleanarg` (`src/tool_getparam.c:625-637`), which
+//     overwrites a credential in the process's own argument vector with `*` so
+//     that `ps` and `/proc/<pid>/cmdline` stop showing it. Consumed by
+//     `curl-rs/src/cli/args.rs`, once per `ARG_CLEAR` option. It is here rather
+//     than in the tool for the same structural reason as the rest of this list
+//     and one of its own: the loader's argument vector is unreachable from safe
+//     Rust -- `std::env::args_os` copies -- so the capability exists only
+//     inside this crate's one `unsafe` island, and `HAVE_WRITABLE_ARGV` is
+//     defined on all four mandated targets, so the alternative was a silent
+//     security regression.
 //
 // WHAT THIS DOES NOT DO, because the distinction is the whole reason the list
 // is a list and not a `pub mod`:
@@ -582,7 +592,7 @@ pub use crate::protocols::scheme_registry;
 //     `pub(crate)`. A consumer gets the capability, never the mechanism.
 //   * No new module and no new file is introduced to carry this.
 pub use crate::ffi::{
-    disable_echo, local_utc_offset_secs, set_file_xattr,
+    disable_echo, local_utc_offset_secs, scrub_argument, set_file_xattr,
     set_locale_from_environment, strftime_gmt, terminal_columns, EchoGuard,
 };
 
@@ -598,13 +608,49 @@ pub use crate::ffi::{
 // this is how `curl-rs` reaches it. See `os_error_message` for the measurement.
 pub use crate::util::os_error_message;
 
+// THE BASE64 CODEC, and the second reason a name leaves `mod util`.
+//
+// `getdate`, the two comparators and `TraceConfig` above are re-exported
+// because they back exported C symbols. These two are not: `curlx_base64_encode`
+// and `curlx_base64_decode` (`lib/curlx/base64.c:241-246`, `:61-163`) are
+// `curlx` internals and appear nowhere in `lib/libcurl.def`. They are here for
+// the other reason, the one the platform facade below is also here for --
+// `curl-rs` cannot reach them any other way, and reproducing them there would
+// be a second implementation of a codec whose exact behaviour is contract.
+//
+// The consumer is `curl-rs/src/cli/vars.rs`, which needs both for the
+// `{{name:b64}}` and `{{name:64dec}}` variable functions of `src/var.c:141-181`.
+// Those two functions do not merely encode and decode: the C's `:64dec` arm
+// puts the literal `[64dec-fail]` in the output for input the decoder REFUSES
+// and carries on, so the tool has to be able to tell "this is not valid
+// base64" from "this could not be attempted". Only a real codec can make that
+// distinction, and only this one makes it the way curl does -- it requires
+// canonical padding, which RFC 4648 does not, and it accepts non-canonical
+// trailing bits, which the `base64` crate does not. A tool-side reimplementation
+// would diverge on both, silently, on real input.
+//
+// Deliberately TWO names, not the module, by the same rule as every entry
+// above. `pub use crate::util::base64;` would additionally expose
+// `CURL_MAX_BASE64_INPUT` and `url_encode` -- the unpadded URL-alphabet variant
+// that `protocols/ws` uses for `Sec-WebSocket-Key` -- neither of which has a
+// consumer outside this crate. `base64` itself stays `pub(crate)`.
+//
+// Renamed on the way out, because at the crate root `encode` and `decode` name
+// no particular codec. Inside `mod util::base64` the module qualifies them; here
+// nothing would.
+pub use crate::util::base64::{
+    decode as base64_decode, encode as base64_encode,
+};
+
 // OPERATING-SYSTEM FACADE -- the narrowest safe bridge to `src/ffi/sys.rs`.
 //
-//  * RE-EXPORTED AS THEY STAND -- the seven names in the `pub use crate::ffi`
+//  * RE-EXPORTED AS THEY STAND -- the eight names in the `pub use crate::ffi`
 //    above: `disable_echo` and `EchoGuard` (F15, terminal echo while a password
-//    is typed), `terminal_columns`, `set_file_xattr` (F17), and
+//    is typed), `terminal_columns`, `set_file_xattr` (F17),
 //    `local_utc_offset_secs`, `strftime_gmt` and `set_locale_from_environment`
-//    (F16, local and locale-dependent time). `ffi/mod.rs` group E marks exactly
+//    (F16, local and locale-dependent time), and `scrub_argument` (`cleanarg`,
+//    the credential wipe over the process argument vector).
+//    `ffi/mod.rs` group E marks exactly
 //    those `pub`, so no wrapper is needed: each is already a total, safe
 //    function -- or, for the guard, a type with private fields -- over
 //    standard-library types, and a wrapper would add a hop and nothing else.

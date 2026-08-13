@@ -56,6 +56,7 @@ use std::path::Path;
 
 use crate::crypto::rand::{Rng, SystemRng};
 use crate::error::{CURLcode, CodeResult};
+use crate::util::fallible;
 use crate::util::redact::Redacted;
 use crate::util::slist::SList;
 use crate::util::CurlOffT;
@@ -316,7 +317,7 @@ pub enum FormOption<'a> {
     ContentLen(CurlOffT),
     /// `CURLFORM_FILECONTENT`: send the named file's **contents** as an
     /// ordinary value.
-    FileContent(Option<&'a str>),
+    FileContent(Option<&'a [u8]>),
     /// `CURLFORM_FILE`: upload the named file.
     ///
     /// `:435-468`. Three outcomes, and the third is how multi-file parts
@@ -328,7 +329,7 @@ pub enum FormOption<'a> {
     /// * a value already present **with** that flag -- spawn a new node on
     ///   the `more` chain and make it current, which is what turns
     ///   `-F 'name=@a.txt,@b.txt'` into a nested `multipart/mixed`.
-    File(Option<&'a str>),
+    File(Option<&'a [u8]>),
     /// `CURLFORM_BUFFERPTR`: upload from a caller-owned buffer.
     BufferPtr(Option<&'a [u8]>),
     /// `CURLFORM_BUFFERLENGTH`: the buffer's length.
@@ -347,16 +348,16 @@ pub enum FormOption<'a> {
     /// [`FormCode::Null`] here -- the answer every sibling option gives --
     /// and it is reported **after** the "already set" test, so the ordering
     /// the C does define is unchanged.
-    Buffer(Option<&'a str>),
+    Buffer(Option<&'a [u8]>),
     /// `CURLFORM_CONTENTTYPE`: the part's `Content-Type`.
-    ContentType(Option<&'a str>),
+    ContentType(Option<&'a [u8]>),
     /// `CURLFORM_CONTENTHEADER`: extra headers for this part.
     ContentHeader(Option<SList>),
     /// `CURLFORM_FILENAME`: the filename to show for a file upload.
     ///
     /// `:554-561`. Shares its arm, and its `showfilename` field, with
     /// [`Self::Buffer`]; see that variant for the `None` case.
-    FileName(Option<&'a str>),
+    FileName(Option<&'a [u8]>),
     /// `CURLFORM_STREAM`: read the part's content through a callback.
     Stream(Option<Box<dyn PartReader>>),
     /// Any option outside the vocabulary: `CURL_FORMADD_UNKNOWN_OPTION`.
@@ -404,21 +405,6 @@ impl fmt::Debug for FormOption<'_> {
             }
         }
 
-        /// A path or a content type: a length, for the same reason. A filename
-        /// discloses a private path and a content type can carry a boundary.
-        fn text(
-            f: &mut fmt::Formatter<'_>,
-            name: &str,
-            v: Option<&str>,
-        ) -> fmt::Result {
-            match v {
-                Some(text) => {
-                    write!(f, "{name}({:?})", Redacted(text.as_bytes()))
-                }
-                None => write!(f, "{name}(None)"),
-            }
-        }
-
         match self {
             Self::CopyName(v) => bytes(f, "CopyName", *v),
             Self::PtrName(v) => bytes(f, "PtrName", *v),
@@ -427,12 +413,12 @@ impl fmt::Debug for FormOption<'_> {
             Self::PtrContents(v) => bytes(f, "PtrContents", *v),
             Self::ContentsLength(n) => write!(f, "ContentsLength({n})"),
             Self::ContentLen(n) => write!(f, "ContentLen({n})"),
-            Self::FileContent(v) => text(f, "FileContent", *v),
-            Self::File(v) => text(f, "File", *v),
+            Self::FileContent(v) => bytes(f, "FileContent", *v),
+            Self::File(v) => bytes(f, "File", *v),
             Self::BufferPtr(v) => bytes(f, "BufferPtr", *v),
             Self::BufferLength(n) => write!(f, "BufferLength({n})"),
-            Self::Buffer(v) => text(f, "Buffer", *v),
-            Self::ContentType(v) => text(f, "ContentType", *v),
+            Self::Buffer(v) => bytes(f, "Buffer", *v),
+            Self::ContentType(v) => bytes(f, "ContentType", *v),
             Self::ContentHeader(v) => {
                 write!(
                     f,
@@ -440,7 +426,7 @@ impl fmt::Debug for FormOption<'_> {
                     v.as_ref().map_or(0, SList::len)
                 )
             }
-            Self::FileName(v) => text(f, "FileName", *v),
+            Self::FileName(v) => bytes(f, "FileName", *v),
             Self::Stream(v) => {
                 write!(
                     f,
@@ -519,9 +505,14 @@ pub struct FormFlags {
 /// [`Cow::Borrowed`] forever, and that is the whole of the `PTRNAME` flag's
 /// deallocation duty.
 ///
-/// `contenttype` and `showfilename` are `String` rather than `Cow` because
-/// the C copies both eagerly (`:535`, `:559`), so no deferral exists to
-/// model, and `curl_formfree` frees both unconditionally (`:684-685`).
+/// `contenttype` and `showfilename` are owned rather than [`Cow`] because the
+/// C copies both eagerly (`:535`, `:559`), so no deferral exists to model, and
+/// `curl_formfree` frees both unconditionally (`:684-685`). They are
+/// `Vec<u8>` rather than `String` for the same reason `name` and `value` are
+/// bytes: both are `char *` in the C, both are emitted on the wire verbatim --
+/// `showfilename` inside a `Content-Disposition` and `contenttype` as a
+/// `Content-Type` -- and a `-F` argument may name a file whose path the local
+/// filesystem accepts and Unicode cannot spell.
 #[derive(Default)]
 struct FormInfo<'a> {
     /// `struct bufref name`.
@@ -529,10 +520,10 @@ struct FormInfo<'a> {
     /// `struct bufref value`.
     value: Option<Cow<'a, [u8]>>,
     /// `struct bufref contenttype`.
-    contenttype: Option<String>,
+    contenttype: Option<Vec<u8>>,
     /// `struct bufref showfilename` -- "The filename to show. If not set, the
     /// actual filename will be used".
-    showfilename: Option<String>,
+    showfilename: Option<Vec<u8>>,
     /// `char *buffer` -- "pointer to existing buffer used for file upload".
     buffer: Option<&'a [u8]>,
     /// `char *userp` -- "pointer for the read callback", here the assembled
@@ -562,8 +553,11 @@ impl fmt::Debug for FormInfo<'_> {
         f.debug_struct("FormInfo")
             .field("name", &self.name.as_deref().map(Redacted))
             .field("value", &self.value.as_deref().map(Redacted))
-            .field("contenttype", &self.contenttype.as_deref().map(str::len))
-            .field("showfilename", &self.showfilename.as_deref().map(str::len))
+            .field("contenttype", &self.contenttype.as_deref().map(<[u8]>::len))
+            .field(
+                "showfilename",
+                &self.showfilename.as_deref().map(<[u8]>::len),
+            )
             .field("buffer", &self.buffer.map(Redacted))
             .field("has_reader", &self.reader.is_some())
             .field(
@@ -637,8 +631,9 @@ pub struct FormEntry<'a> {
     buffer: Option<&'a [u8]>,
     /// `long bufferlength` -- "length of buffer field".
     bufferlength: usize,
-    /// `char *contenttype` -- the part's `Content-Type`.
-    contenttype: Option<String>,
+    /// `char *contenttype` -- the part's `Content-Type`, as the caller's or
+    /// the table's bytes.
+    contenttype: Option<Vec<u8>>,
     /// `struct curl_slist *contentheader` -- "list of extra headers for this
     /// form".
     contentheader: Option<SList>,
@@ -648,8 +643,8 @@ pub struct FormEntry<'a> {
     /// `long flags` -- "as defined below".
     flags: FormFlags,
     /// `char *showfilename` -- "The filename to show. If not set, the actual
-    /// filename will be used".
-    showfilename: Option<String>,
+    /// filename will be used", as the caller's bytes.
+    showfilename: Option<Vec<u8>>,
     /// `void *userp` -- "custom pointer used for HTTPPOST_CALLBACK posts",
     /// here the assembled reader.
     reader: Option<Box<dyn PartReader>>,
@@ -690,14 +685,17 @@ impl fmt::Debug for FormEntry<'_> {
             .field("contentslength", &self.contentslength)
             .field("buffer", &self.buffer.map(Redacted))
             .field("bufferlength", &self.bufferlength)
-            .field("contenttype", &self.contenttype.as_deref().map(str::len))
+            .field("contenttype", &self.contenttype.as_deref().map(<[u8]>::len))
             .field(
                 "contentheader",
                 &self.contentheader.as_ref().map(SList::len),
             )
             .field("more", &self.more)
             .field("flags", &self.flags)
-            .field("showfilename", &self.showfilename.as_deref().map(str::len))
+            .field(
+                "showfilename",
+                &self.showfilename.as_deref().map(<[u8]>::len),
+            )
             .field("has_reader", &self.reader.is_some())
             .field("contentlen", &self.contentlen)
             .finish()
@@ -790,7 +788,7 @@ impl<'a> FormEntry<'a> {
     /// table, then from the previous part's type, then from
     /// `application/octet-stream`.
     #[must_use]
-    pub fn contenttype(&self) -> Option<&str> {
+    pub fn contenttype(&self) -> Option<&[u8]> {
         self.contenttype.as_deref()
     }
 
@@ -802,7 +800,7 @@ impl<'a> FormEntry<'a> {
 
     /// `char *showfilename`: the filename to advertise.
     #[must_use]
-    pub fn showfilename(&self) -> Option<&str> {
+    pub fn showfilename(&self) -> Option<&[u8]> {
         self.showfilename.as_deref()
     }
 
@@ -1081,7 +1079,7 @@ fn apply_option<'a>(
             if curr.flags.ptrcontents || curr.flags.readfile {
                 FormCode::OptionTwice
             } else if let Some(path) = path {
-                curr.value = Some(Cow::Owned(path.as_bytes().to_vec()));
+                curr.value = Some(Cow::Owned(path.to_vec()));
                 curr.flags.readfile = true;
                 FormCode::Ok
             } else {
@@ -1102,7 +1100,7 @@ fn apply_option<'a>(
                 let curr = chain.last_mut().expect(CHAIN_NEVER_EMPTY);
                 match path {
                     Some(path) => {
-                        curr.value = Some(Cow::Owned(path.as_bytes().to_vec()));
+                        curr.value = Some(Cow::Owned(path.to_vec()));
                         curr.flags.filename = true;
                         FormCode::Ok
                     }
@@ -1117,7 +1115,7 @@ fn apply_option<'a>(
                 // advances `curr`, because the tail is what `chain.last_mut`
                 // returns from here on.
                 let mut spawned = FormInfo::spawned();
-                spawned.value = Some(Cow::Owned(path.as_bytes().to_vec()));
+                spawned.value = Some(Cow::Owned(path.to_vec()));
                 chain.push(spawned);
                 FormCode::Ok
             } else {
@@ -1289,8 +1287,24 @@ fn store_value<'a>(
 fn form_add_check<'a>(
     chain: Vec<FormInfo<'a>>,
 ) -> Result<FormEntry<'a>, FormCode> {
-    let mut prevtype: Option<String> = None;
-    let mut nodes: Vec<FormEntry<'a>> = Vec::with_capacity(chain.len());
+    /// One field, copied, reporting a refused allocation as the C's own
+    /// `CURL_FORMADD_MEMORY`.
+    ///
+    /// `FormAddCheck` answers that code for every failed duplication in its
+    /// body -- `:255-258`, `:264-269`, `:270-275`, `:281-282` -- so the mapping
+    /// is stated once here rather than at each of the four sites.
+    fn dup(field: &[u8]) -> Result<Vec<u8>, FormCode> {
+        fallible::vec_from_slice(field).map_err(|_| FormCode::Memory)
+    }
+
+    let mut prevtype: Option<Vec<u8>> = None;
+    // The chain length is the caller's option count, so the reservation is
+    // externally sized. `FormAddCheck` has no matching allocation -- it walks a
+    // linked list the C already built -- so `CURL_FORMADD_MEMORY` is the code
+    // its own allocation failures use throughout, and the one used here.
+    let mut nodes: Vec<FormEntry<'a>> =
+        fallible::vec_with_capacity(chain.len())
+            .map_err(|_| FormCode::Memory)?;
 
     for (index, mut form) in chain.into_iter().enumerate() {
         // The C's `!post` is true only on the first iteration: from the
@@ -1322,25 +1336,33 @@ fn form_add_check<'a>(
             // HTTPPOST_BUFFER) ? &form->showfilename : &form->value);`
             // (`:248-249`). A buffer has no path of its own, so the shown
             // filename is the only thing with a suffix to look at.
-            let probe: Option<&str> = if form.flags.buffer {
+            // The C hands `Curl_mime_contenttype` a `char *` and lets it
+            // match one of ten ASCII suffixes. Both candidates reach it as
+            // the bytes they are, so a path the local filesystem accepts and
+            // Unicode cannot spell is matched exactly as the C matches it --
+            // where decoding first made every such path answer "no suffix".
+            let probe: Option<&[u8]> = if form.flags.buffer {
                 form.showfilename.as_deref()
             } else {
-                // The C hands `Curl_mime_contenttype` a `char *` and lets it
-                // match a suffix. A value that is not UTF-8 cannot match any
-                // of the ten suffixes in curl's table -- all of which are
-                // ASCII -- so treating it as absent gives the same answer the
-                // C gives without inventing a lossy conversion.
-                form.value
-                    .as_deref()
-                    .and_then(|value| std::str::from_utf8(value).ok())
+                form.value.as_deref()
             };
-            let resolved = contenttype(probe)
-                .map(str::to_owned)
-                // `if(!type) type = prevtype;` (`:251-252`).
-                .or_else(|| prevtype.clone())
+            // `Curl_bufref_set(&form->contenttype, type, strlen(type),
+            // NULL)` at `:255-258`, whose surrounding `FormAddCheck` reports
+            // `CURL_FORMADD_MEMORY` for a failed allocation. The three
+            // candidates are a table constant, the previous part's type, or the
+            // octet-stream default; the first is bounded and the second is a
+            // caller- or table-sized extent, so the copy is routed through
+            // `crate::util::fallible` like the rest.
+            let source: &[u8] = match contenttype(probe) {
+                Some(kind) => kind.as_bytes(),
+                // `if(!type) type = prevtype;` (`:251-252`), then
                 // `if(!type) type = FILE_CONTENTTYPE_DEFAULT;` (`:253-254`).
-                .unwrap_or_else(|| FILE_CONTENTTYPE_DEFAULT.to_owned());
-            form.contenttype = Some(resolved);
+                None => match prevtype.as_deref() {
+                    Some(previous) => previous,
+                    None => FILE_CONTENTTYPE_DEFAULT.as_bytes(),
+                },
+            };
+            form.contenttype = Some(dup(source)?);
         }
 
         // `if(name && form->namelength) { if(memchr(name, 0,
@@ -1359,7 +1381,10 @@ fn form_add_check<'a>(
         if !form.flags.ptrname {
             if let Some(name) = form.name.take() {
                 let extent = effective_usize_len(form.namelength, name.len());
-                form.name = Some(Cow::Owned(name[..extent].to_vec()));
+                // `FormInfoCopyField` is `Curl_bufref_memdup0`, and its caller
+                // answers `CURL_FORMADD_MEMORY` for a null return
+                // (`:264-269`). The extent is the caller's name.
+                form.name = Some(Cow::Owned(dup(&name[..extent])?));
             }
         }
 
@@ -1388,7 +1413,9 @@ fn form_add_check<'a>(
                 let requested =
                     usize::try_from(form.contentslength).unwrap_or(usize::MAX);
                 let extent = effective_usize_len(requested, value.len());
-                form.value = Some(Cow::Owned(value[..extent].to_vec()));
+                // As the name above: `FormInfoCopyField` at `:270-275`, over a
+                // length the caller declared.
+                form.value = Some(Cow::Owned(dup(&value[..extent])?));
             }
         }
 
@@ -1401,10 +1428,10 @@ fn form_add_check<'a>(
         // entry rather than from the accumulator because the accumulator has
         // been moved; the value is the same one.
         if let Some(mimetype) = entry.contenttype.as_deref() {
-            prevtype = Some(mimetype.to_owned());
+            prevtype = Some(dup(mimetype)?);
         }
 
-        nodes.push(entry);
+        fallible::push(&mut nodes, entry).map_err(|_| FormCode::Memory)?;
     }
 
     // `AddHttpPost` makes the first node the top-level one and every
@@ -1665,7 +1692,7 @@ fn fill_part(
     //    here must NOT clear a type, because the C's `if(file->contenttype)`
     //    guards the call rather than passing a null through it.
     if let Some(mimetype) = file.contenttype.as_deref() {
-        part.set_type(Some(mimetype));
+        part.set_type(Some(mimetype))?;
     }
 
     // 3. "Set field name." (`:773-775`).
@@ -1684,7 +1711,7 @@ fn fill_part(
             // value, so the remote filename `curl_mime_filedata` set as a
             // side effect must be removed again -- otherwise the part would
             // carry a `filename=` parameter curl 8.x does not emit.
-            part.set_filename(None);
+            part.set_filename(None)?;
         }
     } else if post.flags.buffer {
         // `curl_mime_data(part, post->buffer, post->bufferlength ?
@@ -1743,7 +1770,7 @@ fn fill_part(
             || post.flags.buffer
             || post.flags.callback
         {
-            part.set_filename(Some(showfilename));
+            part.set_filename(Some(showfilename))?;
         }
     }
 
@@ -1762,22 +1789,22 @@ fn fill_part(
 ///
 /// # Errors
 ///
-/// [`CURLcode::BadFunctionArgument`] for a name that is not valid UTF-8. The
-/// C stores a `char *` and the parent module's `set_name` takes a `&str`, so
-/// the check has to happen somewhere; this is the same answer
-/// `MimePart::set_file` gives for an undecodable path, which keeps the two
-/// consistent. It is not reachable from the command-line tool, whose field
-/// names come from a UTF-8 argument vector.
+/// [`CURLcode::OutOfMemory`], which covers both of the C's failure arms here:
+/// its own `curlx_memdup0` of the name range (`:698-700`) and the
+/// `curl_mime_name` it then calls, whose `curlx_strdup` has the same answer.
+/// Only one copy is made on this side, so only one arm exists.
+///
+/// A name that is not valid UTF-8 was previously
+/// [`CURLcode::BadFunctionArgument`] here, because the parent module's
+/// `set_name` took a `&str`. It no longer is: `curl_formadd` stores a
+/// `char *`, the name is emitted inside a `Content-Disposition` byte for byte,
+/// and the tool's `-F` argument comes from an argument vector that is bytes on
+/// every mandated target. Refusing such a name rejected a form the C posts.
 fn set_part_name(part: &mut MimePart, post: &FormEntry<'_>) -> CodeResult<()> {
-    let Some(name) = post.name_bytes() else {
-        // `curl_mime_name(part, NULL)` clears the name (`lib/mime.c:1244`).
-        part.set_name(None);
-        return Ok(());
-    };
-    let text =
-        std::str::from_utf8(name).map_err(|_| CURLcode::BadFunctionArgument)?;
-    part.set_name(Some(text));
-    Ok(())
+    // `curl_mime_name(part, NULL)` clears the name (`lib/mime.c:1244`); the
+    // C's `if(!name || !len) return curl_mime_name(part, name);` is the same
+    // path for an absent name.
+    part.set_name(post.name_bytes())
 }
 
 /// The file branch of the bridge (`lib/formdata.c:784-806`), including the
@@ -1787,8 +1814,9 @@ fn set_part_name(part: &mut MimePart, post: &FormEntry<'_>) -> CodeResult<()> {
 ///
 /// Whatever `MimePart::set_file` reports -- [`CURLcode::ReadError`] for a path
 /// that cannot be stat'd, which is how the C's `curl_mime_filedata` reports
-/// the same condition -- plus [`CURLcode::BadFunctionArgument`] for a path
-/// that is not valid UTF-8.
+/// the same condition. A path that is not valid UTF-8 is no longer among them:
+/// it is a path like any other, and refusing it rejected an upload the C
+/// performs.
 fn set_file_content(
     part: &mut MimePart,
     file: &FormEntry<'_>,
@@ -1809,11 +1837,16 @@ fn set_file_content(
     }
 
     match path {
-        // `curl_mime_filedata(part, file->contents)` (`:803`).
+        // `curl_mime_filedata(part, file->contents)` (`:803`). The bytes are
+        // viewed as a path without decoding: `OsStr::from_bytes` is the
+        // lossless view of a platform string on the mandated targets, and
+        // `std::str::from_utf8` stood here refusing -- with
+        // `CURLE_BAD_FUNCTION_ARGUMENT` -- every path the local filesystem
+        // accepts and Unicode cannot spell. The C passes the `char *` straight
+        // to `curl_mime_filedata`, which stats it and stores it.
         Some(bytes) => {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|_| CURLcode::BadFunctionArgument)?;
-            part.set_file(Some(Path::new(text)))
+            use std::os::unix::ffi::OsStrExt;
+            part.set_file(Some(Path::new(std::ffi::OsStr::from_bytes(bytes))))
         }
         // The C reaches `strcmp(NULL, "-")` here and dereferences a null
         // pointer. It is reachable: a second `CURLFORM_CONTENTTYPE` spawns a
@@ -2317,7 +2350,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"htmlcode")),
                     FormOption::CopyContents(Some(b"<HTML></HTML>")),
-                    FormOption::ContentType(Some("text/html")),
+                    FormOption::ContentType(Some(b"text/html")),
                 ]
             ),
             FormCode::Ok
@@ -2366,7 +2399,7 @@ mod tests {
         let contents = b"Piece of the file that is to uploaded as a formpost\n";
         assert_eq!(contents.len(), 52);
         let path = scratch_file("lib1308", contents);
-        let path_text = path.to_str().expect("a UTF-8 temporary path");
+        let path_text = crate::util::path_bytes(path.as_path());
 
         let mut form = FormList::new();
         assert_eq!(
@@ -2375,7 +2408,7 @@ mod tests {
                 vec![
                     FormOption::PtrName(Some(b"name of file field")),
                     FormOption::File(Some(path_text)),
-                    FormOption::FileName(Some("custom named file")),
+                    FormOption::FileName(Some(b"custom named file")),
                 ]
             ),
             FormCode::Ok
@@ -2480,7 +2513,7 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::PtrContents(Some(b"a")),
-                    FormOption::FileContent(Some("f.txt")),
+                    FormOption::FileContent(Some(b"f.txt")),
                 ]
             ),
             FormCode::OptionTwice
@@ -2490,8 +2523,8 @@ mod tests {
             form_add(
                 &mut form,
                 vec![
-                    FormOption::FileContent(Some("f.txt")),
-                    FormOption::FileContent(Some("g.txt")),
+                    FormOption::FileContent(Some(b"f.txt")),
+                    FormOption::FileContent(Some(b"g.txt")),
                 ]
             ),
             FormCode::OptionTwice
@@ -2505,7 +2538,7 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyContents(Some(b"a")),
-                    FormOption::File(Some("f.txt")),
+                    FormOption::File(Some(b"f.txt")),
                 ]
             ),
             FormCode::OptionTwice
@@ -2550,8 +2583,8 @@ mod tests {
             form_add(
                 &mut form,
                 vec![
-                    FormOption::ContentType(Some("a/b")),
-                    FormOption::ContentType(Some("c/d")),
+                    FormOption::ContentType(Some(b"a/b")),
+                    FormOption::ContentType(Some(b"c/d")),
                 ]
             ),
             FormCode::OptionTwice
@@ -2575,8 +2608,8 @@ mod tests {
             form_add(
                 &mut form,
                 vec![
-                    FormOption::FileName(Some("a")),
-                    FormOption::FileName(Some("b")),
+                    FormOption::FileName(Some(b"a")),
+                    FormOption::FileName(Some(b"b")),
                 ]
             ),
             FormCode::OptionTwice
@@ -2585,8 +2618,8 @@ mod tests {
             form_add(
                 &mut form,
                 vec![
-                    FormOption::FileName(Some("a")),
-                    FormOption::Buffer(Some("b")),
+                    FormOption::FileName(Some(b"a")),
+                    FormOption::Buffer(Some(b"b")),
                 ]
             ),
             FormCode::OptionTwice
@@ -2678,7 +2711,7 @@ mod tests {
         assert_eq!(
             form_add(
                 &mut form,
-                vec![FormOption::File(Some("a.txt")), FormOption::File(None),]
+                vec![FormOption::File(Some(b"a.txt")), FormOption::File(None),]
             ),
             FormCode::Null
         );
@@ -2705,8 +2738,8 @@ mod tests {
             form_add(
                 &mut form,
                 vec![
-                    FormOption::File(Some("a.txt")),
-                    FormOption::ContentType(Some("a/b")),
+                    FormOption::File(Some(b"a.txt")),
+                    FormOption::ContentType(Some(b"a/b")),
                     FormOption::ContentType(None),
                 ]
             ),
@@ -2738,7 +2771,7 @@ mod tests {
             form_add(
                 &mut form,
                 vec![
-                    FormOption::FileName(Some("first")),
+                    FormOption::FileName(Some(b"first")),
                     FormOption::FileName(None),
                 ]
             ),
@@ -2895,7 +2928,7 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"n")),
-                    FormOption::File(Some("f.txt")),
+                    FormOption::File(Some(b"f.txt")),
                     FormOption::ContentsLength(4),
                 ]
             ),
@@ -2910,7 +2943,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::PtrContents(Some(b"v")),
-                    FormOption::File(Some("f.txt")),
+                    FormOption::File(Some(b"f.txt")),
                     FormOption::CopyName(Some(b"x")),
                 ]
             ),
@@ -2925,7 +2958,7 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"n")),
-                    FormOption::File(Some("f.txt")),
+                    FormOption::File(Some(b"f.txt")),
                     FormOption::PtrContents(Some(b"v")),
                 ]
             ),
@@ -2949,7 +2982,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::BufferPtr(Some(b"bytes")),
-                    FormOption::FileName(Some("shown.txt")),
+                    FormOption::FileName(Some(b"shown.txt")),
                 ]
             ),
             FormCode::Ok
@@ -2965,7 +2998,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::PtrContents(Some(b"v")),
-                    FormOption::FileContent(Some("f.txt")),
+                    FormOption::FileContent(Some(b"f.txt")),
                 ]
             ),
             FormCode::OptionTwice
@@ -2982,7 +3015,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::ContentLen(7),
-                    FormOption::File(Some("f.txt")),
+                    FormOption::File(Some(b"f.txt")),
                 ]
             ),
             FormCode::Incomplete
@@ -3002,9 +3035,9 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"n")),
-                    FormOption::File(Some("a.txt")),
-                    FormOption::ContentType(Some("a/b")),
-                    FormOption::ContentType(Some("c/d")),
+                    FormOption::File(Some(b"a.txt")),
+                    FormOption::ContentType(Some(b"a/b")),
+                    FormOption::ContentType(Some(b"c/d")),
                 ]
             ),
             FormCode::Ok
@@ -3012,7 +3045,7 @@ mod tests {
         let entry = form.entry(0).expect("one entry");
         assert_eq!(entry.more().len(), 1);
         let spawned = &entry.more()[0];
-        assert_eq!(spawned.contenttype(), Some("c/d"));
+        assert_eq!(spawned.contenttype(), Some(&b"c/d"[..]));
         assert!(spawned.name().is_none());
         assert!(spawned.contents().is_none());
         // `AddFormInfo` sets the filename flag on every node it chains
@@ -3035,9 +3068,9 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"n")),
-                    FormOption::File(Some("a.txt")),
-                    FormOption::ContentType(Some("a/b")),
-                    FormOption::ContentType(Some("c/d")),
+                    FormOption::File(Some(b"a.txt")),
+                    FormOption::ContentType(Some(b"a/b")),
+                    FormOption::ContentType(Some(b"c/d")),
                     FormOption::PtrContents(Some(b"x")),
                 ]
             ),
@@ -3062,21 +3095,21 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"f")),
-                    FormOption::File(Some("a.dat")),
-                    FormOption::ContentType(Some("x/y")),
+                    FormOption::File(Some(b"a.dat")),
+                    FormOption::ContentType(Some(b"x/y")),
                     // `.dat` is not one of the ten suffixes in curl's table,
                     // so this part has nothing of its own to infer from.
-                    FormOption::File(Some("b.dat")),
+                    FormOption::File(Some(b"b.dat")),
                 ]
             ),
             FormCode::Ok
         );
         let entry = form.entry(0).expect("one entry");
-        assert_eq!(entry.contenttype(), Some("x/y"));
+        assert_eq!(entry.contenttype(), Some(&b"x/y"[..]));
         assert_eq!(entry.more().len(), 1);
         assert_eq!(
             entry.more()[0].contenttype(),
-            Some("x/y"),
+            Some(&b"x/y"[..]),
             "the second file inherits prevtype, NOT the octet-stream default"
         );
 
@@ -3088,14 +3121,14 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"g")),
-                    FormOption::File(Some("c.dat")),
+                    FormOption::File(Some(b"c.dat")),
                 ]
             ),
             FormCode::Ok
         );
         assert_eq!(
             form.entry(0).expect("one entry").contenttype(),
-            Some(FILE_CONTENTTYPE_DEFAULT)
+            Some(FILE_CONTENTTYPE_DEFAULT.as_bytes())
         );
         assert_eq!(FILE_CONTENTTYPE_DEFAULT, "application/octet-stream");
     }
@@ -3112,8 +3145,8 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"first")),
-                    FormOption::File(Some("a.dat")),
-                    FormOption::ContentType(Some("x/y")),
+                    FormOption::File(Some(b"a.dat")),
+                    FormOption::ContentType(Some(b"x/y")),
                 ]
             ),
             FormCode::Ok
@@ -3123,15 +3156,18 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"second")),
-                    FormOption::File(Some("b.dat")),
+                    FormOption::File(Some(b"b.dat")),
                 ]
             ),
             FormCode::Ok
         );
-        assert_eq!(form.entry(0).expect("first").contenttype(), Some("x/y"));
+        assert_eq!(
+            form.entry(0).expect("first").contenttype(),
+            Some(&b"x/y"[..])
+        );
         assert_eq!(
             form.entry(1).expect("second").contenttype(),
-            Some(FILE_CONTENTTYPE_DEFAULT),
+            Some(FILE_CONTENTTYPE_DEFAULT.as_bytes()),
             "prevtype is per-call"
         );
     }
@@ -3161,14 +3197,14 @@ mod tests {
                     &mut form,
                     vec![
                         FormOption::CopyName(Some(b"f")),
-                        FormOption::File(Some(path)),
+                        FormOption::File(Some(path.as_bytes())),
                     ]
                 ),
                 FormCode::Ok
             );
             assert_eq!(
                 form.entry(0).expect("one entry").contenttype(),
-                Some(expected),
+                Some(expected.as_bytes()),
                 "inference for {path}"
             );
         }
@@ -3187,14 +3223,14 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"f")),
                     FormOption::BufferPtr(Some(b"<html></html>")),
-                    FormOption::Buffer(Some("page.html")),
+                    FormOption::Buffer(Some(b"page.html")),
                 ]
             ),
             FormCode::Ok
         );
         assert_eq!(
             form.entry(0).expect("one entry").contenttype(),
-            Some("text/html")
+            Some(&b"text/html"[..])
         );
 
         let mut form = FormList::new();
@@ -3210,7 +3246,7 @@ mod tests {
         );
         assert_eq!(
             form.entry(0).expect("one entry").contenttype(),
-            Some(FILE_CONTENTTYPE_DEFAULT),
+            Some(FILE_CONTENTTYPE_DEFAULT.as_bytes()),
             "no shown filename leaves nothing to infer from"
         );
     }
@@ -3261,9 +3297,9 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"files")),
-                    FormOption::File(Some("a.txt")),
-                    FormOption::File(Some("b.txt")),
-                    FormOption::File(Some("c.txt")),
+                    FormOption::File(Some(b"a.txt")),
+                    FormOption::File(Some(b"b.txt")),
+                    FormOption::File(Some(b"c.txt")),
                 ]
             ),
             FormCode::Ok
@@ -3303,8 +3339,8 @@ mod tests {
     fn filename_and_buffer_write_the_same_field() {
         // `:554-561` is one arm for two options, both writing `showfilename`.
         for option in [
-            FormOption::FileName(Some("shown")),
-            FormOption::Buffer(Some("shown")),
+            FormOption::FileName(Some(b"shown")),
+            FormOption::Buffer(Some(b"shown")),
         ] {
             let mut form = FormList::new();
             assert_eq!(
@@ -3320,7 +3356,7 @@ mod tests {
             );
             assert_eq!(
                 form.entry(0).expect("one entry").showfilename(),
-                Some("shown")
+                Some(&b"shown"[..])
             );
         }
 
@@ -3333,7 +3369,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::CopyContents(Some(b"v")),
-                    FormOption::Buffer(Some("shown")),
+                    FormOption::Buffer(Some(b"shown")),
                 ]
             ),
             FormCode::Ok
@@ -3407,7 +3443,7 @@ mod tests {
                     FormOption::CopyName(Some(b"n")),
                     FormOption::BufferPtr(Some(b"0123456789")),
                     FormOption::BufferLength(4),
-                    FormOption::Buffer(Some("shown.bin")),
+                    FormOption::Buffer(Some(b"shown.bin")),
                 ]
             ),
             FormCode::Ok
@@ -3424,7 +3460,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::BufferPtr(Some(b"0123456789")),
-                    FormOption::Buffer(Some("shown.bin")),
+                    FormOption::Buffer(Some(b"shown.bin")),
                 ]
             ),
             FormCode::Ok
@@ -3599,14 +3635,14 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::CopyContents(Some(b"v")),
-                    FormOption::FileName(Some("ignored.txt")),
+                    FormOption::FileName(Some(b"ignored.txt")),
                 ]
             ),
             FormCode::Ok
         );
         assert_eq!(
             form.entry(0).expect("one entry").showfilename(),
-            Some("ignored.txt"),
+            Some(&b"ignored.txt"[..]),
             "recorded on the entry either way"
         );
         let bytes = serialize(&form, 0).expect("serialises");
@@ -3624,7 +3660,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::BufferPtr(Some(b"bytes")),
-                    FormOption::Buffer(Some("shown.txt")),
+                    FormOption::Buffer(Some(b"shown.txt")),
                 ]
             ),
             FormCode::Ok
@@ -3644,7 +3680,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::Stream(Some(Box::new(FixedReader::new(3)))),
-                    FormOption::FileName(Some("stream.bin")),
+                    FormOption::FileName(Some(b"stream.bin")),
                 ]
             ),
             FormCode::Ok
@@ -3661,7 +3697,7 @@ mod tests {
         // `if(!result && (post->flags & HTTPPOST_READFILE)) result =
         // curl_mime_filename(part, NULL);` (`:804-805`).
         let path = scratch_file("filecontent", b"body bytes\n");
-        let path_text = path.to_str().expect("a UTF-8 temporary path");
+        let path_text = crate::util::path_bytes(path.as_path());
 
         let mut form = FormList::new();
         assert_eq!(
@@ -3708,7 +3744,7 @@ mod tests {
         // The contrast with the test above: `CURLFORM_FILE` leaves the base
         // name in place, so the part advertises it.
         let path = scratch_file("keepname", b"x\n");
-        let path_text = path.to_str().expect("a UTF-8 temporary path");
+        let path_text = crate::util::path_bytes(path.as_path());
         let base = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -3731,7 +3767,7 @@ mod tests {
             .expect("a multipart")
             .part(0)
             .expect("one part");
-        assert_eq!(part.filename(), Some(base));
+        assert_eq!(part.filename(), Some(base.as_bytes()));
 
         std::fs::remove_file(&path).expect("scratch file removed");
     }
@@ -3749,8 +3785,8 @@ mod tests {
         // (`lib/mime.c:1798-1801`).
         let first = scratch_file("nest_a.txt", b"alpha\n");
         let second = scratch_file("nest_b.dat", b"beta\n");
-        let first_text = first.to_str().expect("a UTF-8 temporary path");
-        let second_text = second.to_str().expect("a UTF-8 temporary path");
+        let first_text = crate::util::path_bytes(first.as_path());
+        let second_text = crate::util::path_bytes(second.as_path());
 
         let mut form = FormList::new();
         assert_eq!(
@@ -3759,7 +3795,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"files")),
                     FormOption::File(Some(first_text)),
-                    FormOption::ContentType(Some("m/f")),
+                    FormOption::ContentType(Some(b"m/f")),
                     FormOption::File(Some(second_text)),
                 ]
             ),
@@ -3772,7 +3808,7 @@ mod tests {
         let intermediate = outer.part(0).expect("the intermediate part");
 
         // The name is on the intermediate part, not on the children.
-        assert_eq!(intermediate.name(), Some("files"));
+        assert_eq!(intermediate.name(), Some(&b"files"[..]));
         let generated = headers(intermediate);
         assert_eq!(
             generated[0],
@@ -4195,8 +4231,8 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"n")),
                     FormOption::CopyContents(Some(b"v")),
-                    FormOption::ContentType(Some("a/b")),
-                    FormOption::FileName(Some("shown")),
+                    FormOption::ContentType(Some(b"a/b")),
+                    FormOption::FileName(Some(b"shown")),
                 ]
             ),
             FormCode::Ok
@@ -4301,8 +4337,8 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"files")),
-                    FormOption::File(Some("a.txt")),
-                    FormOption::File(Some("b.txt")),
+                    FormOption::File(Some(b"a.txt")),
+                    FormOption::File(Some(b"b.txt")),
                 ]
             ),
             FormCode::Ok
@@ -4335,8 +4371,8 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"files")),
-                    FormOption::File(Some("a.txt")),
-                    FormOption::File(Some("b.txt")),
+                    FormOption::File(Some(b"a.txt")),
+                    FormOption::File(Some(b"b.txt")),
                     FormOption::Stream(Some(Box::new(FixedReader::new(1)))),
                 ]
             ),
@@ -4376,7 +4412,7 @@ mod tests {
                 vec![
                     FormOption::CopyName(Some(b"third")),
                     FormOption::CopyContents(Some(b"value")),
-                    FormOption::ContentType(Some("a/b")),
+                    FormOption::ContentType(Some(b"a/b")),
                     FormOption::CopyName(Some(b"again")),
                 ]
             ),
@@ -4397,7 +4433,7 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"third")),
-                    FormOption::File(Some("f.txt")),
+                    FormOption::File(Some(b"f.txt")),
                     FormOption::ContentsLength(4),
                 ]
             ),
@@ -4439,7 +4475,7 @@ mod tests {
                 &mut form,
                 vec![
                     FormOption::CopyName(Some(b"n")),
-                    FormOption::File(Some("-")),
+                    FormOption::File(Some(b"-")),
                 ]
             ),
             FormCode::Ok
@@ -4583,7 +4619,7 @@ mod tests {
                     FormOption::CopyName(Some(b"upload")),
                     FormOption::BufferPtr(Some(BUFFER.as_bytes())),
                     FormOption::BufferLength(BUFFER.len()),
-                    FormOption::Buffer(Some(FILENAME)),
+                    FormOption::Buffer(Some(FILENAME.as_bytes())),
                 ]
             ),
             FormCode::Ok
