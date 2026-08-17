@@ -61,6 +61,7 @@
 //! `USE_MANUAL` behaves exactly as this does, and `--manual` is documented
 //! without qualification in `docs/cmdline-opts/manual.md`.
 
+use crate::cli::help;
 use std::io::{self, Write};
 
 // Brings `pub(crate) const MANUAL: &[&str]` into scope -- one element per line of
@@ -131,6 +132,64 @@ pub(crate) fn hugehelp<W: Write>(sink: &mut W) -> io::Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// `showhelp(trigger, arg, endarg)` -- `src/mkhelp.pl:238-251`, declared at
+/// `src/tool_hugehelp.h:29`, carrying the generator's comment "Show the help
+/// text for the 'arg' curl argument on stdout".
+///
+/// ```c
+/// void showhelp(const char *trigger, const char *arg, const char *endarg)
+/// {
+///   int i = 0;
+///   struct scan_ctx ctx;
+///   inithelpscan(&ctx, trigger, arg, endarg);
+///   while(curlman[i]) {
+///     size_t len = strlen(curlman[i]);
+///     if(!helpscan((const unsigned char *)curlman[i], len, &ctx) ||
+///        !helpscan((const unsigned char *)"\n", 1, &ctx))
+///       break;
+///     i++;
+///   }
+/// }
+/// ```
+///
+/// Like `hugehelp` above, this function is *generated* in C -- it is emitted by
+/// `src/mkhelp.pl` alongside the `curlman[]` array, because it is the one place
+/// that array is walked other than `hugehelp()` itself. It lives here for the
+/// same reason: this module owns the manual, and
+/// `crate::cli::help` owns the matcher it feeds.
+///
+/// # The framing is load-bearing
+///
+/// Each manual line is fed **as its own piece**, and the separating newline is
+/// fed **as a second, one-byte piece**. C does that because the array elements
+/// carry no line terminator, and the matcher recognises line boundaries only by
+/// seeing a `\n` byte go past. Concatenating the two would produce the same
+/// bytes on the wire but a different number of `helpscan` calls, and the return
+/// value is checked after each one -- so the concatenated form would fail to
+/// stop between a line and its newline. The two calls are therefore kept
+/// separate, and the short-circuit `||` is preserved: the newline is fed only
+/// when the line itself said "keep going".
+///
+/// Standard output is locked once for the whole scan rather than per line. C
+/// gets the same effect implicitly, because its `puts` writes through one
+/// line-buffered `FILE *`.
+pub(crate) fn showhelp(trigger: &str, arg: &str, endarg: &str) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let mut ctx = help::inithelpscan(trigger, arg, endarg);
+
+    for line in MANUAL {
+        if !help::helpscan(line.as_bytes(), &mut ctx, &mut out)
+            || !help::helpscan(b"\n", &mut ctx, &mut out)
+        {
+            break;
+        }
+    }
+
+    let _ = out.flush();
 }
 
 /// How many lines the built-in manual has.

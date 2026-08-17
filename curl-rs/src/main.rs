@@ -112,27 +112,39 @@
 //! documented as "a requested feature, protocol or option was not found built-in
 //! in this libcurl due to a build-time decision".
 //!
-//! Sixteen of the files AAP section 0.3.1 assigns to this crate have no
+//! Thirteen of the files AAP section 0.3.1 assigns to this crate have no
 //! implementation at this commit, enumerated here rather than gestured at
 //! because every one of them is a separate planned unit of work and a reader
 //! needs to know which:
 //!
 //! * the three-module operation driver, `operate/{mod,single,parallel}.rs`
 //! * the option-to-`setopt` mapping, `config/to_setopts.rs`
-//! * the two remaining configuration stages, `config/parseconfig.rs` (whose
-//!   readable half is absent; the unreadable half is reproduced by
-//!   [`OsParseHost`]) and `config/ssls.rs`
+//! * the remaining configuration stage, `config/ssls.rs`
 //! * the seven transfer callbacks under [`callbacks`] --
 //!   `{write,read,header,debug,seek,progress,socket}.rs`. That module is
 //!   declared and declares none of them, which is why a parsed command line has
 //!   nothing to hand a transfer.
-//! * the two CLI renderers `cli/help.rs` and `cli/ipfs.rs`
 //! * the `--libcurl` emitter, `libcurl_src.rs`
 //!
+//! Three that this list used to carry have landed:
+//!
+//! * `cli/help.rs`, the `--help` renderer and built-in-manual scanner. The
+//!   renderer exists; wiring the `--help`, `--version` and `--engine list`
+//!   dispatch arms to it belongs to the operation driver above.
+//! * `cli/ipfs.rs`, the IPFS and IPNS gateway rewriting of `src/tool_ipfs.c`.
+//!   The eighteen fixtures that exercise it still need an HTTP executor in the
+//!   engine before they can run, because the rewrite sets `CURLUPART_SCHEME`
+//!   and that setter requires a runnable scheme.
+//! * `config/parseconfig.rs`, the `.curlrc` and `-K` reader. Its reader is
+//!   complete and tested, but nothing reaches it yet: `ParseHost::parse_config`
+//!   does not take the `&mut GlobalConfig` the re-entry needs, so no
+//!   configuration file is loaded at run time. That is a signature gap in a
+//!   delivered file rather than an absent file.
+//!
 //! That list is CHECKED, not merely written: `absent_target_gate` in
-//! `src/bin/curlinfo.rs` holds the same sixteen paths together with the
-//! eighteen `curl-rs-lib` and three `curl-rs-ffi` targets, and fails naming any
-//! that has since landed. When it fails, this paragraph is what needs
+//! `src/bin/curlinfo.rs` holds the same thirteen paths together with the
+//! seventeen `curl-rs-lib` and two `curl-rs-ffi` targets, and fails naming
+//! any that has since landed. When it fails, this paragraph is what needs
 //! updating.
 //!
 //! # The runtime shape is prescribed

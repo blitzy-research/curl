@@ -49,11 +49,11 @@
 //! # Partially delivered
 //!
 //! Of this module's planned children, [`ratelimit`], [`progress`], [`sendf`],
-//! [`request`] and [`writeout`] exist. The transfer loop itself, content
-//! encoding and chunked framing arrive with their own files, and each
-//! declaration lands WITH its file -- a `mod` line without a file is
-//! `error[E0583]`, which no attribute can reach, because module resolution
-//! never gets far enough to produce a lint.
+//! [`request`], [`writeout`] and [`chunked`] exist. The transfer loop itself
+//! and content encoding arrive with their own files, and each declaration
+//! lands WITH its file -- a `mod` line without a file is `error[E0583]`, which
+//! no attribute can reach, because module resolution never gets far enough to
+//! produce a lint.
 //!
 //! The order in which they compose is dependency order rather than
 //! preference. [`ratelimit`] came first because it depends on nothing but the
@@ -172,3 +172,22 @@ pub(crate) mod ratelimit;
 /// needs from the transfer loop, `Curl_xfer_pause_recv`, arrives through
 /// `sendf`'s `TransferControl` seam.
 pub(crate) mod writeout;
+
+/// HTTP/1.1 chunked transfer coding, in both directions: supersedes
+/// `lib/http_chunks.c` and `lib/http_chunks.h`.
+///
+/// The receive state machine that de-frames a chunked response body and its
+/// trailers, and the encoder that frames a chunked request body -- both
+/// byte-exact, because 1,476 of the fixtures under `tests/data/` compare the
+/// bytes on the wire as one string and would fail on a size line spelled with
+/// a different case or a leading zero. Chunk framing is therefore NOT
+/// delegated to hyper, which manages the connection and nothing about these
+/// bytes.
+///
+/// It depends on [`sendf`] for the two chain contracts and on nothing else in
+/// this directory, and it names neither [`writeout`] nor a protocol module.
+/// The C reaches through `struct Curl_easy` for a downstream writer, a source
+/// reader and `CURLOPT_TRAILERFUNCTION`; all three arrive here as narrow seams
+/// the consumer implements, which is also what lets the parser be driven from
+/// memory, one byte at a time, without a network.
+pub(crate) mod chunked;

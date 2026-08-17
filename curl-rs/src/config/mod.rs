@@ -48,6 +48,7 @@
 //!   append site that already enforces it.
 
 pub(crate) mod findfile;
+pub(crate) mod parseconfig;
 
 use std::collections::TryReserveError;
 use std::fmt;

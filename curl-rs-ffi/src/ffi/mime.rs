@@ -1570,6 +1570,7 @@ mod tests {
     use super::*;
     use crate::ffi::panic_boundary::contained;
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     /// A live tree, or a failed test: `curl_mime_init` answers null only when
     /// the platform cannot supply entropy, which is not a condition a test
@@ -2525,6 +2526,47 @@ mod tests {
     /// How many times [`counting_free`] has run, process-wide.
     static FREED: AtomicUsize = AtomicUsize::new(0);
 
+    /// Serialises the four tests that assert an exact delta on [`FREED`].
+    ///
+    /// [`counting_free`] is an `extern "C"` function, so its counter has to be
+    /// process-wide: a C function pointer carries no per-test state. Each of
+    /// the four snapshots `before`, acts, and then asserts `before + n`, which
+    /// is only meaningful if nothing else increments the counter inside that
+    /// window. The default harness runs tests concurrently, so two of them
+    /// interleave inside it and corrupt each other's arithmetic.
+    ///
+    /// Measured rather than supposed, and observed at more than one delta
+    /// because the interleaving depends on scheduling: a whole-workspace
+    /// `cargo test` run reported `left: 2, right: 1` for
+    /// `a_callback_part_releases_its_context_exactly_once`, another reported
+    /// `left: 2, right: 0` for the same test on roughly one run in ten and only
+    /// under load, and a third saw `+3` where it asserts `+1` -- while that
+    /// test passed alone and the module's own suite passed alone. Passing under
+    /// `--test-threads=1` is the signature of a shared-state race rather than
+    /// of a defect in the code under test.
+    ///
+    /// Holding this for the duration of each of the four makes the delta the
+    /// test's own again while keeping every assertion exact. Weakening them to
+    /// "at least one" would have removed the property they exist to pin:
+    /// `lib/mime.c:1122-1123` copies the callback pointers rather than
+    /// reference-counting the context, so the hook runs once **per part**, and
+    /// only an exact count catches a future change to that. A per-test counter
+    /// would serve equally well; one lock is chosen because it keeps the
+    /// counter a single description of [`counting_free`] rather than four.
+    static FREED_LOCK: Mutex<()> = Mutex::new(());
+
+    /// [`FREED_LOCK`], with poisoning recovered from rather than propagated.
+    ///
+    /// A panic in one of the four is already that test's failure; turning it
+    /// into a second, differently-worded failure in the next test would bury
+    /// the first -- one failure becoming four, with the original hidden.
+    fn freed_serially() -> MutexGuard<'static, ()> {
+        match FREED_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// A `curl_read_callback` that yields nothing.
     unsafe extern "C" fn empty_read(
         buffer: *mut c_char,
@@ -2554,6 +2596,8 @@ mod tests {
 
     #[test]
     fn a_null_read_callback_is_a_reset_and_discards_the_others() {
+        let _serial = freed_serially();
+
         // `lib/mime.c:1424`: with a null `readfunc` nothing at all is
         // installed, so `freefunc` never runs and `arg` is never released.
         let mime = init();
@@ -2583,6 +2627,8 @@ mod tests {
 
     #[test]
     fn a_callback_part_releases_its_context_exactly_once() {
+        let _serial = freed_serially();
+
         let mime = init();
         let part = addpart(mime);
         let before = FREED.load(Ordering::Relaxed);
@@ -2616,6 +2662,8 @@ mod tests {
 
     #[test]
     fn replacing_a_callback_part_releases_the_previous_context() {
+        let _serial = freed_serially();
+
         // `cleanup_part_content` runs the hook on replacement too.
         let mime = init();
         let part = addpart(mime);
@@ -2790,6 +2838,8 @@ mod tests {
         // `lib/mime.c:1122-1123` copies the pointers, so the shared `arg`
         // reaches `freefunc` once per part. Reproduced literally, and asserted
         // so that a future "improvement" to reference-count it is caught.
+        let _serial = freed_serially();
+
         let before = FREED.load(Ordering::Relaxed);
         let reader = CallbackReader {
             readfunc: Some(empty_read),

@@ -101,34 +101,37 @@
 //! the target rather than an inventory.** The measured state, which every
 //! claim here is to be read against:
 //!
-//! * `curl-rs-ffi/src/ffi/` holds nineteen entries: the ten symbol-family
+//! * `curl-rs-ffi/src/ffi/` holds twenty entries: the eleven symbol-family
 //!   modules `easy`, `escape`, `form`, `global`, `mime`, `misc`, `printf`,
-//!   `slist`, `strerror` and `url`; the type-and-metadata modules `codes`,
-//!   `handle`, `opts` and `types`; the support modules `memory` and
-//!   `panic_boundary`; `mod.rs`; and two oracle fixtures. `multi`, `share` and
+//!   `share`, `slist`, `strerror` and `url`; the type-and-metadata modules
+//!   `codes`, `handle`, `opts` and `types`; the support modules `memory` and
+//!   `panic_boundary`; `mod.rs`; and two oracle fixtures. `multi` and
 //!   `ws` are still targets.
-//! * **59 of the 100 symbols are defined, 41 are not, and 0 extra symbols
+//! * **62 of the 100 symbols are defined, 38 are not, and 0 extra symbols
 //!   leak.** `build.rs` prints the live figure as a `cargo:warning` on every
 //!   build, so that -- not this sentence -- is the number to consult. Two
 //!   independent measurements now AGREE on both the export set and the count:
 //!   `nm -D --defined-only` over the built `cdylib`, and `build.rs`'s
 //!   `undefined_abi_exports`, which parses `lib/libcurl.def` and this crate's
-//!   `#[no_mangle]` and `global_asm!` declarations. They used to differ by six,
-//!   because the six assembled labels reached `libcurl.a` and not
+//!   `#[no_mangle]` and `global_asm!` declarations. They used to differ by the
+//!   assembled labels, which reached `libcurl.a` and not
 //!   `libcurl.so`; `promote_assembled_exports` closed that, so the shared
 //!   library and the static library now export the identical set. The crate
 //!   therefore exports something, but it is **not** a drop-in replacement yet,
-//!   and nothing here should be read as claiming otherwise: 41 of the 100 have
+//!   and nothing here should be read as claiming otherwise: 38 of the 100 have
 //!   no definition at all.
-//! * **The 41 fall in four families, and the split is published rather than
-//!   only written here**: `curl_multi_*` 21, `curl_easy_*` 13, `curl_ws_*` 4,
-//!   `curl_share_*` 3. `build.rs` emits them as `missing-family=<name> <count>`
-//!   lines in `$OUT_DIR/abi-inventory.txt` beside the 41 names, and
+//! * **The 38 fall in three families, and the split is published rather than
+//!   only written here**: `curl_multi_*` 21, `curl_easy_*` 13 and
+//!   `curl_ws_*` 4.
+//!   `build.rs` emits them as `missing-family=<name> <count>`
+//!   lines in `$OUT_DIR/abi-inventory.txt` beside the 38 names, and
 //!   [`abi_inventory`]'s tests assert the counts sum to `missing` and that no
-//!   family is invented. The split is the actionable form of the total: three
-//!   of the four families are the three modules `ffi/` does not hold, and the
-//!   fourth is `ffi/easy.rs`, which exists and defines only its three
-//!   option-introspection entry points.
+//!   family is invented. The split is the actionable form of the total: two
+//!   of the three families are the two modules `ffi/` does not hold, and the
+//!   third is `ffi/easy.rs`, which exists and defines only its three
+//!   option-introspection entry points. `curl_share_*` left this list when
+//!   `ffi/share.rs` landed: it carries three of that family's four names, and
+//!   `ffi/strerror.rs` has always carried the fourth.
 //! * Because the header is generated FROM this crate, an incomplete surface
 //!   would generate an incomplete header. `build.rs` refuses: while any of the
 //!   100 is undefined it writes no header at all and says so, leaving the
@@ -386,13 +389,15 @@
 //! a reader looks for crate-wide caveats. None may be discovered by surprise
 //! later.
 //!
-//! **A4: OPEN AND ESCALATED, with a candidate fourth option identified but
-//! not adopted.** Four exported functions -- `curl_easy_setopt`,
+//! **A4: OPEN AND ESCALATED, with the fourth option now ADOPTED for one of
+//! the four names.** Four exported functions -- `curl_easy_setopt`,
 //! `curl_easy_getinfo`, `curl_multi_setopt` and `curl_share_setopt` -- are
 //! C-variadic in the header, and the design reaches them with a non-variadic
 //! Rust function taking one trailing pointer, which works because the option
 //! identifier already encodes its argument's type class (integer division by
-//! 10,000 recovers the `CURLOPTTYPE_*` base).
+//! 10,000 recovers the `CURLOPTTYPE_*` base -- for three of the four;
+//! `CURLSHoption` is ordinal instead, so `ffi/share.rs` dispatches on the
+//! value itself and says so).
 //!
 //! The hazard is real and was measured on both sides of the call, on all
 //! four targets. A C caller does not put the third argument in the same
@@ -432,10 +437,14 @@
 //! the export set, and `llvm-objdump` shows precisely the four instructions
 //! above. No newer toolchain, no C compiler, no dropped target.
 //!
-//! Because none of the four has a Rust body yet, no trampoline is written and
-//! there is nothing to trampoline to, so the mechanism above is a validated
-//! candidate rather than something this crate contains. That is a fact about
-//! the current state, not a reason to rely on remembering it:
+//! ONE OF THE FOUR NOW USES IT. `ffi/share.rs` defines `curl_share_setopt`
+//! with exactly this mechanism -- four `global_asm!` prologues, one per ABI
+//! flavour, three of them a bare tail call because the argument is already in
+//! the register the callee reads, and the Apple arm64 one `ldr x2, [sp]`
+//! followed by `b` -- tail-calling a private `share_setopt_slot` that is not
+//! `#[no_mangle]` and so does not join the export set. The other three have no
+//! Rust body yet and so no trampoline either. That split is a fact about the
+//! current state, not a reason to rely on remembering it:
 //! `curl-rs-ffi/build.rs`'s `check_variadic_strategy` fails the build, **on
 //! every target**, if any of the four ever gains a plain non-variadic
 //! definition without a `global_asm!` trampoline exporting its label. It

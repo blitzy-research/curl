@@ -1947,18 +1947,20 @@ mod source_presence_gate {
 mod absent_target_gate {
     use std::path::{Path, PathBuf};
 
-    /// The 18 `curl-rs-lib` targets with no file.
+    /// The 17 `curl-rs-lib` targets with no file.
     ///
-    /// The same eighteen `curl-rs-lib/src/lib.rs` enumerates in prose; here so
-    /// that the prose cannot outlive the fact. Three easy-handle modules, two
-    /// transfer stages, the nine per-scheme protocol modules and four proxy
+    /// The same seventeen `curl-rs-lib/src/lib.rs` enumerates in prose; here
+    /// so that the prose cannot outlive the fact. Three easy-handle modules,
+    /// one transfer stage, the nine per-scheme protocol modules and four proxy
     /// mechanisms.
+    ///
+    /// `transfer/chunked.rs` was the eighteenth and has landed, so its row is
+    /// gone -- which is what this gate exists to force.
     const ENGINE_TARGETS: &[&str] = &[
         "curl-rs-lib/src/easy/handle.rs",
         "curl-rs-lib/src/easy/setopt.rs",
         "curl-rs-lib/src/easy/getinfo.rs",
         "curl-rs-lib/src/transfer/content_encoding.rs",
-        "curl-rs-lib/src/transfer/chunked.rs",
         "curl-rs-lib/src/protocols/http1.rs",
         "curl-rs-lib/src/protocols/http2.rs",
         "curl-rs-lib/src/protocols/http3.rs",
@@ -1974,18 +1976,31 @@ mod absent_target_gate {
         "curl-rs-lib/src/proxy/haproxy.rs",
     ];
 
-    /// The 16 `curl-rs` targets with no file.
+    /// The 15 `curl-rs` targets with no file.
     ///
-    /// Two CLI renderers, three configuration stages, the three-module
+    /// No CLI renderer now, two configuration stages, the three-module
     /// operation driver, all seven transfer callbacks, and the `--libcurl`
     /// emitter. `curl-rs/src/callbacks/mod.rs` is on disk and declares none of
     /// its seven children, which is why an invocation parses and then has
     /// nothing to hand a transfer.
+    ///
+    /// Both CLI renderers have now landed -- `curl-rs/src/cli/help.rs` and
+    /// `curl-rs/src/cli/ipfs.rs` -- so both rows are gone, which is this gate
+    /// working as designed rather than being weakened. The renderers exist;
+    /// wiring the `--help`, `--version` and `--engine list` dispatch arms to
+    /// them belongs to the operation driver, three of whose own modules are
+    /// still listed below.
+    ///
+    /// `curl-rs/src/config/parseconfig.rs` was the third configuration stage
+    /// and has landed too, so it is named by [`the_gate_can_see_a_present_file`]
+    /// rather than here. Its reader is complete; what remains is the two lines
+    /// that reach it, because `ParseHost::parse_config`
+    /// (`curl-rs/src/cli/args.rs:2173`) does not yet take the
+    /// `&mut GlobalConfig` the re-entry needs. That is a signature gap in a
+    /// delivered file, not an absent file, so this gate is the wrong instrument
+    /// for it and the module's own documentation carries it.
     const TOOL_TARGETS: &[&str] = &[
-        "curl-rs/src/cli/help.rs",
-        "curl-rs/src/cli/ipfs.rs",
         "curl-rs/src/config/to_setopts.rs",
-        "curl-rs/src/config/parseconfig.rs",
         "curl-rs/src/config/ssls.rs",
         "curl-rs/src/operate/mod.rs",
         "curl-rs/src/operate/single.rs",
@@ -2000,18 +2015,22 @@ mod absent_target_gate {
         "curl-rs/src/libcurl_src.rs",
     ];
 
-    /// The 3 `curl-rs-ffi` targets with no file.
+    /// The 2 `curl-rs-ffi` targets with no file.
     ///
-    /// These three carry 28 of the 41 undefined exports between them -- 21
-    /// `curl_multi_*`, 3 `curl_share_*` and 4 `curl_ws_*`. The remaining 13 are
+    /// These two carry 25 of the 38 undefined exports between them -- 21
+    /// `curl_multi_*` and 4 `curl_ws_*`. The remaining 13 are
     /// the `curl_easy_*` core, whose module `ffi/easy.rs` does exist and today
     /// defines only the three option-introspection entry points. The counts are
     /// the ABI inventory's, published by `curl-rs-ffi/build.rs`.
-    const ABI_TARGETS: &[&str] = &[
-        "curl-rs-ffi/src/ffi/multi.rs",
-        "curl-rs-ffi/src/ffi/share.rs",
-        "curl-rs-ffi/src/ffi/ws.rs",
-    ];
+    ///
+    /// `curl-rs-ffi/src/ffi/share.rs` was the third and has LANDED, which is
+    /// why the figures above read 2/25/38 where they once read 3/28/41. It
+    /// carries three of the four `curl_share_*` names -- `ffi/strerror.rs` has
+    /// always carried `curl_share_strerror`, because `lib/strerror.c` defines
+    /// all four strerror functions in one translation unit and the crate's
+    /// partition follows the definition rather than the declaring header.
+    const ABI_TARGETS: &[&str] =
+        &["curl-rs-ffi/src/ffi/multi.rs", "curl-rs-ffi/src/ffi/ws.rs"];
 
     /// `CARGO_MANIFEST_DIR` is `<root>/curl-rs`, so one `parent()` reaches the
     /// workspace root.
@@ -2023,7 +2042,7 @@ mod absent_target_gate {
     }
 
     fn every_target() -> Vec<&'static str> {
-        let mut all = Vec::with_capacity(37);
+        let mut all = Vec::with_capacity(32);
         all.extend_from_slice(ENGINE_TARGETS);
         all.extend_from_slice(TOOL_TARGETS);
         all.extend_from_slice(ABI_TARGETS);
@@ -2047,11 +2066,11 @@ mod absent_target_gate {
     }
 
     #[test]
-    fn the_split_is_eighteen_sixteen_three() {
-        assert_eq!(ENGINE_TARGETS.len(), 18, "curl-rs-lib");
-        assert_eq!(TOOL_TARGETS.len(), 16, "curl-rs");
-        assert_eq!(ABI_TARGETS.len(), 3, "curl-rs-ffi");
-        assert_eq!(every_target().len(), 37, "the workspace total");
+    fn the_split_is_seventeen_thirteen_two() {
+        assert_eq!(ENGINE_TARGETS.len(), 17, "curl-rs-lib");
+        assert_eq!(TOOL_TARGETS.len(), 13, "curl-rs");
+        assert_eq!(ABI_TARGETS.len(), 2, "curl-rs-ffi");
+        assert_eq!(every_target().len(), 32, "the workspace total");
     }
 
     #[test]
@@ -2075,7 +2094,10 @@ mod absent_target_gate {
 
     /// The absence above is a measurement, so the measuring has to be able to
     /// see a file that IS there. One sibling per crate, chosen because each is
-    /// named in the same design tables as the missing ones.
+    /// named in the same design tables as the missing ones, plus the target
+    /// that most recently moved off [`TOOL_TARGETS`] -- which makes this the
+    /// assertion that fails first if a landed file is ever double-counted as
+    /// both present and absent.
     #[test]
     fn the_gate_can_see_a_present_file() {
         let root = repo_root();
@@ -2084,6 +2106,7 @@ mod absent_target_gate {
             "curl-rs-lib/src/protocols/ftp/listparser.rs",
             "curl-rs/src/callbacks/mod.rs",
             "curl-rs/src/config/mod.rs",
+            "curl-rs/src/config/parseconfig.rs",
             "curl-rs-ffi/src/ffi/easy.rs",
         ] {
             assert!(

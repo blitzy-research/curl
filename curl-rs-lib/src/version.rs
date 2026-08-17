@@ -1159,10 +1159,14 @@ pub const ENGINE_PROTOCOLS: Engine =
 /// lines), `transfer/sendf.rs` (10,231), `transfer/writeout.rs`,
 /// `transfer/progress.rs` and `transfer/ratelimit.rs` all exist. What is missing
 /// is the loop itself -- `transfer/mod.rs` is 174 lines of module declarations
-/// and carries no state machine -- and `transfer/chunked.rs` and
-/// `transfer/content_encoding.rs` are absent outright. So even a scheme with its
-/// own executor would have nothing to run it. Recorded so that a later
-/// checkpoint enabling [`ENGINE_PROTOCOLS`] has to confront this one as well.
+/// and carries no state machine -- and `transfer/content_encoding.rs` is absent
+/// outright. `transfer/chunked.rs` is present and complete: chunk framing in
+/// both directions, with the `chunked` transfer-decoding writer and
+/// transfer-encoding reader both registered. It still runs nothing on its own,
+/// because a stage is only reached by a transfer loop and an executor, neither
+/// of which exists. So even a scheme with its own executor would have nothing
+/// to run it. Recorded so that a later checkpoint enabling
+/// [`ENGINE_PROTOCOLS`] has to confront this one as well.
 pub const ENGINE_TRANSFER: Engine =
     Engine::inert("curl-rs-lib/src/transfer/mod.rs");
 

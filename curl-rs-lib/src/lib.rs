@@ -394,24 +394,31 @@ pub mod share;
 //
 // WHICH CHILDREN, measured against this checkout rather than left vague,
 // because "children remain" is the kind of statement that survives long after
-// it stops being true. Eighteen of the files AAP 0.4.1 assigns to this crate are
-// not on disk: `easy/{handle,setopt,getinfo}.rs`;
-// `transfer/{chunked,content_encoding}.rs`; the eight per-scheme executors
+// it stops being true. Seventeen of the files AAP 0.4.1 assigns to this crate
+// are not on disk: `easy/{handle,setopt,getinfo}.rs`;
+// `transfer/content_encoding.rs`; the eight per-scheme executors
 // `protocols/{http1,http2,http3,ftp/pingpong,sftp,scp,file,ws}.rs` together with
 // `protocols/stub.rs`; and `proxy/{socks,socks_gss,http_connect,haproxy}.rs`.
-// Every other assigned file exists. That distinction is what
-// `version.rs`'s engine registry records per capability, and
-// `curl-rs/src/bin/curlinfo.rs` checks each of its claims against the tree.
+// Every other assigned file exists -- `transfer/chunked.rs` among them, which
+// is why this count reads seventeen and not the eighteen it once did. That
+// distinction is what `version.rs`'s engine registry records per capability,
+// and `curl-rs/src/bin/curlinfo.rs` checks each of its claims against the
+// tree.
 //
-// Those same eighteen paths are held as data, not prose, by
-// `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs`, alongside the sixteen
-// `curl-rs` and three `curl-rs-ffi` targets that are also unwritten -- 37
-// across the workspace. That gate fails, naming the file, as soon as one of
+// Those same seventeen paths are held as data, not prose, by
+// `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs`, alongside the thirteen
+// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 32
+// across the workspace. The ABI figure read three, and the total 37, until
+// `curl-rs-ffi/src/ffi/share.rs` landed. That gate fails, naming the file, as
+// soon as one of
 // them lands, which is what keeps this paragraph from outliving its accuracy
-// the way its predecessor did. Registry granularity and file granularity are
-// deliberately both recorded: the registry answers "can this capability run",
-// the gate answers "what is left to write", and neither substitutes for the
-// other.
+// the way its predecessor did. It has done exactly that three times over for
+// this crate's siblings: `curl-rs/src/cli/help.rs`, `curl-rs/src/cli/ipfs.rs`
+// and `curl-rs/src/config/parseconfig.rs` have all landed, which is why the
+// `curl-rs` figure reads thirteen rather than the sixteen it was.
+// Registry granularity and file granularity are deliberately both recorded:
+// the registry answers "can this capability run", the gate answers "what is
+// left to write", and neither substitutes for the other.
 //
 // THE OPTIONAL ALLOCATION LOG -- `memdebug`, default OFF.
 //

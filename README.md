@@ -58,15 +58,16 @@ can be re-derived rather than trusted.
 
 | what | state |
 | ---- | ----- |
-| Command line | Parses the full curl surface -- flags, arguments, `.curlrc`, `--next` chains -- and reproduces C's diagnostics and exit codes byte for byte. Verified against a stock curl 8.14.1 across nine invocations. |
+| Command line | Parses the full curl surface -- flags, arguments, `--next` chains -- and reproduces C's diagnostics and exit codes byte for byte. Verified against a stock curl 8.14.1 across nine invocations. The `.curlrc` and `-K` reader is written and tested (`curl-rs/src/config/parseconfig.rs`), but is not reached yet: `ParseHost::parse_config` does not take the configuration handle the re-entry needs, so no configuration file is loaded at run time. |
 | Transfers | None. Every operation returns `CURLE_NOT_BUILT_IN`. No scheme has a protocol executor, so nothing opens a connection. |
 | `Protocols:` in `curl --version` | Empty, and correctly so. |
 | `Features:` in `curl --version` | The truthful subset. A capability is advertised only when the module that implements it exists *and* can be executed, which is why names like `SSL`, `HTTP2` and `NTLM` are withheld even though rustls, `h2` and the NTLM primitives are all linked and tested. Under-reporting makes a fixture skip; over-reporting makes it run and fail. |
-| C ABI | 59 of the 100 symbols in `lib/libcurl.def` are exported, and nothing beyond them. |
+| C ABI | 62 of the 100 symbols in `lib/libcurl.def` are exported, and nothing beyond them. |
 | Public headers | Not regenerated. Generation is withheld until the export surface is complete; the headers in the tree remain the ABI contract. |
 | Targets | Two of four build. See [Supported targets](#supported-targets). |
-| Engine modules | 18 of the modules the target design assigns to `curl-rs-lib` are not written; the rest are. `curl-rs-lib/src/version.rs` records, per capability, whether its module is missing or merely uncalled, and a test in `curl-rs/src/bin/curlinfo.rs` checks every one of those claims against the filesystem. |
-| Unwritten modules, all three crates | 37: the 18 above, 16 in `curl-rs` (the operation driver, the option-to-`setopt` mapping, two configuration stages, all seven transfer callbacks, two CLI renderers and the `--libcurl` emitter) and 3 in `curl-rs-ffi` (`ffi/multi.rs`, `ffi/share.rs`, `ffi/ws.rs`, which between them carry 28 of the 41 undefined exports). Each crate root enumerates its own; `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs` holds all 37 as data and fails, naming the file, when one lands. |
+| Engine modules | 17 of the modules the target design assigns to `curl-rs-lib` are not written; the rest are. `curl-rs-lib/src/version.rs` records, per capability, whether its module is missing or merely uncalled, and a test in `curl-rs/src/bin/curlinfo.rs` checks every one of those claims against the filesystem. |
+| Unwritten modules, all three crates | 32: the 17 above, 13 in `curl-rs` (the operation driver, the option-to-`setopt` mapping, one configuration stage, all seven transfer callbacks and the `--libcurl` emitter) and 2 in `curl-rs-ffi` (`ffi/multi.rs`, `ffi/ws.rs`, which between them carry 25 of the 38 undefined exports). Each crate root enumerates its own; `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs` holds all 32 as data and fails, naming the file, when one lands. |
+| IPFS and IPNS | `curl-rs/src/cli/ipfs.rs` implements the gateway discovery chain and the URL rewriting of `src/tool_ipfs.c`, including `--ipfs-gateway`, `IPFS_GATEWAY`, `IPFS_PATH` and the `~/.ipfs/gateway` file. The rewrite produces an ordinary `http` or `https` URL, so the eighteen fixtures that cover it need an HTTP executor in the engine before they can run. |
 | Cargo features | Fifteen, twelve on by default because curl 8.x offers them out of the box. Exactly one -- `memdebug` -- is closed end to end. `curl-rs-lib/Cargo.toml` carries the per-feature state above its `[features]` table. |
 | Publishing | Refused. `publish = false` on the workspace, and the artifacts are not substitutes for curl or libcurl yet. |
 
@@ -254,7 +255,7 @@ Apple pair is a different question this tree cannot answer for itself.
   and a parity check against that file is one of the validation gates. It
   fails on a difference in either direction: a symbol that is missing breaks
   an existing consumer at link time, and one that is extra is a surface
-  nobody agreed to keep. **59 of the 100 are defined today**, so that gate does
+  nobody agreed to keep. **62 of the 100 are defined today**, so that gate does
   not pass yet, and `libcurl.so.4` is not a drop-in substitute for anything.
   Nothing extra is exported: the leaked-symbol half of the check is clean.
 

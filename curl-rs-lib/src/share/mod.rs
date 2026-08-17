@@ -5887,6 +5887,11 @@ mod tests {
     /// 1. **It is one share.** A [`Barrier`] makes both threads attach before
     ///    either proceeds, so the reference count read after it is exactly
     ///    [`THREADS`] rather than 1. Two independent shares would each read 1.
+    ///    The same barrier is waited on a second time so that the read happens
+    ///    while both references are still held: the first rendezvous proves
+    ///    they landed, the second keeps them landed, and without it a thread
+    ///    released early can finish the loop and detach before a parked thread
+    ///    reads -- a race measured at roughly one run in fifty under load.
     /// 2. **Every shared store is reachable from both threads**, including the
     ///    cookie-then-Public-Suffix-List nesting `lib/cookie.c` performs.
     /// 3. **The notifications stay balanced and never double-lock** under a
@@ -5957,9 +5962,25 @@ mod tests {
                     // Both references are now on ONE counter, which is the
                     // whole claim being tested.
                     barrier.wait();
+                    // Read while every thread is provably still attached, and
+                    // hold them there for the duration of the read. The
+                    // barrier above proves both attaches landed; on its own it
+                    // does not prove they are still landed, because a thread
+                    // released from it can run the whole loop below and give
+                    // its reference back at `:detach` before a thread the
+                    // scheduler has parked gets to look. That leaves the
+                    // parked reader seeing one reference where the claim is
+                    // two -- measured deterministically by delaying one thread
+                    // here, and observed as roughly one run in fifty under CPU
+                    // contention without the delay. The count is captured
+                    // between the two rendezvous and asserted after the
+                    // second, so that nothing between them can panic and leave
+                    // the other thread waiting: a genuine violation still
+                    // fails in whichever thread observed it.
+                    let attached = core.dirty();
+                    barrier.wait();
                     assert_eq!(
-                        core.dirty(),
-                        THREADS as u32,
+                        attached, THREADS as u32,
                         "one share, {THREADS} handles"
                     );
 
