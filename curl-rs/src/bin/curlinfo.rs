@@ -1947,20 +1947,29 @@ mod source_presence_gate {
 mod absent_target_gate {
     use std::path::{Path, PathBuf};
 
-    /// The 17 `curl-rs-lib` targets with no file.
+    /// The 14 `curl-rs-lib` targets with no file.
     ///
-    /// The same seventeen `curl-rs-lib/src/lib.rs` enumerates in prose; here
+    /// The same fourteen `curl-rs-lib/src/lib.rs` enumerates in prose; here
     /// so that the prose cannot outlive the fact. Three easy-handle modules,
-    /// one transfer stage, the nine per-scheme protocol modules and four proxy
-    /// mechanisms.
+    /// the nine per-scheme protocol modules and two proxy mechanisms.
     ///
-    /// `transfer/chunked.rs` was the eighteenth and has landed, so its row is
-    /// gone -- which is what this gate exists to force.
+    /// `transfer/chunked.rs` was the eighteenth,
+    /// `transfer/content_encoding.rs` the seventeenth, `proxy/socks.rs` the
+    /// sixteenth and `proxy/haproxy.rs` the fifteenth; all four have landed, so
+    /// all four rows are gone -- which is what this gate exists to force. The
+    /// transfer directory now has no absent file at all, and what remains there
+    /// is the loop itself, which `version.rs`'s `ENGINE_TRANSFER` records as a
+    /// wiring gap rather than a missing file. The two proxy mechanisms left are
+    /// why that count reads two where it read four: the `"SOCKS"` filter of
+    /// `lib/socks.c` is written and `socks_gss.rs` calls into it, and the PROXY
+    /// protocol header filter of `lib/cf-haproxy.c` exists in full. Neither
+    /// makes a proxy REACHABLE, which is why `curl-rs-lib/src/version.rs` still
+    /// withholds the `proxy` capability on `proxy/http_connect.rs` and why that
+    /// row is still below.
     const ENGINE_TARGETS: &[&str] = &[
         "curl-rs-lib/src/easy/handle.rs",
         "curl-rs-lib/src/easy/setopt.rs",
         "curl-rs-lib/src/easy/getinfo.rs",
-        "curl-rs-lib/src/transfer/content_encoding.rs",
         "curl-rs-lib/src/protocols/http1.rs",
         "curl-rs-lib/src/protocols/http2.rs",
         "curl-rs-lib/src/protocols/http3.rs",
@@ -1970,13 +1979,11 @@ mod absent_target_gate {
         "curl-rs-lib/src/protocols/ws.rs",
         "curl-rs-lib/src/protocols/stub.rs",
         "curl-rs-lib/src/protocols/ftp/pingpong.rs",
-        "curl-rs-lib/src/proxy/socks.rs",
         "curl-rs-lib/src/proxy/socks_gss.rs",
         "curl-rs-lib/src/proxy/http_connect.rs",
-        "curl-rs-lib/src/proxy/haproxy.rs",
     ];
 
-    /// The 15 `curl-rs` targets with no file.
+    /// The 13 `curl-rs` targets with no file.
     ///
     /// No CLI renderer now, two configuration stages, the three-module
     /// operation driver, all seven transfer callbacks, and the `--libcurl`
@@ -2042,7 +2049,7 @@ mod absent_target_gate {
     }
 
     fn every_target() -> Vec<&'static str> {
-        let mut all = Vec::with_capacity(32);
+        let mut all = Vec::with_capacity(29);
         all.extend_from_slice(ENGINE_TARGETS);
         all.extend_from_slice(TOOL_TARGETS);
         all.extend_from_slice(ABI_TARGETS);
@@ -2066,11 +2073,11 @@ mod absent_target_gate {
     }
 
     #[test]
-    fn the_split_is_seventeen_thirteen_two() {
-        assert_eq!(ENGINE_TARGETS.len(), 17, "curl-rs-lib");
+    fn the_split_is_fourteen_thirteen_two() {
+        assert_eq!(ENGINE_TARGETS.len(), 14, "curl-rs-lib");
         assert_eq!(TOOL_TARGETS.len(), 13, "curl-rs");
         assert_eq!(ABI_TARGETS.len(), 2, "curl-rs-ffi");
-        assert_eq!(every_target().len(), 32, "the workspace total");
+        assert_eq!(every_target().len(), 29, "the workspace total");
     }
 
     #[test]
@@ -2095,9 +2102,10 @@ mod absent_target_gate {
     /// The absence above is a measurement, so the measuring has to be able to
     /// see a file that IS there. One sibling per crate, chosen because each is
     /// named in the same design tables as the missing ones, plus the target
-    /// that most recently moved off [`TOOL_TARGETS`] -- which makes this the
-    /// assertion that fails first if a landed file is ever double-counted as
-    /// both present and absent.
+    /// that most recently moved off [`TOOL_TARGETS`], and the two that most
+    /// recently moved off [`ENGINE_TARGETS`] -- which makes this the assertion
+    /// that fails first if a landed file is ever double-counted as both present
+    /// and absent.
     #[test]
     fn the_gate_can_see_a_present_file() {
         let root = repo_root();
@@ -2107,6 +2115,8 @@ mod absent_target_gate {
             "curl-rs/src/callbacks/mod.rs",
             "curl-rs/src/config/mod.rs",
             "curl-rs/src/config/parseconfig.rs",
+            "curl-rs-lib/src/proxy/socks.rs",
+            "curl-rs-lib/src/proxy/haproxy.rs",
             "curl-rs-ffi/src/ffi/easy.rs",
         ] {
             assert!(

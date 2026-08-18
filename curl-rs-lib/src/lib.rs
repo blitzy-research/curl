@@ -394,20 +394,20 @@ pub mod share;
 //
 // WHICH CHILDREN, measured against this checkout rather than left vague,
 // because "children remain" is the kind of statement that survives long after
-// it stops being true. Seventeen of the files AAP 0.4.1 assigns to this crate
-// are not on disk: `easy/{handle,setopt,getinfo}.rs`;
-// `transfer/content_encoding.rs`; the eight per-scheme executors
-// `protocols/{http1,http2,http3,ftp/pingpong,sftp,scp,file,ws}.rs` together with
-// `protocols/stub.rs`; and `proxy/{socks,socks_gss,http_connect,haproxy}.rs`.
-// Every other assigned file exists -- `transfer/chunked.rs` among them, which
-// is why this count reads seventeen and not the eighteen it once did. That
-// distinction is what `version.rs`'s engine registry records per capability,
-// and `curl-rs/src/bin/curlinfo.rs` checks each of its claims against the
-// tree.
+// it stops being true. Fourteen of the files AAP 0.4.1 assigns to this crate
+// are not on disk: `easy/{handle,setopt,getinfo}.rs`; the eight per-scheme
+// executors `protocols/{http1,http2,http3,ftp/pingpong,sftp,scp,file,ws}.rs`
+// together with `protocols/stub.rs`; and `proxy/{socks_gss,http_connect}.rs`.
+// Every other assigned file exists -- `transfer/chunked.rs`,
+// `transfer/content_encoding.rs`, `proxy/socks.rs` and `proxy/haproxy.rs` among
+// them, which is why this count reads fourteen and not the eighteen it once
+// did, and why `transfer/` now has no absent file at all. That distinction is
+// what `version.rs`'s engine registry records per capability, and
+// `curl-rs/src/bin/curlinfo.rs` checks each of its claims against the tree.
 //
-// Those same seventeen paths are held as data, not prose, by
+// Those same fourteen paths are held as data, not prose, by
 // `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs`, alongside the thirteen
-// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 32
+// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 29
 // across the workspace. The ABI figure read three, and the total 37, until
 // `curl-rs-ffi/src/ffi/share.rs` landed. That gate fails, naming the file, as
 // soon as one of

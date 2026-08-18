@@ -89,8 +89,19 @@
 //! It carries both copyright holders of `lib/conncache.c:1-23`, in the C's
 //! order. The single blank comment line the C has between "KIND, either
 //! express or implied." and its SPDX line is absorbed, which is what places
+// REUSE-IgnoreStart
 //! `// SPDX-License-Identifier: curl` on line 21 as this tree's other 81
+// REUSE-IgnoreEnd
 //! sources have it.
+//!
+//! The two `REUSE-Ignore` markers around that sentence are load-bearing and
+//! are the mechanism `reuse` documents for exactly this case. Without them the
+//! tool finds the tag inside the prose, parses the REST of the line as a
+//! licence expression, and reports `Invalid SPDX License Expressions: 1`
+//! against this file -- so a paragraph explaining where the real tag sits was
+//! itself being read as a second, malformed tag. The markers are ordinary `//`
+//! comments rather than `//!` ones so that they stay out of the rendered
+//! documentation.
 
 use core::fmt;
 use std::collections::BTreeMap;

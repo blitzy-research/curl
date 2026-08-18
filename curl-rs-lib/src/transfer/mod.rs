@@ -49,10 +49,10 @@
 //! # Partially delivered
 //!
 //! Of this module's planned children, [`ratelimit`], [`progress`], [`sendf`],
-//! [`request`], [`writeout`] and [`chunked`] exist. The transfer loop itself
-//! and content encoding arrive with their own files, and each declaration
-//! lands WITH its file -- a `mod` line without a file is `error[E0583]`, which
-//! no attribute can reach, because module resolution never gets far enough to
+//! [`request`], [`writeout`], [`chunked`] and [`content_encoding`] exist. The
+//! transfer loop itself arrives with its own file, and each declaration lands
+//! WITH its file -- a `mod` line without a file is `error[E0583]`, which no
+//! attribute can reach, because module resolution never gets far enough to
 //! produce a lint.
 //!
 //! The order in which they compose is dependency order rather than
@@ -191,3 +191,26 @@ pub(crate) mod writeout;
 /// the consumer implements, which is also what lets the parser be driven from
 /// memory, one byte at a time, without a network.
 pub(crate) mod chunked;
+
+/// Content and transfer decoding: supersedes `lib/content_encoding.c` and
+/// `lib/content_encoding.h`.
+///
+/// The registry of decoders this build compiled, the `Accept-Encoding` token
+/// list that registry produces, and the construction of the unencoding writer
+/// stack from a `Content-Encoding` or `Transfer-Encoding` header value. The
+/// C's zlib, brotli and zstd calls become `flate2` on its pure-Rust backend,
+/// `brotli` and `zstd`; every registry order, separator byte, state machine
+/// and refusal point is transcribed rather than reinterpreted.
+///
+/// It depends on [`sendf`] for the writer contract and on [`chunked`] for the
+/// one transfer coding it installs without owning -- `"chunked"`, whose stage
+/// arrives through `chunked::transfer_unencoder` -- and it names no protocol
+/// module: HTTP/1 assembly CONSUMES this module, both to install the stack
+/// from a response header and to emit `Accept-Encoding` with the exact bytes
+/// and order `content_encodings` produces.
+///
+/// Decoding is streamed. Each stage decompresses into a fixed 16 KiB window
+/// and forwards what it produced immediately, so a highly compressible body
+/// costs a bounded amount of resident memory rather than its expanded size,
+/// and a downstream refusal returns that stage's own code unchanged.
+pub(crate) mod content_encoding;

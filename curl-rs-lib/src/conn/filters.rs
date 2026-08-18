@@ -3324,7 +3324,7 @@ impl FilterChains {
 // Tests
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::trace::{TraceConfig, TraceLevel, WriterSink};
     use crate::util::sync_cell::SyncCell;
@@ -3339,13 +3339,13 @@ mod tests {
     /// -- deliberately, since recovering the concrete type is exactly what this
     /// module exists to abolish. A shared log is therefore the ONLY way a test
     /// can observe what a linked filter did, and it is fully typed.
-    type EventLog = Arc<SyncCell<Vec<String>>>;
+    pub(crate) type EventLog = Arc<SyncCell<Vec<String>>>;
 
-    fn new_log() -> EventLog {
+    pub(crate) fn new_log() -> EventLog {
         Arc::new(SyncCell::new(Vec::new()))
     }
 
-    fn events(log: &EventLog) -> Vec<String> {
+    pub(crate) fn events(log: &EventLog) -> Vec<String> {
         log.borrow().clone()
     }
 
@@ -3354,42 +3354,42 @@ mod tests {
     /// Everything the in-memory transport can be told to do, and everything it
     /// records having done.
     #[derive(Debug)]
-    struct TransportState {
+    pub(crate) struct TransportState {
         /// Bytes the transport will hand upward, consumed from the front.
-        input: Vec<u8>,
+        pub(crate) input: Vec<u8>,
         /// Bytes the transport captured on the way down.
-        output: Vec<u8>,
+        pub(crate) output: Vec<u8>,
         /// Whether a read would succeed.
-        readable: bool,
+        pub(crate) readable: bool,
         /// Whether a write would succeed.
-        writable: bool,
+        pub(crate) writable: bool,
         /// How many more [`ConnFilter::connect`] calls before it reports done.
-        connect_steps: usize,
+        pub(crate) connect_steps: usize,
         /// How many more [`ConnFilter::shutdown`] calls before it reports done.
-        shutdown_steps: usize,
+        pub(crate) shutdown_steps: usize,
         /// What [`ConnFilter::is_alive`] reports.
-        alive: bool,
+        pub(crate) alive: bool,
         /// The `input_pending` half of that answer.
-        input_pending: bool,
+        pub(crate) input_pending: bool,
         /// What `CF_QUERY_SOCKET` reports.
-        socket: Socket,
+        pub(crate) socket: Socket,
         /// When set, every control event fails with this code.
-        fail_control: Option<CURLcode>,
+        pub(crate) fail_control: Option<CURLcode>,
         /// The answers this transport is prepared to give.
-        answers: Vec<(CfQuery, CfQueryValue)>,
+        pub(crate) answers: Vec<(CfQuery, CfQueryValue)>,
         /// Every control event received, in order.
-        controls: Vec<CfControl>,
+        pub(crate) controls: Vec<CfControl>,
         /// Every query received, in order.
-        queries: Vec<CfQuery>,
+        pub(crate) queries: Vec<CfQuery>,
         /// The `eos` flag of every send received, in order.
-        eos_seen: Vec<bool>,
+        pub(crate) eos_seen: Vec<bool>,
         /// Call counters.
-        sends: usize,
-        recvs: usize,
-        connects: usize,
-        shutdowns: usize,
-        closes: usize,
-        pollsets: usize,
+        pub(crate) sends: usize,
+        pub(crate) recvs: usize,
+        pub(crate) connects: usize,
+        pub(crate) shutdowns: usize,
+        pub(crate) closes: usize,
+        pub(crate) pollsets: usize,
     }
 
     impl Default for TransportState {
@@ -3420,11 +3420,11 @@ mod tests {
     }
 
     /// A handle on a transport's state that outlives the chain owning it.
-    type TransportHandle = Arc<SyncCell<TransportState>>;
+    pub(crate) type TransportHandle = Arc<SyncCell<TransportState>>;
 
     /// A bottom-of-chain transport over two byte buffers.
     #[derive(Debug)]
-    struct InMemory {
+    pub(crate) struct InMemory {
         base: FilterBase,
         state: TransportHandle,
         name: &'static str,
@@ -3433,7 +3433,10 @@ mod tests {
     }
 
     impl InMemory {
-        fn new(name: &'static str, log: &EventLog) -> (Self, TransportHandle) {
+        pub(crate) fn new(
+            name: &'static str,
+            log: &EventLog,
+        ) -> (Self, TransportHandle) {
             let state: TransportHandle =
                 Arc::new(SyncCell::new(TransportState::default()));
             let filter = Self {
@@ -3446,7 +3449,7 @@ mod tests {
             (filter, state)
         }
 
-        fn with_flags(mut self, flags: CfType) -> Self {
+        pub(crate) fn with_flags(mut self, flags: CfType) -> Self {
             self.flags = flags;
             self
         }

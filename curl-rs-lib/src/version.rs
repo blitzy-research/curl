@@ -851,9 +851,11 @@ fn tls_supports_ech() -> bool {
 // already written. `Engine` therefore carries `written` beside `present`, three
 // constructors cover the three reachable combinations, and the fourth --
 // executing work with no source -- is unrepresentable. Measured over this
-// checkout: SIX rows are `working`, TWENTY are `inert` (written, not wired), and
-// THREE are genuinely `unwritten` -- `proxy/http_connect.rs`,
-// `transfer/content_encoding.rs` and `curl-rs/src/libcurl_src.rs`.
+// checkout: SEVEN rows are `working`, TWENTY are `inert` (written, not wired),
+// and TWO are genuinely `unwritten` -- `proxy/http_connect.rs` and
+// `curl-rs/src/libcurl_src.rs`. `transfer/content_encoding.rs` was the third
+// until its file landed, and its row moved to `inert` rather than to `working`
+// because nothing yet installs a decoder stage.
 //
 // The `written` flag changes no capability answer. It exists so that "what would
 // clear this row" is recorded correctly, and so that the claim is checkable:
@@ -1033,13 +1035,16 @@ pub const ENGINE_TLS: Engine = Engine::inert("curl-rs-lib/src/tls/mod.rs");
 /// Proxy support -- `curl-rs-lib/src/proxy/`.
 ///
 /// Gates `HTTPS-proxy`, and the `proxy` row of `curlinfo`. UNWRITTEN, and this
-/// is one of the three entries where that is literally true:
-/// `proxy/http_connect.rs` does not exist, nor do `proxy/socks.rs`,
-/// `proxy/socks_gss.rs` or `proxy/haproxy.rs`. `proxy/mod.rs` and
-/// `proxy/noproxy.rs` are the only two files in the subtree, and `noproxy.rs`
-/// decides whether a proxy would be BYPASSED -- it cannot reach one. So there
-/// is no CONNECT tunnel over which to layer a rustls session and no proxy of
-/// any kind can be reached.
+/// is one of the two entries where that is literally true of the owner:
+/// `proxy/http_connect.rs` does not exist, nor does `proxy/socks_gss.rs`.
+/// `proxy/mod.rs`, `proxy/noproxy.rs`, `proxy/socks.rs` and `proxy/haproxy.rs`
+/// are the whole subtree, and none of the three that exist beyond the module
+/// root can reach a proxy on its own: `noproxy.rs` decides whether one would be
+/// BYPASSED, `socks.rs` performs the SOCKS4, SOCKS4a, SOCKS5 and SOCKS5h
+/// handshake over a transport somebody else connected, and `haproxy.rs` writes
+/// the PROXY protocol header at the head of a connection somebody else
+/// established. So there is no CONNECT tunnel over which to layer a rustls
+/// session and no proxy of any kind can be reached.
 ///
 /// This is the most expensive withholding measured anywhere in the registry: no
 /// fixture gates on `HTTPS-proxy`, but **225** gate on `proxy`, the single most
@@ -1111,13 +1116,30 @@ pub const ENGINE_STATE_STORES: Engine =
 
 /// Content decoding -- `curl-rs-lib/src/transfer/content_encoding.rs`.
 ///
-/// Gates `libz`, `brotli` and `zstd`. UNWRITTEN, and this is one of the three
-/// entries where that is literally true: the file does not exist, so a
-/// `Content-Encoding` response body cannot be decoded even though `flate2`,
-/// `brotli` and `zstd` are linked. 19, 3 and 2 fixtures require the three names
-/// respectively.
+/// Gates `libz`, `brotli` and `zstd`.
+///
+/// INERT, not unwritten, and the row moved for the reason this field exists:
+/// the file IS on disk now. It carries the whole of
+/// `lib/content_encoding.c` -- the registry of compiled decoders, the
+/// `Accept-Encoding` token list `deflate, gzip, br, zstd`, the deflate stage
+/// with its broken-server raw fallback, the transparent gzip wrapper, brotli,
+/// zstd, `identity` and the deferred `ce-error` stage, and
+/// `Curl_build_unencoding_stack` with all eight of its refusals. Its
+/// capability facts are not restated here either: the three names and the
+/// three bits below come from that module's `DECODER_CAPABILITIES`, so a
+/// feature that is off loses its decoder and its advertisement together.
+///
+/// What is missing is the caller. A decoder stage is installed from a response
+/// header, and no response is received: `protocols/http1.rs` does not exist,
+/// so nothing parses a `Content-Encoding` line, and the transfer loop that
+/// would drive the writer chain (see [`ENGINE_TRANSFER`]) is not wired either.
+/// A `Content-Encoding` body therefore still cannot be decoded end to end,
+/// which is what `is_present() == false` says -- and saying it is the safe
+/// direction: 19, 3 and 2 fixtures require the three names respectively, and a
+/// fixture that skips reports the gap while one that runs against an
+/// unreachable engine reports a defect that does not exist.
 pub const ENGINE_CONTENT_ENCODING: Engine =
-    Engine::unwritten("curl-rs-lib/src/transfer/content_encoding.rs");
+    Engine::inert("curl-rs-lib/src/transfer/content_encoding.rs");
 
 /// The protocol implementations -- `curl-rs-lib/src/protocols/`.
 ///
@@ -1157,16 +1179,19 @@ pub const ENGINE_PROTOCOLS: Engine =
 ///
 /// INERT, not unwritten: `transfer/mod.rs`, `transfer/request.rs` (6,279
 /// lines), `transfer/sendf.rs` (10,231), `transfer/writeout.rs`,
-/// `transfer/progress.rs` and `transfer/ratelimit.rs` all exist. What is missing
-/// is the loop itself -- `transfer/mod.rs` is 174 lines of module declarations
-/// and carries no state machine -- and `transfer/content_encoding.rs` is absent
-/// outright. `transfer/chunked.rs` is present and complete: chunk framing in
-/// both directions, with the `chunked` transfer-decoding writer and
-/// transfer-encoding reader both registered. It still runs nothing on its own,
-/// because a stage is only reached by a transfer loop and an executor, neither
-/// of which exists. So even a scheme with its own executor would have nothing
-/// to run it. Recorded so that a later checkpoint enabling
-/// [`ENGINE_PROTOCOLS`] has to confront this one as well.
+/// `transfer/progress.rs` and `transfer/ratelimit.rs` all exist. What is
+/// missing is the loop itself -- `transfer/mod.rs` carries module declarations
+/// and no state machine. Every OTHER file this directory is assigned now
+/// exists: `transfer/chunked.rs` is complete, with chunk framing in both
+/// directions and both the `chunked` transfer-decoding writer and the
+/// transfer-encoding reader registered, and `transfer/content_encoding.rs` is
+/// complete too, with every content decoder and the unencoding stack builder
+/// (see [`ENGINE_CONTENT_ENCODING`], which records its own inertness for the
+/// same reason). Neither runs anything on its own, because a stage is only
+/// reached by a transfer loop and an executor, neither of which exists. So
+/// even a scheme with its own executor would have nothing to run it. Recorded
+/// so that a later checkpoint enabling [`ENGINE_PROTOCOLS`] has to confront
+/// this one as well.
 pub const ENGINE_TRANSFER: Engine =
     Engine::inert("curl-rs-lib/src/transfer/mod.rs");
 
@@ -3375,7 +3400,7 @@ mod tests {
     }
 
     #[test]
-    fn only_three_engines_are_genuinely_unwritten() {
+    fn only_two_engines_are_genuinely_unwritten() {
         // The distinction the `written` field exists to record, asserted as a
         // SET rather than a count so that the answer to "what would clear this
         // row" cannot silently move between "write a file" and "wire one".
@@ -3390,11 +3415,14 @@ mod tests {
             .map(Engine::owner)
             .collect();
 
+        // `curl-rs-lib/src/transfer/content_encoding.rs` was a third member of
+        // this set until its file landed. Its row is now `inert`: the decoders,
+        // the token list and the stack builder all exist, and what is still
+        // missing is the HTTP/1 response parsing that would install a stage.
         assert_eq!(
             unwritten,
             vec![
                 "curl-rs-lib/src/proxy/http_connect.rs",
-                "curl-rs-lib/src/transfer/content_encoding.rs",
                 "curl-rs/src/libcurl_src.rs",
             ],
             "the set of engines whose remedy is WRITING a file"
@@ -3410,7 +3438,7 @@ mod tests {
         // defines all twelve `curl_mime_*` exports on top of the module, which
         // is the artifact-level evidence this registry requires, and
         // `curl-rs/src/bin/curlinfo.rs` reports the row ON accordingly.
-        assert_eq!((working, inert, unwritten.len()), (7, 19, 3));
+        assert_eq!((working, inert, unwritten.len()), (7, 20, 2));
         assert_eq!(working + inert + unwritten.len(), ENGINES.len());
     }
 
