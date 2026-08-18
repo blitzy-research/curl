@@ -172,13 +172,17 @@
 // enforces it across the workspace live in `curl-rs-lib/src/lib.rs`
 // (`mod source_policy`).
 //
-// Every consumer of these wrappers lives in a module this crate has yet to
-// grow -- `dns/if2ip.rs` for the interface snapshot, `protocols/mod.rs` and
-// `url/` for the zone-id lookup, `version.rs` for the availability
-// predicate, `lib.rs` for the optional allocator, and `auth/negotiate.rs`
-// plus `proxy/socks_gss.rs` for the GSS-API surface. Until those land, every
-// wrapper is legitimately unreferenced and the zero-warnings gate would
-// otherwise fail on code that is correct. Without those per-item allowances a
+// Nearly every consumer of these wrappers lives in a module this crate has
+// yet to grow -- `dns/if2ip.rs` for the interface snapshot,
+// `protocols/mod.rs` and `url/` for the zone-id lookup, `version.rs` for the
+// availability predicate, `lib.rs` for the optional allocator, and
+// `auth/negotiate.rs` for the SPNEGO half of the GSS-API surface, which needs
+// an HTTP exchange to reach. `proxy/socks_gss.rs` is the one that has LANDED:
+// in a `negotiate` build it drives the RFC 1961 sub-negotiation through `gss`,
+// `SecurityContext`, `ContextFlags` and `Diagnostics`, so that part of the
+// surface has a consumer today. Until the others land the remaining wrappers
+// are legitimately unreferenced and the zero-warnings gate would otherwise
+// fail on code that is correct. Without those per-item allowances a
 // `negotiate` build reports scores of `dead_code` diagnostics, nearly all of
 // them in `gss.rs`.
 //

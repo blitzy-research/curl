@@ -1035,16 +1035,18 @@ pub const ENGINE_TLS: Engine = Engine::inert("curl-rs-lib/src/tls/mod.rs");
 /// Proxy support -- `curl-rs-lib/src/proxy/`.
 ///
 /// Gates `HTTPS-proxy`, and the `proxy` row of `curlinfo`. UNWRITTEN, and this
-/// is one of the two entries where that is literally true of the owner:
-/// `proxy/http_connect.rs` does not exist, nor does `proxy/socks_gss.rs`.
-/// `proxy/mod.rs`, `proxy/noproxy.rs`, `proxy/socks.rs` and `proxy/haproxy.rs`
-/// are the whole subtree, and none of the three that exist beyond the module
-/// root can reach a proxy on its own: `noproxy.rs` decides whether one would be
-/// BYPASSED, `socks.rs` performs the SOCKS4, SOCKS4a, SOCKS5 and SOCKS5h
-/// handshake over a transport somebody else connected, and `haproxy.rs` writes
-/// the PROXY protocol header at the head of a connection somebody else
-/// established. So there is no CONNECT tunnel over which to layer a rustls
-/// session and no proxy of any kind can be reached.
+/// is one of the entries where that is literally true of the owner:
+/// `proxy/http_connect.rs` does not exist. `proxy/mod.rs`, `proxy/noproxy.rs`,
+/// `proxy/socks.rs`, `proxy/haproxy.rs` and -- behind the default-off
+/// `negotiate` feature -- `proxy/socks_gss.rs` are the whole subtree, and none
+/// of the four that exist beyond the module root can reach a proxy on its own:
+/// `noproxy.rs` decides whether one would be BYPASSED, `socks.rs` performs the
+/// SOCKS4, SOCKS4a, SOCKS5 and SOCKS5h handshake over a transport somebody else
+/// connected, `haproxy.rs` writes the PROXY protocol header at the head of a
+/// connection somebody else established, and `socks_gss.rs` performs the RFC
+/// 1961 GSS-API sub-negotiation inside that SOCKS5 handshake. So there is no
+/// CONNECT tunnel over which to layer a rustls session and no proxy of any kind
+/// can be reached.
 ///
 /// This is the most expensive withholding measured anywhere in the registry: no
 /// fixture gates on `HTTPS-proxy`, but **225** gate on `proxy`, the single most
@@ -1148,18 +1150,23 @@ pub const ENGINE_CONTENT_ENCODING: Engine =
 /// INERT, not unwritten, and the distinction is sharper here than anywhere else
 /// in the registry: `protocols/mod.rs` exists and carries the complete 33-entry
 /// scheme registry that `Curl_get_scheme` resolves against
-/// (`lib/url.c:1469-1500`), so a URL's scheme IS recognised, its default port
-/// IS known, and `CURLU` parsing works. What does not exist is any per-scheme
-/// EXECUTOR. `protocols/` holds exactly three files: `mod.rs` (the registry),
-/// `ftp/mod.rs` (74 lines, a module root declaring its one written child) and
-/// `ftp/listparser.rs` (5,516 lines), and the listing parser interprets the
-/// output of a `LIST` command without being able to issue one. The nine files
-/// that would carry an executor -- `http1`, `http2`, `http3`, `sftp`, `scp`,
-/// `file`, `ws`, `stub` and `ftp/pingpong` -- are all absent, which
-/// `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` checks against the disk.
-/// `protocols::EXECUTORS` is therefore empty, and because `SchemeInfo::runnable`
-/// is derived from it, no scheme reports an implementation -- the same answer
-/// C's non-`NULL` `run` pointer test gives for a scheme compiled out.
+/// (`lib/url.c:1469-1500`) -- its own nine in-scope rows plus the 24 that
+/// `protocols/stub.rs` transcribes for the schemes specification 0.2.2 excludes
+/// from implementation -- so a URL's scheme IS recognised, its default port IS
+/// known, and `CURLU` parsing works. What does not exist is any per-scheme
+/// EXECUTOR. `protocols/` holds exactly four files: `mod.rs` (the registry),
+/// `stub.rs` (the 24 out-of-scope rows, every one carrying `run: None` and none
+/// contributing to the `Protocols:` banner, so the fixtures that target them
+/// skip instead of failing), `ftp/mod.rs` (74 lines, a module root declaring
+/// its one written child) and `ftp/listparser.rs` (5,516 lines), and the
+/// listing parser interprets the output of a `LIST` command without being able
+/// to issue one. The eight files that would carry an executor -- `http1`,
+/// `http2`, `http3`, `sftp`, `scp`, `file`, `ws` and `ftp/pingpong` -- are all
+/// absent, which `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` checks
+/// against the disk. `protocols::EXECUTORS` is therefore empty, and because
+/// `SchemeInfo::runnable` is derived from it, no scheme reports an
+/// implementation -- the same answer C's non-`NULL` `run` pointer test gives
+/// for a scheme compiled out.
 ///
 /// Consequence, stated plainly rather than left to be discovered: [`protocols`]
 /// returns an empty slice and the `Protocols:` banner line is empty. The
@@ -1177,19 +1184,22 @@ pub const ENGINE_PROTOCOLS: Engine =
 /// Gates nothing on its own today, and is registered because it is the engine
 /// every protocol claim ultimately rests on.
 ///
-/// INERT, not unwritten: `transfer/mod.rs`, `transfer/request.rs` (6,279
-/// lines), `transfer/sendf.rs` (10,231), `transfer/writeout.rs`,
-/// `transfer/progress.rs` and `transfer/ratelimit.rs` all exist. What is
-/// missing is the loop itself -- `transfer/mod.rs` carries module declarations
-/// and no state machine. Every OTHER file this directory is assigned now
-/// exists: `transfer/chunked.rs` is complete, with chunk framing in both
-/// directions and both the `chunked` transfer-decoding writer and the
-/// transfer-encoding reader registered, and `transfer/content_encoding.rs` is
-/// complete too, with every content decoder and the unencoding stack builder
+/// INERT, not unwritten -- and no longer for want of the loop.
+/// `transfer/mod.rs` now carries the async transfer core and the state driver:
+/// the `Curl_xfer_*` surface of `lib/transfer.c` together with the per-state
+/// work `multi_runsingle`'s `switch(data->mstate)` performs, reporting its
+/// outcome as a typed value so the multi handle keeps the collection mechanics.
+/// `transfer/request.rs` (6,279 lines), `transfer/sendf.rs` (10,231),
+/// `transfer/writeout.rs`, `transfer/progress.rs` and `transfer/ratelimit.rs`
+/// exist alongside it, as do `transfer/chunked.rs`, complete with chunk framing
+/// in both directions and both the `chunked` transfer-decoding writer and the
+/// transfer-encoding reader registered, and `transfer/content_encoding.rs`,
+/// complete too with every content decoder and the unencoding stack builder
 /// (see [`ENGINE_CONTENT_ENCODING`], which records its own inertness for the
-/// same reason). Neither runs anything on its own, because a stage is only
-/// reached by a transfer loop and an executor, neither of which exists. So
-/// even a scheme with its own executor would have nothing to run it. Recorded
+/// same reason). This directory therefore has no absent file at all. What is
+/// missing sits on either side of the loop rather than in it: no per-scheme
+/// EXECUTOR exists for the driver to run, and neither `crate::easy` nor
+/// `crate::multi` calls the driver yet, so no stage is ever reached. Recorded
 /// so that a later checkpoint enabling [`ENGINE_PROTOCOLS`] has to confront
 /// this one as well.
 pub const ENGINE_TRANSFER: Engine =

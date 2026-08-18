@@ -394,20 +394,31 @@ pub mod share;
 //
 // WHICH CHILDREN, measured against this checkout rather than left vague,
 // because "children remain" is the kind of statement that survives long after
-// it stops being true. Fourteen of the files AAP 0.4.1 assigns to this crate
+// it stops being true. Twelve of the files AAP 0.4.1 assigns to this crate
 // are not on disk: `easy/{handle,setopt,getinfo}.rs`; the eight per-scheme
-// executors `protocols/{http1,http2,http3,ftp/pingpong,sftp,scp,file,ws}.rs`
-// together with `protocols/stub.rs`; and `proxy/{socks_gss,http_connect}.rs`.
-// Every other assigned file exists -- `transfer/chunked.rs`,
-// `transfer/content_encoding.rs`, `proxy/socks.rs` and `proxy/haproxy.rs` among
-// them, which is why this count reads fourteen and not the eighteen it once
-// did, and why `transfer/` now has no absent file at all. That distinction is
-// what `version.rs`'s engine registry records per capability, and
-// `curl-rs/src/bin/curlinfo.rs` checks each of its claims against the tree.
+// executors `protocols/{http1,http2,http3,ftp/pingpong,sftp,scp,file,ws}.rs`;
+// and `proxy/http_connect.rs`.
+// Every other assigned file exists -- `protocols/stub.rs`,
+// `transfer/chunked.rs`, `transfer/content_encoding.rs`, `proxy/socks.rs`,
+// `proxy/haproxy.rs` and `proxy/socks_gss.rs` among them, which is why this
+// count reads twelve and not the eighteen it once did, and why `transfer/` now
+// has no absent file at all. `proxy/socks_gss.rs` is additionally the first
+// module in this crate that exists only behind a non-default feature: it is
+// compiled when `negotiate` is on and is genuinely absent from the default
+// build, which is the C's `#if defined(HAVE_GSSAPI)` and not a gap. That
+// distinction is what `version.rs`'s engine registry records per capability,
+// and `curl-rs/src/bin/curlinfo.rs` checks each of its claims against the tree.
 //
-// Those same fourteen paths are held as data, not prose, by
+// `protocols/stub.rs` is worth one sentence of its own, because its landing
+// changes what is left rather than what this build can do: it REGISTERS the 24
+// schemes AAP 0.2.2 excludes from implementation, every row carrying no
+// executor, and it is deliberately absent from `version.rs`'s `Protocols:`
+// banner so that the 283 fixtures targeting those schemes skip instead of
+// failing. Registering a scheme and serving one are separate obligations.
+//
+// Those same twelve paths are held as data, not prose, by
 // `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs`, alongside the thirteen
-// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 29
+// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 27
 // across the workspace. The ABI figure read three, and the total 37, until
 // `curl-rs-ffi/src/ffi/share.rs` landed. That gate fails, naming the file, as
 // soon as one of

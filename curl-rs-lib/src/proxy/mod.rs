@@ -80,6 +80,26 @@ pub(crate) mod noproxy;
 /// modules and neither can drift from the other.
 pub(crate) mod socks;
 
+/// SOCKS5 GSS-API authentication, RFC 1961 -- supersedes
+/// `lib/socks_gssapi.c`.
+///
+/// Not a filter: the exchange is a helper the `"SOCKS"` filter runs from inside
+/// its own connect path, reached through the [`socks::GssapiNegotiator`] seam
+/// so that neither module has to know how the other is built.
+///
+/// The feature gate IS the C's `#if defined(HAVE_GSSAPI) &&
+/// !defined(CURL_DISABLE_PROXY)` (`lib/socks_gssapi.c:27`), and `negotiate` is
+/// **off by default** (AAP sections 0.5.2 and 0.8.3): the default build links no
+/// C security library at all, and `crate::version` withholds `GSS-API`,
+/// `SPNEGO` and `Kerberos` from the `Features:` banner accordingly, so the
+/// fixtures that gate on them skip legitimately rather than run and fail.
+/// AAP section 0.8.5's conflict C2 records why that does not breach the
+/// no-C-TLS mandate: GSS-API is an authentication mechanism, not a TLS library.
+///
+/// The gate is applied here, once. The module itself is not gated internally.
+#[cfg(feature = "negotiate")]
+pub(crate) mod socks_gss;
+
 /// The PROXY protocol version 1 header -- supersedes `lib/cf-haproxy.c` and
 /// `lib/cf-haproxy.h`.
 ///

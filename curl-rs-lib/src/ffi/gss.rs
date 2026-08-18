@@ -921,11 +921,13 @@ pub(crate) fn request_flags(
 /// C threads a `struct Curl_easy *data` through every function that might need
 /// to talk (`lib/curl_gssapi.c:313`, `:429`) and calls `infof()` on it. The
 /// Rust session handle belongs in `src/easy/`, and `src/ffi/` must not depend
-/// upward on it, so the sink is injected instead. The caller -- either
-/// `src/auth/negotiate.rs` or `src/proxy/socks_gss.rs`, neither of which exists
-/// yet -- is to implement this over its own handle and route the message
-/// through the crate's trace machinery, so that `--verbose` and `--trace`
-/// behave exactly as they do for every other `infof()` message.
+/// upward on it, so the sink is injected instead. The callers are
+/// `src/auth/negotiate.rs` and `src/proxy/socks_gss.rs`, and the second one
+/// implements it today over a collecting sink, so that its RFC 1961
+/// sub-negotiation can decide what each line was for once the call's outcome is
+/// known. Routing those lines onward through the crate's trace machinery, so
+/// that `--verbose` and `--trace` behave exactly as they do for every other
+/// `infof()` message, waits on the session handle in `src/easy/`.
 pub(crate) trait Diagnostics {
     /// Emit one informational line. The message carries no trailing newline,
     /// matching `infof()`.

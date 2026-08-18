@@ -208,21 +208,37 @@ use crate::util::timeval::{timediff_ms, Clock, CurlTime};
 /// `CURLE_UNSUPPORTED_PROTOCOL` rather than fail to compile, and it still has
 /// to report a truthful `Protocols:` line.
 ///
-/// **The other eight children of this directory are absent from this
+/// **The other seven children of this directory are absent from this
 /// checkout**, and their declarations therefore cannot be written: a `mod`
 /// line without its file is `error[E0583]`, which no attribute suppresses. The
 /// absence is measured rather than assumed --
 /// `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` names `http1.rs`,
-/// `http2.rs`, `http3.rs`, `sftp.rs`, `scp.rs`, `file.rs`, `ws.rs`,
-/// `stub.rs` and `ftp/pingpong.rs` and asserts against the disk that each is
+/// `http2.rs`, `http3.rs`, `sftp.rs`, `scp.rs`, `file.rs`, `ws.rs`
+/// and `ftp/pingpong.rs` and asserts against the disk that each is
 /// still missing. Each declaration lands with the file it names, which is the
 /// convention `curl-rs-lib/src/lib.rs` states for the whole crate.
 ///
-/// Two consequences follow and are recorded where they bite: every row of
-/// [`SCHEMES`] carries `run: None` (see [`Scheme::run`]), and the 24 stub rows
-/// are written here rather than imported from the absent `stub.rs`.
+/// One consequence follows and is recorded where it bites: every row of
+/// [`SCHEMES`] carries `run: None` (see [`Scheme::run`]). The eighth child,
+/// [`stub`], has landed and now owns the 24 out-of-scope rows that this file
+/// used to hold inline.
 #[cfg(feature = "ftp")]
 pub(crate) mod ftp;
+
+/// The 24 schemes registered for ABI completeness -- `lib/smtp.c`,
+/// `lib/imap.c`, `lib/pop3.c`, `lib/telnet.c`, `lib/tftp.c`, `lib/smb.c`,
+/// `lib/ldap.c`, `lib/openldap.c`, `lib/rtsp.c`, `lib/mqtt.c`,
+/// `lib/curl_rtmp.c`, `lib/dict.c` and `lib/gopher.c`.
+///
+/// Declared with NO `#[cfg]`, unlike [`ftp`] above, and the asymmetry is
+/// deliberate. `ftp` gates an IMPLEMENTATION, which a build may legitimately
+/// omit; this module holds only REGISTRY ROWS, and the registry has to be 33
+/// rows long under every feature combination -- including
+/// `--no-default-features` -- so that `smtp://` answers
+/// `CURLE_UNSUPPORTED_PROTOCOL` rather than failing to compile, and so that
+/// `CURLOPT_PROTOCOLS_STR` keeps accepting every name the public header
+/// declares.
+pub(crate) mod stub;
 
 // The protocol bit set -- `curl_prot_t` and the `CURLPROTO_*` values
 
@@ -883,124 +899,13 @@ const FLAGS_WSS: ProtocolOptions = protopt(&[
     ProtocolOptions::USERPWDCTRL,
 ]);
 
-/// `lib/smtp.c:2030-2031`.
-const FLAGS_SMTP: ProtocolOptions = protopt(&[
-    ProtocolOptions::CLOSEACTION,
-    ProtocolOptions::NOURLQUERY,
-    ProtocolOptions::URLOPTIONS,
-    ProtocolOptions::SSL_REUSE,
-    ProtocolOptions::CONN_REUSE,
-]);
-
-/// `lib/smtp.c:2047-2048`.
-const FLAGS_SMTPS: ProtocolOptions = protopt(&[
-    ProtocolOptions::CLOSEACTION,
-    ProtocolOptions::SSL,
-    ProtocolOptions::NOURLQUERY,
-    ProtocolOptions::URLOPTIONS,
-    ProtocolOptions::CONN_REUSE,
-]);
-
-/// `lib/imap.c:2349-2351`. No `PROTOPT_NOURLQUERY`: an IMAP URL carries its
-/// query.
-const FLAGS_IMAP: ProtocolOptions = protopt(&[
-    ProtocolOptions::CLOSEACTION,
-    ProtocolOptions::URLOPTIONS,
-    ProtocolOptions::SSL_REUSE,
-    ProtocolOptions::CONN_REUSE,
-]);
-
-/// `lib/imap.c:2367-2368`.
-const FLAGS_IMAPS: ProtocolOptions = protopt(&[
-    ProtocolOptions::CLOSEACTION,
-    ProtocolOptions::SSL,
-    ProtocolOptions::URLOPTIONS,
-    ProtocolOptions::CONN_REUSE,
-]);
-
-/// `lib/pop3.c:1738-1739`.
-const FLAGS_POP3: ProtocolOptions = protopt(&[
-    ProtocolOptions::CLOSEACTION,
-    ProtocolOptions::NOURLQUERY,
-    ProtocolOptions::URLOPTIONS,
-    ProtocolOptions::SSL_REUSE,
-    ProtocolOptions::CONN_REUSE,
-]);
-
-/// `lib/pop3.c:1755-1756`.
-const FLAGS_POP3S: ProtocolOptions = protopt(&[
-    ProtocolOptions::CLOSEACTION,
-    ProtocolOptions::SSL,
-    ProtocolOptions::NOURLQUERY,
-    ProtocolOptions::URLOPTIONS,
-    ProtocolOptions::CONN_REUSE,
-]);
-
-/// `lib/telnet.c`: `PROTOPT_NONE | PROTOPT_NOURLQUERY`.
-///
-/// The C writes the redundant `PROTOPT_NONE` explicitly; it is the identity, so
-/// the mask is `NOURLQUERY` alone. The list keeps the C's shape.
-const FLAGS_TELNET: ProtocolOptions =
-    protopt(&[ProtocolOptions::NONE, ProtocolOptions::NOURLQUERY]);
-
-/// `lib/tftp.c`: `PROTOPT_NOTCPPROXY | PROTOPT_NOURLQUERY`.
-///
-/// `PROTOPT_NOTCPPROXY` is unique to TFTP among all 33 rows -- it is the only
-/// scheme that cannot be proxied over TCP, because it runs over UDP.
-const FLAGS_TFTP: ProtocolOptions =
-    protopt(&[ProtocolOptions::NOTCPPROXY, ProtocolOptions::NOURLQUERY]);
-
-/// `lib/smb.c`: `PROTOPT_CONN_REUSE` alone.
-const FLAGS_SMB: ProtocolOptions = protopt(&[ProtocolOptions::CONN_REUSE]);
-
-/// `lib/smb.c`: `PROTOPT_SSL | PROTOPT_CONN_REUSE`.
-const FLAGS_SMBS: ProtocolOptions =
-    protopt(&[ProtocolOptions::SSL, ProtocolOptions::CONN_REUSE]);
-
-/// `lib/ldap.c`: `PROTOPT_SSL_REUSE` alone, and notably NO `PROTOPT_CONN_REUSE`.
-const FLAGS_LDAP: ProtocolOptions = protopt(&[ProtocolOptions::SSL_REUSE]);
-
-/// `lib/ldap.c`: `PROTOPT_SSL` alone.
-const FLAGS_LDAPS: ProtocolOptions = protopt(&[ProtocolOptions::SSL]);
-
-/// `lib/rtsp.c`: `PROTOPT_CONN_REUSE` alone.
-const FLAGS_RTSP: ProtocolOptions = protopt(&[ProtocolOptions::CONN_REUSE]);
-
-/// `lib/mqtt.c`: `PROTOPT_NONE`.
-const FLAGS_MQTT: ProtocolOptions = protopt(&[ProtocolOptions::NONE]);
-
-/// `lib/mqtt.c`: `PROTOPT_SSL`.
-const FLAGS_MQTTS: ProtocolOptions = protopt(&[ProtocolOptions::SSL]);
-
-/// `lib/curl_rtmp.c`: `PROTOPT_NONE`, for all six RTMP rows.
-///
-/// One constant for the six because the C registers `PROTOPT_NONE` for every
-/// one of `rtmp`, `rtmpt`, `rtmpe`, `rtmpte`, `rtmps` and `rtmpts` -- including
-/// the two TLS spellings, which carry no `PROTOPT_SSL` because librtmp does
-/// its own transport.
-const FLAGS_RTMP: ProtocolOptions = protopt(&[ProtocolOptions::NONE]);
-
-/// `lib/dict.c`: `PROTOPT_NONE | PROTOPT_NOURLQUERY`.
-const FLAGS_DICT: ProtocolOptions =
-    protopt(&[ProtocolOptions::NONE, ProtocolOptions::NOURLQUERY]);
-
-/// `lib/gopher.c`: `PROTOPT_NONE`.
-const FLAGS_GOPHER: ProtocolOptions = protopt(&[ProtocolOptions::NONE]);
-
-/// `lib/gopher.c`: `PROTOPT_SSL`.
-const FLAGS_GOPHERS: ProtocolOptions = protopt(&[ProtocolOptions::SSL]);
-
-/// All 33 schemes the C tree defines and registers.
+/// The nine schemes specification 0.2.1 puts in core scope, in the C's
+/// registration order.
 ///
 /// Transcribed row by row from the `struct Curl_scheme` definitions the table
-/// at `lib/url.c:1488-1522` points at. The nine in core scope come from
-/// `lib/file.c:626`, `lib/ftp.c:4348` and `:4367`, `lib/http.c:5011` and
-/// `:5028`, `lib/vssh/vssh.c:338` and `:352`, and `lib/ws.c:1984` and `:1999`.
-/// The 24 registered for ABI completeness come from `lib/smtp.c:2022` and
-/// `:2039`, `lib/imap.c:2341` and `:2359`, `lib/pop3.c:1730` and `:1747`,
-/// `lib/telnet.c`, `lib/tftp.c`, `lib/smb.c`, `lib/ldap.c`, `lib/rtsp.c`,
-/// `lib/mqtt.c`, `lib/curl_rtmp.c:263` onwards, `lib/dict.c:295` and
-/// `lib/gopher.c`.
+/// at `lib/url.c:1488-1522` points at: `lib/http.c:5011` and `:5028`,
+/// `lib/ftp.c:4348` and `:4367`, `lib/vssh/vssh.c:338` and `:352`,
+/// `lib/file.c:626`, and `lib/ws.c:1984` and `:1999`.
 ///
 /// `#[rustfmt::skip]` because every column is wire- or ABI-bearing and the
 /// alignment is what makes the table auditable against the C side by side.
@@ -1016,8 +921,7 @@ const FLAGS_GOPHERS: ProtocolOptions = protopt(&[ProtocolOptions::SSL]);
 /// * **`file` has `defport` 0**, a literal in the C rather than a `PORT_*`
 ///   macro, because the scheme has no network endpoint.
 #[rustfmt::skip]
-const SCHEMES: &[Scheme] = &[
-    // -- the nine schemes specification 0.2.1 puts in core scope ------------
+const IN_SCOPE_SCHEMES: [Scheme; 9] = [
     Scheme { name: b"http",    run: None, protocol: Proto::HTTP,    family: Proto::HTTP,    flags: FLAGS_HTTP,    defport: PORT_HTTP },
     Scheme { name: b"https",   run: None, protocol: Proto::HTTPS,   family: Proto::HTTP,    flags: FLAGS_HTTPS,   defport: PORT_HTTPS },
     Scheme { name: b"ftp",     run: None, protocol: Proto::FTP,     family: Proto::FTP,     flags: FLAGS_FTP,     defport: PORT_FTP },
@@ -1027,32 +931,58 @@ const SCHEMES: &[Scheme] = &[
     Scheme { name: b"file",    run: None, protocol: Proto::FILE,    family: Proto::FILE,    flags: FLAGS_FILE,    defport: 0 },
     Scheme { name: b"WS",      run: None, protocol: Proto::WS,      family: Proto::HTTP,    flags: FLAGS_WS,      defport: PORT_HTTP },
     Scheme { name: b"WSS",     run: None, protocol: Proto::WSS,     family: Proto::HTTP,    flags: FLAGS_WSS,     defport: PORT_HTTPS },
-    // -- the 24 registered for ABI completeness -----------------------------
-    Scheme { name: b"smtp",    run: None, protocol: Proto::SMTP,    family: Proto::SMTP,    flags: FLAGS_SMTP,    defport: PORT_SMTP },
-    Scheme { name: b"smtps",   run: None, protocol: Proto::SMTPS,   family: Proto::SMTP,    flags: FLAGS_SMTPS,   defport: PORT_SMTPS },
-    Scheme { name: b"imap",    run: None, protocol: Proto::IMAP,    family: Proto::IMAP,    flags: FLAGS_IMAP,    defport: PORT_IMAP },
-    Scheme { name: b"imaps",   run: None, protocol: Proto::IMAPS,   family: Proto::IMAP,    flags: FLAGS_IMAPS,   defport: PORT_IMAPS },
-    Scheme { name: b"pop3",    run: None, protocol: Proto::POP3,    family: Proto::POP3,    flags: FLAGS_POP3,    defport: PORT_POP3 },
-    Scheme { name: b"pop3s",   run: None, protocol: Proto::POP3S,   family: Proto::POP3,    flags: FLAGS_POP3S,   defport: PORT_POP3S },
-    Scheme { name: b"telnet",  run: None, protocol: Proto::TELNET,  family: Proto::TELNET,  flags: FLAGS_TELNET,  defport: PORT_TELNET },
-    Scheme { name: b"tftp",    run: None, protocol: Proto::TFTP,    family: Proto::TFTP,    flags: FLAGS_TFTP,    defport: PORT_TFTP },
-    Scheme { name: b"smb",     run: None, protocol: Proto::SMB,     family: Proto::SMB,     flags: FLAGS_SMB,     defport: PORT_SMB },
-    Scheme { name: b"smbs",    run: None, protocol: Proto::SMBS,    family: Proto::SMB,     flags: FLAGS_SMBS,    defport: PORT_SMBS },
-    Scheme { name: b"ldap",    run: None, protocol: Proto::LDAP,    family: Proto::LDAP,    flags: FLAGS_LDAP,    defport: PORT_LDAP },
-    Scheme { name: b"ldaps",   run: None, protocol: Proto::LDAPS,   family: Proto::LDAP,    flags: FLAGS_LDAPS,   defport: PORT_LDAPS },
-    Scheme { name: b"rtsp",    run: None, protocol: Proto::RTSP,    family: Proto::RTSP,    flags: FLAGS_RTSP,    defport: PORT_RTSP },
-    Scheme { name: b"mqtt",    run: None, protocol: Proto::MQTT,    family: Proto::MQTT,    flags: FLAGS_MQTT,    defport: PORT_MQTT },
-    Scheme { name: b"mqtts",   run: None, protocol: Proto::MQTTS,   family: Proto::MQTT,    flags: FLAGS_MQTTS,   defport: PORT_MQTTS },
-    Scheme { name: b"rtmp",    run: None, protocol: Proto::RTMP,    family: Proto::RTMP,    flags: FLAGS_RTMP,    defport: PORT_RTMP },
-    Scheme { name: b"rtmpt",   run: None, protocol: Proto::RTMPT,   family: Proto::RTMPT,   flags: FLAGS_RTMP,    defport: PORT_RTMPT },
-    Scheme { name: b"rtmpe",   run: None, protocol: Proto::RTMPE,   family: Proto::RTMPE,   flags: FLAGS_RTMP,    defport: PORT_RTMP },
-    Scheme { name: b"rtmpte",  run: None, protocol: Proto::RTMPTE,  family: Proto::RTMPTE,  flags: FLAGS_RTMP,    defport: PORT_RTMPT },
-    Scheme { name: b"rtmps",   run: None, protocol: Proto::RTMPS,   family: Proto::RTMP,    flags: FLAGS_RTMP,    defport: PORT_RTMPS },
-    Scheme { name: b"rtmpts",  run: None, protocol: Proto::RTMPTS,  family: Proto::RTMPT,   flags: FLAGS_RTMP,    defport: PORT_RTMPS },
-    Scheme { name: b"dict",    run: None, protocol: Proto::DICT,    family: Proto::DICT,    flags: FLAGS_DICT,    defport: PORT_DICT },
-    Scheme { name: b"gopher",  run: None, protocol: Proto::GOPHER,  family: Proto::GOPHER,  flags: FLAGS_GOPHER,  defport: PORT_GOPHER },
-    Scheme { name: b"gophers", run: None, protocol: Proto::GOPHERS, family: Proto::GOPHER,  flags: FLAGS_GOPHERS, defport: PORT_GOPHER },
 ];
+
+/// How many schemes the registry holds: 9 + 24 = 33.
+///
+/// Derived from the two tables rather than written as a literal, so that the
+/// arithmetic cannot disagree with either of them. 33 is the number of non-NULL
+/// entries in `all_schemes[67]` (`lib/url.c:1488-1522`); 67 is that array's hash
+/// modulus and never a count.
+const SCHEME_COUNT: usize = IN_SCOPE_SCHEMES.len() + stub::SCHEMES.len();
+
+/// All 33 schemes the C tree defines and registers.
+///
+/// The nine in core scope are [`IN_SCOPE_SCHEMES`] above; the 24 registered for
+/// ABI completeness are [`stub::SCHEMES`], which owns their transcription and
+/// the reasoning behind their `run: None`. The seam is asserted from both sides
+/// -- by [`mod tests`](self) here and by `stub`'s own tests -- so a row cannot
+/// migrate across it unnoticed.
+///
+/// The ORDER is the C's registration order and is preserved: the nine in-scope
+/// rows first, then the 24 in their C-source grouping. Nothing observable
+/// depends on it, because the lookup compares names, but the correspondence
+/// with the C is what makes the tables auditable and it is asserted.
+const SCHEMES: &[Scheme] = &registry();
+
+/// Concatenates the two halves of [`SCHEMES`] in a `const` context.
+///
+/// There is no `const` slice concatenation and no `const` iterator, so the two
+/// `while` loops below are the whole mechanism. [`Scheme`] is [`Copy`], which is
+/// what lets the array be initialised from one row and then overwritten -- an
+/// `Option<&dyn Protocol>` has no `const` default, so there is no null row to
+/// start from.
+///
+/// A `const fn` rather than a `static` built at run time: the registry is
+/// consulted by `getn_scheme` on every URL, it must be available in `const`
+/// contexts, and a `static` would additionally require `Scheme: Sync`.
+const fn registry() -> [Scheme; SCHEME_COUNT] {
+    let mut rows = [IN_SCOPE_SCHEMES[0]; SCHEME_COUNT];
+
+    let mut index = 0;
+    while index < IN_SCOPE_SCHEMES.len() {
+        rows[index] = IN_SCOPE_SCHEMES[index];
+        index += 1;
+    }
+
+    let mut stub_index = 0;
+    while stub_index < stub::SCHEMES.len() {
+        rows[IN_SCOPE_SCHEMES.len() + stub_index] = stub::SCHEMES[stub_index];
+        stub_index += 1;
+    }
+
+    rows
+}
 
 /// `Curl_get_scheme(scheme)` (`lib/url.c:1469-1472`): resolve a NUL-terminated
 /// scheme name.
