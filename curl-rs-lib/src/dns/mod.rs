@@ -2307,8 +2307,10 @@ pub(crate) trait DohTransport: fmt::Debug + Send + Sync {
 /// It is empty, and empty is the honest state: `dns/doh.rs` carries the RFC 8484
 /// query builder, the response parser and the probe pairing in full, and every
 /// implementor of this trait anywhere in the tree is a `#[cfg(test)]` double.
-/// A production one needs an HTTPS transfer, which needs
-/// `curl-rs-lib/src/protocols/http1.rs`; that file does not exist.
+/// A production one needs an HTTPS transfer. The writer it would go through,
+/// `curl-rs-lib/src/protocols/http1.rs`, has landed; what is missing is a
+/// caller for it, so `protocols::SCHEMES` still holds `run: None` on both
+/// HTTP rows and no transfer can be driven.
 ///
 /// **Why a registry rather than a comment.** `supports_doh()` previously rested
 /// on `ENGINE_DOH` being hand-marked `Engine::inert`. That is correct today and

@@ -394,20 +394,74 @@ pub mod share;
 //
 // WHICH CHILDREN, measured against this checkout rather than left vague,
 // because "children remain" is the kind of statement that survives long after
-// it stops being true. Twelve of the files AAP 0.4.1 assigns to this crate
-// are not on disk: `easy/{handle,setopt,getinfo}.rs`; the eight per-scheme
-// executors `protocols/{http1,http2,http3,ftp/pingpong,sftp,scp,file,ws}.rs`;
+// it stops being true. Eight of the files AAP 0.4.1 assigns to this crate
+// are not on disk: `easy/{handle,setopt,getinfo}.rs`; the four remaining
+// per-scheme executors `protocols/{http2,http3,scp,ws}.rs`;
 // and `proxy/http_connect.rs`.
-// Every other assigned file exists -- `protocols/stub.rs`,
-// `transfer/chunked.rs`, `transfer/content_encoding.rs`, `proxy/socks.rs`,
+// Every other assigned file exists -- `protocols/file.rs`,
+// `protocols/http1.rs`, `protocols/sftp.rs`, `protocols/stub.rs`,
+// `protocols/ftp/pingpong.rs`, `transfer/chunked.rs`,
+// `transfer/content_encoding.rs`, `proxy/socks.rs`,
 // `proxy/haproxy.rs` and `proxy/socks_gss.rs` among them, which is why this
-// count reads twelve and not the eighteen it once did, and why `transfer/` now
-// has no absent file at all. `proxy/socks_gss.rs` is additionally the first
+// count reads eight and not the eighteen it once did, and why `transfer/` now
+// has no absent file at all.
+//
+// `protocols/file.rs` is worth its own sentence for the same reason
+// `protocols/stub.rs` is, and for the opposite reason: it is the FIRST
+// per-scheme EXECUTOR to land, superseding the whole of `lib/file.c` -- the
+// URL-to-path decode, the synthesised `Content-Length:`, `Accept-ranges:` and
+// `Last-Modified:` lines, `--range`, uploads with `--append`, the directory
+// listing and every one of the five `CURLcode` values that file selects -- and
+// it fills 5 of `struct Curl_protocol`'s 17 slots, which is the sparsest
+// handler in the C tree and therefore the cheap proof that the trait's twelve
+// defaults really do stand in for `ZERO_NULL`. What it does NOT do is make
+// `file://` reachable: `protocols/mod.rs`'s `SCHEMES` is a `const` table, so
+// it can hold neither a reference to a `static` nor a reference to
+// interior-mutable data, and a handler that binds one transfer's state has
+// both properties; `crate::transfer::TransferIo::xfer_ctx` borrows its owner
+// mutably, so the transfer core cannot hand `do_it` a context AND the
+// transfer-side seam. So `version.rs`'s `ENGINE_PROTOCOLS` stays inert and the
+// `Protocols:` banner still withholds `file` -- a wiring gap between delivered
+// files rather than an absent one, which is exactly the distinction this
+// paragraph exists to keep.
+//
+//
+// `protocols/sftp.rs` is the first per-scheme executor whose registry row is
+// WIRED, and is worth naming for what it changes: the `SFTP` row of
+// `protocols/mod.rs`'s registry now carries an implementation, so `Scheme::run`
+// is no longer uniformly `None`, and `protocols/mod.rs`'s own
+// `nothing_is_runnable_in_this_checkout` -- whose documentation said it was to
+// be DELETED rather than edited by exactly this checkpoint -- has been
+// deleted. That module also HOSTS the shared russh SSH session core, because
+// `Curl_protocol_sftp` and `Curl_protocol_scp` are byte-identical in 14 of
+// their 17 slots (`lib/vssh/libssh2.c:3846-3864` against `:3823-3841`) and AAP
+// 0.4.1 names no third file to put it in; `protocols/scp.rs` will import it.
+// What `sftp.rs` cannot yet do is reach a transfer's OPTIONS, because
+// `easy/setopt.rs` is one of the eight above, which is why
+// `version.rs`'s `ENGINE_PROTOCOLS` stays inert and the `Protocols:` banner
+// still withholds `sftp` -- under-reporting a capability makes a fixture skip
+// and over-reporting makes it run and fail.
+//
+// `proxy/socks_gss.rs` is the first
 // module in this crate that exists only behind a non-default feature: it is
 // compiled when `negotiate` is on and is genuinely absent from the default
 // build, which is the C's `#if defined(HAVE_GSSAPI)` and not a gap. That
 // distinction is what `version.rs`'s engine registry records per capability,
 // and `curl-rs/src/bin/curlinfo.rs` checks each of its claims against the tree.
+//
+// `protocols/http1.rs` is worth a paragraph of its own, because it is the
+// largest of these landings and the one most likely to be misread as making
+// HTTP work. It carries the whole of `lib/http.c`'s request writer -- the
+// 20-slot default header order of `lib/http.c:2827-2853`, the three `Host:`
+// forms, the request target, the status-line parse and the 8-of-17 vtable that
+// `Curl_scheme_http` and `Curl_scheme_https` both point at -- and it exports
+// the two assembled registry rows. It does NOT make an HTTP transfer possible:
+// nothing constructs a request specification, because `easy/{handle,setopt}.rs`
+// are two of the eight paths above, so `protocols/mod.rs` deliberately keeps
+// `run: None` on both HTTP rows and `version.rs` keeps `ENGINE_PROTOCOLS`
+// inert. Writing a file and reaching it are separate obligations; only the
+// second is open for HTTP, and the `Protocols:` banner stays empty until it
+// closes.
 //
 // `protocols/stub.rs` is worth one sentence of its own, because its landing
 // changes what is left rather than what this build can do: it REGISTERS the 24
@@ -416,9 +470,18 @@ pub mod share;
 // banner so that the 283 fixtures targeting those schemes skip instead of
 // failing. Registering a scheme and serving one are separate obligations.
 //
-// Those same twelve paths are held as data, not prose, by
+// `protocols/ftp/pingpong.rs` is worth one more, for the same reason: the FTP
+// request/response cadence of `lib/pingpong.c` now exists -- the command
+// writer that owns the terminating CRLF, the reply-line framer, the
+// per-response timeout and the readiness loop -- and it is what an FTP state
+// machine will be driven by. It performs no transfer on its own, because the
+// command sequencing of `lib/ftp.c` that would implement its two callbacks is
+// not written at all, so `version.rs` keeps `ftp` out of the
+// `Protocols:` banner and its fixtures keep skipping.
+//
+// Those same eight paths are held as data, not prose, by
 // `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs`, alongside the thirteen
-// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 27
+// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 23
 // across the workspace. The ABI figure read three, and the total 37, until
 // `curl-rs-ffi/src/ffi/share.rs` landed. That gate fails, naming the file, as
 // soon as one of

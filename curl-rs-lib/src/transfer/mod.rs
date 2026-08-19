@@ -1878,6 +1878,17 @@ pub(crate) trait TransferIo: fmt::Debug {
     /// # Errors
     ///
     /// [`CURLcode::OutOfMemory`], the only failure the C reports here.
+    ///
+    /// The allowance below is not a placeholder: this member's only production
+    /// caller is [`Self::wildcard_init`]'s own, [`pretransfer_wildcard`], which
+    /// sits behind `#[cfg(feature = "ftp")]` because FTP is the only scheme
+    /// with a wildcard stage. Without that feature the member is genuinely
+    /// uncalled, exactly as the C's `Curl_wildcard_init` is absent under
+    /// `CURL_DISABLE_FTP`, and the lint would otherwise fire on a
+    /// `--no-default-features` build alone.
+    ///
+    /// [`pretransfer_wildcard`]: TransferState::pretransfer_wildcard
+    #[allow(dead_code)] // caller: pretransfer_wildcard, under `ftp`
     fn wildcard_init(&mut self) -> CodeResult<()> {
         Ok(())
     }

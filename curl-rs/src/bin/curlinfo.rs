@@ -1947,31 +1947,84 @@ mod source_presence_gate {
 mod absent_target_gate {
     use std::path::{Path, PathBuf};
 
-    /// The 12 `curl-rs-lib` targets with no file.
+    /// The 8 `curl-rs-lib` targets with no file.
     ///
-    /// The same twelve `curl-rs-lib/src/lib.rs` enumerates in prose; here
+    /// The same eight `curl-rs-lib/src/lib.rs` enumerates in prose; here
     /// so that the prose cannot outlive the fact. Three easy-handle modules,
-    /// the eight per-scheme protocol EXECUTORS and one proxy mechanism.
+    /// the four remaining per-scheme protocol EXECUTORS and one proxy
+    /// mechanism.
+    ///
+    /// `protocols/file.rs` was the twelfth and has LANDED -- the FIRST
+    /// per-scheme executor to do so, and the sparsest, filling 5 of `struct
+    /// Curl_protocol`'s 17 slots (`lib/file.c:601-619`). Its row is gone from
+    /// this gate, which is the gate working as designed. Note what its landing
+    /// does NOT change: `curl-rs-lib/src/version.rs`'s `ENGINE_PROTOCOLS` stays
+    /// inert and the `Protocols:` banner still withholds `file`, because
+    /// `protocols/mod.rs`'s `SCHEMES` is a `const` table and cannot hold a
+    /// handler that owns per-transfer state, and because
+    /// `crate::transfer::TransferIo::xfer_ctx` borrows its owner mutably and so
+    /// cannot hand `do_it` the transfer-side seam as well. That module's own
+    /// documentation carries both, and until they change the executor exists
+    /// without being reachable -- a wiring gap in delivered files, which this
+    /// gate is the wrong instrument for.
+    ///
+    /// `protocols/http1.rs` was the eleventh and has LANDED too. It carries the
+    /// request writer of `lib/http.c` -- the 20-slot default header order, the
+    /// three `Host:` forms, the request target and the shared 8-of-17 vtable
+    /// that `Curl_scheme_http` and `Curl_scheme_https` both point at -- and it
+    /// exports the two assembled registry rows for this table's own registry to
+    /// adopt. What is still outstanding for HTTP is WIRING and not writing: no
+    /// easy handle exists to build a request specification from, so
+    /// `protocols/mod.rs` keeps `run: None` on both rows and
+    /// `curl-rs-lib/src/version.rs`'s `ENGINE_PROTOCOLS` stays inert. Landing a
+    /// file and reaching it are separate obligations, and only the second is
+    /// still open here -- the same distinction `file.rs` above is held by.
+    ///
+    /// `protocols/sftp.rs` was the tenth and has LANDED, and it is the first
+    /// executor whose row is WIRED: the
+    /// `SFTP` row of `curl-rs-lib/src/protocols/mod.rs`'s registry is the only
+    /// one to carry an implementation -- and `protocols/mod.rs`'s
+    /// `nothing_is_runnable_in_this_checkout`, whose own documentation said it
+    /// was to be DELETED rather than edited by exactly this checkpoint, is
+    /// therefore gone. `protocols/scp.rs` remains below because it is a
+    /// separate file, even though the shared SSH session core it will import
+    /// already exists inside `sftp.rs`.
+    ///
+    /// `protocols/ftp/pingpong.rs` was the ninth and has LANDED: the FTP
+    /// request/response cadence of `lib/pingpong.c` -- the command writer, the
+    /// reply-line framer, the per-response timeout and the readiness loop --
+    /// now exists, and what FTP still lacks is the command sequencing of
+    /// `lib/ftp.c` that would implement its two callbacks. A cadence engine
+    /// with no state machine to drive performs no transfer, so
+    /// `ENGINE_PROTOCOLS` stays inert and the `Protocols:` banner stays silent
+    /// about `ftp`.
     ///
     /// `protocols/stub.rs` has LANDED, which is why the phrase above says
     /// executors rather than protocol modules: the 24 out-of-scope schemes are
     /// now registered by their own module, and what is left under `protocols/`
-    /// is the eight files that would actually perform a transfer. Registering a
+    /// is the files that would actually perform a transfer -- eight when
+    /// `stub.rs` landed, four now that `file.rs`, `http1.rs`, `sftp.rs` and
+    /// `ftp/pingpong.rs` have.
+    /// Registering a
     /// scheme and serving one are separate obligations, and only the second is
     /// still outstanding -- `curl-rs-lib/src/version.rs`'s `ENGINE_PROTOCOLS`
     /// records that on those terms, and `stub.rs` deliberately contributes
     /// nothing to the `Protocols:` banner.
     ///
-    /// `transfer/chunked.rs` was the eighteenth,
-    /// `transfer/content_encoding.rs` the seventeenth, `proxy/socks.rs` the
-    /// sixteenth, `proxy/haproxy.rs` the fifteenth, `proxy/socks_gss.rs` the
-    /// fourteenth and `protocols/stub.rs` the thirteenth; all six have landed,
-    /// so all six rows are gone -- which is what this gate exists to force. The
-    /// transfer directory now has no absent file at all, and the loop itself
-    /// has landed too, so what `version.rs`'s `ENGINE_TRANSFER` still records
-    /// is a wiring gap -- no executor for the driver to run -- rather than a
-    /// missing file. The one proxy mechanism left is why that
-    /// count reads one where it read four: the `"SOCKS"` filter of
+    /// `protocols/ftp/pingpong.rs` was the ninth, `protocols/sftp.rs` the
+    /// tenth, `protocols/http1.rs` the eleventh, `protocols/file.rs` the
+    /// twelfth,
+    /// `transfer/chunked.rs` the eighteenth,
+    /// `transfer/content_encoding.rs` the seventeenth,
+    /// `proxy/socks.rs` the sixteenth, `proxy/haproxy.rs` the fifteenth,
+    /// `proxy/socks_gss.rs` the fourteenth and `protocols/stub.rs` the
+    /// thirteenth; all ten have landed, so all ten rows are gone -- which
+    /// is what this gate exists to force. The transfer directory now has no
+    /// absent file at all, and the loop itself has landed too, so what
+    /// `version.rs`'s `ENGINE_TRANSFER` still records is a wiring gap -- no
+    /// executor for the driver to run -- rather than a missing file. The one
+    /// proxy mechanism left is why that count reads one where it read four:
+    /// the `"SOCKS"` filter of
     /// `lib/socks.c` is written, the SOCKS5 GSS-API sub-negotiation of
     /// `lib/socks_gssapi.c` is written behind the default-off `negotiate`
     /// feature and calls into it, and the PROXY protocol header filter of
@@ -1983,14 +2036,10 @@ mod absent_target_gate {
         "curl-rs-lib/src/easy/handle.rs",
         "curl-rs-lib/src/easy/setopt.rs",
         "curl-rs-lib/src/easy/getinfo.rs",
-        "curl-rs-lib/src/protocols/http1.rs",
         "curl-rs-lib/src/protocols/http2.rs",
         "curl-rs-lib/src/protocols/http3.rs",
-        "curl-rs-lib/src/protocols/sftp.rs",
         "curl-rs-lib/src/protocols/scp.rs",
-        "curl-rs-lib/src/protocols/file.rs",
         "curl-rs-lib/src/protocols/ws.rs",
-        "curl-rs-lib/src/protocols/ftp/pingpong.rs",
         "curl-rs-lib/src/proxy/http_connect.rs",
     ];
 
@@ -2060,7 +2109,7 @@ mod absent_target_gate {
     }
 
     fn every_target() -> Vec<&'static str> {
-        let mut all = Vec::with_capacity(27);
+        let mut all = Vec::with_capacity(23);
         all.extend_from_slice(ENGINE_TARGETS);
         all.extend_from_slice(TOOL_TARGETS);
         all.extend_from_slice(ABI_TARGETS);
@@ -2084,11 +2133,11 @@ mod absent_target_gate {
     }
 
     #[test]
-    fn the_split_is_twelve_thirteen_two() {
-        assert_eq!(ENGINE_TARGETS.len(), 12, "curl-rs-lib");
+    fn the_split_is_eight_thirteen_two() {
+        assert_eq!(ENGINE_TARGETS.len(), 8, "curl-rs-lib");
         assert_eq!(TOOL_TARGETS.len(), 13, "curl-rs");
         assert_eq!(ABI_TARGETS.len(), 2, "curl-rs-ffi");
-        assert_eq!(every_target().len(), 27, "the workspace total");
+        assert_eq!(every_target().len(), 23, "the workspace total");
     }
 
     #[test]
@@ -2113,9 +2162,13 @@ mod absent_target_gate {
     /// The absence above is a measurement, so the measuring has to be able to
     /// see a file that IS there. One sibling per crate, chosen because each is
     /// named in the same design tables as the missing ones, plus the target
-    /// that most recently moved off [`TOOL_TARGETS`], and the four that most
-    /// recently moved off [`ENGINE_TARGETS`] -- `protocols/stub.rs` and
-    /// `proxy/socks_gss.rs` being the latest two -- which makes this the
+    /// that most recently moved off [`TOOL_TARGETS`], and the eight that most
+    /// recently moved off [`ENGINE_TARGETS`] -- `protocols/file.rs`, the first
+    /// per-scheme executor to land, `protocols/http1.rs`,
+    /// `protocols/sftp.rs`, the first whose registry row is wired, and
+    /// `protocols/ftp/pingpong.rs` being the latest four, with
+    /// `protocols/stub.rs` and `proxy/socks_gss.rs` behind
+    /// them -- which makes this the
     /// assertion that fails first if a landed file is ever double-counted as
     /// both present and absent. `proxy/socks_gss.rs` is checked here even
     /// though it compiles only under the `negotiate` feature, because what is
@@ -2126,13 +2179,17 @@ mod absent_target_gate {
         for present in [
             "curl-rs-lib/src/easy/mod.rs",
             "curl-rs-lib/src/protocols/ftp/listparser.rs",
+            "curl-rs-lib/src/protocols/ftp/pingpong.rs",
             "curl-rs/src/callbacks/mod.rs",
             "curl-rs/src/config/mod.rs",
             "curl-rs/src/config/parseconfig.rs",
+            "curl-rs-lib/src/protocols/sftp.rs",
             "curl-rs-lib/src/protocols/stub.rs",
+            "curl-rs-lib/src/protocols/file.rs",
             "curl-rs-lib/src/proxy/socks.rs",
             "curl-rs-lib/src/proxy/socks_gss.rs",
             "curl-rs-lib/src/proxy/haproxy.rs",
+            "curl-rs-lib/src/protocols/http1.rs",
             "curl-rs-ffi/src/ffi/easy.rs",
         ] {
             assert!(

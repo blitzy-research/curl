@@ -11,16 +11,17 @@ URLs.
 
 **This tree is a partial milestone of the C-to-Rust rewrite and transfers
 nothing yet.** It builds, it parses a full curl command line, and it then
-returns `CURLE_NOT_BUILT_IN` for every operation, because no protocol has an
-executor. Read the rest of this file as a description of where the work stands,
-not of a working replacement -- every claim below is measured against this
-checkout, and [Current state](#current-state) collects the measurements in one
-place.
+returns `CURLE_NOT_BUILT_IN` for every operation, because no protocol executor
+can be reached. Read the rest of this file as a description of where the work
+stands, not of a working replacement -- every claim below is measured against
+this checkout, and [Current state](#current-state) collects the measurements in
+one place.
 
 The nine URL schemes in scope are FILE, FTP, FTPS, HTTP, HTTPS, SCP, SFTP, WS
 and WSS, with HTTP transfers to use HTTP/1.1, HTTP/2 or HTTP/3. Those nine are
-the target and none of them is served today, so `curl --version` prints an
-empty `Protocols:` line and `curl-config --protocols` prints nothing. That line
+the target and none of them is served today -- SFTP has an executor but no way
+to receive its options -- so `curl --version` prints an empty `Protocols:` line
+and `curl-config --protocols` prints nothing. That line
 is generated from the same capability table the engine answers from, so it will
 name each scheme as its executor lands, without an edit here.
 
@@ -59,14 +60,14 @@ can be re-derived rather than trusted.
 | what | state |
 | ---- | ----- |
 | Command line | Parses the full curl surface -- flags, arguments, `--next` chains -- and reproduces C's diagnostics and exit codes byte for byte. Verified against a stock curl 8.14.1 across nine invocations. The `.curlrc` and `-K` reader is written and tested (`curl-rs/src/config/parseconfig.rs`), but is not reached yet: `ParseHost::parse_config` does not take the configuration handle the re-entry needs, so no configuration file is loaded at run time. |
-| Transfers | None. Every operation returns `CURLE_NOT_BUILT_IN`. No scheme has a protocol executor, so nothing opens a connection. |
+| Transfers | None. Every operation returns `CURLE_NOT_BUILT_IN`, and no transfer can be driven. One scheme -- SFTP -- now carries a *wired* protocol executor (`curl-rs-lib/src/protocols/sftp.rs`, which also hosts the SSH session core SCP will share), and it cannot yet be reached: nine of its eleven vtable slots need the transfer's options and `curl-rs-lib/src/easy/setopt.rs` is not on disk to supply them. `curl-rs-lib/src/protocols/file.rs` is written and tested -- the whole of `lib/file.c`, and the only scheme that needs no connection -- but no registry row can reach it, so nothing is served. `curl-rs-lib/src/protocols/http1.rs` carries the HTTP/1.x request writer and vtable of `lib/http.c` in full, and nothing constructs a request for it either: `easy/handle.rs` and `easy/setopt.rs` are unwritten, so both HTTP registry rows keep `run: None`. `curl-rs-lib/src/protocols/ftp/pingpong.rs` carries the FTP request/response cadence of `lib/pingpong.c`, and the command sequencing of `lib/ftp.c` that would drive it is not written. Nothing opens a connection. |
 | `Protocols:` in `curl --version` | Empty, and correctly so. |
 | `Features:` in `curl --version` | The truthful subset. A capability is advertised only when the module that implements it exists *and* can be executed, which is why names like `SSL`, `HTTP2` and `NTLM` are withheld even though rustls, `h2` and the NTLM primitives are all linked and tested. Under-reporting makes a fixture skip; over-reporting makes it run and fail. |
 | C ABI | 62 of the 100 symbols in `lib/libcurl.def` are exported, and nothing beyond them. |
 | Public headers | Not regenerated. Generation is withheld until the export surface is complete; the headers in the tree remain the ABI contract. |
 | Targets | Two of four build. See [Supported targets](#supported-targets). |
-| Engine modules | 12 of the modules the target design assigns to `curl-rs-lib` are not written; the rest are. One further module, `curl-rs-lib/src/proxy/socks_gss.rs`, is written but exists only when the non-default `negotiate` feature is on, which is the C's `#if defined(HAVE_GSSAPI)` rather than a gap. `curl-rs-lib/src/version.rs` records, per capability, whether its module is missing or merely uncalled, and a test in `curl-rs/src/bin/curlinfo.rs` checks every one of those claims against the filesystem. |
-| Unwritten modules, all three crates | 27: the 12 above, 13 in `curl-rs` (the operation driver, the option-to-`setopt` mapping, one configuration stage, all seven transfer callbacks and the `--libcurl` emitter) and 2 in `curl-rs-ffi` (`ffi/multi.rs`, `ffi/ws.rs`, which between them carry 25 of the 38 undefined exports). Each crate root enumerates its own; `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs` holds all 27 as data and fails, naming the file, when one lands. |
+| Engine modules | 8 of the modules the target design assigns to `curl-rs-lib` are not written; the rest are, `protocols/file.rs` -- the first per-scheme executor -- `protocols/http1.rs`, `protocols/sftp.rs` and `protocols/ftp/pingpong.rs` included. One further module, `curl-rs-lib/src/proxy/socks_gss.rs`, is written but exists only when the non-default `negotiate` feature is on, which is the C's `#if defined(HAVE_GSSAPI)` rather than a gap. `curl-rs-lib/src/version.rs` records, per capability, whether its module is missing or merely uncalled, and a test in `curl-rs/src/bin/curlinfo.rs` checks every one of those claims against the filesystem. |
+| Unwritten modules, all three crates | 23: the 8 above, 13 in `curl-rs` (the operation driver, the option-to-`setopt` mapping, one configuration stage, all seven transfer callbacks and the `--libcurl` emitter) and 2 in `curl-rs-ffi` (`ffi/multi.rs`, `ffi/ws.rs`, which between them carry 25 of the 38 undefined exports). Each crate root enumerates its own; `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs` holds all 23 as data and fails, naming the file, when one lands. |
 | IPFS and IPNS | `curl-rs/src/cli/ipfs.rs` implements the gateway discovery chain and the URL rewriting of `src/tool_ipfs.c`, including `--ipfs-gateway`, `IPFS_GATEWAY`, `IPFS_PATH` and the `~/.ipfs/gateway` file. The rewrite produces an ordinary `http` or `https` URL, so the eighteen fixtures that cover it need an HTTP executor in the engine before they can run. |
 | Cargo features | Fifteen, twelve on by default because curl 8.x offers them out of the box. Exactly one -- `memdebug` -- is closed end to end. `curl-rs-lib/Cargo.toml` carries the per-feature state above its `[features]` table. |
 | Publishing | Refused. `publish = false` on the workspace, and the artifacts are not substitutes for curl or libcurl yet. |

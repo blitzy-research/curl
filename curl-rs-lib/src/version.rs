@@ -1132,9 +1132,11 @@ pub const ENGINE_STATE_STORES: Engine =
 /// feature that is off loses its decoder and its advertisement together.
 ///
 /// What is missing is the caller. A decoder stage is installed from a response
-/// header, and no response is received: `protocols/http1.rs` does not exist,
-/// so nothing parses a `Content-Encoding` line, and the transfer loop that
-/// would drive the writer chain (see [`ENGINE_TRANSFER`]) is not wired either.
+/// header, and no response is received: `protocols/http1.rs` has landed and
+/// does parse response headers, but nothing reaches it -- no easy handle builds
+/// a request, so both HTTP rows of `protocols::SCHEMES` keep `run: None` -- and
+/// the transfer loop that would drive the writer chain (see
+/// [`ENGINE_TRANSFER`]) is not wired either.
 /// A `Content-Encoding` body therefore still cannot be decoded end to end,
 /// which is what `is_present() == false` says -- and saying it is the safe
 /// direction: 19, 3 and 2 fixtures require the three names respectively, and a
@@ -1153,18 +1155,59 @@ pub const ENGINE_CONTENT_ENCODING: Engine =
 /// (`lib/url.c:1469-1500`) -- its own nine in-scope rows plus the 24 that
 /// `protocols/stub.rs` transcribes for the schemes specification 0.2.2 excludes
 /// from implementation -- so a URL's scheme IS recognised, its default port IS
-/// known, and `CURLU` parsing works. What does not exist is any per-scheme
-/// EXECUTOR. `protocols/` holds exactly four files: `mod.rs` (the registry),
+/// known, and `CURLU` parsing works. What no scheme has is an executor a
+/// transfer can REACH. `protocols/` holds exactly eight files: `mod.rs` (the
+/// registry),
 /// `stub.rs` (the 24 out-of-scope rows, every one carrying `run: None` and none
 /// contributing to the `Protocols:` banner, so the fixtures that target them
-/// skip instead of failing), `ftp/mod.rs` (74 lines, a module root declaring
-/// its one written child) and `ftp/listparser.rs` (5,516 lines), and the
+/// skip instead of failing), `ftp/mod.rs` (a module root declaring
+/// its two written children), `ftp/listparser.rs` (5,516 lines), whose
 /// listing parser interprets the output of a `LIST` command without being able
-/// to issue one. The eight files that would carry an executor -- `http1`,
-/// `http2`, `http3`, `sftp`, `scp`, `file`, `ws` and `ftp/pingpong` -- are all
+/// to issue one, `ftp/pingpong.rs`, whose cadence engine can write a command
+/// and frame a reply without having a state machine to sequence either -- both
+/// are halves of an FTP executor whose `lib/ftp.c` half is not written --
+/// `file.rs`, the FIRST per-scheme executor to land,
+/// superseding the whole of `lib/file.c` and filling 5 of `struct
+/// Curl_protocol`'s 17 slots, `http1.rs`, the HTTP/1.x request writer and
+/// the shared vtable of `lib/http.c`, and `sftp.rs`, which also hosts the
+/// shared russh SSH session core `scp.rs` will import. The four files that
+/// would carry the remaining executors -- `http2`, `http3`, `scp` and `ws`
+/// -- are all still
 /// absent, which `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` checks
-/// against the disk. `protocols::EXECUTORS` is therefore empty, and because
-/// `SchemeInfo::runnable` is derived from it, no scheme reports an
+/// against the disk.
+///
+/// `sftp.rs` IS on disk and its row DOES carry an implementation, and this
+/// engine is still inert -- deliberately, and this is the sharpest reading in
+/// the registry. `Curl_protocol_sftp`'s eleven filled slots are implemented,
+/// but nine of them need the transfer's OPTIONS -- the user name, the
+/// authentication mask, the host-key fingerprints, the quote lists, the resume
+/// offset -- and `easy/setopt.rs` is not on disk to supply them. So the module
+/// reports `CURLE_NOT_BUILT_IN` from the members that would need settings, and
+/// advertising `sftp` in the banner would convert 40 cleanly-skipped fixtures
+/// into 40 failures. AAP 0.6.5's asymmetry decides it: under-reporting a
+/// capability makes a fixture skip, over-reporting makes it run and fail.
+///
+/// ⚠ And the banner must NEVER carry `libssh`, `libssh2` or `badlibssh`. Those
+/// three tokens name C backends that this build does not link -- russh
+/// supersedes them -- and the harness maps each to a feature it would then
+/// gate fixtures on. `the_never_advertised_names_are_absent` asserts it.
+///
+/// Every OTHER row of the registry carries `run: None` -- `file`,
+/// `http` and `https` included -- and for two further reasons that are worth
+/// keeping apart. For `file` it is structural rather than a matter of effort:
+/// the table is
+/// a `const`, so it may hold neither a reference to a `static`
+/// (`error[E0013]`) nor a reference to interior-mutable data
+/// (`error[E0492]`), while a `protocols::file::FileProtocol` binds one
+/// transfer's own state and has both properties. `TransferIo::xfer_ctx`
+/// compounds it by borrowing its owner mutably, so the transfer core cannot
+/// hand `do_it` a context AND the seam the executor reads `data` through. For
+/// `http` and `https` it is a missing CALLER: `http1.rs` defines a complete
+/// executor, but no easy handle exists to build a request specification for it,
+/// so `protocols/mod.rs` deliberately keeps the column empty rather than
+/// advertising a transfer that cannot run.
+/// Because `SchemeInfo::runnable` is derived from that column, no scheme but
+/// `SFTP` reports an
 /// implementation -- the same answer C's non-`NULL` `run` pointer test gives
 /// for a scheme compiled out.
 ///
@@ -1172,10 +1215,14 @@ pub const ENGINE_CONTENT_ENCODING: Engine =
 /// returns an empty slice and the `Protocols:` banner line is empty. The
 /// harness's `parseprotocols()` then derives no protocol features, so every
 /// fixture with a `<server>` requirement skips -- which is every fixture that
-/// transfers anything. That is the truthful description of a build with a scheme
-/// table and no executors, and it is the reading AAP 0.6.5 requires: a fixture
-/// that skips reports the gap, whereas a fixture that runs against a missing
-/// engine reports a defect that does not exist.
+/// transfers anything -- the 27 fixtures with `<server>file` and the 40 with
+/// `<server>sftp` among them, even
+/// though the code that would serve them is written and tested. That is the
+/// truthful description of a build with a scheme
+/// table and no reachable executor, and it is the reading AAP 0.6.5
+/// requires: a fixture
+/// that skips reports the gap, whereas a fixture that runs against an
+/// unreachable engine reports a defect that does not exist.
 pub const ENGINE_PROTOCOLS: Engine =
     Engine::inert("curl-rs-lib/src/protocols/mod.rs");
 
@@ -1731,10 +1778,12 @@ pub const fn supports_cookies() -> bool {
 /// The third conjunct is the one that cannot be forgotten.
 /// `crate::dns::doh_transport_registered` reports whether this build registers
 /// a production `dns::DohTransport`, and it does not: every implementor in the
-/// tree is a `#[cfg(test)]` double, because a real one needs an HTTPS transfer
-/// and `protocols/http1.rs` does not exist. Reading the registry rather than
-/// trusting `ENGINE_DOH`'s hand-chosen marker means the capability turns itself
-/// on when a transport is registered and cannot be turned on before -- the
+/// tree is a `#[cfg(test)]` double, because a real one needs an HTTPS transfer:
+/// `protocols/http1.rs` has landed, but nothing drives it, so both HTTP rows of
+/// `protocols::SCHEMES` still carry `run: None`. Reading the registry rather
+/// than trusting `ENGINE_DOH`'s hand-chosen marker means the capability turns
+/// itself on when a transport is registered and cannot be turned on before --
+/// the
 /// construction `crate::protocols`' `EXECUTORS` uses for scheme runnability.
 /// Over-reporting here would make the harness run the DoH fixtures rather than
 /// skip them (specification 0.6.5).

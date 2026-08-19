@@ -230,38 +230,101 @@ unmaintained = "all"
 #   the only level `cargo audit` and `cargo deny` can see, because both read
 #   Cargo.lock and a lockfile is the union of every optional dependency
 #   regardless of features. It is why an unfiltered `cargo audit` exits 1 with
-#   exactly these four identifiers. The one configuration that escapes level 1
+#   these four identifiers. The one configuration that escapes level 1
 #   is a build with both protocols switched off, which is a diagnostic
 #   measurement rather than a shippable posture - rust-audit.yml takes it and
 #   asserts it, which localises the exposure without pretending the default
 #   resolution is clean.
+#
+#   A FIFTH IDENTIFIER NOW APPEARS AND IS DELIBERATELY NOT ACCEPTED HERE.
+#   `cargo audit` also reports RUSTSEC-2026-0258 against `h2 0.4.15` -- empty
+#   DATA frames queued without limit, low severity, patched in h2 0.4.16. It is
+#   NOT in the ignore list below, so `rust-audit.yml`'s undocumented-advisory
+#   comparison fails on it, which is that comparison working: nothing has been
+#   silently accepted.
+#
+#   It is recorded rather than resolved because both remedies belong to a
+#   decision this file cannot take alone. `h2` is pinned at 0.4.15 by AAP
+#   section 0.5.1's dependency inventory, so bumping it is a manifest change,
+#   and Cargo.lock is byte-identical to the baseline here. Its exposure is also
+#   bounded the way the four below were: `protocols/http2.rs` is absent, so h2
+#   contributes ZERO hits to the level-3 measurement that finds 56 each for
+#   `rsa` and `russh`. Remedy, for whoever owns the manifests: take h2 0.4.16
+#   (it is a patch bump on the pinned minor), or record a reasoned acceptance
+#   here. Do not add an `--ignore` flag to the workflow.
 #
 #   LEVEL 2 - COMPILED AND OFFERED TO THE LINKER. **Yes, all four.**
 #   `cargo build --release --verbose` shows librussh, librussh_cryptovec,
 #   librsa, libquinn and libquinn_proto among the rlibs on the link line, and
 #   rustc passes each to curl-rs-lib as `--extern`.
 #
-#   LEVEL 3 - PRESENT IN A SHIPPED ARTIFACT, AND CALLABLE. **No, none of the
-#   four, at this checkpoint.** No Rust source in this workspace contains a
-#   single reference to russh, quinn or rsa, so dead-strip removes every
-#   object. Measured: `nm -a target/release/libcurl.so` reports zero symbols
-#   matching russh, quinn or cryptovec, and `strings` reports zero occurrences
-#   of any of those names in libcurl.so or in the curl executable. The control
-#   that makes this a real result rather than a stripping artefact is `rustls`,
-#   which IS used and leaves 13,582 string hits in the same file.
+#   LEVEL 3 - PRESENT IN A SHIPPED ARTIFACT, AND CALLABLE. **Now YES for three
+#   of the four - rsa, russh and russh-cryptovec - and still no for the quinn
+#   pair.** This paragraph previously recorded the opposite, and it was true
+#   when it was written: no Rust source referenced russh, quinn or rsa, so
+#   dead-strip removed every object and `strings` found nothing.
+#
+#   `curl-rs-lib/src/protocols/sftp.rs` HAS NOW LANDED, and it is the first
+#   `use russh` in the workspace. It carries the SFTP executor together with the
+#   SSH session core that `protocols/scp.rs` shares, so russh is compiled,
+#   linked and reachable. Re-measured on the tree that carries it, with
+#   `strings -a <artifact> | grep -E '/(quinn|quinn-proto|h3|h3-quinn|rsa|russh|
+#   russh-cryptovec)-[0-9]'`:
+#
+#     target/release/libcurl.so   56 hits   /rsa-0.9.10, /russh-0.54.5
+#     target/release/curl         56 hits   /rsa-0.9.10, /russh-0.54.5
+#     target/release/curlinfo     56 hits   /rsa-0.9.10, /russh-0.54.5
+#     control /rustls-[0-9]       35 hits   (non-vacuity, so the pattern works)
+#
+#   `rsa` is there because russh authenticates with RSA keys. The quinn pair and
+#   the h3 pair contribute ZERO, because `protocols/http3.rs` is still absent -
+#   which is also the second control: two members of the same list, measured by
+#   the same command, giving different answers.
 #
 # WHAT LEVEL 3 DOES AND DOES NOT LICENCE. It is not a mitigation and it is not
-# a reason to relax anything. The vulnerable code cannot execute only because
-# `protocols/sftp.rs`, `protocols/scp.rs` and `protocols/http3.rs` do not
-# exist, so nothing ever opens an SSH session or a QUIC connection. Level 3
-# becomes "yes" with the first `use russh`, and the remote CryptoVec path of
-# RUSTSEC-2026-0153 becomes genuinely reachable for sftp:// and scp:// the same
-# day. So the acceptances stay, the removal conditions on each entry stand, and
-# rust-audit.yml asserts level 3 mechanically: landing a protocol executor
-# while its advisory is still accepted FAILS the build instead of shipping
-# quietly. That assertion is the executable form of the release obligation -
-# these paths are not to be released until an advisory-free compatible
-# dependency strategy exists.
+# a reason to relax anything. Until sftp.rs landed, the vulnerable code could
+# not execute only because `protocols/sftp.rs`, `protocols/scp.rs` and
+# `protocols/http3.rs` did not exist, so nothing ever opened an SSH session or a
+# QUIC connection. That bound was always described here as a property of the
+# checkpoint rather than a mitigation, and as expiring "with the first `use
+# russh`". **It has now expired**, and the remote CryptoVec path of
+# RUSTSEC-2026-0153 is genuinely reachable for sftp:// and scp://.
+#
+# THE ACCEPTANCES STAY AND THE TRIPWIRE STAYS ARMED. `rust-audit.yml`'s
+# 'no accepted advisory has reached a shipped artifact' step now FAILS, and that
+# is the step working exactly as designed - it is the executable form of the
+# release obligation, and these paths are not to be released until an
+# advisory-free compatible dependency strategy exists. It has NOT been weakened,
+# re-scoped or re-patterned to accommodate the executor, because silencing it is
+# precisely the "shipping quietly" it exists to prevent.
+#
+# WHY THE ADVISORY COULD NOT SIMPLY BE RESOLVED FIRST. Both remedies are closed
+# by OTHER mandated constraints, so there is no ordering of this work that lands
+# the executor with a clean gate:
+#
+#   * Upgrading is blocked twice over. RUSTSEC-2026-0153 and -0154 need
+#     russh >= 0.60.3; russh 0.60.3 carries 17 pre-release version requirements
+#     across the SSH crypto stack, and declares rust-version 1.85 against a
+#     mandated MSRV of 1.75. RUSTSEC-2023-0071 has no patched release on the
+#     rsa 0.9 line at all.
+#   * Dropping the vector is not available either. The obvious candidate is
+#     russh's `flate2` feature, which is the zlib-decompression half of the
+#     -0153 growth path - but `CURLOPT_SSH_COMPRESSION` is public option 268
+#     (`include/curl/curl.h:2084`), `--compressed-ssh` sets it
+#     (`src/tool_getparam.c:2000`), and `libssh2_session_flag(...,
+#     LIBSSH2_FLAG_COMPRESS, 1)` implements it (`lib/vssh/libssh2.c:3395-3396`).
+#     Removing the feature would delete a mandated public option, which the
+#     preservation mandate forbids. The packet-read half of -0153 has no
+#     feature switch at all.
+#
+# So this is a genuine conflict between mandated requirements - land the SFTP
+# executor with russh, hold MSRV 1.75, ship no release-candidate cryptography,
+# and carry no reachable accepted advisory - and no implementation satisfies all
+# four. It is recorded here rather than resolved, ESCALATED as a decision for
+# whoever owns the release, and the options are the same three the MSRV
+# conflict has: raise the floor to 1.85 and take russh >= 0.60.3, accept
+# release-candidate cryptography, or hold the SSH schemes back from release
+# while keeping them in the tree. This file takes none of them unilaterally.
 #
 # A fifth and sixth entry were carried here at one point, for RUSTSEC-2026-0118
 # and RUSTSEC-2026-0119 against hickory-proto 0.25.2, and both have been REMOVED
@@ -498,7 +561,7 @@ ignore = [
   #
   # Remove this entry when rsa 0.10 ships as a stable release and russh depends
   # on it from a stable release of its own.
-  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10, CVSS 5.9 MEDIUM Marvin-Attack timing side channel behind the ssh feature. At LEVEL 1 and LEVEL 2 today and not at LEVEL 3, measured the same way as the two russh entries. RustSec records no safe upgrade for the whole 0.9 line; the fix exists only in rsa 0.10.0-rc.x, the release-candidate cryptography the dependency selection deliberately rejected. curl's SSH client role is not an RSA decryption oracle. Remove when rsa 0.10 is stable and russh depends on it from a stable release." },
+  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10, CVSS 5.9 MEDIUM Marvin-Attack timing side channel behind the ssh feature. At LEVEL 1, LEVEL 2 and -- since curl-rs-lib/src/protocols/sftp.rs landed -- LEVEL 3, measured the same way as the two russh entries: /rsa-0.9.10 appears 56 times in each of libcurl.so, curl and curlinfo, because russh authenticates with RSA keys. RustSec records no safe upgrade for the whole 0.9 line; the fix exists only in rsa 0.10.0-rc.x, the release-candidate cryptography the dependency selection deliberately rejected. curl's SSH client role is not an RSA decryption oracle. Remove when rsa 0.10 is stable and russh depends on it from a stable release." },
 
   # RUSTSEC-2026-0154 - russh 0.54.5
   #   Accepted   2026-07-31
@@ -564,7 +627,7 @@ ignore = [
   #
   # Remove this entry when a russh release exists that carries the fix AND has
   # a fully stable dependency graph AND satisfies the workspace MSRV.
-  { id = "RUSTSEC-2026-0154", reason = "russh 0.54.5, CVSS 7.5 HIGH availability-only DoS behind the ssh feature: the SSH AGENT client and server accepted peer-controlled agent frame lengths with no maximum, so the untrusted peer is the local agent socket rather than the remote SSH server, and this workspace uses neither agent role - which is the one acceptance here whose reachability argument survives the arrival of an SSH executor, since the agent roles are not used by design rather than by absence. It is at LEVEL 1 and LEVEL 2 and not at LEVEL 3 today, like all four. Shares GHSA-g9f8-wqj9-fjw5 with RUSTSEC-2026-0153, which is the half that carries a remote path. The fix requires russh >= 0.60.3, blocked twice over and independently: (1) russh 0.60.3 carries 17 pre-release version requirements covering the whole SSH crypto stack (rsa 0.10.0-rc.16, ed25519-dalek 3.0.0-pre.6, ml-kem 0.3.0-rc.1, pkcs1 0.8.0-rc.4 and 13 more), and no release in the 0.58.0-0.62.4 band is free of them; (2) russh 0.60.3 declares rust-version 1.85 against a measured, currently-satisfied floor of 1.75. Remove when a russh release carries the fix with a fully stable graph AND satisfies the MSRV." },
+  { id = "RUSTSEC-2026-0154", reason = "russh 0.54.5, CVSS 7.5 HIGH availability-only DoS behind the ssh feature: the SSH AGENT client and server accepted peer-controlled agent frame lengths with no maximum, so the untrusted peer is the local agent socket rather than the remote SSH server, and this workspace uses neither agent role - which is the one acceptance here whose reachability argument survives the arrival of an SSH executor, since the agent roles are not used by design rather than by absence. It is at LEVEL 1, LEVEL 2 and now LEVEL 3: curl-rs-lib/src/protocols/sftp.rs is the first `use russh` and puts /russh-0.54.5 into all three shipped artifacts. This entry is the one whose reachability argument SURVIVES that, because it is the agent roles being unused by design rather than any executor being absent -- sftp.rs opens a session and an SFTP subsystem channel and never an agent connection, which its own tests assert. Shares GHSA-g9f8-wqj9-fjw5 with RUSTSEC-2026-0153, which is the half that carries a remote path. The fix requires russh >= 0.60.3, blocked twice over and independently: (1) russh 0.60.3 carries 17 pre-release version requirements covering the whole SSH crypto stack (rsa 0.10.0-rc.16, ed25519-dalek 3.0.0-pre.6, ml-kem 0.3.0-rc.1, pkcs1 0.8.0-rc.4 and 13 more), and no release in the 0.58.0-0.62.4 band is free of them; (2) russh 0.60.3 declares rust-version 1.85 against a measured, currently-satisfied floor of 1.75. Remove when a russh release carries the fix with a fully stable graph AND satisfies the MSRV." },
 
   # RUSTSEC-2026-0153 - russh-cryptovec 0.52.0
   #   Accepted   2026-07-31
@@ -603,7 +666,7 @@ ignore = [
   # two entries are one decision, exactly as stated above.
   #
   # Remove this entry together with RUSTSEC-2026-0154.
-  { id = "RUSTSEC-2026-0153", reason = "russh-cryptovec 0.52.0, CVSS 7.5 HIGH availability-only DoS behind the ssh feature; the half of GHSA-g9f8-wqj9-fjw5 that carries a REMOTE path. Before russh 0.58.0 CryptoVec also backed the transport and compression buffers, so remote SSH traffic can drive unchecked growth through packet reads and zlib decompression output, letting a hostile server abort the process under memory pressure; russh is pinned at 0.54.5 with flate2 enabled, so this workspace WILL be on that code path once it opens an SSH session, and the blast radius is sftp:// and scp://. It is at LEVEL 1 and LEVEL 2 today and NOT at LEVEL 3 - measured, zero russh symbols and zero russh strings in either shipped artifact, because no source calls it while protocols/sftp.rs and protocols/scp.rs are absent. That is a property of this checkpoint, not a mitigation, and it expires with the first `use russh`. russh 0.54.5 requires this exact version, so it cannot be resolved independently of RUSTSEC-2026-0154. Remove both entries together." },
+  { id = "RUSTSEC-2026-0153", reason = "russh-cryptovec 0.52.0, CVSS 7.5 HIGH availability-only DoS behind the ssh feature; the half of GHSA-g9f8-wqj9-fjw5 that carries a REMOTE path. Before russh 0.58.0 CryptoVec also backed the transport and compression buffers, so remote SSH traffic can drive unchecked growth through packet reads and zlib decompression output, letting a hostile server abort the process under memory pressure; russh is pinned at 0.54.5 with flate2 enabled, so this workspace WILL be on that code path once it opens an SSH session, and the blast radius is sftp:// and scp://. It is now at LEVEL 3 as well as LEVEL 1 and LEVEL 2. The bound recorded here previously -- zero russh strings in any shipped artifact, because no source called it while protocols/sftp.rs and protocols/scp.rs were absent -- was always described as a property of the checkpoint rather than a mitigation, and as expiring with the first `use russh`. curl-rs-lib/src/protocols/sftp.rs IS that first `use russh`, so it HAS expired: /russh-0.54.5 now appears in libcurl.so, curl and curlinfo, and the remote CryptoVec growth path is reachable for sftp:// and scp://. rust-audit.yml's level-3 step fails accordingly and has deliberately NOT been weakened. The zlib half cannot be dropped either: russh's flate2 feature implements CURLOPT_SSH_COMPRESSION (public option 268) and --compressed-ssh, so removing it would delete mandated public surface. ESCALATED -- see the LEVEL 3 discussion in the header. russh 0.54.5 requires this exact version, so it cannot be resolved independently of RUSTSEC-2026-0154. Remove both entries together." },
 ]
 
 # [licenses] - what we may redistribute

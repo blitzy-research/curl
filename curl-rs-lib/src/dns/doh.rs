@@ -72,8 +72,11 @@
 //! **No PRODUCTION transport is registered, and that is what withholds the
 //! `DoH` label.** Every implementor of either trait in this tree -- here and in
 //! `dns/mod.rs` alike -- is a `#[cfg(test)]` double, because a real one has to
-//! perform an HTTPS transfer and `curl-rs-lib/src/protocols/http1.rs` does not
-//! exist. The module root holds the registry, `dns::DOH_TRANSPORTS`, and
+//! perform an HTTPS transfer, and no HTTPS transfer can be driven yet:
+//! `curl-rs-lib/src/protocols/http1.rs` has landed and carries the request
+//! writer, but nothing constructs a request for it, so both HTTP rows of
+//! `protocols::SCHEMES` still hold `run: None`. The module root holds the
+//! registry, `dns::DOH_TRANSPORTS`, and
 //! [`crate::version::supports_doh`] conjoins it: the capability turns itself on
 //! when the slice gains an entry and cannot be turned on before. So the codec,
 //! the probe pairing and the record walk below are complete and exercised while

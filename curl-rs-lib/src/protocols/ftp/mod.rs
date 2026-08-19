@@ -46,11 +46,16 @@
 //!
 //! # Partially delivered
 //!
-//! Of this directory's three modules only [`listparser`] exists yet; the
-//! protocol engine itself (`lib/ftp.c`) and the pingpong cadence
-//! (`lib/pingpong.c`) arrive with their own files. This file is the module root
-//! and declares exactly the one child that exists, per the crate convention
-//! recorded in `curl-rs-lib/src/lib.rs`.
+//! Two of this directory's three modules exist: [`listparser`] and
+//! [`pingpong`]. The protocol engine itself (`lib/ftp.c`) -- the command
+//! sequencing, the state machine and the `Protocol` implementation -- arrives
+//! with its own file, and it is what will implement
+//! [`pingpong::PingPongOps`] and [`pingpong::PingPongIo`] and turn the cadence
+//! engine into a working scheme. Until it does, no FTP transfer can be
+//! attempted and `crate::version` withholds the `ftp` protocol from the
+//! `Protocols:` banner, so the fixtures that target it skip rather than fail.
+//! This file is the module root and declares exactly the children that exist,
+//! per the crate convention recorded in `curl-rs-lib/src/lib.rs`.
 //!
 //! `pub(crate)`, and so is everything it declares: no exported symbol of
 //! `lib/libcurl.def` is backed from this directory. The listing parser's
@@ -72,3 +77,21 @@
 /// belong on the ITEMS whose consumers have yet to land, so that an item added
 /// later with no consumer is still reported.
 pub(crate) mod listparser;
+
+/// The request/response cadence -- supersedes `lib/pingpong.c` with
+/// `lib/pingpong.h`.
+///
+/// The non-blocking command writer, the reply-line framer, the per-response
+/// timeout and the readiness loop that drives an FTP state machine one reply at
+/// a time. It owns the two bytes that terminate every command, and it hands
+/// every complete reply line on with its LF intact.
+///
+/// It lives here rather than beside `lib/`'s other utilities because FTP is its
+/// only possible consumer: the C compiles the mechanism in for FTP, IMAP, POP3
+/// and SMTP, and specification 0.2.2 excludes the other three from
+/// implementation. Nothing in it is FTP-specific for all that -- deciding which
+/// line ends a reply is the callback the protocol module implements.
+///
+/// The same allowance policy as [`listparser`]: per-item, never on this
+/// declaration.
+pub(crate) mod pingpong;
