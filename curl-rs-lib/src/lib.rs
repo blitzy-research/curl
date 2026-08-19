@@ -394,16 +394,18 @@ pub mod share;
 //
 // WHICH CHILDREN, measured against this checkout rather than left vague,
 // because "children remain" is the kind of statement that survives long after
-// it stops being true. Eight of the files AAP 0.4.1 assigns to this crate
-// are not on disk: `easy/{handle,setopt,getinfo}.rs`; the four remaining
-// per-scheme executors `protocols/{http2,http3,scp,ws}.rs`;
+// it stops being true. Five of the files AAP 0.4.1 assigns to this crate
+// are not on disk: `easy/{handle,setopt,getinfo}.rs`; the one remaining
+// per-scheme executor `protocols/http3.rs`;
 // and `proxy/http_connect.rs`.
 // Every other assigned file exists -- `protocols/file.rs`,
-// `protocols/http1.rs`, `protocols/sftp.rs`, `protocols/stub.rs`,
-// `protocols/ftp/pingpong.rs`, `transfer/chunked.rs`,
+// `protocols/http1.rs`, `protocols/http2.rs`, `protocols/sftp.rs`,
+// `protocols/scp.rs`, `protocols/stub.rs`, `protocols/ws.rs`,
+// `protocols/ftp/pingpong.rs`,
+// `transfer/chunked.rs`,
 // `transfer/content_encoding.rs`, `proxy/socks.rs`,
 // `proxy/haproxy.rs` and `proxy/socks_gss.rs` among them, which is why this
-// count reads eight and not the eighteen it once did, and why `transfer/` now
+// count reads five and not the eighteen it once did, and why `transfer/` now
 // has no absent file at all.
 //
 // `protocols/file.rs` is worth its own sentence for the same reason
@@ -437,7 +439,7 @@ pub mod share;
 // their 17 slots (`lib/vssh/libssh2.c:3846-3864` against `:3823-3841`) and AAP
 // 0.4.1 names no third file to put it in; `protocols/scp.rs` will import it.
 // What `sftp.rs` cannot yet do is reach a transfer's OPTIONS, because
-// `easy/setopt.rs` is one of the eight above, which is why
+// `easy/setopt.rs` is one of the five above, which is why
 // `version.rs`'s `ENGINE_PROTOCOLS` stays inert and the `Protocols:` banner
 // still withholds `sftp` -- under-reporting a capability makes a fixture skip
 // and over-reporting makes it run and fail.
@@ -457,11 +459,19 @@ pub mod share;
 // `Curl_scheme_http` and `Curl_scheme_https` both point at -- and it exports
 // the two assembled registry rows. It does NOT make an HTTP transfer possible:
 // nothing constructs a request specification, because `easy/{handle,setopt}.rs`
-// are two of the eight paths above, so `protocols/mod.rs` deliberately keeps
+// are two of the five paths above, so `protocols/mod.rs` deliberately keeps
 // `run: None` on both HTTP rows and `version.rs` keeps `ENGINE_PROTOCOLS`
 // inert. Writing a file and reaching it are separate obligations; only the
 // second is open for HTTP, and the `Protocols:` banner stays empty until it
 // closes.
+//
+// `protocols/http2.rs` has now landed too. It implements the HTTP/2 connection
+// filter, curl-compatible SETTINGS and h2c upgrade bytes, HPACK-backed stream
+// processing, flow-control updates, trailers and push headers. Like the HTTP/1
+// writer, it is not yet reachable from an easy handle: request construction and
+// protocol dispatch still depend on the absent easy modules above. Its source
+// is therefore complete while `version.rs` correctly keeps the capability
+// inert.
 //
 // `protocols/stub.rs` is worth one sentence of its own, because its landing
 // changes what is left rather than what this build can do: it REGISTERS the 24
@@ -470,18 +480,42 @@ pub mod share;
 // banner so that the 283 fixtures targeting those schemes skip instead of
 // failing. Registering a scheme and serving one are separate obligations.
 //
-// `protocols/ftp/pingpong.rs` is worth one more, for the same reason: the FTP
-// request/response cadence of `lib/pingpong.c` now exists -- the command
-// writer that owns the terminating CRLF, the reply-line framer, the
-// per-response timeout and the readiness loop -- and it is what an FTP state
-// machine will be driven by. It performs no transfer on its own, because the
-// command sequencing of `lib/ftp.c` that would implement its two callbacks is
-// not written at all, so `version.rs` keeps `ftp` out of the
-// `Protocols:` banner and its fixtures keep skipping.
+// `protocols/ftp/` is worth one more, because it is now complete as a
+// directory: `pingpong.rs` carries the request/response cadence of
+// `lib/pingpong.c` -- the command writer that owns the terminating CRLF, the
+// reply-line framer, the per-response timeout and the readiness loop --
+// `listparser.rs` carries `lib/ftplistparser.c` with `lib/fileinfo.c`, and
+// `mod.rs` now carries the `lib/ftp.c` command sequencing that drives both:
+// the 37-state machine and its single mutator, the two data-channel modes,
+// the five quote lists, the wildcard driver and the exhaustive reply
+// dispatcher, with its own two registry rows assembled beside them. What it
+// still performs no transfer for is the same reason HTTP does not: nothing
+// constructs a request specification, so `protocols/mod.rs` keeps `run: None`
+// on both FTP rows, `version.rs` keeps `ftp` out of the `Protocols:` banner
+// and its fixtures keep skipping.
 //
-// Those same eight paths are held as data, not prose, by
+// `protocols/ws.rs` is worth the last one, and for a reason none of the others
+// share: it is the only executor whose handler is almost entirely SOMEBODY
+// ELSE'S. `Curl_protocol_ws` (`lib/ws.c:1918-1936`) fills eight slots and
+// seven of them point at the HTTP implementation, so the Rust handler wraps
+// `protocols/http1.rs`'s and overrides `setup_connection` alone -- which is
+// why this file could not have landed before that one. What it does own is
+// everything below the vtable: the three-header handshake in curl's exact
+// order, the `Sec-WebSocket-Accept` hash, the frame encoder with its three
+// big-endian length forms and its per-connection mask, the decoder with its
+// fourteen first-byte arms, the automatic PONG, and the engine behind the four
+// `curl_ws_*` exports. Two things it deliberately does NOT do: advertise
+// `ws`/`wss` in the `Protocols:` banner, because the registry rows still carry
+// `run: None` for want of an easy handle; and enforce the three RFC 6455
+// response obligations that `lib/ws.c:1359-1377` records as comments with no
+// code beneath them -- the algorithm is implemented and tested, but applying
+// it would fail all 28 WebSocket fixtures, and AAP 0.8.1 makes the fixtures the
+// oracle rather than the target. The module documents that divergence at the
+// function that embodies it.
+//
+// Those same five paths are held as data, not prose, by
 // `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs`, alongside the thirteen
-// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 23
+// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 20
 // across the workspace. The ABI figure read three, and the total 37, until
 // `curl-rs-ffi/src/ffi/share.rs` landed. That gate fails, naming the file, as
 // soon as one of

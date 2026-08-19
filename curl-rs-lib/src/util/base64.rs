@@ -319,7 +319,15 @@ pub fn encode(input: &[u8]) -> Result<String, CURLcode> {
 /// url_encode(&[0xfb, 0xff])   == Ok("-_8".to_owned())
 /// url_encode(&[0xff, 0xef])   == Ok("_-8".to_owned())
 /// ```
-// `protocols/ws` reaches this one first, for `Sec-WebSocket-Key`.
+// NOT the encoder `protocols/ws` uses. An earlier note here claimed the
+// `Sec-WebSocket-Key` nonce reaches this one; it does not, and the fixtures say
+// so: `tests/data/test2300` expects `NDMyMTUzMjE2MzIxNzMyMQ==`, whose `==` tail
+// is padding this encoder never emits and whose alphabet is the standard one.
+// `lib/ws.c:1268` calls `curlx_base64_encode`, so `protocols/ws` calls
+// [`encode`]. The url-safe form is `lib/curlx/base64.c`'s
+// `curlx_base64url_encode`, whose in-tree callers are the JOSE-style encodings
+// -- and it stays here because that surface is part of the file it supersedes,
+// not because a caller is pending.
 #[allow(dead_code)]
 pub(crate) fn url_encode(input: &[u8]) -> Result<String, CURLcode> {
     encode_with(BASE64_URL, None, input)

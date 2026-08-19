@@ -212,27 +212,39 @@ use crate::util::timeval::{timediff_ms, Clock, CurlTime};
 /// `CURLE_UNSUPPORTED_PROTOCOL` rather than fail to compile, and it still has
 /// to report a truthful `Protocols:` line.
 ///
-/// **Six of the other children of this directory are absent from this
-/// checkout**, and their declarations therefore cannot be written: a `mod`
+/// **One of the other children of this directory is absent from this
+/// checkout**, and its declaration therefore cannot be written: a `mod`
 /// line without its file is `error[E0583]`, which no attribute suppresses. The
 /// absence is measured rather than assumed --
 /// `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` names
-/// `http2.rs`, `http3.rs`, `sftp.rs`, `scp.rs`, `file.rs`, `ws.rs`
-/// and `ftp/pingpong.rs` and asserts against the disk that each is
+/// `http3.rs` and asserts against the disk that it is
 /// still missing. Each declaration lands with the file it names, which is the
 /// convention `curl-rs-lib/src/lib.rs` states for the whole crate.
 ///
-/// One consequence follows and is recorded where it bites: all but one row of
-/// [`SCHEMES`] carries `run: None` (see [`Scheme::run`]). The exception is
-/// `SFTP`, whose module [`sftp`] has landed. Three other children have landed
-/// without changing that column: [`stub`], which owns the 24 out-of-scope rows
-/// this file used to hold inline, [`file`], whose handler cannot sit in a
-/// `const` table, and [`http1`], which owns the HTTP/1.x request writer and the
-/// vtable both HTTP rows would point at -- [`http1::SCHEMES`] carries
-/// `run: Some(&http1::HTTP)` on its own two rows, and a test in that module
-/// binds them to the two rows below column for column so wiring HTTP stays a
-/// one-column substitution, held until an easy handle exists to build a request
-/// from and not for want of a writer.
+/// One consequence follows and is recorded where it bites: with `ssh` enabled,
+/// exactly two rows of [`SCHEMES`] carry implementations, `SFTP` and `SCP`.
+/// With it disabled both rows remain and carry `run: None`. Four other children
+/// have landed without changing their registry columns: [`stub`], which owns
+/// the 24 out-of-scope rows this file used to hold inline, [`file`], whose
+/// handler cannot sit in a `const` table, [`http1`], which owns the HTTP/1.x
+/// request writer and the vtable both HTTP rows would point at --
+/// [`http1::SCHEMES`] carries `run: Some(&http1::HTTP)` on its own two rows, and
+/// a test in that module binds them to the two rows below column for column so
+/// wiring HTTP stays a one-column substitution, held until an easy handle
+/// exists to build a request from and not for want of a writer -- and [`ws`],
+/// which owns the WebSocket framing, masking and handshake of `lib/ws.c` and
+/// does the same for the two rows below it: [`ws::SCHEMES`] carries
+/// `run: Some(&ws::WS)` on rows that are otherwise column-for-column identical
+/// to `WS` and `WSS` here, and its handler delegates every slot but
+/// `setup_connection` to [`http1::HTTP`], which is exactly what
+/// `Curl_protocol_ws` (`lib/ws.c:1918-1936`) does. It is held by the same
+/// missing easy handle, not by a missing writer. Two further delivered
+/// children also leave this table unchanged: [`http2`] is a connection filter
+/// and contributes no scheme row at all, while [`ftp`] does what [`http1`] and
+/// [`ws`] do -- its own [`ftp::SCHEMES`] carries `run: Some(&ftp::FTP)` on two
+/// rows assembled column for column against the `ftp` and `ftps` rows below,
+/// so adopting them stays a one-column substitution held by the same missing
+/// easy handle.
 #[cfg(feature = "ftp")]
 pub(crate) mod ftp;
 
@@ -261,6 +273,31 @@ pub(crate) mod ftp;
 /// rather than transcribing it a second time.
 pub(crate) mod http1;
 
+/// HTTP/2 -- `lib/http2.c` and `lib/http2.h`, with nghttp2 replaced by the
+/// `h2` crate.
+///
+/// Gated on `http2`, matching the C's
+/// `#if !defined(CURL_DISABLE_HTTP) && defined(USE_NGHTTP2)`
+/// (`lib/http2.c:26`), and gated on the CHILD for the same reason [`ftp`] and
+/// [`sftp`] are: [`SCHEMES`] must hold its 33 rows under every feature
+/// combination, and `https` must keep working over HTTP/1.1 in a build without
+/// this module.
+///
+/// It is a CONNECTION FILTER and not a [`Protocol`] implementor, which is the
+/// asymmetry with every other module declared here. `http` and `https` share
+/// the one handler [`http1`] owns, and HTTP/2 installs BENEATH it in the chain
+/// `crate::conn` owns -- exactly as `struct Curl_cftype Curl_cft_nghttp2`
+/// (`lib/http2.c:2773-2789`) does. So this module contributes no [`SCHEMES`]
+/// row at all, and adding one would be wrong rather than merely redundant.
+///
+/// Its own documentation records the division of labour that specification
+/// 0.8.5's conflict resolution C4 mandates: `h2` performs HPACK and the
+/// HEADERS/DATA framing, and this module decides the SETTINGS payload and its
+/// entry order, the flow-control windows, the `h2c` upgrade bytes and the
+/// ordered field list HPACK compresses.
+#[cfg(feature = "http2")]
+pub(crate) mod http2;
+
 /// SFTP, and the SSH session core `protocols/scp.rs` shares with it --
 /// `lib/vssh/libssh2.c`, `lib/vssh/vssh.c` and `lib/vssh/ssh.h`.
 ///
@@ -273,11 +310,34 @@ pub(crate) mod http1;
 /// Specification 0.4.1 assigns `lib/vssh/` two targets and no third, and the
 /// two C handlers are identical in 14 of their 17 slots
 /// (`lib/vssh/libssh2.c:3846-3864` against `:3823-3841`), so this module hosts
-/// the shared core and `protocols/scp.rs` imports it. `protocols/scp.rs` is not
-/// on disk yet, which is why the [`SCHEMES`] row for `SCP` still carries
-/// `run: None` while `SFTP`'s does not.
+/// the shared core and [`scp`] imports it. Both [`SCHEMES`] rows therefore
+/// carry an implementation, and they are the only two that do.
 #[cfg(feature = "ssh")]
 pub(crate) mod sftp;
+
+/// SCP -- `lib/vssh/libssh2.c`, `lib/vssh/vssh.c` and `lib/vssh/ssh.h`.
+///
+/// Gated on `ssh` and gated on the CHILD, for the same reason [`sftp`] is: the
+/// registry has to hold its 33 rows under every feature combination, so
+/// `scp://` must answer `CURLE_UNSUPPORTED_PROTOCOL` in a build without this
+/// module rather than fail to compile.
+///
+/// A thin layer over [`sftp`] rather than a second SSH implementation, and the
+/// measurement behind that is the 14-of-17 slot identity cited above. It
+/// contributes the registry row, the three differing vtable slots -- `done`,
+/// `doing` and `disconnect` -- the SCP-DO and SCP-DONE phases of the shared
+/// 62-state machine, and the SCP wire dialogue that libssh2 performs inside
+/// `libssh2_scp_recv2` and `libssh2_scp_send64` and that no crate in the closed
+/// dependency set provides. Everything else it imports, including the state
+/// enumeration and the single function permitted to write the state field.
+///
+/// SCP-DISCONNECT is deliberately NOT in that list. Its two states are
+/// `SSH_SESSION_DISCONNECT` and `SSH_SESSION_FREE`, and `lib/vssh/ssh.h:117`
+/// annotates the second *"Last state in SCP/SFTP-DISCONNECT"* -- it terminates
+/// BOTH schemes -- so the whole phase stays in [`sftp`] and `scp` hands it
+/// there.
+#[cfg(feature = "ssh")]
+pub(crate) mod scp;
 
 /// The 24 schemes registered for ABI completeness -- `lib/smtp.c`,
 /// `lib/imap.c`, `lib/pop3.c`, `lib/telnet.c`, `lib/tftp.c`, `lib/smb.c`,
@@ -306,6 +366,11 @@ pub(crate) mod stub;
 /// cheap proof that [`Protocol`]'s twelve defaults really do stand in for
 /// `ZERO_NULL`.
 ///
+/// [`ws`] is the OPPOSITE extreme and has landed alongside it: it fills one
+/// slot of its own and forwards the other sixteen to [`http1`], because
+/// `Curl_protocol_ws` (`lib/ws.c:1918-1936`) is initialiser-for-initialiser
+/// identical to `Curl_protocol_http` except for `setup_connection`.
+///
 /// [`SCHEMES`]'s `file` row nevertheless still carries `run: None`, and the
 /// reason is structural rather than a matter of effort: this table is a `const`,
 /// so it may hold neither a reference to a `static` (`error[E0013]`) nor a
@@ -317,6 +382,25 @@ pub(crate) mod stub;
 /// records both, along with why leaving the row `None` is also the truthful
 /// answer while `crate::version`'s `ENGINE_PROTOCOLS` is inert.
 pub(crate) mod file;
+
+/// WebSockets -- `lib/ws.c` and `lib/ws.h`, backing
+/// `include/curl/websockets.h`.
+///
+/// Gated on `websockets`, matching the C's
+/// `#if !defined(CURL_DISABLE_WEBSOCKETS) && !defined(CURL_DISABLE_HTTP)`
+/// (`lib/ws.h:31`), and gated on the CHILD for the reason [`ftp`] is: the
+/// registry holds its 33 rows under every feature combination, so `ws://` must
+/// answer `CURLE_UNSUPPORTED_PROTOCOL` in a build without this module rather
+/// than fail to compile. The `WS` and `WSS` rows of [`SCHEMES`] are
+/// unconditional and stay in place either way.
+///
+/// It owns the frame codec, the masking, the handshake headers in curl's exact
+/// order, and the engine behind the four exported `curl_ws_*` symbols. What it
+/// deliberately does NOT own is a second copy of the HTTP transfer: its
+/// [`Protocol`] implementor wraps [`http1`]'s and overrides exactly one slot,
+/// which is what the C's own vtable does.
+#[cfg(feature = "websockets")]
+pub(crate) mod ws;
 
 // The protocol bit set -- `curl_prot_t` and the `CURLPROTO_*` values
 
@@ -756,29 +840,34 @@ pub(crate) struct Scheme {
     /// names it explicitly: *"Check the ->run struct field for non-NULL to
     /// figure out if an implementation is present"* (`lib/url.c:1474-1476`).
     ///
-    /// **Exactly ONE row of [`SCHEMES`] carries an implementation in this
-    /// checkout: `SFTP`.** That is a measurement, not an aspiration, and the
-    /// rows that carry [`None`] do so for two DIFFERENT reasons that are worth
+    /// **Exactly TWO rows of [`SCHEMES`] carry implementations when `ssh` is
+    /// enabled: `SFTP` and `SCP`.** With `ssh` disabled, both rows remain and
+    /// carry [`None`]. That is a measurement, not an aspiration, and the rows
+    /// that carry [`None`] do so for two DIFFERENT reasons that are worth
     /// keeping apart. For most schemes the file that would define an
-    /// implementation is absent: five remain missing under
-    /// `protocols/` -- `http2.rs`, `http3.rs`, `scp.rs`, `ws.rs` and
-    /// `ftp/pingpong.rs` -- which
+    /// implementation is absent: one assigned file remains missing under
+    /// `protocols/` -- `http3.rs` -- which
     /// `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` asserts against the
-    /// disk. For `file`, `http` and `https` the file has LANDED and the column
-    /// is still empty: [`http1`] defines a
+    /// disk. For `file`, `http`, `https`, `ftp` and `ftps` the file has LANDED
+    /// and the column is still empty: [`http1`] defines a
     /// full [`Protocol`] implementor and exports its own two rows carrying
     /// `run: Some(&http1::HTTP)`, and what those two rows lack is a CALLER --
     /// nothing in this checkout builds a request specification, because
-    /// `easy/handle.rs` and `easy/setopt.rs` are unwritten -- while [`file`]'s
+    /// `easy/handle.rs` and `easy/setopt.rs` are unwritten -- [`ftp`] defines
+    /// the `lib/ftp.c` command sequencing and exports its own two rows carrying
+    /// `run: Some(&ftp::FTP)` and lacks the same caller, while [`file`]'s
     /// handler binds one transfer's state and so cannot sit in a `const` table
-    /// at all. Adopting either
-    /// executor here would advertise a transfer this build cannot perform, and
+    /// at all. Adopting any of them
+    /// executor here would advertise a transfer this build cannot perform.
+    /// [`http2`] has also landed, but it is a connection filter beneath the
+    /// shared HTTP handler and therefore never occupies this column. The
+    /// distinction matters because
     /// specification 0.6.5 measures that asymmetry precisely: under-reporting
     /// makes a fixture SKIP, over-reporting makes it RUN AND FAIL. Each column
     /// therefore stays `None` until its caller exists, and a test in [`http1`]
     /// binds its rows to these column for column so the substitution stays a
-    /// one-column change. Every row but `SFTP`'s answers exactly as a C curl
-    /// configured with the matching
+    /// one-column change. Every row but the two SSH rows answers exactly as a C
+    /// curl configured with the matching
     /// `CURL_DISABLE_<PROTO>` answers -- the scheme RESOLVES, with its
     /// port and its flags, and then reports no implementation.
     ///
@@ -1022,6 +1111,23 @@ const RUN_SFTP: Option<&'static dyn Protocol> = Some(&sftp::SFTP);
 #[cfg(not(feature = "ssh"))]
 const RUN_SFTP: Option<&'static dyn Protocol> = None;
 
+/// The `SCP` row's implementation column.
+///
+/// The same cfg'd-constant idiom as [`RUN_SFTP`], transcribing the same `#ifdef`
+/// from the row two lines below `Curl_scheme_sftp`'s in the C
+/// (`lib/vssh/vssh.c:352-358`). Both SSH rows are gated on one Cargo feature
+/// because the C gates both on one `USE_SSH`.
+#[cfg(feature = "ssh")]
+const RUN_SCP: Option<&'static dyn Protocol> = Some(&scp::SCP);
+
+/// The `SCP` row's implementation column in a build without `ssh`.
+///
+/// The `#else` arm: the row survives, its executor does not, and `getn_scheme`
+/// still resolves `scp://` so the request can be refused with
+/// `CURLE_UNSUPPORTED_PROTOCOL` rather than "no such scheme".
+#[cfg(not(feature = "ssh"))]
+const RUN_SCP: Option<&'static dyn Protocol> = None;
+
 /// The nine schemes specification 0.2.1 puts in core scope, in the C's
 /// registration order.
 ///
@@ -1050,7 +1156,7 @@ const IN_SCOPE_SCHEMES: [Scheme; 9] = [
     Scheme { name: b"ftp",     run: None, protocol: Proto::FTP,     family: Proto::FTP,     flags: FLAGS_FTP,     defport: PORT_FTP },
     Scheme { name: b"ftps",    run: None, protocol: Proto::FTPS,    family: Proto::FTP,     flags: FLAGS_FTPS,    defport: PORT_FTPS },
     Scheme { name: b"SFTP",    run: RUN_SFTP, protocol: Proto::SFTP, family: Proto::SFTP, flags: FLAGS_SSH,     defport: PORT_SSH },
-    Scheme { name: b"SCP",     run: None, protocol: Proto::SCP,     family: Proto::SCP,     flags: FLAGS_SSH,     defport: PORT_SSH },
+    Scheme { name: b"SCP",     run: RUN_SCP, protocol: Proto::SCP,  family: Proto::SCP,     flags: FLAGS_SSH,     defport: PORT_SSH },
     Scheme { name: b"file",    run: None, protocol: Proto::FILE,    family: Proto::FILE,    flags: FLAGS_FILE,    defport: 0 },
     Scheme { name: b"WS",      run: None, protocol: Proto::WS,      family: Proto::HTTP,    flags: FLAGS_WS,      defport: PORT_HTTP },
     Scheme { name: b"WSS",     run: None, protocol: Proto::WSS,     family: Proto::HTTP,    flags: FLAGS_WSS,     defport: PORT_HTTPS },
@@ -2759,21 +2865,24 @@ impl HttpsConnect {
     /// sockets are closed before the winner's sub-chain is installed and the
     /// connection is reported connected.
     ///
-    /// # The one omission, and why it is not a gap
+    /// # The remaining integration seam
     ///
     /// C follows the promotion with an `#ifdef USE_NGHTTP2` block that reads the
     /// negotiated ALPN and calls `Curl_http2_switch_at(cf, data)` when the
-    /// server chose `h2` (`:227-241`). That switch belongs to
-    /// `protocols/http2.rs`, which is absent from this checkout, so this build
-    /// is in exactly the state a C build without `USE_NGHTTP2` is in: the block
-    /// does not run. The negotiated protocol is still read, because the trace
-    /// line the C emits either way depends on it.
+    /// server chose `h2` (`:227-241`). The switch implementation now exists in
+    /// [`http2::CfH2::insert_after`], but constructing it requires the
+    /// multi-handle SETTINGS inputs that this connect-only race does not own.
+    /// Until the connection factory supplies that typed seam, this path reads
+    /// the negotiated value through [`CfQuery::AlpnNegotiated`] but does not
+    /// install the filter. `crate::version` therefore continues to withhold
+    /// HTTP/2 rather than advertise a path no easy handle can reach.
     ///
     /// # Errors
     ///
     /// Nothing here fails today. The signature keeps the C's `CURLcode` return
-    /// because the HTTP/2 switch it will carry can fail, and the C stores that
-    /// failure in `ctx->result` and moves to [`HcState::Failure`].
+    /// because installing the HTTP/2 filter can fail once the SETTINGS seam is
+    /// supplied, and the C stores that failure in `ctx->result` and moves to
+    /// [`HcState::Failure`].
     fn baller_connected(
         &mut self,
         cx: &mut CallCtx<'_, '_>,
@@ -3830,14 +3939,15 @@ static REGISTRY: AllSchemes = AllSchemes;
 ///
 /// # Why this returns a table wider than the `Protocols:` banner
 ///
-/// All 33 schemes resolve, and none of them is [`SchemeInfo::runnable`] in this
-/// checkout. The distinction between the two answers is load-bearing rather than
-/// pedantic: RESOLVING a scheme is what URL parsing needs, while runnability and
-/// the banner describe what a TRANSFER can do. So this table stays at 33 --
-/// which is what keeps `guess_scheme`'s host-name prefixes, the default-port
-/// lookups and the parse-versus-set asymmetry behaving as they do in curl
-/// 8.19.0-DEV -- while every row carries `run: None` and
-/// `crate::version::protocols()` returns nothing.
+/// All 33 schemes resolve. With `ssh` enabled, `SFTP` and `SCP` are
+/// [`SchemeInfo::runnable`]; without it, their rows remain and neither is. The
+/// distinction between the two answers is load-bearing rather than pedantic:
+/// RESOLVING a scheme is what URL parsing needs, while runnability and the
+/// banner describe what a TRANSFER can do. So this table stays at 33 -- which is
+/// what keeps `guess_scheme`'s host-name prefixes, the default-port lookups and
+/// the parse-versus-set asymmetry behaving as they do in curl 8.19.0-DEV --
+/// while `crate::version::protocols()` still returns nothing because its engine
+/// advertisement remains intentionally inert.
 ///
 /// Both UNDER-report, which makes a fixture skip, rather than over-reporting,
 /// which makes it run and fail.
@@ -4668,6 +4778,33 @@ mod tests {
                 "{name}'s core-scope answer disagrees with specification 0.2.2"
             );
         }
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn both_ssh_rows_are_wired_when_the_feature_is_enabled() {
+        let sftp = get_scheme(b"sftp").expect("SFTP remains registered");
+        let scp = get_scheme(b"scp").expect("SCP remains registered");
+        assert!(sftp.run.is_some());
+        assert!(scp.run.is_some());
+        assert!(sftp.runnable());
+        assert!(scp.runnable());
+        assert_eq!(sftp.flags, scp.flags);
+        assert_eq!(sftp.defport, scp.defport);
+    }
+
+    #[cfg(not(feature = "ssh"))]
+    #[test]
+    fn both_ssh_rows_remain_unwired_when_the_feature_is_disabled() {
+        assert_eq!(SCHEMES.len(), 33);
+        let sftp = get_scheme(b"sftp").expect("SFTP remains registered");
+        let scp = get_scheme(b"scp").expect("SCP remains registered");
+        assert!(sftp.run.is_none());
+        assert!(scp.run.is_none());
+        assert!(!sftp.runnable());
+        assert!(!scp.runnable());
+        assert_eq!(sftp.flags, scp.flags);
+        assert_eq!(sftp.defport, scp.defport);
     }
 
     #[test]

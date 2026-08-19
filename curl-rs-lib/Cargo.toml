@@ -654,11 +654,11 @@ memchr = { workspace = true }
 #
 #   feature       default  DEP  MODULE  E2E   what is missing
 #   ------------  -------  ---  ------  ----  --------------------------------
-#   http2         on       yes  NO      no    protocols/http2.rs
+#   http2         on       yes  yes     no    easy/request dispatch wiring
 #   http3         on       yes  NO      no    protocols/http3.rs
-#   ftp           on       n/a  NO      no    protocols/ftp/pingpong.rs
-#   ssh           on       yes  NO      no    protocols/{sftp,scp}.rs
-#   websockets    on       n/a  NO      no    protocols/ws.rs, 4 curl_ws_*
+#   ftp           on       n/a  yes     no    registry row + easy/setopt
+#   ssh           on       yes  yes     no    easy/setopt to reach the vtable
+#   websockets    on       n/a  yes     no    ffi/ws.rs, 4 curl_ws_*
 #   brotli        on       yes  NO      no    transfer/content_encoding.rs
 #   zstd          on       yes  NO      no    transfer/content_encoding.rs
 #   gzip          on       yes  NO      no    transfer/content_encoding.rs
@@ -725,8 +725,8 @@ default = [
 # dependency. Gates this crate's direct use of h2's raw SETTINGS and
 # flow-control surface; see the h2 entry above for the honest caveat about hyper
 # keeping h2 in the graph regardless. The module named is the AAP 0.4.1
-# assignment and is NOT on disk (closure table above): the dependency is here,
-# the implementation is not.
+# assignment and is on disk (closure table above); the remaining gap is wiring
+# it into the easy/request dispatch path.
 http2 = ["dep:h2"]
 
 # HTTP/3 over QUIC -- src/protocols/http3.rs, superseding lib/vquic/*. As with
@@ -736,21 +736,26 @@ http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
 # FTP and FTPS -- src/protocols/ftp/{mod,pingpong,listparser}.rs, superseding
 # lib/ftp.c, lib/pingpong.c, lib/ftplistparser.c and lib/fileinfo.c. No
 # exclusive external dependency: the command sequencing is ours and must stay
-# byte-exact, and FTPS reuses the unconditional TLS stack. Of the three modules,
-# `listparser` and `mod` exist and `pingpong` does not, so no command sequence
-# can be driven.
+# byte-exact, and FTPS reuses the unconditional TLS stack. All three modules are
+# on disk -- `mod` carries the 37-state command sequencing, the wildcard driver
+# and both data-channel modes -- and what no sequence can yet be driven from is
+# an easy handle, because the registry row still carries `run: None`.
 ftp = []
 
-# SFTP and SCP -- src/protocols/{sftp,scp}.rs. russh is pinned; neither module is
-# on disk.
+# SFTP and SCP -- src/protocols/{sftp,scp}.rs. russh is pinned; both modules are
+# on disk, `sftp` hosting the shared SSH session core and `scp` the thin
+# SCP-specific layer over it, and both registry rows carry an implementation.
+# What neither can reach is a transfer's options, because easy/setopt.rs is not
+# written.
 ssh = ["dep:russh"]
 
 # The WebSocket surface -- src/protocols/ws.rs, superseding lib/ws.c and
 # backing the four curl_ws_* symbols AAP 0.3.1 assigns to the ABI shim.
 # Specified target design: framing is to be implemented natively because AAP
 # 0.6.7's comparison is byte-exact, and the handshake accept key is to use the
-# unconditional sha1 and base64 dependencies. Neither the module nor those
-# exports is delivered yet.
+# unconditional sha1 and base64 dependencies. The module is delivered --
+# handshake, frame encoder and decoder, masking and the automatic PONG -- and
+# the four exports are not, because curl-rs-ffi/src/ffi/ws.rs is not written.
 websockets = []
 
 # Cookie engine -- src/cookies/mod.rs, superseding lib/cookie.c. The jar format

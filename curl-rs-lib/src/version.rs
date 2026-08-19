@@ -1163,16 +1163,20 @@ pub const ENGINE_CONTENT_ENCODING: Engine =
 /// skip instead of failing), `ftp/mod.rs` (a module root declaring
 /// its two written children), `ftp/listparser.rs` (5,516 lines), whose
 /// listing parser interprets the output of a `LIST` command without being able
-/// to issue one, `ftp/pingpong.rs`, whose cadence engine can write a command
-/// and frame a reply without having a state machine to sequence either -- both
-/// are halves of an FTP executor whose `lib/ftp.c` half is not written --
+/// to issue one, `ftp/pingpong.rs`, whose cadence engine writes a command and
+/// frames a reply, and `ftp/mod.rs`'s own command sequencing, the `lib/ftp.c`
+/// half that drives both of them --
 /// `file.rs`, the FIRST per-scheme executor to land,
 /// superseding the whole of `lib/file.c` and filling 5 of `struct
 /// Curl_protocol`'s 17 slots, `http1.rs`, the HTTP/1.x request writer and
-/// the shared vtable of `lib/http.c`, and `sftp.rs`, which also hosts the
-/// shared russh SSH session core `scp.rs` will import. The four files that
-/// would carry the remaining executors -- `http2`, `http3`, `scp` and `ws`
-/// -- are all still
+/// the shared vtable of `lib/http.c`, `sftp.rs`, which also hosts the
+/// shared russh SSH session core `scp.rs` imports, `scp.rs`, the thin
+/// SCP-specific layer over that core, `ws.rs`, whose
+/// handler fills one slot of its own and forwards the other seven to
+/// `http1.rs`'s exactly as `Curl_protocol_ws` (`lib/ws.c:1918-1936`) forwards
+/// them to HTTP's, and `http2.rs`, which is a connection filter beneath the
+/// shared HTTP handler rather than a scheme executor of its own. The one file
+/// that would carry the remaining executor -- `http3` -- is still
 /// absent, which `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` checks
 /// against the disk.
 ///
