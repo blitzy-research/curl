@@ -653,16 +653,42 @@ const OPTIONS_H_ITEMS: &[&str] = &[
 /// second declaration.
 const HEADER_H_ITEMS: &[&str] = &[];
 
-/// Items owned by `websockets.h`: nine flag bits and four functions.
-/// `struct curl_ws_frame` is verbatim, being layout-visible.
-const WEBSOCKETS_H_ITEMS: &[&str] = &[
-    // websockets.h:40-45, :60 and :89-90. CURLWS_PONG is separated from its
-    // five siblings in the C header, which the note above records.
-    "curl_ws_meta",
-    "curl_ws_recv",
-    "curl_ws_send",
-    "curl_ws_start_frame",
-];
+/// Items owned by `websockets.h`: none.
+///
+/// The fourth empty partition -- [`URLAPI_H_ITEMS`], [`HEADER_H_ITEMS`] and
+/// [`MPRINTF_H_ITEMS`] are the others -- and empty for both of the reasons
+/// they are, measured on this tree rather than anticipated:
+///
+///   1. INTERLEAVING. The frozen file does not put its constants in one
+///      block and its prototypes in another. `CURLWS_PONG (1 << 6)`
+///      (websockets.h:60) sits BETWEEN `curl_ws_recv` (:55-57) and
+///      `curl_ws_send` (:70-73) under its own `/* flags for
+///      curl_ws_send() */` comment, and the two `CURLOPT_WS_OPTIONS` bits
+///      (:88-90) sit between `curl_ws_start_frame` (:84-86) and
+///      `curl_ws_meta` (:92). cbindgen emits ONE contiguous generated
+///      region, so no partition of this header can express that order --
+///      the same limit that put `urlapi.h`'s three remaining constructors
+///      in [`URLAPI_H_ITEMS`]'s verbatim list, where the flag bits and the
+///      handle typedef likewise interleave with the prototypes. A
+///      generator that groups the constants would move `CURLWS_PONG` and
+///      produce a large diff in a frozen, reviewed file.
+///   2. THE `struct` KEYWORD. `curl_ws_recv`'s `metap` parameter and
+///      `curl_ws_meta`'s return type both name `struct curl_ws_frame`,
+///      which websockets.h:31-37 declares in TAG form with no typedef.
+///      With `style = "type"` cbindgen spells a struct by its bare name,
+///      so generating either prototype emits `const curl_ws_frame **` --
+///      `error: unknown type name 'curl_ws_frame'`, exactly the invalid C
+///      that `cbindgen.toml`'s `[export.rename]` note records for
+///      `curl_header`, and exactly what `docs/examples/websocket.c` and
+///      `websocket-cb.c` would have failed to compile. Carrying the
+///      prototypes verbatim removes the referent instead of renaming it,
+///      which is the reason that same note gives for `curl_khkey` needing
+///      no entry.
+///
+/// Both are settled by [`WEBSOCKETS_H_DECLS`], which carries the whole
+/// interior, and by this header's [`HeaderSpec::verbatim`], which keeps
+/// every one of the four names out of every pass -- the umbrella included.
+const WEBSOCKETS_H_ITEMS: &[&str] = &[];
 
 /// Items owned by `mprintf.h`: none.
 ///
@@ -1312,8 +1338,45 @@ typedef enum {
 typedef struct Curl_URL CURLU;
 "#;
 
-/// `websockets.h`, after the `extern "C"` open. Layout-visible, so
-/// verbatim: consumers read all five fields of the frame metadata.
+/// `websockets.h`, after the `extern "C"` open: the WHOLE interior of the
+/// frozen header, `websockets.h:31-92` byte for byte.
+///
+/// Every construct in it is one cbindgen cannot render to the frozen bytes,
+/// which is why nothing is left for it to generate and
+/// [`WEBSOCKETS_H_ITEMS`] is empty. Four independent measurements, each
+/// naming what the generated alternative produced:
+///
+///   1. ORDER. The nine `CURLWS_*` bits are not contiguous with each other
+///      and not contiguous with the prototypes: six precede
+///      `curl_ws_recv`, `CURLWS_PONG` follows it, and the two option bits
+///      follow `curl_ws_start_frame`. cbindgen writes one generated region,
+///      so this interleaving is unreachable through a partition -- and
+///      `cbindgen.toml`'s `[const]` note commits to reproducing the
+///      placement, which only this block can honour.
+///   2. THE `L` SUFFIX. cbindgen was measured to DROP it -- `1L` comes out
+///      as `1` -- which would change `CURLOPT_WS_OPTIONS`'s varargs type
+///      from `long` to `int`. `CURLWS_RAW_MODE` and `CURLWS_NOAUTOPONG`
+///      are passed through `curl_easy_setopt`, so the suffix is ABI.
+///   3. THE `struct` KEYWORD. `struct curl_ws_frame` is tag-form with no
+///      typedef, and `style = "type"` spells a struct by its bare name, so
+///      a generated `curl_ws_recv` or `curl_ws_meta` emits C that does not
+///      compile. See [`WEBSOCKETS_H_ITEMS`].
+///   4. THE PROTOTYPE COMMENTS AND WRAPPING. The four `/* NAME
+///      curl_ws_*() */` blocks are the frozen file's own, whereas
+///      `documentation_length = "full"` would emit each function's entire
+///      Rust doc comment -- `# Errors` and `# Safety` headings and all --
+///      and re-wrap the parameter lists to `line_length`. `docs/libcurl/`'s
+///      `curl_ws_*` pages are cross-checked against these declarations, so
+///      both the prose and the hand-wrapping are part of what is frozen.
+///
+/// `struct curl_ws_frame` would be verbatim regardless of the above, being
+/// layout-visible: consumers read all five of its fields off the pointer
+/// `curl_ws_recv` stores through `metap` and the one `curl_ws_meta`
+/// returns. `age` is a struct-version field and stays FIRST -- moving it
+/// would change every consumer's `offsetof`. Its `int flags` is signed
+/// while `curl_ws_send`'s `unsigned int flags` parameter is not; that
+/// asymmetry is in the frozen file and harmonising it would change the ABI
+/// of both.
 const WEBSOCKETS_H_DECLS: &str = r#"
 struct curl_ws_frame {
   int age;              /* zero */
@@ -1323,13 +1386,6 @@ struct curl_ws_frame {
   size_t len;           /* size of the current data chunk */
 };
 
-/* ---- verbatim from websockets.h, not generated ---- */
-/* cbindgen cannot carry these faithfully, measured on all three
-   forms: it DROPS an `L` suffix (`2L` becomes `2`, changing the
-   varargs type of a long option), rewrites hex as decimal, and
-   cannot express a #define whose value is another identifier.
-   The nine CURLWS_* frame and option bits are therefore
-   spliced from the frozen header exactly as written. */
 /* flag bits */
 #define CURLWS_TEXT       (1 << 0)
 #define CURLWS_BINARY     (1 << 1)
@@ -1338,12 +1394,52 @@ struct curl_ws_frame {
 #define CURLWS_PING       (1 << 4)
 #define CURLWS_OFFSET     (1 << 5)
 
+/*
+ * NAME curl_ws_recv()
+ *
+ * DESCRIPTION
+ *
+ * Receives data from the websocket connection. Use after successful
+ * curl_easy_perform() with CURLOPT_CONNECT_ONLY option.
+ */
+CURL_EXTERN CURLcode curl_ws_recv(CURL *curl, void *buffer, size_t buflen,
+                                  size_t *recv,
+                                  const struct curl_ws_frame **metap);
+
 /* flags for curl_ws_send() */
 #define CURLWS_PONG       (1 << 6)
+
+/*
+ * NAME curl_ws_send()
+ *
+ * DESCRIPTION
+ *
+ * Sends data over the websocket connection. Use after successful
+ * curl_easy_perform() with CURLOPT_CONNECT_ONLY option.
+ */
+CURL_EXTERN CURLcode curl_ws_send(CURL *curl, const void *buffer,
+                                  size_t buflen, size_t *sent,
+                                  curl_off_t fragsize,
+                                  unsigned int flags);
+
+/*
+ * NAME curl_ws_start_frame()
+ *
+ * DESCRIPTION
+ *
+ * Buffers a websocket frame header with the given flags and length.
+ * Errors when a previous frame is not complete, e.g. not all its
+ * payload has been added.
+ */
+CURL_EXTERN CURLcode curl_ws_start_frame(CURL *curl,
+                                         unsigned int flags,
+                                         curl_off_t frame_len);
 
 /* bits for the CURLOPT_WS_OPTIONS bitmask: */
 #define CURLWS_RAW_MODE   (1L << 0)
 #define CURLWS_NOAUTOPONG (1L << 1)
+
+CURL_EXTERN const struct curl_ws_frame *curl_ws_meta(CURL *curl);
 "#;
 
 /// `mprintf.h`, before the `extern "C"` open.
@@ -1510,7 +1606,22 @@ const SIBLING_HEADERS: [HeaderSpec; 7] = [
         blank_before_guard_close: true,
         named_guard_close: true,
         items: WEBSOCKETS_H_ITEMS,
-        verbatim: &[],
+        // All four are declared by WEBSOCKETS_H_DECLS, so every pass must
+        // suppress them -- this one included, or they would be declared
+        // twice in the same file. Naming them here is also what keeps them
+        // out of the UMBRELLA: `curl.h`'s suppression list is built from
+        // `verbatim` plus `observed` intersected with the sibling ITEM
+        // lists, and this header's item list is now empty, so without these
+        // four entries the prototypes would migrate into `curl.h` -- in
+        // cbindgen's own order and wrapping, and spelling
+        // `struct curl_ws_frame` without its keyword. Same arrangement as
+        // `header.h`'s three and `urlapi.h`'s five.
+        verbatim: &[
+            "curl_ws_meta",
+            "curl_ws_recv",
+            "curl_ws_send",
+            "curl_ws_start_frame",
+        ],
     },
     HeaderSpec {
         file: "mprintf.h",
@@ -3693,8 +3804,9 @@ const EXPORTED_SYMBOLS: usize = 100;
 /// `curl_m*printf` functions, the twelve whose frozen signature names a type
 /// this crate's Rust spelling cannot ask cbindgen to produce
 /// (`cbindgen.toml`, "Group 5e"), the two whose parameter names a public enum,
-/// the two the header API declares and the three remaining URL-API
-/// constructors. 4 + 5 + 10 + 12 + 2 + 2 + 3 = 38.
+/// the two the header API declares, the three remaining URL-API
+/// constructors and the four WebSocket entry points.
+/// 4 + 5 + 10 + 12 + 2 + 2 + 3 + 4 = 42.
 ///
 /// The next two are `curl_easy_header` and `curl_easy_nextheader`. They were
 /// generated until the render of `include/curl/header.h` was measured against
@@ -3711,7 +3823,17 @@ const EXPORTED_SYMBOLS: usize = 100;
 /// region cannot express, and `curl_url_dup`'s frozen parameter name `in`
 /// (`urlapi.h:126`) is a Rust keyword. [`URLAPI_H_ITEMS`] records the full
 /// measurement.
-const VERBATIM_FUNCTIONS: usize = 38;
+///
+/// The last four are `curl_ws_recv`, `curl_ws_send`, `curl_ws_start_frame`
+/// and `curl_ws_meta`, and they joined for BOTH of `urlapi.h`'s reasons at
+/// once. `websockets.h` interleaves three constant blocks between its four
+/// prototypes -- `CURLWS_PONG` between the first and the second, the two
+/// `CURLOPT_WS_OPTIONS` bits between the third and the fourth -- which one
+/// contiguous generated region cannot express; and two of the four name
+/// `struct curl_ws_frame`, a tag-form struct with no typedef, which
+/// `style = "type"` renders as a bare `curl_ws_frame` that does not compile.
+/// [`WEBSOCKETS_H_ITEMS`] records the full measurement.
+const VERBATIM_FUNCTIONS: usize = 42;
 
 // Three further facts about the option metadata, recorded as comments
 // because they are shape rather than count:
@@ -4198,8 +4320,8 @@ fn run_self_checks() -> Result<(), Box<dyn Error>> {
     }
 
     // The per-header function partition has to account for every exported
-    // symbol exactly once. 100 symbols, 35 of them verbatim, so the eight
-    // partitions must contribute 65 function names between them. Counting
+    // symbol exactly once. 100 symbols, 42 of them verbatim, so the eight
+    // partitions must contribute 58 function names between them. Counting
     // them directly would require distinguishing functions from types, so
     // the weaker but still useful invariant is asserted: the partition
     // cannot contain more names than the header set can possibly declare.
@@ -4720,17 +4842,18 @@ fn callables_on(line: &str) -> Vec<String> {
 /// and therefore hand-written -- never both and never neither.
 ///
 /// Measured today, and CHECKED rather than dated -- `check_export_coverage`
-/// below fails the build if either figure moves: 62 claimed, 38 verbatim,
+/// below fails the build if either figure moves: 58 claimed, 42 verbatim,
 /// disjoint, union 100 of 100, nothing unaccounted. These two describe how each
 /// of the 100 DECLARATIONS reaches the header, and say nothing about how many
 /// symbols the crate currently defines; that is
 /// [`undefined_abi_exports`]'s figure, and confusing the two has misled a
-/// review once. The 38 are the four C-variadic setters, the five
+/// review once. The 42 are the four C-variadic setters, the five
 /// deprecated prototypes, the ten `curl_m*printf` functions, the twelve
 /// whose frozen signature names a type this crate's Rust spelling cannot ask
 /// cbindgen to produce (cbindgen.toml, "Group 5e"), the two `urlapi.h`
-/// declares with a `CURLUPart` parameter, the two `header.h` declares and the
-/// three remaining `urlapi.h` constructors, which matches
+/// declares with a `CURLUPart` parameter, the two `header.h` declares, the
+/// three remaining `urlapi.h` constructors and the four `websockets.h`
+/// declares between its three interleaved constant blocks, which matches
 /// [`VERBATIM_FUNCTIONS`] exactly.
 fn check_export_coverage(root: &Path) -> Result<(), Box<dyn Error>> {
     let symbols = exported_symbols(root)?;

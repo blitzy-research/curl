@@ -18,32 +18,49 @@
 # curl-testsuite.yml. One workflow per validation gate, so that a failure names
 # its own cause.
 #
-# WHY THIS GATE IS EXPECTED TO BE RED TODAY, AND WHY THAT IS CORRECT
+# WHY THE ARITHMETIC IS DONE HERE RATHER THAN DELEGATED TO A FLAG
 #
-# `curl-rs-lib/src/protocols/` and `curl-rs-lib/src/transfer/` do not exist in
-# this checkout yet. AAP 0.4.1 assigns them a large body of work -- http1,
-# http2, http3, the ftp trio, sftp, scp, file, ws and the stub registry on one
-# side, and the transfer loop, request state, sendf, writeout, progress,
-# ratelimit, content_encoding and chunked on the other -- and none of it has
-# landed.
+# Both mandated trees are present in this checkout and both are measurable.
+# AAP 0.4.1 assigns them the modules this gate scores: http1, http2, http3,
+# the ftp trio, sftp, scp, file, ws and the stub registry on one side, and the
+# transfer loop, request state, sendf, writeout, progress, ratelimit,
+# content_encoding and chunked on the other.
 #
-# This gate therefore fails, naming both absent trees. That is deliberate. The
-# alternative implementations were considered and each is dishonest:
+# The threshold is therefore a live measurement, and it is computed per tree.
+# Three cheaper implementations were considered and each is dishonest:
 #
+#   - `cargo llvm-cov --fail-under-lines 80` gates the WORKSPACE TOTAL, not the
+#     two mandated trees. That is a different and materially easier assertion:
+#     the workspace total is carried by thousands of lines of utility, option
+#     table and FFI code, so it can sit comfortably above 80% while
+#     `protocols/` sits at 40%. A total-only gate would report nothing wrong.
+#     This is why `--fail-under-lines` is not used here at all.
 #   - Summing lines under a prefix that matches nothing yields 0/0. Reported as
 #     a percentage that is either a division by zero or a spurious 100%, it
-#     turns an unwritten module into a passing grade.
-#   - `cargo llvm-cov --fail-under-lines 80` gates the WORKSPACE TOTAL, not the
-#     two mandated trees. Measured on this checkout the workspace total is
-#     97.39% (18127/18613 lines), so a total-only gate passes comfortably while
-#     both mandated trees are absent. That is precisely the vacuous green this
-#     gate exists to prevent, which is why `--fail-under-lines` is not used
-#     here and the per-tree arithmetic is done explicitly.
-#   - Narrowing the mandate to the modules that happen to exist would edit the
-#     requirement instead of meeting it.
+#     turns an unmeasured module into a passing grade. Every such path is an
+#     explicit failure below, never a default.
+#   - Narrowing the mandate to the modules that happen to be well covered would
+#     edit the requirement instead of meeting it.
 #
-# A red gate that names the missing subject is the truthful state. It turns
-# green when the mandated modules land and are tested, and not before.
+# WHY 80% IS REACHABLE HERE WITHOUT A NETWORK -- AAP 0.3.3 P12
+#
+# P12 is dependency injection: "The resolver, the clock, and the TLS provider
+# are injected rather than reached for globally, which is what makes the
+# protocol modules testable to the mandated 80% line coverage without live
+# network access."
+#
+# Two consequences, both load bearing for this file:
+#
+#   - This job needs NO outbound network access, no listening fixture server
+#     and no proxy. It compiles the workspace with instrumentation and runs the
+#     unit tests compiled into the crates. Nothing here sets up a network, and
+#     nothing should be added that does.
+#   - When a tree falls short, the remedy is MORE TESTS IN THE OWNING CRATE,
+#     exercising the injected resolver, clock and TLS provider. The remedy is
+#     never a lowered threshold and never an exclusion filter added here. A
+#     filter that drops a poorly covered file raises the number while lowering
+#     the amount of verified code, which is the exact inversion this gate
+#     exists to catch.
 #
 # LINEAGE
 #
@@ -97,6 +114,13 @@ env:
   # own LLVM, and mixing versions produces "unsupported instrumentation profile
   # version" rather than a wrong number, but pinning states the intent.
   STABLE_TOOLCHAIN: '1.97.1'
+  # AAP 0.5.1 pins cargo-llvm-cov to exactly 0.8.7, and the workspace manifest
+  # records the same number in its CI-tool table. It is a tool installed by this
+  # workflow rather than a manifest dependency, so the pin has to be carried
+  # here. Declared as an environment variable, as rust-audit.yml does for
+  # CARGO_AUDIT_VERSION and CARGO_DENY_VERSION, so the version appears exactly
+  # once and the install and the assertion below cannot disagree.
+  CARGO_LLVM_COV_VERSION: '0.8.7'
   # AAP 0.8.4 gate 8. Expressed here so the number appears exactly once.
   COVERAGE_MIN: '80'
   # AAP 0.8.4 gate 8 names these two trees and no others. Space separated,
@@ -122,7 +146,15 @@ jobs:
           fi
           # llvm-tools-preview supplies llvm-profdata and llvm-cov. cargo-llvm-cov
           # locates them inside the active toolchain's sysroot, so the component
-          # must be installed on the same toolchain that compiles the code.
+          # must be present on the same toolchain that compiles the code.
+          #
+          # rust-toolchain.toml ALREADY declares it: channel "1.97.1" with
+          # components ["rustfmt", "clippy", "llvm-tools-preview"]. A separate
+          # `rustup component add llvm-tools-preview` is therefore redundant and
+          # must not be added here. What this step does instead is name the
+          # toolchain and its component in one install, so a runner image that
+          # ships a different default still lands on the pin rather than
+          # resolving it lazily on the first cargo call.
           rustup toolchain install "${STABLE_TOOLCHAIN}" \
             --profile minimal \
             --component llvm-tools-preview \
@@ -132,20 +164,51 @@ jobs:
       - name: 'install cargo-llvm-cov at the pinned version'
         run: |
           set -eu
-          # AAP 0.5.1 pins cargo-llvm-cov to exactly 0.8.7. An unpinned install
-          # would let the coverage arithmetic change under an unchanged commit,
-          # which is the same class of defect that the dated nightly pin in
-          # rust-miri.yml exists to prevent.
-          cargo install cargo-llvm-cov --locked --version 0.8.7
+          # An unpinned install would let the coverage arithmetic change under an
+          # unchanged commit, which is the same class of defect that the dated
+          # nightly pin in rust-miri.yml exists to prevent. --locked keeps
+          # cargo-llvm-cov's own dependency graph fixed too; --force makes the
+          # step idempotent regardless of what the runner image happens to ship,
+          # while --version still governs exactly what lands.
+          if [ -z "${CARGO_LLVM_COV_VERSION}" ]; then
+            echo 'FAIL: CARGO_LLVM_COV_VERSION is empty.'
+            exit 1
+          fi
+          cargo install cargo-llvm-cov \
+            --version "${CARGO_LLVM_COV_VERSION}" \
+            --locked \
+            --force
 
       - name: 'toolchain versions'
         run: |
           set -eu
+          echo '::group::toolchain and coverage tool versions'
+          command -v rustc
+          command -v cargo
+          command -v cargo-llvm-cov
           rustc --version
           cargo --version
           cargo llvm-cov --version
           echo "coverage floor: ${COVERAGE_MIN}%"
           echo "mandated trees: ${COVERAGE_TREES}"
+          echo '::endgroup::'
+
+      - name: 'assert: cargo-llvm-cov is exactly the pinned version'
+        run: |
+          set -eu
+          # `cargo llvm-cov --version` prints "cargo-llvm-cov <semver>". Printing
+          # it is evidence; comparing it is the assertion. Without the compare, a
+          # runner image shipping a different build would be reported in the log
+          # and then silently used, and the coverage arithmetic would move under
+          # an unchanged commit.
+          have="$(cargo llvm-cov --version | awk 'NR == 1 {print $NF}')"
+          if [ "${have}" != "${CARGO_LLVM_COV_VERSION}" ]; then
+            echo "FAIL: cargo-llvm-cov reports '${have}' but AAP 0.5.1 pins"
+            echo "${CARGO_LLVM_COV_VERSION}. Coverage numbers are only comparable"
+            echo 'across runs when the measuring tool is held fixed.'
+            exit 1
+          fi
+          echo "cargo-llvm-cov ${have} matches the pin"
 
       - name: 'assert: the pinned stable toolchain is the active one'
         run: |
@@ -160,6 +223,7 @@ jobs:
           # cargo-llvm-cov shells out to llvm-profdata and llvm-cov from the
           # sysroot. If the component were missing the run would fail later with
           # a confusing message, so prove it is present now.
+          echo '::group::llvm tooling in the toolchain sysroot'
           sysroot="$(rustc --print sysroot)"
           found=0
           for tool in llvm-profdata llvm-cov; do
@@ -172,6 +236,7 @@ jobs:
             fi
           done
           echo "stable ${have} active, with ${found} llvm tool(s) present"
+          echo '::endgroup::'
 
       - name: 'assert: the mandated module trees exist'
         run: |
@@ -183,21 +248,21 @@ jobs:
           # instrumented line.
           # WHY A FILE COUNT IS NOT ENOUGH, and what replaced it.
           #
-          # This guard used to accept any non-empty tree. Measured against this
-          # checkout, that is precisely the state it fails to catch:
-          # curl-rs-lib/src/protocols/ holds mod.rs and ftp/listparser.rs, and
-          # curl-rs-lib/src/transfer/ holds a module-declaration mod.rs and five
-          # of its eight modules - so both trees are "present and hold Rust
-          # source" while not one protocol executor exists and no transfer loop
-          # runs. A scheme registry and a directory-listing parser can carry the
-          # coverage floor to 80% on their own, and the gate would then report a
-          # green tick over a subject that cannot perform a transfer. That is the
-          # measuring-nothing failure this step exists to prevent, one level up.
+          # This guard used to accept any non-empty tree, and that is the state it
+          # cannot catch: a tree holding only mod.rs and a directory-listing
+          # parser is "present and holds Rust source" while no protocol executor
+          # exists and no transfer loop runs. A scheme registry and a list parser
+          # can carry the coverage floor to 80% between them, and the gate would
+          # then report a green tick over a subject that cannot perform a
+          # transfer. That is the measuring-nothing failure this step prevents,
+          # one level above the arithmetic.
           #
           # So the requirement is the EXACT module inventory AAP 0.4.1 assigns,
-          # named file by file. A tree that is missing any of them fails, and the
-          # message names which - which is the difference between a gate that
-          # tells you what to write and one that tells you a directory is empty.
+          # named file by file: twelve modules under protocols/ including the
+          # three-file ftp/ subtree, and eight under transfer/. A tree missing any
+          # of them fails, and the message names which - the difference between a
+          # gate that tells you what to write and one that tells you a directory
+          # is empty.
           #
           # The lists are literal rather than derived from a glob, for the same
           # reason the option table and the export list are: a set that discovers
@@ -205,6 +270,7 @@ jobs:
           required_protocols='mod.rs http1.rs http2.rs http3.rs sftp.rs scp.rs file.rs ws.rs stub.rs ftp/mod.rs ftp/pingpong.rs ftp/listparser.rs'
           required_transfer='mod.rs request.rs sendf.rs writeout.rs progress.rs ratelimit.rs content_encoding.rs chunked.rs'
 
+          echo '::group::mandated module inventory'
           missing=''
           for tree in ${COVERAGE_TREES}; do
             if [ ! -d "${tree}" ]; then
@@ -261,6 +327,7 @@ jobs:
             exit 1
           fi
           echo 'every mandated module tree is present and holds Rust source'
+          echo '::endgroup::'
 
       - name: 'fetch the locked dependency graph'
         run: |
@@ -302,9 +369,21 @@ jobs:
           # a multi-megabyte document, which is fragile in shell and direct here.
           #
           # The arithmetic is deliberately explicit rather than delegated to
-          # --fail-under-lines, because that flag gates the workspace total. On
-          # this checkout the total is 97.39% while both mandated trees are
-          # absent, so a total-only gate would pass and report nothing wrong.
+          # --fail-under-lines, because that flag gates the workspace total and
+          # the mandate names two trees. The total is carried by thousands of
+          # lines of utility, option-table and FFI code that are not the subject
+          # of gate 8, so it can sit well above the floor while either mandated
+          # tree sits below it. The total is still printed, clearly marked as
+          # context, so the two figures are never confused for one another.
+          #
+          # The script also prints a PER-FILE table before each aggregate. That
+          # is what keeps a small, trivially covered module from hiding a poorly
+          # covered neighbour behind a healthy directory average -- protocols/
+          # stub.rs is the obvious candidate, since it only registers the 13
+          # out-of-scope schemes and returns CURLE_UNSUPPORTED_PROTOCOL, so it is
+          # short and cheap to cover. The per-file rows also make the recursive
+          # match visible: the three ftp/ modules appear in the protocols/ table
+          # rather than being silently dropped by a non-recursive glob.
           python3 - \
             "${RUNNER_TEMP}/coverage/coverage.json" \
             "${GITHUB_WORKSPACE}" \
@@ -354,7 +433,8 @@ jobs:
                   return real[len(ROOT) + 1:]
               return real
 
-          buckets = {t: {"count": 0, "covered": 0, "files": 0} for t in TREES}
+          buckets = {t: {"count": 0, "covered": 0, "files": 0, "rows": []}
+                     for t in TREES}
           for entry in files:
               name = rel(entry.get("filename", ""))
               # Third-party and generated code is not the subject of the mandate.
@@ -364,9 +444,16 @@ jobs:
               for tree in TREES:
                   prefix = tree if tree.endswith("/") else tree + "/"
                   if name.startswith(prefix):
-                      buckets[tree]["count"] += int(lines.get("count", 0))
-                      buckets[tree]["covered"] += int(lines.get("covered", 0))
+                      count = int(lines.get("count", 0))
+                      covered = int(lines.get("covered", 0))
+                      buckets[tree]["count"] += count
+                      buckets[tree]["covered"] += covered
                       buckets[tree]["files"] += 1
+                      # The path is kept relative to the tree so the ftp/ subtree
+                      # reads as "ftp/pingpong.rs", making the recursive match
+                      # self-evident in the log.
+                      buckets[tree]["rows"].append(
+                          (name[len(prefix):], covered, count))
 
           totals = (data[0].get("totals") or {}).get("lines") or {}
           print("workspace total (context only, NOT the gate): %d/%d lines = %.2f%%"
@@ -400,6 +487,23 @@ jobs:
               verdict = "ok" if pct >= THRESHOLD else "BELOW THRESHOLD"
               print("  %-34s %6d/%-6d lines = %6.2f%%  (%d file(s))  %s"
                     % (tree, b["covered"], b["count"], pct, b["files"], verdict))
+              # Per-file rows, worst covered first. The aggregate above is the
+              # gate; these rows are what stop a short, cheaply covered module
+              # from carrying a poorly covered neighbour to a healthy average.
+              # They also evidence the recursive match, since the ftp/ modules
+              # appear here as ftp/*.rs rather than being silently absent.
+              rows = sorted(
+                  b["rows"],
+                  key=lambda r: (r[1] / r[2] if r[2] else 1.0, r[0]))
+              for fname, fcov, fcnt in rows:
+                  if fcnt == 0:
+                      print("      %-30s %6d/%-6d          (no instrumented line)"
+                            % (fname, fcov, fcnt))
+                      continue
+                  fpct = 100.0 * fcov / fcnt
+                  print("      %-30s %6d/%-6d lines = %6.2f%%%s"
+                        % (fname, fcov, fcnt, fpct,
+                           "" if fpct >= THRESHOLD else "   <- below the floor"))
               if pct < THRESHOLD:
                   failures.append(
                       "%s reaches only %.2f%% line coverage (%d/%d), below the "

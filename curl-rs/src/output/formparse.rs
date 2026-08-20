@@ -2777,6 +2777,33 @@ mod tests {
             assert!(outcome.is_ok(), "translation failed");
             recorder
         }
+
+        /// [`Self::output`] with `voutf`'s line wrapping undone, for a test
+        /// that asserts on the TEXT of one diagnostic.
+        ///
+        /// `voutf` (`src/tool_msgs.c:37-73`) wraps at the terminal width: it
+        /// cuts the message at the last blank before the limit, writes the
+        /// bytes up to and including that blank, emits a newline, and then
+        /// re-emits the `"Warning: "` prefix for the remainder. So a single
+        /// long warning arrives as several lines whose join point is exactly
+        /// `"\nWarning: "`, with the blank retained on the first line -- which
+        /// is why removing that separator alone reconstitutes the message.
+        ///
+        /// This matters because the width at which a message wraps depends on
+        /// its length, and a message that interpolates a path is as long as
+        /// the path is. A test asserting on a contiguous substring of such a
+        /// message is otherwise sensitive to where the temporary directory
+        /// happens to live -- `TMPDIR=/tmp` wraps in one place and
+        /// `TMPDIR=/tmp/curl-rs-0` in another, and only one of them keeps the
+        /// substring intact. Undoing the wrap first makes the assertion about
+        /// the text, which is what it is for. The wrapping itself is frozen
+        /// behaviour and is asserted on its own in `output::msgs`.
+        ///
+        /// Only for a single expected diagnostic: joining is indiscriminate,
+        /// so two warnings would run together.
+        fn unwrapped(&self) -> String {
+            self.output.replace("\nWarning: ", "")
+        }
     }
 
     fn parse_many(
@@ -3471,8 +3498,11 @@ mod tests {
             "{}",
             parsed.output
         );
+        // Through `unwrapped` because the interpolated path makes this
+        // message long enough for `voutf` to break it, and where it breaks
+        // depends on how long the temporary directory's path is.
         assert!(
-            parsed.output.contains("No such file or directory"),
+            parsed.unwrapped().contains("No such file or directory"),
             "{}",
             parsed.output
         );
@@ -4346,8 +4376,10 @@ mod tests {
         let path = dir.path().join("absent");
         let spec = format!("field=value;headers=@{}", path.display());
         let parsed = parse(&spec);
+        // `unwrapped` for the reason given on that method: the path this
+        // message carries decides where `voutf` breaks the line.
         assert!(
-            parsed.output.contains(expected.as_str()),
+            parsed.unwrapped().contains(expected.as_str()),
             "the shared renderer's text must appear verbatim: {}",
             parsed.output
         );

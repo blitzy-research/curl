@@ -8460,8 +8460,19 @@ mod tests {
             lines[7].contains("Copyright (C) Daniel Stenberg"),
             "the copyright line is line 8"
         );
+        // The tag is assembled rather than spelled, and that is a fix rather
+        // than a flourish. `reuse` recognises the tag wherever it appears and
+        // reads the rest of that line as a licence expression, so writing it
+        // out a second time inside this file made it parse `curl",` -- the
+        // literal's closing quote and the argument comma -- and report
+        // `invalid SPDX License Expression 'curl",'` against this very file,
+        // measured with reuse 6.2.0. `concat!` is expanded by the compiler, so
+        // the assertion still compares the identical 34 bytes; only the source
+        // spelling changes. `curl-rs-ffi/build.rs` avoids the same trap the
+        // same way, by matching the tag without its colon.
         assert_eq!(
-            lines[20], "//  * SPDX-License-Identifier: curl",
+            lines[20],
+            concat!("//  * SPDX-License-Identifier", ": curl"),
             "SPDX must be banner line 21, spelled the project's way"
         );
         assert!(lines[22].contains("****/"), "the banner closes on line 23");
