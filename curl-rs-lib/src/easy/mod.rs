@@ -54,13 +54,27 @@
 //!
 //! # Partially delivered
 //!
-//! Of this module's planned children, only [`options`] exists yet; the
-//! easy handle itself (from `lib/easy.c` with `lib/urldata.h`), the option
-//! setters (`lib/setopt.c`) and the `CURLINFO` accessors
-//! (`lib/getinfo.c`) arrive with their own files. This file is the module
-//! root and declares exactly the one child that exists: a `mod` line
+//! Two of this module's planned children exist: [`options`], and now
+//! [`handle`] -- the decomposed easy handle itself, from `lib/easy.c` with
+//! `lib/urldata.h`. The option setters (`lib/setopt.c`) and the `CURLINFO`
+//! accessors (`lib/getinfo.c`) arrive with their own files. This file is the
+//! module root and declares exactly the children that exist: a `mod` line
 //! without its file is `error[E0583]`, which no attribute can suppress,
 //! so each declaration lands with the file it names.
+//!
+//! [`handle`] delivers the state those two remaining files act on -- the
+//! option set with its frozen defaults, the metadata store, the identity
+//! token and the `curl_easy_getinfo` backing store -- so it lands first by
+//! necessity rather than by preference.
+
+/// The easy handle: `lib/urldata.h`'s god-struct, decomposed.
+///
+/// `pub` because both adapter crates need the handle type: `curl-rs-ffi`
+/// owns it across the C boundary for `curl_easy_init` and
+/// `curl_easy_cleanup`, and `curl-rs` reads the *"peer verification
+/// disabled"* state through it in order to warn on standard error before
+/// proceeding. Its internals stay `pub(crate)`.
+pub mod handle;
 
 /// Option identity: the lookup behind `curl_easy_option_by_name`,
 /// `curl_easy_option_by_id` and `curl_easy_option_next`.

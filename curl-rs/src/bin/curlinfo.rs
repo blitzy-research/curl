@@ -2064,8 +2064,22 @@ mod absent_target_gate {
     /// one, which is why `curl-rs-lib/src/version.rs` still withholds the
     /// `proxy` capability -- but it now withholds it as `inert` rather than as
     /// `unwritten`, and that row is no longer below.
+    /// `easy/handle.rs` has now LANDED, so its row is gone from below and the
+    /// three-strong `easy/` group is down to two. It carries the decomposed
+    /// easy handle: `struct Curl_easy`'s 24 members apportioned to the modules
+    /// that own their lifecycles, `Curl_init_userdefined`'s frozen defaults
+    /// with certificate verification ON, the generational identity token that
+    /// `multi/` will key its slab with, and the four injected seams -- clock,
+    /// resolver, TLS factory and generator -- that let the protocol and
+    /// transfer modules be exercised without a live network.
+    ///
+    /// It does not by itself make a transfer possible, and the distinction is
+    /// the same one every executor above is held by: `setopt.rs` and
+    /// `getinfo.rs` remain absent, so nothing can yet WRITE an option onto a
+    /// handle or READ a statistic off one, and `protocols/mod.rs` still keeps
+    /// `run: None` on every row. A handle that can be built and defaulted is a
+    /// delivered file whose gap is wiring, not source.
     const ENGINE_TARGETS: &[&str] = &[
-        "curl-rs-lib/src/easy/handle.rs",
         "curl-rs-lib/src/easy/setopt.rs",
         "curl-rs-lib/src/easy/getinfo.rs",
     ];
@@ -2143,7 +2157,7 @@ mod absent_target_gate {
     }
 
     fn every_target() -> Vec<&'static str> {
-        let mut all = Vec::with_capacity(17);
+        let mut all = Vec::with_capacity(16);
         all.extend_from_slice(ENGINE_TARGETS);
         all.extend_from_slice(TOOL_TARGETS);
         all.extend_from_slice(ABI_TARGETS);
@@ -2171,15 +2185,16 @@ mod absent_target_gate {
     /// It read five/thirteen/two until `protocols/http3.rs` and
     /// `proxy/http_connect.rs` landed and their rows left [`ENGINE_TARGETS`],
     /// and until `curl-rs-ffi/src/ffi/ws.rs` landed and its row left
-    /// [`ABI_TARGETS`]. Renaming rather than loosening the numbers is
-    /// deliberate: a count in a name cannot drift silently, and the rename is
-    /// the same notification the absence gate gives.
+    /// [`ABI_TARGETS`]; it read three/thirteen/one until `easy/handle.rs`
+    /// landed and left [`ENGINE_TARGETS`] too. Renaming rather than loosening
+    /// the numbers is deliberate: a count in a name cannot drift silently, and
+    /// the rename is the same notification the absence gate gives.
     #[test]
-    fn the_split_is_three_thirteen_one() {
-        assert_eq!(ENGINE_TARGETS.len(), 3, "curl-rs-lib");
+    fn the_split_is_two_thirteen_one() {
+        assert_eq!(ENGINE_TARGETS.len(), 2, "curl-rs-lib");
         assert_eq!(TOOL_TARGETS.len(), 13, "curl-rs");
         assert_eq!(ABI_TARGETS.len(), 1, "curl-rs-ffi");
-        assert_eq!(every_target().len(), 17, "the workspace total");
+        assert_eq!(every_target().len(), 16, "the workspace total");
     }
 
     #[test]
@@ -2206,8 +2221,10 @@ mod absent_target_gate {
     /// named in the same design tables as the missing ones, plus the target
     /// that most recently moved off [`ABI_TARGETS`] -- `ffi/ws.rs`, which
     /// took the whole `curl_ws_*` family with it -- the target
-    /// that most recently moved off [`TOOL_TARGETS`], and the thirteen that
-    /// most recently moved off [`ENGINE_TARGETS`] -- `protocols/http3.rs`, the
+    /// that most recently moved off [`TOOL_TARGETS`], and the fourteen that
+    /// most recently moved off [`ENGINE_TARGETS`] -- `easy/handle.rs`, the
+    /// most recent of them and the first file in the `easy/` group to land,
+    /// `protocols/http3.rs`, the
     /// last per-scheme executor to land and the only filter that terminates
     /// its own chain, `proxy/http_connect.rs`, the three CONNECT filters that
     /// empty the proxy directory from the absence gate, `protocols/ws.rs`,
@@ -2230,6 +2247,7 @@ mod absent_target_gate {
         let root = repo_root();
         for present in [
             "curl-rs-lib/src/easy/mod.rs",
+            "curl-rs-lib/src/easy/handle.rs",
             "curl-rs-lib/src/protocols/ftp/listparser.rs",
             "curl-rs-lib/src/protocols/ftp/pingpong.rs",
             "curl-rs/src/callbacks/mod.rs",

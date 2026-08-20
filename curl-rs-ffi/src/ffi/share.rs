@@ -975,6 +975,35 @@ mod tests {
     const DATA_CONNECT: c_int = 5;
     const DATA_PSL: c_int = 6;
     const DATA_HSTS: c_int = 7;
+
+    /// The answer `CURLSHOPT_SHARE` and `CURLSHOPT_UNSHARE` give for `kind` in
+    /// THIS build.
+    ///
+    /// Three of the five shareable kinds are unconditional and two are not.
+    /// The cookie jar sits inside `#ifndef CURL_DISABLE_COOKIES` in the C
+    /// (`lib/curl_share.c:94-96` for the share arm, `:161-163` for the
+    /// unshare arm) and the HSTS cache inside `#ifndef CURL_DISABLE_HSTS`
+    /// (`:106-108` and `:171-173`), so a build without them answers
+    /// `CURLSHE_NOT_BUILT_IN` where a full build answers `CURLSHE_OK`. Both
+    /// arms agree, which is why one helper serves both directions.
+    ///
+    /// Asserting the build's OWN answer rather than a fixed `CURLSHE_OK` is
+    /// what `curl-rs-lib`'s `share` tests already do -- see
+    /// `unshare_with_the_public_suffix_list_is_a_bad_option_and_still_clears`,
+    /// which takes the same `cfg!` form. Without it these assertions pass only
+    /// under the default feature set and fail under `--no-default-features`
+    /// for a reason that is not a defect in the code under test.
+    fn expected_for_kind(kind: c_int) -> CURLSHcode {
+        match kind {
+            DATA_COOKIE if !cfg!(feature = "cookies") => {
+                CURLSHcode::CURLSHE_NOT_BUILT_IN
+            }
+            DATA_HSTS if !cfg!(feature = "hsts") => {
+                CURLSHcode::CURLSHE_NOT_BUILT_IN
+            }
+            _ => CURLSHcode::CURLSHE_OK,
+        }
+    }
     const DATA_LAST: c_int = 8;
 
     /// This file up to but not including its test module.
@@ -1489,8 +1518,8 @@ mod tests {
             ] {
                 assert_eq!(
                     setopt_int(share, SHOPT_SHARE, kind),
-                    CURLSHcode::CURLSHE_OK,
-                    "CURLSHOPT_SHARE refused kind {kind}",
+                    expected_for_kind(kind),
+                    "CURLSHOPT_SHARE answered wrongly for kind {kind}",
                 );
             }
 
@@ -1568,12 +1597,12 @@ mod tests {
             for kind in [DATA_DNS, DATA_COOKIE, DATA_HSTS, DATA_SSL_SESSION] {
                 assert_eq!(
                     setopt_int(share, SHOPT_SHARE, kind),
-                    CURLSHcode::CURLSHE_OK,
+                    expected_for_kind(kind),
                 );
                 assert_eq!(
                     setopt_int(share, SHOPT_UNSHARE, kind),
-                    CURLSHcode::CURLSHE_OK,
-                    "CURLSHOPT_UNSHARE refused kind {kind}",
+                    expected_for_kind(kind),
+                    "CURLSHOPT_UNSHARE answered wrongly for kind {kind}",
                 );
             }
 
@@ -1899,11 +1928,11 @@ mod tests {
         unsafe {
             assert_eq!(
                 setopt_int(share, SHOPT_SHARE, DATA_COOKIE),
-                CURLSHcode::CURLSHE_OK,
+                expected_for_kind(DATA_COOKIE),
             );
             assert_eq!(
                 setopt_int(share, SHOPT_SHARE, DATA_DNS),
-                CURLSHcode::CURLSHE_OK,
+                expected_for_kind(DATA_DNS),
             );
         }
 
@@ -2003,7 +2032,7 @@ mod tests {
                     SHOPT_SHARE,
                     DATA_COOKIE as usize as *mut c_void,
                 ),
-                CURLSHcode::CURLSHE_OK,
+                expected_for_kind(DATA_COOKIE),
             );
             assert_eq!(
                 share_setopt_slot(
@@ -2011,7 +2040,7 @@ mod tests {
                     SHOPT_UNSHARE,
                     DATA_COOKIE as usize as *mut c_void,
                 ),
-                CURLSHcode::CURLSHE_OK,
+                expected_for_kind(DATA_COOKIE),
             );
             assert_eq!(
                 share_setopt_slot(share, SHOPT_NONE, ptr::null_mut()),
@@ -2181,8 +2210,8 @@ mod tests {
         // option's declared type.
         unsafe {
             for (option, value, expected) in [
-                (SHOPT_SHARE, DATA_COOKIE, CURLSHcode::CURLSHE_OK),
-                (SHOPT_UNSHARE, DATA_COOKIE, CURLSHcode::CURLSHE_OK),
+                (SHOPT_SHARE, DATA_COOKIE, expected_for_kind(DATA_COOKIE)),
+                (SHOPT_UNSHARE, DATA_COOKIE, expected_for_kind(DATA_COOKIE)),
                 (SHOPT_SHARE, 4242, CURLSHcode::CURLSHE_BAD_OPTION),
                 (SHOPT_NONE, 0, CURLSHcode::CURLSHE_BAD_OPTION),
             ] {

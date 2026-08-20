@@ -4930,8 +4930,8 @@ pub(crate) static SCHEME_WSS: Scheme = Scheme {
 /// Those two rows still carry `run: None` in this checkout, and the reason is
 /// [`super::http1`]'s: a WebSocket transfer is an HTTP transfer plus a
 /// handshake, and nothing in this checkout builds a request specification for
-/// [`Http1`] to compose -- `easy/handle.rs` and `easy/setopt.rs` are not on
-/// disk. Advertising `ws` while [`Protocol::do_it`] answers
+/// [`Http1`] to compose -- `easy/handle.rs` is on disk and holds the option
+/// state, but `easy/setopt.rs`, which writes a URL onto it, is not. Advertising `ws` while [`Protocol::do_it`] answers
 /// [`CURLcode::FailedInit`] would convert 28 cleanly-skipped fixtures into 28
 /// failures, and specification 0.6.5 measures that asymmetry precisely:
 /// under-reporting makes a fixture SKIP, over-reporting makes it RUN AND FAIL.

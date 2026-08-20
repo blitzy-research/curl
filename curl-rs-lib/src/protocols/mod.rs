@@ -153,9 +153,10 @@
 //!
 //! * Every path to an answer runs through an HTTP request writer AND something
 //!   that drives it. The writer has landed -- it is [`http1`] -- but the driver
-//!   has not: nothing in this checkout constructs a request specification,
-//!   because `easy/handle.rs` and `easy/setopt.rs` are two of the four files
-//!   `curl-rs-lib/src/lib.rs` enumerates as absent, and
+//!   has not: nothing in this checkout constructs a request specification.
+//!   `easy/handle.rs` has landed, so a handle exists to hold the options, but
+//!   `easy/setopt.rs` -- one of the two files `curl-rs-lib/src/lib.rs`
+//!   enumerates as absent -- is what would WRITE a URL onto one, and
 //!   `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` asserts that absence
 //!   against the disk. Composing a `DohTransport` on top of a writer with no
 //!   caller would put the round trip's other half in this file, which is not
@@ -884,8 +885,9 @@ pub(crate) struct Scheme {
     /// and the column is still empty: [`http1`] defines a
     /// full [`Protocol`] implementor and exports its own two rows carrying
     /// `run: Some(&http1::HTTP)`, and what those two rows lack is a CALLER --
-    /// nothing in this checkout builds a request specification, because
-    /// `easy/handle.rs` and `easy/setopt.rs` are unwritten -- [`ftp`] defines
+    /// nothing in this checkout builds a request specification: `easy/handle.rs`
+    /// has landed but `easy/setopt.rs`, which puts a URL on a handle, has not
+    /// -- [`ftp`] defines
     /// the `lib/ftp.c` command sequencing and exports its own two rows carrying
     /// `run: Some(&ftp::FTP)` and lacks the same caller, while [`file`]'s
     /// handler binds one transfer's state and so cannot sit in a `const` table

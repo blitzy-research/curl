@@ -394,9 +394,15 @@ pub mod share;
 //
 // WHICH CHILDREN, measured against this checkout rather than left vague,
 // because "children remain" is the kind of statement that survives long after
-// it stops being true. THREE of the files AAP 0.4.1 assigns to this crate
-// are not on disk, and all three are the same child: `easy/{handle,setopt,
-// getinfo}.rs`. **No per-scheme executor is absent any more**, and neither
+// it stops being true. TWO of the files AAP 0.4.1 assigns to this crate
+// are not on disk, and both are the same child: `easy/{setopt,getinfo}.rs`.
+// `easy/handle.rs` was the third and has LANDED: the decomposed easy handle,
+// with `struct Curl_easy`'s 24 members apportioned to the modules that own
+// their lifecycles, `Curl_init_userdefined`'s frozen defaults, the
+// generational identity token and the four injected seams. What is still
+// absent is the pair that WRITES an option onto a handle and READS a
+// statistic off one, which is why every `run:` row below stays `None`.
+// **No per-scheme executor is absent any more**, and neither
 // `protocols/` nor `proxy/` has an absent file at all: `protocols/http3.rs`
 // was the last of the executors and it has landed, and
 // `proxy/http_connect.rs` was the last of the proxy mechanisms and it has
@@ -472,10 +478,11 @@ pub mod share;
 // forms, the request target, the status-line parse and the 8-of-17 vtable that
 // `Curl_scheme_http` and `Curl_scheme_https` both point at -- and it exports
 // the two assembled registry rows. It does NOT make an HTTP transfer possible:
-// nothing constructs a request specification, because `easy/{handle,setopt}.rs`
-// are two of the five paths above, so `protocols/mod.rs` deliberately keeps
-// `run: None` on both HTTP rows and `version.rs` keeps `ENGINE_PROTOCOLS`
-// inert. Writing a file and reaching it are separate obligations; only the
+// nothing constructs a request specification. `easy/handle.rs` has landed, so
+// a handle can now be built and defaulted, but `easy/setopt.rs` -- one of the
+// two paths above -- is what would put a URL on it, so `protocols/mod.rs`
+// deliberately keeps `run: None` on both HTTP rows and `version.rs` keeps
+// `ENGINE_PROTOCOLS` inert. Writing a file and reaching it are separate obligations; only the
 // second is open for HTTP, and the `Protocols:` banner stays empty until it
 // closes.
 //

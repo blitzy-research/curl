@@ -3195,9 +3195,13 @@ pub(crate) struct CfH3 {
     /// The C hashes `data->mid` to a `struct h3_stream_ctx` because one filter
     /// serves every transfer on the connection. One stream is held here
     /// because the transfer identity arrives through
-    /// [`CfControl::DataSetup`] and `easy/handle.rs` is not on disk to supply
-    /// one; [`Self::attached`] carries the count the multiplexing query needs,
-    /// so the answer `CF_QUERY_MAX_CONCURRENT` gives is already the right one.
+    /// [`CfControl::DataSetup`] and nothing yet SENDS one: `easy/handle.rs` is
+    /// on disk and holds the identity -- a `MultiXferId` and its generational
+    /// token -- but no executor exists to carry it to a filter, so this is a
+    /// wiring gap rather than a missing file. [`Self::attached`] carries the
+    /// count the multiplexing query needs, so the answer
+    /// `CF_QUERY_MAX_CONCURRENT` gives is already the right one, and widening
+    /// this to a map keyed by `mid` is the change that follows the wiring.
     stream: H3StreamCtx,
     /// Where the stream's asynchronous half is.
     io: StreamIo,
@@ -4151,8 +4155,11 @@ impl ConnFilter for CfH3 {
     ///
     /// `no_body` is `data->req.no_body` and arrives as `false` here, because
     /// the transfer's request state comes through
-    /// [`CfControl::DataSetup`] and `easy/handle.rs` is not on disk to supply
-    /// one. The consequence is confined and worth naming: a stream RESET after
+    /// [`CfControl::DataSetup`] and nothing yet sends one. `easy/handle.rs` is
+    /// on disk, but the member this needs lives in the `SingleRequest` it
+    /// aggregates and only `easy/setopt.rs` -- still absent -- puts a request
+    /// on a handle, so the value has no populated source to travel from.
+    /// The consequence is confined and worth naming: a stream RESET after
     /// complete response headers on a `--head` transfer reports
     /// [`CURLcode::Http3`] where the C would report success. [`H3StreamCtx::handle_close`]
     /// implements both arms and takes the flag, so wiring the transfer state
