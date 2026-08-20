@@ -7939,6 +7939,7 @@ mod tests {
 
     /// The state field is private: the only writer in this file is the mutator.
     #[test]
+    #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn only_the_mutator_assigns_the_state_field() {
         let source = code_only();
         let writes: Vec<&str> = source
@@ -8086,6 +8087,7 @@ mod tests {
 
     /// One handler, two rows -- the C's `&Curl_protocol_ftp` twice.
     #[test]
+    #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn both_rows_share_one_handler_column() {
         assert_eq!(SCHEMES.len(), 2);
         assert_eq!(SCHEMES[0].name, SCHEME_FTP.name);
@@ -8118,6 +8120,7 @@ mod tests {
 
     /// Exactly eleven slots are overridden and six take the trait's defaults.
     #[test]
+    #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn exactly_eleven_of_seventeen_slots_are_overridden() {
         let source = code_only();
         let overridden = [
@@ -8866,6 +8869,7 @@ mod tests {
 
     /// The two blocking-read texts are the C's.
     #[test]
+    #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn the_blocking_read_texts_are_the_c_strings() {
         assert_eq!(RESPONSE_TIMEOUT_MESSAGE, "FTP response timeout");
         assert_eq!(
@@ -10111,6 +10115,7 @@ mod tests {
 
     /// Addresses are formatted only by the module that owns the conversion.
     #[test]
+    #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn addresses_are_printed_through_the_inet_helpers() {
         assert_eq!(
             printable_address(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
@@ -12338,6 +12343,7 @@ mod tests {
     /// The credential-like fields are compared with the repository's
     /// constant-time comparator, not with `==`.
     #[test]
+    #[cfg_attr(miri, ignore = "this reads the source tree, not the program")]
     fn the_credential_fields_are_compared_in_constant_time() {
         let source = code_only();
         let predicate = source

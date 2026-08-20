@@ -1947,12 +1947,16 @@ mod source_presence_gate {
 mod absent_target_gate {
     use std::path::{Path, PathBuf};
 
-    /// The 5 `curl-rs-lib` targets with no file.
+    /// The 3 `curl-rs-lib` targets with no file.
     ///
-    /// The same five `curl-rs-lib/src/lib.rs` enumerates in prose; here
-    /// so that the prose cannot outlive the fact. Three easy-handle modules,
-    /// the one remaining per-scheme protocol EXECUTOR and one proxy
-    /// mechanism.
+    /// The same three `curl-rs-lib/src/lib.rs` enumerates in prose; here
+    /// so that the prose cannot outlive the fact. All three are easy-handle
+    /// modules. **No per-scheme protocol EXECUTOR is absent any more**, which
+    /// is the change `protocols/http3.rs` made, and **no proxy mechanism is
+    /// absent either**, which is the change `proxy/http_connect.rs` made: the
+    /// `protocols/` and `proxy/` directories are now both complete on disk,
+    /// and everything still missing from a transfer is an easy handle to
+    /// originate it.
     ///
     /// `protocols/file.rs` was the twelfth and has LANDED -- the FIRST
     /// per-scheme executor to do so, and the sparsest, filling 5 of `struct
@@ -1987,6 +1991,18 @@ mod absent_target_gate {
     /// construct requests remain absent, so this is another delivered executor
     /// whose remaining gap is wiring rather than source.
     ///
+    /// `protocols/http3.rs` has now LANDED as the LAST of them, and with it the
+    /// `protocols/` directory holds every file the target design assigns. It
+    /// carries the HTTP/3 connection filter of `lib/vquic/curl_ngtcp2.c` --
+    /// `Curl_cft_http3`'s four type flags, all fifteen typed queries, the
+    /// `quinn` transport parameters `quic_settings` sets, the handshake
+    /// deadline, qlog, and the QUIC row of `conn/happy_eyeballs.rs`'s transport
+    /// registry -- with `quinn` + `h3` + `h3-quinn` in place of ngtcp2 and
+    /// nghttp3. Its gap is the same wiring gap the other executors have:
+    /// `curl-rs-lib/src/version.rs` still withholds the `HTTP3` feature and the
+    /// `h3` protocol token, deliberately, because under-reporting a capability
+    /// makes a fixture SKIP while over-reporting makes it run and fail.
+    ///
     /// `protocols/sftp.rs` was the tenth and has LANDED, and it was the first
     /// executor whose row was WIRED. `protocols/scp.rs` has now landed as the
     /// thin SCP-specific layer over that shared core, so both SSH rows in
@@ -2010,8 +2026,8 @@ mod absent_target_gate {
     /// executors rather than protocol modules: the 24 out-of-scope schemes are
     /// now registered by their own module, and what is left under `protocols/`
     /// is the files that would actually perform a transfer -- eight when
-    /// `stub.rs` landed, one now that `file.rs`, `http1.rs`, `http2.rs`,
-    /// `sftp.rs`, `scp.rs`, `ftp/pingpong.rs` and `ws.rs` have.
+    /// `stub.rs` landed, NONE now that `file.rs`, `http1.rs`, `http2.rs`,
+    /// `http3.rs`, `sftp.rs`, `scp.rs`, `ftp/pingpong.rs` and `ws.rs` have.
     /// Registering a
     /// scheme and serving one are separate obligations, and only the second is
     /// still outstanding -- `curl-rs-lib/src/version.rs`'s `ENGINE_PROTOCOLS`
@@ -2030,22 +2046,28 @@ mod absent_target_gate {
     /// which is what this gate exists to force. The transfer directory now has no
     /// absent file at all, and the loop itself has landed too, so what
     /// `version.rs`'s `ENGINE_TRANSFER` still records is a wiring gap -- no
-    /// executor for the driver to run -- rather than a missing file. The one
-    /// proxy mechanism left is why that count reads one where it read four:
-    /// the `"SOCKS"` filter of
-    /// `lib/socks.c` is written, the SOCKS5 GSS-API sub-negotiation of
-    /// `lib/socks_gssapi.c` is written behind the default-off `negotiate`
-    /// feature and calls into it, and the PROXY protocol header filter of
-    /// `lib/cf-haproxy.c` exists in full. None of the three makes a proxy
-    /// REACHABLE, which is why `curl-rs-lib/src/version.rs` still withholds the
-    /// `proxy` capability on `proxy/http_connect.rs` and why that row is still
-    /// below.
+    /// executor for the driver to run -- rather than a missing file.
+    ///
+    /// `proxy/http_connect.rs` was the twentieth and has now LANDED, which
+    /// empties the proxy directory from this gate entirely. It carries all
+    /// three CONNECT filters -- `"HTTP-PROXY"` dispatching on the negotiated
+    /// ALPN, `"H1-PROXY"` running the six-state HTTP/1.x tunnel of
+    /// `lib/cf-h1-proxy.c`, and `"H2-PROXY"` running the five-state HTTP/2
+    /// tunnel of `lib/cf-h2-proxy.c` -- alongside the `CONNECT` request
+    /// builder whose bytes 31 `<verify><proxy>` fixtures compare literally. So
+    /// every proxy mechanism curl has is now written: the `"SOCKS"` filter of
+    /// `lib/socks.c`, the SOCKS5 GSS-API sub-negotiation of
+    /// `lib/socks_gssapi.c` behind the default-off `negotiate` feature, the
+    /// PROXY protocol header filter of `lib/cf-haproxy.c`, and the three
+    /// tunnel filters. None of them makes a proxy REACHABLE, because no
+    /// production `crate::conn::ConnectionFilterFactories` exists to install
+    /// one, which is why `curl-rs-lib/src/version.rs` still withholds the
+    /// `proxy` capability -- but it now withholds it as `inert` rather than as
+    /// `unwritten`, and that row is no longer below.
     const ENGINE_TARGETS: &[&str] = &[
         "curl-rs-lib/src/easy/handle.rs",
         "curl-rs-lib/src/easy/setopt.rs",
         "curl-rs-lib/src/easy/getinfo.rs",
-        "curl-rs-lib/src/protocols/http3.rs",
-        "curl-rs-lib/src/proxy/http_connect.rs",
     ];
 
     /// The 13 `curl-rs` targets with no file.
@@ -2087,22 +2109,29 @@ mod absent_target_gate {
         "curl-rs/src/libcurl_src.rs",
     ];
 
-    /// The 2 `curl-rs-ffi` targets with no file.
+    /// The 1 `curl-rs-ffi` target with no file.
     ///
-    /// These two carry 25 of the 38 undefined exports between them -- 21
-    /// `curl_multi_*` and 4 `curl_ws_*`. The remaining 13 are
+    /// It carries 21 of the 34 undefined exports -- the whole of
+    /// `curl_multi_*`. The remaining 13 are
     /// the `curl_easy_*` core, whose module `ffi/easy.rs` does exist and today
     /// defines only the three option-introspection entry points. The counts are
     /// the ABI inventory's, published by `curl-rs-ffi/build.rs`.
     ///
-    /// `curl-rs-ffi/src/ffi/share.rs` was the third and has LANDED, which is
-    /// why the figures above read 2/25/38 where they once read 3/28/41. It
+    /// `curl-rs-ffi/src/ffi/ws.rs` was the second and has LANDED, which is why
+    /// the figures above read 1/21/34 where they read 2/25/38 before it and
+    /// 3/28/41 before `ffi/share.rs`. It carries all four `curl_ws_*` names --
+    /// the last four entries of `lib/libcurl.def` -- and answers
+    /// `CURLE_NOT_BUILT_IN` from three of them and NULL from `curl_ws_meta`,
+    /// which is `lib/ws.c:1938-1980` exactly: the branch a build without
+    /// WebSocket support carries. That is not a stub but the C's own second
+    /// definition, selected from `curl_rs_lib::version::supports_websockets`,
+    /// and it flips to the built-in branch when `ENGINE_PROTOCOLS` becomes
+    /// present. `ffi/share.rs` was the third-to-last to land and
     /// carries three of the four `curl_share_*` names -- `ffi/strerror.rs` has
     /// always carried `curl_share_strerror`, because `lib/strerror.c` defines
     /// all four strerror functions in one translation unit and the crate's
     /// partition follows the definition rather than the declaring header.
-    const ABI_TARGETS: &[&str] =
-        &["curl-rs-ffi/src/ffi/multi.rs", "curl-rs-ffi/src/ffi/ws.rs"];
+    const ABI_TARGETS: &[&str] = &["curl-rs-ffi/src/ffi/multi.rs"];
 
     /// `CARGO_MANIFEST_DIR` is `<root>/curl-rs`, so one `parent()` reaches the
     /// workspace root.
@@ -2114,7 +2143,7 @@ mod absent_target_gate {
     }
 
     fn every_target() -> Vec<&'static str> {
-        let mut all = Vec::with_capacity(20);
+        let mut all = Vec::with_capacity(17);
         all.extend_from_slice(ENGINE_TARGETS);
         all.extend_from_slice(TOOL_TARGETS);
         all.extend_from_slice(ABI_TARGETS);
@@ -2137,12 +2166,20 @@ mod absent_target_gate {
         );
     }
 
+    /// The split, as a total this test's own NAME carries.
+    ///
+    /// It read five/thirteen/two until `protocols/http3.rs` and
+    /// `proxy/http_connect.rs` landed and their rows left [`ENGINE_TARGETS`],
+    /// and until `curl-rs-ffi/src/ffi/ws.rs` landed and its row left
+    /// [`ABI_TARGETS`]. Renaming rather than loosening the numbers is
+    /// deliberate: a count in a name cannot drift silently, and the rename is
+    /// the same notification the absence gate gives.
     #[test]
-    fn the_split_is_five_thirteen_two() {
-        assert_eq!(ENGINE_TARGETS.len(), 5, "curl-rs-lib");
+    fn the_split_is_three_thirteen_one() {
+        assert_eq!(ENGINE_TARGETS.len(), 3, "curl-rs-lib");
         assert_eq!(TOOL_TARGETS.len(), 13, "curl-rs");
-        assert_eq!(ABI_TARGETS.len(), 2, "curl-rs-ffi");
-        assert_eq!(every_target().len(), 20, "the workspace total");
+        assert_eq!(ABI_TARGETS.len(), 1, "curl-rs-ffi");
+        assert_eq!(every_target().len(), 17, "the workspace total");
     }
 
     #[test]
@@ -2167,8 +2204,14 @@ mod absent_target_gate {
     /// The absence above is a measurement, so the measuring has to be able to
     /// see a file that IS there. One sibling per crate, chosen because each is
     /// named in the same design tables as the missing ones, plus the target
-    /// that most recently moved off [`TOOL_TARGETS`], and the eleven that most
-    /// recently moved off [`ENGINE_TARGETS`] -- `protocols/ws.rs`, whose
+    /// that most recently moved off [`ABI_TARGETS`] -- `ffi/ws.rs`, which
+    /// took the whole `curl_ws_*` family with it -- the target
+    /// that most recently moved off [`TOOL_TARGETS`], and the thirteen that
+    /// most recently moved off [`ENGINE_TARGETS`] -- `protocols/http3.rs`, the
+    /// last per-scheme executor to land and the only filter that terminates
+    /// its own chain, `proxy/http_connect.rs`, the three CONNECT filters that
+    /// empty the proxy directory from the absence gate, `protocols/ws.rs`,
+    /// whose
     /// handler delegates to `protocols/http1.rs`'s and so could not have
     /// landed before it, `protocols/http2.rs`, the connection filter that
     /// installs beneath that same handler, `protocols/scp.rs`, the thin layer
@@ -2199,10 +2242,13 @@ mod absent_target_gate {
             "curl-rs-lib/src/proxy/socks.rs",
             "curl-rs-lib/src/proxy/socks_gss.rs",
             "curl-rs-lib/src/proxy/haproxy.rs",
+            "curl-rs-lib/src/proxy/http_connect.rs",
             "curl-rs-lib/src/protocols/http1.rs",
             "curl-rs-lib/src/protocols/http2.rs",
+            "curl-rs-lib/src/protocols/http3.rs",
             "curl-rs-lib/src/protocols/ws.rs",
             "curl-rs-ffi/src/ffi/easy.rs",
+            "curl-rs-ffi/src/ffi/ws.rs",
         ] {
             assert!(
                 root.join(present).is_file(),

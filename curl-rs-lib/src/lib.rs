@@ -394,19 +394,33 @@ pub mod share;
 //
 // WHICH CHILDREN, measured against this checkout rather than left vague,
 // because "children remain" is the kind of statement that survives long after
-// it stops being true. Five of the files AAP 0.4.1 assigns to this crate
-// are not on disk: `easy/{handle,setopt,getinfo}.rs`; the one remaining
-// per-scheme executor `protocols/http3.rs`;
-// and `proxy/http_connect.rs`.
+// it stops being true. THREE of the files AAP 0.4.1 assigns to this crate
+// are not on disk, and all three are the same child: `easy/{handle,setopt,
+// getinfo}.rs`. **No per-scheme executor is absent any more**, and neither
+// `protocols/` nor `proxy/` has an absent file at all: `protocols/http3.rs`
+// was the last of the executors and it has landed, and
+// `proxy/http_connect.rs` was the last of the proxy mechanisms and it has
+// landed too.
 // Every other assigned file exists -- `protocols/file.rs`,
-// `protocols/http1.rs`, `protocols/http2.rs`, `protocols/sftp.rs`,
+// `protocols/http1.rs`, `protocols/http2.rs`, `protocols/http3.rs`,
+// `protocols/sftp.rs`,
 // `protocols/scp.rs`, `protocols/stub.rs`, `protocols/ws.rs`,
 // `protocols/ftp/pingpong.rs`,
 // `transfer/chunked.rs`,
 // `transfer/content_encoding.rs`, `proxy/socks.rs`,
-// `proxy/haproxy.rs` and `proxy/socks_gss.rs` among them, which is why this
-// count reads five and not the eighteen it once did, and why `transfer/` now
-// has no absent file at all.
+// `proxy/haproxy.rs`, `proxy/socks_gss.rs` and `proxy/http_connect.rs` among
+// them, which is why this count reads three and not the eighteen it once did,
+// and why `protocols/`, `transfer/` and `proxy/` now all three have no absent
+// file at all.
+//
+// `proxy/http_connect.rs` completes the proxy directory: it supersedes six C
+// files -- `lib/http_proxy.{c,h}`, `lib/cf-h1-proxy.{c,h}` and
+// `lib/cf-h2-proxy.{c,h}` -- with the three CONNECT filters the C registers,
+// and it owns the `CONNECT` request bytes that 31 `<verify><proxy>` fixtures
+// compare literally. Every proxy mechanism curl has is therefore written; none
+// is REACHABLE, because no production `conn::ConnectionFilterFactories` exists
+// to install a filter, and `version.rs`'s `ENGINE_PROXY` records that as
+// `inert` rather than as `unwritten`.
 //
 // `protocols/file.rs` is worth its own sentence for the same reason
 // `protocols/stub.rs` is, and for the opposite reason: it is the FIRST
@@ -439,7 +453,7 @@ pub mod share;
 // their 17 slots (`lib/vssh/libssh2.c:3846-3864` against `:3823-3841`) and AAP
 // 0.4.1 names no third file to put it in; `protocols/scp.rs` will import it.
 // What `sftp.rs` cannot yet do is reach a transfer's OPTIONS, because
-// `easy/setopt.rs` is one of the five above, which is why
+// `easy/setopt.rs` is one of the three above, which is why
 // `version.rs`'s `ENGINE_PROTOCOLS` stays inert and the `Protocols:` banner
 // still withholds `sftp` -- under-reporting a capability makes a fixture skip
 // and over-reporting makes it run and fail.
@@ -494,7 +508,7 @@ pub mod share;
 // on both FTP rows, `version.rs` keeps `ftp` out of the `Protocols:` banner
 // and its fixtures keep skipping.
 //
-// `protocols/ws.rs` is worth the last one, and for a reason none of the others
+// `protocols/ws.rs` is worth another, and for a reason none of the others
 // share: it is the only executor whose handler is almost entirely SOMEBODY
 // ELSE'S. `Curl_protocol_ws` (`lib/ws.c:1918-1936`) fills eight slots and
 // seven of them point at the HTTP implementation, so the Rust handler wraps
@@ -513,11 +527,35 @@ pub mod share;
 // oracle rather than the target. The module documents that divergence at the
 // function that embodies it.
 //
-// Those same five paths are held as data, not prose, by
+// `protocols/http3.rs` is worth the LAST one, because it is the file that
+// emptied this directory of absences and because it is the only filter in the
+// tree that terminates its own chain. `Curl_cft_http3`
+// (`lib/vquic/curl_ngtcp2.c:2894`) carries four type flags --
+// `IP_CONNECT | SSL | MULTIPLEX | HTTP` -- where every other filter carries one
+// or two, and it does so because it performs all four jobs itself: there is no
+// socket filter and no TLS filter beneath it. The Rust module holds the whole of
+// that: all fifteen typed queries, the eight control events, the five `quinn`
+// transport parameters `quic_settings` sets (which travel in the ClientHello
+// and are therefore wire-visible), the handshake deadline enforced from the
+// injected clock, `QLOGDIR`, and the QUIC row of
+// `conn/happy_eyeballs.rs`'s transport registry -- with `quinn` + `h3` +
+// `h3-quinn` in place of ngtcp2 and nghttp3, and with no `unsafe` and no
+// `use crate::tls` anywhere in it. Two things it deliberately does NOT do:
+// advertise `HTTP3` or `h3` in the banner, for want of the easy handle every
+// other executor is waiting on; and store a `:status` pseudo-header, because
+// `cb_h3_recv_header` never pushes one -- `lib/http2.c:1512` is the only
+// `Curl_headers_push` call site outside `lib/headers.c`, so an HTTP/3 transfer
+// in curl 8.19.0-DEV has no pseudo-header in its store and adding one would be
+// an API-visible change AAP 0.8.1 forbids.
+//
+// Those same three paths are held as data, not prose, by
 // `absent_target_gate` in `curl-rs/src/bin/curlinfo.rs`, alongside the thirteen
-// `curl-rs` and two `curl-rs-ffi` targets that are also unwritten -- 20
+// `curl-rs` and one `curl-rs-ffi` target that are also unwritten -- 17
 // across the workspace. The ABI figure read three, and the total 37, until
-// `curl-rs-ffi/src/ffi/share.rs` landed. That gate fails, naming the file, as
+// `curl-rs-ffi/src/ffi/share.rs` landed, and two until `ffi/ws.rs` took the
+// whole `curl_ws_*` family with it; the engine figure read five, and the
+// total 20, until `protocols/http3.rs` and `proxy/http_connect.rs` did. That
+// gate fails, naming the file, as
 // soon as one of
 // them lands, which is what keeps this paragraph from outliving its accuracy
 // the way its predecessor did. It has done exactly that three times over for

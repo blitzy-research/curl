@@ -101,13 +101,13 @@
 //! the target rather than an inventory.** The measured state, which every
 //! claim here is to be read against:
 //!
-//! * `curl-rs-ffi/src/ffi/` holds twenty entries: the eleven symbol-family
+//! * `curl-rs-ffi/src/ffi/` holds twenty-one entries: the twelve symbol-family
 //!   modules `easy`, `escape`, `form`, `global`, `mime`, `misc`, `printf`,
-//!   `share`, `slist`, `strerror` and `url`; the type-and-metadata modules
-//!   `codes`, `handle`, `opts` and `types`; the support modules `memory` and
-//!   `panic_boundary`; `mod.rs`; and two oracle fixtures. `multi` and
-//!   `ws` are still targets.
-//! * **62 of the 100 symbols are defined, 38 are not, and 0 extra symbols
+//!   `share`, `slist`, `strerror`, `url` and `ws`; the type-and-metadata
+//!   modules `codes`, `handle`, `opts` and `types`; the support modules
+//!   `memory` and `panic_boundary`; `mod.rs`; and two oracle fixtures. `multi`
+//!   is the one family still a target.
+//! * **66 of the 100 symbols are defined, 34 are not, and 0 extra symbols
 //!   leak.** `build.rs` prints the live figure as a `cargo:warning` on every
 //!   build, so that -- not this sentence -- is the number to consult. Two
 //!   independent measurements now AGREE on both the export set and the count:
@@ -118,20 +118,20 @@
 //!   `libcurl.so`; `promote_assembled_exports` closed that, so the shared
 //!   library and the static library now export the identical set. The crate
 //!   therefore exports something, but it is **not** a drop-in replacement yet,
-//!   and nothing here should be read as claiming otherwise: 38 of the 100 have
+//!   and nothing here should be read as claiming otherwise: 34 of the 100 have
 //!   no definition at all.
-//! * **The 38 fall in three families, and the split is published rather than
-//!   only written here**: `curl_multi_*` 21, `curl_easy_*` 13 and
-//!   `curl_ws_*` 4.
+//! * **The 34 fall in two families, and the split is published rather than
+//!   only written here**: `curl_multi_*` 21 and `curl_easy_*` 13.
 //!   `build.rs` emits them as `missing-family=<name> <count>`
-//!   lines in `$OUT_DIR/abi-inventory.txt` beside the 38 names, and
+//!   lines in `$OUT_DIR/abi-inventory.txt` beside the 34 names, and
 //!   [`abi_inventory`]'s tests assert the counts sum to `missing` and that no
-//!   family is invented. The split is the actionable form of the total: two
-//!   of the three families are the two modules `ffi/` does not hold, and the
-//!   third is `ffi/easy.rs`, which exists and defines only its three
+//!   family is invented. The split is the actionable form of the total: one
+//!   of the two families is the one module `ffi/` does not hold, and the
+//!   other is `ffi/easy.rs`, which exists and defines only its three
 //!   option-introspection entry points. `curl_share_*` left this list when
 //!   `ffi/share.rs` landed: it carries three of that family's four names, and
-//!   `ffi/strerror.rs` has always carried the fourth.
+//!   `ffi/strerror.rs` has always carried the fourth. `curl_ws_*` left it
+//!   whole when `ffi/ws.rs` landed, carrying all four of its names.
 //! * Because the header is generated FROM this crate, an incomplete surface
 //!   would generate an incomplete header. `build.rs` refuses: while any of the
 //!   100 is undefined it writes no header at all and says so, leaving the

@@ -116,6 +116,24 @@ pub(crate) mod socks_gss;
 /// need it.
 pub(crate) mod haproxy;
 
+/// HTTP `CONNECT` tunnelling -- supersedes `lib/http_proxy.c`,
+/// `lib/http_proxy.h`, `lib/cf-h1-proxy.c`, `lib/cf-h1-proxy.h`,
+/// `lib/cf-h2-proxy.c` and `lib/cf-h2-proxy.h`.
+///
+/// Three filters live there, not one, because the C registers three:
+/// `"HTTP-PROXY"` dispatches on the negotiated ALPN and then installs either
+/// `"H1-PROXY"` -- a six-state machine that reads the `CONNECT` response one
+/// byte at a time -- or `"H2-PROXY"`, a five-state machine that carries the
+/// tunnelled traffic as HTTP/2 DATA for the life of the connection. They share
+/// the request builder and the `CF_QUERY_HOST_PORT` answer, which is why they
+/// share a module.
+///
+/// No feature gate on the module. `lib/http_proxy.h` is guarded by
+/// `#ifndef CURL_DISABLE_PROXY` alone, and HTTPS-proxy support is
+/// unconditional here because rustls is the only TLS backend. Only the HTTP/2
+/// tunnel is gated, on `http2`, mirroring the C's `USE_NGHTTP2`.
+pub(crate) mod http_connect;
+
 /// `CURLAUTH_BASIC` (`include/curl/curl.h:829`) = `1 << 0`, narrowed to the
 /// width the SOCKS5 option actually occupies.
 ///

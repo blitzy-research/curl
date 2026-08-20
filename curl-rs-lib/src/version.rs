@@ -851,11 +851,12 @@ fn tls_supports_ech() -> bool {
 // already written. `Engine` therefore carries `written` beside `present`, three
 // constructors cover the three reachable combinations, and the fourth --
 // executing work with no source -- is unrepresentable. Measured over this
-// checkout: SEVEN rows are `working`, TWENTY are `inert` (written, not wired),
-// and TWO are genuinely `unwritten` -- `proxy/http_connect.rs` and
-// `curl-rs/src/libcurl_src.rs`. `transfer/content_encoding.rs` was the third
-// until its file landed, and its row moved to `inert` rather than to `working`
-// because nothing yet installs a decoder stage.
+// checkout: SEVEN rows are `working`, TWENTY-ONE are `inert` (written, not
+// wired), and ONE is genuinely `unwritten` -- `curl-rs/src/libcurl_src.rs`.
+// `transfer/content_encoding.rs` and `proxy/http_connect.rs` were the other two
+// until their files landed, and both rows moved to `inert` rather than to
+// `working`: nothing yet installs a decoder stage, and nothing yet implements
+// `ConnectionFilterFactories` to install a proxy filter.
 //
 // The `written` flag changes no capability answer. It exists so that "what would
 // clear this row" is recorded correctly, and so that the claim is checkable:
@@ -1034,19 +1035,27 @@ pub const ENGINE_TLS: Engine = Engine::inert("curl-rs-lib/src/tls/mod.rs");
 
 /// Proxy support -- `curl-rs-lib/src/proxy/`.
 ///
-/// Gates `HTTPS-proxy`, and the `proxy` row of `curlinfo`. UNWRITTEN, and this
-/// is one of the entries where that is literally true of the owner:
-/// `proxy/http_connect.rs` does not exist. `proxy/mod.rs`, `proxy/noproxy.rs`,
-/// `proxy/socks.rs`, `proxy/haproxy.rs` and -- behind the default-off
-/// `negotiate` feature -- `proxy/socks_gss.rs` are the whole subtree, and none
-/// of the four that exist beyond the module root can reach a proxy on its own:
-/// `noproxy.rs` decides whether one would be BYPASSED, `socks.rs` performs the
-/// SOCKS4, SOCKS4a, SOCKS5 and SOCKS5h handshake over a transport somebody else
-/// connected, `haproxy.rs` writes the PROXY protocol header at the head of a
-/// connection somebody else established, and `socks_gss.rs` performs the RFC
-/// 1961 GSS-API sub-negotiation inside that SOCKS5 handshake. So there is no
-/// CONNECT tunnel over which to layer a rustls session and no proxy of any kind
-/// can be reached.
+/// Gates `HTTPS-proxy`, and the `proxy` row of `curlinfo`.
+///
+/// INERT, not unwritten -- and this entry changed category when
+/// `proxy/http_connect.rs` landed. The whole subtree now exists:
+/// `proxy/mod.rs`, `proxy/noproxy.rs`, `proxy/socks.rs`, `proxy/haproxy.rs`,
+/// `proxy/http_connect.rs` and -- behind the default-off `negotiate` feature --
+/// `proxy/socks_gss.rs`. `http_connect.rs` supplies all three CONNECT filters:
+/// `"HTTP-PROXY"` dispatching on the negotiated ALPN, `"H1-PROXY"` running the
+/// six-state HTTP/1.x tunnel, and `"H2-PROXY"` running the five-state HTTP/2
+/// one. So a CONNECT tunnel over which to layer a rustls session now exists as
+/// code.
+///
+/// What is missing is the caller. Each of these five modules performs its
+/// handshake over a transport SOMEBODY ELSE connected, and that somebody is a
+/// production implementation of
+/// [`crate::conn::ConnectionFilterFactories`] -- the injected surface through
+/// which `conn/mod.rs`'s setup filter installs `"SSL-PROXY"` and then the
+/// tunnel. No such implementation exists in this checkout; the only two are
+/// test doubles. Nothing therefore reaches a proxy at runtime, which is why the
+/// row stays withheld even though every module behind it is written and every
+/// one of them is unit-tested.
 ///
 /// This is the most expensive withholding measured anywhere in the registry: no
 /// fixture gates on `HTTPS-proxy`, but **225** gate on `proxy`, the single most
@@ -1058,7 +1067,7 @@ pub const ENGINE_TLS: Engine = Engine::inert("curl-rs-lib/src/tls/mod.rs");
 /// reports the row `OFF` is exactly the build whose `--proxy` must fail that
 /// way, so honesty here creates a checkable obligation instead of hiding one.
 pub const ENGINE_PROXY: Engine =
-    Engine::unwritten("curl-rs-lib/src/proxy/http_connect.rs");
+    Engine::inert("curl-rs-lib/src/proxy/http_connect.rs");
 
 /// Authentication mechanisms -- `curl-rs-lib/src/auth/`.
 ///
@@ -1174,11 +1183,14 @@ pub const ENGINE_CONTENT_ENCODING: Engine =
 /// SCP-specific layer over that core, `ws.rs`, whose
 /// handler fills one slot of its own and forwards the other seven to
 /// `http1.rs`'s exactly as `Curl_protocol_ws` (`lib/ws.c:1918-1936`) forwards
-/// them to HTTP's, and `http2.rs`, which is a connection filter beneath the
-/// shared HTTP handler rather than a scheme executor of its own. The one file
-/// that would carry the remaining executor -- `http3` -- is still
-/// absent, which `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` checks
-/// against the disk.
+/// them to HTTP's, `http2.rs`, which is a connection filter beneath the
+/// shared HTTP handler rather than a scheme executor of its own, and `http3.rs`,
+/// which is the same -- a filter, and the only one that terminates its own
+/// chain, since `Curl_cft_http3` carries `IP_CONNECT | SSL | MULTIPLEX | HTTP`
+/// itself. **Every file this registry names is now on disk**, which
+/// `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` checks against the disk
+/// and which changes nothing about the tokens below: absence was never why they
+/// are withheld.
 ///
 /// `sftp.rs` IS on disk and its row DOES carry an implementation, and this
 /// engine is still inert -- deliberately, and this is the sharpest reading in
@@ -1248,9 +1260,12 @@ pub const ENGINE_PROTOCOLS: Engine =
 /// complete too with every content decoder and the unencoding stack builder
 /// (see [`ENGINE_CONTENT_ENCODING`], which records its own inertness for the
 /// same reason). This directory therefore has no absent file at all. What is
-/// missing sits on either side of the loop rather than in it: no per-scheme
-/// EXECUTOR exists for the driver to run, and neither `crate::easy` nor
-/// `crate::multi` calls the driver yet, so no stage is ever reached. Recorded
+/// missing sits on either side of the loop rather than in it: the per-scheme
+/// EXECUTORS all exist now -- `protocols/http3.rs` was the last to land, so
+/// `protocols/` carries every file the target design assigns -- but neither
+/// `crate::easy` nor `crate::multi` calls the driver yet, and no easy handle
+/// exists to build a request specification from, so no stage is ever reached and
+/// no executor is ever entered. Recorded
 /// so that a later checkpoint enabling [`ENGINE_PROTOCOLS`] has to confront
 /// this one as well.
 pub const ENGINE_TRANSFER: Engine =
@@ -3463,7 +3478,7 @@ mod tests {
     }
 
     #[test]
-    fn only_two_engines_are_genuinely_unwritten() {
+    fn only_one_engine_is_genuinely_unwritten() {
         // The distinction the `written` field exists to record, asserted as a
         // SET rather than a count so that the answer to "what would clear this
         // row" cannot silently move between "write a file" and "wire one".
@@ -3478,16 +3493,16 @@ mod tests {
             .map(Engine::owner)
             .collect();
 
-        // `curl-rs-lib/src/transfer/content_encoding.rs` was a third member of
-        // this set until its file landed. Its row is now `inert`: the decoders,
-        // the token list and the stack builder all exist, and what is still
-        // missing is the HTTP/1 response parsing that would install a stage.
+        // Two files have left this set. `transfer/content_encoding.rs` was
+        // the first: its row is now `inert` because the decoders, the token
+        // list and the stack builder all exist and what is still missing is
+        // the HTTP/1 response parsing that would install a stage.
+        // `proxy/http_connect.rs` was the second: all three CONNECT filters
+        // exist and what is still missing is a production
+        // `ConnectionFilterFactories` to install one.
         assert_eq!(
             unwritten,
-            vec![
-                "curl-rs-lib/src/proxy/http_connect.rs",
-                "curl-rs/src/libcurl_src.rs",
-            ],
+            vec!["curl-rs/src/libcurl_src.rs"],
             "the set of engines whose remedy is WRITING a file"
         );
 
@@ -3501,7 +3516,7 @@ mod tests {
         // defines all twelve `curl_mime_*` exports on top of the module, which
         // is the artifact-level evidence this registry requires, and
         // `curl-rs/src/bin/curlinfo.rs` reports the row ON accordingly.
-        assert_eq!((working, inert, unwritten.len()), (7, 20, 2));
+        assert_eq!((working, inert, unwritten.len()), (7, 21, 1));
         assert_eq!(working + inert + unwritten.len(), ENGINES.len());
     }
 

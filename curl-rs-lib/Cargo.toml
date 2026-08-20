@@ -655,10 +655,10 @@ memchr = { workspace = true }
 #   feature       default  DEP  MODULE  E2E   what is missing
 #   ------------  -------  ---  ------  ----  --------------------------------
 #   http2         on       yes  yes     no    easy/request dispatch wiring
-#   http3         on       yes  NO      no    protocols/http3.rs
+#   http3         on       yes  yes     no    easy/request dispatch wiring
 #   ftp           on       n/a  yes     no    registry row + easy/setopt
 #   ssh           on       yes  yes     no    easy/setopt to reach the vtable
-#   websockets    on       n/a  yes     no    ffi/ws.rs, 4 curl_ws_*
+#   websockets    on       n/a  yes     no    easy handle; ffi/ws.rs landed
 #   brotli        on       yes  NO      no    transfer/content_encoding.rs
 #   zstd          on       yes  NO      no    transfer/content_encoding.rs
 #   gzip          on       yes  NO      no    transfer/content_encoding.rs
@@ -674,7 +674,7 @@ memchr = { workspace = true }
 # self-contained: `memdebug` installs a counting `GlobalAlloc` and writes the
 # `lib/memdebug.c` record format, which needs no transfer to be true.
 #
-# The eight `MODULE = NO` rows fail for a missing FILE; the five
+# The seven `MODULE = NO` rows fail for a missing FILE; the six
 # `MODULE = yes, E2E = no` rows fail for missing WIRING - their code is written
 # and tested against the C oracle, and what they lack is a transfer to be
 # called from. `hickory-dns` fails for neither reason: it is a reserved name
@@ -729,9 +729,32 @@ default = [
 # it into the easy/request dispatch path.
 http2 = ["dep:h2"]
 
-# HTTP/3 over QUIC -- src/protocols/http3.rs, superseding lib/vquic/*. As with
-# http2, the three crates are pinned and the module is not on disk.
-http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
+# HTTP/3 over QUIC -- src/protocols/http3.rs, superseding lib/vquic/vquic.c,
+# lib/vquic/curl_ngtcp2.c and lib/vquic/vquic-tls.c. The three crates are pinned
+# and the module IS on disk (closure table above); as with http2, the remaining
+# gap is wiring it into the easy/request dispatch path.
+#
+# It ENABLES `http2`, and that is an implementation fact of this tree rather
+# than a protocol one, so it is recorded rather than left to be discovered.
+# HTTP/2 and HTTP/3 build the SAME ordered field list from the same HTTP/1
+# request head: `nghttp3`'s submit path calls `Curl_http_req_to_h2`
+# (`lib/vquic/curl_ngtcp2.c:1612`) exactly as `nghttp2`'s does
+# (`lib/http2.c:2096`), which is why the C defines that function once, in
+# `lib/http.c:4874`, and declares it unguarded in `lib/http.h:258`. In the C the
+# shared builder therefore costs an HTTP/3-only build nothing, and `USE_HTTP3`
+# (`lib/curl_setup.h:1515-1524`) does not imply `USE_HTTP2`.
+#
+# In this crate the builder -- `req_to_h2`, with `H1Request` and
+# `parse_h1_request` -- lives in `src/protocols/http2.rs`, so reaching it needs
+# that module compiled. The alternative was to relocate ~240 lines of
+# wire-bearing code out of a delivered, byte-exact module to buy a feature
+# subset nothing asks for, which AAP 0.8.2's minimal-change mandate rules out.
+# The implication costs the default build nothing, because both features are on
+# by default; it changes only the `--features http3` subset, which did not
+# compile at all before. A later checkpoint that moves the shared builder to
+# `src/protocols/http1.rs` -- where `lib/http.c`'s successor belongs, and which
+# is compiled unconditionally -- can drop the `"http2"` entry unchanged.
+http3 = ["http2", "dep:quinn", "dep:h3", "dep:h3-quinn"]
 
 # FTP and FTPS -- src/protocols/ftp/{mod,pingpong,listparser}.rs, superseding
 # lib/ftp.c, lib/pingpong.c, lib/ftplistparser.c and lib/fileinfo.c. No
@@ -755,7 +778,10 @@ ssh = ["dep:russh"]
 # 0.6.7's comparison is byte-exact, and the handshake accept key is to use the
 # unconditional sha1 and base64 dependencies. The module is delivered --
 # handshake, frame encoder and decoder, masking and the automatic PONG -- and
-# the four exports are not, because curl-rs-ffi/src/ffi/ws.rs is not written.
+# curl-rs-ffi/src/ffi/ws.rs now defines all four exports. They answer
+# lib/ws.c:1938-1980, the branch a build without WebSocket support carries,
+# because this module is pub(crate) inside a pub(crate) mod protocols and no
+# easy handle exists for the shim to act on.
 websockets = []
 
 # Cookie engine -- src/cookies/mod.rs, superseding lib/cookie.c. The jar format

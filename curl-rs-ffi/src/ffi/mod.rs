@@ -50,18 +50,19 @@
 //! distinction between it and what exists today is load-bearing rather than
 //! pedantic, so both are stated:
 //!
-//! * MEASURED, at the commit that completed `share`: 62 of the 100
-//!   are defined, 38 are not, and 0 extra symbols are exported. Two
+//! * MEASURED, at the commit that added `ws`: 66 of the 100
+//!   are defined, 34 are not, and 0 extra symbols are exported. Two
 //!   independent measurements
 //!   agree on the export set -- `nm --defined-only` over the built staticlib,
 //!   and `build.rs`'s `undefined_abi_exports` computed from `lib/libcurl.def` --
 //!   and `build.rs` prints the live figure as a `cargo:warning` on every build,
 //!   which is the authority to consult rather than this sentence. The
-//!   declarations below are therefore ELEVEN symbol-family modules, not twelve:
+//!   declarations below are therefore TWELVE symbol-family modules, one of
+//!   which the target partition does not name:
 //!   `easy`, `escape`, `form`, `global`, `mime`, `misc`, `printf`, `share`,
-//!   `slist`, `strerror` and `url` -- `printf` declared apart from the other
-//!   ten, for the two reasons recorded at its declaration, but a family all the
-//!   same.
+//!   `slist`, `strerror`, `url` and `ws` -- `printf` declared apart from the
+//!   other eleven, for the two reasons recorded at its declaration, but a
+//!   family all the same. `multi` is the one target family still absent.
 //!   `escape` does
 //!   not appear in the twelve-name list above because it is not a family of its
 //!   own -- it now holds only `curl_easy_escape` and `curl_easy_unescape`, which
@@ -69,10 +70,10 @@
 //!   and `curl_unescape` have moved to `misc`, which the same partition assigns
 //!   them to, and they forward into `escape` exactly as `lib/escape.c:36-45`
 //!   forwards.
-//! * The 38 that are absent are exactly `curl_easy_*` (13), all of
-//!   `curl_multi_*` (21) and `curl_ws_*` (4) -- computed by
+//! * The 34 that are absent are exactly `curl_easy_*` (13) and all of
+//!   `curl_multi_*` (21) -- computed by
 //!   differencing `lib/libcurl.def` against `nm` over the staticlib, which is
-//!   also how the three family figures were obtained rather than by subtracting
+//!   also how the two family figures were obtained rather than by subtracting
 //!   from the previous value of this sentence. Three earlier figures here are
 //!   corrected by that measurement and not merely restated: `curl_easy_*` is 13
 //!   short, not 15; NO `curl_global_*` name is missing at all; and
@@ -80,7 +81,8 @@
 //!   family's four names and `strerror` the fourth. Neither
 //!   `curl_mime_*` nor `curl_url*` nor the legacy `curl_form*` trio is among
 //!   them any longer either: `mime` carries all 12 of the first, `url` all of
-//!   the second and `form` all three of the third.
+//!   the second and `form` all three of the third. `curl_ws_*` left the list
+//!   whole when `ws` landed, carrying all four of its names.
 //!   They are unwritten work,
 //!   not a defect: the modules that back them are assigned to units of work
 //!   beyond this checkpoint, and `include/curl/` is deliberately NOT
@@ -135,29 +137,37 @@ pub(crate) mod opts;
 pub(crate) mod panic_boundary;
 pub(crate) mod types;
 
-// The symbol-family modules that EXIST at this commit -- ten of the twelve
+// The symbol-family modules that EXIST at this commit -- eleven of the twelve
 // the target partition names. Each owns a disjoint slice of the 100 names in
 // `lib/libcurl.def`, and `build.rs`'s `check_export_coverage` asserts that the
-// partition stays disjoint and exhaustive as families land. `multi` and
-// `ws` are not yet declared because they are not yet written.
+// partition stays disjoint and exhaustive as families land. `multi` alone is
+// not yet declared, because it is not yet written.
 //
 // The counts below were measured over the built artifacts, not accumulated from
-// the previous value of this sentence. The ten carry 52 definitions between
-// them; with `printf`'s ten that is the 62 `build.rs` scans from source, and on
-// ELF all 62 reach the cdylib as well, because `promote_assembled_exports`
+// the previous value of this sentence. The eleven carry 56 definitions between
+// them; with `printf`'s ten that is the 66 `build.rs` scans from source, and on
+// ELF all 66 reach the cdylib as well, because `promote_assembled_exports`
 // merges a second version script naming the seven symbols `global_asm!` defines.
-// On Mach-O those seven are still absent and the cdylib carries 55; the module
+// On Mach-O those seven are still absent and the cdylib carries 59; the module
 // documentation above records the measurement and why ld64 differs.
 //
-// `share` is the newest of the ten and the smallest: three names, being the
-// four `curl_share_*` entries of `lib/libcurl.def` less `curl_share_strerror`,
+// `ws` is the newest of the eleven: four names, being
+// the whole of the `curl_ws_*` family, which is also the last four entries of
+// `lib/libcurl.def` in its alphabetical order. None of the four is variadic, so
+// none is assembled and none is touched by escalation A4; all four are declared
+// unconditionally, and a build without the `websockets` feature answers
+// `CURLE_NOT_BUILT_IN` from them rather than dropping a symbol.
+//
+// `share` is the smallest of the eleven, tied with `form`: three names, being
+// the four `curl_share_*` entries of `lib/libcurl.def` less
+// `curl_share_strerror`,
 // which `strerror` owns because `lib/strerror.c` defines all four strerror
 // functions in one translation unit and the partition follows the definition.
 // One of its three, `curl_share_setopt`, is assembled rather than written as a
 // Rust function -- it is one of the four A4 names, and its four per-ABI
 // prologues are what resolve the hazard for it.
 //
-// `form` is the smallest but one: three names, all deprecated
+// `form` is the other of that pair: three names, all deprecated
 // in the headers since 7.56.0 and all still exported, because the symbol-parity
 // gate compares the whole set and dropping a deprecated export would fail it.
 // One of the three, `curl_formadd`, is assembled for the other reason -- a
@@ -176,6 +186,7 @@ pub(crate) mod share;
 pub(crate) mod slist;
 pub(crate) mod strerror;
 pub(crate) mod url;
+pub(crate) mod ws;
 
 // The `curl_m*printf` family, declared apart from the six above because it is
 // unlike every other family in this crate in two ways.

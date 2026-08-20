@@ -154,7 +154,7 @@
 //! * Every path to an answer runs through an HTTP request writer AND something
 //!   that drives it. The writer has landed -- it is [`http1`] -- but the driver
 //!   has not: nothing in this checkout constructs a request specification,
-//!   because `easy/handle.rs` and `easy/setopt.rs` are two of the eleven files
+//!   because `easy/handle.rs` and `easy/setopt.rs` are two of the four files
 //!   `curl-rs-lib/src/lib.rs` enumerates as absent, and
 //!   `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` asserts that absence
 //!   against the disk. Composing a `DohTransport` on top of a writer with no
@@ -212,19 +212,19 @@ use crate::util::timeval::{timediff_ms, Clock, CurlTime};
 /// `CURLE_UNSUPPORTED_PROTOCOL` rather than fail to compile, and it still has
 /// to report a truthful `Protocols:` line.
 ///
-/// **One of the other children of this directory is absent from this
-/// checkout**, and its declaration therefore cannot be written: a `mod`
-/// line without its file is `error[E0583]`, which no attribute suppresses. The
-/// absence is measured rather than assumed --
-/// `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` names
-/// `http3.rs` and asserts against the disk that it is
-/// still missing. Each declaration lands with the file it names, which is the
-/// convention `curl-rs-lib/src/lib.rs` states for the whole crate.
+/// **Every child this directory is assigned is now present**, and every one is
+/// therefore declared: `http3.rs` was the last absent file under `protocols/`
+/// and it has landed, so `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate`
+/// no longer names anything in this directory. That gate is where the claim is
+/// measured rather than asserted in prose, and it fails if the two ever
+/// disagree. Each declaration lands with the file it names -- a `mod` line
+/// without its file is `error[E0583]`, which no attribute suppresses -- which is
+/// the convention `curl-rs-lib/src/lib.rs` states for the whole crate.
 ///
 /// One consequence follows and is recorded where it bites: with `ssh` enabled,
 /// exactly two rows of [`SCHEMES`] carry implementations, `SFTP` and `SCP`.
-/// With it disabled both rows remain and carry `run: None`. Four other children
-/// have landed without changing their registry columns: [`stub`], which owns
+/// With it disabled both rows remain and carry `run: None`. Every other child
+/// has landed without changing its registry column: [`stub`], which owns
 /// the 24 out-of-scope rows this file used to hold inline, [`file`], whose
 /// handler cannot sit in a `const` table, [`http1`], which owns the HTTP/1.x
 /// request writer and the vtable both HTTP rows would point at --
@@ -239,8 +239,9 @@ use crate::util::timeval::{timediff_ms, Clock, CurlTime};
 /// `setup_connection` to [`http1::HTTP`], which is exactly what
 /// `Curl_protocol_ws` (`lib/ws.c:1918-1936`) does. It is held by the same
 /// missing easy handle, not by a missing writer. Two further delivered
-/// children also leave this table unchanged: [`http2`] is a connection filter
-/// and contributes no scheme row at all, while [`ftp`] does what [`http1`] and
+/// children also leave this table unchanged: [`http2`] and [`http3`] are
+/// connection filters and contribute no scheme row at all, while [`ftp`] does
+/// what [`http1`] and
 /// [`ws`] do -- its own [`ftp::SCHEMES`] carries `run: Some(&ftp::FTP)` on two
 /// rows assembled column for column against the `ftp` and `ftps` rows below,
 /// so adopting them stays a one-column substitution held by the same missing
@@ -297,6 +298,36 @@ pub(crate) mod http1;
 /// ordered field list HPACK compresses.
 #[cfg(feature = "http2")]
 pub(crate) mod http2;
+
+/// HTTP/3 over QUIC -- `lib/vquic/vquic.c`, `lib/vquic/curl_ngtcp2.c` and
+/// `lib/vquic/vquic-tls.c`, with ngtcp2 and nghttp3 replaced by `quinn`, `h3`
+/// and `h3-quinn`.
+///
+/// Gated on `http3`, matching the C's
+/// `#if !defined(CURL_DISABLE_HTTP) && defined(USE_HTTP3)`
+/// (`lib/vquic/vquic.h:28`), and gated on the CHILD for the same reason
+/// [`ftp`] and [`http2`] are: [`SCHEMES`] must hold its 33 rows under every
+/// feature combination, and `https` must keep working over HTTP/1.1 and
+/// HTTP/2 in a build without this module.
+///
+/// It is a CONNECTION FILTER and not a [`Protocol`] implementor, exactly as
+/// [`http2`] is, and it is the only filter in the tree carrying FOUR type
+/// flags -- `CF_TYPE_IP_CONNECT | CF_TYPE_SSL | CF_TYPE_MULTIPLEX |
+/// CF_TYPE_HTTP` (`lib/vquic/curl_ngtcp2.c:2896`) -- because one link makes
+/// the connection, secures it, multiplexes it and speaks HTTP. So it
+/// contributes no [`SCHEMES`] row and TERMINATES the chain rather than
+/// installing above a socket filter.
+///
+/// Two obligations of this file are its counterparts. [`conn_may_http3`]
+/// below is declared UNCONDITIONALLY, because `lib/vquic/vquic.h:54-56` puts
+/// it outside the `USE_HTTP3` block while putting five other declarations
+/// inside; this module cannot host it and consumes it instead. And the QUIC
+/// row of `crate::conn::happy_eyeballs`'s `TransportRegistry` exists unfilled
+/// under the same feature: `http3::install_quic_provider` is what fills it,
+/// which is how the Happy Eyeballs race creates a QUIC candidate without
+/// knowing anything about QUIC.
+#[cfg(feature = "http3")]
+pub(crate) mod http3;
 
 /// SFTP, and the SSH session core `protocols/scp.rs` shares with it --
 /// `lib/vssh/libssh2.c`, `lib/vssh/vssh.c` and `lib/vssh/ssh.h`.
@@ -844,11 +875,12 @@ pub(crate) struct Scheme {
     /// enabled: `SFTP` and `SCP`.** With `ssh` disabled, both rows remain and
     /// carry [`None`]. That is a measurement, not an aspiration, and the rows
     /// that carry [`None`] do so for two DIFFERENT reasons that are worth
-    /// keeping apart. For most schemes the file that would define an
-    /// implementation is absent: one assigned file remains missing under
-    /// `protocols/` -- `http3.rs` -- which
-    /// `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` asserts against the
-    /// disk. For `file`, `http`, `https`, `ftp` and `ftps` the file has LANDED
+    /// keeping apart. For the 24 out-of-scope schemes there is no
+    /// implementation to define at all: [`stub`] registers them deliberately
+    /// without one, which specification 0.2.2 requires. No assigned file under
+    /// `protocols/` is missing any more -- `http3.rs` was the last, and
+    /// `curl-rs/src/bin/curlinfo.rs`'s `absent_target_gate` asserts that against
+    /// the disk. For `file`, `http`, `https`, `ftp` and `ftps` the file has LANDED
     /// and the column is still empty: [`http1`] defines a
     /// full [`Protocol`] implementor and exports its own two rows carrying
     /// `run: Some(&http1::HTTP)`, and what those two rows lack is a CALLER --
@@ -859,8 +891,12 @@ pub(crate) struct Scheme {
     /// handler binds one transfer's state and so cannot sit in a `const` table
     /// at all. Adopting any of them
     /// executor here would advertise a transfer this build cannot perform.
-    /// [`http2`] has also landed, but it is a connection filter beneath the
-    /// shared HTTP handler and therefore never occupies this column. The
+    /// [`http2`] has also landed, and so has [`http3`], but both are connection
+    /// filters beneath the shared HTTP handler and therefore never occupy this
+    /// column -- which is exactly what the C does: `Curl_cft_http3`
+    /// (`lib/vquic/curl_ngtcp2.c:2894`) is a `Curl_cftype`, not a
+    /// `Curl_protocol`, and HTTP/3 reaches a transfer through the `https` row
+    /// like every other HTTP version. The
     /// distinction matters because
     /// specification 0.6.5 measures that asymmetry precisely: under-reporting
     /// makes a fixture SKIP, over-reporting makes it RUN AND FAIL. Each column

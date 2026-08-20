@@ -142,10 +142,13 @@
 //!   delivered file rather than an absent file.
 //!
 //! That list is CHECKED, not merely written: `absent_target_gate` in
-//! `src/bin/curlinfo.rs` holds the same thirteen paths together with the
-//! seventeen `curl-rs-lib` and two `curl-rs-ffi` targets, and fails naming
+//! `src/bin/curlinfo.rs` holds the same thirteen paths together with the FOUR
+//! `curl-rs-lib` and two `curl-rs-ffi` targets, and fails naming
 //! any that has since landed. When it fails, this paragraph is what needs
-//! updating.
+//! updating. The engine figure read five until `protocols/http3.rs` landed,
+//! which emptied `curl-rs-lib/src/protocols/` of absences entirely; what the
+//! engine still lacks is the three easy-handle modules and one proxy mechanism,
+//! not an executor.
 //!
 //! # The runtime shape is prescribed
 //!

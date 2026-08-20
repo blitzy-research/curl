@@ -12365,6 +12365,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "statx(2) is refused under isolation")]
     async fn a_public_key_that_does_not_exist_is_reported_not_ignored() {
         let clock = clock();
         let (mut chains, _state) = chains_with_transport(&clock, 5);
